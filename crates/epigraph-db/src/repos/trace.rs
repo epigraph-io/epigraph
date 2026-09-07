@@ -137,9 +137,9 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: TraceId,
     ) -> Result<Option<ReasoningTrace>, DbError> {
@@ -170,7 +170,7 @@ impl ReasoningTraceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<TraceWithAgentRow> = q.fetch_optional(pool).await?;
+        let row: Option<TraceWithAgentRow> = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => {
@@ -206,9 +206,9 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
@@ -232,7 +232,7 @@ impl ReasoningTraceRepository {
         if let Some(g) = viewer.group_bind() {
             qy = qy.bind(g);
         }
-        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(pool).await?;
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(executor).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -296,9 +296,9 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_parents(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_parents<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         trace_id: TraceId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
@@ -322,7 +322,7 @@ impl ReasoningTraceRepository {
         if let Some(g) = viewer.group_bind() {
             qy = qy.bind(g);
         }
-        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(pool).await?;
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(executor).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -358,9 +358,9 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_children(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_children<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         trace_id: TraceId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
@@ -384,7 +384,7 @@ impl ReasoningTraceRepository {
         if let Some(g) = viewer.group_bind() {
             qy = qy.bind(g);
         }
-        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(pool).await?;
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(executor).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 

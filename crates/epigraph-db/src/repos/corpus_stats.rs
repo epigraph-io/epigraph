@@ -155,7 +155,10 @@ impl CorpusStatsRepository {
     /// # Errors
     ///
     /// Returns [`DbError`] if the query fails.
-    pub async fn agent_count(pool: &PgPool, _viewer: &Viewer) -> Result<i64, DbError> {
+    pub async fn agent_count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        _viewer: &Viewer,
+    ) -> Result<i64, DbError> {
         let count: (i64,) = sqlx::query_as(
             "-- VISIBILITY-EXEMPT: `agents` is not in migration 062's tier_a array and
              -- has no owner_group_id to filter on — 062 gives it profile_visibility
@@ -165,7 +168,7 @@ impl CorpusStatsRepository {
              -- owner_group_id, or if this count is ever exposed per-agent.
              SELECT COUNT(*) FROM agents",
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(count.0)
     }

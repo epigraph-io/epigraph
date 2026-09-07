@@ -43,7 +43,6 @@
 //! set is shaped by a row the caller cannot see, but only ever *narrowed* by
 //! it, which is the fail-closed direction and discloses nothing.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::visibility::Viewer;
@@ -77,8 +76,8 @@ impl AlternativeSetRepository {
     /// # Errors
     ///
     /// Returns the underlying [`sqlx::Error`] if the query fails.
-    pub async fn scan_candidates(
-        pool: &PgPool,
+    pub async fn scan_candidates<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         target_filter: Option<Uuid>,
         min_strength: f64,
@@ -181,7 +180,7 @@ impl AlternativeSetRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()

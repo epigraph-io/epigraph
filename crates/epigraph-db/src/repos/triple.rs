@@ -200,10 +200,10 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
+    #[instrument(skip(executor, viewer))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn query(
-        pool: &PgPool,
+    pub async fn query<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         subject_id: Option<Uuid>,
         predicate_pattern: Option<&str>,
@@ -252,7 +252,7 @@ impl TripleRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -281,9 +281,9 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn entity_neighborhood(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn entity_neighborhood<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         entity_id: Uuid,
         limit: i64,
@@ -323,7 +323,7 @@ impl TripleRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -353,9 +353,9 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<TripleRow>, DbError> {
@@ -387,7 +387,7 @@ impl TripleRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -416,9 +416,9 @@ impl TripleRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn claim_has_triples(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_has_triples<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
@@ -434,7 +434,7 @@ impl TripleRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.exists)
@@ -452,9 +452,9 @@ impl TripleRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     /// Takes `_viewer` so the exemption is visible at every call site rather
     /// than only in this file.
-    #[instrument(skip(pool, _viewer))]
-    pub async fn index_counts(
-        pool: &PgPool,
+    #[instrument(skip(executor, _viewer))]
+    pub async fn index_counts<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         _viewer: &crate::visibility::Viewer,
     ) -> Result<IndexCounts, DbError> {
         let row = sqlx::query!(
@@ -471,7 +471,7 @@ impl TripleRepository {
               (SELECT COUNT(*) FROM entity_mentions) AS "entity_mentions!"
             "#
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(IndexCounts {

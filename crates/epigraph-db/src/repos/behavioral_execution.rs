@@ -333,10 +333,10 @@ impl BehavioralExecutionRepository {
     /// aggregation.
     ///
     /// Returns `(lineage_root, avg_similarity, execution_count)`.
-    #[instrument(skip(pool, viewer, goal_embedding_pgvec))]
+    #[instrument(skip(executor, viewer, goal_embedding_pgvec))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn behavioral_affinity_lineage(
-        pool: &PgPool,
+    pub async fn behavioral_affinity_lineage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         goal_embedding_pgvec: &str,
         min_similarity: f64,
@@ -415,7 +415,7 @@ impl BehavioralExecutionRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<AffinityRow> = q.fetch_all(pool).await?;
+        let rows: Vec<AffinityRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()

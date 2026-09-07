@@ -127,8 +127,8 @@ impl ClaimThemeRepository {
     /// Returns the number of claims that contributed. Zero means no visible
     /// claim in `claim_ids` had an embedding, and the centroid is left unset
     /// rather than written as NULL.
-    pub async fn set_centroid_from_claims(
-        pool: &PgPool,
+    pub async fn set_centroid_from_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         theme_id: Uuid,
         claim_ids: &[Uuid],
@@ -152,7 +152,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let n = q.fetch_optional(pool).await.map_err(DbError::from)?;
+        let n = q.fetch_optional(executor).await.map_err(DbError::from)?;
         Ok(n.unwrap_or(0))
     }
 
@@ -338,8 +338,8 @@ impl ClaimThemeRepository {
     /// `paper_doi_filter` `TODO(diverse-recall)` already exhibits on this
     /// path; the window must not become the second instance of it.
     #[allow(clippy::too_many_arguments)]
-    pub async fn claims_in_themes_at_dim_since(
-        pool: &PgPool,
+    pub async fn claims_in_themes_at_dim_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         theme_ids: &[Uuid],
         query_vec: &str,
@@ -382,7 +382,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -418,8 +418,8 @@ impl ClaimThemeRepository {
     ///
     /// These are candidates for theme reassignment — they sit on cluster boundaries
     /// and are far from their assigned centroid.
-    pub async fn find_boundary_claims(
-        pool: &PgPool,
+    pub async fn find_boundary_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         min_boundary_ratio: f64,
         min_centroid_distance: f64,
@@ -444,7 +444,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -475,8 +475,8 @@ impl ClaimThemeRepository {
     /// Get the cosine distance from a claim's embedding to its current theme centroid.
     ///
     /// Returns `None` if the claim has no theme, no embedding, or the theme has no centroid.
-    pub async fn get_claim_theme_distance(
-        pool: &PgPool,
+    pub async fn get_claim_theme_distance<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<f64>, DbError> {
@@ -494,7 +494,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let row = vq.fetch_optional(pool).await.map_err(DbError::from)?;
+        let row = vq.fetch_optional(executor).await.map_err(DbError::from)?;
 
         Ok(row.map(|r| r.get::<f64, _>("distance")))
     }
@@ -502,8 +502,8 @@ impl ClaimThemeRepository {
     /// Get a claim's embedding as a pgvector string for use in find_similar_themes.
     ///
     /// Returns `None` if the claim has no embedding.
-    pub async fn get_claim_embedding_str(
-        pool: &PgPool,
+    pub async fn get_claim_embedding_str<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<String>, DbError> {
@@ -515,7 +515,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let row = vq.fetch_optional(pool).await.map_err(DbError::from)?;
+        let row = vq.fetch_optional(executor).await.map_err(DbError::from)?;
 
         Ok(row.map(|r| r.get::<String, _>("emb_str")))
     }
@@ -525,8 +525,8 @@ impl ClaimThemeRepository {
     /// Uses a CTE: find claims with embeddings but no theme_id, assign each
     /// to the nearest theme centroid via pgvector `<=>`. Returns count assigned.
     /// Call in a loop until it returns 0.
-    pub async fn assign_unthemed_batch(
-        pool: &PgPool,
+    pub async fn assign_unthemed_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         _viewer: &crate::visibility::Viewer,
         batch_size: i64,
     ) -> Result<i64, DbError> {
@@ -552,7 +552,7 @@ impl ClaimThemeRepository {
             RETURNING c.id",
         )
         .bind(batch_size)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(DbError::from)?;
 
@@ -657,8 +657,8 @@ impl ClaimThemeRepository {
     }
 
     /// Find themes with high intra-cluster variance (candidates for splitting).
-    pub async fn find_split_candidates(
-        pool: &PgPool,
+    pub async fn find_split_candidates<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         variance_threshold: f64,
         min_claims: i64,
@@ -685,7 +685,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -701,8 +701,8 @@ impl ClaimThemeRepository {
     }
 
     /// Find themes with many claims far from their centroid (new theme candidates).
-    pub async fn find_distant_claims(
-        pool: &PgPool,
+    pub async fn find_distant_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         distance_threshold: f64,
         min_cluster_size: i64,
@@ -730,7 +730,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -747,8 +747,8 @@ impl ClaimThemeRepository {
     ///
     /// Returns embeddings as pgvector text format. The API handler converts
     /// to JSON arrays for the response.
-    pub async fn get_theme_embeddings(
-        pool: &PgPool,
+    pub async fn get_theme_embeddings<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         theme_id: Uuid,
         limit: i64,
@@ -765,7 +765,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()

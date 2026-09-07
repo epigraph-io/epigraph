@@ -118,7 +118,6 @@
 
 use crate::errors::DbError;
 use crate::visibility::Viewer;
-use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -176,9 +175,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn node_counts(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn node_counts<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(String, i64)>, DbError> {
@@ -217,7 +216,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Edge counts by relationship, restricted to [`COARSE_EDGE_TYPES`], to
@@ -243,9 +242,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn edge_counts(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn edge_counts<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(String, i64)>, DbError> {
@@ -293,7 +292,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// One row per visible owned node, carrying that node's degree counted over
@@ -301,9 +300,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn degrees(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn degrees<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(i64,)>, DbError> {
@@ -347,7 +346,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// `(belief, plausibility, pignistic_prob)` for every visible owned claim
@@ -355,9 +354,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn belief_intervals(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn belief_intervals<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<BeliefIntervalRow>, DbError> {
@@ -379,7 +378,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Number of distinct frames touched by the owner's visible claims.
@@ -390,9 +389,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn frame_coverage(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn frame_coverage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<i64, DbError> {
@@ -414,7 +413,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_one(pool).await?)
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Weekly bins of `ownership.created_at` over the last 30 days, restricted
@@ -422,9 +421,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn temporal_bins(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn temporal_bins<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(String, i64)>, DbError> {
@@ -466,7 +465,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Local clustering coefficient for every visible owned node of visible
@@ -494,9 +493,9 @@ impl StructuralRepository {
     /// eligible_nodes: 0}` for exactly the graphs the statistic was written to
     /// describe, and no test could see it. The casts fix the decode; propagating
     /// the error is what made the bug observable at all.
-    #[instrument(skip(pool, viewer))]
-    pub async fn clustering_coefficients(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn clustering_coefficients<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(f64,)>, DbError> {
@@ -569,7 +568,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Number of distinct communities the owner's visible perspectives belong
@@ -582,9 +581,9 @@ impl StructuralRepository {
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn community_membership_count(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn community_membership_count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<i64, DbError> {
@@ -605,7 +604,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_one(pool).await?)
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Conflict coefficients of the global combined beliefs of the owner's
@@ -617,9 +616,9 @@ impl StructuralRepository {
     /// Like [`Self::clustering_coefficients`], this replaced an
     /// `.unwrap_or_default()` that turned a query error into an empty
     /// distribution.
-    #[instrument(skip(pool, viewer))]
-    pub async fn conflict_coefficients(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn conflict_coefficients<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         owner_id: Uuid,
     ) -> Result<Vec<(Option<f64>,)>, DbError> {
@@ -643,7 +642,7 @@ impl StructuralRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 }
 

@@ -165,9 +165,9 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: SemanticLinkId,
     ) -> Result<Option<SemanticLink>, DbError> {
@@ -193,7 +193,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<EdgeRow> = q.fetch_optional(pool).await?;
+        let row: Option<EdgeRow> = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => Ok(Some(semantic_link_from_row(row)?)),
@@ -205,9 +205,9 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_source(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_source<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         source_claim_id: ClaimId,
     ) -> Result<Vec<SemanticLink>, DbError> {
@@ -229,7 +229,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<EdgeRow> = q.fetch_all(pool).await?;
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -243,9 +243,9 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_target(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_target<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         target_claim_id: ClaimId,
     ) -> Result<Vec<SemanticLink>, DbError> {
@@ -267,7 +267,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<EdgeRow> = q.fetch_all(pool).await?;
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -283,9 +283,9 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_between(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_between<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_a: ClaimId,
         claim_b: ClaimId,
@@ -310,7 +310,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<EdgeRow> = q.fetch_all(pool).await?;
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -324,9 +324,9 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_type(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_type<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         link_type: SemanticLinkType,
     ) -> Result<Vec<SemanticLink>, DbError> {
@@ -348,7 +348,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<EdgeRow> = q.fetch_all(pool).await?;
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -378,9 +378,9 @@ impl SemanticLinkRepository {
     /// PR-16 owns the write-side predicate. The parameter is here so the hook
     /// exists at every call site before then, and so a reviewer can see which
     /// writes are still unfiltered.
-    #[instrument(skip(pool, _viewer))]
-    pub async fn retract(
-        pool: &PgPool,
+    #[instrument(skip(executor, _viewer))]
+    pub async fn retract<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         _viewer: &crate::visibility::Viewer,
         id: SemanticLinkId,
     ) -> Result<bool, DbError> {
@@ -400,7 +400,7 @@ impl SemanticLinkRepository {
             "#,
         )
         .bind(uuid)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -410,9 +410,9 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
@@ -433,7 +433,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<EdgeRow> = q.fetch_all(pool).await?;
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -447,8 +447,11 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count(pool: &PgPool, viewer: &crate::visibility::Viewer) -> Result<i64, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<i64, DbError> {
         let sql = viewer.splice(
             r#"
             SELECT COUNT(*) as count
@@ -463,7 +466,7 @@ impl SemanticLinkRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row = q.fetch_one(pool).await?;
+        let row = q.fetch_one(executor).await?;
 
         let count: Option<i64> = row.try_get("count")?;
         Ok(count.unwrap_or(0))

@@ -92,9 +92,9 @@ impl ScopedBeliefRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         scope_type: &str,
@@ -121,7 +121,7 @@ impl ScopedBeliefRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<ScopedBeliefRow> = q.fetch_optional(pool).await?;
+        let row: Option<ScopedBeliefRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -130,9 +130,9 @@ impl ScopedBeliefRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_for_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ScopedBeliefRow>, DbError> {
@@ -152,7 +152,7 @@ impl ScopedBeliefRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ScopedBeliefRow> = q.fetch_all(pool).await?;
+        let rows: Vec<ScopedBeliefRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -161,10 +161,10 @@ impl ScopedBeliefRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
+    #[instrument(skip(executor, viewer))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn list_for_scope(
-        pool: &PgPool,
+    pub async fn list_for_scope<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         scope_type: &str,
         scope_id: Option<Uuid>,
@@ -196,7 +196,7 @@ impl ScopedBeliefRepository {
         if let Some(g) = viewer.group_bind() {
             q0 = q0.bind(g);
         }
-        let rows: Vec<ScopedBeliefRow> = q0.fetch_all(pool).await?;
+        let rows: Vec<ScopedBeliefRow> = q0.fetch_all(executor).await?;
 
         Ok(rows)
     }

@@ -758,7 +758,9 @@ async fn test_concurrent_claim_creation_no_conflicts(pool: PgPool) {
         .expect("Agent creation should succeed");
 
     let pool = Arc::new(pool);
-    let initial_count = ClaimRepository::count(&pool, &viewer, None).await.unwrap();
+    // `&*pool`, not `&pool`: the repo signature is generic over the executor, and a
+    // generic parameter gets no deref coercion the way a concrete `&PgPool` did.
+    let initial_count = ClaimRepository::count(&*pool, &viewer, None).await.unwrap();
 
     // Act: Create claims concurrently (without traces for simplicity - testing concurrency)
     let num_concurrent = 10;
@@ -807,7 +809,7 @@ async fn test_concurrent_claim_creation_no_conflicts(pool: PgPool) {
     );
 
     // Verify final count
-    let final_count = ClaimRepository::count(&pool, &viewer, None).await.unwrap();
+    let final_count = ClaimRepository::count(&*pool, &viewer, None).await.unwrap();
     assert_eq!(
         final_count,
         initial_count + num_concurrent,

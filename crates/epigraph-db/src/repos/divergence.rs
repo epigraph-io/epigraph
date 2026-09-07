@@ -86,9 +86,9 @@ impl DivergenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_latest(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_latest<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<DivergenceRow>, DbError> {
@@ -112,7 +112,7 @@ impl DivergenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<DivergenceRow> = q.fetch_optional(pool).await?;
+        let row: Option<DivergenceRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -122,9 +122,9 @@ impl DivergenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn top_divergent(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn top_divergent<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
     ) -> Result<Vec<DivergenceRow>, DbError> {
@@ -145,7 +145,7 @@ impl DivergenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<DivergenceRow> = q.fetch_all(pool).await?;
+        let rows: Vec<DivergenceRow> = q.fetch_all(executor).await?;
 
         // Sort by KL divergence descending and take the top N.
         // We do this in Rust because DISTINCT ON + ORDER BY kl_divergence

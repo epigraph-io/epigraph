@@ -72,7 +72,6 @@
 //! [`compound_neighbors`]: GraphViewRepository::compound_neighbors
 //! [`Viewer::edge_predicate_fragment`]: crate::visibility::Viewer::edge_predicate_fragment
 
-use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -189,9 +188,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, degree_relationships))]
-    pub async fn expand_cluster_nodes(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, degree_relationships))]
+    pub async fn expand_cluster_nodes<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         cluster_id: Uuid,
         run_id: Uuid,
@@ -229,7 +228,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Compound-mode nodes of one precomputed neighborhood: each compound that
@@ -242,9 +241,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn neighborhood_compound_nodes(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_compound_nodes<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         neighborhood_id: Uuid,
     ) -> Result<Vec<CompoundNodeRow>, DbError> {
@@ -289,16 +288,16 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Claim-level nodes belonging to one precomputed neighborhood.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn neighborhood_atomic_nodes(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_atomic_nodes<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         neighborhood_id: Uuid,
     ) -> Result<Vec<AtomicNodeRow>, DbError> {
@@ -320,7 +319,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// The compound groupings of an atomic neighborhood: each parent compound
@@ -334,9 +333,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn neighborhood_compound_groups(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn neighborhood_compound_groups<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         neighborhood_id: Uuid,
     ) -> Result<Vec<CompoundGroupRow>, DbError> {
@@ -357,7 +356,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// The centre claim's content for a compound-neighborhood expansion.
@@ -368,9 +367,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn compound_center_content(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn compound_center_content<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         claim_id: Uuid,
     ) -> Result<Option<String>, DbError> {
@@ -382,7 +381,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_optional(pool).await?)
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// Compounds adjacent to `claim_id` through positive-weight epistemic
@@ -394,9 +393,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn compound_neighbors(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn compound_neighbors<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         claim_id: Uuid,
         limit: i64,
@@ -460,7 +459,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Claim nodes of an arbitrary id set, for `load_subgraph`.
@@ -478,9 +477,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, node_ids))]
-    pub async fn subgraph_claims(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, node_ids))]
+    pub async fn subgraph_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         node_ids: &[Uuid],
     ) -> Result<Vec<SubgraphClaimRow>, DbError> {
@@ -497,7 +496,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Evidence nodes of an arbitrary id set, for `load_subgraph`.
@@ -508,9 +507,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, node_ids))]
-    pub async fn subgraph_evidence(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, node_ids))]
+    pub async fn subgraph_evidence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         node_ids: &[Uuid],
     ) -> Result<Vec<SubgraphEvidenceRow>, DbError> {
@@ -524,7 +523,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Edges wholly inside an id set, for `load_subgraph`.
@@ -553,9 +552,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, node_ids))]
-    pub async fn subgraph_edges(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, node_ids))]
+    pub async fn subgraph_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         node_ids: &[Uuid],
     ) -> Result<Vec<SubgraphEdgeRow>, DbError> {
@@ -571,7 +570,7 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Reasoning-trace nodes of an arbitrary id set, for `load_subgraph`.
@@ -587,9 +586,9 @@ impl GraphViewRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, node_ids))]
-    pub async fn subgraph_traces(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, node_ids))]
+    pub async fn subgraph_traces<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &Viewer,
         node_ids: &[Uuid],
     ) -> Result<Vec<SubgraphTraceRow>, DbError> {
@@ -601,6 +600,6 @@ impl GraphViewRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 }

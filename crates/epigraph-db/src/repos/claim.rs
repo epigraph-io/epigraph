@@ -638,9 +638,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn promotion_flag(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn promotion_flag<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Option<bool>, DbError> {
@@ -654,7 +654,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let flag: Option<Option<bool>> = q.fetch_optional(pool).await?;
+        let flag: Option<Option<bool>> = q.fetch_optional(executor).await?;
         Ok(flag.flatten())
     }
 
@@ -678,9 +678,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_belief_columns(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_belief_columns<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Option<ClaimBeliefColumns>, DbError> {
@@ -694,7 +694,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<ClaimBeliefColumns> = q.fetch_optional(pool).await?;
+        let row: Option<ClaimBeliefColumns> = q.fetch_optional(executor).await?;
         Ok(row)
     }
 
@@ -754,9 +754,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn version_history(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn version_history<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ClaimVersionHit>, DbError> {
@@ -825,7 +825,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -855,9 +855,9 @@ impl ClaimRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, viewer, embedding))]
-    pub async fn semantic_search_flat(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_search_flat<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         min_similarity: f64,
@@ -907,7 +907,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// `claims.content` and `claims.properties` for one id, viewer-filtered.
@@ -934,9 +934,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn content_and_properties(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn content_and_properties<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<(String, serde_json::Value)>, DbError> {
@@ -951,7 +951,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_optional(pool).await?)
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// Corpus-wide embedding-neighbourhood cardinality and mean similarity.
@@ -965,9 +965,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, embedding))]
-    pub async fn embedding_density_stats(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn embedding_density_stats<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         radius: f64,
@@ -986,7 +986,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_one(pool).await?)
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// Raw `claims.embedding` vectors for a probe neighbourhood, viewer-filtered.
@@ -1001,9 +1001,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, embedding))]
-    pub async fn neighborhood_embeddings(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn neighborhood_embeddings<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         min_similarity: f64,
@@ -1029,7 +1029,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Count / mean / median cosine similarity inside a distance radius of a
@@ -1047,9 +1047,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, embedding))]
-    pub async fn embedding_radius_density(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn embedding_radius_density<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         radius: f64,
@@ -1072,7 +1072,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_one(pool).await?)
+        Ok(q.fetch_one(executor).await?)
     }
 
     /// `properties->>'level'` / `properties->>'source_type'` for the nearest
@@ -1086,9 +1086,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, embedding))]
-    pub async fn embedding_radius_breakdown(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn embedding_radius_breakdown<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         embedding: &str,
         radius: f64,
@@ -1112,7 +1112,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Graph neighbours of a selected claim set, for the diverse search path's
@@ -1151,9 +1151,9 @@ impl ClaimRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails, or
     /// `DbError::InvalidData` for an unrecognised `embedding_col`.
-    #[instrument(skip(pool, viewer, embedding))]
-    pub async fn semantic_graph_neighbors(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_graph_neighbors<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         embedding_col: &str,
         embedding: &str,
@@ -1196,7 +1196,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Claims whose belief interval falls inside the given bounds, optionally
@@ -1221,9 +1221,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_by_belief_bounds(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_by_belief_bounds<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         min_belief: f64,
         max_plausibility: f64,
@@ -1256,7 +1256,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Claims belonging to a frame, sorted by a belief metric.
@@ -1282,9 +1282,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn frame_claims_sorted(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn frame_claims_sorted<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
         sort: BeliefSort,
@@ -1317,7 +1317,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Hybrid semantic + epistemic + connectivity retrieval for
@@ -1357,9 +1357,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
-    pub async fn rag_hybrid_context(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn rag_hybrid_context<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         min_truth: f64,
@@ -1412,7 +1412,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -1566,9 +1566,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_agent_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_agent_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<Uuid>, DbError> {
@@ -1580,7 +1580,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let agent_id: Option<Uuid> = q.fetch_optional(pool).await?;
+        let agent_id: Option<Uuid> = q.fetch_optional(executor).await?;
         Ok(agent_id)
     }
 
@@ -1588,9 +1588,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<Claim>, DbError> {
@@ -1613,7 +1613,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -1646,9 +1646,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_labels(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Vec<String>, DbError> {
@@ -1660,7 +1660,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<(Vec<String>,)> = q.fetch_optional(pool).await?;
+        let row: Option<(Vec<String>,)> = q.fetch_optional(executor).await?;
         Ok(row.map(|(l,)| l).unwrap_or_default())
     }
 
@@ -1675,9 +1675,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id_with_labels(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
@@ -1698,7 +1698,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row = q.fetch_optional(pool).await?;
+        let row = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => {
@@ -1776,9 +1776,9 @@ impl ClaimRepository {
     /// pool rather than trimming an already-truncated top-K (see
     /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
     /// correctness rather than performance).
-    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding_since(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         dim: u32,
@@ -1863,7 +1863,7 @@ impl ClaimRepository {
             q = q.bind(g);
         }
 
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Search **current** claims by embedding similarity across **all levels**.
@@ -1900,9 +1900,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding_scoped(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -1939,7 +1939,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -1958,9 +1958,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
-    pub async fn nearest_by_embedding(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -1984,7 +1984,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -2043,8 +2043,8 @@ impl ClaimRepository {
     /// belief recomputation touches without changing its content, so an
     /// `updated_at` window would report the whole recomputed corpus as new.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_hybrid_scoped_since(
-        pool: &PgPool,
+    pub async fn search_hybrid_scoped_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         query_text: &str,
@@ -2115,7 +2115,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g); // $9
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -2151,8 +2151,8 @@ impl ClaimRepository {
     /// falls back to when the embedder is down; a window that held on the
     /// hybrid path but not here would silently widen on embedder failure.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_lexical_scoped_since(
-        pool: &PgPool,
+    pub async fn search_lexical_scoped_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_text: &str,
         k_rrf: i64,
@@ -2194,7 +2194,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g); // $7
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -2209,9 +2209,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_agent(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_agent<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: AgentId,
     ) -> Result<Vec<Claim>, DbError> {
@@ -2234,7 +2234,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
 
@@ -2439,9 +2439,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_high_truth(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_high_truth<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         threshold: f64,
     ) -> Result<Vec<Claim>, DbError> {
@@ -2458,7 +2458,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         let mut claims = Vec::with_capacity(rows.len());
@@ -2484,9 +2484,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_low_truth(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_low_truth<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         threshold: f64,
     ) -> Result<Vec<Claim>, DbError> {
@@ -2503,7 +2503,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         let mut claims = Vec::with_capacity(rows.len());
@@ -2619,9 +2619,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
@@ -2666,7 +2666,7 @@ impl ClaimRepository {
             query = query.bind(g);
         }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
 
@@ -2697,8 +2697,8 @@ impl ClaimRepository {
     /// outside that window is silently invisible (backlog bug `5a55a48e`:
     /// `query_claims(max_truth=0.75)` returned empty while matching claims
     /// existed).
-    pub async fn list_by_truth_range(
-        pool: &PgPool,
+    pub async fn list_by_truth_range<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         min_truth: f64,
         max_truth: f64,
@@ -2724,7 +2724,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2750,8 +2750,8 @@ impl ClaimRepository {
     /// all yield `false`. Used to guard structural-edge creation against
     /// stale/duplicate endpoints — e.g. a CORROBORATES edge must not point at
     /// a claim that has already been retired (backlog bug `5c7fc645`).
-    pub async fn are_all_current(
-        pool: &PgPool,
+    pub async fn are_all_current<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<bool, DbError> {
@@ -2771,7 +2771,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let live: i64 = q.fetch_one(pool).await?;
+        let live: i64 = q.fetch_one(executor).await?;
         // Distinct ids must each be present-and-current. A missing or
         // non-current id lowers the count below the distinct cardinality.
         let distinct: std::collections::HashSet<&uuid::Uuid> = ids.iter().collect();
@@ -2794,8 +2794,8 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    pub async fn contents_by_ids(
-        pool: &PgPool,
+    pub async fn contents_by_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
@@ -2812,7 +2812,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.into_iter().collect())
     }
 
@@ -2843,8 +2843,8 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    pub async fn contents_by_ids_any_version(
-        pool: &PgPool,
+    pub async fn contents_by_ids_any_version<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
@@ -2860,7 +2860,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.into_iter().collect())
     }
 
@@ -2946,8 +2946,8 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    pub async fn hidden_claim_ids(
-        pool: &PgPool,
+    pub async fn hidden_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<std::collections::HashSet<uuid::Uuid>, DbError> {
@@ -2978,7 +2978,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?.into_iter().collect())
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
     /// Fetch `labels` for a batch of claim ids in one round-trip.
@@ -3001,8 +3001,8 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    pub async fn labels_by_ids(
-        pool: &PgPool,
+    pub async fn labels_by_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<String>>, DbError> {
@@ -3018,7 +3018,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.into_iter().collect())
     }
 
@@ -3043,9 +3043,9 @@ impl ClaimRepository {
     /// queries that don't need these columns) untouched, and we don't widen
     /// `claim_from_row`'s signature — its other ~20 callers don't care about
     /// retirement state.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_by_labels(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_by_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query: LabelQuery<'_>,
     ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
@@ -3099,7 +3099,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -3145,8 +3145,8 @@ impl ClaimRepository {
     ///
     /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
     /// monotonic progress through the backlog across scheduled runs.
-    pub async fn list_undecomposed(
-        pool: &PgPool,
+    pub async fn list_undecomposed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
@@ -3196,7 +3196,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
@@ -3228,9 +3228,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn search_by_label_and_text(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn search_by_label_and_text<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         labels: &[String],
         text: &str,
@@ -3265,7 +3265,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
@@ -3287,9 +3287,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         search: Option<&str>,
     ) -> Result<i64, DbError> {
@@ -3325,7 +3325,7 @@ impl ClaimRepository {
             query = query.bind(g);
         }
 
-        let row_count = query.fetch_one(pool).await?;
+        let row_count = query.fetch_one(executor).await?;
 
         Ok(row_count)
     }
@@ -3380,35 +3380,19 @@ impl ClaimRepository {
     }
 
     /// Count total number of claims within an existing transaction.
+    ///
+    /// Delegates to the generic form above, which accepts any executor. The
+    /// hand-written duplicate this replaced was the drift class that a gate
+    /// cannot see: two copies of one predicate, only one of which gets fixed.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn count_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         search: Option<&str>,
     ) -> Result<i64, DbError> {
-        let search_pattern = search.map(|s| format!("%{}%", s));
-        let (query_str, vis_bind) = if search_pattern.is_some() {
-            (
-                r#"SELECT COUNT(*) as count FROM claims
-                   WHERE content ILIKE $1 /* {VISIBILITY:claims} */"#,
-                2,
-            )
-        } else {
-            (
-                r#"SELECT COUNT(*) as count FROM claims
-                   WHERE true /* {VISIBILITY:claims} */"#,
-                1,
-            )
-        };
-        let sql = viewer.splice(query_str, vis_bind);
-        let mut query = sqlx::query_scalar::<_, i64>(&sql);
-        if let Some(s) = search_pattern {
-            query = query.bind(s);
-        }
-        if let Some(g) = viewer.group_bind() {
-            query = query.bind(g);
-        }
-        let count = query.fetch_one(&mut *conn).await?;
-        Ok(count)
+        Self::count(&mut *conn, viewer, search).await
     }
 
     /// Batch create multiple claims in a single transaction
@@ -4041,9 +4025,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn latest_in_lineage(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn latest_in_lineage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         lineage_id: Uuid,
     ) -> Result<Vec<LineageHead>, DbError> {
@@ -4070,7 +4054,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows)
     }
 }
@@ -4122,8 +4106,8 @@ impl ClaimRepository {
     }
 
     /// Count all evidence for a claim, including inherited evidence (via derived_from edges).
-    pub async fn count_all_evidence_for_claim(
-        pool: &PgPool,
+    pub async fn count_all_evidence_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<i64, DbError> {
@@ -4146,7 +4130,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (i64,) = q.fetch_one(pool).await?;
+        let row: (i64,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }
@@ -4161,8 +4145,8 @@ impl ClaimRepository {
     /// - `evidence --SUPPORTS-->       claim`
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
-    pub async fn has_grounded_evidence(
-        pool: &PgPool,
+    pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
@@ -4183,7 +4167,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (bool,) = q.fetch_one(pool).await?;
+        let row: (bool,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }
@@ -4194,8 +4178,8 @@ impl ClaimRepository {
     ///
     /// Valid values mirror the DB CHECK constraint on reasoning_traces:
     /// deductive, inductive, abductive, analogical, statistical.
-    pub async fn claim_ids_by_methodology(
-        pool: &PgPool,
+    pub async fn claim_ids_by_methodology<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         reasoning_type: &str,
     ) -> Result<Vec<Uuid>, DbError> {
@@ -4213,7 +4197,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid,)> = q.fetch_all(pool).await?;
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
@@ -4222,8 +4206,8 @@ impl ClaimRepository {
     ///
     /// Valid values mirror the DB evidence_type column:
     /// document, observation, testimony, computation, reference, figure, conversational.
-    pub async fn claim_ids_by_evidence_type(
-        pool: &PgPool,
+    pub async fn claim_ids_by_evidence_type<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         evidence_type: &str,
     ) -> Result<Vec<Uuid>, DbError> {
@@ -4240,7 +4224,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid,)> = q.fetch_all(pool).await?;
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
@@ -4332,9 +4316,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_classification(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_classification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<String>, DbError> {
@@ -4346,7 +4330,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<(Option<String>,)> = q.fetch_optional(pool).await?;
+        let row: Option<(Option<String>,)> = q.fetch_optional(executor).await?;
         Ok(row.and_then(|(c,)| c))
     }
 
@@ -4386,9 +4370,9 @@ impl ClaimRepository {
     /// # Errors
     /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
     /// - `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn pairwise_cosine_distance(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn pairwise_cosine_distance<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
         max_distance: f64,
@@ -4431,7 +4415,7 @@ impl ClaimRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ClaimPairDistance> = q.fetch_all(pool).await?;
+        let rows: Vec<ClaimPairDistance> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -5276,9 +5260,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer, claim_ids))]
-    pub async fn in_epistemic_degree_batch(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn in_epistemic_degree_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, i64>, DbError> {
@@ -5307,7 +5291,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows.into_iter().map(|r| (r.target_id, r.degree)).collect())
@@ -5339,9 +5323,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer, claim_ids))]
-    pub async fn dispute_batch(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn dispute_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, ClaimDispute>, DbError> {
@@ -5370,7 +5354,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -7075,9 +7059,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn enumerate_current_embedded(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn enumerate_current_embedded<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_scope: Option<&[Uuid]>,
         labels_scope: Option<&[String]>,
@@ -7107,7 +7091,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -7128,9 +7112,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn nearest_neighbors_of_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn nearest_neighbors_of_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         k: i64,
@@ -7176,7 +7160,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -7196,9 +7180,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer, ids))]
-    pub async fn content_hashes_for(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn content_hashes_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, Vec<u8>>, DbError> {
@@ -7216,7 +7200,7 @@ impl ClaimRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.content_hash)).collect())
     }

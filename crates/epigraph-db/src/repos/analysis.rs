@@ -108,8 +108,8 @@ impl AnalysisRepository {
     }
 
     /// Find all analyses that produced a given claim (via `concludes` edges).
-    pub async fn get_for_claim(
-        pool: &PgPool,
+    pub async fn get_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<AnalysisRecord>, sqlx::Error> {
@@ -131,13 +131,13 @@ impl AnalysisRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<AnalysisRow> = q.fetch_all(pool).await?;
+        let rows: Vec<AnalysisRow> = q.fetch_all(executor).await?;
         Ok(rows.into_iter().map(from_row).collect())
     }
 
     /// Find all claims produced by an analysis (via `concludes` edges).
-    pub async fn get_claims_for_analysis(
-        pool: &PgPool,
+    pub async fn get_claims_for_analysis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         analysis_id: Uuid,
     ) -> Result<Vec<ClaimSummary>, sqlx::Error> {
@@ -157,7 +157,7 @@ impl AnalysisRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ClaimSummaryRow> = q.fetch_all(pool).await?;
+        let rows: Vec<ClaimSummaryRow> = q.fetch_all(executor).await?;
         Ok(rows
             .into_iter()
             .map(|r| ClaimSummary {
