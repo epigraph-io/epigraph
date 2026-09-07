@@ -745,9 +745,10 @@ async fn method_evidence_counts_only_the_claims_the_viewer_can_see(pool: PgPool)
 /// `MethodRepository::get` — BEHAVIOUR PRESERVATION, because no tenancy
 /// assertion is available or honest.
 ///
-/// `methods` has no `visibility` column, no `owner_group_id` and no RLS, so
-/// there is nothing for a viewer to suppress and an "a stranger sees less"
-/// assertion here would be one that cannot fail. What CAN be asserted is that
+/// `methods` has no `visibility` column, no `owner_group_id` and no RLS, so a
+/// row of `methods` is not suppressible by viewer and an "a stranger sees less"
+/// assertion against THAT TABLE would be one that cannot fail. What CAN be
+/// asserted is that
 /// the widened signature returns the same row through the handler that the repo
 /// returns directly, and that the not-found path still answers `NotFound` rather
 /// than the `InternalError` a refused `read_as` produces.

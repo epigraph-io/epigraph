@@ -594,12 +594,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "method.rs",
         "get",
-        "Reads `methods` by primary key. `methods` is global reference data: measured at migration \
-         head 91 it has neither a `visibility` nor an `owner_group_id` column, and row-level \
-         security is off on it (`pg_class.relrowsecurity` and `relforcerowsecurity` are both \
-         false, against `claims` which is true/true). There is therefore no column a `Viewer` \
-         could be spliced against, and no RLS policy for a session GUC to select. PR-29 widened \
-         the executor only; the SQL is unchanged.",
+        "Reads `methods` by primary key, and the statement's FROM is `methods` alone -- it joins \
+         nothing. `methods` is global reference data: measured at migration head 91 it has \
+         neither a `visibility` nor an `owner_group_id` column, and row-level security is off on \
+         it (`pg_class.relrowsecurity` and `relforcerowsecurity` are both false, against `claims` \
+         which is true/true). This SITE therefore has no predicate to add to the table it reads, \
+         and no RLS policy for a session GUC to select. SCOPE, stated so this entry is not read \
+         as blessing more than it measured: PR-29 widened the executor only. The SQL is \
+         unchanged, the projected row shape is unchanged, and neither was re-derived here.",
     ),
     (
         "claim_theme.rs",

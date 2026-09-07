@@ -31,9 +31,10 @@ use crate::state::AppState;
 /// The two statements have different tenancy postures, and only one of them can
 /// have a predicate:
 ///
-/// - `MethodRepository::get` reads `methods`, which has no tenancy columns and
-///   no row-level security, so it takes no `&Viewer` and there is nothing to
-///   splice. PR-29 widened it to `<'e, E: sqlx::PgExecutor<'e>>` — the ONE new
+/// - `MethodRepository::get` reads `methods` alone and joins nothing. `methods`
+///   has no tenancy columns and no row-level security, so this site has no
+///   predicate to add to the table it reads and the function takes no
+///   `&Viewer`. PR-29 widened it to `<'e, E: sqlx::PgExecutor<'e>>` — the ONE new
 ///   repo form the shard was budgeted, plus one the budget missed (see the PR
 ///   body). The reason it holds no viewer is recorded in
 ///   `epigraph-db/tests/visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER` rather than
