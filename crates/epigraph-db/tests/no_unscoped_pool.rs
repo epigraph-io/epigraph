@@ -15,7 +15,7 @@
 //! # Why it is SEEDED rather than asserted at zero
 //!
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
-//! lint would fail on day one"*. It would — there are 402 unconverted sites as
+//! lint would fail on day one"*. It would — there are 391 unconverted sites as
 //! of this commit, and a lint that fails on day one is a lint someone deletes
 //! in week two.
 //!
@@ -54,7 +54,7 @@
 //!   against, and the write-side predicate is 16b's, not this PR's. Measured on
 //!   this tree with a same-line name needle (create / insert / update / delete
 //!   / upsert / supersede / revoke / mark_ / record_ / append): **30** of the
-//!   402 sites below are visibly write-shaped, led by
+//!   391 sites below are visibly write-shaped, led by
 //!   `routes/experiment_loop.rs` (5), `routes/tasks.rs` (4) and
 //!   `routes/crud.rs`, `routes/claims.rs`, `routes/workflows.rs`,
 //!   `routes/webhooks.rs` (3 each). That is a LOWER bound — the needle only
@@ -100,11 +100,15 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 402 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 391 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
-//!      second; PR-26 converted the first shard's seven sites and PR-28 the
-//!      second shard's five. None discharged the gate — 402 is not 0 — and
-//!      neither PR-25 nor PR-26 nor PR-28 may be read as unblocking step 11d.
+//!      second; PR-26 converted the first shard's seven sites, PR-28 the
+//!      second shard's five, and PR-29 — the first MULTI-FILE shard — the third
+//!      shard's eleven, across `routes/search.rs`, `routes/voids.rs` and
+//!      `routes/methods.rs`. None discharged the gate — 391 is not 0 — and
+//!      neither PR-25 nor PR-26 nor PR-28 nor PR-29 may be read as unblocking
+//!      step 11d. A SMALLER number is not a discharged decision: 25 of the 416
+//!      sites the series began with are converted, and 391 are not.
 //!
 //!   And independently of both, the conversion is unargued: each file takes a
 //!   raw `&PgPool` as a *parameter* (from `state.db_pool` and from the
@@ -182,7 +186,11 @@
 //!   anticipates the wrapper: a body with no `sqlx::query` is skipped as a
 //!   delegating wrapper, because the callee is subject to the same lint.
 //!   **Cost metric for sizing later shards: 2 new connection-taking repo forms
-//!   for 7 converted sites.**
+//!   for 7 converted sites.** PR-28 then measured ZERO new forms for 5 sites,
+//!   and PR-29 TWO new forms for 11 sites across three files — so the cost is
+//!   driven by how many distinct callees a shard reaches, not by its site count.
+//!   Both of PR-29's are single-statement generic widenings of functions that
+//!   take no `Viewer` at all, a category PR-27's pass excluded by construction.
 //!
 //!   **PR-27 adds a third shape for the single-statement majority, and this
 //!   paragraph should be read with that scope attached — it does NOT supersede
@@ -449,13 +457,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 402;
+const HIGH_WATER: usize = 391;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
-const HIGH_WATER_FILES: usize = 49;
+const HIGH_WATER_FILES: usize = 46;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 402 sites across 49 files as of this commit. Lower an entry when a shard
+/// 391 sites across 46 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -497,7 +505,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first
     // conversion shard, moved all seven onto `AppState::read_as`. `measure()`
     // only ever emits non-zero entries, so a `0` row could never be satisfied.
-    ("routes/methods.rs", 2),
+    //
+    // `routes/methods.rs` was 2 and is GONE, not zeroed: PR-29, conversion shard
+    // 3, moved both onto `AppState::read_as`. It is one of THREE rows that shard
+    // deleted — see `routes/search.rs` and `routes/voids.rs` below — which is
+    // what makes it the first multi-file shard in the series.
     ("routes/papers.rs", 8),
     ("routes/perspective.rs", 5),
     ("routes/policies.rs", 9),
@@ -506,14 +518,19 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/rag.rs", 4),
     ("routes/reasoning.rs", 1),
     ("routes/revoke_signature.rs", 1),
-    ("routes/search.rs", 6),
+    // `routes/search.rs` was 6 and is GONE, not zeroed: PR-29, conversion shard
+    // 3. Two of the six were inline `sqlx::query*` statements in the handler
+    // rather than repo calls; both kept their SQL where it was and changed only
+    // the executor, so `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`
+    // still records `("search.rs", 1)` and must not be lowered.
     ("routes/spans.rs", 6),
     ("routes/structural.rs", 1),
     ("routes/submit.rs", 4),
     ("routes/tasks.rs", 15),
     ("routes/timeline.rs", 2),
     ("routes/versioning.rs", 9),
-    ("routes/voids.rs", 3),
+    // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
+    // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is
     // owned by the principal that registered it, so these three are ordinary
     // authenticated CRUD, not a pre-auth receiver.

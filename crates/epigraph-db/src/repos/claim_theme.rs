@@ -233,8 +233,20 @@ impl ClaimThemeRepository {
     /// `DbError::InvalidData` — the dim gate is the *only* path by which a
     /// column name is interpolated, which is what makes the `format!`-built
     /// SQL injection-safe.
-    pub async fn find_similar_themes_at_dim(
-        pool: &PgPool,
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so a caller holding a viewer-stamped
+    /// connection can run this statement on it instead of the raw pool. PR-29
+    /// widened it for `routes/search.rs::semantic_search`; `&PgPool` still
+    /// satisfies the bound, so [`Self::find_similar_themes`] and the
+    /// `epigraph-engine` wrapper compile unchanged.
+    ///
+    /// It takes no `&Viewer` because `claim_themes` carries no tenancy to filter
+    /// on — see the `EXECUTOR_WITHOUT_VIEWER` entry in
+    /// `epigraph-db/tests/visibility_lint.rs`, which records the measurement.
+    pub async fn find_similar_themes_at_dim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         query_vec: &str,
         limit: i32,
         centroid_dim: u32,
@@ -255,7 +267,7 @@ impl ClaimThemeRepository {
         let rows = sqlx::query(&sql)
             .bind(query_vec)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await
             .map_err(DbError::from)?;
 
@@ -302,10 +314,16 @@ impl ClaimThemeRepository {
     /// REST passes `false` to match its historical behaviour.
     ///
     /// Retained at its original arity as a delegating wrapper over
-    /// [`Self::claims_in_themes_at_dim_since`], so the REST
-    /// `/api/v1/search/semantic?diverse=true` route (which reaches this
-    /// through `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`)
-    /// keeps the call it already has.
+    /// [`Self::claims_in_themes_at_dim_since`].
+    ///
+    /// The rationale that arity was retained FOR no longer applies, and saying
+    /// so is cheaper than letting the next reader re-derive it: the REST
+    /// `/api/v1/search/semantic?diverse=true` route used to reach this through
+    /// `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`, and
+    /// PR-29 re-pointed it at [`Self::claims_in_themes_at_dim_since`] directly
+    /// on a viewer-stamped connection. This method is still called — by
+    /// [`Self::claims_in_themes`], the legacy 1536d convenience above — so it is
+    /// not orphaned; only the REST justification is spent.
     pub async fn claims_in_themes_at_dim(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,

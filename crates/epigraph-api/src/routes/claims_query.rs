@@ -171,56 +171,6 @@ pub struct ClaimListResponse {
 // Handler
 // ============================================================================
 
-/// Finish the viewer-stamped read, logging the reason and answering opaquely.
-///
-/// A named helper rather than two copies of PR-26's inline block, because this
-/// handler has TWO return paths — the fast path returns early inside
-/// `if !needs_in_memory_filters` — and an explicit finish is mandatory on both.
-/// [`epigraph_db::ScopedRead`] has no `Drop` impl, so under
-/// `SessionGucMode::Transaction` an un-finished read rolls back silently; the
-/// read is read-only, so nothing is lost, but the connection is then returned a
-/// round trip later than it needed to be. The `Session` arm is a bare
-/// connection and finishing it is a no-op — which is exactly why this must not
-/// be left to the mode: a shard that skips it looks correct in one
-/// configuration and is wasteful in the other.
-///
-/// Same error shape as the acquire: the reason goes to the operator's log, the
-/// client gets an opaque message. A `format!`-ed `DbError` here would render its
-/// `#[source]` driver text into the response body, since `errors.rs` serialises
-/// `ApiError::InternalError { message }` verbatim.
-///
-/// # Why the failure is FATAL here, when the primitive says it need not be
-///
-/// A DELIBERATE choice, recorded because this shard is the template the
-/// remaining conversion shards copy. [`epigraph_db::ScopedRead::commit`]'s own
-/// doc says skipping the finish on a read is safe — sqlx rolls back on drop and
-/// a read has nothing to lose — so a caller could log a commit failure and
-/// still answer 200 with rows it already holds. This handler propagates instead,
-/// and the reason is that the two are not the same claim. "The finish is
-/// optional" is about SKIPPING it; this helper RAN it and the server said no.
-/// Under `SessionGucMode::Transaction` that is a failed COMMIT of the very
-/// transaction the tenancy predicate was evaluated in, and a handler cannot
-/// distinguish "the rows are fine, only the bookkeeping failed" from "the
-/// session was not in the state I believed it was" without inspecting driver
-/// internals. Answering 500 costs a retry; answering 200 on an unverified
-/// session is the failure direction this whole series exists to remove. The
-/// cost is bounded and known: under `SessionGucMode::Session` the commit is a
-/// no-op, so this branch is unreachable in the default configuration.
-#[cfg(feature = "db")]
-async fn finish_scoped_read(read: epigraph_db::ScopedRead<'_>) -> Result<(), ApiError> {
-    read.commit().await.map_err(|e| {
-        tracing::error!(
-            target: "tenancy.scoped_read",
-            error = %e,
-            handler = "list_claims_query",
-            "could not finish a viewer-stamped read"
-        );
-        ApiError::InternalError {
-            message: "Failed to finish the scoped read".to_string(),
-        }
-    })
-}
-
 /// List and filter claims from PostgreSQL
 ///
 /// `GET /api/v1/claims`
@@ -462,7 +412,7 @@ pub async fn list_claims_query(
             message: format!("Database query failed: {}", e),
         })?;
 
-        finish_scoped_read(read).await?;
+        crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
         let paginated: Vec<ClaimSummary> = rows
             .into_iter()
@@ -503,7 +453,7 @@ pub async fn list_claims_query(
     // The last statement on this path. Everything below is in-memory, so the
     // connection is returned before the filtering, the sort and the pagination
     // rather than after them.
-    finish_scoped_read(read).await?;
+    crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
     let mut claims: Vec<_> = all_claims.iter().collect();
 

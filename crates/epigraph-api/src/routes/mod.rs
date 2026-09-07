@@ -108,6 +108,98 @@ pub mod webhooks;
 #[cfg(feature = "db")]
 pub mod workflows;
 
+/// Finish a viewer-stamped read, mapping a failed finish to a 500.
+///
+/// # Why this lives here and not in one route file
+///
+/// PR-28 introduced it as a private helper in `claims_query.rs`, correctly, for
+/// a handler with two return paths. PR-29 is the first MULTI-FILE conversion
+/// shard and needs the identical finish on five success paths across three
+/// files, so it is promoted here rather than copied four times. The `handler`
+/// argument is what the private version hard-coded in its log line; it is a
+/// `&'static str` so a caller cannot make the log field caller-controlled data.
+/// `claims_query.rs` now calls this and its private copy is gone — that is a
+/// consolidation, not a behaviour change, and the two log lines it emits are
+/// byte-identical to the ones it emitted before.
+///
+/// # Why an explicit finish at all
+///
+/// [`epigraph_db::ScopedRead`] has no `Drop` impl, so under
+/// `SessionGucMode::Transaction` an un-finished read rolls back silently; the
+/// read is read-only, so nothing is lost, but the connection is returned a round
+/// trip later than it needed to be. The `Session` arm is a bare connection and
+/// finishing it is a no-op — which is exactly why this must not be left to the
+/// mode: a shard that skips it looks correct in one configuration and is
+/// wasteful in the other.
+///
+/// Same error shape as the acquire: the reason goes to the operator's log, the
+/// client gets an opaque message. A `format!`-ed `DbError` here would render its
+/// `#[source]` driver text into the response body, since `errors.rs` serialises
+/// `ApiError::InternalError { message }` verbatim.
+///
+/// # Why the failure is FATAL here, when the primitive says it need not be
+///
+/// A DELIBERATE choice, recorded because this is the shape the remaining
+/// conversion shards copy. [`epigraph_db::ScopedRead::commit`]'s own doc says
+/// skipping the finish on a read is safe — sqlx rolls back on drop and a read
+/// has nothing to lose — so a caller could log a commit failure and still answer
+/// 200 with rows it already holds. This propagates instead, and the reason is
+/// that the two are not the same claim. "The finish is optional" is about
+/// SKIPPING it; this helper RAN it and the server said no. Under
+/// `SessionGucMode::Transaction` that is a failed COMMIT of the very transaction
+/// the tenancy predicate was evaluated in, and a handler cannot distinguish "the
+/// rows are fine, only the bookkeeping failed" from "the session was not in the
+/// state I believed it was" without inspecting driver internals. Answering 500
+/// costs a retry; answering 200 on an unverified session is the failure
+/// direction this whole series exists to remove. The cost is bounded and known:
+/// under `SessionGucMode::Session` the commit is a no-op, so this branch is
+/// unreachable in the default configuration.
+///
+/// # What is NOT owed
+///
+/// An ERROR path may drop the read without finishing it. That is the documented
+/// safe case on a read, and every early `?` return in a converted handler relies
+/// on it. Only success paths call this.
+///
+/// # A RULE FOR CONVERTED HANDLERS THAT NOTHING IN THE GATE ENFORCES
+///
+/// Recorded here because this is the one file every remaining conversion shard
+/// reads, and because the property is NEW: before the conversion each read took
+/// its own pooled connection, so an error was contained to that statement.
+///
+/// Under `SessionGucMode::Transaction` the shared [`epigraph_db::ScopedRead`] is
+/// one transaction, and a statement error ABORTS it — every subsequent statement
+/// on that handle then fails, and the abort is silent if the error was swallowed
+/// with `.ok()` or `.unwrap_or_default()`. So a converted handler may swallow an
+/// error only on its LAST statement; anything that reads afterwards must
+/// propagate. A handler that gets this wrong does not fail loudly: it can return
+/// 200 with an empty result set that is indistinguishable from a legitimate
+/// tenancy suppression.
+///
+/// PR-29 has two swallowed-error sites and both are compliant BY POSITION, which
+/// is exactly why the rule is written down rather than left to the next author's
+/// luck: `search.rs::semantic_search`'s `semantic_graph_neighbors(..)
+/// .unwrap_or_default()` has no read after it (its results are already built
+/// from the full-row fetch), and `methods.rs::get_method`'s
+/// `get_evidence_strength(..).ok()` is that handler's final statement.
+#[cfg(feature = "db")]
+pub(crate) async fn finish_scoped_read(
+    read: epigraph_db::ScopedRead<'_>,
+    handler: &'static str,
+) -> Result<(), crate::errors::ApiError> {
+    read.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = handler,
+            "could not finish a viewer-stamped read"
+        );
+        crate::errors::ApiError::InternalError {
+            message: "Failed to finish the scoped read".to_string(),
+        }
+    })
+}
+
 // `crate::metrics` is deliberately NOT imported here. `/metrics` was removed
 // from both router variants in PR-03 and is served only by the internal
 // listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).

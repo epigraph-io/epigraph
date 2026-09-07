@@ -322,7 +322,22 @@ impl MethodRepository {
     }
 
     /// Get method by ID.
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<MethodSearchResult>, sqlx::Error> {
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so a caller that has already acquired a
+    /// viewer-stamped connection can run this statement on it rather than
+    /// reaching for the raw pool. PR-29 widened it for
+    /// `routes/methods.rs::get_method`; `&PgPool` still satisfies the bound, so
+    /// every pre-existing caller compiles unchanged.
+    ///
+    /// It takes no `&Viewer` because `methods` carries no tenancy to filter on —
+    /// see the `EXECUTOR_WITHOUT_VIEWER` entry in
+    /// `epigraph-db/tests/visibility_lint.rs`, which records the measurement.
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<MethodSearchResult>, sqlx::Error> {
         let row: Option<MethodDetailRow> = sqlx::query_as(
             "SELECT id, name, canonical_name, technique_type, measures, resolution, \
              sensitivity, limitations, required_equipment, typical_conditions, \
@@ -330,7 +345,7 @@ impl MethodRepository {
              FROM methods WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(|r| MethodSearchResult {
