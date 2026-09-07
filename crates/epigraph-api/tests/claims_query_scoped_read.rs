@@ -386,8 +386,8 @@ async fn the_methodology_prefetch_narrows_without_dropping_the_viewers_own_claim
 }
 
 /// THE EVIDENCE-TYPE PREFETCH — `ClaimRepository::claim_ids_by_evidence_type`,
-/// the second and structurally different one: it selects `e.claim_id` FROM
-/// `evidence`, so the row it filters is not the row it returns.
+/// the second and structurally different one: the row it filters is not the row
+/// it returns.
 ///
 /// That asymmetry is safe here only because the application is an intersection
 /// (see the handler's doc comment) — and, independently, because migration 070's
