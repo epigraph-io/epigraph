@@ -73,7 +73,9 @@ pub const MAX_CANDIDATE_POOL: u32 = 1000;
 /// would have authored a connection-taking form that neither connection-shape
 /// lint in `epigraph-db/tests/visibility_lint.rs` can see, because their
 /// `repos_dir()` is a non-recursive `read_dir` over `epigraph-db/src/repos`.
-/// The remaining callers are [`run_diverse_pipeline`] and MCP `recall.rs`.
+/// The remaining callers, enumerated rather than gestured at: [`run_diverse_pipeline`]
+/// — which is how MCP `recall.rs` reaches this wrapper, transitively; it does
+/// not call it directly — and `epigraph-engine/tests/diverse_retrieval_integration.rs`.
 pub async fn find_similar_themes_at_dim(
     pool: &PgPool,
     query_pgvec: &str,
@@ -90,6 +92,21 @@ pub async fn find_similar_themes_at_dim(
 ///
 /// Thin async wrapper over [`ClaimThemeRepository::claims_in_themes_at_dim`].
 /// See the repo method for column-interpolation safety notes.
+///
+/// # Callers: NONE, as of PR-29
+///
+/// Stated because a `pub` function with no caller is invisible to `dead_code`
+/// and the next reader would otherwise have to grep for it. Its one real caller
+/// was the REST `/api/v1/search/semantic?diverse=true` route, which PR-29 moved
+/// onto a viewer-stamped connection calling
+/// `ClaimThemeRepository::claims_in_themes_at_dim_since` directly (see
+/// [`find_similar_themes_at_dim`] for why the route bypasses these wrappers
+/// rather than widening them). [`run_diverse_pipeline`] calls the `_since`
+/// sibling, not this one; the only remaining mentions of this name in the
+/// workspace are comments.
+///
+/// Retained rather than removed: deleting a `pub` engine API is a decision for
+/// a shard that owns this crate's surface, not for a route conversion.
 pub async fn candidates_in_themes_at_dim(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,

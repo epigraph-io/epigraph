@@ -50,8 +50,18 @@ use sqlx::Row;
 // `centroid_dim` is validated against `1536 | 3072` at the request boundary
 // below before either call runs, so it is unreachable.
 //
-// The wrappers are NOT deleted: `run_diverse_pipeline` and MCP
-// `recall_with_context` still call them.
+// NEITHER WRAPPER IS DELETED, but they are no longer symmetrical and saying
+// otherwise would be a false claim about what this diff leaves behind:
+//
+// - `find_similar_themes_at_dim` KEEPS callers — `run_diverse_pipeline` (which
+//   is how MCP `recall_with_context` reaches it; MCP does not call the wrapper
+//   directly) and `epigraph-engine/tests/diverse_retrieval_integration.rs`.
+// - `candidates_in_themes_at_dim` is left with NO caller anywhere in the
+//   workspace, tests included, by this change. `run_diverse_pipeline` calls the
+//   `_since` sibling, and the only remaining mentions of the name are comments.
+//   It is retained rather than removed because deleting a `pub` engine API is
+//   not a conversion shard's call; recorded here so the next shard finds it
+//   already measured instead of re-deriving it.
 #[cfg(feature = "db")]
 use epigraph_engine::diverse_retrieval::{DEFAULT_CANDIDATE_POOL, MAX_CANDIDATE_POOL};
 
@@ -567,14 +577,31 @@ pub async fn semantic_search(
         // above the branch is the only shape that holds for all three request
         // shapes.
         //
-        // THE COST, STATED: the `frac_3072` auto-detect below runs BEFORE the
-        // outbound embedding round trip, and the remaining four reads run after
-        // it, so this connection is held across that network call against a
-        // request pool of 8. That is a real footprint cost and it is recorded
-        // rather than left implicit. It is bounded — at most six statements on
-        // one handle, no per-node loop, no unbounded N — so it is not the
-        // walk-shaped case `F-PR26-lineage-holds-one-connection-for-n-round-trips`
-        // owns, and this shard does NOT discharge that finding.
+        // THE COST, STATED, AND IT DIFFERS BY REQUEST SHAPE — the earlier
+        // wording said `frac_3072` runs before the embedding call full stop,
+        // which is true only of `diverse=true`:
+        //
+        // - `diverse=true`: the `frac_3072` auto-detect runs on this handle
+        //   BEFORE the outbound embedding round trip and the remaining reads
+        //   after it, so the hoist costs nothing that path would not pay anyway.
+        // - `diverse=false`, THE DEFAULT AND MORE COMMON SHAPE: no statement at
+        //   all runs before `generate_query_embedding` in the flat tail, so the
+        //   handle is held idle across that network call. That is an
+        //   unconditional cost accepted for the fall-through property above, not
+        //   one forced by this path; `voids.rs::embedding_density` shows the
+        //   acquire-after-embed alternative, which is not available here without
+        //   splitting the acquire the fall-through requires be single.
+        //
+        // The pool it is held against is the API request pool, whose size is
+        // `epigraph_db::ScopedPoolOptions::default()` — cited rather than
+        // transcribed so a sizing change invalidates the citation instead of
+        // silently invalidating this comment. (An earlier revision wrote "8",
+        // which is the background JOB pool; see `bin/server.rs`'s connection
+        // budget.) Bounded regardless: at most six statements on one handle, no
+        // per-node loop, no unbounded N. `detect_voids` in `routes/voids.rs` is
+        // the shape in this shard that is NOT bounded; its own doc says so.
+        // This shard does NOT discharge
+        // `F-PR26-lineage-holds-one-connection-for-n-round-trips`.
         //
         // The validation returns above are deliberately NOT covered: they answer
         // without touching the database, and hoisting the acquire over them
@@ -750,7 +777,13 @@ pub async fn semantic_search(
                 // spliced, and that is safe by derivation rather than by
                 // oversight. It is bounded by `WHERE c.id = ANY($2)` over
                 // `selected_claim_ids`, every element of which came out of
-                // `candidates_in_themes_at_dim` — which IS viewer-filtered. A
+                // `ClaimThemeRepository::claims_in_themes_at_dim_since` —
+                // which IS viewer-filtered, splicing `{VISIBILITY:c}` onto the
+                // joined `claims`. (PR-29 re-pointed this call off the
+                // `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`
+                // wrapper it used to name here; the wrapper's whole body was
+                // that same call with `since = None`, so the derivation is
+                // unchanged — only the callee's name is.) A
                 // second predicate here would be redundant. Do not "harden" it
                 // by adding a marker without also re-checking that derivation:
                 // if the source of `selected_claim_ids` ever changes, this

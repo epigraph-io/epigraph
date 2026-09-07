@@ -838,8 +838,13 @@ impl ClaimRepository {
     ///
     /// # Why this moved out of `routes/search.rs`
     ///
-    /// `semantic_search` destructures a `ViewerExtractor` and then spent it on
-    /// exactly one of its four statements (`candidates_in_themes_at_dim`). This
+    /// AS MEASURED AT PR-07: `semantic_search` destructured a `ViewerExtractor`
+    /// and then spent it on exactly one of its four statements — the theme
+    /// candidate pull, then reached through the engine wrapper
+    /// `candidates_in_themes_at_dim` and since PR-29 called directly as
+    /// `ClaimThemeRepository::claims_in_themes_at_dim_since`. (That handler now
+    /// runs six statements, all viewer-stamped; the count and the callee name
+    /// are both restated here rather than left to read as current.) This
     /// one — which returns `claims.content` for the whole corpus ranked against
     /// a caller-supplied probe vector — ran unfiltered, with no
     /// `check_content_access` pass behind it either.

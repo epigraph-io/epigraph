@@ -314,10 +314,16 @@ impl ClaimThemeRepository {
     /// REST passes `false` to match its historical behaviour.
     ///
     /// Retained at its original arity as a delegating wrapper over
-    /// [`Self::claims_in_themes_at_dim_since`], so the REST
-    /// `/api/v1/search/semantic?diverse=true` route (which reaches this
-    /// through `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`)
-    /// keeps the call it already has.
+    /// [`Self::claims_in_themes_at_dim_since`].
+    ///
+    /// The rationale that arity was retained FOR no longer applies, and saying
+    /// so is cheaper than letting the next reader re-derive it: the REST
+    /// `/api/v1/search/semantic?diverse=true` route used to reach this through
+    /// `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`, and
+    /// PR-29 re-pointed it at [`Self::claims_in_themes_at_dim_since`] directly
+    /// on a viewer-stamped connection. This method is still called — by
+    /// [`Self::claims_in_themes`], the legacy 1536d convenience above — so it is
+    /// not orphaned; only the REST justification is spent.
     pub async fn claims_in_themes_at_dim(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
