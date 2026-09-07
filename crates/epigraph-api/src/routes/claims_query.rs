@@ -570,11 +570,33 @@ pub async fn list_claims_query(
 /// List and filter claims from the in-memory claim store (no database)
 ///
 /// `GET /api/v1/claims`
+///
+/// # The same authentication precondition as the `db` arm
+///
+/// This arm takes a [`ViewerExtractor`](crate::middleware::bearer::ViewerExtractor)
+/// for the same reason `routes/events.rs::list_events` does, and the precedent
+/// there is the authority: `ViewerExtractor` is defined under BOTH features —
+/// over `epigraph_db::Viewer` under `db`, over `NoDbViewer` under `not(db)`,
+/// with the same rejection branches in the same order — precisely so that the
+/// two builds of one route cannot acquire different authentication
+/// preconditions. `bearer.rs`'s own doc says `NoDbViewer` exists to prevent
+/// exactly that divergence, and `list_events` records a revision that produced
+/// it here once already and had to be reverted.
+///
+/// The extracted value is unused: under `not(db)` it is a unit and there is no
+/// corpus to filter. It is bound anyway so the extractor RUNS, which is the
+/// whole point — an extractor that is not named in the signature does not
+/// execute.
 #[cfg(not(feature = "db"))]
 pub async fn list_claims_query(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ClaimQueryParams>,
 ) -> Result<Json<ClaimListResponse>, ApiError> {
+    // Bound, not consumed: see this function's doc comment. Under `not(db)` the
+    // viewer is a unit and nothing reads it.
+    let _ = &viewer;
+
     // ---- Validate and normalize pagination ----
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
@@ -799,9 +821,27 @@ mod tests {
     use tower::ServiceExt;
 
     /// Create a test router with the claims query endpoint
+    ///
+    /// The `Extension` layer is not decoration. `list_claims_query` now takes a
+    /// `ViewerExtractor` under `not(db)` as well as under `db`, and that
+    /// extractor rejects a request carrying no `AuthContext`. In production the
+    /// bearer middleware installs one; a bare test router carries none, so every
+    /// request below would answer 401 before reaching the handler and all ~20
+    /// validation assertions would be vacuous. This mirrors the fixture
+    /// `crates/epigraph-cli/tests/pr_hierarchical_ingest_test.rs::app` uses for
+    /// the same reason.
     fn test_router(state: AppState) -> Router {
+        let principal = uuid::Uuid::new_v4();
         Router::new()
             .route("/api/v1/claims", get(list_claims_query))
+            .layer(axum::Extension(crate::middleware::bearer::AuthContext {
+                client_id: principal,
+                agent_id: Some(principal),
+                owner_id: Some(principal),
+                client_type: crate::middleware::bearer::ClientType::Service,
+                scopes: vec!["claims:read".to_string()],
+                jti: uuid::Uuid::new_v4(),
+            }))
             .with_state(state)
     }
 
