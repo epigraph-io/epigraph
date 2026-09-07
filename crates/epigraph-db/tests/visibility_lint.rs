@@ -495,7 +495,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] inspects only
 /// functions whose PARAMETER LIST mentions `Viewer`. A `*_conn` sibling that
 /// simply omits the `Viewer` parameter is therefore invisible to it — and PR-23
-/// made `*_conn` siblings the standard conversion shape for the 402 sites
+/// made `*_conn` siblings the standard conversion shape for the 391 sites
 /// `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this rule, a
 /// sibling written without a viewer would pass BOTH controls: this file would
 /// not inspect it, and the ratchet would count its call site as converted
@@ -579,12 +579,40 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// with the reason. Asserted as an exact set, in both directions, by
 /// [`every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt`].
 ///
-/// EMPTY, and that is the measured state rather than an aspiration: all 188
-/// functions PR-27 widened already took a `&Viewer` before it widened them, and
-/// it added no new function. Keyed on `(file, fn)` the same way
-/// [`EXPECTED_EXEMPTIONS`] and [`CONN_WITHOUT_VIEWER`] are, so the first entry is
-/// a visible diff naming the function.
-const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[];
+/// It was EMPTY through PR-27, and that was the measured state rather than an
+/// aspiration: all 188 functions PR-27 widened already took a `&Viewer` before
+/// it widened them, and it added no new function. PR-29 added the first two
+/// entries, because conversion shard 3 is the first shard whose call sites
+/// bottom out in reads of tables that have no tenancy at all — PR-27 re-measured
+/// only the functions that took BOTH a pool and a `&Viewer`, so a viewer-less
+/// read was outside its scope by construction rather than by judgement.
+///
+/// Keyed on `(file, fn)` the same way [`EXPECTED_EXEMPTIONS`] and
+/// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
+/// function.
+const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    (
+        "method.rs",
+        "get",
+        "Reads `methods` by primary key. `methods` is global reference data: measured at migration \
+         head 91 it has neither a `visibility` nor an `owner_group_id` column, and row-level \
+         security is off on it (`pg_class.relrowsecurity` and `relforcerowsecurity` are both \
+         false, against `claims` which is true/true). There is therefore no column a `Viewer` \
+         could be spliced against, and no RLS policy for a session GUC to select. PR-29 widened \
+         the executor only; the SQL is unchanged.",
+    ),
+    (
+        "claim_theme.rs",
+        "find_similar_themes_at_dim",
+        "Reads `claim_themes` centroids to rank themes by vector similarity. `claim_themes` is \
+         derived corpus-level clustering output with the same posture as `methods`: measured at \
+         migration head 91 it carries neither a `visibility` nor an `owner_group_id` column, and \
+         row-level security is off on it (`relrowsecurity` and `relforcerowsecurity` both false). \
+         The claim-level read that follows theme selection is \
+         `ClaimThemeRepository::claims_in_themes_at_dim_since`, which DOES take a `&Viewer` and \
+         splices it. PR-29 widened the executor only; the SQL is unchanged.",
+    ),
+];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
 /// none — the same rule [`every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt`]

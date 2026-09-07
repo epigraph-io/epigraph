@@ -55,6 +55,32 @@ pub struct DensityQuery {
 /// fail-open about; the only gate was the router's `bearer_auth_middleware`.
 /// The `ViewerExtractor` is therefore a deliberate behaviour change: a bearer
 /// token that resolves to no `agents.id` now 401s here.
+///
+/// # Tenancy: ONE viewer-stamped connection for the whole request
+///
+/// PR-29 is conversion shard 3 against
+/// `D-PR17-request-path-never-stamps-session-gucs`. It moves this handler's
+/// single raw-pool read onto [`AppState::read_as`]. `read_as` and not
+/// `acquire_as`: the latter hard-refuses `EPIGRAPH_SESSION_GUC_MODE=transaction`,
+/// the pooler fallback `bin/server.rs` advertises to operators.
+///
+/// The read is `ClaimRepository::semantic_search_flat`, which PR-27 had already
+/// widened to `<'e, E: sqlx::PgExecutor<'e>>`, so this file authors NO new repo
+/// form and changes NO SQL. The reborrow is explicit at the call site on
+/// purpose: deref coercion does not fire against a generic `E`, so `&mut read`
+/// would infer `E = &mut ScopedRead<'_>` and fail the bound.
+///
+/// # Footprint: one connection across N embed round trips
+///
+/// The acquire is hoisted above the concept loop so that every concept in one
+/// request is answered from the same stamped session — a request that returned
+/// `void` for one concept and `covered` for another because the two sampled
+/// different sessions would be describing two different corpora. The cost is
+/// that the connection is held across `request.concepts.len()` outbound
+/// embedding calls, and `concepts` is caller-supplied and unbounded. That is a
+/// real footprint cost and it is recorded here rather than left implicit; it is
+/// the same shape `F-PR26-lineage-holds-one-connection-for-n-round-trips`
+/// names, and this shard does NOT discharge that finding.
 #[cfg(feature = "db")]
 pub async fn detect_voids(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -72,6 +98,23 @@ pub async fn detect_voids(
     let mut sparse = Vec::new();
     let mut covered = Vec::new();
 
+    // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/claims_query.rs`).
+    // `read_as`'s refusal reason is internal design prose aimed at whoever
+    // mis-built the `AppState`; `errors.rs` serialises
+    // `ApiError::InternalError { message }` verbatim into the response body, so
+    // it is logged in full and answered with an opaque message.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "detect_voids",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     for concept in &request.concepts {
         let embedding = embedder
             .generate(concept)
@@ -85,7 +128,7 @@ pub async fn detect_voids(
         // cosine similarity is bounded below by -1, so the floor excludes
         // nothing, and `ORDER BY similarity DESC` is `ORDER BY distance ASC`.
         let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
-            &state.db_pool,
+            &mut *read,
             &viewer,
             &format_embedding(&embedding),
             NO_SIMILARITY_FLOOR,
@@ -123,6 +166,8 @@ pub async fn detect_voids(
         }
     }
 
+    crate::routes::finish_scoped_read(read, "detect_voids").await?;
+
     Ok(Json(serde_json::json!({
         "total_concepts": request.concepts.len(),
         "void_concepts": voids,
@@ -142,6 +187,22 @@ pub async fn detect_voids(
 /// nearest-claim 200-character excerpt as [`detect_voids`]. Both are now
 /// viewer-scoped, so `claim_count` is the reader's count. Same deliberate
 /// behaviour change as [`detect_voids`]: this handler took no auth argument.
+///
+/// # Tenancy: ONE viewer-stamped connection for the whole request
+///
+/// PR-29 moves both of this handler's raw-pool reads onto
+/// [`AppState::read_as`], acquired once below. `claim_count` and `nearest_claim`
+/// are two statements describing one neighbourhood; running them on one stamped
+/// handle is what makes the pair internally consistent, and under
+/// `SessionGucMode::Transaction` they are also one transaction. Both callees
+/// (`ClaimRepository::embedding_density_stats`, `::semantic_search_flat`) were
+/// already generic over [`sqlx::PgExecutor`] from PR-27, so no new repo form and
+/// no SQL change.
+///
+/// The acquire sits AFTER the outbound embedding call rather than at the top of
+/// the handler, so the connection is not held across the network round trip.
+/// This handler embeds exactly one string, unlike [`detect_voids`], so the
+/// hoist that handler needs is not needed here.
 #[cfg(feature = "db")]
 pub async fn embedding_density(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -162,9 +223,23 @@ pub async fn embedding_density(
                 message: format!("Failed to embed query: {e}"),
             })?;
 
+    // See the acquire in `detect_voids` for why the reason is logged rather than
+    // rendered into the response body.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "embedding_density",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Count visible claims within radius and get stats
     let (claim_count, avg_similarity) = epigraph_db::ClaimRepository::embedding_density_stats(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         &format_embedding(&embedding),
         radius,
@@ -176,7 +251,7 @@ pub async fn embedding_density(
 
     // Get nearest visible claim
     let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         &format_embedding(&embedding),
         NO_SIMILARITY_FLOOR,
@@ -191,6 +266,8 @@ pub async fn embedding_density(
         message: format!("Failed to find nearest: {e}"),
     })?;
     let nearest = nearest.first();
+
+    crate::routes::finish_scoped_read(read, "embedding_density").await?;
 
     Ok(Json(serde_json::json!({
         "query": params.query,
