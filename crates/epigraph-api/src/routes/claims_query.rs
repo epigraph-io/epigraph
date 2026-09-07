@@ -188,6 +188,24 @@ pub struct ClaimListResponse {
 /// client gets an opaque message. A `format!`-ed `DbError` here would render its
 /// `#[source]` driver text into the response body, since `errors.rs` serialises
 /// `ApiError::InternalError { message }` verbatim.
+///
+/// # Why the failure is FATAL here, when the primitive says it need not be
+///
+/// A DELIBERATE choice, recorded because this shard is the template the
+/// remaining conversion shards copy. [`epigraph_db::ScopedRead::commit`]'s own
+/// doc says skipping the finish on a read is safe — sqlx rolls back on drop and
+/// a read has nothing to lose — so a caller could log a commit failure and
+/// still answer 200 with rows it already holds. This handler propagates instead,
+/// and the reason is that the two are not the same claim. "The finish is
+/// optional" is about SKIPPING it; this helper RAN it and the server said no.
+/// Under `SessionGucMode::Transaction` that is a failed COMMIT of the very
+/// transaction the tenancy predicate was evaluated in, and a handler cannot
+/// distinguish "the rows are fine, only the bookkeeping failed" from "the
+/// session was not in the state I believed it was" without inspecting driver
+/// internals. Answering 500 costs a retry; answering 200 on an unverified
+/// session is the failure direction this whole series exists to remove. The
+/// cost is bounded and known: under `SessionGucMode::Session` the commit is a
+/// no-op, so this branch is unreachable in the default configuration.
 #[cfg(feature = "db")]
 async fn finish_scoped_read(read: epigraph_db::ScopedRead<'_>) -> Result<(), ApiError> {
     read.commit().await.map_err(|e| {
@@ -349,6 +367,17 @@ pub async fn list_claims_query(
     // Acquired HERE and not at the top of the function: the seven validation
     // early-returns above answer without touching the database, and hoisting the
     // acquire over them would hold a pooled connection across every 400.
+    //
+    // READ THAT AS AN OBSERVATION, NOT AN ENFORCED INVARIANT. Nothing in the
+    // gate catches a hoist: this file's only unit-test module is gated
+    // `#[cfg(all(test, not(feature = "db")))]` while the crate's `default` is
+    // `["db"]`, so those ~20 validation tests never compile in the shipping
+    // configuration, and neither scoped-read test file drives an invalid
+    // parameter and asserts a 400. A future author who hoists the acquire — a
+    // natural-looking simplification, since it removes the two-return-path
+    // awkwardness `finish_scoped_read` exists to absorb — gets a green run. The
+    // placement is correct today and is a connection-footprint choice, not a
+    // correctness one.
     //
     // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/lineage.rs::get_lineage`).
     // `read_as`'s refusal reason is a paragraph of internal design prose aimed at
