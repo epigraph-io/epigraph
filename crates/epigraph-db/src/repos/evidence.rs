@@ -167,9 +167,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: EvidenceId,
     ) -> Result<Option<Evidence>, DbError> {
@@ -189,7 +189,7 @@ impl EvidenceRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -238,9 +238,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Vec<Evidence>, DbError> {
@@ -263,7 +263,7 @@ impl EvidenceRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         let mut evidence_list = Vec::with_capacity(rows.len());
@@ -339,9 +339,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn provided_for_claim_as_of(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn provided_for_claim_as_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         as_of: chrono::DateTime<chrono::Utc>,
@@ -364,7 +364,7 @@ impl EvidenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Fetch the flattened detail projection for a single evidence row.
@@ -404,9 +404,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn detail_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn detail_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<EvidenceDetailRow>, DbError> {
@@ -422,7 +422,7 @@ impl EvidenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_optional(pool).await?)
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// Evidence linked to `claim_id` by an edge with the given `relationship`.
@@ -436,9 +436,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn by_relationship_for_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn by_relationship_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         relationship: &str,
@@ -465,7 +465,7 @@ impl EvidenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Delete evidence by ID
@@ -478,9 +478,9 @@ impl EvidenceRepository {
     /// Takes a viewer it does not yet use: WRITE path, PR-16 owns the
     /// write-side predicate. The parameter exists so the hook is already at
     /// every call site.
-    #[instrument(skip(pool, _viewer))]
-    pub async fn delete(
-        pool: &PgPool,
+    #[instrument(skip(executor, _viewer))]
+    pub async fn delete<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         _viewer: &crate::visibility::Viewer,
         id: EvidenceId,
     ) -> Result<bool, DbError> {
@@ -498,7 +498,7 @@ impl EvidenceRepository {
             "#,
             uuid
         )
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -552,9 +552,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
@@ -587,7 +587,7 @@ impl EvidenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }

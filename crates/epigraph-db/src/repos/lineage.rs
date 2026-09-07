@@ -588,9 +588,9 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn detect_cycles(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn detect_cycles<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
@@ -630,7 +630,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let result: CycleResult = q.fetch_one(pool).await?;
+        let result: CycleResult = q.fetch_one(executor).await?;
 
         Ok(result.has_cycle.unwrap_or(false))
     }
@@ -649,9 +649,9 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_depth(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_depth<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<i32, DbError> {
@@ -691,7 +691,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let result: DepthResult = q.fetch_one(pool).await?;
+        let result: DepthResult = q.fetch_one(executor).await?;
 
         Ok(result.max_depth.unwrap_or(0))
     }
@@ -711,9 +711,9 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_ancestor_ids(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_ancestor_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
@@ -761,7 +761,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<IdDepthRow> = q.fetch_all(pool).await?;
+        let rows: Vec<IdDepthRow> = q.fetch_all(executor).await?;
 
         // Sort by depth descending (ancestors first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
@@ -1100,9 +1100,9 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_descendant_ids(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_descendant_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
@@ -1150,7 +1150,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<IdDepthRow> = q.fetch_all(pool).await?;
+        let rows: Vec<IdDepthRow> = q.fetch_all(executor).await?;
 
         // Sort by depth ascending (root first)
         let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
@@ -1177,9 +1177,9 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_lca(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_lca<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_a: Uuid,
         claim_b: Uuid,
@@ -1256,7 +1256,7 @@ impl LineageRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<LcaRow> = q.fetch_optional(pool).await?;
+        let row: Option<LcaRow> = q.fetch_optional(executor).await?;
 
         Ok(row.map(|r| LcaResult {
             ancestor_id: r.ancestor_id,

@@ -117,9 +117,9 @@ impl ExperimentRepository {
     }
 
     /// Count completed experiments for a hypothesis that have analysis nodes.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count_completed_with_analysis(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_completed_with_analysis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         hypothesis_id: Uuid,
     ) -> Result<i64, DbError> {
@@ -142,7 +142,7 @@ impl ExperimentRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (i64,) = q.fetch_one(pool).await?;
+        let row: (i64,) = q.fetch_one(executor).await?;
         Ok(row.0)
     }
 }

@@ -285,9 +285,9 @@ impl CommunityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<CommunityRow>, DbError> {
@@ -304,7 +304,7 @@ impl CommunityRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<CommunityRow> = q.fetch_optional(pool).await?;
+        let row: Option<CommunityRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -313,9 +313,9 @@ impl CommunityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
@@ -336,7 +336,7 @@ impl CommunityRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<CommunityRow> = q.fetch_all(pool).await?;
+        let rows: Vec<CommunityRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -510,9 +510,9 @@ impl CommunityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_members(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_members<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         community_id: Uuid,
     ) -> Result<Vec<PerspectiveRow>, DbError> {
@@ -532,7 +532,7 @@ impl CommunityRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<PerspectiveRow> = q.fetch_all(pool).await?;
+        let rows: Vec<PerspectiveRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }

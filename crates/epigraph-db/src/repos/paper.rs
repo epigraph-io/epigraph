@@ -88,9 +88,9 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn has_processed_by_edge(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn has_processed_by_edge<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
         pipeline_version: &str,
@@ -116,7 +116,7 @@ impl PaperRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row.is_some())
     }
@@ -138,9 +138,9 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count_asserted_claims(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_asserted_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
     ) -> Result<i64, DbError> {
@@ -162,7 +162,7 @@ impl PaperRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(row.count)
     }
@@ -180,9 +180,9 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count_claims_by_doi_label(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_claims_by_doi_label<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         doi: &str,
     ) -> Result<i64, DbError> {
@@ -202,7 +202,7 @@ impl PaperRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(row.count)
     }
@@ -212,9 +212,9 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_authors(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_authors<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
     ) -> Result<Vec<(Uuid, Option<String>)>, DbError> {
@@ -238,7 +238,7 @@ impl PaperRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
     }
@@ -252,9 +252,9 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_asserted_claims(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_asserted_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
         limit: i64,
@@ -287,7 +287,7 @@ impl PaperRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         rows.into_iter()
             .map(|r| {

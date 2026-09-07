@@ -153,10 +153,10 @@ impl RecallEventRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer))]
+    #[instrument(skip(executor, viewer))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn list(
-        pool: &PgPool,
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Option<Uuid>,
         claim_id: Option<Uuid>,
@@ -188,7 +188,7 @@ impl RecallEventRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows

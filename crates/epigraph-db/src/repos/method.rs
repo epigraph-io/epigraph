@@ -407,8 +407,8 @@ impl MethodRepository {
     }
 
     /// Get average DS belief strength for claims linked to a method.
-    pub async fn get_evidence_strength(
-        pool: &PgPool,
+    pub async fn get_evidence_strength<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         method_id: Uuid,
     ) -> Result<MethodEvidenceStrength, sqlx::Error> {
@@ -433,7 +433,7 @@ impl MethodRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<MethodEvidenceStrengthRow> = q.fetch_optional(pool).await?;
+        let row: Option<MethodEvidenceStrengthRow> = q.fetch_optional(executor).await?;
 
         Ok(row.map_or(
             MethodEvidenceStrength {
@@ -450,8 +450,8 @@ impl MethodRepository {
     }
 
     /// Get source papers for a method.
-    pub async fn get_source_papers(
-        pool: &PgPool,
+    pub async fn get_source_papers<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         method_id: Uuid,
     ) -> Result<Vec<MethodSourcePaper>, sqlx::Error> {
@@ -471,7 +471,7 @@ impl MethodRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<MethodSourcePaperRow> = q.fetch_all(pool).await?;
+        let rows: Vec<MethodSourcePaperRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()
@@ -486,8 +486,8 @@ impl MethodRepository {
     }
 
     /// Get usage examples for a method from analyses.
-    pub async fn get_usage_examples(
-        pool: &PgPool,
+    pub async fn get_usage_examples<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         method_id: Uuid,
         limit: i64,
@@ -514,7 +514,7 @@ impl MethodRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<MethodUsageRow> = q.fetch_all(pool).await?;
+        let rows: Vec<MethodUsageRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()

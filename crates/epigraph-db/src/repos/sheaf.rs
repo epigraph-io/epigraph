@@ -2,7 +2,6 @@
 //!
 //! Joins claims with their edge neighbors to compute sheaf sections.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Raw row: a claim and one of its neighbors' BetP values.
@@ -44,8 +43,8 @@ impl SheafRepository {
     /// Returns pairs of (claim, neighbor) where the edge is epistemic
     /// (supports, refutes, contradicts, corroborates, elaborates, specializes, generalizes,
     /// frame_validates).
-    pub async fn get_claim_neighbor_betp_pairs(
-        pool: &PgPool,
+    pub async fn get_claim_neighbor_betp_pairs<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         _frame_id: Option<Uuid>,
         limit: i64,
@@ -86,14 +85,14 @@ impl SheafRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await.map_err(crate::DbError::from)?;
+        let rows = q.fetch_all(executor).await.map_err(crate::DbError::from)?;
 
         Ok(rows)
     }
 
     /// Fetch all claim-to-claim epistemic edges with both endpoints' BetP.
-    pub async fn get_epistemic_edge_pairs(
-        pool: &PgPool,
+    pub async fn get_epistemic_edge_pairs<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         _frame_id: Option<Uuid>,
     ) -> Result<Vec<EpistemicEdgePairRow>, crate::DbError> {
@@ -131,7 +130,7 @@ impl SheafRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await.map_err(crate::DbError::from)?;
+        let rows = q.fetch_all(executor).await.map_err(crate::DbError::from)?;
 
         Ok(rows)
     }

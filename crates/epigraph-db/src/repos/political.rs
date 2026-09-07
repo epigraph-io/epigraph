@@ -257,9 +257,9 @@ impl PoliticalRepository {
 
     /// Get all claims attributed to an agent for profile building.
     /// Traverses both ATTRIBUTED_TO and ORIGINATED_BY edges.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_agent_profile_claims(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_agent_profile_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
     ) -> Result<Vec<AgentClaimProfileRow>, DbError> {
@@ -286,15 +286,15 @@ impl PoliticalRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await?;
+        let rows = vq.fetch_all(executor).await?;
 
         Ok(rows)
     }
 
     /// Get evidence type distribution for an agent's claims
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_agent_evidence_distribution(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_agent_evidence_distribution<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
     ) -> Result<Vec<EvidenceTypeCount>, DbError> {
@@ -317,7 +317,7 @@ impl PoliticalRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await?;
+        let rows = vq.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -326,9 +326,9 @@ impl PoliticalRepository {
 
     /// Get claims for an agent on a given topic, ordered by date.
     /// Uses semantic similarity if an embedding is provided.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_agent_position_timeline(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_agent_position_timeline<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         since: Option<chrono::DateTime<chrono::Utc>>,
@@ -364,7 +364,7 @@ impl PoliticalRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await?;
+        let rows = vq.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -372,9 +372,9 @@ impl PoliticalRepository {
     // ── Talking Point Genealogy (Item 8) ─────────────────────────────────
 
     /// Get the propagation tree for a claim — walk ORIGINATED_BY and AMPLIFIED_BY edges.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_claim_genealogy(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_claim_genealogy<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<PropagationStepRow>, DbError> {
@@ -401,15 +401,15 @@ impl PoliticalRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows = vq.fetch_all(pool).await?;
+        let rows = vq.fetch_all(executor).await?;
 
         Ok(rows)
     }
 
     /// Get claims originated by an agent that were amplified by N+ others.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_originated_claims_with_amplification(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_originated_claims_with_amplification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         min_amplifiers: i64,
@@ -444,7 +444,7 @@ impl PoliticalRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows: Vec<(Uuid, String, i64)> = vq.fetch_all(pool).await?;
+        let rows: Vec<(Uuid, String, i64)> = vq.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -453,9 +453,9 @@ impl PoliticalRepository {
 
     /// Get claims with quantitative assertions and their counter-evidence.
     /// Looks for claims with inflation_factor in properties.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_agent_inflation_claims(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_agent_inflation_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
     ) -> Result<Vec<(Uuid, String, f64, serde_json::Value)>, DbError> {
@@ -475,7 +475,7 @@ impl PoliticalRepository {
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
-        let rows: Vec<(Uuid, String, f64, serde_json::Value)> = vq.fetch_all(pool).await?;
+        let rows: Vec<(Uuid, String, f64, serde_json::Value)> = vq.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -483,10 +483,10 @@ impl PoliticalRepository {
     // ── Techniques on a claim ────────────────────────────────────────────
 
     /// Get propaganda techniques used by a claim via USES_TECHNIQUE edges.
-    #[instrument(skip(pool, viewer))]
+    #[instrument(skip(executor, viewer))]
     #[allow(clippy::type_complexity)]
-    pub async fn get_claim_techniques(
-        pool: &PgPool,
+    pub async fn get_claim_techniques<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<(PropagandaTechniqueRow, serde_json::Value)>, DbError> {
@@ -522,7 +522,7 @@ impl PoliticalRepository {
             if let Some(g) = viewer.group_bind() {
                 vq = vq.bind(g);
             }
-            vq.fetch_all(pool).await?
+            vq.fetch_all(executor).await?
         };
 
         Ok(rows

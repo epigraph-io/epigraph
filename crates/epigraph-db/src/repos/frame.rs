@@ -86,9 +86,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<FrameRow>, DbError> {
@@ -105,7 +105,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<FrameRow> = q.fetch_optional(pool).await?;
+        let row: Option<FrameRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -114,9 +114,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_name(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_by_name<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         name: &str,
     ) -> Result<Option<FrameRow>, DbError> {
@@ -133,7 +133,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<FrameRow> = q.fetch_optional(pool).await?;
+        let row: Option<FrameRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -142,9 +142,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
@@ -163,7 +163,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<FrameRow> = q.fetch_all(pool).await?;
+        let rows: Vec<FrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -174,9 +174,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_claims_in_frame(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_claims_in_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
     ) -> Result<Vec<ClaimFrameRow>, DbError> {
@@ -193,7 +193,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ClaimFrameRow> = q.fetch_all(pool).await?;
+        let rows: Vec<ClaimFrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -272,9 +272,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_children(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_children<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
     ) -> Result<Vec<FrameRow>, DbError> {
@@ -292,7 +292,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<FrameRow> = q.fetch_all(pool).await?;
+        let rows: Vec<FrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -304,9 +304,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_ancestry(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_ancestry<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
     ) -> Result<Vec<FrameRow>, DbError> {
@@ -335,7 +335,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<FrameRow> = q.fetch_all(pool).await?;
+        let rows: Vec<FrameRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -346,9 +346,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_claim_assignment(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_claim_assignment<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         frame_id: Uuid,
@@ -368,7 +368,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<ClaimFrameRow> = q.fetch_optional(pool).await?;
+        let row: Option<ClaimFrameRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -377,8 +377,11 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn count(pool: &PgPool, viewer: &crate::visibility::Viewer) -> Result<i64, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<i64, DbError> {
         let sql = viewer.splice(
             "SELECT COUNT(*) FROM frames WHERE true /* {VISIBILITY:frames} */",
             1,
@@ -387,7 +390,7 @@ impl FrameRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (i64,) = q.fetch_one(pool).await?;
+        let row: (i64,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }

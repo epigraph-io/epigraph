@@ -181,8 +181,8 @@ impl WorkflowRepository {
     }
 
     /// Semantic search for workflows by embedding with hybrid scoring.
-    pub async fn find_by_embedding(
-        pool: &PgPool,
+    pub async fn find_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query_embedding: &[f32],
         min_truth: f64,
@@ -236,7 +236,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<WorkflowRecallRow> = q.fetch_all(pool).await?;
+        let rows: Vec<WorkflowRecallRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()
@@ -254,8 +254,8 @@ impl WorkflowRepository {
     }
 
     /// Text-based workflow search (fallback when embeddings unavailable).
-    pub async fn find_by_text(
-        pool: &PgPool,
+    pub async fn find_by_text<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         query: &str,
         min_truth: f64,
@@ -295,7 +295,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<WorkflowRecallRow> = q.fetch_all(pool).await?;
+        let rows: Vec<WorkflowRecallRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()
@@ -365,8 +365,8 @@ impl WorkflowRepository {
 
     /// Find all descendants of a workflow via `variant_of` or `supersedes` edges
     /// (for cascade deprecation).
-    pub async fn find_descendants(
-        pool: &PgPool,
+    pub async fn find_descendants<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Vec<Uuid>, sqlx::Error> {
@@ -389,7 +389,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid,)> = q.fetch_all(pool).await?;
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
@@ -398,8 +398,8 @@ impl WorkflowRepository {
     ///
     /// Returns `workflow_id` itself if it has no parent (is already a root).
     /// The root is the ancestor with no outgoing `variant_of` or `supersedes` edge.
-    pub async fn find_lineage_root(
-        pool: &PgPool,
+    pub async fn find_lineage_root<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Uuid, sqlx::Error> {
@@ -433,7 +433,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let root: Option<(Uuid,)> = q.fetch_optional(pool).await?;
+        let root: Option<(Uuid,)> = q.fetch_optional(executor).await?;
 
         Ok(root.map(|(id,)| id).unwrap_or(workflow_id))
     }
@@ -446,8 +446,8 @@ impl WorkflowRepository {
     ///
     /// The promotion gate compares a variant against its immediate parent; this
     /// resolves which workflow that is.
-    pub async fn immediate_variant_parent(
-        pool: &PgPool,
+    pub async fn immediate_variant_parent<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Option<Uuid>, sqlx::Error> {
@@ -467,7 +467,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let parent: Option<(Uuid,)> = q.fetch_optional(pool).await?;
+        let parent: Option<(Uuid,)> = q.fetch_optional(executor).await?;
 
         Ok(parent.map(|(id,)| id))
     }

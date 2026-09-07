@@ -81,9 +81,9 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<ContextRow>, DbError> {
@@ -101,7 +101,7 @@ impl ContextRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: Option<ContextRow> = q.fetch_optional(pool).await?;
+        let row: Option<ContextRow> = q.fetch_optional(executor).await?;
 
         Ok(row)
     }
@@ -110,9 +110,9 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
@@ -135,7 +135,7 @@ impl ContextRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ContextRow> = q.fetch_all(pool).await?;
+        let rows: Vec<ContextRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -147,9 +147,9 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_active(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_active<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
     ) -> Result<Vec<ContextRow>, DbError> {
         let sql = viewer.splice(
@@ -168,7 +168,7 @@ impl ContextRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ContextRow> = q.fetch_all(pool).await?;
+        let rows: Vec<ContextRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -180,9 +180,9 @@ impl ContextRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_for_frame(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_for_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         frame_id: Uuid,
     ) -> Result<Vec<ContextRow>, DbError> {
@@ -207,7 +207,7 @@ impl ContextRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<ContextRow> = q.fetch_all(pool).await?;
+        let rows: Vec<ContextRow> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }

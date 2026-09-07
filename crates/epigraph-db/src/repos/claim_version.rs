@@ -44,8 +44,8 @@ impl ClaimVersionRepository {
     }
 
     /// List all versions for a claim, most recent first.
-    pub async fn list_by_claim(
-        pool: &PgPool,
+    pub async fn list_by_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ClaimVersionRow>, DbError> {
@@ -61,7 +61,7 @@ impl ClaimVersionRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
         Ok(rows)
     }
 
@@ -69,8 +69,8 @@ impl ClaimVersionRepository {
     /// The predicate is here even though only an integer leaves the function:
     /// an edit count is a side channel that says "this claim exists and has
     /// been revised N times" for a claim the caller cannot read.
-    pub async fn latest_version_number(
-        pool: &PgPool,
+    pub async fn latest_version_number<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<i32, DbError> {
@@ -83,7 +83,7 @@ impl ClaimVersionRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (i64,) = q.fetch_one(pool).await?;
+        let row: (i64,) = q.fetch_one(executor).await?;
         Ok(row.0 as i32)
     }
 }

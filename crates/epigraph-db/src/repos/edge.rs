@@ -341,9 +341,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_source(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_source<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         source_id: Uuid,
         source_type: &str,
@@ -372,7 +372,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -421,9 +421,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_current_claim_targets(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_current_claim_targets<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         source_id: Uuid,
     ) -> Result<Vec<(Uuid, Uuid, String)>, DbError> {
@@ -461,7 +461,7 @@ impl EdgeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(pool).await?;
+        let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -528,9 +528,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_target(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_target<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         target_id: Uuid,
         target_type: &str,
@@ -559,7 +559,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -582,9 +582,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_by_relationship(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_relationship<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         relationship: &str,
     ) -> Result<Vec<EdgeRow>, DbError> {
@@ -611,7 +611,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -634,9 +634,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_between(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_between<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         source_id: Uuid,
         source_type: &str,
@@ -670,7 +670,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -703,10 +703,10 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
+    #[instrument(skip(executor, viewer))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn list_filtered(
-        pool: &PgPool,
+    pub async fn list_filtered<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         source_id: Option<Uuid>,
         target_id: Option<Uuid>,
@@ -746,7 +746,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -769,9 +769,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn list_all(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_all<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
     ) -> Result<Vec<EdgeRow>, DbError> {
@@ -798,7 +798,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -819,9 +819,9 @@ impl EdgeRepository {
 
     /// Get currently-valid edges for an entity with a specific relationship.
     /// Returns edges where valid_to IS NULL (ongoing or atemporal).
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_current_edges(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_current_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         entity_id: Uuid,
         relationship: &str,
@@ -852,7 +852,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -1003,9 +1003,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count_for_entity(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_for_entity<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         entity_id: Uuid,
         entity_type: &str,
@@ -1034,7 +1034,7 @@ impl EdgeRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.count.unwrap_or(0))
@@ -1060,9 +1060,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_claims_attributed_to(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_claims_attributed_to<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         min_truth: f64,
@@ -1095,7 +1095,7 @@ impl EdgeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows = q.fetch_all(pool).await?;
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -1104,9 +1104,9 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn count_claims_attributed_to(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_claims_attributed_to<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         agent_id: Uuid,
         min_truth: f64,
@@ -1131,7 +1131,7 @@ impl EdgeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let row: (i64,) = q.fetch_one(pool).await?;
+        let row: (i64,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }

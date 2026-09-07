@@ -66,8 +66,8 @@ impl ChallengeRepository {
     /// the surface plan §2.4 / §4.9 #23 flags: it leaks the substance of a claim
     /// the caller may not be able to read. `challenges` carries its own tenancy
     /// columns (migration 062), so the predicate applies to the row directly.
-    pub async fn get(
-        pool: &PgPool,
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<ChallengeRow>, sqlx::Error> {
@@ -81,12 +81,12 @@ impl ChallengeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_optional(pool).await
+        q.fetch_optional(executor).await
     }
 
     /// List all challenges for a given claim.
-    pub async fn list_for_claim(
-        pool: &PgPool,
+    pub async fn list_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<ChallengeRow>, sqlx::Error> {
@@ -102,7 +102,7 @@ impl ChallengeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(pool).await
+        q.fetch_all(executor).await
     }
 
     /// Update challenge state (e.g. pending -> accepted/rejected).
@@ -163,8 +163,8 @@ impl ChallengeRepository {
     /// Query gap-originated challenges with optional filters.
     /// The change inventory expected this to join `claims`; it does not — the
     /// query reads `challenges` alone. One alias, one marker.
-    pub async fn get_gap_challenges(
-        pool: &PgPool,
+    pub async fn get_gap_challenges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         gap_type: Option<&str>,
         state: Option<&str>,
@@ -190,6 +190,6 @@ impl ChallengeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(pool).await
+        q.fetch_all(executor).await
     }
 }

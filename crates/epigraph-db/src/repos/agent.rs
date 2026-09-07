@@ -1292,9 +1292,9 @@ impl AgentRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, viewer))]
-    pub async fn get_public_profile(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_public_profile<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<AgentPublicProfile>, DbError> {
@@ -1336,7 +1336,7 @@ impl AgentRepository {
         .bind(viewer.principal())
         .bind(viewer.group_bind().unwrap_or(&[]))
         .bind(viewer.is_bypass())
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(

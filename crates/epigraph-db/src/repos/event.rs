@@ -205,8 +205,8 @@ impl EventRepository {
     /// # Errors
     ///
     /// Returns the underlying [`sqlx::Error`] if the query fails.
-    pub async fn list(
-        pool: &PgPool,
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         event_type: Option<&str>,
         actor_id: Option<Uuid>,
@@ -244,7 +244,7 @@ impl EventRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(pool).await
+        q.fetch_all(executor).await
     }
 
     /// Get the latest graph version number.
