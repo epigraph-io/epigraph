@@ -972,11 +972,27 @@ async fn declassification_is_gated_and_sealed_claims_can_never_be_widened(pool: 
 /// the seal/unseal protocol it will add more, and this is what they have to
 /// keep true.
 ///
-/// The INSERT-side enforcement — a trigger on `claim_encryption` refusing to
-/// seal a public claim — is deliberately NOT added here. `claim_encryption`'s
-/// writers are PR-21's to rewrite, and its acceptance line already owns
-/// "seal-then-declassify raises 42501 unconditionally". This test is the
-/// standing measurement until then.
+/// # The INSERT-side trigger now EXISTS, and this test still measures something
+/// # else (PR-18a)
+///
+/// An earlier revision of this comment said the INSERT-side enforcement — a
+/// trigger on `claim_encryption` refusing to seal a public claim — was
+/// "deliberately NOT added here", because `claim_encryption`'s writers are
+/// PR-21's to rewrite. **Migration 081 adds it**:
+/// `claim_encryption_no_public_sealed`, `BEFORE INSERT OR UPDATE`, raising
+/// 42501. So the standing-measurement framing is retired.
+///
+/// What this test measures is not the same property and does not become
+/// redundant. The trigger refuses a `claim_encryption` row whose claim is
+/// KNOWN-public at write time; its read of `claims` is invoker-side and subject
+/// to `claims_tenancy`, so a session that cannot see the claim reads NULL and
+/// the trigger admits. The assertion below is the corpus-wide invariant — no
+/// sealed claim is publicly visible, whatever route or session produced it —
+/// and it is what a writer PR-21 adds still has to keep true.
+///
+/// The two claims sealed here are group-owned, so neither exercises the trigger.
+/// That is deliberate: an invariant test that also depended on the trigger would
+/// stop being independent of it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_sealed_claim_is_publicly_visible(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "sealed").await;

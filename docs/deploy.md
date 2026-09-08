@@ -504,6 +504,16 @@ the documented `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` kill switch, which
 drops FORCE and leaves the policies enabled. A FORCE-only probe would be
 disarmed in both.
 
+**The kill switch covers 39 relations from PR-18a onward, not 35.** `079` is an
+applied migration and could not name the four privatization tables, so
+migrations `080`/`082`/`083` FORCE the tables they create. The boot assertion
+counts the **catalog** rather than 079's array, so running a copy of
+`docs/runbooks/079-undo.sql` that predates PR-18a un-FORCEs only the original 35
+and leaves the API refusing to boot on a **partially** FORCEd set — the rollback
+turns into an outage. Always run the script from the tree you are rolling back
+to, and finish with the VERIFY query at the foot of it, which is what detects a
+partial flip.
+
 **It must name the same database as `DATABASE_URL`.** A maintenance DSN pointing
 elsewhere does not error — it reads zero rows and writes nowhere — so
 `maintenance_database_url` compares the two **effective** database names (the

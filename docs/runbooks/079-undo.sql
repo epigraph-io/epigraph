@@ -35,15 +35,26 @@
 -- protected set — zero FORCEd is a pre-079 database and is inert, all FORCEd is
 -- the armed state, and a subset is a half-applied migration with no legitimate
 -- cause. An undo that missed a table would land the cluster in exactly that
--- state and the API would not come back up. The list below is transcribed from
--- `migrations/079_rls_force.sql` and
--- `crates/epigraph-db/tests/locked_decisions.rs::FORCE_PROTECTED_SET` pins the
--- two together.
+-- state and the API would not come back up.
+--
+-- THE ARRAY IS NO LONGER 079's ARRAY, AND THAT IS THE POINT (PR-18a). The boot
+-- assertion counts what the CATALOG reports FORCEd, not what 079 wrote, so this
+-- script has to cover every FORCEd relation whatever installed it. 079 is an
+-- applied file and cannot be edited — `migrations/README.md` states the rule and
+-- the checksum failure it causes — so a table added from 080 onward FORCEs
+-- itself at creation, exactly as 078 did for `rls_canary`. The list below is
+-- therefore 079's thirty-five PLUS the four privatization tables 080/082/083
+-- FORCE, and `crates/epigraph-db/tests/locked_decisions.rs::FORCE_PROTECTED_SET`
+-- pins this file, `epigraph_api::state::FORCE_PROTECTED_SET` and the catalog
+-- together.
 --
 -- `rls_canary` is deliberately absent, exactly as in 079: migration 078 FORCEs
 -- it at creation and it must STAY FORCEd. Un-FORCing it would make the canary
 -- row visible to the owner and the boot probe would then report a false alarm
--- during the very rollback this script is performing.
+-- during the very rollback this script is performing. It is the ONE relation
+-- the catalog reports FORCEd that this script must not touch, and
+-- `d4_the_kill_switch_covers_the_same_relations_as_the_flip` asserts its
+-- absence.
 --
 -- ===================================================================
 -- WHO RUNS THIS. The table owner — `epigraph` — or a superuser. `ALTER TABLE`
@@ -77,7 +88,19 @@ DECLARE t text;
           'agents','jobs','security_events',
           -- ---- the four encryption tables --------------------------------
           'claim_encryption','claim_version_encryption',
-          'evidence_encryption','edge_encryption'];
+          'evidence_encryption','edge_encryption',
+          -- ---- the four privatization tables (PR-18a) --------------------
+          -- NOT FORCEd by 079. 080, 082 and 083 FORCE the table they create,
+          -- for the reason 078 established for `rls_canary`. They are undone
+          -- HERE because the boot assertion counts the CATALOG, not 079's
+          -- array: leaving four of thirty-nine FORCEd is the partial state
+          -- `AppState::rls_verdict` refuses on, so an undo that skipped them
+          -- would be the outage this script exists to prevent. The `IF EXISTS`
+          -- guard below is what makes that safe on a database that has not run
+          -- 080-083 — and it is why this script does not need to know whether
+          -- they ran.
+          'privatization_plans','privatization_plan_items',
+          'privatization_audit','instance_admins'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c
