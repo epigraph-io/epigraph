@@ -513,47 +513,71 @@ async fn security_events_read_widens_to_the_whole_log_for_an_instance_admin_only
     );
 }
 
-/// `privatization_audit_read` gives an instance admin the plan-level rows and
-/// **no** `entity_id`s — including for a plan whose target group it administers.
+/// `privatization_audit_read` scopes `entity_id` rows to the plans whose target
+/// group the caller administers, and to those only.
 ///
 /// 082's header calls `entity_id` "a complete index of every private entity id
-/// in the instance", so the row-level scoping is the only thing standing between
-/// an instance admin and that index. The arm reads
+/// in the instance", so this row-level scoping is the whole of FINAL-PLAN
+/// §6.5.2 point 3: "plan-level rows for every plan, entity ids only for plans
+/// whose target group the caller administers".
+///
+/// # Why the shape of this test changed with migration 087
+///
+/// The arm reads
 /// `epigraph_is_group_admin((SELECT p.target_group_id FROM privatization_plans p
-/// WHERE p.id = privatization_audit.plan_id))`, and 080 leaves
-/// `privatization_plans` with **no SELECT policy under FORCE**, so on an app
-/// connection that scalar sub-select yields NULL for EVERY plan and
-/// `epigraph_is_group_admin(NULL)` — an `EXISTS` over `group_memberships WHERE
-/// m.group_id = NULL` — is false.
+/// WHERE p.id = privatization_audit.plan_id))`, and that scalar sub-select is
+/// itself RLS-filtered. 083's own header records the consequence of shipping it
+/// against a `privatization_plans` that had no SELECT policy: the sub-select
+/// yielded NULL for every plan, `epigraph_is_group_admin(NULL)` was false, and
+/// the ADMINISTERED direction was denied along with the unadministered one. An
+/// earlier revision of this test asserted that blanket denial, because that was
+/// the behaviour the policy set produced.
 ///
-/// So the entity rows are denied in both directions for as long as
-/// `privatization_plans` has no SELECT policy. PR-18a expected 18b to add one;
-/// 18b did not — it ships the selection pass as a pure computation and persists
-/// no plan, because a policy needs a migration and the PR-18 plan section's four
-/// numbers were all consumed by 18a (080-083). The denial below is therefore the
-/// standing behaviour, not a transient state with a known end date.
+/// Migration 087 gives `privatization_plans` its SELECT policy, so the arm now
+/// resolves and both directions are separately observable. The test is therefore
+/// two-armed, which is what §6.5.2 point 3 actually specifies — and the second
+/// arm is the one that matters, because a policy that simply admitted every
+/// entity row to any instance admin would satisfy the first arm alone.
 ///
-/// The actor here is deliberately the strongest possible case: an
-/// instance admin who IS a live `role='admin'` of the plan's target group. The
-/// calibration below asserts that same principal gets `true` from
-/// `epigraph_is_group_admin(<the group>)` on the very same connection, which is
-/// what makes the denial attributable to the NULL sub-select rather than to a
-/// caller who simply is not a group admin.
+/// # Calibration
+///
+/// Three assertions carry it. The actor must be a live instance admin (or the
+/// whole third disjunct is false and both arms pass vacuously); it must be a
+/// live `role='admin'` of the ADMINISTERED plan's target group on the connection
+/// under test (or arm one measures nothing); and it must NOT be an admin of the
+/// other plan's target group (or arm two measures nothing).
 #[sqlx::test(migrations = "../../migrations")]
-async fn privatization_audit_read_yields_plan_rows_but_no_entity_ids_to_an_instance_admin(
-    pool: PgPool,
-) {
-    let (author, group) = fixture::seed_agent_with_group(&pool, "pa-author").await;
-    backdate_group(&pool, group).await;
-    add_admin(&pool, group, "pa-co-1").await;
-    add_admin(&pool, group, "pa-co-2").await;
-    let plan = insert_plan(&pool, group, author).await.expect("plan");
+async fn privatization_audit_entity_rows_follow_the_callers_group_adminship(pool: PgPool) {
+    // The plan the actor administers.
+    let (author, mine) = fixture::seed_agent_with_group(&pool, "pa-author").await;
+    backdate_group(&pool, mine).await;
+    add_admin(&pool, mine, "pa-co-1").await;
+    add_admin(&pool, mine, "pa-co-2").await;
+    let my_plan = insert_plan(&pool, mine, author).await.expect("plan");
 
-    let plan_level = insert_audit(&pool, plan, author, "plan.create", None).await;
-    let entity_level = insert_audit(&pool, plan, author, "item.apply", Some(Uuid::new_v4())).await;
+    // A plan against a group the actor has nothing to do with. Its own author
+    // is a different agent; 081's guard needs the same maturity and plurality.
+    let (stranger, theirs) = fixture::seed_agent_with_group(&pool, "pa-stranger").await;
+    backdate_group(&pool, theirs).await;
+    add_admin(&pool, theirs, "pa-their-co-1").await;
+    add_admin(&pool, theirs, "pa-their-co-2").await;
+    let their_plan = insert_plan(&pool, theirs, stranger).await.expect("plan");
+
+    let my_plan_level = insert_audit(&pool, my_plan, author, "plan.create", None).await;
+    let my_entity_level =
+        insert_audit(&pool, my_plan, author, "item.apply", Some(Uuid::new_v4())).await;
+    let their_plan_level = insert_audit(&pool, their_plan, stranger, "plan.create", None).await;
+    let their_entity_level = insert_audit(
+        &pool,
+        their_plan,
+        stranger,
+        "item.apply",
+        Some(Uuid::new_v4()),
+    )
+    .await;
 
     // BEFORE THE GRANT. Not an instance admin: the whole third disjunct is
-    // false, so neither row is readable.
+    // false, so no row is readable — not even a plan-level one.
     let mut conn = stamped_app_conn(&pool, author).await;
     let seen = visible_audit(&mut conn).await;
     assert!(
@@ -570,33 +594,54 @@ async fn privatization_audit_read_yields_plan_rows_but_no_entity_ids_to_an_insta
 
     let mut conn = stamped_app_conn(&pool, author).await;
 
-    // CALIBRATION. This principal really is a live admin of the target group on
-    // THIS connection. Without it, the entity-row denial below is satisfied by a
-    // caller who was never a group admin in the first place, and the test would
-    // pass against a policy that had no row-level scoping at all.
-    let is_group_admin: bool = sqlx::query_scalar("SELECT public.epigraph_is_group_admin($1)")
-        .bind(group)
+    // CALIBRATION, both directions, on THIS connection.
+    let administers_mine: bool = sqlx::query_scalar("SELECT public.epigraph_is_group_admin($1)")
+        .bind(mine)
         .fetch_one(&mut *conn)
         .await
-        .expect("epigraph_is_group_admin");
+        .expect("epigraph_is_group_admin(mine)");
     assert!(
-        is_group_admin,
-        "the actor must be a live admin of the plan's target group, or the entity-row assertion \
-         below measures nothing"
+        administers_mine,
+        "the actor must be a live admin of its own plan's target group, or the first arm \
+         measures nothing"
+    );
+    let administers_theirs: bool = sqlx::query_scalar("SELECT public.epigraph_is_group_admin($1)")
+        .bind(theirs)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("epigraph_is_group_admin(theirs)");
+    assert!(
+        !administers_theirs,
+        "the actor must NOT administer the other plan's target group, or the second arm is a \
+         restatement of the first"
     );
 
     let seen = visible_audit(&mut conn).await;
+
+    // PLAN-LEVEL: every plan, including one the actor does not administer.
     assert!(
-        seen.contains(&plan_level),
-        "an instance admin must see plan-level rows (entity_id IS NULL) for every plan"
+        seen.contains(&my_plan_level) && seen.contains(&their_plan_level),
+        "an instance admin must see plan-level rows (entity_id IS NULL) for EVERY plan; an \
+         auditor needs the instance-wide timeline (FINAL-PLAN §6.5.8)"
     );
+
+    // ARM ONE — the administered plan's entity ids are readable. This is what
+    // migration 087 makes reachable.
     assert!(
-        !seen.contains(&entity_level),
-        "the entity_id arm must be unreachable from an app connection: the sub-select over \
-         privatization_plans yields NULL because 080 gives that table no SELECT policy under \
-         FORCE, so epigraph_is_group_admin(NULL) is false. The direction is denial, not \
-         disclosure. Whichever slice is allocated a migration number owns the read policy that \
-         would open it deliberately; 18b was not, and did not."
+        seen.contains(&my_entity_level),
+        "an instance admin who is a live admin of a plan's target group must see that plan's \
+         entity-level rows; that is FINAL-PLAN §6.5.2 point 3's 'entity ids only for plans whose \
+         target group the caller administers', and it is reachable because migration 087 gives \
+         privatization_plans the SELECT policy the arm's sub-select needs"
+    );
+
+    // ARM TWO — the unadministered plan's entity ids are NOT. This is the
+    // control, and it is the assertion that fails silently: a policy admitting
+    // every entity row to any instance admin passes arm one unchanged.
+    assert!(
+        !seen.contains(&their_entity_level),
+        "entity-level rows for a plan whose target group the caller does NOT administer must \
+         stay denied. instance:admin alone is explicitly not sufficient for entity ids"
     );
 }
 

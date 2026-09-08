@@ -68,7 +68,8 @@ Current reservation:
   | **068–084** | PR-05 … PR-22 | the remaining plan §3.1 migrations, shifted **+4** from the plan's printed numbering after 062 (plan 064 → 068, …, plan 080 → 084) |
   | **085** | PR-10 | `webhook_subscriptions` — **claimed 2026-09-03**, was headroom |
   | **086** | PR-24 | `epigraph_claim_tenancy_by_ids` `SECURITY DEFINER` read helper — **claimed 2026-09-06**, was headroom |
-  | **087–090** | — | remaining headroom |
+  | **087** | PR-18 (delivered as 18b) | SELECT + INSERT policies on `privatization_plans` and `privatization_plan_items` — **claimed 2026-09-08**, was headroom |
+  | **088–090** | — | remaining headroom |
 
   **The post-shift numbers, pinned.** THIS TABLE IS AUTHORITATIVE; plan §3.1's
   own columns are not, and neither is `docs/tenancy/FINAL-PLAN.md`. Derive
@@ -95,6 +96,7 @@ Current reservation:
   | **083** | PR-18a | `instance_admins` + `epigraph_is_instance_admin(uuid)`, plus the two policies 082 could not create before the function existed (`privatization_audit_read`, and `security_events_read`'s restored instance-admin disjunct). Seeds nothing. **Correction to the plan:** it prescribes no INSERT/UPDATE policy on `instance_admins`, which under `FORCE` denies the operator grant to every role; 083 ships a bypass-only INSERT and UPDATE pair instead, and stops short of `FOR ALL` so DELETE stays denied. File: `083_instance_admins.sql`. **Throwaway only.** |
   | **084** | PR-22 | retire `ownership` |
   | **085** | PR-10 | `webhook_subscriptions` (durable webhook registrations, `agent_id` FK) |
+  | **087** | PR-18 (18b) | SELECT + INSERT policies on `privatization_plans` and `privatization_plan_items`. **The plan specifies no policy for either table** — fourteen `CREATE POLICY` blocks in `docs/tenancy/FINAL-PLAN.md`, none naming them — so this file designs them from 082/083's two templates and says so in its own header. Read is instance-admin **AND** group-admin-of-target (§6.5.2 point 2); write is bypass-only, matching 083's `instance_admins` shape, because 080 already REVOKEs DML from `epigraph_app`. **Side effect on a table it does not touch:** 083's `privatization_audit_read` entity arm resolves its sub-select over `privatization_plans` and therefore activates. UPDATE and DELETE stay uncovered and stay registered in `rls_enforcement.rs::DELIBERATELY_UNCOVERED`. File: `087_privatization_plan_policies.sql`. **Throwaway only.** |
 
   **PR-10 takes 085, NOT the 081 `docs/tenancy/FINAL-PLAN.md` names.** The
   plan's PR-10 note says its migration "takes the next unused number in the

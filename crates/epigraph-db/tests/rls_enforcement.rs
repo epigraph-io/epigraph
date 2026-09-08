@@ -115,36 +115,20 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
     // commit — which is the property that makes the eight rows worth their
     // weight rather than boilerplate.
     //
-    // AMENDED BY 18b, WHICH DID NOT DO WHAT THE PARAGRAPH ABOVE PREDICTS.
-    // "the preview routes are 18b" is PR-18a's expectation, not an outcome:
-    // 18b ships the selection pass as a repo-layer computation with no route,
-    // no persisted plan and therefore no policy, because adding one needs a
-    // migration and no number is assigned to that slice. The per-pair reasons
-    // below carry the current owner and are authoritative over this paragraph.
-    // Migration 080's header states the same expectation and is FROZEN by the
-    // applied-checksum rule, so it cannot be corrected there; that disagreement
-    // is recorded rather than resolved by silence, which is this register's own
-    // culture rule.
-    (
-        "privatization_plans",
-        "SELECT",
-        "Still no reader. PR-18a expected 18b to add the SELECT policy and delete \
-         this row in the same commit; 18b ships the SELECTION PASS only — the \
-         repo layer that computes what a plan would contain — and persists \
-         nothing, so the pair stays. Adding a policy requires a migration, and \
-         the PR-18 plan section's four numbers were all consumed by 18a \
-         (080-083); no number is assigned to this slice. The owner is whichever \
-         slice is allocated one.",
-    ),
-    (
-        "privatization_plans",
-        "INSERT",
-        "Still no writer, for the same reason as the SELECT pair above. Note for \
-         whoever does claim a number: FORCE binds epigraph_maintenance too — it \
-         is rolbypassrls=f — so 'create the plan on the maintenance pool' does \
-         NOT work without a policy. Measured: the INSERT fails with \
-         'new row violates row-level security policy'.",
-    ),
+    // AMENDED TWICE. The first amendment recorded that 18b's SECOND slice did
+    // not do what the paragraph above predicts: it shipped the selection pass as
+    // a repo-layer computation with no route, no persisted plan and therefore no
+    // policy, because adding one needs a migration and no number was assigned to
+    // it. THE THIRD SLICE CLAIMED 087 AND DID. The four SELECT/INSERT pairs the
+    // paragraph above predicted are gone from this register, deleted in the same
+    // commit as `migrations/087_privatization_plan_policies.sql`, which is the
+    // property that makes the remaining rows worth their weight.
+    //
+    // What is left is UPDATE and DELETE on both tables, and their owners are
+    // unchanged. Migration 080's header states the whole-slice expectation and
+    // is FROZEN by the applied-checksum rule, so it cannot be corrected there;
+    // that disagreement is recorded rather than resolved by silence, which is
+    // this register's own culture rule.
     (
         "privatization_plans",
         "UPDATE",
@@ -156,23 +140,6 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
         "DELETE",
         "A plan is the record that a privatization was attempted and is never \
          deleted. Nothing is expected to claim this pair.",
-    ),
-    (
-        "privatization_plan_items",
-        "SELECT",
-        "The frozen item set is a complete index of every entity a plan would \
-         privatize. PR-18a expected 18b's preview to own the read policy; 18b \
-         computes the item set in the repo layer but does not persist it, so \
-         there is still no reader. See the privatization_plans SELECT row for \
-         why the policy did not land with it.",
-    ),
-    (
-        "privatization_plan_items",
-        "INSERT",
-        "Items would be materialised by the selection pass. 18b ships that pass \
-         as a pure computation over the two migration-080 selection functions \
-         and returns it to its caller; freezing it into this table is the write \
-         that still has no policy.",
     ),
     (
         "privatization_plan_items",
