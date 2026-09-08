@@ -83,6 +83,7 @@ pub mod perspective;
 #[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
+pub mod privatization;
 /// Deterministic 2-D PCA used by `/themes/:id/embeddings` so that endpoint can
 /// serve theme-splitting clients without disclosing raw embedding vectors.
 pub mod projection;
@@ -564,6 +565,22 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/tasks/:id/fail", post(tasks::fail_task))
         // Security audit log — requires audit:read scope
         .route("/api/v1/audit/security", get(audit::query_security_events))
+        // D4 admin privatization (FINAL-PLAN §6.5.7). PROTECTED, never public:
+        // every one of these carries §6.6's three-condition check, and
+        // `public_router_allowlist.rs` asserts the anonymous surface is exactly
+        // `/health` and `/api/v1/openapi.json`.
+        .route(
+            "/api/v1/admin/privatization/plans",
+            post(privatization::create_plan).get(privatization::list_plans),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id",
+            get(privatization::get_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/items",
+            get(privatization::get_plan_items),
+        )
         .route("/api/v1/graph/communities/overview", get(graph::overview))
         .route("/api/v1/graph/communities/:id/expand", get(graph::expand))
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
@@ -1315,6 +1332,21 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
+        )
+        // D4 admin privatization. Registered in BOTH `create_router` variants so
+        // the two chains do not diverge on an admin surface; the handlers here
+        // are the `#[cfg(not(feature = "db"))]` arms and answer 503.
+        .route(
+            "/api/v1/admin/privatization/plans",
+            post(privatization::create_plan).get(privatization::list_plans),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id",
+            get(privatization::get_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/items",
+            get(privatization::get_plan_items),
         );
 
     // Authentication for `protected`: OAuth2 Bearer, unconditionally.
