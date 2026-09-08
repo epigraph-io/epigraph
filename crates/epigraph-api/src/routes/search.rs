@@ -1212,37 +1212,40 @@ mod db_integration_tests {
     use super::*;
     use crate::state::{ApiConfig, AppState};
 
-    async fn try_test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(3)
-            .connect(&url)
+    /// Rebuild a connection URL for the database `pool` is connected to.
+    ///
+    /// `#[sqlx::test]` hands each arm a randomly-named private database but no
+    /// URL, and [`call_diverse_search`] needs one to build its `ScopedPool`.
+    /// Asking the database its own name and splicing that onto the ambient
+    /// `DATABASE_URL`'s authority is the same move
+    /// `tests/viewer_fixture.rs::database_url_for` makes; it is duplicated here
+    /// because this is an in-crate `#[cfg(test)]` module and cannot reach the
+    /// integration-test fixture.
+    ///
+    /// Without it the arms would seed the private database and the handler
+    /// would read the SHARED one -- a silent vacuous pass, which is strictly
+    /// worse than the flake being fixed.
+    async fn database_url_for(pool: &sqlx::PgPool) -> String {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
             .await
-            .ok()?;
-        sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-        Some(pool)
-    }
-
-    macro_rules! test_pool_or_skip {
-        () => {{
-            match try_test_pool().await {
-                Some(p) => p,
-                None => {
-                    eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                    return;
-                }
-            }
-        }};
-    }
-
-    /// Wipe `claim_themes` and unassign all claims so each test starts with
-    /// a known empty theme table. Necessary because the DB is shared across
-    /// tests and prior k-means runs could otherwise leak themes.
-    async fn reset_themes(pool: &sqlx::PgPool) {
-        let _ = sqlx::query("UPDATE claims SET theme_id = NULL")
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM claim_themes").execute(pool).await;
+            .expect("current_database()");
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        // Strip the query string before touching the path, or `?sslmode=require`
+        // would be mistaken for part of the database name.
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        }
     }
 
     /// Insert a fresh agent for the test scope (returns its UUID).
@@ -1428,7 +1431,7 @@ mod db_integration_tests {
         let viewer = epigraph_db::Viewer::resolve(&pool, uuid::Uuid::nil())
             .await
             .expect("resolve viewer");
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set by test_pool_or_skip!");
+        let url = database_url_for(&pool).await;
         let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
             .await
             .expect("connect a scoped pool");
@@ -1458,11 +1461,8 @@ mod db_integration_tests {
 
     /// Test 1 — explicit 3072d hint queries the 3072d centroids and
     /// surfaces `centroid_dim_used: 3072`.
-    #[tokio::test]
-    async fn diverse_search_uses_3072d_centroids_when_hinted() {
-        let pool = test_pool_or_skip!();
-        reset_themes(&pool).await;
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_uses_3072d_centroids_when_hinted(pool: sqlx::PgPool) {
         let agent = seed_agent(&pool, "diverse-3072-test").await;
         let theme_ids = seed_themes_with_3072_centroids(&pool, 5).await;
         let _claims = seed_claims_with_3072_embeddings(&pool, 50, &theme_ids, agent).await;
@@ -1484,11 +1484,8 @@ mod db_integration_tests {
 
     /// Test 2 — explicit 3072d hint with NO 3072d centroids populated:
     /// must reject with ValidationError on field=centroid_dim.
-    #[tokio::test]
-    async fn diverse_search_rejects_when_3072d_centroids_missing() {
-        let pool = test_pool_or_skip!();
-        reset_themes(&pool).await;
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_rejects_when_3072d_centroids_missing(pool: sqlx::PgPool) {
         let _ids = seed_themes_with_only_1536_centroids(&pool, 5).await;
 
         let result = call_diverse_search(pool.clone(), Some(3072)).await;
@@ -1506,11 +1503,8 @@ mod db_integration_tests {
 
     /// Test 3 — auto-detect: when ≥50% of themes have `centroid_3072`
     /// populated and the caller does NOT hint, the search picks 3072d.
-    #[tokio::test]
-    async fn diverse_search_auto_picks_3072d_when_majority_populated() {
-        let pool = test_pool_or_skip!();
-        reset_themes(&pool).await;
-
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn diverse_search_auto_picks_3072d_when_majority_populated(pool: sqlx::PgPool) {
         // 8/10 themes have centroid_3072 (80% > 50% threshold)
         let theme_ids = seed_themes_with_mixed_centroids(&pool, 10, 8).await;
         let agent = seed_agent(&pool, "diverse-auto-test").await;
