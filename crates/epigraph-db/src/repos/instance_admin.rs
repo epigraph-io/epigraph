@@ -65,6 +65,28 @@ pub struct InstanceAdminRow {
 /// Repository for instance-administrator grants.
 pub struct InstanceAdminRepository;
 
+/// The four facts FINAL-PLAN §6.6's check is a function of.
+///
+/// Deliberately NOT a `bool`. The middleware turns each field into a distinct
+/// 403 reason, and collapsing them here would make an authorised operator's
+/// refusal indistinguishable from an unauthorised one's — which is the outcome
+/// `middleware/instance_authz.rs`'s header says the whole function exists to
+/// prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivatizationAuthority {
+    /// A live `instance_admins` row for the caller (condition 2).
+    pub is_instance_admin: bool,
+    /// `None` when the target group does not exist. Otherwise the value
+    /// condition 3a's 24-hour maturity test is applied to.
+    pub target_group_created_at: Option<DateTime<Utc>>,
+    /// Live `role='admin'` memberships of the target group OTHER than the
+    /// caller (condition 3b).
+    pub other_live_admins: i64,
+    /// The caller's own live `role='admin'` membership of the target group
+    /// (condition 4).
+    pub is_target_group_admin: bool,
+}
+
 impl InstanceAdminRepository {
     /// Is `agent_id` a live instance administrator?
     ///
@@ -114,6 +136,81 @@ impl InstanceAdminRepository {
             .fetch_one(pool)
             .await?;
         Ok(row.0.unwrap_or(false))
+    }
+
+    /// Every fact FINAL-PLAN §6.6's four-condition check needs, in ONE
+    /// statement on ONE connection.
+    ///
+    /// # Why this exists rather than four separate repository calls
+    ///
+    /// `middleware/instance_authz.rs` originally composed
+    /// [`Self::is_active`], `GroupRepository::get_by_id`,
+    /// `GroupMembershipRepository::count_live_admins_excluding` and
+    /// `get_member_role`, all of which take a `&PgPool`. A route cannot supply
+    /// one: `no_unscoped_pool.rs` bans `.db_pool` in `crates/epigraph-api/src`
+    /// with an exact, monotone-decreasing register, and the only pools reachable
+    /// from `AppState` that are NOT that one are hidden behind connection-
+    /// yielding accessors (`read_as`, `maintenance_viewer`) by design. Widening
+    /// those four to take a connection would either duplicate them as `*_conn`
+    /// siblings — the drift shape `visibility_lint.rs::CONN_WITHOUT_VIEWER`'s own
+    /// doc names — or pull four heavily-used functions into a lint register on a
+    /// reason that has nothing to do with why they were widened.
+    ///
+    /// One purpose-built probe is smaller, and it is also more correct: the four
+    /// facts are read at one instant rather than across four round trips, so the
+    /// caller cannot authorise against a group that lost its second admin between
+    /// the third call and the fourth.
+    ///
+    /// # Why it takes no `Viewer`, and what connection it needs
+    ///
+    /// This is an AUTHORIZATION probe about the CALLER'S OWN identity, not a
+    /// corpus read. Filtering it by the caller's `Viewer` would make the answer
+    /// depend on what that caller can currently see rather than on what is true —
+    /// a caller who cannot see the target group's other admins would be told
+    /// there are none and refused, which is a fail-closed wrong answer and
+    /// indistinguishable from the real one. It is the same argument
+    /// `epigraph_is_group_admin` embodies at the SQL level.
+    ///
+    /// So it must run on a connection that can see the whole roster: the
+    /// **maintenance** connection. On a stamped app connection the two
+    /// `group_memberships` sub-selects are narrowed by migration 077's policy and
+    /// the counts under-report. `epigraph_is_instance_admin` works on either — it
+    /// is `SECURITY DEFINER` and admits `p_agent = epigraph_principal_id() OR
+    /// epigraph_bypass()` — which is exactly why the other three facts are the
+    /// ones that decide the connection.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails. A failure is never
+    /// mapped to an authorisation.
+    #[instrument(skip(conn))]
+    pub async fn privatization_authority(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        target_group_id: Uuid,
+    ) -> Result<PrivatizationAuthority, DbError> {
+        let row: (Option<bool>, Option<DateTime<Utc>>, i64, bool) = sqlx::query_as(
+            r#"
+            SELECT public.epigraph_is_instance_admin($1),
+                   (SELECT g.created_at FROM public.groups g WHERE g.id = $2),
+                   (SELECT count(*) FROM public.group_memberships m
+                     WHERE m.group_id = $2 AND m.role = 'admin'
+                       AND m.revoked_at IS NULL AND m.agent_id <> $1),
+                   EXISTS (SELECT 1 FROM public.group_memberships m
+                            WHERE m.group_id = $2 AND m.agent_id = $1
+                              AND m.role = 'admin' AND m.revoked_at IS NULL)
+            "#,
+        )
+        .bind(agent_id)
+        .bind(target_group_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        Ok(PrivatizationAuthority {
+            is_instance_admin: row.0.unwrap_or(false),
+            target_group_created_at: row.1,
+            other_live_admins: row.2,
+            is_target_group_admin: row.3,
+        })
     }
 
     /// Grant (or re-grant) instance administrator to `agent_id`.

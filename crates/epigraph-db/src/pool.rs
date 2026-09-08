@@ -522,6 +522,51 @@ pub async fn apply_statement_timeout(
     Ok(())
 }
 
+/// Read this connection's current `statement_timeout`.
+///
+/// # WHY THIS EXISTS AT ALL
+///
+/// [`apply_statement_timeout`] issues a SESSION-scope `SET`. On a pool
+/// connection that outlives the caller — which every pooled connection does —
+/// the bound therefore applies to whatever runs next on it. `after_connect`
+/// cannot undo it: that hook fires once when a physical connection is
+/// established, not on each checkout. [`ScopedPool`]'s `after_release` scrub is
+/// [`SET_SESSION_GUCS`] and covers the three tenancy GUCs only.
+///
+/// So a caller that bounds one piece of work rather than a whole pool must
+/// read the prior value, and restore it with [`restore_statement_timeout`] on
+/// EVERY exit including the error ones. `SET LOCAL` is the alternative and it
+/// is only available inside a transaction.
+///
+/// # Errors
+/// Returns `sqlx::Error` if the `SHOW` fails.
+pub async fn read_statement_timeout(conn: &mut PgConnection) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(conn)
+        .await
+}
+
+/// Put back a value [`read_statement_timeout`] returned.
+///
+/// The value is QUOTED. `SHOW` renders the setting with its unit (`0`, `30s`,
+/// `45min`), and `SET statement_timeout = 45min` is a syntax error while
+/// `SET statement_timeout = '45min'` is not.
+///
+/// # Errors
+/// Returns `sqlx::Error` if the `SET` fails.
+pub async fn restore_statement_timeout(
+    conn: &mut PgConnection,
+    value: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "SET statement_timeout = '{}'",
+        value.replace('\'', "''")
+    ))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 // =============================================================================
 // ScopedPool — plan §0.5
 // =============================================================================

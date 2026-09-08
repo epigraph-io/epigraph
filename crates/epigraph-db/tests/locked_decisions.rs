@@ -992,6 +992,113 @@ async fn d4_the_audit_tables_are_append_only_by_a_trigger_not_only_by_a_policy(p
 /// **D4, locked.** The D4 write surface is admin-only because there is NO
 /// request-path write surface at all.
 ///
+/// **PR-18 (18b).** The request path reaches D4 selection only through the
+/// composed entry point, so a handler can never hold a bare selection-pass id.
+///
+/// # The decision this locks
+///
+/// FINAL-PLAN §6.5.2 records a previous revision of this design that shipped a
+/// cross-tenant read oracle: selection must run UNFILTERED to be correct, and
+/// the previous revision then serialised the ids and content it selected.
+/// `repos/privatization.rs` closes that with a two-pass split, and the split is
+/// now expressed as a TYPE — `UnfilteredSelection` wraps the selection pass's
+/// output with a private field, and every exit that can carry an entity id
+/// either takes the ACTOR's `Viewer` or writes into a `FORCE`-protected table.
+///
+/// Rust visibility cannot finish the job. The selection primitives must stay
+/// `pub` because four integration-test binaries in another crate exercise them
+/// directly, and `UnfilteredSelection` needs an unguarded constructor and
+/// accessor for the same reason. So the request path is held off them here, by
+/// the same instrument
+/// [`d4_no_request_path_writes_the_instance_admin_table`] uses.
+///
+/// # Why a source lint is the right shape, stated plainly
+///
+/// It is an exact-substring scan after whitespace collapse, so an aliased import
+/// walks past it. What makes it worth its weight is that the thing it catches —
+/// a handler calling `select_closure` and serialising the result — is a diff, at
+/// review time, with no runtime signature at all: the oracle returns `200` and
+/// every test passes. There is no behavioural assertion that can stand in for
+/// it, because the defect is "the handler answered with MORE than it should
+/// have", and a test written against the wrong shape returns more, not less.
+///
+/// `RESTRICTED` names selection-pass entry points and the two test-only
+/// constructors on the wrapper. It deliberately does NOT name the composed entry
+/// point `PrivatizationRepository::select`, nor the rendering functions
+/// (`visible_previews`, `visible_boundary_edges`, `count_visible`) — those take
+/// the actor's own viewer and refuse a bypass one at runtime, so a route calling
+/// them is the intended shape.
+#[test]
+fn d4_the_request_path_reaches_privatization_only_through_the_composed_entry_point() {
+    // Raw, not comment-stripped, for the reason the sibling lint gives: these
+    // are the names a doc comment explaining the rule would want to spell, and
+    // the false positive is cheaper than a call hidden behind a `//` that a
+    // later edit reinstates. Consequence for a future author: say "the selection
+    // pass" rather than naming the function.
+    const RESTRICTED: &[&str] = &[
+        "PrivatizationRepository::select_closure",
+        "PrivatizationRepository::select_content_lineage_hull",
+        "PrivatizationRepository::count_selected",
+        // BOTH UFCS SPELLINGS. The method-call needles below only catch
+        // `sel.into_selected()`; `UnfilteredSelection::into_selected(sel)` is
+        // the same call and walked straight past an earlier revision of this
+        // list, which named the `from_selected` UFCS form and not this one.
+        "UnfilteredSelection::from_selected",
+        "UnfilteredSelection::into_selected",
+        ".into_selected(",
+        ".from_selected(",
+    ];
+    // The two REQUEST-PATH crates. `epigraph-mcp/src/tools` has no privatization
+    // tool today and is scanned ANYWAY: the six MCP tools FINAL-PLAN §6.5.7 names
+    // are the next slice's, they answer the same requests over a different
+    // transport, and a rule that arrived with them would be a rule written by the
+    // code it is meant to constrain.
+    //
+    // `epigraph-jobs/src` is deliberately absent for the opposite reason: 18c is
+    // chartered to add an apply handler there, it runs on the maintenance pool,
+    // and reaching the selection primitives directly is its job. Banning a call
+    // the next slice must make would be a rule written ahead of the decision that
+    // owns it.
+    let roots = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../epigraph-api/src/routes"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../epigraph-mcp/src/tools"),
+    ];
+
+    let mut offenders: Vec<String> = Vec::new();
+    for root in roots {
+        let sources = rust_sources(std::path::Path::new(root));
+        // VACUITY GUARD. `rust_sources` returns an empty `Vec` when `read_dir`
+        // fails, so a moved directory would turn this into
+        // `assert!(vec![].is_empty())`.
+        assert!(
+            !sources.is_empty(),
+            "scan root {root} yielded no .rs files; the lint would pass vacuously"
+        );
+        for path in sources {
+            let display = path.display().to_string();
+            let src = read(path.to_str().expect("utf-8 path"));
+            let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            for needle in RESTRICTED {
+                if flat.contains(needle) {
+                    offenders.push(format!("{display}: {needle}"));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a handler or MCP tool reaches the D4 SELECTION pass directly. WHAT THIS MEASURES: exact \
+         substrings after whitespace collapse over epigraph-api/src/routes and \
+         epigraph-mcp/src/tools — an aliased import walks past it, and the real control is that \
+         `UnfilteredSelection`'s field is private and its id-bearing exits take the actor's own \
+         Viewer. WHY THE RULE: the selection pass runs unfiltered by necessity, so a value it \
+         produced is not safe to serialise; `PrivatizationRepository::select` returns it wrapped \
+         precisely so a handler cannot get a bare Uuid out of it, and the restricted names are \
+         the ways around that wrapper. If a request path genuinely needs the raw selection, that \
+         is a design change and this test is where it is argued. Offenders: {offenders:?}"
+    );
+}
+
 /// `instance_admins` is the authority behind every privatization, and PR-18a's
 /// acceptance clause is that it is empty after migration and stays empty until
 /// an operator grants. That clause is only true while the request path cannot

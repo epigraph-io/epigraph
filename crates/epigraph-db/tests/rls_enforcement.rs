@@ -110,22 +110,25 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
     // routes are 18b and the apply/revert handlers are 18c. A read policy with
     // no consumer is a grant nobody asked for.
     //
-    // Because this register is exact in BOTH directions, 18b cannot add a
+    // Because this register is exact in BOTH directions, a slice cannot add a
     // policy to either table without deleting the matching row here in the same
     // commit — which is the property that makes the eight rows worth their
     // weight rather than boilerplate.
-    (
-        "privatization_plans",
-        "SELECT",
-        "PR-18a ships no reader. 18b's preview route owns the SELECT policy and \
-         deletes this row in the same commit.",
-    ),
-    (
-        "privatization_plans",
-        "INSERT",
-        "PR-18a ships no writer. Plans are created by 18b's route on the \
-         maintenance pool, which is where the INSERT policy belongs.",
-    ),
+    //
+    // AMENDED TWICE. The first amendment recorded that 18b's SECOND slice did
+    // not do what the paragraph above predicts: it shipped the selection pass as
+    // a repo-layer computation with no route, no persisted plan and therefore no
+    // policy, because adding one needs a migration and no number was assigned to
+    // it. THE THIRD SLICE CLAIMED 087 AND DID. The four SELECT/INSERT pairs the
+    // paragraph above predicted are gone from this register, deleted in the same
+    // commit as `migrations/087_privatization_plan_policies.sql`, which is the
+    // property that makes the remaining rows worth their weight.
+    //
+    // What is left is UPDATE and DELETE on both tables, and their owners are
+    // unchanged. Migration 080's header states the whole-slice expectation and
+    // is FROZEN by the applied-checksum rule, so it cannot be corrected there;
+    // that disagreement is recorded rather than resolved by silence, which is
+    // this register's own culture rule.
     (
         "privatization_plans",
         "UPDATE",
@@ -137,17 +140,6 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
         "DELETE",
         "A plan is the record that a privatization was attempted and is never \
          deleted. Nothing is expected to claim this pair.",
-    ),
-    (
-        "privatization_plan_items",
-        "SELECT",
-        "The frozen item set is a complete index of every entity a plan would \
-         privatize. PR-18a ships no reader; 18b's preview owns it.",
-    ),
-    (
-        "privatization_plan_items",
-        "INSERT",
-        "Items are materialised by the selection pass, which is 18b.",
     ),
     (
         "privatization_plan_items",

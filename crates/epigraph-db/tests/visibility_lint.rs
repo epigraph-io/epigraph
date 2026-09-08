@@ -480,6 +480,37 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          rows. There is nothing for a Viewer to filter on; adding one would be decoration.",
     ),
     (
+        "privatization.rs",
+        "load_plan_conn",
+        "READ of `privatization_plans`, which has NO tenancy column at all — no `visibility`, no \
+         `owner_group_id` — so there is no predicate to splice and a `Viewer` parameter could not \
+         be spent. Its tenancy is migration 087's `privatization_plans_read` policy (instance \
+         admin AND group admin of the plan's target group), which selects on the CONNECTION, so \
+         this must be given a STAMPED app connection; on a maintenance connection \
+         `epigraph_bypass()` is true and the policy admits every row. The projected columns carry \
+         no entity ids.",
+    ),
+    (
+        "privatization.rs",
+        "list_plans_conn",
+        "READ of `privatization_plans`, same absent-tenancy-column argument as `load_plan_conn`. \
+         It is the one of the three that does NOT rely on 087's policy alone: FINAL-PLAN §6.6's \
+         conjunction is spliced into its `WHERE` from the same session helpers the policy uses, so \
+         two independent filters bind. That predicate is written by hand rather than by \
+         `Viewer::splice`, because a `Viewer` filters on row columns this table does not have.",
+    ),
+    (
+        "privatization.rs",
+        "load_plan_items_conn",
+        "READ of `privatization_plan_items`, which likewise has no `visibility` and no \
+         `owner_group_id`; migration 087's `privatization_plan_items_read` resolves the target \
+         group THROUGH the plan row. Its projection DOES carry entity ids, and 087's policy is not \
+         the same property as being able to read each selected claim — so its caller must re-render \
+         them through `visible_previews`, which takes the actor's viewer. A future widening of this \
+         statement into a join on `claims` would be a viewer-less read of tenanted content and must \
+         take a `&Viewer` instead of inheriting this entry.",
+    ),
+    (
         "provenance.rs",
         "append_conn",
         "WRITE, append-only, into `provenance_log`. It records who authorised a write that the \
@@ -502,12 +533,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// because the `.db_pool` access is gone. The two together would certify
 /// "converted" for a read that filters on nothing.
 ///
-/// So the key is the NAME. Fourteen `*_conn` functions exist today; five take a
+/// So the key is the NAME. Seventeen `*_conn` functions exist today; five take a
 /// `Viewer` (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}` and,
 /// from PR-26, `LineageRepository::{get_lineage_conn, get_descendants_conn}`)
-/// and the nine below are enumerated with reasons. Seven of the nine are writes,
-/// where migration 077's `WITH CHECK` rather than a read predicate is the
-/// control.
+/// and the twelve below are enumerated with reasons. Seven of the twelve are
+/// writes, where migration 077's `WITH CHECK` rather than a read predicate is
+/// the control.
+///
+/// # The name rule is also the hole, and PR-18 fell in it
+///
+/// Keying on the name means a viewer-less `&mut PgConnection` read called
+/// anything else is invisible to all three registers in this file at once.
+/// PR-18's third slice shipped `load_plan`, `list_plans` and `load_plan_items`
+/// exactly that way — reads of the plan tables, one of them projecting entity
+/// ids — and they were registered nowhere. They are the last three entries in
+/// [`CONN_WITHOUT_VIEWER`] and were RENAMED to earn them. The alternative,
+/// widening the selector to "parameter list mentions `PgConnection`", is a
+/// larger change to this lint's contract than a route slice should make; it is
+/// recorded as a follow-up rather than done here.
 ///
 /// Counted by this test's own rule — name ends `_conn` AND the parameter list
 /// mentions `PgConnection` — not by a bare grep for `_conn`, which finds a
@@ -878,6 +921,62 @@ fn the_edge_marker_scanner_is_not_vacuous() {
         (false, Some("evidence".to_string())),
         "{by_alias:?}"
     );
+
+    // A SCHEMA-QUALIFIED table resolves to its bare name.
+    //
+    // Both directions are asserted because the qualifier broke both. The
+    // second is the one that mattered: before the fix, `FROM public.edges e`
+    // with the SINGLE-OWNER marker resolved to `public.edges`, missed the
+    // `Some("edges")` arm, and read as compliance — so the qualified spelling
+    // was a way to write the exact leak this file exists to refuse.
+    let qualified_edge = "let sql = viewer.splice(\"SELECT 1 FROM public.edges e \
+                          WHERE true /* {EDGE_VISIBILITY:e} */\", 2);";
+    let got = markers_with_their_tables(qualified_edge);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].2, got[0].3.as_deref()),
+        (true, Some("edges")),
+        "a schema-qualified edges read must resolve to `edges`, or the correct EDGE spelling is \
+         reported as an error on a table that does not exist"
+    );
+
+    let qualified_plain = "let sql = viewer.splice(\"SELECT 1 FROM public.edges e \
+                           WHERE true /* {VISIBILITY:e} */\", 2);";
+    let got = markers_with_their_tables(qualified_plain);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].2, got[0].3.as_deref()),
+        (false, Some("edges")),
+        "a schema-qualified edges read taking the SINGLE-OWNER predicate must still resolve to \
+         `edges`, or the ratchet is evaded by writing `public.` in front of the table"
+    );
+
+    // A marker in a JOIN's `ON` clause, with a SECOND marker on the driving
+    // table. `repos/privatization.rs` writes both shapes — a `LEFT JOIN`
+    // predicate has to live in `ON`, because a `WHERE` on the right-hand table
+    // would silently turn it back into an inner join — and this scanner's
+    // `continue` paths are silent, so a marker it skipped would look exactly
+    // like a marker it approved.
+    let joined = "let sql = viewer.splice(\"SELECT 1 FROM public.edges e \
+                  JOIN public.claims oc ON oc.id = e.target_id /* {VISIBILITY:oc} */ \
+                  WHERE true /* {EDGE_VISIBILITY:e} */\", 2);";
+    let got = markers_with_their_tables(joined);
+    assert_eq!(
+        got.len(),
+        2,
+        "BOTH markers must be seen. One skipped marker is one unfiltered read the lint \
+         reports as compliant: {got:?}"
+    );
+    assert_eq!(
+        (got[0].1.as_str(), got[0].2, got[0].3.as_deref()),
+        ("oc", false, Some("claims")),
+        "a marker in an ON clause must bind to the table the JOIN names: {got:?}"
+    );
+    assert_eq!(
+        (got[1].1.as_str(), got[1].2, got[1].3.as_deref()),
+        ("e", true, Some("edges")),
+        "and the driving table's own marker must not be captured by the later JOIN: {got:?}"
+    );
 }
 
 /// `(line, alias, is_edge_spelling, table_the_alias_names)` for every marker.
@@ -945,7 +1044,27 @@ fn last_binding(window: &str, alias: &str) -> Option<String> {
         let Some(tbl_raw) = words.get(i + 1) else {
             continue;
         };
-        let tbl = tbl_raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        let tbl =
+            tbl_raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_');
+        // STRIP THE SCHEMA QUALIFIER, AND WHY THIS IS NOT COSMETIC.
+        //
+        // `FROM public.edges e` resolved to the literal `public.edges`, which
+        // equals neither `edges` nor any other table this scanner compares
+        // against — so BOTH arms of the caller missed it. The
+        // `edge_marker_on_a_non_edges_table` arm produced a false ACCUSATION
+        // (measured: it reported `public.edges` as a table with "no
+        // co_owner_group_id column", which is exactly backwards), and the arm
+        // that matters for safety — an `edges` read taking the SINGLE-OWNER
+        // predicate — silently passed, because `Some("public.edges")` does not
+        // match `Some("edges")`. That direction is a fail-open: the qualified
+        // spelling was a way to write the leak this test exists to catch and
+        // have it read as compliance.
+        //
+        // The repo layer already schema-qualifies FUNCTIONS routinely
+        // (`FROM public.epigraph_claim_tenancy_by_ids(...) cx` in `event.rs`
+        // and `claim.rs`), so the qualified spelling is house style rather than
+        // a hypothetical, and a qualified TABLE was one edit away.
+        let tbl = tbl.rsplit('.').next().unwrap_or(tbl);
         if tbl.is_empty() {
             continue;
         }

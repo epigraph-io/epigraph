@@ -409,10 +409,8 @@ async fn main() {
 
         // A THIRD, deliberately small pool, and not a reuse of `job_pool`.
         //
-        // `AppState::maintenance_viewer` draws from this one. It has exactly
-        // ONE consumer today — `routes/claims.rs::find_claims_needing_embeddings`,
-        // the `claims:admin` embedding-gap enumerator — and that handler runs
-        // its statement on the connection it leases from here, not on
+        // `AppState::maintenance_viewer` draws from this one. Every consumer
+        // runs its statement on the connection it leases from here, not on
         // `state.db_pool`. That is what makes this pool load-bearing rather
         // than decorative: acquiring a privileged connection and querying the
         // application pool would be the same hybrid PR-15 deleted from the CLI
@@ -420,15 +418,35 @@ async fn main() {
         // check; if that grep ever returns zero call sites, delete this pool
         // rather than leaving it idling.)
         //
+        // CONSUMERS: `routes/claims.rs::find_claims_needing_embeddings` (the
+        // `claims:admin` embedding-gap enumerator) and, from PR-18's third
+        // slice, `routes/privatization.rs` — `create_plan` for the whole
+        // authorize/select/freeze span, and `require_plan_authority` once per
+        // `get_plan` / `get_plan_items`. That is a change of KIND as well as of
+        // number: it was an occasional operator-triggered read and it now
+        // includes a caller-facing read path.
+        //
+        // THE SIZE BELOW WAS DELIBERATELY NOT REVISITED IN THAT SLICE, and the
+        // reason is this comment's own next paragraph — a change to the
+        // connection budget is an availability change to the request path, and
+        // smuggling one inside a feature PR is the "unreviewable second
+        // decision" it warns about. The mitigation taken instead was to stop
+        // any single request holding a connection from two pools at once:
+        // `get_plan` and `get_plan_items` both commit their application
+        // transaction before acquiring from here. Re-sizing is filed with an
+        // owner in `docs/tenancy/progress.json`.
+        //
         // Handing that route the job pool instead would silently give it the
         // 45-minute `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`, which is an
         // availability change to the request path smuggled inside a
         // pool-plumbing change — exactly the "unreviewable second decision"
-        // `ScopedPool::connect`'s own doc warns about. Two connections: this is
-        // an occasional operator-triggered read, not a work queue. Each
-        // in-flight request pins one, so a third concurrent call waits on the
-        // acquire timeout; that is acceptable for an admin-scoped backfill
-        // enumerator and would not be for a caller-facing route.
+        // `ScopedPool::connect`'s own doc warns about. Two connections: this
+        // was sized for an occasional operator-triggered read, not a work
+        // queue. Each in-flight request pins one, so a third concurrent call
+        // waits on the acquire timeout; that was acceptable for an admin-scoped
+        // backfill enumerator, and whether it remains so now that an
+        // instance-admin route also draws from here is the open question named
+        // above.
         //
         // Connection budget at boot is therefore API(10) + jobs(8) +
         // maintenance(2) = 20, up from 18. See `docs/deploy.md` §1c-bis.

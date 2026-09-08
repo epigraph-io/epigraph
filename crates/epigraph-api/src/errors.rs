@@ -196,6 +196,19 @@ pub enum ApiError {
 
     #[error("Bad gateway: {reason}")]
     BadGateway { reason: String },
+
+    /// A surface whose SCHEMA SLOT exists and whose SEMANTICS deliberately do
+    /// not.
+    ///
+    /// Distinct from `ServiceUnavailable` (503, "try again"), from `BadRequest`
+    /// (400, "you asked wrongly") and from `NotFound` (404, "no such thing").
+    /// It means the request was well-formed and names a documented capability
+    /// this build does not implement, so a client must not retry and must not
+    /// conclude the field is a typo. FINAL-PLAN §6.5.1 requires exactly this for
+    /// a `saved_query` privatization selector: "Ship the schema slot; do not
+    /// ship the semantics."
+    #[error("Not implemented: {feature}")]
+    NotImplemented { feature: String },
 }
 
 /// JSON error response structure
@@ -278,6 +291,11 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_GATEWAY,
                 "BadGateway",
                 Some(serde_json::json!({ "reason": reason })),
+            ),
+            ApiError::NotImplemented { feature } => (
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                Some(serde_json::json!({ "feature": feature })),
             ),
         };
 

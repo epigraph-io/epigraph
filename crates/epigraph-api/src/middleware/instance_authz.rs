@@ -58,13 +58,18 @@
 //! function exists so a refusal is a 403 with a reason rather than a 500
 //! carrying a raw SQLSTATE.
 //!
-//! # Why this takes `pool` as a parameter
+//! # Why this takes a CONNECTION as a parameter
 //!
 //! `no_unscoped_pool.rs` scans all of `crates/epigraph-api/src` for `.db_pool`
-//! against an exact per-file register with monotone ceilings. Taking the pool as
-//! an argument — the `group_authz.rs` precedent — keeps this file off that
-//! register entirely; the routes that will call it (PR-18b) are where the
-//! connection-shape decision belongs.
+//! against an exact per-file register with monotone ceilings. Taking the
+//! database handle as an argument — the `group_authz.rs` precedent — keeps this
+//! file off that register entirely.
+//!
+//! It is a `&mut PgConnection` rather than a `&PgPool` because the route that
+//! calls it cannot produce a pool at all under that ban: every handle
+//! `AppState` offers a converted handler is a connection
+//! (`AppState::read_as`, `AppState::maintenance_viewer`). Which of those two it
+//! must be is no longer deferred; see the function's own doc.
 
 use uuid::Uuid;
 
@@ -94,29 +99,38 @@ pub const TARGET_GROUP_MIN_OTHER_ADMINS: i64 = 2;
 /// Returns the caller's `agent_id` on success, so a handler does not have to
 /// re-unwrap `auth.agent_id` and cannot accidentally proceed with `None`.
 ///
-/// # ⚠ `pool` must be stamped or maintenance — 18b's decision, stated here
+/// # ⚠ `conn` must be the MAINTENANCE connection — 18b's decision, made here
 ///
-/// On a BARE, UNSTAMPED `epigraph_app` pool, condition 2 is false for every
-/// caller and this function denies everyone: `epigraph_is_instance_admin` binds
-/// its subject to `epigraph.principal_id`, which only
-/// [`epigraph_db::pool::ScopedPool`] sets. That is fail-CLOSED — there is no
-/// configuration in which this admits a caller it should not — but it is a
-/// silent, total denial rather than an error, so it would present as "the
-/// operator's grant did not work".
+/// An earlier revision of this function took a `&sqlx::PgPool` and left the
+/// connection shape to its first caller. `routes/privatization.rs` is that
+/// caller, and it chose the maintenance connection. Both halves of the reason
+/// are recorded because each rules out a different alternative:
 ///
-/// The requirement is repeated here rather than left on
-/// `InstanceAdminRepository::is_active` one crate away, because THIS is the item
-/// a route will call and the connection shape is chosen at that call site. The
-/// argument is a bare `&sqlx::PgPool` and therefore carries no such guarantee in
-/// its type; see the header's last section for why the pool is a parameter at
-/// all.
+/// * **Not a bare, unstamped `epigraph_app` pool.** Condition 2 would be false
+///   for every caller — `epigraph_is_instance_admin` admits
+///   `p_agent = epigraph_principal_id() OR epigraph_bypass()`, and an unstamped
+///   app session satisfies neither. Fail-CLOSED, but a silent total denial that
+///   presents as "the operator's grant did not work".
+/// * **Not a stamped app connection either, which is the less obvious half.**
+///   Condition 2 works there, but conditions 3b and 4 count
+///   `group_memberships` rows, and migration 077's policy narrows that table to
+///   what the CALLER can see. A caller who cannot see the target group's other
+///   admins would be told there are none. That is also fail-closed, and it is
+///   also wrong — and it is indistinguishable from the true refusal, which is
+///   precisely what this function exists to prevent.
+///
+/// The parameter is a bare `&mut sqlx::PgConnection` and therefore carries no
+/// such guarantee in its type. It is a connection rather than a pool so a route
+/// can supply one at all: `no_unscoped_pool.rs` bans `.db_pool` under
+/// `crates/epigraph-api/src` against an exact register, and every pool
+/// `AppState` will hand out is behind a connection-yielding accessor.
 ///
 /// # Errors
 ///
 /// * `ApiError::Forbidden` — any of the four conditions fails. Every failure is
 ///   a 403 with a distinct reason and none of them leaks whether the target
 ///   group exists to a caller who is not already an instance admin: conditions
-///   1 and 2 are checked before the group is read at all.
+///   1 and 2 are checked before the group's own facts are consulted.
 /// * `ApiError::NotFound` — the target group does not exist. Only reachable by
 ///   a caller who has already cleared conditions 1 and 2.
 /// * `ApiError::InternalError` — the database query failed. A failure is never
@@ -125,11 +139,9 @@ pub const TARGET_GROUP_MIN_OTHER_ADMINS: i64 = 2;
 pub async fn require_instance_admin_for_group(
     auth: &AuthContext,
     target_group_id: Uuid,
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
 ) -> Result<Uuid, ApiError> {
     use chrono::{Duration, Utc};
-    use epigraph_db::repos::group::GroupRepository;
-    use epigraph_db::repos::group_membership::GroupMembershipRepository;
     use epigraph_db::repos::instance_admin::InstanceAdminRepository;
 
     // 1. Token scope.
@@ -146,33 +158,41 @@ pub async fn require_instance_admin_for_group(
         reason: "instance:admin requires an agent identity".to_string(),
     })?;
 
+    // All four facts in one statement. See
+    // `InstanceAdminRepository::privatization_authority` for why they are read
+    // together rather than across four round trips — the short version is that
+    // the target group can lose its second admin between two of them.
+    //
+    // Reading them together means conditions 3 and 4 are EVALUATED before
+    // condition 2 is CHECKED. The order the header promises is preserved by the
+    // order of the branches below, and the probe discloses nothing: it returns
+    // four facts to this process, and this process returns a 403 naming only
+    // "not an instance administrator" when condition 2 fails.
+    let authority =
+        InstanceAdminRepository::privatization_authority(conn, agent_id, target_group_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?;
+
     // 2. The instance's own record. Asked through
     // `epigraph_is_instance_admin(uuid)`, not by reading `instance_admins` —
     // see that repository's module docs.
-    if !InstanceAdminRepository::is_active(pool, agent_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?
-    {
+    if !authority.is_instance_admin {
         return Err(ApiError::Forbidden {
             reason: "not an instance administrator".to_string(),
         });
     }
 
-    // 3a. Maturity. `GroupRepository::get_by_id` — NOT `get`, which the plan's
-    // sketch names and which does not exist.
-    let group = GroupRepository::get_by_id(pool, target_group_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?
+    // 3a. Maturity.
+    let created_at = authority
+        .target_group_created_at
         .ok_or(ApiError::NotFound {
             entity: "group".to_string(),
             id: target_group_id.to_string(),
         })?;
 
-    if group.created_at > Utc::now() - Duration::hours(TARGET_GROUP_MIN_AGE_HOURS) {
+    if created_at > Utc::now() - Duration::hours(TARGET_GROUP_MIN_AGE_HOURS) {
         return Err(ApiError::Forbidden {
             reason: format!(
                 "target group must pre-exist the plan by {TARGET_GROUP_MIN_AGE_HOURS}h"
@@ -181,13 +201,7 @@ pub async fn require_instance_admin_for_group(
     }
 
     // 3b. Plurality.
-    let other_admins =
-        GroupMembershipRepository::count_live_admins_excluding(pool, target_group_id, agent_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: e.to_string(),
-            })?;
-    if other_admins < TARGET_GROUP_MIN_OTHER_ADMINS {
+    if authority.other_live_admins < TARGET_GROUP_MIN_OTHER_ADMINS {
         return Err(ApiError::Forbidden {
             reason: format!(
                 "target group needs >= {TARGET_GROUP_MIN_OTHER_ADMINS} live admins besides you"
@@ -197,17 +211,14 @@ pub async fn require_instance_admin_for_group(
 
     // 4. Group admin in the TARGET group. `role == "admin"` ONLY: `creator` is
     // unstorable under `group_memberships_role_check` and the branch that
-    // accepted it was deleted in PR-02.
-    match GroupMembershipRepository::get_member_role(pool, target_group_id, agent_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })? {
-        Some(role) if role == "admin" => Ok(agent_id),
-        _ => Err(ApiError::Forbidden {
+    // accepted it was deleted in PR-02. The probe asks for that role by name.
+    if !authority.is_target_group_admin {
+        return Err(ApiError::Forbidden {
             reason: "admin role in the target group required".to_string(),
-        }),
+        });
     }
+
+    Ok(agent_id)
 }
 
 #[cfg(all(test, feature = "db"))]

@@ -48,6 +48,7 @@ pub mod paper;
 pub mod pattern_template;
 pub mod perspective;
 pub mod political;
+pub mod privatization;
 pub mod provenance;
 pub mod provenance_chain;
 pub mod recall_event;

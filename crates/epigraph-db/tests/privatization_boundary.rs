@@ -52,6 +52,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use epigraph_db::repos::privatization::PrivatizationRepository;
 use epigraph_db::repos::{EdgeRepository, SemanticLinkRepository};
 use epigraph_db::visibility::Viewer;
 use sqlx::PgPool;
@@ -713,5 +714,310 @@ async fn a_malformed_co_owner_is_a_check_violation_not_a_query_failure(pool: PgP
             epigraph_db::DbError::CheckViolation { .. }
         ),
         "a co-owner without visibility = 'group' is a CHECK violation"
+    );
+}
+
+// ===========================================================================
+// 3 — the D4 boundary SURVEY, over the same four endpoint shapes
+//
+// §8.6 puts the boundary survey in this file. Sections 1 and 2 above pin the
+// trigger-level meet — what tenancy an edge ACQUIRES. This section pins the
+// four `PrivatizationRepository` functions that read that tenancy back out and
+// turn it into what an operator is shown before they approve a plan.
+//
+// The pool these tests run on is the `#[sqlx::test]` pool, which connects as
+// `epigraph` — superuser and `rolbypassrls`. That is deliberate and it is what
+// makes the negative assertions attributable: RLS is not filtering anything
+// here, so the spliced `Viewer` predicate is the ONLY control, and a rendering
+// function that forgot it would show a stranger every edge and fail the test
+// rather than being covered for by the policy. Section 2's reads are on the
+// same pool for the same reason.
+// ===========================================================================
+
+/// An edge with a caller-chosen relationship, tenancy left to the trigger.
+async fn seed_edge_rel(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', $3, \
+                 jsonb_build_object('created_by', $4::text, 'strength', 0.7)) \
+         RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .bind(Uuid::new_v4().to_string())
+    .fetch_one(pool)
+    .await
+    .expect("insert edge")
+}
+
+/// `boundary_edge_counts` counts edges with EXACTLY ONE endpoint in the
+/// selection, grouped by relationship — including the cross-group co-owned one.
+///
+/// The wholly-inside edge is the discriminating case. A survey written with
+/// `OR` instead of the symmetric difference would report it, and would then
+/// tell the operator that privatizing a connected component leaves a boundary
+/// where it leaves none — which is the failure mode that makes the warning
+/// ignorable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boundary_survey_counts_one_endpoint_edges_by_relationship(pool: PgPool) {
+    let c = corpus(&pool).await;
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    // Selection: G's private claim and one of the public claims.
+    let selection = vec![c.claim_g, c.public_b];
+
+    seed_edge_rel(&pool, c.claim_g, c.public_a, "supports").await;
+    seed_edge_rel(&pool, c.public_a, c.public_b, "supports").await;
+    // Cross-group: co-owned by G and H (migration 072), and still a boundary.
+    seed_edge_rel(&pool, c.claim_g, c.claim_h, "derived_from").await;
+    // WHOLLY INSIDE the selection: not a boundary at all.
+    let inside = seed_edge_rel(&pool, c.claim_g, c.public_b, "contradicts").await;
+    let (_, _, co) = edge_tenancy(&pool, inside).await;
+    assert!(
+        co.is_none(),
+        "fixture sanity: the inside edge is single-owned"
+    );
+
+    let counts = PrivatizationRepository::boundary_edge_counts(&mut conn, &bypass, &selection)
+        .await
+        .expect("boundary survey");
+    let of = |rel: &str| {
+        counts
+            .iter()
+            .find(|b| b.relationship == rel)
+            .map(|b| b.count)
+    };
+
+    assert_eq!(
+        of("supports"),
+        Some(2),
+        "both one-endpoint `supports` edges straddle the boundary: {counts:?}"
+    );
+    assert_eq!(
+        of("derived_from"),
+        Some(1),
+        "the CROSS-GROUP edge is a boundary edge too. It is the one an operator most needs \
+         reported, because after the plan applies it is the only remaining link between two \
+         private regions: {counts:?}"
+    );
+    assert_eq!(
+        of("contradicts"),
+        None,
+        "an edge with BOTH endpoints inside the selection is not a boundary; reporting it \
+         would inflate the one number the operator is asked to act on: {counts:?}"
+    );
+}
+
+/// `visible_boundary_edges` names only the edges the ACTOR's own viewer admits.
+///
+/// This is the rendering-side half of the sec-F7 split — the edge-id
+/// counterpart to `visible_previews`. The co-owned edge is the sharp case: a
+/// principal in G alone must not learn the id of an edge that names H's claim,
+/// because the id is the disclosure.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boundary_edge_sample_is_filtered_by_the_actors_own_viewer(pool: PgPool) {
+    let c = corpus(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let selection = vec![c.claim_g];
+
+    // Meets at G (public × group G): readable by a member of G.
+    let single_owned = seed_edge_rel(&pool, c.claim_g, c.public_a, "supports").await;
+    // Co-owned by G and H: readable only by a principal in BOTH.
+    let co_owned = seed_edge_rel(&pool, c.claim_g, c.claim_h, "derived_from").await;
+
+    let (_, _, co) = edge_tenancy(&pool, co_owned).await;
+    assert_eq!(
+        co,
+        Some(c.group_h),
+        "fixture precondition: the cross-group edge must really be co-owned, or the \
+         intersection assertion below is vacuous"
+    );
+
+    async fn sample(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        selection: &[Uuid],
+    ) -> Vec<Uuid> {
+        PrivatizationRepository::visible_boundary_edges(conn, viewer, selection, 50)
+            .await
+            .expect("sample")
+    }
+
+    let stranger = sample(&mut conn, &c.stranger, &selection).await;
+    assert!(
+        stranger.is_empty(),
+        "a stranger to both groups learns no boundary edge id: {stranger:?}"
+    );
+
+    let in_g = sample(&mut conn, &c.in_g, &selection).await;
+    assert!(
+        in_g.contains(&single_owned),
+        "POSITIVE CONTROL: a member of G must still get the edge G owns outright. Without \
+         this, a function returning nothing at all passes every other assertion here"
+    );
+    assert!(
+        !in_g.contains(&co_owned),
+        "the co-ownership clause is an INTERSECTION: membership in G alone must not reveal \
+         the id of an edge that also names H's claim"
+    );
+
+    let in_both = sample(&mut conn, &c.in_both, &selection).await;
+    assert!(
+        in_both.contains(&co_owned) && in_both.contains(&single_owned),
+        "a principal in BOTH groups sees both, which is what makes the denial above an \
+         authority decision rather than a broken read: {in_both:?}"
+    );
+
+    // A caller that asks for no sample gets none, rather than one id.
+    let none =
+        PrivatizationRepository::visible_boundary_edges(&mut conn, &c.in_both, &selection, 0)
+            .await
+            .expect("a zero sample bound is not an error");
+    assert!(
+        none.is_empty(),
+        "limit = 0 means NO sample. Rounding it up to one id is a silent widening in the \
+         function whose whole job is to bound how many ids leave: {none:?}"
+    );
+
+    // AND THE BOUND REACHES THE STATEMENT. `in_both` can read two boundary
+    // edges, so asking for one must yield one. Without this, `limit` could stop
+    // being bound to `LIMIT $2` entirely — every other assertion here uses a
+    // bound larger than the result set and would not notice.
+    let one = PrivatizationRepository::visible_boundary_edges(&mut conn, &c.in_both, &selection, 1)
+        .await
+        .expect("sample");
+    assert_eq!(
+        one.len(),
+        1,
+        "the caller's sample bound must reach the statement, not merely the doc comment. \
+         MAX_BOUNDARY_EDGE_SAMPLE ceilings the same parameter: {one:?}"
+    );
+}
+
+/// `authors_losing_own_claims` counts authors who are not LIVE members of the
+/// target group.
+///
+/// The revoked-membership case is the one that decides whether the count is
+/// real: a membership row that exists but is revoked confers no read access
+/// after the move, so its author is losing their own claim exactly as an author
+/// with no row at all is. `revoked_at IS NULL` is one clause, and dropping it
+/// would under-report — which reads as "nobody is harmed, no acknowledgement
+/// needed" and silently defeats the dual-control gate this number drives.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_author_loss_count_ignores_a_revoked_membership(pool: PgPool) {
+    let c = corpus(&pool).await;
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let member = seed_agent(&pool).await;
+    let revoked = seed_agent(&pool).await;
+    let outsider = seed_agent(&pool).await;
+    join(&pool, c.group_g, member).await;
+    join(&pool, c.group_g, revoked).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(c.group_g)
+    .bind(revoked)
+    .execute(&pool)
+    .await
+    .expect("revoke the membership");
+
+    let mut selection = Vec::new();
+    for author in [member, revoked, outsider] {
+        selection.push(fixture::seed_public_claim(&pool, author, "authored").await);
+    }
+
+    let losing = PrivatizationRepository::authors_losing_own_claims(
+        &mut conn, &bypass, &selection, c.group_g,
+    )
+    .await
+    .expect("author loss");
+    assert_eq!(
+        losing, 2,
+        "the revoked member and the outsider both lose read access to their own claim; the \
+         live member does not"
+    );
+
+    // CALIBRATION: point the same selection at a group all three belong to and
+    // the count must fall to zero, so the 2 above is a membership decision and
+    // not a constant.
+    for author in [member, revoked, outsider] {
+        join(&pool, c.group_h, author).await;
+    }
+    let none = PrivatizationRepository::authors_losing_own_claims(
+        &mut conn, &bypass, &selection, c.group_h,
+    )
+    .await
+    .expect("author loss");
+    assert_eq!(
+        none, 0,
+        "no author loses a claim moving into a group they are all live members of"
+    );
+}
+
+/// `omitted_edge_types` reports a relationship the request did NOT traverse,
+/// and stays silent about the traversed one and about structural types.
+///
+/// The structural exclusion is not cosmetic: `select_closure` REFUSES those
+/// four relationships, so listing one as a missed opportunity would advertise
+/// the single request this layer will not answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_omitted_edge_type_warning_names_only_what_was_left_untraversed(pool: PgPool) {
+    let c = corpus(&pool).await;
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let selection = vec![c.claim_g];
+
+    seed_edge_rel(&pool, c.claim_g, c.public_a, "derived_from").await;
+    seed_edge_rel(&pool, c.claim_g, c.public_b, "decomposes_to").await;
+    seed_edge_rel(&pool, c.claim_g, c.claim_h, "within_frame").await;
+    // TWO edges of one untraversed relationship pointing at the SAME far
+    // claim, in opposite directions. `would_add` answers "how many more claims
+    // would this relationship have added", so the answer is one claim, not two
+    // edges — and the pair also exercises both arms of the CASE that picks the
+    // far endpoint.
+    seed_edge_rel(&pool, c.claim_g, c.public_a, "contradicts").await;
+    seed_edge_rel(&pool, c.public_a, c.claim_g, "contradicts").await;
+
+    let traversed = vec!["derived_from".to_string()];
+    let warnings =
+        PrivatizationRepository::omitted_edge_types(&mut conn, &bypass, &selection, &traversed)
+            .await
+            .expect("omitted edge types");
+    let of = |rel: &str| {
+        warnings
+            .iter()
+            .find(|w| w.relationship == rel)
+            .map(|w| w.would_add)
+    };
+
+    assert_eq!(
+        of("decomposes_to"),
+        Some(1),
+        "POSITIVE CONTROL: an untraversed relationship with a live claim on the far side is \
+         exactly what the warning exists to surface: {warnings:?}"
+    );
+    assert_eq!(
+        of("derived_from"),
+        None,
+        "the relationship the request DID traverse is already in the selection and is not a \
+         missed opportunity: {warnings:?}"
+    );
+    assert_eq!(
+        of("within_frame"),
+        None,
+        "a structural relationship is refused as a traversal, so it must not be advertised \
+         as one: {warnings:?}"
+    );
+    assert_eq!(
+        of("contradicts"),
+        Some(1),
+        "`would_add` is a count of CLAIMS, not of edges: two edges to the same far claim \
+         would add that one claim. An edge count here would overstate the warning the \
+         operator is asked to act on, in the direction that makes it ignorable: {warnings:?}"
     );
 }
