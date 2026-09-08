@@ -308,14 +308,19 @@
 //! the series that does — until 077 there was no policy in `pg_policy` at all.
 //!
 //! * **D4 gains a subject.** `migrations/077_rls_policies.sql` installs the
-//!   policy set and `079_rls_force.sql` FORCEs it over
-//!   [`FORCE_PROTECTED_SET`]. The per-command coverage table D4 asks for lives
-//!   in `crates/epigraph-db/tests/rls_enforcement.rs`, enumerated from
+//!   policy set and `079_rls_force.sql` FORCEs the 35 relations it names. It is
+//!   NOT the only source of [`FORCE_PROTECTED_SET`] — see the next bullet and
+//!   that constant's own doc comment. The per-command coverage table D4 asks for
+//!   lives in `crates/epigraph-db/tests/rls_enforcement.rs`, enumerated from
 //!   `pg_policy.polcmd` and never from the migration text, with an exact
 //!   `DELIBERATELY_UNCOVERED` register.
 //! * **The locked array is 062's `tier_a` (25) ∪ the ten group/identity/
-//!   encryption control tables**, asserted by
-//!   [`d4_the_force_array_is_tier_a_plus_the_control_tables`]. The plan says
+//!   encryption control tables ∪ the four privatization tables (PR-18a)**,
+//!   asserted by [`d4_the_force_array_is_tier_a_plus_the_control_tables`]. The
+//!   first two terms are 079's array; the four privatization tables are NOT in
+//!   it and must never be added to it — 079 is applied and immutable, and
+//!   `080`–`083` FORCE themselves at creation on 078's `rls_canary` precedent.
+//!   The plan says
 //!   this array equals "the generated protected set ∪ the group/encryption/
 //!   admin tables"; **that formulation is not literally satisfiable** — the
 //!   generated set (`tenancy_coverage.rs::protected_set`) contains two VIEWs and
@@ -902,10 +907,249 @@ async fn d1_tenancy_tier_is_declared_never_defaulted(pool: PgPool) {
 // D4 — privatization is an explicit, audited administrative act
 // ===========================================================================
 //
-// PR-18: assert that every non-public row reachable through a privatization plan
-// has a `tenancy_transcription_log` entry, that `privatization_audit` is
-// append-only, and that the D4 HTTP surface is admin-only.
+// PR-18a discharges the SECOND and THIRD of the three obligations this slot
+// reserved — `privatization_audit` is append-only, and the D4 write surface is
+// admin-only — because 080–083 create the objects both are about.
 //
+// The FIRST — every non-public row reachable through a privatization plan has a
+// `tenancy_transcription_log` entry — stays reserved and belongs to 18c. It is a
+// property of the APPLY, and PR-18a ships no apply: no job handler, no route,
+// and `privatization_plan_items` with no write policy. An assertion over an
+// empty table would be vacuous, which is the failure mode this whole file
+// exists to refuse.
+
+/// **D4, locked.** `privatization_audit` and `security_events` are append-only
+/// by a control that also binds the TABLE OWNER.
+///
+/// RLS is not that control and cannot be. `ENABLE` exempts the owner outright,
+/// `FORCE` does not defeat `BYPASSRLS`, and a superuser holds `BYPASSRLS`
+/// implicitly — so a policy-only answer to "append-only" is satisfied by a
+/// database on which the owner can rewrite the audit trail at will. Migration
+/// 082's `BEFORE UPDATE OR DELETE … FOR EACH ROW` trigger is what binds every
+/// role including the owner, and this asserts the trigger is there and ARMED
+/// rather than merely defined.
+///
+/// `tgenabled` is checked because `ALTER TABLE … DISABLE TRIGGER` is a one-line,
+/// no-migration way to remove the control that leaves the catalog otherwise
+/// unchanged — the same reason `tenancy_triggers.rs` checks it for 070's
+/// stamping triggers.
+///
+/// STATED LIMIT, so a reader does not over-read this: a row-level trigger does
+/// not fire on `TRUNCATE`. `TRUNCATE` requires table ownership, which
+/// `epigraph_app` does not have, so the app role cannot reach it; an owner or
+/// maintenance connection can, and no assertion here would say so. 082's header
+/// carries the same statement.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d4_the_audit_tables_are_append_only_by_a_trigger_not_only_by_a_policy(pool: PgPool) {
+    // (table, trigger, function, tgtype, tgenabled)
+    let rows: Vec<(String, String, String, i16, String)> = sqlx::query_as(
+        "SELECT c.relname::text, t.tgname::text, p.proname::text, t.tgtype, t.tgenabled::text \
+           FROM pg_trigger t \
+           JOIN pg_class c ON c.oid = t.tgrelid \
+           JOIN pg_proc p ON p.oid = t.tgfoid \
+          WHERE NOT t.tgisinternal \
+            AND c.relnamespace = 'public'::regnamespace \
+            AND t.tgname IN ('privatization_audit_no_mutate', 'security_events_no_mutate') \
+          ORDER BY c.relname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit trigger catalog probe");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "migration 082 must install an immutability trigger on BOTH audit tables; got {rows:?}"
+    );
+
+    for (table, trigger, func, tgtype, tgenabled) in &rows {
+        assert_eq!(
+            func, "epigraph_audit_immutable",
+            "{table}.{trigger} must run 082's shared immutability body; a second body is a \
+             second thing to keep in step"
+        );
+        assert_eq!(
+            tgenabled, "O",
+            "{table}.{trigger} is not tgenabled='O'. ALTER TABLE ... DISABLE TRIGGER removes \
+             the control with no migration and no other catalog change."
+        );
+        // pg_trigger.tgtype bits: 1 = ROW, 2 = BEFORE, 4 = INSERT, 8 = DELETE,
+        // 16 = UPDATE. Asserted by bit rather than by equality so a later
+        // migration that ALSO covers INSERT does not fail this for being
+        // stricter than it was.
+        assert_eq!(*tgtype & 1, 1, "{table}.{trigger} must be FOR EACH ROW");
+        assert_eq!(*tgtype & 2, 2, "{table}.{trigger} must be BEFORE");
+        assert_eq!(
+            *tgtype & 8,
+            8,
+            "{table}.{trigger} must cover DELETE — an actor erasing its own audit trail is the \
+             whole threat"
+        );
+        assert_eq!(*tgtype & 16, 16, "{table}.{trigger} must cover UPDATE");
+    }
+}
+
+/// **D4, locked.** The D4 write surface is admin-only because there is NO
+/// request-path write surface at all.
+///
+/// `instance_admins` is the authority behind every privatization, and PR-18a's
+/// acceptance clause is that it is empty after migration and stays empty until
+/// an operator grants. That clause is only true while the request path cannot
+/// write the table. Two independent controls hold it — migration 083's `REVOKE
+/// INSERT, UPDATE, DELETE … FROM epigraph_app`, and a write policy pair whose
+/// only disjunct is `epigraph_bypass()`, which reads `session_user` and is false
+/// on an app connection — and this is the third: a SOURCE lint that no handler
+/// or MCP tool calls the write repository at all.
+///
+/// A source lint rather than a behavioural one on purpose. The behavioural half
+/// lives in `privatization_boundary.rs` / `privatization_authz.rs` and needs a
+/// non-owner role to be non-vacuous; this catches the case that matters
+/// EARLIEST — a future PR wiring `grant` into a route — at the point where it is
+/// still a diff, and it keeps holding if the grants are ever loosened.
+#[test]
+fn d4_no_request_path_writes_the_instance_admin_table() {
+    // THE SCAN IS RAW, NOT COMMENT-STRIPPED, AND THAT IS A CHOICE. `code_lines`
+    // exists in this file because prose explaining why a construct is banned
+    // would otherwise trip the ban — but the needles below are the very names a
+    // route's doc comment would want to use to state the rule. Stripping would
+    // let `// SAFETY: we call InstanceAdminRepository::grant only from ...` sit
+    // one edit away from being uncommented, and this is the one lint where the
+    // false positive (a comment naming the call) is cheaper than the false
+    // negative (a call hidden behind a `//` that a later edit reinstates).
+    // Consequence for a future author: say "the operator CLI's grant path"
+    // rather than spelling the symbol.
+    const BANNED: &[&str] = &[
+        "InstanceAdminRepository::grant",
+        "InstanceAdminRepository::revoke",
+        "INSERT INTO instance_admins",
+        "UPDATE instance_admins",
+        "DELETE FROM instance_admins",
+    ];
+    // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
+    //
+    // `InstanceAdminRepository::list` is `pub`, re-exported from
+    // `epigraph-db/src/lib.rs`, takes a bare `&PgPool` and carries no `Viewer`,
+    // so `visibility_lint.rs` never inspects it. On a STAMPED app pool
+    // `instance_admins_self_or_definer` narrows it to the caller's own row — but
+    // on the maintenance or superuser pool, which is the posture until plan §9.2
+    // step 11d, it returns the whole roster plus `granted_by` and `note`. A
+    // future `GET /api/v1/admin/instance-admins` calling `list(&state.db_pool,
+    // true)` would pass fmt, clippy, the whole suite and the write half of this
+    // lint. The roster is the authority list every privatization is checked
+    // against, so enumerating it is a target-selection read even though it
+    // mutates nothing.
+    //
+    // Only the two REQUEST-PATH crates are scanned. `epigraph-cli/src/bin` is
+    // forced onto the maintenance pool by `no_unmaintained_dsn.rs` and reading
+    // the roster there IS the operator CLI's job, and `epigraph-jobs/src` is
+    // 18c's chartered surface — banning a read it may legitimately need would be
+    // a rule written ahead of the decision that owns it. The write half scans
+    // all four because a grant is never legitimate outside the operator CLI.
+    const BANNED_READS: &[&str] = &["InstanceAdminRepository::list", "FROM instance_admins"];
+    const READ_ROOTS: usize = 2;
+    // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
+    // scanned `epigraph-api/src` and `epigraph-mcp/src` only — the two APP-POOL
+    // crates, where 083's REVOKE and its `epigraph_bypass()`-only write policies
+    // deny the write with `42501` no matter what the source says. The lint was
+    // redundant exactly where it looked and absent everywhere it would have
+    // bitten: `epigraph-jobs/src` runs on the MAINTENANCE pool (`bin/server.rs`
+    // builds `job_pool` from `maintenance_url`, and the tree's own `jobs_app`
+    // ROW_ONLY_BY_DESIGN note says so), and `no_unmaintained_dsn.rs` actively
+    // FORCES every `epigraph-cli/src/bin` target onto it. On those pools
+    // `epigraph_bypass()` is true and the grant SUCCEEDS.
+    //
+    // The realistic shape of the threat this lint's own failure message names is
+    // a route that ENQUEUES a job with the grant in the handler — and 18c is
+    // chartered to add `epigraph-jobs/src/privatization.rs`. So both pools are
+    // scanned, with one exact allowance for the single intended writer.
+    let roots = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../epigraph-api/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../epigraph-mcp/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../epigraph-jobs/src"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../epigraph-cli/src"),
+    ];
+    // The operator CLI: the one intended writer. The allowance is a path suffix
+    // rather than a file name so a second `instance_admin.rs` elsewhere in the
+    // scanned tree does not inherit it.
+    const ALLOWED: &str = "epigraph-cli/src/bin/instance_admin.rs";
+
+    let mut offenders: Vec<String> = Vec::new();
+    for (idx, root) in roots.into_iter().enumerate() {
+        // `roots` is ordered api, mcp, jobs, cli; the first `READ_ROOTS` are the
+        // request-path crates that the read half applies to. Pinned rather than
+        // matched on the path string so reordering `roots` cannot silently move
+        // the read ban onto the operator CLI.
+        let reads_banned = idx < READ_ROOTS;
+        let sources = rust_sources(std::path::Path::new(root));
+        // VACUITY GUARD. `rust_sources` returns an empty `Vec` when `read_dir`
+        // fails, so a crate rename or a moved `src` would silently turn this
+        // whole test into `assert!(vec![].is_empty())` — in the one file whose
+        // stated purpose is refusing vacuous assertions. Every other lint here
+        // goes through `read`, which panics on a missing path and therefore
+        // cannot go quiet.
+        assert!(
+            !sources.is_empty(),
+            "scan root {root} yielded no .rs files; the lint would pass vacuously"
+        );
+        for path in sources {
+            let display = path.display().to_string();
+            if display.replace('\\', "/").contains(ALLOWED) {
+                continue;
+            }
+            // Collapse runs of whitespace before matching. The needles are exact
+            // substrings, so a raw SQL literal wrapped as `INSERT INTO\n
+            // instance_admins` would evade every one of them; the module's
+            // `code_lines` convention already concedes these scanners are
+            // textual approximations, and here the approximation and the root
+            // set were failing in the same direction.
+            let src = read(path.to_str().expect("utf-8 path"));
+            let flat = src.split_whitespace().collect::<Vec<_>>().join(" ");
+            let applicable = BANNED
+                .iter()
+                .chain(if reads_banned { BANNED_READS } else { &[] });
+            for needle in applicable {
+                if flat.contains(needle) {
+                    offenders.push(format!("{display}: {needle}"));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a literal-source scan over epigraph-api/src, epigraph-mcp/src, epigraph-jobs/src and \
+         epigraph-cli/src found a banned instance_admins reference. WHAT THIS MEASURES: exact \
+         substrings, after whitespace collapse, with one path allowance for the operator CLI — \
+         so an aliased import (`use … as Admins; Admins::grant`) or a `format!`-built table name \
+         walks past it, and the DATABASE controls are the real boundary (083's REVOKE plus \
+         write policies whose only disjunct is epigraph_bypass(), asserted behaviourally in \
+         privatization_authz.rs). WHY THE RULE: granting the D4 authority is an operator action \
+         taken out of band, over epigraph_maintenance, through the epigraph-instance-admin CLI — \
+         a route that could grant it would let a token escalate itself into the authority the \
+         token is checked against, and a job handler on the maintenance pool is the same \
+         escalation with one hop of indirection. The read ban covers the two request-path crates \
+         only: on the maintenance pool `list` returns the entire roster, which is the authority \
+         list every privatization is checked against. Offenders: {offenders:?}"
+    );
+}
+
+/// Every `.rs` file under `dir`, recursively. `read` below takes a path string,
+/// so this yields owned paths rather than borrowing an iterator's temporary.
+fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rust_sources(&path));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
 // Nothing to assert at PR-04: none of those objects exists yet. Migration 062
 // creates `tenancy_transcription_log` as an empty ledger; `tenancy_migration_shape.rs`
 // pins its shape.
@@ -1371,13 +1615,27 @@ async fn d1_the_co_owner_column_has_no_default_and_cannot_widen(pool: PgPool) {
 // D4 — the FORCE array (PR-17)
 // ===========================================================================
 
-/// Migration 079's protected set, transcribed.
+/// Every relation the migrations FORCE, transcribed.
 ///
 /// A test that read the array back out of the catalog would agree with the
 /// migration by construction, including when the migration is wrong. This is
-/// the third independent copy — the other two are `079_rls_force.sql` itself
+/// the third independent copy — the other two are `docs/runbooks/079-undo.sql`
 /// and `epigraph_api::state::FORCE_PROTECTED_SET` — and the assertion below
-/// pins all of them to 062's `tier_a` plus a named ten.
+/// pins all of them to 062's `tier_a` plus a named ten plus a named four.
+///
+/// # This stopped being "migration 079's array" at PR-18a
+///
+/// It was that until 080–083 landed. It is not any single migration's array
+/// now, and the rename is not cosmetic: the third assertion below compares this
+/// constant to **every** `relforcerowsecurity` relation in `public`, so the
+/// referent has to be the catalog's set rather than one file's transcription.
+///
+/// 079 is applied and therefore frozen — `migrations/README.md` states the rule
+/// and the checksum failure editing it causes — so the four privatization tables
+/// could not be added to it. They FORCE themselves at creation instead, which is
+/// the instrument 078 established for `rls_canary` and which 079's own header
+/// names. A table added from 080 onward belongs in ITS OWN migration and here,
+/// never in 079.
 const FORCE_PROTECTED_SET: &[&str] = &[
     "claims",
     "evidence",
@@ -1414,9 +1672,14 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "claim_version_encryption",
     "evidence_encryption",
     "edge_encryption",
+    "privatization_plans",
+    "privatization_plan_items",
+    "privatization_audit",
+    "instance_admins",
 ];
 
-/// The ten non-`tier_a` members, named so the arithmetic below is checkable.
+/// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
+/// checkable.
 const CONTROL_TABLES: &[&str] = &[
     "groups",
     "group_memberships",
@@ -1430,15 +1693,50 @@ const CONTROL_TABLES: &[&str] = &[
     "edge_encryption",
 ];
 
-/// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
-/// tables, and it is exactly what the catalog reports.
+/// The four D4 tables 080, 082 and 083 create and FORCE (PR-18a).
 ///
-/// A table added to 062's generators and not to 079 fails here, which is the
-/// property the plan asks `locked_decisions.rs` to hold.
+/// A THIRD TERM RATHER THAN FOUR MORE `CONTROL_TABLES`. Folding them in would
+/// make "the ten" fourteen and that constant's own doc comment false, and it
+/// would erase the one fact worth keeping visible: these tables are FORCEd by a
+/// DIFFERENT MECHANISM. 079 flips its thirty-five in one applied, frozen file;
+/// these three migrations each flip the table they create. A reader who cannot
+/// see that distinction goes looking for them in 079's array, does not find
+/// them, and concludes the array is wrong.
+///
+/// None of the four joins `tier_a`: the catalog probe below recovers `tier_a` as
+/// the relations carrying columns spelled exactly `visibility` and
+/// `owner_group_id`, and these tables spell theirs `before_visibility` /
+/// `after_visibility` / `before_owner_group_id` / `after_owner_group_id`,
+/// because they RECORD a tenancy transition rather than carry one. `tier_a`
+/// stays 25 and the assertion below still measures what it did before.
+const PRIVATIZATION_TABLES: &[&str] = &[
+    "privatization_plans",
+    "privatization_plan_items",
+    "privatization_audit",
+    "instance_admins",
+];
+
+/// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
+/// tables ∪ the privatization tables, and it is exactly what the catalog
+/// reports.
+///
+/// A table added to 062's generators and not to the arrays fails here, which is
+/// the property the plan asks `locked_decisions.rs` to hold.
 ///
 /// `tier_a` is recovered from the CATALOG — the relations carrying both tenancy
 /// columns — rather than by parsing 062, because that is the same set 062's loop
 /// produces and it cannot drift from what the database actually has.
+///
+/// # Why the third assertion stayed TOTAL at PR-18a
+///
+/// The catalog probe below excludes exactly one relation, `rls_canary`, and it
+/// was tempting to exclude the four privatization tables the same way and leave
+/// `declared` at thirty-five. That would have converted a total invariant — the
+/// catalog's FORCEd set IS the declared set — into a partial one, and the next
+/// self-FORCEing table declared nowhere would then pass silently. `rls_canary`
+/// is excluded because it must stay FORCEd through the kill switch, which is a
+/// property of the ROLLBACK and not an exemption from declaration; these four
+/// have no such property. So the set grew instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     let tier_a: BTreeSet<String> = sqlx::query_scalar::<_, String>(
@@ -1465,6 +1763,7 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .iter()
         .cloned()
         .chain(CONTROL_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(PRIVATIZATION_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()
@@ -1472,10 +1771,14 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .collect();
     assert_eq!(
         declared, expected,
-        "migration 079's array must be 062's tier_a union the ten control tables. If a table \
-         was ADDED to the generators, add it to 079_rls_force.sql, docs/runbooks/079-undo.sql, \
-         epigraph_api::state::FORCE_PROTECTED_SET, rls_enforcement.rs::PROTECTED and this \
-         constant — all five, in the same commit."
+        "the FORCEd set must be 062's tier_a union the ten control tables union the four \
+         privatization tables. If a table was ADDED to the generators: FORCE it IN ITS OWN \
+         MIGRATION — 079_rls_force.sql is APPLIED and editing it changes its checksum, which \
+         makes the next `sqlx migrate run` refuse to start; 078 set the precedent by FORCEing \
+         rls_canary at creation and 080/082/083 followed it. Then add the name to \
+         docs/runbooks/079-undo.sql, epigraph_api::state::FORCE_PROTECTED_SET, \
+         rls_enforcement.rs::PROTECTED (with a DELIBERATELY_UNCOVERED row per uncovered \
+         command) and this constant — all four, in the same commit as the migration."
     );
 
     let forced: BTreeSet<String> = sqlx::query_scalar::<_, String>(
@@ -1490,8 +1793,14 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     .collect();
     assert_eq!(
         forced, declared,
-        "the catalog and migration 079's array disagree. `rls_canary` is excluded on purpose: \
-         078 FORCEs it at creation and 079's array omits it."
+        "the catalog and the DECLARED FORCEd set disagree. The declared set is 062's tier_a \
+         union the ten control tables union the four privatization tables — NOT migration \
+         079's array, which names only the first two terms and is APPLIED and immutable. A \
+         relation that appears here and nowhere in the declaration is a table that FORCEs \
+         itself at creation without being declared; add it to PRIVATIZATION_TABLES (or to \
+         CONTROL_TABLES, whichever it is) and to the three editable copies named in the \
+         assertion above — never to 079. `rls_canary` is excluded on purpose: 078 FORCEs it at \
+         creation and 079's array omits it, which is the precedent 080-083 follow."
     );
 }
 

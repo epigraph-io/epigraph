@@ -339,21 +339,41 @@ impl ApiConfig {
     }
 }
 
-/// The relations `migrations/079_rls_force.sql` FORCEs, transcribed.
+/// Every relation the migrations FORCE, transcribed.
 ///
-/// 062's `tier_a` (25) ∪ the ten group/identity/encryption control tables.
-/// Duplicated here rather than derived from the catalog on purpose: a probe
-/// that asked "which tables are FORCEd" and then checked that they are all
-/// FORCEd would pass whatever the migration did.
+/// 062's `tier_a` (25) ∪ the ten group/identity/encryption control tables ∪ the
+/// four privatization tables. Duplicated here rather than derived from the
+/// catalog on purpose: a probe that asked "which tables are FORCEd" and then
+/// checked that they are all FORCEd would pass whatever the migration did.
 ///
 /// `rls_canary` is deliberately absent — migration 078 FORCEs it at creation and
 /// 079's array omits it for the same reason.
 ///
-/// **A correction to the plan:** its 079 array also names `privatization_plans`,
-/// `privatization_plan_items`, `privatization_audit` and `instance_admins`. None
-/// exist; under `migrations/README.md` they are PR-18's 080–083. PR-18 adds them
-/// to 079's array, to this constant and to
-/// `locked_decisions.rs::FORCE_PROTECTED_SET` in one commit.
+/// # `079_rls_force.sql` IS NOT THE ONLY SOURCE, AND IT MUST NOT BE EDITED
+///
+/// An earlier revision of this comment said PR-18 "adds them to 079's array, to
+/// this constant and to `locked_decisions.rs::FORCE_PROTECTED_SET` in one
+/// commit". **The first of those three is impossible.** 079 is applied on every
+/// database that has run this branch, and `migrations/README.md` states the
+/// governing rule: editing an applied file changes its checksum and
+/// `sqlx migrate run` then refuses to start, which panics the api binary on
+/// restart. 079's own header carries the same wrong instruction and cannot be
+/// corrected either, for exactly that reason.
+///
+/// The instrument is the one 078 established and 079's header names: **a table
+/// added from 080 onward FORCEs itself at creation.** Migrations 080–083 each
+/// issue `ENABLE` + `FORCE ROW LEVEL SECURITY` on the table they create. So a
+/// table added to this constant must be FORCEd by ITS OWN migration, never by
+/// 079.
+///
+/// # Adding a name here without the DDL is a self-inflicted outage
+///
+/// [`rls_verdict`] refuses to serve when `0 < forced_count < protected_count`,
+/// and that refusal is unconditional and identity-independent. Both counts are
+/// computed over relations that EXIST, so naming a not-yet-created table here is
+/// inert — but naming a table that exists and is NOT FORCEd makes the process
+/// refuse to start on every database that has run the migration. The DDL and
+/// this constant are one decision.
 #[cfg(feature = "db")]
 pub const FORCE_PROTECTED_SET: &[&str] = &[
     "claims",
@@ -391,6 +411,13 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     "claim_version_encryption",
     "evidence_encryption",
     "edge_encryption",
+    // The four privatization tables, FORCEd by their own migrations (080, 082,
+    // 083) rather than by 079. See the "079 IS NOT THE ONLY SOURCE" section
+    // above.
+    "privatization_plans",
+    "privatization_plan_items",
+    "privatization_audit",
+    "instance_admins",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -427,7 +454,12 @@ pub struct RlsPosture {
     /// `rls_canary` (which migration 078 FORCEs at creation and which 079's
     /// array deliberately omits).
     pub forced_count: i64,
-    /// How many relations migration 079's array names and that exist.
+    /// How many relations [`FORCE_PROTECTED_SET`] names and that exist.
+    ///
+    /// Deliberately not "migration 079's array": since PR-18a the constant is
+    /// 079's 35 relations PLUS the four privatization tables, which 080–083
+    /// FORCE at creation because 079 is applied and immutable. See
+    /// [`FORCE_PROTECTED_SET`]'s own doc comment, ninety lines above.
     pub protected_count: i64,
     /// Does `public.rls_canary` exist? False below migration 078.
     pub canary_exists: bool,

@@ -61,16 +61,43 @@ pub struct SecurityEventResponse {
 ///
 /// Returns a list of security events filtered by the provided query parameters,
 /// ordered by `created_at DESC`.  Requires `audit:read` OAuth2 scope.
+///
+/// # Per-principal scoping lives in the database, not here
+///
+/// This read runs on the unscoped `state.db_pool` — entry
+/// `("routes/audit.rs", 1)` on `no_unscoped_pool.rs`'s register, an accepted
+/// debt, and that register is a count ceiling rather than a certification that
+/// the read is scoped. Per-principal narrowing is therefore the
+/// `security_events_read` RLS policy's job alone, and migration 083 recreates
+/// and widens that policy. Note also that `audit:read` is a member of
+/// `canonical_scopes::READ_SCOPES`, not of `ADMIN_ONLY_SCOPES`.
+///
+/// The coupling between this handler and that policy is carried as an open
+/// obligation in `docs/tenancy/progress.json` under `F-PR18a-B1`, assigned to
+/// the conversion-shard series; analysis is held outside this repository.
+/// PR-18a ships no route and deliberately does not convert this site.
 #[cfg(feature = "db")]
 pub async fn query_security_events(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<SecurityEventQuery>,
 ) -> Result<Json<Vec<SecurityEventResponse>>, ApiError> {
-    // Admin scope gate — any authenticated caller must carry audit:read
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["audit:read"])?;
-    }
+    // Admin scope gate — any authenticated caller must carry audit:read.
+    //
+    // An ABSENT auth context is a refusal, not a pass. This route is registered
+    // on the `protected` chain, which layers a mandatory `bearer_auth_middleware`
+    // (PR-03), and `locked_decisions.rs` asserts no route moves between the
+    // `public` and `protected` chains — so the extension is always present today
+    // and this branch is unreachable. It is written as a refusal anyway because
+    // the previous `if let Some(..)` with no `else` made the handler's
+    // correctness depend on which router chain it happened to be registered on,
+    // and it is the caller-facing end of a read policy 083 widens.
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["audit:read"])?;
 
     use epigraph_db::repos::security_event::{SecurityEventFilter, SecurityEventRepository};
 

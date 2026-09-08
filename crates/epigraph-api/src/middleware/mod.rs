@@ -3,6 +3,8 @@ pub mod bearer;
 #[cfg(feature = "db")]
 pub mod group_authz;
 #[cfg(feature = "db")]
+pub mod instance_authz;
+#[cfg(feature = "db")]
 pub mod provenance;
 pub mod rate_limit;
 pub mod scopes;
@@ -21,6 +23,8 @@ pub use bearer::{bearer_auth_middleware, optional_bearer_auth_middleware, AuthCo
 pub use epigraph_auth::ClientType;
 #[cfg(feature = "db")]
 pub use group_authz::require_group_admin;
+#[cfg(feature = "db")]
+pub use instance_authz::require_instance_admin_for_group;
 #[cfg(feature = "db")]
 pub use provenance::record_provenance;
 pub use scopes::check_scopes;

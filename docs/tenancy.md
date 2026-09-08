@@ -44,6 +44,7 @@ a gate.
 | **070** | PR-12 | Warns and counts. Nothing fails. |
 | **074** | PR-16 | Drops the defaults and replaces arm (a) with the final, `RAISE`-terminated form. An undeclared insert becomes a hard **`23502` not-null violation**. |
 | **077 / 079** | PR-17 | RLS policies, then `FORCE ROW LEVEL SECURITY`. A row you cannot see is absent, not blanked. |
+| **080 / 082 / 083** | PR-18a | The D4 privatization schema and the `instance_admins` authority. **These are additional FORCE sources.** 079 is applied and immutable, so each of them `ENABLE`s and `FORCE`s the tables it creates, on the precedent 078 set for `rls_canary`. The FORCE-protected set grows **35 → 39**; see the kill switch below. |
 
 The gate between 070 and 074 is plan §9.2 week **11b**: the
 `tenancy_undeclared_writes` counter must be **flat at zero for 24 hours across
@@ -301,6 +302,16 @@ reverting `DATABASE_URL` to the owner role it is a sub-minute rollback. The
 undo script loops the *same array* as `079_rls_force.sql`, because
 `AppState::assert_rls_posture` refuses to boot on a **partially** FORCEd set —
 a half-applied undo would leave the cluster un-bootable.
+
+**From PR-18a the undo script is LONGER than 079's array, and a stale copy is
+unsafe.** 079 could not name the four privatization tables — they did not exist
+— so 080/082/083 FORCE their own. The boot assertion counts the **catalog**, not
+079, so it now expects **39** protected relations while a pre-18a copy of
+`079-undo.sql` un-FORCEs only 35. That leaves `0 < forced < protected`, which is
+exactly the partial state `rls_verdict` refuses on: the sub-minute rollback
+becomes an outage. Run the copy of the script that ships in the tree you are
+rolling back, and use the VERIFY query at the foot of it — it is total over the
+protected set and reports a partial flip.
 
 ### `epigraph.allow_declassify` — what actually controls it
 

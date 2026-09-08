@@ -236,7 +236,18 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     ("agent_keys.rs", 3),
     ("agents.rs", 2),
-    ("audit.rs", 1),
+    // `("audit.rs", 1)` REMOVED by PR-18a, on the PR-10 precedent recorded
+    // below: `query_security_events` now takes the prescribed
+    // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
+    // shape and checks `audit:read` unconditionally, so the file measures 0.
+    // Removed rather than set to `0` for the reason the PR-10 note gives — the
+    // register is compared as a whole `BTreeMap` and a `0` row would never match.
+    //
+    // PR-18a is a schema shard and did not set out to convert a handler. It
+    // converted this one because migration 083 recreates `security_events_read`,
+    // the sole per-principal narrowing on the table this route reads, and a
+    // fail-open scope check on the caller-facing end of a policy being widened in
+    // the same commit is not a debt worth carrying forward one more PR.
     ("claims.rs", 2),
     ("crud.rs", 11),
     ("edges.rs", 9),

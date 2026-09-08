@@ -984,7 +984,19 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// The version is NOT the gate — [`applicable_definer_functions`] gates on the
 /// function's presence in `pg_proc`. It is carried so the skip NOTE can name the
 /// migration an operator has to apply. See [`DEFINER_FUNCTIONS`]' last section.
-const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[("epigraph_claim_tenancy_by_ids", 86)];
+/// `epigraph_is_instance_admin` (83) is deferred for the same reason as 086's
+/// entry and carries the same stake in a different direction. Its `ALTER
+/// FUNCTION ... OWNER TO epigraph_maintenance` is inside 083's guarded `DO`
+/// block, so on a cluster where 060 could only `RAISE NOTICE` the ownership
+/// silently stays with the migration runner. The body still reaches
+/// `instance_admins` — through the runner's superuser bypass rather than through
+/// `epigraph_definer_bypass()` — so it FAILS SAFE but with more authority than
+/// intended, and nothing in `_sqlx_migrations` records the difference. This gate
+/// is the only instrument that reports it.
+const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
+    ("epigraph_claim_tenancy_by_ids", 86),
+    ("epigraph_is_instance_admin", 83),
+];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
 /// actually EXISTS on this database.

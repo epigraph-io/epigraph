@@ -85,24 +85,123 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
     (
         "security_events",
         "UPDATE",
-        "The actor log is append-only. Default-deny is the whole control until \
-         PR-18's migration 082 adds the immutability trigger.",
+        "The actor log is append-only. Default-deny is now one of three \
+         controls, not the whole of it: PR-18a's migration 082 adds the \
+         `security_events_no_mutate` BEFORE UPDATE OR DELETE trigger and \
+         REVOKEs UPDATE and DELETE from epigraph_app. The pair stays HERE and \
+         not deleted because a trigger is not a `pg_policy` row — the command \
+         is still uncovered, which is what this register measures.",
     ),
     (
         "security_events",
         "DELETE",
-        "Same as UPDATE: an actor must not be able to erase its own audit trail. \
-         The plan put this trigger 'in 078'; under migrations/README.md that is \
-         PR-18's 082, so PR-17 ships the default-deny half only.",
+        "Same as UPDATE: an actor must not be able to erase its own audit \
+         trail. The plan put the trigger 'in 078'; under migrations/README.md \
+         that is PR-18's 082, which now ships it. The trigger is the control \
+         that also binds the TABLE OWNER, which RLS does not; the REVOKE and \
+         this default-deny are the other two.",
+    ),
+    // ---- PR-18a: the four D4 tables. -------------------------------------
+    //
+    // 080 creates `privatization_plans` and `privatization_plan_items` with
+    // ENABLE + FORCE and NO POLICY AT ALL, which is full default deny on all
+    // four commands. That is deliberate and it is the honest posture for
+    // PR-18a, which ships no reader and no writer of either table: the preview
+    // routes are 18b and the apply/revert handlers are 18c. A read policy with
+    // no consumer is a grant nobody asked for.
+    //
+    // Because this register is exact in BOTH directions, 18b cannot add a
+    // policy to either table without deleting the matching row here in the same
+    // commit — which is the property that makes the eight rows worth their
+    // weight rather than boilerplate.
+    (
+        "privatization_plans",
+        "SELECT",
+        "PR-18a ships no reader. 18b's preview route owns the SELECT policy and \
+         deletes this row in the same commit.",
+    ),
+    (
+        "privatization_plans",
+        "INSERT",
+        "PR-18a ships no writer. Plans are created by 18b's route on the \
+         maintenance pool, which is where the INSERT policy belongs.",
+    ),
+    (
+        "privatization_plans",
+        "UPDATE",
+        "State transitions (approve, dispatch, cursor advance) are 18c's \
+         apply/revert handlers, on the maintenance pool.",
+    ),
+    (
+        "privatization_plans",
+        "DELETE",
+        "A plan is the record that a privatization was attempted and is never \
+         deleted. Nothing is expected to claim this pair.",
+    ),
+    (
+        "privatization_plan_items",
+        "SELECT",
+        "The frozen item set is a complete index of every entity a plan would \
+         privatize. PR-18a ships no reader; 18b's preview owns it.",
+    ),
+    (
+        "privatization_plan_items",
+        "INSERT",
+        "Items are materialised by the selection pass, which is 18b.",
+    ),
+    (
+        "privatization_plan_items",
+        "UPDATE",
+        "Per-item state (applied/skipped/failed/reverted) is 18c's handler.",
+    ),
+    (
+        "privatization_plan_items",
+        "DELETE",
+        "Items cascade with their plan and are never deleted individually; the \
+         FK carries ON DELETE CASCADE, which does not consult a policy.",
+    ),
+    (
+        "privatization_audit",
+        "UPDATE",
+        "Append-only, by the same three controls as security_events: 082's \
+         `privatization_audit_no_mutate` trigger, its REVOKE of UPDATE and \
+         DELETE from epigraph_app, and this default-deny. The trigger is the \
+         only one of the three that also binds the table owner.",
+    ),
+    (
+        "privatization_audit",
+        "DELETE",
+        "Same as UPDATE. The audit trail of a privatization outlives the plan \
+         it describes; the FK to privatization_plans is ON DELETE RESTRICT \
+         precisely so a plan cannot take its own record with it.",
+    ),
+    (
+        "instance_admins",
+        "DELETE",
+        "Revocation is a `revoked_at` stamp, never a DELETE: the row is the \
+         record that the authority once existed. 083 grants INSERT and UPDATE \
+         to a bypass-only policy pair so the operator CLI can grant and revoke \
+         on the maintenance role, and deliberately stops short of FOR ALL, \
+         which would have covered DELETE too.",
     ),
 ];
 
-/// Every relation `migrations/079_rls_force.sql` FORCEs.
+/// Every relation the migrations FORCE.
 ///
 /// Transcribed, not derived: a test that asked the catalog which relations are
 /// protected and then checked that those relations are protected would pass
 /// whatever the migration did. `rls_canary` is absent because 078 FORCEs it at
 /// creation and 079's array omits it.
+///
+/// # It was "079's array" until PR-18a
+///
+/// 079 flips thirty-five relations in one file. The four D4 tables are FORCEd by
+/// the migrations that CREATE them — 080, 082 and 083 — because 079 is applied
+/// and frozen, so this constant's referent is now the catalog's FORCEd set
+/// rather than any one file's transcription.
+/// `locked_decisions.rs::d4_the_force_array_is_tier_a_plus_the_control_tables`
+/// is what pins the two together, and it is a TOTAL comparison against
+/// `pg_class.relforcerowsecurity`.
 const PROTECTED: &[&str] = &[
     "claims",
     "evidence",
@@ -139,6 +238,10 @@ const PROTECTED: &[&str] = &[
     "claim_version_encryption",
     "evidence_encryption",
     "edge_encryption",
+    "privatization_plans",
+    "privatization_plan_items",
+    "privatization_audit",
+    "instance_admins",
 ];
 
 // ===========================================================================
@@ -166,8 +269,9 @@ async fn every_protected_relation_is_enabled_and_forced(pool: PgPool) {
     assert_eq!(
         rows.len(),
         PROTECTED.len(),
-        "migration 079's array names {} relations but only {} exist as ordinary tables. \
-         079 RAISEs on this, so reaching it here means the array and the schema disagree.",
+        "PROTECTED names {} relations but only {} exist as ordinary tables. 079 RAISEs on a \
+         missing name among its own thirty-five, and 080/082/083 create the four they FORCE, \
+         so reaching this means the array and the schema disagree.",
         PROTECTED.len(),
         rows.len()
     );
@@ -856,6 +960,18 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         "epigraph_principal_id",
         "epigraph_is_group_admin",
         "epigraph_is_group_creator",
+        // 083's roster predicate. It belongs here on the same ground as
+        // `epigraph_is_group_admin`: its body binds its subject to
+        // `epigraph_principal_id()` (or `epigraph_bypass()`), so an arm naming it
+        // IS session-derived however the argument is spelled. Today 083's two
+        // arms pass only incidentally — they happen to spell
+        // `epigraph_is_instance_admin((SELECT public.epigraph_principal_id()))`,
+        // and it is the NESTED helper the substring match finds. An arm written
+        // `epigraph_is_instance_admin(agent_id)` would be reported as an
+        // unconditional grant while being strictly session-bound, and the natural
+        // repair — a `ROW_ONLY_BY_DESIGN` entry — would genuinely weaken this
+        // ratchet by excusing an arm rather than recognising a helper.
+        "epigraph_is_instance_admin",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //
