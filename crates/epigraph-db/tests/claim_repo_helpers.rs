@@ -139,6 +139,16 @@ async fn drop_unique_constraint(pool: &PgPool) {
 /// the constraint to be PRESENT, and still assert `DuplicateKey` /
 /// `was_created` false-on-second-call against it.
 ///
+/// # The ADD is now a fallback, and the helper proves its post-condition
+///
+/// Say plainly what the isolation changed: migration 013 creates
+/// `uq_claims_content_hash_agent` and no later migration drops it, so on the
+/// freshly-migrated per-test database the constraint is ALREADY there and the
+/// ALTER always takes the exception path. The ADD adds nothing; it is a
+/// fallback for a database that arrives without it. Because a helper whose
+/// every statement can be swallowed cannot fail, the post-condition is
+/// asserted against `pg_constraint` at the end rather than assumed.
+///
 /// Dedups any (content_hash, agent_id) duplicate rows first. The dedup is
 /// RETAINED rather than dropped along with the shared pool, and the reason is
 /// not defensive: it mirrors the S2 backfill semantics production migration 107
@@ -172,6 +182,30 @@ async fn add_unique_constraint(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("add constraint");
+
+    // Assert the POST-CONDITION rather than trusting the swallow.
+    //
+    // On a freshly-migrated database migration 013 has already created this
+    // constraint, so the ALTER above always raises 42P07 and is always caught:
+    // the ADD is a fallback, not the normal path, and the helper can no longer
+    // fail by itself. That is fine for the post-107 arms — the constraint is
+    // genuinely present — but it means a future edit that renamed the
+    // constraint, named the wrong columns or targeted the wrong table would be
+    // swallowed identically and leave the arms asserting DuplicateKey against
+    // whatever 013 happens to provide. Checking pg_constraint closes that gap:
+    // the fixture now proves the precondition it claims to establish.
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conname = 'uq_claims_content_hash_agent'
+           AND conrelid = 'claims'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("inspect pg_constraint");
+    assert_eq!(
+        present, 1,
+        "post-107 fixture requires uq_claims_content_hash_agent on `claims`"
+    );
 }
 
 async fn insert_test_agent(pool: &PgPool, agent_id: Uuid) {
@@ -205,8 +239,25 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row(pool: PgPool) {
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 
-    let mut conn = pool.acquire().await.expect("acquire conn");
     let content = format!("test content {}", Uuid::new_v4());
+
+    // Seed the SAME content under a DIFFERENT agent. This is the row the
+    // helper exists to exclude: wrong-agent leakage — returning another
+    // agent's claim for an identical content_hash — is exactly the S1 hazard
+    // documented in this file's header. On the shared database a stray sibling
+    // row sometimes played this part; on a private database we must seed it
+    // deliberately, or dropping the `agent_id = $2` predicate would pass.
+    let other_agent = Uuid::new_v4();
+    insert_test_agent(&pool, other_agent).await;
+    ClaimRepository::create(
+        &pool,
+        &make_claim(&content, other_agent),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create other-agent claim");
+
+    let mut conn = pool.acquire().await.expect("acquire conn");
     let hash = ContentHasher::hash(content.as_bytes());
 
     let found = ClaimRepository::find_by_content_hash_and_agent(
@@ -219,6 +270,20 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row(pool: PgPool) {
     .expect("find call");
 
     assert!(found.is_none(), "expected None, got {:?}", found);
+
+    // The decoy must be findable under ITS OWN agent, or the None above is
+    // explained by the row being invisible rather than by the agent predicate.
+    let found_other = ClaimRepository::find_by_content_hash_and_agent(
+        &mut conn,
+        &viewer,
+        hash.as_slice(),
+        other_agent,
+    )
+    .await
+    .expect("find call")
+    .expect("decoy must be findable under its own agent");
+    let found_other_agent: Uuid = found_other.agent_id.into();
+    assert_eq!(found_other_agent, other_agent);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -231,6 +296,19 @@ async fn find_by_content_hash_and_agent_returns_some_when_matching(pool: PgPool)
     let _ = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create");
+
+    // A competing row with an IDENTICAL content_hash under a different agent.
+    // The `found_agent == agent_id` assertion below is only meaningful if
+    // another agent's row with the same hash is present to be picked wrongly.
+    let other_agent = Uuid::new_v4();
+    insert_test_agent(&pool, other_agent).await;
+    ClaimRepository::create(
+        &pool,
+        &make_claim(&claim.content, other_agent),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create other-agent claim");
 
     let mut conn = pool.acquire().await.expect("acquire conn");
     let hash = ContentHasher::hash(claim.content.as_bytes());

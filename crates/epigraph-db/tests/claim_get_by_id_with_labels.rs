@@ -41,12 +41,40 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
 async fn get_by_id_with_labels_returns_none_when_no_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
 
+    // Seed a DECOY that must NOT be returned. On the shared database this arm
+    // used to run against, some sibling arm's rows happened to supply this
+    // role; that discrimination was an accident of execution order, not a
+    // property of the test. `#[sqlx::test]` hands us an empty table, so without
+    // an explicit decoy `is_none()` would be satisfied by there being nothing
+    // to return at all — deleting the `WHERE id = $1` predicate from
+    // `get_by_id_with_labels` would still pass. The decoy makes the predicate
+    // the only reason the result is None.
+    let decoy_agent = Uuid::new_v4();
+    insert_test_agent(&pool, decoy_agent).await;
+    let decoy = ClaimRepository::create(
+        &pool,
+        &make_claim(&format!("decoy {}", Uuid::new_v4()), decoy_agent),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create decoy");
+
     let found =
         ClaimRepository::get_by_id_with_labels(&pool, &viewer, epigraph_core::ClaimId::new())
             .await
             .expect("query call");
 
     assert!(found.is_none(), "expected None, got {:?}", found.is_some());
+
+    // The decoy is real, visible to this viewer, and would have been returned
+    // by an unfiltered query — otherwise the assertion above proves nothing.
+    assert!(
+        ClaimRepository::get_by_id_with_labels(&pool, &viewer, decoy.id)
+            .await
+            .expect("query call")
+            .is_some(),
+        "decoy must be retrievable by its own id, or it cannot discriminate"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -68,6 +96,24 @@ async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
     )
     .await
     .expect("seed labels");
+
+    // Seed a second LABELLED claim under a different agent. Without it the
+    // per-test database holds exactly one labelled claim, so dropping the
+    // claim_id predicate from `get_labels` would return that same row's labels
+    // and the `new_sorted == ["atomic", "backlog"]` assertion would still pass.
+    // The decoy's labels are disjoint, so any leak changes the result.
+    let decoy_agent = Uuid::new_v4();
+    insert_test_agent(&pool, decoy_agent).await;
+    let decoy = ClaimRepository::create(
+        &pool,
+        &make_claim(&format!("decoy labels {}", Uuid::new_v4()), decoy_agent),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create decoy");
+    ClaimRepository::update_labels(&pool, decoy.id.as_uuid(), &["decoy-label".to_string()], &[])
+        .await
+        .expect("seed decoy labels");
 
     let (via_new, labels_via_new) =
         ClaimRepository::get_by_id_with_labels(&pool, &viewer, created.id)
