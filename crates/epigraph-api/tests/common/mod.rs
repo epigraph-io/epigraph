@@ -97,28 +97,28 @@ pub fn test_bearer_token() -> String {
     dead_code,
     reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
 )]
+/// Seed exactly one cluster run holding one cluster of `size` members.
+///
+/// # It no longer truncates, and it must not
+///
+/// This helper used to open with unfiltered `DELETE`s against
+/// `graph_cluster_runs`, `claim_cluster_membership`, `graph_clusters` and
+/// `cluster_edges`. That was how its only caller manufactured "exactly one run
+/// exists" on a database shared with every other test binary — the root cause
+/// of F-tests-depend-on-accumulated-shared-db-fixtures, since it destroyed
+/// sibling binaries' fixtures as a side effect of seeding its own.
+///
+/// Its caller (`graph_routes_test.rs`, the sole one — grep before adding
+/// another) now runs under `#[sqlx::test]`, so the database is already empty
+/// and the truncation would delete nothing. Re-adding it would reintroduce the
+/// finding the moment any caller runs on a shared pool.
 pub async fn seed_one_cluster(pool: &PgPool, size: usize) -> uuid::Uuid {
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claim_cluster_membership")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_clusters")
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM cluster_edges")
-        .execute(pool)
-        .await
-        .unwrap();
-
     let test_agent_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
     // public_key is unique across all agents — must differ per test binary.
     // 00...AA distinguishes graph_routes_test from graph_themes_test (00...BB)
-    // and graph_neighborhoods_test (00...CC).
+    // and graph_neighborhoods_test (00...CC). Retained deliberately: the
+    // collision it guards against is impossible on a per-test database, but the
+    // constant is load-bearing for any caller still on a shared pool.
     sqlx::query(
         "INSERT INTO agents (id, public_key, display_name, agent_type)
          VALUES ($1, decode(repeat('AA', 32), 'hex'), 'graph-routes-test', 'system')
