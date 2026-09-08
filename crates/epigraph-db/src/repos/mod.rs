@@ -36,6 +36,7 @@ pub mod graph_view;
 pub mod group;
 pub mod group_key_epoch;
 pub mod group_membership;
+pub mod instance_admin;
 pub mod learning_event;
 pub mod lineage;
 pub mod mass_function;
@@ -151,6 +152,7 @@ pub use evidence_encryption::{EvidenceEncryptionRepository, EvidenceEncryptionRo
 pub use group::{GroupRepository, GroupRow};
 pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
+pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
