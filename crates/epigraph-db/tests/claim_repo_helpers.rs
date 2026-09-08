@@ -1,6 +1,41 @@
 //! Integration tests for ClaimRepository find/create-or-get/create-strict helpers
 //! introduced in S1 of the noun-claims-and-verb-edges architecture
 //! (see docs/architecture/noun-claims-and-verb-edges.md).
+//!
+//! # Why every arm here takes an injected `pool`
+//!
+//! These fixtures are the only ones in `epigraph-db` that issue **global DDL**:
+//! [`drop_unique_constraint`] and [`add_unique_constraint`] add and remove
+//! `uq_claims_content_hash_agent` on `claims` in contradictory directions, and
+//! `add_unique_constraint` additionally runs a table-wide dedup `DELETE`. On a
+//! shared database that is not a per-test detail — it is a schema change every
+//! other connection observes immediately.
+//!
+//! The consequences were both measured on this tree:
+//!
+//! * **In-binary.** At `--test-threads=4` this binary failed on 4 of 4 runs,
+//!   and the IDENTITY of the failing arm varied run to run
+//!   (`create_or_get_is_idempotent_post_107`, then
+//!   `create_strict_inserts_unconditionally_pre_107` +
+//!   `create_strict_returns_duplicate_key_post_107`, then …). A pre-107 arm
+//!   dropping the constraint while a post-107 arm depends on it is a race with
+//!   no fixed loser.
+//! * **Across binaries.** The file left the shared database's schema mutated on
+//!   exit, with no restore — the exact signature migrations/README.md records
+//!   for the deployed drift, where `_sqlx_migrations` reports 013 applied while
+//!   the constraint is absent from `claims`.
+//!
+//! `#[sqlx::test]` provisions a freshly-migrated private database per test,
+//! which is the precondition each of these arms was previously trying to
+//! manufacture by mutating a shared one. **The DDL and the dedup DELETE are
+//! unchanged and every assertion is unchanged** — only their blast radius is.
+//! Note that the constraint is now PRESENT at test start (migration 013 runs),
+//! so the pre-107 arms must drop it explicitly; that explicit drop is what
+//! establishes the pre-107 fixture rather than an accident of shared state.
+//!
+//! Transactional rollback was rejected: a wrapping transaction cannot contain
+//! `ALTER TABLE` for a concurrent observer, and `ClaimRepository::create` takes
+//! its own pool connection, which would not see the fixture's uncommitted rows.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -8,11 +43,10 @@ mod fixture;
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::ClaimRepository;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Names this file is allowed to mutate without an explicit opt-in.
+/// Names a destructive claim fixture may mutate without an explicit opt-in.
 ///
 /// `#[sqlx::test]` template/instance databases are `_sqlx_test*`; the
 /// hand-rolled scratch databases this repo documents for integration work
@@ -23,57 +57,26 @@ use uuid::Uuid;
 /// is named `epigraph`, exactly like the long-lived deployment, so no
 /// blocklist can separate them. Everything outside the disposable set must
 /// opt in via `EPIGRAPH_TEST_DESTRUCTIVE_DB=1`.
+///
+/// # This is the reference implementation, and that is why it outlived its
+/// # caller here
+///
+/// The arms in this file no longer need the guard: `#[sqlx::test]` hands each
+/// one a private `_sqlx_test*` database, so there is no shared database left to
+/// misdirect and the pool-construction guard that used to call this function
+/// was removed with the shared-pool harness.
+///
+/// The classifier itself stays because **two other files mirror it by name and
+/// defer to this one for the rationale** —
+/// `crates/epigraph-mcp/tests/common/mod.rs::db_is_disposable` ("see that file
+/// for the full rationale") and
+/// `crates/epigraph-api/tests/integration/test_claim_cleanup.rs::db_is_disposable`
+/// ("Mirrors `epigraph-db/tests/claim_repo_helpers.rs::db_is_disposable`").
+/// Those callers are still on shared pools and still need the rule. Deleting
+/// the definition the others cite would leave two live guards with no stated
+/// contract and no test pinning the `_e2e` / `_dev` exclusions below.
 fn db_is_disposable(name: &str) -> bool {
     name.starts_with("_sqlx_test") || name.ends_with("_test")
-}
-
-/// Environment opt-in for running these fixtures against a
-/// non-disposable-looking database (set by CI, whose DB is named `epigraph`).
-const DESTRUCTIVE_OPT_IN: &str = "EPIGRAPH_TEST_DESTRUCTIVE_DB";
-
-/// Refuse to hand back a pool onto a database these fixtures must not touch.
-///
-/// This guard sits at pool construction rather than on the individual
-/// destructive helpers because `try_test_pool` *itself* mutates: it runs
-/// `sqlx::migrate!` against whatever `DATABASE_URL` names. Guarding only
-/// `drop_unique_constraint`/`add_unique_constraint` would leave that hole
-/// open.
-///
-/// This is not hypothetical. The deployed `epigraph` database records
-/// migration 013 as applied (`_sqlx_migrations.success = true`) while
-/// `uq_claims_content_hash_agent` is absent from `claims` — the signature of
-/// `drop_unique_constraint` having run against it and never being restored.
-/// Panicking (rather than skipping) is deliberate: a silent skip would let a
-/// misdirected `DATABASE_URL` look like a green test run.
-async fn assert_disposable_db(pool: &PgPool) {
-    let db: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(pool)
-        .await
-        .expect("query current_database()");
-
-    if db_is_disposable(&db) || std::env::var(DESTRUCTIVE_OPT_IN).as_deref() == Ok("1") {
-        return;
-    }
-
-    panic!(
-        "refusing to run destructive claim fixtures against database {db:?}.\n\
-         These tests DROP the uq_claims_content_hash_agent constraint and run a \
-         table-wide dedup DELETE on `claims`.\n\
-         Point DATABASE_URL at a scratch database (e.g. epigraph_db_repo_test), or \
-         set {DESTRUCTIVE_OPT_IN}=1 if {db:?} really is disposable."
-    );
-}
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    assert_disposable_db(&pool).await;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-    Some(pool)
 }
 
 #[test]
@@ -94,21 +97,14 @@ fn disposable_db_classification() {
     assert!(!db_is_disposable("epigraph_demo_dev"));
 }
 
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
-
 /// Drop the (content_hash, agent_id) UNIQUE constraint if present so this
 /// test exercises the pre-107 path. See docs/architecture/noun-claims-and-verb-edges.md
 /// for the rationale of running both pre- and post-107 fixtures.
+///
+/// `IF EXISTS` is still the right spelling even though migration 013 now always
+/// leaves the constraint in place on the injected database: the helper states
+/// "afterwards the constraint is absent", which is the fixture's contract, not
+/// "a constraint was removed".
 async fn drop_unique_constraint(pool: &PgPool) {
     sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
         .execute(pool)
@@ -118,12 +114,43 @@ async fn drop_unique_constraint(pool: &PgPool) {
 
 /// Add the (content_hash, agent_id) UNIQUE constraint, ignoring the case
 /// where it already exists. Postgres has no `ADD CONSTRAINT IF NOT EXISTS`,
-/// so the DO block swallows the duplicate_object SQLSTATE.
+/// so the DO block swallows the already-present SQLSTATEs.
 ///
-/// Dedups any (content_hash, agent_id) duplicate rows first — earlier tests
-/// in this file may have inserted rows under the pre-107 fixture that would
-/// otherwise prevent the constraint from being created. Mirrors the S2
-/// backfill semantics required by production migration 107.
+/// # The handler must name `duplicate_table`, and the old one did not
+///
+/// This block previously caught `duplicate_object` (42710) alone, which made
+/// the "ignoring the case where it already exists" contract **unsatisfiable**:
+/// `ALTER TABLE … ADD CONSTRAINT … UNIQUE` implements the constraint as an
+/// INDEX, so when the name is taken Postgres reports the INDEX collision —
+/// `42P07 duplicate_table`, `relation "uq_claims_content_hash_agent" already
+/// exists` — and 42710 never fires. Measured directly against a migrated
+/// database: the `duplicate_object`-only block errors out; adding
+/// `duplicate_table` catches it.
+///
+/// It went unnoticed because on a SHARED database the constraint was reliably
+/// absent by the time this ran — migration 013 creates it, and a sibling arm's
+/// `drop_unique_constraint` had already removed it globally. So the helper only
+/// ever took the succeed-outright path, and the exception handler was dead code
+/// that had never once executed. Per-test isolation removed the sibling that
+/// was silently preparing the ground, and the latent defect became a
+/// deterministic failure in both post-107 arms.
+///
+/// This is a fixture repair, not a relaxation: the post-107 arms still require
+/// the constraint to be PRESENT, and still assert `DuplicateKey` /
+/// `was_created` false-on-second-call against it.
+///
+/// Dedups any (content_hash, agent_id) duplicate rows first. The dedup is
+/// RETAINED rather than dropped along with the shared pool, and the reason is
+/// not defensive: it mirrors the S2 backfill semantics production migration 107
+/// requires, so it is part of what "add the constraint the way 107 does" means.
+///
+/// What changed is only who it can reach. It used to be a table-wide DELETE
+/// over a database every other test binary was also writing — it existed
+/// because an EARLIER ARM IN THIS FILE had inserted duplicates under the
+/// pre-107 fixture, and it removed rows it had never heard of on the way past.
+/// On the injected `#[sqlx::test]` database the only rows in `claims` are the
+/// ones the calling arm created, so the statement is unchanged and its blast
+/// radius is one test.
 async fn add_unique_constraint(pool: &PgPool) {
     sqlx::query(
         "DELETE FROM claims a USING claims b
@@ -139,7 +166,7 @@ async fn add_unique_constraint(pool: &PgPool) {
         r#"DO $$ BEGIN
               ALTER TABLE claims ADD CONSTRAINT uq_claims_content_hash_agent
                   UNIQUE (content_hash, agent_id);
-           EXCEPTION WHEN duplicate_object THEN NULL;
+           EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
            END $$"#,
     )
     .execute(pool)
@@ -172,9 +199,8 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
 // find_by_content_hash_and_agent
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn find_by_content_hash_and_agent_returns_none_when_no_row() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_content_hash_and_agent_returns_none_when_no_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
@@ -195,9 +221,8 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row() {
     assert!(found.is_none(), "expected None, got {:?}", found);
 }
 
-#[tokio::test]
-async fn find_by_content_hash_and_agent_returns_some_when_matching() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_content_hash_and_agent_returns_some_when_matching(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
@@ -229,9 +254,8 @@ async fn find_by_content_hash_and_agent_returns_some_when_matching() {
 // create_strict — pre-107 (no constraint)
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn create_strict_inserts_unconditionally_pre_107() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_strict_inserts_unconditionally_pre_107(pool: PgPool) {
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -271,9 +295,8 @@ async fn create_strict_inserts_unconditionally_pre_107() {
 // create_strict — post-107 (constraint applied)
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn create_strict_returns_duplicate_key_post_107() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_strict_returns_duplicate_key_post_107(pool: PgPool) {
     add_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -308,9 +331,8 @@ async fn create_strict_returns_duplicate_key_post_107() {
 // create_or_get — pre-107
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn create_or_get_inserts_when_no_existing() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_inserts_when_no_existing(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
@@ -333,9 +355,8 @@ async fn create_or_get_inserts_when_no_existing() {
     assert_eq!(returned.content, claim.content);
 }
 
-#[tokio::test]
-async fn create_or_get_returns_existing_when_present() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_returns_existing_when_present(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
@@ -389,9 +410,8 @@ async fn create_or_get_returns_existing_when_present() {
 // would be inherently racy and is intentionally omitted (spec lines 99–101).
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn create_or_get_is_idempotent_post_107() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_or_get_is_idempotent_post_107(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     add_unique_constraint(&pool).await;
 
