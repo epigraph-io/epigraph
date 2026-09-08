@@ -194,9 +194,15 @@ impl GroupMembershipRepository {
     /// does NOT use this: a separate count is a second snapshot, and two
     /// concurrent removals both pass it. That guard is
     /// [`Self::revoke_member_unless_last_admin`], which folds the count into the
-    /// writing `UPDATE`. This function survives for PR-18's privatization
-    /// approver check, which needs "≥ 2 live admins other than the plan author"
-    /// on the target group as a read-only precondition.
+    /// writing `UPDATE`. It was retained for PR-18's privatization approver
+    /// check, which needs "≥ 2 live admins other than the plan author" on the
+    /// target group as a read-only precondition — but PR-18's third slice folded
+    /// that check into `InstanceAdminRepository::privatization_authority`, a
+    /// single probe that answers all of FINAL-PLAN §6.6's conditions in one
+    /// statement. **This function now has NO production caller**: what remains
+    /// is its own regression coverage in
+    /// `crates/epigraph-api/tests/group_lifecycle.rs`, which is what pins the
+    /// "other than" semantics that `privatization_authority` restates.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.

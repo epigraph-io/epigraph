@@ -480,6 +480,37 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          rows. There is nothing for a Viewer to filter on; adding one would be decoration.",
     ),
     (
+        "privatization.rs",
+        "load_plan_conn",
+        "READ of `privatization_plans`, which has NO tenancy column at all — no `visibility`, no \
+         `owner_group_id` — so there is no predicate to splice and a `Viewer` parameter could not \
+         be spent. Its tenancy is migration 087's `privatization_plans_read` policy (instance \
+         admin AND group admin of the plan's target group), which selects on the CONNECTION, so \
+         this must be given a STAMPED app connection; on a maintenance connection \
+         `epigraph_bypass()` is true and the policy admits every row. The projected columns carry \
+         no entity ids.",
+    ),
+    (
+        "privatization.rs",
+        "list_plans_conn",
+        "READ of `privatization_plans`, same absent-tenancy-column argument as `load_plan_conn`. \
+         It is the one of the three that does NOT rely on 087's policy alone: FINAL-PLAN §6.6's \
+         conjunction is spliced into its `WHERE` from the same session helpers the policy uses, so \
+         two independent filters bind. That predicate is written by hand rather than by \
+         `Viewer::splice`, because a `Viewer` filters on row columns this table does not have.",
+    ),
+    (
+        "privatization.rs",
+        "load_plan_items_conn",
+        "READ of `privatization_plan_items`, which likewise has no `visibility` and no \
+         `owner_group_id`; migration 087's `privatization_plan_items_read` resolves the target \
+         group THROUGH the plan row. Its projection DOES carry entity ids, and 087's policy is not \
+         the same property as being able to read each selected claim — so its caller must re-render \
+         them through `visible_previews`, which takes the actor's viewer. A future widening of this \
+         statement into a join on `claims` would be a viewer-less read of tenanted content and must \
+         take a `&Viewer` instead of inheriting this entry.",
+    ),
+    (
         "provenance.rs",
         "append_conn",
         "WRITE, append-only, into `provenance_log`. It records who authorised a write that the \
@@ -502,12 +533,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// because the `.db_pool` access is gone. The two together would certify
 /// "converted" for a read that filters on nothing.
 ///
-/// So the key is the NAME. Fourteen `*_conn` functions exist today; five take a
+/// So the key is the NAME. Seventeen `*_conn` functions exist today; five take a
 /// `Viewer` (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}` and,
 /// from PR-26, `LineageRepository::{get_lineage_conn, get_descendants_conn}`)
-/// and the nine below are enumerated with reasons. Seven of the nine are writes,
-/// where migration 077's `WITH CHECK` rather than a read predicate is the
-/// control.
+/// and the twelve below are enumerated with reasons. Seven of the twelve are
+/// writes, where migration 077's `WITH CHECK` rather than a read predicate is
+/// the control.
+///
+/// # The name rule is also the hole, and PR-18 fell in it
+///
+/// Keying on the name means a viewer-less `&mut PgConnection` read called
+/// anything else is invisible to all three registers in this file at once.
+/// PR-18's third slice shipped `load_plan`, `list_plans` and `load_plan_items`
+/// exactly that way — reads of the plan tables, one of them projecting entity
+/// ids — and they were registered nowhere. They are the last three entries in
+/// [`CONN_WITHOUT_VIEWER`] and were RENAMED to earn them. The alternative,
+/// widening the selector to "parameter list mentions `PgConnection`", is a
+/// larger change to this lint's contract than a route slice should make; it is
+/// recorded as a follow-up rather than done here.
 ///
 /// Counted by this test's own rule — name ends `_conn` AND the parameter list
 /// mentions `PgConnection` — not by a bare grep for `_conn`, which finds a

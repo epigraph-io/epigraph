@@ -27,7 +27,7 @@ mod fixture;
 
 use epigraph_db::repos::privatization::{
     ClosureDirection, ClosureRequest, PrivatizationRepository, SelectionError, SelectionRefusal,
-    STRUCTURAL_EDGE_TYPES,
+    MAX_TRAVERSAL_DEPTH, STRUCTURAL_EDGE_TYPES,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -163,6 +163,14 @@ async fn the_traversal_matches_both_case_spellings(pool: PgPool) {
 }
 
 /// A cycle terminates and reports each claim exactly once.
+///
+/// `max_depth` is `MAX_TRAVERSAL_DEPTH` — the largest value the system will
+/// accept — rather than the arbitrary `10` an earlier revision used. The point
+/// of the arm is that path-array cycle control, not the depth bound, is what
+/// stops the walk, so the depth must be comfortably larger than the 3-claim
+/// cycle; 6 is, and 10 is now refused by FINAL-PLAN §3.1's ceiling. Written as
+/// the constant so a future change to the ceiling moves this arm with it instead
+/// of turning it into a test of the ceiling.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_cycle_terminates_and_reports_each_claim_once(pool: PgPool) {
     let (_scoped, viewer) = fixture::bypass(&pool).await;
@@ -184,7 +192,7 @@ async fn a_cycle_terminates_and_reports_each_claim_once(pool: PgPool) {
             seeds: &[a],
             edge_types: &edge_types,
             direction: ClosureDirection::Out,
-            max_depth: 10,
+            max_depth: MAX_TRAVERSAL_DEPTH,
             node_cap: 100,
         },
     )
