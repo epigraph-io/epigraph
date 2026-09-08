@@ -9,32 +9,8 @@ mod fixture;
 
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_db::ClaimRepository;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-    Some(pool)
-}
-
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
 
 async fn insert_test_agent(pool: &PgPool, agent_id: Uuid) {
     sqlx::query(
@@ -57,9 +33,8 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
     )
 }
 
-#[tokio::test]
-async fn get_belief_columns_includes_mass_on_empty_and_missing() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_belief_columns_includes_mass_on_empty_and_missing(pool: PgPool) {
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 
@@ -99,9 +74,8 @@ async fn get_belief_columns_includes_mass_on_empty_and_missing() {
     assert_eq!(cols.mass_on_missing, Some(0.05));
 }
 
-#[tokio::test]
-async fn get_belief_columns_mass_fields_default_to_zero_on_fresh_claim() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_belief_columns_mass_fields_default_to_zero_on_fresh_claim(pool: PgPool) {
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 

@@ -13,32 +13,8 @@ mod fixture;
 
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_db::ClaimRepository;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-    Some(pool)
-}
-
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
 
 async fn insert_test_agent(pool: &PgPool, agent_id: Uuid) {
     sqlx::query(
@@ -61,9 +37,8 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
     )
 }
 
-#[tokio::test]
-async fn get_by_id_with_labels_returns_none_when_no_row() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_id_with_labels_returns_none_when_no_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
 
     let found =
@@ -74,9 +49,8 @@ async fn get_by_id_with_labels_returns_none_when_no_row() {
     assert!(found.is_none(), "expected None, got {:?}", found.is_some());
 }
 
-#[tokio::test]
-async fn get_by_id_with_labels_matches_separate_calls() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
