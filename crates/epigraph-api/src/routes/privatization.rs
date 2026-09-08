@@ -406,6 +406,16 @@ const PLAN_TTL_HOURS: i64 = 4;
 /// and the hull are the two statements in this system that can walk the whole
 /// edge corpus — the hull being a LOOP of them. Applied to the connection by
 /// `PrivatizationRepository::select` before the first statement.
+///
+/// # IT COVERS THOSE TWO STATEMENTS AND NOT THE WHOLE PREVIEW
+///
+/// `select` restores the connection's prior bound before it returns, so the
+/// plan INSERT, the freeze and the actor-scoped rendering pass all run under
+/// whatever the pool was built with. That is the right scope — the two
+/// corpus-walking statements are what the bound exists for, and the alternative
+/// is a session-scope `SET` left on a pooled connection for the next borrower —
+/// but it means "the preview returns within this bound" is not literally true of
+/// the whole handler, so it is written here rather than assumed.
 #[cfg(feature = "db")]
 const SELECTION_STATEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -629,6 +639,20 @@ pub async fn create_plan(
     // chartered to validate exactly that digest against exactly that set. The
     // transaction is therefore rolled back and the operator asked to re-run,
     // rather than a permanently self-inconsistent row being written.
+    //
+    // WHY `item_count()` IS THE RIGHT QUANTITY TO COMPARE AGAINST, since the
+    // three numbers involved are computed three different ways. `digest()`
+    // hashes a set `plan_digest` DEDUPES; `freeze_into` carries `ON CONFLICT DO
+    // NOTHING`, so its row count is the distinct-and-live cardinality; and
+    // `item_count()` is a plain `len()`. They coincide because
+    // `PrivatizationRepository::select` — the only constructor of an
+    // `UnfilteredSelection` the request path can reach, which is what the
+    // `locked_decisions.rs` source lint holds — returns
+    // `select_content_lineage_hull`'s output, and that is built from a
+    // `BTreeMap` keyed on `claim_id`. So the items are unique by construction,
+    // every kind is `claim`, and the only way the three can disagree is the
+    // dropped-claim race this branch catches. If a future change gives the
+    // wrapper a second production constructor, that argument has to be redone.
     if frozen != u64::try_from(selection.item_count()).unwrap_or(u64::MAX) {
         return Err(ApiError::Conflict {
             reason:
