@@ -878,6 +878,62 @@ fn the_edge_marker_scanner_is_not_vacuous() {
         (false, Some("evidence".to_string())),
         "{by_alias:?}"
     );
+
+    // A SCHEMA-QUALIFIED table resolves to its bare name.
+    //
+    // Both directions are asserted because the qualifier broke both. The
+    // second is the one that mattered: before the fix, `FROM public.edges e`
+    // with the SINGLE-OWNER marker resolved to `public.edges`, missed the
+    // `Some("edges")` arm, and read as compliance — so the qualified spelling
+    // was a way to write the exact leak this file exists to refuse.
+    let qualified_edge = "let sql = viewer.splice(\"SELECT 1 FROM public.edges e \
+                          WHERE true /* {EDGE_VISIBILITY:e} */\", 2);";
+    let got = markers_with_their_tables(qualified_edge);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].2, got[0].3.as_deref()),
+        (true, Some("edges")),
+        "a schema-qualified edges read must resolve to `edges`, or the correct EDGE spelling is \
+         reported as an error on a table that does not exist"
+    );
+
+    let qualified_plain = "let sql = viewer.splice(\"SELECT 1 FROM public.edges e \
+                           WHERE true /* {VISIBILITY:e} */\", 2);";
+    let got = markers_with_their_tables(qualified_plain);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        (got[0].2, got[0].3.as_deref()),
+        (false, Some("edges")),
+        "a schema-qualified edges read taking the SINGLE-OWNER predicate must still resolve to \
+         `edges`, or the ratchet is evaded by writing `public.` in front of the table"
+    );
+
+    // A marker in a JOIN's `ON` clause, with a SECOND marker on the driving
+    // table. `repos/privatization.rs` writes both shapes — a `LEFT JOIN`
+    // predicate has to live in `ON`, because a `WHERE` on the right-hand table
+    // would silently turn it back into an inner join — and this scanner's
+    // `continue` paths are silent, so a marker it skipped would look exactly
+    // like a marker it approved.
+    let joined = "let sql = viewer.splice(\"SELECT 1 FROM public.edges e \
+                  JOIN public.claims oc ON oc.id = e.target_id /* {VISIBILITY:oc} */ \
+                  WHERE true /* {EDGE_VISIBILITY:e} */\", 2);";
+    let got = markers_with_their_tables(joined);
+    assert_eq!(
+        got.len(),
+        2,
+        "BOTH markers must be seen. One skipped marker is one unfiltered read the lint \
+         reports as compliant: {got:?}"
+    );
+    assert_eq!(
+        (got[0].1.as_str(), got[0].2, got[0].3.as_deref()),
+        ("oc", false, Some("claims")),
+        "a marker in an ON clause must bind to the table the JOIN names: {got:?}"
+    );
+    assert_eq!(
+        (got[1].1.as_str(), got[1].2, got[1].3.as_deref()),
+        ("e", true, Some("edges")),
+        "and the driving table's own marker must not be captured by the later JOIN: {got:?}"
+    );
 }
 
 /// `(line, alias, is_edge_spelling, table_the_alias_names)` for every marker.
@@ -945,7 +1001,27 @@ fn last_binding(window: &str, alias: &str) -> Option<String> {
         let Some(tbl_raw) = words.get(i + 1) else {
             continue;
         };
-        let tbl = tbl_raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        let tbl =
+            tbl_raw.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_');
+        // STRIP THE SCHEMA QUALIFIER, AND WHY THIS IS NOT COSMETIC.
+        //
+        // `FROM public.edges e` resolved to the literal `public.edges`, which
+        // equals neither `edges` nor any other table this scanner compares
+        // against — so BOTH arms of the caller missed it. The
+        // `edge_marker_on_a_non_edges_table` arm produced a false ACCUSATION
+        // (measured: it reported `public.edges` as a table with "no
+        // co_owner_group_id column", which is exactly backwards), and the arm
+        // that matters for safety — an `edges` read taking the SINGLE-OWNER
+        // predicate — silently passed, because `Some("public.edges")` does not
+        // match `Some("edges")`. That direction is a fail-open: the qualified
+        // spelling was a way to write the leak this test exists to catch and
+        // have it read as compliance.
+        //
+        // The repo layer already schema-qualifies FUNCTIONS routinely
+        // (`FROM public.epigraph_claim_tenancy_by_ids(...) cx` in `event.rs`
+        // and `claim.rs`), so the qualified spelling is house style rather than
+        // a hypothetical, and a qualified TABLE was one edit away.
+        let tbl = tbl.rsplit('.').next().unwrap_or(tbl);
         if tbl.is_empty() {
             continue;
         }
