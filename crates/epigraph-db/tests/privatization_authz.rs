@@ -54,6 +54,9 @@ use uuid::Uuid;
 use viewer_fixture as fixture;
 
 use epigraph_db::repos::instance_admin::InstanceAdminRepository;
+use epigraph_db::repos::privatization::{
+    PrivatizationRepository, SelectionError, SelectionRefusal,
+};
 
 /// **The acceptance clause, first half.** Migration 083 seeds nothing, and
 /// nobody is an instance administrator at head.
@@ -523,8 +526,14 @@ async fn security_events_read_widens_to_the_whole_log_for_an_instance_admin_only
 /// `epigraph_is_group_admin(NULL)` — an `EXISTS` over `group_memberships WHERE
 /// m.group_id = NULL` — is false.
 ///
-/// So the entity rows are denied in both directions until 18b gives that table a
-/// read policy. The actor here is deliberately the strongest possible case: an
+/// So the entity rows are denied in both directions for as long as
+/// `privatization_plans` has no SELECT policy. PR-18a expected 18b to add one;
+/// 18b did not — it ships the selection pass as a pure computation and persists
+/// no plan, because a policy needs a migration and the PR-18 plan section's four
+/// numbers were all consumed by 18a (080-083). The denial below is therefore the
+/// standing behaviour, not a transient state with a known end date.
+///
+/// The actor here is deliberately the strongest possible case: an
 /// instance admin who IS a live `role='admin'` of the plan's target group. The
 /// calibration below asserts that same principal gets `true` from
 /// `epigraph_is_group_admin(<the group>)` on the very same connection, which is
@@ -586,7 +595,8 @@ async fn privatization_audit_read_yields_plan_rows_but_no_entity_ids_to_an_insta
         "the entity_id arm must be unreachable from an app connection: the sub-select over \
          privatization_plans yields NULL because 080 gives that table no SELECT policy under \
          FORCE, so epigraph_is_group_admin(NULL) is false. The direction is denial, not \
-         disclosure, and 18b owns the read policy that would open it deliberately."
+         disclosure. Whichever slice is allocated a migration number owns the read policy that \
+         would open it deliberately; 18b was not, and did not."
     );
 }
 
@@ -725,4 +735,265 @@ async fn add_admin(pool: &PgPool, group: Uuid, label: &str) -> Uuid {
     .await
     .expect("seed co-admin membership");
     agent
+}
+
+// ===========================================================================
+// Acceptance clause 1, the negative direction: `not_visible_to_actor` is a
+// COUNT WITH NO IDS.
+//
+// This is the half of the clause that fails silently. "The preview reported 7
+// items" is satisfied by a preview that also leaked all 7 ids and their
+// content; only an assertion on the ABSENCE of the id can tell the two apart.
+//
+// It runs on a STAMPED, DOWNGRADED connection rather than on the `#[sqlx::test]`
+// pool. `DATABASE_URL` is `epigraph` — `rolsuper`, `rolbypassrls` — so on the
+// default pool every row is visible to every actor, and the negative assertion
+// below would pass against a rendering pass that had no predicate at all. That
+// is the same trap this file's module doc records for the write side.
+// ===========================================================================
+
+/// The rendering pass returns ids and content ONLY for what the actor can read,
+/// while the selection pass counts everything.
+///
+/// The two-pass split is the sec-F7 closure: selection must be unfiltered to
+/// produce a correct plan, and rendering must be filtered or the preview is an
+/// exfiltration channel. This asserts both halves at once, which is the only
+/// way to tell the fix from either failure mode — a filtered selection (wrong
+/// plan) and an unfiltered rendering (the oracle) each satisfy one assertion
+/// and fail the other.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rendering_pass_yields_no_id_and_no_content_for_what_the_actor_cannot_read(
+    pool: PgPool,
+) {
+    let (actor, _actor_group) = fixture::seed_agent_with_group(&pool, "render-actor").await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "render-stranger").await;
+
+    const SECRET: &str = "the stranger's private content";
+    let readable = fixture::seed_public_claim(&pool, actor, "public and readable").await;
+    let hidden = fixture::seed_group_claim(&pool, stranger, stranger_group, SECRET).await;
+    let candidates = vec![readable, hidden];
+
+    // SELECTION: unfiltered, and it must see BOTH. If this half ever returns 1,
+    // the plan is wrong rather than leaky, and the assertion below stops
+    // measuring anything.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let mut maintenance = pool.acquire().await.expect("acquire");
+    let counted = PrivatizationRepository::count_selected(&mut maintenance, &bypass, &candidates)
+        .await
+        .expect("unfiltered count");
+    assert_eq!(
+        counted, 2,
+        "selection runs unfiltered and must count the stranger's claim too — a filtered \
+         selection silently omits exactly the rows privatization exists to find"
+    );
+    drop(maintenance);
+
+    // RENDERING: the actor's own authority, on a connection that really is
+    // subject to the policy.
+    let mut conn = fully_stamped_app_conn(&pool, actor).await;
+    let actor_viewer = epigraph_db::visibility::Viewer::resolve(&pool, actor)
+        .await
+        .expect("resolve the actor");
+    let rendered = PrivatizationRepository::visible_previews(&mut conn, &actor_viewer, &candidates)
+        .await
+        .expect("render");
+
+    let rendered_ids: Vec<Uuid> = rendered.iter().map(|p| p.claim_id).collect();
+    assert!(
+        rendered_ids.contains(&readable),
+        "POSITIVE CONTROL: the actor must still get the claim it CAN read. Without this, an \
+         implementation that renders nothing at all passes every assertion below"
+    );
+    assert!(
+        !rendered_ids.contains(&hidden),
+        "the id of a claim the actor cannot read must not appear. An id is itself the \
+         disclosure: it names an entity in another tenant's private region"
+    );
+    for preview in &rendered {
+        assert!(
+            !preview.preview.contains(SECRET),
+            "no rendered preview may carry content the actor cannot read"
+        );
+    }
+
+    // `not_visible_to_actor` is the DIFFERENCE, and it is reported as a number.
+    let not_visible = counted - i64::try_from(rendered.len()).expect("small");
+    assert_eq!(
+        not_visible, 1,
+        "the preview reports what it withheld as a count, so the operator learns the plan is \
+         larger than what they can inspect without learning what is in it"
+    );
+
+    // CALIBRATION: the stranger CAN read its own claim on the same code path,
+    // so the denial above is attributable to the actor's authority and not to a
+    // rendering pass that is simply broken.
+    drop(conn);
+    let mut stranger_conn = fully_stamped_app_conn(&pool, stranger).await;
+    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve the stranger");
+    let stranger_sees = PrivatizationRepository::visible_previews(
+        &mut stranger_conn,
+        &stranger_viewer,
+        &candidates,
+    )
+    .await
+    .expect("render for the stranger");
+    assert!(
+        stranger_sees.iter().any(|p| p.claim_id == hidden),
+        "the owner of the private claim must read it through the very same function"
+    );
+}
+
+/// A downgraded `epigraph_app` connection stamped with BOTH session GUCs.
+///
+/// # Why [`stamped_app_conn`] is not enough here
+///
+/// That helper stamps `epigraph.principal_id` only, which is all the
+/// `instance_admins` and `privatization_audit` policies read. `claims_tenancy`
+/// is a different shape: its last disjunct is
+/// `owner_group_id = ANY(epigraph_session_groups())`, and
+/// `epigraph_session_groups()` reads the **`epigraph.group_ids`** GUC — a
+/// second stamp that migration 067 keeps deliberately separate from the
+/// principal.
+///
+/// Measured: with `principal_id` alone, a principal cannot read its **own**
+/// group-private claim, because the group array is empty and only the
+/// `visibility = 'public'` disjunct can match. A negative assertion written on
+/// such a connection passes for a reason that has nothing to do with the code
+/// under test, and its positive control fails — which is how this was caught.
+///
+/// Stamping both is also what makes the two halves of plan §4.5's qual/GUC
+/// coherence agree on this connection: the `Viewer` supplies `$V` to the
+/// spliced predicate, and the identical group set reaches the RLS policy
+/// through the GUC. A row filtered by one is filtered by the other, so a test
+/// on this connection cannot pass because RLS silently compensated for a
+/// missing application predicate — or the reverse.
+async fn fully_stamped_app_conn(
+    pool: &PgPool,
+    principal: Uuid,
+) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    let groups: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT group_id FROM group_memberships WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(principal)
+    .fetch_all(pool)
+    .await
+    .expect("read live memberships");
+
+    let app = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut conn = app.acquire().await.expect("acquire an app connection");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1::text, false)")
+        .bind(principal)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp epigraph.principal_id");
+    let joined = groups
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::query("SELECT set_config('epigraph.group_ids', $1, false)")
+        .bind(&joined)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp epigraph.group_ids");
+
+    // CALIBRATION. Both stamps took, and the connection really is downgraded —
+    // without all three of these the assertions built on this connection are
+    // vacuous in three different ways.
+    let (session_user, bypassrls, observed, observed_groups): (
+        String,
+        bool,
+        Option<Uuid>,
+        Vec<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT session_user::text, \
+                (SELECT r.rolbypassrls FROM pg_roles r WHERE r.rolname = session_user), \
+                public.epigraph_principal_id(), \
+                public.epigraph_session_groups()",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("session probe");
+    assert_eq!(
+        session_user, "epigraph_app",
+        "the connection must really be downgraded, or FORCE is not in play"
+    );
+    assert!(
+        !bypassrls,
+        "epigraph_app must not hold BYPASSRLS, or every policy assertion is vacuous"
+    );
+    assert_eq!(
+        observed,
+        Some(principal),
+        "the principal stamp must have taken"
+    );
+    assert_eq!(
+        observed_groups.len(),
+        groups.len(),
+        "the group stamp must have taken, or claims_tenancy sees an empty group array and the \
+         principal cannot read its own group-private rows"
+    );
+    conn
+}
+
+/// Both rendering functions REFUSE a bypass viewer, at runtime.
+///
+/// # Why an assertion on a `debug_assert!` would have been worthless
+///
+/// The root `Cargo.toml` declares no `[profile.release]`, so `release` takes
+/// cargo's default `debug-assertions = false` and a `debug_assert!` guard is
+/// simply not in the shipped binary. A test run under `cargo test` compiles
+/// with debug assertions ON, so a test can only ever observe the guard that is
+/// absent from production — which is why the guard on this side of the split is
+/// an `if … return Err(…)` and this test asserts an `Err`, not a panic.
+///
+/// The selection side keeps its `debug_assert!`s deliberately: handing them the
+/// wrong viewer produces an under-selected plan, which is wrong and visible,
+/// where handing the rendering side a bypass viewer emits ids and content for
+/// entities the actor cannot read, which is neither.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rendering_pass_refuses_a_bypass_viewer_rather_than_asserting(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "render-refusal").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "a claim").await;
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let previews = PrivatizationRepository::visible_previews(&mut conn, &bypass, &[claim]).await;
+    assert!(
+        matches!(
+            previews,
+            Err(SelectionError::Refused(
+                SelectionRefusal::BypassViewerInRenderingPass
+            ))
+        ),
+        "rendering under a bypass viewer must be refused, not merely asserted against: \
+         got {previews:?}"
+    );
+
+    let edges =
+        PrivatizationRepository::visible_boundary_edges(&mut conn, &bypass, &[claim], 10).await;
+    assert!(
+        matches!(
+            edges,
+            Err(SelectionError::Refused(
+                SelectionRefusal::BypassViewerInRenderingPass
+            ))
+        ),
+        "the boundary-edge SAMPLE carries ids and must be refused the same way: got {edges:?}"
+    );
+
+    // CALIBRATION. The same two calls SUCCEED under the actor's own viewer, so
+    // the refusals above are attributable to the viewer shape and not to a code
+    // path that errors for every input.
+    let actor = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("resolve the actor");
+    PrivatizationRepository::visible_previews(&mut conn, &actor, &[claim])
+        .await
+        .expect("a scoped viewer must be accepted");
+    PrivatizationRepository::visible_boundary_edges(&mut conn, &actor, &[claim], 10)
+        .await
+        .expect("a scoped viewer must be accepted");
 }
