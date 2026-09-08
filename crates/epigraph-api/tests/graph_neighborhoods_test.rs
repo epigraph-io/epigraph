@@ -20,6 +20,22 @@
 //! URL, so each arm passes `fixture::database_url_for(&pool)` -- the per-test
 //! database's URL -- rather than the ambient `DATABASE_URL`, which would seed
 //! one database and assert against another.
+//!
+//! # These arms lost their multi-threaded runtime, deliberately
+//!
+//! They were `#[tokio::test(flavor = "multi_thread")]`. `#[sqlx::test]` drives
+//! the future through sqlx's `rt::test_block_on`, which builds a
+//! CURRENT-THREAD Tokio runtime, so the axum server `spawn_app` spawns and the
+//! reqwest client that drives it are now cooperatively scheduled on ONE thread.
+//! That is fine today -- nothing in the request path blocks: there is no
+//! `block_in_place`, `Handle::block_on` or `futures::executor::block_on`
+//! anywhere in epigraph-api/db/engine `src/`, and `spawn_app` binds an
+//! ephemeral port so there is no fixed-port contention. It is written down
+//! because it is a PRECEDENT: the next shard converts the remaining
+//! `flavor = "multi_thread"` arms in this package the same way, and the day a
+//! handler grows a blocking call it will panic ("can call blocking only when
+//! running on the multi-threaded runtime") or deadlock outright, with nothing
+//! in that diff to explain why.
 
 use serde_json::Value;
 use sqlx::PgPool;
@@ -340,9 +356,6 @@ async fn neighborhoods_expand_atomic_returns_atoms_and_compound_groups(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighborhoods_expand_compound_populates_structural_edges(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;
-
-    // Wipe local fixture rows. Run this file with `-- --test-threads=1`: all
-    // tests here DELETE the same fixture tables, so parallel execution races.
 
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(

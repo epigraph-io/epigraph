@@ -29,6 +29,22 @@
 //! assert against the shared one, which is the silent-vacuous-pass failure this
 //! note exists to prevent.
 //!
+//! # These arms lost their multi-threaded runtime, deliberately
+//!
+//! They were `#[tokio::test(flavor = "multi_thread")]`. `#[sqlx::test]` drives
+//! the future through sqlx's `rt::test_block_on`, which builds a
+//! CURRENT-THREAD Tokio runtime, so the axum server `spawn_app` spawns and the
+//! reqwest client that drives it are now cooperatively scheduled on ONE thread.
+//! That is fine today -- nothing in the request path blocks: there is no
+//! `block_in_place`, `Handle::block_on` or `futures::executor::block_on`
+//! anywhere in epigraph-api/db/engine `src/`, and `spawn_app` binds an
+//! ephemeral port so there is no fixed-port contention. It is written down
+//! because it is a PRECEDENT: the next shard converts the remaining
+//! `flavor = "multi_thread"` arms in this package the same way, and the day a
+//! handler grows a blocking call it will panic ("can call blocking only when
+//! running on the multi-threaded runtime") or deadlock outright, with nothing
+//! in that diff to explain why.
+//!
 //! The two remaining `#[tokio::test]` arms are deliberately left alone:
 //! `legacy_neighborhood_endpoint_returns_410_gone` and
 //! `graph_endpoints_require_bearer` assert 410/401 unconditionally, read no
