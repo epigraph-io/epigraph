@@ -26,9 +26,12 @@ use axum::{
     Json,
 };
 use epigraph_db::{GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository};
-// rotate_group_key (from epigraph-privacy) and the rotate_key handler live in
-// the epigraph-enterprise repo. To add it here: add epigraph-privacy as a dep
-// and re-implement the handler calling rotate_group_key from that crate.
+// Key rotation is client-side work with a server-side bookkeeping half. The
+// client half ships: the `epigraph-group` binary mints the next epoch's key and
+// re-wraps it for each member. The server half — a rotate handler that retires
+// the outgoing epoch and admits the new shares in one transaction — is PR-20's,
+// and is deliberately not stubbed here: a rotation that updated epochs without
+// the re-wrapped shares would strand every member.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -296,6 +299,16 @@ pub async fn add_member(
     // truncated or padded share would be stored happily and fail at UNWRAP time
     // — on the member's machine, long after the admin who submitted it has
     // moved on. Reject at the boundary instead.
+    //
+    // Length is all this can check, and the residual is wider than it used to
+    // be: a share is now bound to the group, the epoch and the member it was
+    // wrapped for, and the server holds no key with which to verify any of the
+    // three. A well-formed share bound to the wrong tuple is stored and fails
+    // closed on the member's machine. That is the cost of the server never
+    // holding a group key, not an oversight. Neither side verifies the tuple:
+    // the operator supplies it to the ceremony tool, which contacts no server
+    // and so cannot know the group's live state, and this route stamps the
+    // membership row with the epoch it reads from the database.
     const WRAPPED_KEY_SHARE_BYTES: usize = 12 + 32 + 16;
 
     let wrapped_key_bytes =

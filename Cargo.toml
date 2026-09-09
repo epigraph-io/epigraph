@@ -8,6 +8,11 @@ members = [
     "crates/epigraph-authz",
     "crates/epigraph-core",
     "crates/epigraph-crypto",
+    # The plan places this "between epigraph-crypto and epigraph-db", which is
+    # where it is. Immediately AFTER epigraph-crypto, whose primitives it
+    # composes, rather than immediately BEFORE epigraph-db: epigraph-ds sits
+    # between those two, so only one of the readings can be the literal one.
+    "crates/epigraph-privacy",
     "crates/epigraph-ds",
     "crates/epigraph-db",
     "crates/epigraph-embeddings",
@@ -71,6 +76,7 @@ epigraph-authz = { path = "crates/epigraph-authz" }  # Fail-closed, resource-awa
 epigraph-auth = { path = "crates/epigraph-auth" }
 epigraph-core = { path = "crates/epigraph-core" }
 epigraph-crypto = { path = "crates/epigraph-crypto" }
+epigraph-privacy = { path = "crates/epigraph-privacy" }  # Client-side sealing (no DB, no key custody)
 epigraph-db = { path = "crates/epigraph-db" }
 epigraph-engine = { path = "crates/epigraph-engine" }
 epigraph-api = { path = "crates/epigraph-api" }
