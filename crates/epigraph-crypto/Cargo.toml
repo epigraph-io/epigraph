@@ -16,6 +16,10 @@ aes-gcm = { workspace = true }
 x25519-dalek = { workspace = true }
 curve25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+# `wrap_group_key`'s AAD binds a group id and a member agent id; both are UUIDs
+# everywhere else in the tree, and taking them as `[u8; 16]` here would push the
+# conversion (and the chance of transposing the two) onto every caller.
+uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

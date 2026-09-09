@@ -82,9 +82,14 @@
 //! # What is NOT here
 //!
 //! `PrivatizationResealHandler`. §6.5.5 names three handlers; the third reseals
-//! group-key-rotated ciphertext, `crates/epigraph-privacy` does not exist, and
-//! `seal` mode is PR-21's — `routes/privatization.rs::create_plan` still returns
-//! `501` for it. Migration 077's `jobs_app` policy already names
+//! group-key-rotated ciphertext, and `seal` mode is PR-21's —
+//! `routes/privatization.rs::create_plan` still returns `501` for it. The
+//! sealing primitives now exist in `crates/epigraph-privacy`, but they are
+//! client-side by construction: no server-side job can reseal content whose key
+//! the server does not hold, so this handler waits on the manifest ceremony
+//! that carries the ciphertext, not on the encryptor.
+//!
+//! Migration 077's `jobs_app` policy already names
 //! `privatization_reseal` and keeps naming it; the job type exists in the policy
 //! and has no producer, which is the same forward-staging that file describes.
 

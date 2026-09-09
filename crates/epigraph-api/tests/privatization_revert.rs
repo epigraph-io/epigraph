@@ -12,8 +12,9 @@
 //! admits the value so the refusal can be measured against the mode it is about.
 //! The positive arm — a seal plan whose items were genuinely sealed and then
 //! unsealed CAN be reverted — cannot be exercised by this build, because
-//! `crates/epigraph-privacy` does not exist and nothing in the product writes a
-//! seal. What is asserted instead is the same request accepted once the
+//! nothing in the product writes a seal: the encryptor exists, but the manifest
+//! ceremony that would carry its output to the server is PR-21's. What is
+//! asserted instead is the same request accepted once the
 //! encryption row is gone, which measures the refusal's CONDITION rather than a
 //! revert that never worked.
 //!

@@ -19,9 +19,6 @@ use uuid::Uuid;
 #[cfg(feature = "db")]
 use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
-// set_group_context (from epigraph-privacy) lives in the epigraph-enterprise
-// repo. Add epigraph-privacy as a dep there to restore RLS group context
-// scoping; kernel RLS arrives with migrations 073-075.
 
 // =============================================================================
 // PAGINATION CONSTANTS
@@ -950,7 +947,11 @@ pub async fn get_claim(
         }
     }
 
-    // Set RLS context within a TRANSACTION to scope set_config and prevent pool leak
+    // A transaction, not a pooled connection: no group context is set on it
+    // today, and any future set_config must be scoped to one so it cannot
+    // leak to the next borrower of the connection. What constrains this read
+    // is the Viewer threaded into the repository call below, not RLS; kernel
+    // RLS arrives with migrations 073-075.
     let mut tx = state
         .db_pool
         .begin()
@@ -958,8 +959,6 @@ pub async fn get_claim(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to begin transaction: {e}"),
         })?;
-    // epigraph-enterprise: set_group_context(&mut *tx, params.group_id) — add the
-    // epigraph-privacy dep to enable
 
     // Query claim on the same transaction (RLS arrives with migrations 073-075)
     let claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
@@ -1079,7 +1078,11 @@ pub async fn list_claims(
         }
     }
 
-    // Set RLS context within a TRANSACTION to scope set_config and prevent pool leak
+    // A transaction, not a pooled connection: no group context is set on it
+    // today, and any future set_config must be scoped to one so it cannot
+    // leak to the next borrower of the connection. What constrains this read
+    // is the Viewer threaded into the repository call below, not RLS; kernel
+    // RLS arrives with migrations 073-075.
     let mut tx = state
         .db_pool
         .begin()
@@ -1087,8 +1090,6 @@ pub async fn list_claims(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to begin transaction: {e}"),
         })?;
-    // epigraph-enterprise: set_group_context(&mut *tx, params.group_id) — add the
-    // epigraph-privacy dep to enable
 
     // Fetch on the same transaction (RLS arrives with migrations 073-075)
     let claims = ClaimRepository::list_conn(

@@ -95,9 +95,12 @@
 //! # What this module still does NOT do, and why
 //!
 //! The seal/unseal manifest ceremony (`seal-manifest`, `seal-commit`,
-//! `unseal-manifest`, `unseal-commit`) is absent: it is a key ceremony over
-//! `crates/epigraph-privacy`, which does not exist, and `create_plan` still
-//! answers `501` for `mode="seal"`. The MCP tools §6.5.7 names are absent too;
+//! `unseal-manifest`, `unseal-commit`) is absent, and `create_plan` still
+//! answers `501` for `mode="seal"`. `crates/epigraph-privacy` now supplies the
+//! encryptor the ceremony would run on the CLIENT; the ceremony itself — the
+//! manifest, its digest, and the all-or-nothing commit — is PR-21's.
+//!
+//! The MCP tools §6.5.7 names are absent too;
 //! they discharge no acceptance clause and are recorded as descoped in
 //! `docs/tenancy/progress.json` rather than shipped ahead of the surface they
 //! would mirror.
@@ -601,12 +604,12 @@ pub async fn create_plan(
 
     let mode = body.mode.as_deref().unwrap_or("restrict");
     if mode == "seal" {
-        // FINAL-PLAN §6.5.6's seal is a two-phase, client-driven key ceremony
-        // and `crates/epigraph-privacy` does not exist yet. A preview that
-        // described a seal it cannot perform would be a promise.
+        // FINAL-PLAN §6.5.6's seal is a two-phase, client-driven key ceremony,
+        // and this build ships neither phase. A preview that described a seal
+        // the server cannot perform would be a promise.
         return Err(ApiError::NotImplemented {
             feature: "mode=seal; seal is a later slice and its side effects cannot be previewed \
-                      honestly before the encryptor exists"
+                      honestly before the seal ceremony exists"
                 .to_string(),
         });
     }
@@ -1462,9 +1465,9 @@ pub async fn abort_plan(
 /// FINAL-PLAN's acceptance clause 10 also asks that a `mode='seal'` plan whose
 /// items are all unsealed can be reverted and one with sealed items returns
 /// `409` with the still-sealed count. **The 409 arm ships and the positive arm
-/// cannot be exercised**: `crates/epigraph-privacy` does not exist, `seal` mode
-/// is PR-21's, and `create_plan` returns `501` for it — so no plan this build
-/// can create has a sealed item. That is stated rather than faked.
+/// cannot be exercised**: `seal` mode is PR-21's and `create_plan` returns
+/// `501` for it, so no plan this build can create has a sealed item. That is
+/// stated rather than faked.
 ///
 /// # Errors
 ///

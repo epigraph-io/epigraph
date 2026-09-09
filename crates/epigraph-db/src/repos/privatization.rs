@@ -2530,9 +2530,10 @@ impl PrivatizationRepository {
     /// bypass viewer.
     ///
     /// So the count is scoped to seal-mode plans. What is still NOT shipped is
-    /// the seal path that could make it non-zero through the product —
-    /// `crates/epigraph-privacy` does not exist, `seal` is PR-21's, and
-    /// `routes/privatization.rs::create_plan` returns `501` for it — so this
+    /// the seal path that could make it non-zero through the product — `seal`
+    /// is PR-21's and `routes/privatization.rs::create_plan` returns `501` for
+    /// it; `crates/epigraph-privacy` now supplies the encryptor, but nothing
+    /// carries its output into these tables yet — so this
     /// returns 0 for every plan the ROUTE can create today. It is here so that
     /// the refusal arrives with the seal mode rather than after it.
     ///

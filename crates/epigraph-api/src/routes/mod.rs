@@ -527,7 +527,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/groups/:id/members/:agent_id",
             delete(groups::remove_member),
         )
-        // /api/v1/groups/:id/rotate-key lives in the epigraph-enterprise repo.
+        // No rotate-key route: rotation's server half is PR-20's. See the
+        // header of routes/groups.rs for why it is not stubbed.
         // Isomorphism pattern detection (episcience feature)
         // Admin OAuth client management
         .route(
