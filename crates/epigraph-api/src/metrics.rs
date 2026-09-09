@@ -97,6 +97,46 @@ pub struct Metrics {
     /// "canary visible because the policy was dropped" — which are a no-op and
     /// a total tenancy failure respectively.
     pub rls_app_role: Gauge,
+
+    /// Groups that have owed a re-key for more than seven days — FINAL-PLAN
+    /// §6.7 point 2's `epigraph_groups_reseal_required`.
+    ///
+    /// A member removal sets `groups.reseal_required_at` and marks the epoch
+    /// `rotating`; only a key-holding admin can finish the job, because by
+    /// §6.5.6 the server holds no group key. So the obligation is one the
+    /// server can measure and cannot discharge, and an obligation nobody can
+    /// see is one nobody services. Every day it goes unmet is another day the
+    /// removed member's retained share reads content the group still writes.
+    ///
+    /// **The seven-day clause is part of the instrument, not a tuning knob.**
+    /// A fresh obligation is a normal operational state; one a week old is a
+    /// process failure, and a gauge without the age clause alerts on the first
+    /// and so gets muted before it can report the second.
+    ///
+    /// **In this release the series is monotone non-decreasing, and a reader
+    /// deciding whether the alert is actionable needs to know that.** Nothing
+    /// clears `groups.reseal_required_at`: rotation deliberately does not
+    /// (§6.7 point 3 gives the clearing to the re-seal handler, when the last
+    /// `claim_encryption` row has actually moved) and that handler is not
+    /// built. So read this as "groups that have EVER incurred an unrotated
+    /// removal older than 7 days", not "groups currently owing one" — a group
+    /// stays counted after its admin has done everything the system asks. The
+    /// gauge is still worth having in that form, but an alert wired to it will
+    /// not clear on remediation, which is a property of the deferred design and
+    /// not of the sampler.
+    ///
+    /// A `Gauge`, and sampled rather than incremented: the value is a `count(*)`
+    /// the database owns, and it falls whenever the underlying count does.
+    /// Fed by `tenancy_gauge::TenancyGaugeSampler::sample_reseal_required` for
+    /// the same reason as its neighbours — `Collector::encode` is synchronous
+    /// and cannot await sqlx. Seeded to -1 ("not yet sampled"), because 0 is
+    /// the healthy value and publishing it before the first tick would report a
+    /// clean instance nobody has looked at.
+    ///
+    /// Deliberately NOT behind `#[cfg(feature = "db")]`: this field is pure
+    /// `prometheus_client`, and naming it under `--no-default-features` must
+    /// keep compiling.
+    pub groups_reseal_required: Gauge,
 }
 
 impl Metrics {
@@ -159,6 +199,15 @@ impl Metrics {
             rls_app_role.clone(),
         );
 
+        let groups_reseal_required: Gauge = Gauge::default();
+        groups_reseal_required.set(-1);
+        registry.register(
+            "epigraph_groups_reseal_required",
+            "Groups whose reseal_required_at is non-NULL and older than 7 days, \
+             -1 not yet sampled",
+            groups_reseal_required.clone(),
+        );
+
         Self {
             registry,
             requests_total,
@@ -168,6 +217,7 @@ impl Metrics {
             tenancy_undeclared_writes,
             rls_canary_visible,
             rls_app_role,
+            groups_reseal_required,
         }
     }
 }

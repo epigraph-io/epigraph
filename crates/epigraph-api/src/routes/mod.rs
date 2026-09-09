@@ -527,8 +527,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/groups/:id/members/:agent_id",
             delete(groups::remove_member),
         )
-        // No rotate-key route: rotation's server half is PR-20's. See the
-        // header of routes/groups.rs for why it is not stubbed.
+        // PR-20's rotation, spelled `/rotate` — what FINAL-PLAN §6.7 and its
+        // interface table say. The `/rotate-key` spelling this comment used to
+        // carry was never served by anything.
+        .route("/api/v1/groups/:id/rotate", post(groups::rotate_key))
         // Isomorphism pattern detection (episcience feature)
         // Admin OAuth client management
         .route(

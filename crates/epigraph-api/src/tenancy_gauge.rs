@@ -36,6 +36,14 @@ use crate::metrics::{Metrics, TenancyTableLabel};
 use sqlx::PgPool;
 use std::collections::BTreeSet;
 
+/// How stale a `groups.reseal_required_at` must be before
+/// `epigraph_groups_reseal_required` counts it.
+///
+/// FINAL-PLAN §6.7 point 2 says "non-NULL and older than 7 days", and the
+/// number is named here rather than inlined so that a future reader can see it
+/// is a specification and not a default someone picked.
+const RESEAL_OVERDUE_DAYS: i32 = 7;
+
 /// A stateful sampler for the `epigraph_tenancy_undeclared_writes` gauge.
 ///
 /// One instance per process; call [`sample`](Self::sample) on a tick.
@@ -94,6 +102,59 @@ impl TenancyGaugeSampler {
                     .set(0);
             }
         }
+        Ok(())
+    }
+
+    /// FINAL-PLAN §6.7 point 2's pass: how many groups have owed a re-key for
+    /// more than [`RESEAL_OVERDUE_DAYS`] days.
+    ///
+    /// # Why this needs no reset bookkeeping, unlike [`sample`](Self::sample)
+    ///
+    /// It is ONE series, not a `Family`, and the query is a `count(*)` over the
+    /// whole `groups` table rather than a per-key projection. A count that
+    /// falls to zero is returned AS zero, so there is no set of keys the
+    /// previous pass exported and this one did not — which is the entire reason
+    /// `sample` carries a `seen` set. Do not "make this consistent" by giving
+    /// it one.
+    ///
+    /// # Why it takes the pool as a PARAMETER
+    ///
+    /// Same as `sample`, and it matters: `crates/epigraph-db/tests/no_unscoped_pool.rs`
+    /// exempts this file at EXACTLY ONE `.db_pool` site (`sample_canary`, which
+    /// genuinely needs the whole `AppState`), and that count is asserted in
+    /// both directions. Reaching for `state.db_pool` here would silently
+    /// inherit an exemption written for a different statement.
+    ///
+    /// The read takes no `Viewer` and carries no `-- VISIBILITY-EXEMPT:`
+    /// marker; see `GroupRepository::count_reseal_required_older_than` for why
+    /// both would be wrong on a table with no tenancy columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`epigraph_db::DbError`] if the read fails. Like `sample`, the
+    /// caller logs and retries: a database blip must not take the API down, and
+    /// a gauge that goes stale is visible in the scrape's staleness.
+    ///
+    /// **On error this gauge deliberately goes STALE, not `-1`**, and that is
+    /// the opposite of [`sample_canary`](Self::sample_canary) five lines below,
+    /// whose doc comment says a failed probe must export `-1` ("unmeasured")
+    /// and never the previous value. The difference is what the two numbers
+    /// mean. The canary's value is a binary safety assertion, where holding a
+    /// stale "safe" is itself the failure mode. This one is a population count
+    /// whose consumers are a trend and a threshold, and injecting a sentinel
+    /// into that series would corrupt both. Matching `sample` here is a
+    /// decision, not an omission — do not "make it consistent" with the canary.
+    pub async fn sample_reseal_required(
+        &mut self,
+        pool: &PgPool,
+        metrics: &Metrics,
+    ) -> Result<(), epigraph_db::DbError> {
+        let n = epigraph_db::GroupRepository::count_reseal_required_older_than(
+            pool,
+            RESEAL_OVERDUE_DAYS,
+        )
+        .await?;
+        metrics.groups_reseal_required.set(n);
         Ok(())
     }
 

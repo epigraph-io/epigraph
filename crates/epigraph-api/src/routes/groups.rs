@@ -11,8 +11,12 @@
 //! | `POST /api/v1/groups/:id/members` | `groups:admin` | `role='admin'` in this group |
 //! | `DELETE /api/v1/groups/:id/members/:agent_id` | `groups:admin` | `role='admin'` in this group; not the last admin |
 //! | `GET /api/v1/groups/:id` | `groups:read` | live member of this group |
+//! | `POST /api/v1/groups/:id/rotate` | `groups:admin` | `role='admin'` in this group |
 //!
-//! `POST /api/v1/groups/:id/rotate-key` is not implemented here.
+//! The rotate route is spelled `/rotate`, which is what FINAL-PLAN §6.7, its
+//! §6.5.7 interface table and its PR-20 *Files* line all say. Two comments in
+//! this workspace previously wrote `/rotate-key`; that spelling was never
+//! served by anything and has been corrected here and in `routes/mod.rs`.
 //!
 //! Scope AND membership, never OR: a `groups:admin` token must still be an
 //! admin of the specific target group.
@@ -28,10 +32,11 @@ use axum::{
 use epigraph_db::{GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository};
 // Key rotation is client-side work with a server-side bookkeeping half. The
 // client half ships: the `epigraph-group` binary mints the next epoch's key and
-// re-wraps it for each member. The server half — a rotate handler that retires
-// the outgoing epoch and admits the new shares in one transaction — is PR-20's,
-// and is deliberately not stubbed here: a rotation that updated epochs without
-// the re-wrapped shares would strand every member.
+// re-wraps it for each member. PR-20 adds the server half below — `rotate_key`
+// retires the outgoing epoch, creates the next one and admits the new shares in
+// ONE transaction, and refuses a submission that does not cover every live
+// member, because a rotation that advanced the epoch without the re-wrapped
+// shares would strand them.
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -117,15 +122,66 @@ pub struct GroupInfoResponse {
     pub current_epoch: Option<i32>,
     pub member_count: usize,
     pub created_at: String,
+    /// When a member removal last left this group owing a re-key and a re-seal
+    /// (FINAL-PLAN §6.7), RFC 3339, or `null` when nothing is outstanding.
+    ///
+    /// Surfaced here because the obligation is the group admin's to discharge
+    /// and they are the only principal who can: the server holds no group key.
+    /// The `epigraph_groups_reseal_required` gauge is the operator-side view of
+    /// the same column.
+    pub reseal_required_at: Option<String>,
 }
 
-/// Response after key rotation
+/// One member's re-wrapped share for the incoming epoch.
+#[derive(Debug, Deserialize)]
+pub struct RotateShare {
+    /// The live member this share was wrapped for.
+    pub agent_id: Uuid,
+    /// The wrapped group key for `agent_id` at the NEW epoch (hex-encoded,
+    /// 60 bytes: 12-byte nonce + 32-byte wrapped key + 16-byte GCM tag).
+    pub wrapped_key_share: String,
+}
+
+/// Request to rotate a group's key epoch.
+///
+/// The server mints nothing. The `epigraph-group` CLI generates the next
+/// epoch's base key locally and re-wraps it for each member; this request is
+/// the result of that ceremony being submitted for bookkeeping.
+///
+/// The previous revision of this file declared a `RotateKeyResponse` carrying a
+/// `new_epoch_key` the server was supposed to return. That type had no handler
+/// and could never have one: by FINAL-PLAN §6.5.6 the server holds no group key
+/// material, so there is no correct value for that field. It has been replaced
+/// by these types rather than filled in.
+///
+/// It carries no escrow field, and an earlier revision of this PR added one.
+/// See [`epigraph_db::GroupKeyEpochRepository::rotate_conn`] for why it was
+/// withdrawn rather than validated: the recoverability gate must not be
+/// satisfiable by a value the server cannot check.
+#[derive(Debug, Deserialize)]
+pub struct RotateKeyRequest {
+    /// A re-wrapped share for EVERY live member, and for no one else.
+    ///
+    /// A partial roster is refused rather than partially applied: an epoch
+    /// advance that skipped a member would leave them holding a share for a
+    /// retired epoch and unable to read anything written after the rotation.
+    pub shares: Vec<RotateShare>,
+}
+
+/// Response after key rotation.
 #[derive(Debug, Serialize)]
 pub struct RotateKeyResponse {
     pub group_id: Uuid,
-    pub new_epoch: u32,
-    /// New epoch key (hex-encoded) — caller must re-wrap for all members
-    pub new_epoch_key: String,
+    /// The epoch that was retired.
+    pub previous_epoch: i32,
+    /// The epoch that is now active.
+    pub new_epoch: i32,
+    /// How many live memberships were re-wrapped at `new_epoch`.
+    pub members_rewrapped: usize,
+    /// FINAL-PLAN §6.7's disclosure, verbatim. See
+    /// [`crate::tenancy_disclosure`] for why it is a constant and why it is
+    /// carried on the response at all.
+    pub revocation: &'static str,
 }
 
 // =============================================================================
@@ -331,22 +387,24 @@ pub async fn add_member(
         }
     })?;
 
-    // Get current epoch. A group with no active epoch is a broken group — it
+    // Get current epoch. A group with no current epoch is a broken group — it
     // cannot have been created by `create_group` (which writes epoch 0 in the
     // same transaction), and pinning the new member to a fabricated epoch 0
-    // would hand them a share that decrypts nothing.
-    let active_epoch = GroupKeyEpochRepository::get_active_epoch(&state.db_pool, group_id)
+    // would hand them a share that decrypts nothing. "Current" and not "active":
+    // the row may be `rotating` while a removal's re-key obligation is
+    // outstanding, and a newcomer is pinned to it in that state too.
+    let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to query active epoch: {e}"),
+            message: format!("Failed to query current epoch: {e}"),
         })?
         .ok_or_else(|| ApiError::Conflict {
-            reason: "Group has no active key epoch; rotate or re-provision it \
+            reason: "Group has no current key epoch; rotate or re-provision it \
                  before adding members"
                 .to_string(),
         })?;
 
-    let epoch = active_epoch.epoch;
+    let epoch = current_epoch.epoch;
 
     // Persist membership
     let membership_id = GroupMembershipRepository::add_member(
@@ -402,8 +460,12 @@ pub async fn add_member(
 /// Remove a member from a group (revoke access).
 ///
 /// Revocation alone does not re-key the group: the removed member can still
-/// decrypt anything they already hold. Marking the group as needing a reseal is
-/// PR-20's job and is deliberately not done here.
+/// decrypt anything they already hold. PR-20 makes that obligation explicit —
+/// `revoke_member_unless_last_admin` sets `groups.reseal_required_at` and moves
+/// the group's current key epoch to `status = 'rotating'`, in the same
+/// transaction as the revoke and only when a revoke actually happened. It
+/// MARKS; it does not enqueue a re-seal, because re-sealing needs the group key
+/// and by FINAL-PLAN §6.5.6 the server does not have one.
 ///
 /// # Authorization
 /// `groups:admin` scope AND a live `role='admin'` membership in this group.
@@ -522,10 +584,10 @@ pub async fn get_group(
             message: format!("Failed to query members: {e}"),
         })?;
 
-    let active_epoch = GroupKeyEpochRepository::get_active_epoch(&state.db_pool, group_id)
+    let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to query active epoch: {e}"),
+            message: format!("Failed to query current epoch: {e}"),
         })?;
 
     Ok(Json(GroupInfoResponse {
@@ -533,14 +595,205 @@ pub async fn get_group(
         display_name: group.display_name,
         did_key: group.did_key,
         public_key: hex::encode(&group.public_key),
-        current_epoch: active_epoch.map(|e| e.epoch),
+        current_epoch: current_epoch.map(|e| e.epoch),
         member_count: members.len(),
         created_at: group.created_at.to_rfc3339(),
+        reseal_required_at: group.reseal_required_at.map(|t| t.to_rfc3339()),
     }))
 }
 
-// No rotate_key handler exists in this workspace. Rotation must retire epoch N
-// and create epoch N+1 in ONE transaction (retire first) — the
-// `group_key_epochs_one_active` partial unique index from migration 060 makes a
-// second active epoch a 23505 — and must re-wrap every live member's share. See
-// migration 060's ROTATION CONTRACT comments.
+/// Rotate a group's key epoch: retire N, create N+1, re-wrap every live member.
+///
+/// FINAL-PLAN §6.7's server half. The client half is the `epigraph-group`
+/// binary, which mints the next base key and re-wraps it per member; this route
+/// accepts that ceremony's output and commits it atomically.
+///
+/// # Authorization
+/// `groups:admin` scope AND a live `role='admin'` membership in this group.
+/// Both, never either — the same rule as `add_member` and `remove_member`. The
+/// membership half is checked ON THE ROTATION'S OWN TRANSACTION, so the
+/// decision and the writes it authorises cannot be taken on different
+/// connections.
+///
+/// # Why the whole body runs on `ScopedPool::begin_as`
+///
+/// Every table this touches — `group_key_epochs` and `group_memberships` —
+/// carries a FORCEd RLS policy from migrations 077/079 that keys on the
+/// connection's tenancy GUCs. A rotation on the raw application pool writes
+/// correctly today (the connecting role still bypasses) and writes NOTHING from
+/// §9.2 step 11d onward, with no error. It also keeps this file at the exact
+/// site count `crates/epigraph-db/tests/no_unscoped_pool.rs` records for it —
+/// that register is at its ceiling and a new raw-pool read here would be a
+/// regression the ratchet exists to stop. Note the asymmetry this creates and
+/// does not resolve: rotation is stamped, while the other four group routes
+/// (including the removal that sets `reseal_required_at`) still run unstamped,
+/// as all 391 unconverted sites do.
+///
+/// # The refusals, and why each is a refusal rather than a best effort
+///
+/// * **409, unrecoverable retiring key.** Retiring epoch N when nobody can
+///   produce N's key strands every claim sealed under it, permanently. Either
+///   the epoch row already carries a `wrapped_key` or the group names an
+///   external `kms_key_ref`, or the rotation does not happen. This request
+///   carries no key material of its own: a gate satisfiable by a value the
+///   server cannot check is not a gate.
+/// * **400, roster mismatch.** The submission must cover exactly the live
+///   roster the transaction locked. A missing member would be advanced past a
+///   key they do not hold; an extra share names someone who is not a member.
+/// * **400, duplicate shares.** One agent named twice is two contradictory
+///   answers to the same question, not a submission to disambiguate.
+/// * **409, no current epoch.** A group with no `active` or `rotating` epoch is
+///   broken, not rotatable.
+///
+/// The response carries §6.7's sentence verbatim. A caller who has just
+/// rotated is precisely the caller most likely to believe they have revoked
+/// something, and this is the moment to say that they have not.
+///
+/// # Errors
+/// `403` scope or membership; `400` a malformed share or a roster mismatch;
+/// `409` an unrecoverable retiring key or a group with no current epoch;
+/// `500` a database fault or a process that was not built from a `ScopedPool`.
+pub async fn rotate_key(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    RequireScopeGroupsAdmin(auth_ctx): RequireScopeGroupsAdmin,
+    Path(group_id): Path<Uuid>,
+    Json(req): Json<RotateKeyRequest>,
+) -> Result<Json<RotateKeyResponse>, ApiError> {
+    // Same structural check `add_member` applies, for the same reason: length
+    // is all the server can verify, and rejecting at the boundary beats failing
+    // on the member's machine long after the admin has moved on.
+    const WRAPPED_KEY_SHARE_BYTES: usize = 12 + 32 + 16;
+
+    if req.shares.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "shares must carry a re-wrapped share for every live member; \
+                      an empty rotation would strand the whole group"
+                .to_string(),
+        });
+    }
+
+    let mut shares: Vec<(Uuid, Vec<u8>)> = Vec::with_capacity(req.shares.len());
+    for share in &req.shares {
+        let bytes = hex::decode(&share.wrapped_key_share).map_err(|e| ApiError::BadRequest {
+            message: format!("Invalid hex wrapped_key_share for {}: {e}", share.agent_id),
+        })?;
+        if bytes.len() != WRAPPED_KEY_SHARE_BYTES {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "wrapped_key_share for {} must be {WRAPPED_KEY_SHARE_BYTES} bytes \
+                     (12-byte nonce + 32-byte wrapped key + 16-byte GCM tag), got {}",
+                    share.agent_id,
+                    bytes.len()
+                ),
+            });
+        }
+        epigraph_crypto::EncryptedPayload::from_bytes(&bytes).map_err(|e| {
+            ApiError::BadRequest {
+                message: format!(
+                    "wrapped_key_share for {} is not a valid encrypted payload: {e}",
+                    share.agent_id
+                ),
+            }
+        })?;
+        shares.push((share.agent_id, bytes));
+    }
+
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            handler = "groups::rotate_key",
+            "rotation refused: this process was not built from a ScopedPool"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+
+    let mut tx = scoped.begin_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "groups::rotate_key",
+            "could not begin a viewer-stamped transaction"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+
+    crate::middleware::group_authz::require_group_admin_conn(&auth_ctx, group_id, &mut tx).await?;
+
+    let outcome = GroupKeyEpochRepository::rotate_conn(&mut tx, group_id, &shares)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to rotate group key: {e}"),
+        })?;
+
+    // Every arm below except `Rotated` returns without committing, so the
+    // transaction rolls back on drop and the refusal leaves no partial epoch.
+    let (previous_epoch, new_epoch, members_rewrapped) = match outcome {
+        epigraph_db::RotateOutcome::Rotated {
+            previous_epoch,
+            new_epoch,
+            members_rewrapped,
+        } => (previous_epoch, new_epoch, members_rewrapped),
+        epigraph_db::RotateOutcome::NoCurrentEpoch => {
+            return Err(ApiError::Conflict {
+                reason: "Group has no current key epoch to retire; re-provision it \
+                         rather than rotating"
+                    .to_string(),
+            });
+        }
+        epigraph_db::RotateOutcome::RetiringKeyUnrecoverable => {
+            return Err(ApiError::Conflict {
+                reason: "Refusing to retire an epoch whose key is not recoverable: the \
+                         content sealed under it would become permanently unreadable. \
+                         Record a `kms_key_ref` in the group's properties naming the \
+                         external escrow that holds the base key, and retry."
+                    .to_string(),
+            });
+        }
+        epigraph_db::RotateOutcome::RosterMismatch { missing, unknown } => {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "shares must cover exactly the live roster: {} live member(s) have no \
+                     share ({:?}) and {} submitted share(s) name a non-member ({:?})",
+                    missing.len(),
+                    missing,
+                    unknown.len(),
+                    unknown
+                ),
+            });
+        }
+        epigraph_db::RotateOutcome::DuplicateShares { agent_ids } => {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "shares names {} agent(s) more than once ({agent_ids:?}); two shares for one \
+                     member is an ambiguity the server will not resolve by picking the last one",
+                    agent_ids.len()
+                ),
+            });
+        }
+    };
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit rotation: {e}"),
+    })?;
+
+    tracing::info!(
+        group_id = %group_id,
+        previous_epoch,
+        new_epoch,
+        members_rewrapped,
+        "Rotated group key epoch"
+    );
+
+    Ok(Json(RotateKeyResponse {
+        group_id,
+        previous_epoch,
+        new_epoch,
+        members_rewrapped,
+        revocation: crate::tenancy_disclosure::ROTATION_DOES_NOT_REVOKE_PAST_ACCESS,
+    }))
+}

@@ -123,6 +123,24 @@ async fn a_preview_counts_what_the_actor_cannot_read_and_names_only_what_it_can(
         preview.plan_digest
     );
 
+    // PR-20 / FINAL-PLAN §6.7 point 1: the preview is the THIRD home of the
+    // revocation disclosure, and the only one an operator reads BEFORE acting.
+    //
+    // Asserted on the SERIALIZED value rather than on the field, because the
+    // field access is a compile-time fact and the property at issue is a
+    // runtime one: whether the sentence still reaches the caller. A rename of
+    // the JSON key, a `#[serde(skip)]`, or `side_effects` dropping off
+    // `PlanPreview` all leave `preview.side_effects.revocation` compiling and
+    // the disclosure gone. `group_rotation.rs` asserts the complementary half —
+    // that the value is the shared constant and not a fourth copy of the
+    // sentence that can drift.
+    let wire = serde_json::to_value(&preview).expect("the preview serializes");
+    assert_eq!(
+        wire["side_effects"]["revocation"].as_str(),
+        Some(epigraph_api::tenancy_disclosure::ROTATION_DOES_NOT_REVOKE_PAST_ACCESS),
+        "the preview must carry §6.7's disclosure ON THE WIRE: {wire}"
+    );
+
     let named: Vec<Uuid> = preview.sample.iter().map(|s| s.id).collect();
     assert!(
         named.contains(&readable),

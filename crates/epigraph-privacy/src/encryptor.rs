@@ -333,6 +333,90 @@ pub fn decrypt_with_base_key(
 mod tests {
     use super::*;
 
+    // ---- PR-20's documented property ---------------------------------------
+
+    /// **This is a property, not a defect, and it is asserted so that nobody
+    /// later mistakes rotation for revocation and "fixes" it.**
+    ///
+    /// FINAL-PLAN §6.7 states it in prose and PR-20 puts that prose in
+    /// `docs/tenancy.md`, in the rotate response body and in the privatization
+    /// preview. This is the executable half: what the prose says is true of the
+    /// cryptography, and it is true because content sealed under epoch N is
+    /// sealed under a key derived from the base key and N, while rotation only
+    /// ever moves *forward* — it re-wraps a new base key for the members who
+    /// remain, and re-encrypts nothing.
+    ///
+    /// The test lives here, in the crate that owns the primitives, rather than
+    /// beside `crates/epigraph-api/tests/group_rotation.rs`, which carries the
+    /// HTTP and transactional half. `epigraph-privacy` is a dependency of
+    /// `epigraph-cli` alone, and the deferred obligation `D-PR19-B` proposes a
+    /// closure ratchet requiring `epigraph-api` and `epigraph-mcp` to EXCLUDE it
+    /// — a dev-dependency enters the closure, so adding one to reach these
+    /// functions would pre-commit that ratchet's shape for a single assertion.
+    ///
+    /// The inverse assertion would be the dangerous one to write: a test that
+    /// the removed member can no longer decrypt would encode a guarantee this
+    /// system does not make, and would pass only because a fixture withheld a
+    /// key the real ex-member still holds.
+    #[test]
+    fn a_share_retained_from_a_retired_epoch_still_opens_content_sealed_under_it() {
+        let claim_id = Uuid::new_v4();
+        let sealed_before_rotation = "board minutes, sealed while they were still a member";
+
+        // Epoch N, with the group's base key at the time.
+        let base_key_at_n = [7u8; 32];
+        let epoch_n = 4u32;
+        let payload = encrypt_with_base_key(
+            sealed_before_rotation.as_bytes(),
+            &base_key_at_n,
+            claim_id,
+            epoch_n,
+            FieldTag::Content,
+        )
+        .expect("seal under epoch N");
+
+        // The rotation: a NEW base key for epoch N+1, re-wrapped for the
+        // members who remain. Nothing re-encrypts the payload above; its
+        // `claim_encryption` row stays bound to epoch N by foreign key.
+        let base_key_at_n_plus_1 = [99u8; 32];
+        assert_ne!(
+            base_key_at_n, base_key_at_n_plus_1,
+            "CALIBRATION: the two epochs must have genuinely different base keys, or the \
+             assertion below is satisfied by the key not having changed"
+        );
+
+        // The removed member kept the epoch-N key material they were given.
+        let recovered = decrypt_with_base_key(
+            &payload,
+            &base_key_at_n,
+            claim_id,
+            epoch_n,
+            FieldTag::Content,
+        )
+        .expect(
+            "the retained epoch-N key still opens epoch-N ciphertext. If this ever fails, the \
+             system's disclosure in docs/tenancy.md has become WRONG and must be rewritten \
+             before this test is deleted.",
+        );
+        assert_eq!(recovered, sealed_before_rotation.as_bytes());
+
+        // And the forward half of the same property: the new key opens nothing
+        // that was sealed under the old epoch, which is why rotation gates
+        // future ciphertext and only future ciphertext.
+        assert!(
+            decrypt_with_base_key(
+                &payload,
+                &base_key_at_n_plus_1,
+                claim_id,
+                epoch_n,
+                FieldTag::Content,
+            )
+            .is_err(),
+            "epoch N+1's key must not open epoch N's ciphertext; if it did, rotation would not \
+             gate anything at all"
+        );
+    }
+
     // ---- the seven ported round-trip / binding tests -----------------------
 
     #[test]

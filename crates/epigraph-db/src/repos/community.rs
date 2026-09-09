@@ -476,7 +476,7 @@ impl CommunityRepository {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
+        let revoked = sqlx::query(
             r#"
             UPDATE group_memberships gm
                SET revoked_at = now()
@@ -497,6 +497,49 @@ impl CommunityRepository {
         .bind(perspective_id)
         .execute(&mut *tx)
         .await?;
+
+        // PR-20 / FINAL-PLAN §6.7 point 2. This is a SECOND live removal path:
+        // `create` above projects the community onto a real tenancy group with
+        // its own `group_key_epochs` row, so a member revoked here keeps a
+        // `wrapped_key_share` that still opens everything sealed before the
+        // rotation, exactly as one revoked through
+        // `GroupMembershipRepository::revoke_member_unless_last_admin` does.
+        // Marking in only one of the two places would make
+        // `epigraph_groups_reseal_required` report the healthy value for a
+        // group that owes a re-key, and a metric that is silent on a real
+        // obligation is worse than no metric.
+        //
+        // Guarded on `rows_affected() > 0`, so the over-revocation case the
+        // `NOT EXISTS` above prevents — an agent whose OTHER perspective still
+        // holds the membership — marks nothing, because nothing was revoked.
+        //
+        // Table order is `group_memberships`, then `groups`, then
+        // `group_key_epochs`, matching `revoke_member_unless_last_admin` and
+        // `GroupKeyEpochRepository::rotate_conn`; those two doc comments explain
+        // why taking them in a different order here would be a deadlock.
+        if revoked.rows_affected() > 0 {
+            sqlx::query(
+                r#"
+                UPDATE groups
+                SET reseal_required_at = COALESCE(reseal_required_at, now())
+                WHERE id = $1
+                "#,
+            )
+            .bind(community_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                r#"
+                UPDATE group_key_epochs
+                SET status = 'rotating'
+                WHERE group_id = $1 AND status = 'active'
+                "#,
+            )
+            .bind(community_id)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         if result.rows_affected() > 0 {

@@ -789,6 +789,19 @@ async fn main() {
                         "tenancy undeclared-write sampler failed; gauge will go stale"
                     );
                 }
+                // FINAL-PLAN §6.7's re-key backlog rides the same tick, for
+                // the same reason the canary does: one interval for an
+                // operator to keep in step, and no second pool of connections
+                // held for periodic work.
+                if let Err(e) = sampler
+                    .sample_reseal_required(&sampler_pool, &sampler_metrics)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "groups reseal-required sampler failed; gauge will go stale"
+                    );
+                }
                 // Returns no error by design: a canary probe that fails must
                 // export -1 ("unmeasured"), never the previous value and never
                 // zero. See `TenancyGaugeSampler::sample_canary`.
