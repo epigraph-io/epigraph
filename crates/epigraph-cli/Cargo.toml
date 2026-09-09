@@ -244,3 +244,21 @@ http-body-util = "0.1"
 
 [lints]
 workspace = true
+
+# `epigraph-privatize` (PR-21): the client half of the D4 seal ceremony.
+#
+# Same naming convention as its two siblings above: a snake_case path with a
+# kebab-case `name`. FINAL-PLAN §6.5.7 spells the source file
+# `epigraph-privatize.rs`; the BINARY name is what the plan invokes and it is
+# preserved exactly.
+#
+# NO `required-features`, for the same reason `epigraph-group` has none and with
+# the same caveat: the SOURCE opens no pool, names no database type and reads no
+# `DATABASE_URL` — which is why `no_unmaintained_dsn.rs` passes it without an
+# exemption row — while the CRATE still links epigraph-db through
+# `default = ["db"]`, because Cargo dependencies are per-crate and not
+# per-target. "The key never reaches a process the operator controls" is a
+# property of where this binary is RUN, not something this manifest enforces.
+[[bin]]
+name = "epigraph-privatize"
+path = "src/bin/privatize.rs"

@@ -790,6 +790,247 @@ pub struct NewPlan<'a> {
     pub authors_losing_count: i32,
 }
 
+// =========================================================================
+// SEAL — the §6.5.4 trusted computing base, as data.
+// =========================================================================
+
+/// The sentinel `claims.content` carries once a claim is sealed.
+///
+/// # The id is written WITHOUT hyphens and behind an `x`, and both are measured
+///
+/// FINAL-PLAN §6.5.4 specifies `'[sealed:' || claims.id::text || ']'` and
+/// requires `array_length(tsvector_to_array(content_tsv), 1) <= 2`. **Those two
+/// requirements are incompatible as written.** Measured on this database over
+/// 3,000 random uuids, the plan's literal spelling yields between FIVE and TEN
+/// lexemes, because the default parser splits a hyphenated token into its parts
+/// and keeps the whole as well — and the count VARIES WITH THE UUID, which is
+/// the opposite of the constant lexical footprint the clause is asking for.
+///
+/// Stripping the hyphens gets it to two or three. Three, not two, whenever the
+/// hex happens to start in a way the parser reads as a numeric prefix followed
+/// by a word. Prefixing the hex with a literal `x` makes the whole thing one
+/// unambiguous word token: measured **exactly 2 lexemes across 60,000 random
+/// uuids**, and `length(content)` exactly 42 for every one of them.
+///
+/// So the sentinel is `[sealed:x<32 hex chars>]`. The `x` is not decoration; it
+/// is what makes the token count a constant rather than a function of the id.
+///
+/// The suffix itself is not cosmetic. It is what makes the sentinel distinct
+/// per claim, so `content_tsv`, `length(content)` and any hash taken over
+/// `content` differ between two sealed claims whose plaintexts were identical.
+///
+/// Written as a SQL fragment rather than formatted in Rust because the seal
+/// UPDATE is set-based over a batch: the sentinel has to be computed per row by
+/// the statement, not supplied per row by the caller.
+const SEAL_CONTENT_SENTINEL: &str = "'[sealed:x' || replace(c.id::text, '-', '') || ']'";
+
+/// [`SEAL_CONTENT_SENTINEL`] for `claim_versions`, which is keyed on its
+/// parent claim so every version of one claim carries one sentinel.
+const SEAL_VERSION_SENTINEL: &str = "'[sealed:x' || replace(v.claim_id::text, '-', '') || ']'";
+
+/// The sentinel `evidence.raw_content` carries once its claim is sealed.
+///
+/// Not id-suffixed, and it does not need to be: `evidence` has no generated
+/// tsvector, no uniqueness constraint over its content and no content hash, so
+/// the three reasons the claim sentinel carries an id do not apply. One fixed
+/// token is the smaller side channel.
+const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+
+/// `privacy_tier` on every encryption row.
+///
+/// `claim_encryption_privacy_tier_check` and
+/// `evidence_encryption_privacy_tier_check` both pin the column to this single
+/// value, so it is a constant rather than a parameter. **FINAL-PLAN §3's DDL
+/// for `evidence_encryption` omits the column entirely**; the applied table has
+/// it `NOT NULL`, and an INSERT written from the plan would fail at runtime.
+const SEALED_PRIVACY_TIER: &str = "fully_private";
+
+/// Derived tables whose rows are DELETED rather than encrypted on seal.
+///
+/// §6.5.4's argument for deleting rather than encrypting: these are *derived*,
+/// re-derivable from the plaintext on unseal, and encrypting each would
+/// multiply the key ceremony by a table shape apiece for no confidentiality
+/// gain.
+///
+/// **`experiment_entity_mentions` is not in the plan's list and is in this
+/// one.** It is the eighteenth claim-derived table in
+/// `epigraph_propagate_tenancy`'s own `derived[]` array and it carries
+/// `surface_form text NOT NULL` — the same column, on the same kind of row, as
+/// `entity_mentions.surface_form`, which the plan does name. A seal that
+/// emptied one and not the other would leave the extraction it exists to
+/// destroy sitting one table over.
+pub const SEAL_DELETE_TABLES: &[&str] = &[
+    "triples",
+    "entity_mentions",
+    "experiment_entity_mentions",
+    "reasoning_traces",
+    "challenges",
+    "experiment_triples",
+];
+
+/// One claim's plaintext trusted computing base, as the seal manifest serves it.
+///
+/// This is the only shape in the system that carries plaintext the requesting
+/// principal may not otherwise be entitled to read (§6.5.6 step 1), which is
+/// why it is a named type rather than an anonymous tuple: every field on it is
+/// a disclosure, and adding one has to be a visible diff.
+#[derive(Debug, Clone)]
+pub struct SealManifestItem {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// `claims.content`.
+    pub content: String,
+    /// `claims.labels`.
+    pub labels: Vec<String>,
+    /// `claims.properties`.
+    pub properties: serde_json::Value,
+    /// Every `claim_versions` row for this claim.
+    pub versions: Vec<SealManifestVersion>,
+    /// Every `evidence` row for this claim.
+    pub evidence: Vec<SealManifestEvidence>,
+}
+
+/// One `claim_versions` row in a seal manifest.
+#[derive(Debug, Clone)]
+pub struct SealManifestVersion {
+    /// `claim_versions.id`.
+    pub id: Uuid,
+    /// `claim_versions.content`.
+    pub content: String,
+}
+
+/// One `evidence` row in a seal manifest.
+#[derive(Debug, Clone)]
+pub struct SealManifestEvidence {
+    /// `evidence.id`.
+    pub id: Uuid,
+    /// `evidence.raw_content`, which is nullable in the schema.
+    pub raw_content: Option<String>,
+    /// `evidence.properties`.
+    pub properties: serde_json::Value,
+}
+
+/// One claim's ciphertext, as the client returns it to seal-commit.
+///
+/// Every field is REQUIRED. §6.5.4's TCB is a set, and §6.5.6 says a commit
+/// missing any member of it is refused rather than partially applied — a
+/// half-sealed claim reports success while the plaintext is one `pg_dump`
+/// away. The `Option`s that would let a caller omit a field are therefore
+/// absent from the type, and the version/evidence completeness check that the
+/// type cannot express is [`PrivatizationRepository::seal_tcb_shape_conn`]'s.
+#[derive(Debug, Clone)]
+pub struct SealCommitItem {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// `EncryptedPayload::to_bytes()` of the padded `content`.
+    pub content_ct: Vec<u8>,
+    /// `EncryptedPayload::to_bytes()` of the padded `labels`.
+    pub labels_ct: Vec<u8>,
+    /// `EncryptedPayload::to_bytes()` of the padded `properties`.
+    pub properties_ct: Vec<u8>,
+    /// BLAKE3 over `content_ct`. Exactly 32 bytes, per
+    /// `claims_content_hash_length`.
+    pub content_hash: Vec<u8>,
+    /// One entry per `claim_versions` row.
+    pub versions: Vec<SealCommitVersion>,
+    /// One entry per `evidence` row.
+    pub evidence: Vec<SealCommitEvidence>,
+}
+
+/// One sealed `claim_versions` row.
+#[derive(Debug, Clone)]
+pub struct SealCommitVersion {
+    /// `claim_versions.id`.
+    pub id: Uuid,
+    /// `EncryptedPayload::to_bytes()` of the padded version content.
+    pub content_ct: Vec<u8>,
+}
+
+/// One sealed `evidence` row.
+#[derive(Debug, Clone)]
+pub struct SealCommitEvidence {
+    /// `evidence.id`.
+    pub id: Uuid,
+    /// `EncryptedPayload::to_bytes()` of the padded `raw_content`.
+    pub content_ct: Vec<u8>,
+    /// `EncryptedPayload::to_bytes()` of the padded `properties`.
+    pub properties_ct: Vec<u8>,
+}
+
+/// The version and evidence rows a seal-commit must cover for one claim.
+///
+/// Read from the database at commit time, never from the manifest the client
+/// was served: a row inserted between the manifest and the commit would
+/// otherwise survive the seal in plaintext, which is the shape of the defect
+/// §6.5.4 was written to close.
+#[derive(Debug, Clone)]
+pub struct SealTcbShape {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// Every live `claim_versions.id` for it.
+    pub version_ids: Vec<Uuid>,
+    /// Every live `evidence.id` for it.
+    pub evidence_ids: Vec<Uuid>,
+}
+
+/// One claim's ciphertext, as the unseal manifest serves it.
+#[derive(Debug, Clone)]
+pub struct UnsealManifestItem {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// The epoch every ciphertext on this item is bound to.
+    pub epoch: i32,
+    /// `claim_encryption.encrypted_content`.
+    pub content_ct: Vec<u8>,
+    /// `claim_encryption.encrypted_labels`.
+    pub labels_ct: Option<Vec<u8>>,
+    /// `claim_encryption.encrypted_properties`.
+    pub properties_ct: Option<Vec<u8>>,
+    /// `claim_version_encryption` rows.
+    pub versions: Vec<SealCommitVersion>,
+    /// `evidence_encryption` rows.
+    pub evidence: Vec<SealCommitEvidence>,
+}
+
+/// One claim's restored plaintext, as the client returns it to unseal-commit.
+#[derive(Debug, Clone)]
+pub struct UnsealCommitItem {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// The restored `claims.content`.
+    pub content: String,
+    /// The restored `claims.content_hash`. Exactly 32 bytes.
+    pub content_hash: Vec<u8>,
+    /// The restored `claims.labels`.
+    pub labels: Vec<String>,
+    /// The restored `claims.properties`.
+    pub properties: serde_json::Value,
+    /// The restored `claim_versions` rows.
+    pub versions: Vec<UnsealCommitVersion>,
+    /// The restored `evidence` rows.
+    pub evidence: Vec<UnsealCommitEvidence>,
+}
+
+/// One restored `claim_versions` row.
+#[derive(Debug, Clone)]
+pub struct UnsealCommitVersion {
+    /// `claim_versions.id`.
+    pub id: Uuid,
+    /// The restored content.
+    pub content: String,
+}
+
+/// One restored `evidence` row.
+#[derive(Debug, Clone)]
+pub struct UnsealCommitEvidence {
+    /// `evidence.id`.
+    pub id: Uuid,
+    /// The restored `raw_content`.
+    pub raw_content: Option<String>,
+    /// The restored `properties`.
+    pub properties: serde_json::Value,
+}
+
 /// Read-only selection and rendering for D4 privatization.
 pub struct PrivatizationRepository;
 
@@ -2558,6 +2799,1020 @@ impl PrivatizationRepository {
         .bind(plan_id)
         .fetch_one(&mut *conn)
         .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    // =====================================================================
+    // SEAL — the two-phase, client-driven ceremony (§6.5.6).
+    //
+    // THE SERVER NEVER HOLDS A KEY. Nothing below encrypts, decrypts or
+    // derives; it serves plaintext to a key-holding admin, accepts ciphertext
+    // back, and performs the §6.5.4 mutation. Every function here runs on the
+    // MAINTENANCE connection, because the manifest must not be viewer-filtered
+    // (a filtered manifest yields a partial commit, which §6.5.6 forbids) and
+    // because the mutation writes rows whose RLS `WITH CHECK` the app role
+    // cannot satisfy.
+    // =====================================================================
+
+    /// The group's `active` key epoch, or `None`.
+    ///
+    /// Seal binds every ciphertext to one epoch through
+    /// `claim_encryption_epoch_fkey (group_id, epoch)`, and a group with no
+    /// active epoch cannot be sealed into at all — which is a refusal, not a
+    /// default. Returning `Option` rather than defaulting to `0` is the whole
+    /// point: epoch `0` is a legal epoch, so a silent default would bind
+    /// ciphertext to a key nobody rotated into.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn active_epoch_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+    ) -> Result<Option<i32>, DbError> {
+        sqlx::query_scalar::<_, i32>(
+            r"
+            SELECT e.epoch
+              FROM public.group_key_epochs e
+             WHERE e.group_id = $1 AND e.status = 'active'
+             ORDER BY e.epoch DESC
+             LIMIT 1
+            ",
+        )
+        .bind(group_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// One page of a plan's SEAL MANIFEST: the plaintext §6.5.4 TCB.
+    ///
+    /// # This is the one response in the system that discloses plaintext the
+    /// caller may not otherwise read, and it is deliberately not filtered
+    ///
+    /// §6.5.6 step 1 says so, and the reason is structural rather than a
+    /// convenience: a manifest narrowed to what the actor can read yields a
+    /// commit that covers only the rows the actor could see, and a commit that
+    /// covers a subset of the TCB is the partial seal §6.5.4 forbids. The
+    /// authority for the disclosure is §6.6's three conditions, checked in the
+    /// route, plus the dual `security_events` / `privatization_audit` log the
+    /// route writes — not a predicate here.
+    ///
+    /// `viewer` is nonetheless a real parameter and its marker is a real marker:
+    /// a bypass viewer renders it to nothing, and a `Scoped` viewer passed here
+    /// by mistake NARROWS the page rather than widening it. The failure
+    /// direction is a manifest that is too small, which the commit's
+    /// completeness check refuses loudly, rather than one that is too large,
+    /// which nothing would catch.
+    ///
+    /// # Paging is keyset, on `claims.id`
+    ///
+    /// `after` is exclusive. An OFFSET page over a set that a concurrent seal is
+    /// mutating skips rows; a keyset page over an immutable frozen item set does
+    /// not.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn seal_manifest_page_conn(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        plan_id: Uuid,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<SealManifestItem>, DbError> {
+        let sql = viewer.splice(
+            r"
+            SELECT c.id, c.content, c.labels, c.properties
+              FROM public.claims c
+              JOIN public.privatization_plan_items i
+                ON i.entity_id = c.id AND i.kind = 'claim'
+             WHERE i.plan_id = $1
+               AND ($2::uuid IS NULL OR c.id > $2)
+               /* {VISIBILITY:c} */
+             ORDER BY c.id
+             LIMIT $3
+            ",
+            4,
+        );
+        let mut query = sqlx::query_as::<_, (Uuid, String, Vec<String>, serde_json::Value)>(&sql)
+            .bind(plan_id)
+            .bind(after)
+            .bind(limit);
+        if let Some(groups) = viewer.group_bind() {
+            query = query.bind(groups);
+        }
+        let heads = query
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        if heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let claim_ids: Vec<Uuid> = heads.iter().map(|(id, ..)| *id).collect();
+
+        let versions = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+            r"
+            SELECT v.claim_id, v.id, v.content
+              FROM public.claim_versions v
+             WHERE v.claim_id = ANY($1)
+             ORDER BY v.claim_id, v.id
+            ",
+        )
+        .bind(&claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        let evidence = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, serde_json::Value)>(
+            r"
+            SELECT e.claim_id, e.id, e.raw_content, e.properties
+              FROM public.evidence e
+             WHERE e.claim_id = ANY($1)
+             ORDER BY e.claim_id, e.id
+            ",
+        )
+        .bind(&claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        Ok(heads
+            .into_iter()
+            .map(|(claim_id, content, labels, properties)| SealManifestItem {
+                claim_id,
+                content,
+                labels,
+                properties,
+                versions: versions
+                    .iter()
+                    .filter(|(cid, ..)| *cid == claim_id)
+                    .map(|(_, id, content)| SealManifestVersion {
+                        id: *id,
+                        content: content.clone(),
+                    })
+                    .collect(),
+                evidence: evidence
+                    .iter()
+                    .filter(|(cid, ..)| *cid == claim_id)
+                    .map(|(_, id, raw_content, properties)| SealManifestEvidence {
+                        id: *id,
+                        raw_content: raw_content.clone(),
+                        properties: properties.clone(),
+                    })
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// The `claim_versions` and `evidence` rows a seal-commit must cover.
+    ///
+    /// Read at COMMIT time, on the same transaction as the mutation, so a row
+    /// inserted between the manifest and the commit is caught rather than left
+    /// behind in plaintext. §6.5.4's whole indictment of the previous revision
+    /// is that it sealed a subset and reported success; comparing the commit
+    /// against the manifest it served would reproduce that, because both would
+    /// describe the same stale world.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn seal_tcb_shape_conn(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SealTcbShape>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, (Uuid, Vec<Uuid>, Vec<Uuid>)>(
+            r"
+            SELECT ids.claim_id,
+                   COALESCE(ARRAY(SELECT v.id FROM public.claim_versions v
+                                   WHERE v.claim_id = ids.claim_id
+                                   ORDER BY v.id), ARRAY[]::uuid[]) AS version_ids,
+                   COALESCE(ARRAY(SELECT e.id FROM public.evidence e
+                                   WHERE e.claim_id = ids.claim_id
+                                   ORDER BY e.id), ARRAY[]::uuid[]) AS evidence_ids
+              FROM unnest($1::uuid[]) AS ids(claim_id)
+             ORDER BY ids.claim_id
+            ",
+        )
+        .bind(claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        Ok(rows
+            .into_iter()
+            .map(|(claim_id, version_ids, evidence_ids)| SealTcbShape {
+                claim_id,
+                version_ids,
+                evidence_ids,
+            })
+            .collect())
+    }
+
+    /// THE SEAL MUTATION. The whole §6.5.4 TCB, in the caller's transaction.
+    ///
+    /// Returns the ids it actually sealed. A claim that already carries a
+    /// `claim_encryption` row is skipped whole — it is not re-sentinelled and
+    /// its derived rows are not re-deleted — so a re-delivered commit is a
+    /// no-op rather than a second, differently-keyed seal over a row whose
+    /// plaintext is already gone.
+    ///
+    /// # Nine statements, one transaction, no partial seal
+    ///
+    /// The caller opens the transaction and the caller commits it. Every
+    /// statement below is bounded to the ids the first one actually inserted,
+    /// so the set that gets a ciphertext row and the set that loses its
+    /// plaintext are the same set by construction rather than by care.
+    ///
+    /// What each statement is for:
+    ///
+    /// 1. `claim_encryption` — the ciphertext for `content`, `labels` and
+    ///    `properties`. `encrypted_properties` is written here; the
+    ///    `ClaimEncryptionRepository` shipped by an earlier slice cannot write
+    ///    that column at all, which is why this INSERT is inline rather than a
+    ///    call into it. Writing it here also keeps the whole ceremony on ONE
+    ///    explicitly-acquired maintenance connection — the caller's — which is
+    ///    the property the rest of this module holds and is worth more than the
+    ///    two lines the reuse would have saved.
+    /// 2. `claims` — the sentinel, the ciphertext hash, and the emptying of
+    ///    every plaintext-derived column. **`embedding_3072` is nulled here and
+    ///    is absent from §6.5.4's table.** It is a second, live
+    ///    `vector(3072)` ANN column on the same row, written by the re-embed
+    ///    path and read by recall at `centroid_dim=3072`; leaving it would keep
+    ///    a plaintext-derived vector on a sealed claim, which is the exact
+    ///    defect the plan's own audit clause was written to catch one column
+    ///    over. `content_tsv` needs no statement — it is `GENERATED ALWAYS` and
+    ///    follows `content`.
+    /// 3. `claim_version_encryption` + 4. `claim_versions` — the complete
+    ///    plaintext version history, which is the survivor §6.5.4 names first.
+    /// 5. `evidence_encryption` + 6. `evidence` — including
+    ///    `embedding_3072` again, and `privacy_tier`, which the plan's DDL for
+    ///    this table omits and the applied schema requires.
+    /// 7. The derived-extraction DELETEs, over
+    ///    [`SEAL_DELETE_TABLES`].
+    /// 8. `harvester_fragments`, through the provenance join. Not recoverable
+    ///    on unseal, which the preview states.
+    ///
+    /// # Ordering: restrict first, then seal
+    ///
+    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081),
+    /// which raises `42501` on sealing a claim that is still
+    /// `visibility='public'`. That is the backstop, not the control: the route
+    /// refuses a plan that has not been applied. It is load-bearing anyway,
+    /// because it is what makes the ordering an invariant of the database
+    /// rather than of this function.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault. A `42501` from statement 1 is 081's guard
+    /// refusing an unrestricted claim.
+    pub async fn seal_claims_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+        epoch: i32,
+        items: &[SealCommitItem],
+    ) -> Result<Vec<Uuid>, DbError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+        let content_cts: Vec<Vec<u8>> = items.iter().map(|i| i.content_ct.clone()).collect();
+        let labels_cts: Vec<Vec<u8>> = items.iter().map(|i| i.labels_ct.clone()).collect();
+        let props_cts: Vec<Vec<u8>> = items.iter().map(|i| i.properties_ct.clone()).collect();
+        let hashes: Vec<Vec<u8>> = items.iter().map(|i| i.content_hash.clone()).collect();
+
+        // 1. The ciphertext row. ON CONFLICT DO NOTHING is what makes a
+        //    re-delivered commit a no-op; the RETURNING set is what bounds
+        //    every statement after it.
+        let sealed: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            r"
+            INSERT INTO public.claim_encryption
+                   (claim_id, group_id, epoch, privacy_tier,
+                    encrypted_content, encrypted_labels, encrypted_properties)
+            SELECT t.claim_id, $5, $6, $7, t.content_ct, t.labels_ct, t.props_ct
+              FROM unnest($1::uuid[], $2::bytea[], $3::bytea[], $4::bytea[])
+                AS t(claim_id, content_ct, labels_ct, props_ct)
+            ON CONFLICT (claim_id) DO NOTHING
+            RETURNING claim_id
+            ",
+        )
+        .bind(&claim_ids)
+        .bind(&content_cts)
+        .bind(&labels_cts)
+        .bind(&props_cts)
+        .bind(group_id)
+        .bind(epoch)
+        .bind(SEALED_PRIVACY_TIER)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        if sealed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 2. The claim itself.
+        sqlx::query(&format!(
+            r"
+            UPDATE public.claims c
+               SET content = {SEAL_CONTENT_SENTINEL},
+                   content_hash = t.content_hash,
+                   embedding = NULL,
+                   embedding_3072 = NULL,
+                   labels = ARRAY[]::text[],
+                   properties = '{{}}'::jsonb,
+                   updated_at = now()
+              FROM unnest($1::uuid[], $2::bytea[]) AS t(claim_id, content_hash)
+             WHERE c.id = t.claim_id AND c.id = ANY($3)
+            "
+        ))
+        .bind(&claim_ids)
+        .bind(&hashes)
+        .bind(&sealed)
+        .execute(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        // 3/4. Version history.
+        let (version_ids, version_cts): (Vec<Uuid>, Vec<Vec<u8>>) = items
+            .iter()
+            .filter(|i| sealed.contains(&i.claim_id))
+            .flat_map(|i| i.versions.iter().map(|v| (v.id, v.content_ct.clone())))
+            .unzip();
+        if !version_ids.is_empty() {
+            sqlx::query(
+                r"
+                INSERT INTO public.claim_version_encryption
+                       (claim_version_id, claim_id, group_id, epoch, encrypted_content)
+                SELECT t.version_id, v.claim_id, $3, $4, t.content_ct
+                  FROM unnest($1::uuid[], $2::bytea[]) AS t(version_id, content_ct)
+                  JOIN public.claim_versions v ON v.id = t.version_id
+                ON CONFLICT (claim_version_id) DO NOTHING
+                ",
+            )
+            .bind(&version_ids)
+            .bind(&version_cts)
+            .bind(group_id)
+            .bind(epoch)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+
+            sqlx::query(&format!(
+                r"
+                UPDATE public.claim_versions v
+                   SET content = {SEAL_VERSION_SENTINEL}
+                 WHERE v.id = ANY($1)
+                "
+            ))
+            .bind(&version_ids)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+
+        // 5/6. Evidence.
+        let mut evidence_ids: Vec<Uuid> = Vec::new();
+        let mut evidence_cts: Vec<Vec<u8>> = Vec::new();
+        let mut evidence_prop_cts: Vec<Vec<u8>> = Vec::new();
+        for item in items.iter().filter(|i| sealed.contains(&i.claim_id)) {
+            for e in &item.evidence {
+                evidence_ids.push(e.id);
+                evidence_cts.push(e.content_ct.clone());
+                evidence_prop_cts.push(e.properties_ct.clone());
+            }
+        }
+        if !evidence_ids.is_empty() {
+            sqlx::query(
+                r"
+                INSERT INTO public.evidence_encryption
+                       (evidence_id, group_id, epoch, privacy_tier,
+                        encrypted_content, encrypted_properties)
+                SELECT t.evidence_id, $4, $5, $6, t.content_ct, t.props_ct
+                  FROM unnest($1::uuid[], $2::bytea[], $3::bytea[])
+                    AS t(evidence_id, content_ct, props_ct)
+                ON CONFLICT (evidence_id) DO NOTHING
+                ",
+            )
+            .bind(&evidence_ids)
+            .bind(&evidence_cts)
+            .bind(&evidence_prop_cts)
+            .bind(group_id)
+            .bind(epoch)
+            .bind(SEALED_PRIVACY_TIER)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+
+            sqlx::query(
+                r"
+                UPDATE public.evidence e
+                   SET raw_content = $2,
+                       embedding = NULL,
+                       embedding_3072 = NULL,
+                       properties = '{}'::jsonb
+                 WHERE e.id = ANY($1)
+                ",
+            )
+            .bind(&evidence_ids)
+            .bind(SEAL_EVIDENCE_SENTINEL)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+
+        // 7. The derived extractions. Deleted, not encrypted.
+        for table in SEAL_DELETE_TABLES {
+            sqlx::query(&format!(
+                "DELETE FROM public.{table} WHERE claim_id = ANY($1)"
+            ))
+            .bind(&sealed)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+
+        // 8. Harvester source text, through the provenance join. NOT restored
+        //    by unseal, and the preview says so before the admin clicks.
+        //
+        //    DELIBERATELY NOT NARROWED TO FRAGMENTS CITED ONLY BY SEALED CLAIMS.
+        //    `harvester_claim_provenance` is keyed `(claim_id, fragment_id)`, so
+        //    one fragment can back several claims, and a fragment shared with a
+        //    claim outside this plan is blanked for all of them. Adding a
+        //    `NOT EXISTS (… p2.claim_id <> ALL($1))` guard would leave the
+        //    SEALED claim's own source text sitting in the corpus in plaintext —
+        //    the direction §6.5.4 calls worse than not sealing at all. The cost
+        //    is borne by the other claim's provenance, which is a functional
+        //    loss and not a confidentiality one, and `SEAL_UNRECOVERABLE` states
+        //    it in the preview before the admin clicks.
+        sqlx::query(
+            r"
+            UPDATE public.harvester_fragments f
+               SET content_text = $2, context_window = NULL
+              FROM public.harvester_claim_provenance p
+             WHERE p.fragment_id = f.id AND p.claim_id = ANY($1)
+            ",
+        )
+        .bind(&sealed)
+        .bind(SEAL_EVIDENCE_SENTINEL)
+        .execute(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        Ok(sealed)
+    }
+
+    /// One page of a plan's UNSEAL MANIFEST: ciphertext only.
+    ///
+    /// No `Viewer` and no marker, and — unlike the seal manifest — nothing here
+    /// is a disclosure: every byte it returns is already ciphertext bound to a
+    /// key the server does not hold. The authority is still §6.6's, checked in
+    /// the route, because knowing WHICH claims are sealed is itself
+    /// information; but there is no plaintext predicate to spend a viewer on.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn unseal_manifest_page_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<UnsealManifestItem>, DbError> {
+        type Head = (Uuid, i32, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>);
+        let heads = sqlx::query_as::<_, Head>(
+            r"
+            SELECT ce.claim_id, ce.epoch, ce.encrypted_content,
+                   ce.encrypted_labels, ce.encrypted_properties
+              FROM public.claim_encryption ce
+              JOIN public.privatization_plan_items i
+                ON i.entity_id = ce.claim_id AND i.kind = 'claim'
+             WHERE i.plan_id = $1
+               AND ($2::uuid IS NULL OR ce.claim_id > $2)
+             ORDER BY ce.claim_id
+             LIMIT $3
+            ",
+        )
+        .bind(plan_id)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        if heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let claim_ids: Vec<Uuid> = heads.iter().map(|(id, ..)| *id).collect();
+
+        let versions = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>)>(
+            r"
+            SELECT cve.claim_id, cve.claim_version_id, cve.encrypted_content
+              FROM public.claim_version_encryption cve
+             WHERE cve.claim_id = ANY($1)
+             ORDER BY cve.claim_id, cve.claim_version_id
+            ",
+        )
+        .bind(&claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        let evidence = sqlx::query_as::<_, (Uuid, Uuid, Vec<u8>, Option<Vec<u8>>)>(
+            r"
+            SELECT e.claim_id, ee.evidence_id, ee.encrypted_content,
+                   ee.encrypted_properties
+              FROM public.evidence_encryption ee
+              JOIN public.evidence e ON e.id = ee.evidence_id
+             WHERE e.claim_id = ANY($1)
+             ORDER BY e.claim_id, ee.evidence_id
+            ",
+        )
+        .bind(&claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        Ok(heads
+            .into_iter()
+            .map(
+                |(claim_id, epoch, content_ct, labels_ct, properties_ct)| UnsealManifestItem {
+                    claim_id,
+                    epoch,
+                    content_ct,
+                    labels_ct,
+                    properties_ct,
+                    versions: versions
+                        .iter()
+                        .filter(|(cid, ..)| *cid == claim_id)
+                        .map(|(_, id, ct)| SealCommitVersion {
+                            id: *id,
+                            content_ct: ct.clone(),
+                        })
+                        .collect(),
+                    evidence: evidence
+                        .iter()
+                        .filter(|(cid, ..)| *cid == claim_id)
+                        .map(|(_, id, ct, props)| SealCommitEvidence {
+                            id: *id,
+                            content_ct: ct.clone(),
+                            properties_ct: props.clone().unwrap_or_default(),
+                        })
+                        .collect(),
+                },
+            )
+            .collect())
+    }
+
+    /// The `claim_version_encryption` and `evidence_encryption` rows an
+    /// unseal-commit must cover, for the claims that are actually sealed.
+    ///
+    /// The mirror of [`Self::seal_tcb_shape_conn`], and the asymmetry between
+    /// the two is deliberate rather than an oversight: seal covers
+    /// `claim_versions` — every PLAINTEXT row that exists — while unseal covers
+    /// `claim_version_encryption` — every CIPHERTEXT row that exists. A version
+    /// row inserted after the seal has plaintext and no ciphertext; unseal must
+    /// neither demand it nor touch it, and reading the shape from the encryption
+    /// tables is what makes that true by construction.
+    ///
+    /// A claim with no `claim_encryption` row is ABSENT from the result rather
+    /// than present with empty arrays. The caller uses that to tell "already
+    /// unsealed, so a re-delivered commit for it is a no-op" from "sealed with
+    /// nothing to cover", which are the same shape and must not be the same
+    /// decision.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn unseal_tcb_shape_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SealTcbShape>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, (Uuid, Vec<Uuid>, Vec<Uuid>)>(
+            r"
+            SELECT ce.claim_id,
+                   COALESCE(ARRAY(SELECT cve.claim_version_id
+                                    FROM public.claim_version_encryption cve
+                                   WHERE cve.claim_id = ce.claim_id
+                                   ORDER BY cve.claim_version_id), ARRAY[]::uuid[]),
+                   COALESCE(ARRAY(SELECT ee.evidence_id
+                                    FROM public.evidence_encryption ee
+                                    JOIN public.evidence e ON e.id = ee.evidence_id
+                                   WHERE e.claim_id = ce.claim_id
+                                   ORDER BY ee.evidence_id), ARRAY[]::uuid[])
+              FROM public.claim_encryption ce
+             WHERE ce.claim_id = ANY($1) AND ce.group_id = $2
+             ORDER BY ce.claim_id
+            ",
+        )
+        .bind(claim_ids)
+        .bind(group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        Ok(rows
+            .into_iter()
+            .map(|(claim_id, version_ids, evidence_ids)| SealTcbShape {
+                claim_id,
+                version_ids,
+                evidence_ids,
+            })
+            .collect())
+    }
+
+    /// THE UNSEAL MUTATION. The mirror of [`Self::seal_claims_conn`].
+    ///
+    /// Returns the ids it restored.
+    ///
+    /// # Every statement is bound to `group_id` or to a restored claim
+    ///
+    /// The server cannot verify the plaintext it is handed: `content_hash` is
+    /// BLAKE3 over the CIPHERTEXT on the seal path, the route's unseal-side hash
+    /// check is self-consistent by construction, and the key that would settle
+    /// the question is one the server never holds. The scoping predicates are
+    /// therefore the whole of the protection, and there are two:
+    ///
+    /// * `claim_encryption.group_id = $6` on the head UPDATE. Not
+    ///   belt-and-braces over the caller's plan-membership check: a claim can be
+    ///   an item of one group's plan while its ciphertext is bound to another's,
+    ///   and only this predicate answers that.
+    /// * `t.claim_id` carried through the version and evidence `unnest`es, so a
+    ///   row id is addressable only through the claim it actually belongs to.
+    ///   Without it, one restored claim in a batch can rewrite another claim's
+    ///   version or evidence text.
+    ///
+    /// # `content_tsv` has no statement, and that is the design
+    ///
+    /// It is `GENERATED ALWAYS AS (to_tsvector('english', content)) STORED`
+    /// (migration 050), so restoring `content` restores it. §6.5.6 says it in
+    /// those words: there is no tsvector code path to write.
+    ///
+    /// # The embedding is NOT restored here
+    ///
+    /// It cannot be — the server has no embedder on this path and the vector was
+    /// destroyed by the seal, not stashed. The caller enqueues an
+    /// `embedding_generation` job per restored claim (ops F14); until that job
+    /// runs, the claim is embedding-less, which the CLAUDE.md audit reports as a
+    /// live gap rather than hiding.
+    ///
+    /// # What unseal does NOT restore
+    ///
+    /// The deleted extractions and `harvester_fragments`' source text. Both are
+    /// stated in the seal preview, and re-extraction is a separate, explicit
+    /// operation.
+    ///
+    /// # The ciphertext DELETEs are keyed on what was RESTORED, not on the claim
+    ///
+    /// A commit that restores a claim's head but omits one of its version rows
+    /// must not delete that row's ciphertext: the seal already destroyed the
+    /// plaintext, so the ciphertext is the only remaining copy and the deletion
+    /// is not reversible by anyone, key or no key. Keying the two derived
+    /// DELETEs on the ids actually restored makes the worst case a STRANDED
+    /// ciphertext row — still decryptable by a key-holder, out of the unseal
+    /// manifest's reach until re-linked — rather than a destroyed one. The
+    /// caller additionally refuses an incomplete cover outright
+    /// ([`Self::unseal_tcb_shape_conn`]), so through the route this branch is
+    /// unreachable; it is the repo function being correct on its own terms.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault. A `23514` here is
+    /// `claims_content_not_empty` refusing a blank restore; the caller checks
+    /// first so this is a backstop.
+    pub async fn unseal_claims_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+        items: &[UnsealCommitItem],
+    ) -> Result<Vec<Uuid>, DbError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+        let contents: Vec<String> = items.iter().map(|i| i.content.clone()).collect();
+        let hashes: Vec<Vec<u8>> = items.iter().map(|i| i.content_hash.clone()).collect();
+        let labels: Vec<serde_json::Value> = items
+            .iter()
+            .map(|i| serde_json::Value::from(i.labels.clone()))
+            .collect();
+        let properties: Vec<serde_json::Value> =
+            items.iter().map(|i| i.properties.clone()).collect();
+
+        // Bounded to rows that carry a ciphertext row BOUND TO THIS GROUP, so an
+        // unseal can neither rewrite a claim that was never sealed nor reach a
+        // claim sealed under another group's key.
+        let restored: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            r"
+            UPDATE public.claims c
+               SET content = t.content,
+                   content_hash = t.content_hash,
+                   labels = ARRAY(SELECT jsonb_array_elements_text(t.labels)),
+                   properties = t.properties,
+                   updated_at = now()
+              FROM unnest($1::uuid[], $2::text[], $3::bytea[], $4::jsonb[], $5::jsonb[])
+                AS t(claim_id, content, content_hash, labels, properties)
+             WHERE c.id = t.claim_id
+               AND EXISTS (SELECT 1 FROM public.claim_encryption ce
+                            WHERE ce.claim_id = c.id AND ce.group_id = $6)
+            RETURNING c.id
+            ",
+        )
+        .bind(&claim_ids)
+        .bind(&contents)
+        .bind(&hashes)
+        .bind(&labels)
+        .bind(&properties)
+        .bind(group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        if restored.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // `t.claim_id` is carried alongside the row id, and the UPDATE matches on
+        // BOTH. A bare `v.id = t.version_id` would let one claim in the batch
+        // address another claim's version row.
+        let mut version_ids: Vec<Uuid> = Vec::new();
+        let mut version_parents: Vec<Uuid> = Vec::new();
+        let mut version_contents: Vec<String> = Vec::new();
+        for item in items.iter().filter(|i| restored.contains(&i.claim_id)) {
+            for v in &item.versions {
+                version_ids.push(v.id);
+                version_parents.push(item.claim_id);
+                version_contents.push(v.content.clone());
+            }
+        }
+        if !version_ids.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE public.claim_versions v
+                   SET content = t.content
+                  FROM unnest($1::uuid[], $2::uuid[], $3::text[])
+                    AS t(version_id, claim_id, content)
+                 WHERE v.id = t.version_id AND v.claim_id = t.claim_id
+                ",
+            )
+            .bind(&version_ids)
+            .bind(&version_parents)
+            .bind(&version_contents)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+
+        let mut evidence_ids: Vec<Uuid> = Vec::new();
+        let mut evidence_parents: Vec<Uuid> = Vec::new();
+        let mut evidence_contents: Vec<Option<String>> = Vec::new();
+        let mut evidence_props: Vec<serde_json::Value> = Vec::new();
+        for item in items.iter().filter(|i| restored.contains(&i.claim_id)) {
+            for e in &item.evidence {
+                evidence_ids.push(e.id);
+                evidence_parents.push(item.claim_id);
+                evidence_contents.push(e.raw_content.clone());
+                evidence_props.push(e.properties.clone());
+            }
+        }
+        if !evidence_ids.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE public.evidence e
+                   SET raw_content = t.raw_content,
+                       properties = t.properties
+                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[])
+                    AS t(evidence_id, claim_id, raw_content, properties)
+                 WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
+                ",
+            )
+            .bind(&evidence_ids)
+            .bind(&evidence_parents)
+            .bind(&evidence_contents)
+            .bind(&evidence_props)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+
+        // The ciphertext rows go LAST. `claim_encryption` is the predicate the
+        // claims UPDATE above bounds itself on, and it is also what
+        // `epigraph_claims_block_widening` reads to refuse a declassification;
+        // dropping it before the plaintext is back would open a window in which
+        // a sealed claim has neither.
+        if !version_ids.is_empty() {
+            sqlx::query(
+                "DELETE FROM public.claim_version_encryption \
+                  WHERE claim_id = ANY($1) AND claim_version_id = ANY($2)",
+            )
+            .bind(&restored)
+            .bind(&version_ids)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+        if !evidence_ids.is_empty() {
+            sqlx::query(
+                r"
+                DELETE FROM public.evidence_encryption ee
+                 USING public.evidence e
+                 WHERE e.id = ee.evidence_id
+                   AND e.claim_id = ANY($1)
+                   AND ee.evidence_id = ANY($2)
+                ",
+            )
+            .bind(&restored)
+            .bind(&evidence_ids)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
+        sqlx::query(
+            "DELETE FROM public.claim_encryption WHERE claim_id = ANY($1) AND group_id = $2",
+        )
+        .bind(&restored)
+        .bind(group_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+
+        Ok(restored)
+    }
+
+    /// Which of `claim_ids` are FROZEN ITEMS of this plan.
+    ///
+    /// A seal-commit names claims; this is what proves each of them is one the
+    /// plan actually selected and an operator actually approved. Returning the
+    /// intersection rather than a boolean lets the caller name the count in its
+    /// refusal without a second round trip, and without echoing the ids of rows
+    /// that are not in the plan.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn plan_contains_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            r"
+            SELECT i.entity_id
+              FROM public.privatization_plan_items i
+             WHERE i.plan_id = $1 AND i.kind = 'claim' AND i.entity_id = ANY($2)
+             ORDER BY i.entity_id
+            ",
+        )
+        .bind(plan_id)
+        .bind(claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Append one `privatization_audit` row per entity for a seal or unseal.
+    ///
+    /// # It writes `before_sealed` / `after_sealed`, which nothing else does
+    ///
+    /// Migration 082 created those two columns for exactly this and PR-21 is
+    /// their first writer. `record_item_audit_conn`'s projection describes a
+    /// TENANCY transition — `before_visibility` to `after_visibility` — and a
+    /// seal changes neither: the claim was already `visibility='group'` before
+    /// the ceremony began, because 081 refuses to seal a public claim. Reusing
+    /// that function would therefore write an audit row asserting a visibility
+    /// change that did not occur, which is worse than no row.
+    ///
+    /// Set-based over the whole batch, for the reason
+    /// [`Self::record_item_audit_conn`] gives: 500 round trips inside a
+    /// transaction holding the global privatization lock is not an audit trail,
+    /// it is a lock-wait.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_seal_audit_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        action: &str,
+        entity_ids: &[Uuid],
+        sealed_after: bool,
+        correlation_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+        sqlx::query(
+            r"
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, before_owner_group_id, before_sealed,
+                    after_visibility, after_owner_group_id, after_sealed,
+                    correlation_id)
+            SELECT $1, $2, $3, 'claim', c.id,
+                   c.visibility, c.owner_group_id, NOT $5,
+                   c.visibility, c.owner_group_id, $5,
+                   $6
+              FROM public.claims c
+             WHERE c.id = ANY($4)
+             ORDER BY c.id
+            ",
+        )
+        .bind(plan_id)
+        .bind(actor_agent_id)
+        .bind(action)
+        .bind(entity_ids)
+        .bind(sealed_after)
+        .bind(correlation_id)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// How many of a group's sealed rows are still bound to a NON-active epoch.
+    ///
+    /// The reseal handler's completion test (§6.7 point 3). A rotation retires
+    /// epoch N and creates N+1 but re-encrypts nothing, so every
+    /// `claim_encryption` row stays bound to N through
+    /// `claim_encryption_epoch_fkey`. Zero here means the ceremony is finished
+    /// and `groups.reseal_required_at` may be cleared; non-zero means it is not,
+    /// and no amount of server-side work can make it so.
+    ///
+    /// # A group with NO active epoch counts every ciphertext row as stale
+    ///
+    /// The `active` CTE is then empty, `(SELECT epoch FROM active)` is NULL and
+    /// `IS DISTINCT FROM NULL` is true for every row, so the flag cannot clear.
+    /// That is the intended reading rather than an accident: a group whose only
+    /// epochs are `retiring` or `retired` has no key to re-seal ONTO, so the
+    /// ceremony genuinely is unfinished. A group that answers a rotation by
+    /// unsealing everything still clears, because the count is then zero for
+    /// want of rows rather than for want of an epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn stale_epoch_seal_count_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+    ) -> Result<i64, DbError> {
+        sqlx::query_scalar::<_, i64>(
+            r"
+            WITH active AS (
+                SELECT e.epoch FROM public.group_key_epochs e
+                 WHERE e.group_id = $1 AND e.status = 'active'
+                 ORDER BY e.epoch DESC LIMIT 1
+            )
+            SELECT (SELECT count(*) FROM public.claim_encryption ce
+                     WHERE ce.group_id = $1
+                       AND ce.epoch IS DISTINCT FROM (SELECT epoch FROM active))
+                 + (SELECT count(*) FROM public.claim_version_encryption cve
+                     WHERE cve.group_id = $1
+                       AND cve.epoch IS DISTINCT FROM (SELECT epoch FROM active))
+                 + (SELECT count(*) FROM public.evidence_encryption ee
+                     WHERE ee.group_id = $1
+                       AND ee.epoch IS DISTINCT FROM (SELECT epoch FROM active))
+            ",
+        )
+        .bind(group_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Clear `groups.reseal_required_at`.
+    ///
+    /// **The only writer of that column back to NULL.** PR-20's rotation sets
+    /// it and deliberately does not clear it, because rotation moves no
+    /// `claim_encryption` row; clearing it on rotation would report a re-seal
+    /// that did not happen. Its one caller is
+    /// `epigraph_jobs::privatization::PrivatizationResealHandler`, which calls
+    /// it only after [`Self::stale_epoch_seal_count_conn`] returns zero.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn clear_reseal_required_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+    ) -> Result<u64, DbError> {
+        sqlx::query(
+            r"
+            UPDATE public.groups g
+               SET reseal_required_at = NULL, updated_at = now()
+             WHERE g.id = $1 AND g.reseal_required_at IS NOT NULL
+            ",
+        )
+        .bind(group_id)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
         .map_err(|source| DbError::QueryFailed { source })
     }
 

@@ -180,15 +180,21 @@ pub async fn create_plan(pool: &PgPool, world: &World, seeds: &[Uuid]) -> (Uuid,
 
 /// [`create_plan`], with the plan `mode` chosen.
 ///
-/// # `mode = "seal"` is reachable HERE and not through the route, deliberately
+/// # `mode = "seal"` is reachable through the route too, as of PR-21
 ///
-/// `routes/privatization.rs::create_plan` returns `501` for `seal` — the seal
-/// path is PR-21's — but migration 080's `pp_mode_check` admits the value and
-/// `pp_seal_needs_pad` only requires `pad_to > 0`, so the repository can persist
-/// one. That is what lets the seal-specific refusal in `revert_plan` be measured
-/// against a seal plan instead of against a `restrict` plan that never sealed
-/// anything, which is the shape that would make the refusal look correct while
-/// being a bug on the reversibility of every restrict plan.
+/// This helper predates that: `routes/privatization.rs::create_plan` used to
+/// return `501` for `seal`, and persisting one through the repository was the
+/// only way to measure the seal-specific refusal in `revert_plan` against the
+/// mode it is about rather than against a `restrict` plan that never sealed
+/// anything.
+///
+/// PR-21 removed the 501 arm, so the route is now the shorter path — see
+/// `privatization_seal.rs::applied_seal_plan`, which goes through it precisely
+/// because "the route answers for seal" is one of the things that file asserts.
+/// This helper is kept because it bypasses §6.6's authorization and the group's
+/// keyed-ness requirement, which is what lets `privatization_revert.rs` build a
+/// seal plan without promoting its group; a caller that wants the production
+/// path should use the route.
 pub async fn create_plan_with_mode(
     pool: &PgPool,
     world: &World,

@@ -75,6 +75,18 @@
 //! counted may not appear in either. `PrivatizationRepository::load_plan_items_conn`
 //! carries the argument for why an offset is sound over this particular table.
 //!
+//! **The two manifest routes are the carve-out, and they are a carve-out from
+//! the rule's rationale rather than an exception to it.** `seal_manifest` and
+//! `unseal_manifest` page with a KEYSET cursor over `claims.id`: they emit the
+//! last claim id on the page as `next_cursor` and accept one back. The rule
+//! above forbids that everywhere else because an id the actor may only count
+//! must not leak through a token. These two endpoints serve the full plaintext
+//! or full ciphertext of exactly the rows they page over, under §6.6's three
+//! conditions, so a cursor discloses nothing the response body has not already
+//! disclosed — and a keyset page over an immutable frozen item set is what stops
+//! a concurrent seal from making an OFFSET page skip a row, which on this path
+//! would be a silently unsealed claim.
+//!
 //! # Nothing here applies anything
 //!
 //! `approve`, `apply`, `abort` and `revert` now exist, and none of them moves a
@@ -95,10 +107,12 @@
 //! # What this module still does NOT do, and why
 //!
 //! The seal/unseal manifest ceremony (`seal-manifest`, `seal-commit`,
-//! `unseal-manifest`, `unseal-commit`) is absent, and `create_plan` still
-//! answers `501` for `mode="seal"`. `crates/epigraph-privacy` now supplies the
-//! encryptor the ceremony would run on the CLIENT; the ceremony itself — the
-//! manifest, its digest, and the all-or-nothing commit — is PR-21's.
+//! `unseal-manifest`, `unseal-commit`) is HERE as of PR-21, and `create_plan`
+//! no longer answers `501` for `mode="seal"`. The encryption itself is not:
+//! `crates/epigraph-privacy` supplies it and it runs on the CLIENT
+//! (`epigraph-privatize`). What this module owns is the manifest, its digest,
+//! and the all-or-nothing commit — the server's half of a ceremony whose key it
+//! must never hold.
 //!
 //! The MCP tools §6.5.7 names are absent too;
 //! they discharge no acceptance clause and are recorded as descoped in
@@ -302,7 +316,63 @@ pub struct SideEffects {
     /// The §6.7 sentence, verbatim, from one constant shared with the rotate
     /// response — see [`crate::tenancy_disclosure`].
     pub revocation: &'static str,
+    /// **Seal mode only.** The derived tables whose rows this plan DESTROYS.
+    ///
+    /// PR-21's share of `F-PR18b-preview-schema-is-a-subset`. §6.5.4 requires
+    /// the preview to state, before the admin clicks, exactly which derived
+    /// rows a seal destroys — because they are deleted rather than encrypted,
+    /// and unseal does not bring them back. `None` for `restrict`, which
+    /// destroys nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destroys_derived_rows: Option<&'static [&'static str]>,
+    /// **Seal mode only.** The one loss that is not re-derivable at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrecoverable: Option<&'static str>,
+    /// **Seal mode only.** That the server cannot undo this by itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reversibility: Option<&'static str>,
 }
+
+/// The tables a `mode='seal'` plan empties of rows, named in the preview.
+///
+/// Kept beside [`SideEffects`] rather than aliased to the repo layer's
+/// `SEAL_DELETE_TABLES`, because these are two different statements: that one
+/// is what the mutation DOES, this one is what the operator is TOLD. A single
+/// shared constant would make them agree by construction and therefore stop
+/// saying anything about the consent surface.
+///
+/// The agreement is asserted instead, as an exact set, by
+/// `epigraph-api/tests/privatization_seal.rs::the_preview_names_exactly_the_tables_the_seal_deletes`.
+/// Drift here is a preview that under-reports what a seal destroys, which is
+/// consent the operator did not give.
+pub const SEAL_DESTROYS: &[&str] = &[
+    "triples",
+    "entity_mentions",
+    "experiment_entity_mentions",
+    "reasoning_traces",
+    "challenges",
+    "experiment_triples",
+];
+
+/// What a seal takes that no unseal returns.
+///
+/// The second clause is not decoration. A source fragment is linked to claims
+/// `(claim_id, fragment_id)`, so one fragment can back several claims, and
+/// blanking it takes the source text away from every claim that cites it —
+/// including claims outside this plan. The alternative, skipping a shared
+/// fragment, would leave the SEALED claim's own source text in the corpus in
+/// plaintext, which §6.5.4 calls worse than not sealing at all. So the loss is
+/// real, it is chosen, and it is stated here before the admin clicks.
+const SEAL_UNRECOVERABLE: &str = "harvester_fragments source text (content_text and \
+     context_window) is blanked and is NOT restored by unseal; re-extraction cannot recover it \
+     because the fragment text is the source. A fragment cited by claims OUTSIDE this plan is \
+     blanked for those claims too: the fragment is one row, and leaving it would leave the sealed \
+     claim's own source text readable";
+
+/// What a seal costs that a restrict does not.
+const SEAL_NOT_SERVER_REVERSIBLE: &str = "a seal is not server-reversible: the server holds no \
+     key, so only a key-holding admin can unseal, and until every item is unsealed this plan \
+     cannot be reverted";
 
 /// `counts` in the preview.
 #[derive(Serialize, Debug)]
@@ -540,6 +610,227 @@ pub struct PlanItem {
 }
 
 // =============================================================================
+// SEAL CEREMONY WIRE TYPES (FINAL-PLAN §6.5.6)
+//
+// Declared OUTSIDE the `db` feature, like every other type in this module, so
+// the `#[cfg(not(feature = "db"))]` placeholder handlers can name them.
+// =============================================================================
+
+/// `?cursor=&limit=` on either manifest.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ManifestQuery {
+    /// Keyset cursor: the last `claim_id` of the previous page, exclusive.
+    #[serde(default)]
+    pub cursor: Option<Uuid>,
+    /// Page size, 1..=500.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET …/seal-manifest` response.
+#[derive(Serialize, Debug)]
+pub struct SealManifest {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// The active key epoch every ciphertext must be bound to.
+    pub epoch: i32,
+    /// The padding bucket the commit's ciphertexts must be a multiple of.
+    pub pad_to: i32,
+    /// BLAKE3 over this page's TCB SHAPE, `b3:` + hex. The commit echoes it.
+    pub manifest_digest: String,
+    /// The last `claim_id` on this page, or `None` at the end of the stream.
+    pub next_cursor: Option<Uuid>,
+    /// The page.
+    pub items: Vec<SealManifestEntry>,
+}
+
+/// One claim's plaintext TCB.
+#[derive(Serialize, Debug)]
+pub struct SealManifestEntry {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// `claims.content`.
+    pub content: String,
+    /// `claims.labels`.
+    pub labels: Vec<String>,
+    /// `claims.properties`.
+    pub properties: serde_json::Value,
+    /// Every `claim_versions` row.
+    pub versions: Vec<ManifestVersion>,
+    /// Every `evidence` row.
+    pub evidence: Vec<ManifestEvidence>,
+}
+
+/// One `claim_versions` row's plaintext.
+#[derive(Serialize, Debug)]
+pub struct ManifestVersion {
+    /// `claim_versions.id`.
+    pub id: Uuid,
+    /// `claim_versions.content`.
+    pub content: String,
+}
+
+/// One `evidence` row's plaintext.
+#[derive(Serialize, Debug)]
+pub struct ManifestEvidence {
+    /// `evidence.id`.
+    pub id: Uuid,
+    /// `evidence.raw_content`.
+    pub raw_content: Option<String>,
+    /// `evidence.properties`.
+    pub properties: serde_json::Value,
+}
+
+/// `POST …/seal-commit` body.
+#[derive(Deserialize, Debug, Clone)]
+pub struct SealCommitRequest {
+    /// The digest the manifest served. Recomputed server-side from the
+    /// DATABASE, so a TCB that grew since is a `409` rather than a partial seal.
+    pub manifest_digest: String,
+    /// The page's ciphertext.
+    pub items: Vec<SealCommitEntry>,
+}
+
+/// One claim's ciphertext. Every field is required; see the repo type's doc.
+#[derive(Deserialize, Debug, Clone)]
+pub struct SealCommitEntry {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// Base64 `EncryptedPayload::to_bytes()` of the padded content.
+    pub content_ct_b64: String,
+    /// Base64 ciphertext of the padded labels.
+    pub labels_ct_b64: String,
+    /// Base64 ciphertext of the padded properties.
+    pub properties_ct_b64: String,
+    /// Base64 BLAKE3 over the content ciphertext, 32 bytes.
+    pub content_hash_b64: String,
+    /// One entry per `claim_versions` row.
+    pub versions: Vec<CommitVersion>,
+    /// One entry per `evidence` row.
+    pub evidence: Vec<CommitEvidence>,
+}
+
+/// One `claim_versions` row's ciphertext.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CommitVersion {
+    /// `claim_versions.id`.
+    pub id: Uuid,
+    /// Base64 ciphertext.
+    pub ct_b64: String,
+}
+
+/// One `evidence` row's ciphertext.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CommitEvidence {
+    /// `evidence.id`.
+    pub id: Uuid,
+    /// Base64 ciphertext of `raw_content`.
+    pub ct_b64: String,
+    /// Base64 ciphertext of `properties`.
+    pub props_ct_b64: String,
+}
+
+/// `GET …/unseal-manifest` response. Ciphertext only.
+#[derive(Serialize, Debug)]
+pub struct UnsealManifest {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// BLAKE3 over this page's TCB shape.
+    pub manifest_digest: String,
+    /// The last `claim_id` on this page.
+    pub next_cursor: Option<Uuid>,
+    /// The page.
+    pub items: Vec<UnsealManifestEntry>,
+}
+
+/// One claim's ciphertext, as served for unsealing.
+#[derive(Serialize, Debug)]
+pub struct UnsealManifestEntry {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// The epoch this row's ciphertext is bound to. It is the ROW's epoch and
+    /// not the group's active one, because a rotation retires an epoch without
+    /// re-encrypting anything — see §6.7.
+    pub epoch: i32,
+    /// The padding bucket to strip after decrypting.
+    pub pad_to: i32,
+    /// Base64 `claim_encryption.encrypted_content`.
+    pub content_ct_b64: String,
+    /// Base64 `claim_encryption.encrypted_labels`.
+    pub labels_ct_b64: Option<String>,
+    /// Base64 `claim_encryption.encrypted_properties`.
+    pub properties_ct_b64: Option<String>,
+    /// `claim_version_encryption` rows.
+    pub versions: Vec<CommitVersion>,
+    /// `evidence_encryption` rows.
+    pub evidence: Vec<CommitEvidence>,
+}
+
+/// `POST …/unseal-commit` body.
+#[derive(Deserialize, Debug, Clone)]
+pub struct UnsealCommitRequest {
+    /// The restored plaintext.
+    pub items: Vec<UnsealCommitEntry>,
+}
+
+/// One claim's restored plaintext.
+#[derive(Deserialize, Debug, Clone)]
+pub struct UnsealCommitEntry {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// The restored `claims.content`.
+    pub content: String,
+    /// Base64 BLAKE3 over the restored plaintext, 32 bytes.
+    pub content_hash_b64: String,
+    /// The restored `claims.labels`.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// The restored `claims.properties`.
+    #[serde(default)]
+    pub properties: serde_json::Value,
+    /// The restored `claim_versions` rows.
+    #[serde(default)]
+    pub versions: Vec<UnsealCommitVersionEntry>,
+    /// The restored `evidence` rows.
+    #[serde(default)]
+    pub evidence: Vec<UnsealCommitEvidenceEntry>,
+}
+
+/// One restored `claim_versions` row.
+#[derive(Deserialize, Debug, Clone)]
+pub struct UnsealCommitVersionEntry {
+    /// `claim_versions.id`.
+    pub id: Uuid,
+    /// The restored content.
+    pub content: String,
+}
+
+/// One restored `evidence` row.
+#[derive(Deserialize, Debug, Clone)]
+pub struct UnsealCommitEvidenceEntry {
+    /// `evidence.id`.
+    pub id: Uuid,
+    /// The restored `raw_content`.
+    pub raw_content: Option<String>,
+    /// The restored `properties`.
+    #[serde(default)]
+    pub properties: serde_json::Value,
+}
+
+/// `POST …/seal-commit` and `POST …/unseal-commit` response.
+#[derive(Serialize, Debug)]
+pub struct CommitResponse {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// How many items this call moved.
+    pub committed: usize,
+    /// How many were already in the requested state. NOT a failure: a
+    /// re-delivered commit is a no-op, and reporting the difference is how a
+    /// client learns it was re-delivered rather than inferring it from silence.
+    pub already_done: usize,
+}
+
+// =============================================================================
 // BOUNDS
 // =============================================================================
 
@@ -598,8 +889,9 @@ const SECOND_APPROVER_ITEM_THRESHOLD: usize = 1000;
 ///
 /// `401` no auth context; `403` any of FINAL-PLAN §6.6's four conditions;
 /// `400` a refused selector — including §3.1's two request ceilings, which are
-/// a refusal and not a truncation; `501` a `saved_query` seed or `mode=seal`;
-/// `500` a database fault.
+/// a refusal and not a truncation — and, for `mode='seal'`, a `pad_to` of 0,
+/// which migration 080's `pp_seal_needs_pad` forbids; `501` a `saved_query`
+/// seed; `500` a database fault.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 pub async fn create_plan(
@@ -623,18 +915,12 @@ pub async fn create_plan(
         });
     };
 
+    // PR-21 REMOVED THE `mode == "seal"` 501 ARM. Both phases of §6.5.6's
+    // ceremony now exist — `seal-manifest`/`seal-commit` and their unseal
+    // mirrors — so a seal preview is no longer a promise about work that does
+    // not exist.
     let mode = body.mode.as_deref().unwrap_or("restrict");
-    if mode == "seal" {
-        // FINAL-PLAN §6.5.6's seal is a two-phase, client-driven key ceremony,
-        // and this build ships neither phase. A preview that described a seal
-        // the server cannot perform would be a promise.
-        return Err(ApiError::NotImplemented {
-            feature: "mode=seal; seal is a later slice and its side effects cannot be previewed \
-                      honestly before the seal ceremony exists"
-                .to_string(),
-        });
-    }
-    if mode != "restrict" {
+    if !matches!(mode, "restrict" | "seal") {
         return Err(ApiError::BadRequest {
             message: format!("mode must be 'restrict' or 'seal', got '{mode}'"),
         });
@@ -649,6 +935,19 @@ pub async fn create_plan(
     if !matches!(pad_to, 0 | 256 | 1024 | 4096) {
         return Err(ApiError::BadRequest {
             message: format!("pad_to must be one of 0, 256, 1024, 4096, got {pad_to}"),
+        });
+    }
+    // Migration 080's `pp_seal_needs_pad` CHECK says the same thing and binds
+    // the maintenance connection too. Saying it here makes it a 400 with a
+    // sentence rather than a 500 carrying `23514`, and it also settles §6.5.4's
+    // "pad_to = 0 requires an explicit override": there is no override to
+    // build, because the applied schema forbids the combination outright.
+    if mode == "seal" && pad_to == 0 {
+        return Err(ApiError::BadRequest {
+            message: "mode='seal' requires pad_to > 0. Without padding, octet_length of the \
+                      stored ciphertext is a function of the plaintext length, which is the \
+                      side channel seal exists to close"
+                .to_string(),
         });
     }
 
@@ -912,6 +1211,9 @@ pub async fn create_plan(
             || authors_losing > 0,
         side_effects: SideEffects {
             revocation: crate::tenancy_disclosure::ROTATION_DOES_NOT_REVOKE_PAST_ACCESS,
+            destroys_derived_rows: (mode == "seal").then_some(SEAL_DESTROYS),
+            unrecoverable: (mode == "seal").then_some(SEAL_UNRECOVERABLE),
+            reversibility: (mode == "seal").then_some(SEAL_NOT_SERVER_REVERSIBLE),
         },
     };
 
@@ -1480,18 +1782,19 @@ pub async fn abort_plan(
 /// `POST /api/v1/admin/privatization/plans/:id/revert` — un-apply the items that
 /// were applied.
 ///
-/// # `restrict` is fully reversible, and clause 10 is not met by this build
+/// # `restrict` is fully reversible, and clause 10 is now met in both arms
 ///
 /// §6.5.5's strongest argument for `restrict` as the default is that `content`,
 /// `content_tsv` and `embedding` are never touched, so a revert is a tenancy
-/// UPDATE and nothing else. That half ships here.
+/// UPDATE and nothing else. That half has shipped since the apply/revert slice.
 ///
 /// FINAL-PLAN's acceptance clause 10 also asks that a `mode='seal'` plan whose
 /// items are all unsealed can be reverted and one with sealed items returns
-/// `409` with the still-sealed count. **The 409 arm ships and the positive arm
-/// cannot be exercised**: `seal` mode is PR-21's and `create_plan` returns
-/// `501` for it, so no plan this build can create has a sealed item. That is
-/// stated rather than faked.
+/// `409` with the still-sealed count. When this handler was written the
+/// positive arm was unexercisable, because nothing in the product wrote a seal.
+/// **PR-21 made it exercisable**: `seal-commit` writes the ciphertext row this
+/// refusal reads, and `unseal-commit` removes it, so the 409 and its release
+/// are now both reachable from the product's own surface.
 ///
 /// # Errors
 ///
@@ -1686,8 +1989,983 @@ pub async fn get_audit(
 }
 
 // =============================================================================
+// SEAL — the two-phase, client-driven ceremony (FINAL-PLAN §6.5.6)
+// =============================================================================
+
+/// `GET /api/v1/admin/privatization/plans/:id/seal-manifest`.
+///
+/// # THE ONLY RESPONSE IN THE SYSTEM THAT RETURNS PLAINTEXT THE CALLER MAY NOT
+/// OTHERWISE READ
+///
+/// §6.5.6 step 1 says so and this handler is where that is true. It is
+/// deliberately NOT viewer-filtered: a manifest narrowed to what the actor can
+/// read produces a commit covering a subset of the §6.5.4 TCB, and a partial
+/// seal reports success while the plaintext is one `pg_dump` away. What stands
+/// in for the filter is everything else — §6.6's three conditions, a plan the
+/// caller administers, `mode='seal'`, a plan that has already been APPLIED (so
+/// every row is already `visibility='group'`), and a dual entry in
+/// `security_events` and `privatization_audit` for every page served.
+///
+/// # `manifest_digest` binds the SHAPE, not the bytes
+///
+/// It is BLAKE3 over the page's `(claim_id, version ids…, evidence ids…)` in
+/// order. Seal-commit recomputes it from the DATABASE at commit time, so a
+/// version or evidence row inserted between the manifest and the commit changes
+/// the digest and the commit is refused. A digest over the plaintext would
+/// prove only that the client echoed what it was sent, which is the property
+/// that matters least.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` §6.6; `404` no such plan, or one the caller may
+/// not read; `409` a plan that is not `mode='seal'` or has not been applied;
+/// `410` an expired plan; `500` a database fault.
+#[cfg(feature = "db")]
+pub async fn seal_manifest(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+    Query(params): Query<ManifestQuery>,
+) -> Result<Json<SealManifest>, ApiError> {
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    refuse_if_expired(&plan)?;
+    refuse_unless_sealable(&plan)?;
+
+    let limit = manifest_limit(params.limit)?;
+    let (mut maint, bypass) = maintenance(&state).await?;
+
+    let epoch = PrivatizationRepository::active_epoch_conn(&mut maint, plan.target_group_id)
+        .await?
+        .ok_or_else(|| ApiError::Conflict {
+            reason: "the target group has no active key epoch; rotate a key into it before \
+                     sealing"
+                .to_string(),
+        })?;
+
+    let items = PrivatizationRepository::seal_manifest_page_conn(
+        &mut maint,
+        &bypass,
+        plan_id,
+        params.cursor,
+        limit,
+    )
+    .await?;
+
+    let digest = manifest_digest(items.iter().map(|i| {
+        (
+            i.claim_id,
+            i.versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+            i.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
+        )
+    }));
+    let next_cursor = items.last().map(|i| i.claim_id);
+
+    // RETURNED BEFORE THE AUDIT ACQUIRES ITS OWN. `log_manifest_read` takes a
+    // maintenance connection, and the maintenance pool is deliberately the
+    // smallest in the process — `load_plan_for_actor` makes the same commit for
+    // the same reason. Two concurrent manifest requests each holding one and
+    // blocking on a second is a deadlock the pool size makes reachable.
+    drop(bypass);
+    drop(maint);
+
+    // DUAL-LOGGED, and BEFORE the body is returned. `security_events` is the
+    // principal-keyed record that this agent was served plaintext;
+    // `privatization_audit` is the plan-keyed one a group admin can read. §6.5.6
+    // requires both, and neither is a substitute for the other. The `?` is what
+    // makes it fail CLOSED: an audit that cannot be written means no plaintext
+    // leaves this process.
+    log_manifest_read(
+        &state,
+        &plan,
+        actor,
+        "plan.seal_manifest",
+        items.len(),
+        &digest,
+    )
+    .await?;
+
+    Ok(Json(SealManifest {
+        plan_id,
+        epoch,
+        pad_to: plan.pad_to,
+        manifest_digest: digest,
+        next_cursor,
+        items: items
+            .into_iter()
+            .map(|i| SealManifestEntry {
+                claim_id: i.claim_id,
+                content: i.content,
+                labels: i.labels,
+                properties: i.properties,
+                versions: i
+                    .versions
+                    .into_iter()
+                    .map(|v| ManifestVersion {
+                        id: v.id,
+                        content: v.content,
+                    })
+                    .collect(),
+                evidence: i
+                    .evidence
+                    .into_iter()
+                    .map(|e| ManifestEvidence {
+                        id: e.id,
+                        raw_content: e.raw_content,
+                        properties: e.properties,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }))
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/seal-commit`.
+///
+/// # A commit missing any TCB member is REFUSED, not partially applied
+///
+/// The verification list is §6.5.6's, in order, and every one of them refuses
+/// the WHOLE request rather than the offending item. A per-item rejection would
+/// produce exactly the state §6.5.4 indicts: some claims sealed, some not, the
+/// operator told it worked.
+///
+/// # Errors
+///
+/// `400` a malformed ciphertext, a wrong hash, a padding violation, or a
+/// missing TCB member; `401` no auth context; `403` §6.6; `404` no such plan;
+/// `409` a plan that is not sealable or a stale manifest digest; `410` an
+/// expired plan; `500` a database fault.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn seal_commit(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<SealCommitRequest>,
+) -> Result<Json<CommitResponse>, ApiError> {
+    use epigraph_db::repos::privatization::{
+        PrivatizationRepository, SealCommitEvidence, SealCommitItem, SealCommitVersion,
+    };
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    refuse_if_expired(&plan)?;
+    refuse_unless_sealable(&plan)?;
+
+    if body.items.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "a seal-commit with no items is not a seal".to_string(),
+        });
+    }
+
+    let (mut maint, _bypass) = maintenance(&state).await?;
+
+    let epoch = PrivatizationRepository::active_epoch_conn(&mut maint, plan.target_group_id)
+        .await?
+        .ok_or_else(|| ApiError::Conflict {
+            reason: "the target group has no active key epoch; rotate a key into it before \
+                     sealing"
+                .to_string(),
+        })?;
+
+    // 1. Every claim_id is in the plan's FROZEN item set. Not "exists" — in the
+    //    plan. A commit naming a claim outside the plan would seal a row nobody
+    //    approved.
+    let claim_ids: Vec<Uuid> = body.items.iter().map(|i| i.claim_id).collect();
+    let frozen =
+        PrivatizationRepository::plan_contains_conn(&mut maint, plan_id, &claim_ids).await?;
+    if frozen.len() != claim_ids.len() {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "{} of {} claims in this commit are not items of plan {plan_id}",
+                claim_ids.len() - frozen.len(),
+                claim_ids.len()
+            ),
+        });
+    }
+
+    // 2. The TCB shape, read from the DATABASE and not from the manifest this
+    //    server served. That is the whole point of re-reading it: a version row
+    //    inserted since would otherwise keep its plaintext.
+    let shape = PrivatizationRepository::seal_tcb_shape_conn(&mut maint, &claim_ids).await?;
+
+    // 3. The manifest digest, recomputed over that shape in the same order the
+    //    manifest served it.
+    let expected = manifest_digest(
+        shape
+            .iter()
+            .map(|s| (s.claim_id, s.version_ids.clone(), s.evidence_ids.clone())),
+    );
+    if expected != body.manifest_digest {
+        return Err(ApiError::Conflict {
+            reason: "the manifest digest does not describe this plan's current TCB; a version or \
+                     evidence row changed since the manifest was served. Re-read the manifest and \
+                     re-commit"
+                .to_string(),
+        });
+    }
+
+    // 4. Every TCB member is covered, and every ciphertext parses, hashes and
+    //    pads correctly.
+    let mut items: Vec<SealCommitItem> = Vec::with_capacity(body.items.len());
+    for item in &body.items {
+        let s = shape
+            .iter()
+            .find(|s| s.claim_id == item.claim_id)
+            .ok_or_else(|| ApiError::BadRequest {
+                message: format!("claim {} has no rows to seal", item.claim_id),
+            })?;
+
+        let content_ct = decode_ciphertext(&item.content_ct_b64, "content", plan.pad_to)?;
+        let labels_ct = decode_ciphertext(&item.labels_ct_b64, "labels", plan.pad_to)?;
+        let properties_ct = decode_ciphertext(&item.properties_ct_b64, "properties", plan.pad_to)?;
+
+        let content_hash = decode_hash(&item.content_hash_b64)?;
+        if content_hash != blake3::hash(&content_ct).as_bytes() {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "content_hash for claim {} is not BLAKE3 over the content ciphertext",
+                    item.claim_id
+                ),
+            });
+        }
+
+        let mut versions = Vec::with_capacity(item.versions.len());
+        for v in &item.versions {
+            versions.push(SealCommitVersion {
+                id: v.id,
+                content_ct: decode_ciphertext(&v.ct_b64, "version content", plan.pad_to)?,
+            });
+        }
+        require_full_cover(
+            item.claim_id,
+            "claim_versions",
+            &s.version_ids,
+            &versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+        )?;
+
+        let mut evidence = Vec::with_capacity(item.evidence.len());
+        for e in &item.evidence {
+            evidence.push(SealCommitEvidence {
+                id: e.id,
+                content_ct: decode_ciphertext(&e.ct_b64, "evidence content", plan.pad_to)?,
+                properties_ct: decode_ciphertext(
+                    &e.props_ct_b64,
+                    "evidence properties",
+                    plan.pad_to,
+                )?,
+            });
+        }
+        require_full_cover(
+            item.claim_id,
+            "evidence",
+            &s.evidence_ids,
+            &evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
+        )?;
+
+        items.push(SealCommitItem {
+            claim_id: item.claim_id,
+            content_ct,
+            labels_ct,
+            properties_ct,
+            content_hash,
+            versions,
+            evidence,
+        });
+    }
+
+    // 5. The mutation. One transaction, under the global privatization advisory
+    //    lock, so a seal-commit and an apply batch cannot interleave over the
+    //    same rows. One correlation id for the whole request — see
+    //    `unseal_commit` — so the audit rows and the reseal job it dispatches
+    //    carry the same one rather than two unrelated ones.
+    let correlation_id = new_correlation_id();
+    let mut tx = sqlx::Connection::begin(&mut *maint)
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+    PrivatizationRepository::begin_batch_conn(&mut tx)
+        .await
+        .map_err(plan_write_error)?;
+    let sealed =
+        PrivatizationRepository::seal_claims_conn(&mut tx, plan.target_group_id, epoch, &items)
+            .await
+            .map_err(plan_write_error)?;
+    PrivatizationRepository::record_seal_audit_conn(
+        &mut tx,
+        plan_id,
+        actor,
+        "item.seal",
+        &sealed,
+        true,
+        Some(&correlation_id),
+    )
+    .await
+    .map_err(plan_write_error)?;
+
+    // A re-seal after a key rotation is a seal-commit like any other, and this
+    // is the moment "the last row moves" (§6.7 point 3). Enqueueing the check
+    // here — in the same transaction as the mutation, on the maintenance
+    // connection migration 077's `jobs_app` policy requires — is what lets
+    // `PrivatizationResealHandler` be the only writer that clears
+    // `groups.reseal_required_at` without polling for it.
+    if !sealed.is_empty() {
+        let job = epigraph_jobs::EpiGraphJob::PrivatizationReseal {
+            group_id: plan.target_group_id,
+            dispatched_by: actor,
+            correlation_id: correlation_id.clone(),
+        };
+        let payload = serde_json::to_value(&job).map_err(|e| {
+            tracing::error!(target: "tenancy.privatization", error = %e, "reseal job payload");
+            ApiError::InternalError {
+                message: "Failed to encode the reseal check job".to_string(),
+            }
+        })?;
+        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
+            .await
+            .map_err(plan_write_error)?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    let committed = sealed.len();
+    Ok(Json(CommitResponse {
+        plan_id,
+        committed,
+        // Items whose ciphertext row already existed. NOT a failure — a
+        // re-delivered commit is a no-op — but reported so a client that
+        // expected to seal them knows it did not.
+        already_done: body.items.len() - committed,
+    }))
+}
+
+/// `GET /api/v1/admin/privatization/plans/:id/unseal-manifest`.
+///
+/// Ciphertext only, so unlike its seal counterpart it discloses no plaintext.
+/// It is still §6.6-gated and still audited: which claims are sealed is itself
+/// information about a group's private region.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` §6.6; `404` no such plan; `500` a database
+/// fault.
+#[cfg(feature = "db")]
+pub async fn unseal_manifest(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+    Query(params): Query<ManifestQuery>,
+) -> Result<Json<UnsealManifest>, ApiError> {
+    use base64::Engine as _;
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    // NOT `refuse_if_expired`. Unsealing is the way BACK, and a plan whose
+    // preview has gone stale is exactly the plan an operator most needs to
+    // undo — the same argument `revert_plan` makes for skipping the TTL.
+    if plan.mode != "seal" {
+        return Err(ApiError::Conflict {
+            reason: format!("plan {plan_id} is mode='{}', not 'seal'", plan.mode),
+        });
+    }
+
+    let limit = manifest_limit(params.limit)?;
+    let (mut maint, _bypass) = maintenance(&state).await?;
+    let items = PrivatizationRepository::unseal_manifest_page_conn(
+        &mut maint,
+        plan_id,
+        params.cursor,
+        limit,
+    )
+    .await?;
+
+    let digest = manifest_digest(items.iter().map(|i| {
+        (
+            i.claim_id,
+            i.versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+            i.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
+        )
+    }));
+    let next_cursor = items.last().map(|i| i.claim_id);
+    // See `seal_manifest`: the maintenance connection goes back to the pool
+    // before the audit acquires its own.
+    drop(maint);
+    log_manifest_read(
+        &state,
+        &plan,
+        actor,
+        "plan.unseal_manifest",
+        items.len(),
+        &digest,
+    )
+    .await?;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(Json(UnsealManifest {
+        plan_id,
+        manifest_digest: digest,
+        next_cursor,
+        items: items
+            .into_iter()
+            .map(|i| UnsealManifestEntry {
+                claim_id: i.claim_id,
+                epoch: i.epoch,
+                pad_to: plan.pad_to,
+                content_ct_b64: b64.encode(&i.content_ct),
+                labels_ct_b64: i.labels_ct.as_ref().map(|c| b64.encode(c)),
+                properties_ct_b64: i.properties_ct.as_ref().map(|c| b64.encode(c)),
+                versions: i
+                    .versions
+                    .into_iter()
+                    .map(|v| CommitVersion {
+                        id: v.id,
+                        ct_b64: b64.encode(&v.content_ct),
+                    })
+                    .collect(),
+                evidence: i
+                    .evidence
+                    .into_iter()
+                    .map(|e| CommitEvidence {
+                        id: e.id,
+                        ct_b64: b64.encode(&e.content_ct),
+                        props_ct_b64: b64.encode(&e.properties_ct),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }))
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/unseal-commit`.
+///
+/// # It enqueues an embedding job per restored claim, and that is ops F14
+///
+/// The seal destroyed the vector; unseal cannot recreate it, and
+/// `find_claims_needing_embeddings` is `ORDER BY created_at LIMIT $1` with no
+/// priority, so a freshly unsealed 2019 claim would queue behind every other
+/// embedding-less row. The job is enqueued in the SAME transaction as the
+/// restore, on the maintenance connection, because migration 077's `jobs_app`
+/// policy is what stops anything else enqueueing privatization work and the
+/// restore and its follow-up must not be able to disagree.
+///
+/// # It is scoped to the plan, exactly as `seal-commit` is
+///
+/// §6.6's authority is checked against `plan.target_group_id`, so the set of
+/// rows the request may MUTATE has to be the set that authority was granted
+/// over. Three checks establish that, and none of them is redundant:
+///
+/// 1. `plan_contains_conn` — every `claim_id` in the body is a FROZEN item of
+///    this plan. Without it the authorisation is evaluated against one object
+///    and applied to another, caller-chosen one.
+/// 2. `unseal_tcb_shape_conn`, which reads only ciphertext rows bound to
+///    `plan.target_group_id`, and a `ce.group_id` predicate inside the mutation.
+///    A claim can be an item of one group's plan while its ciphertext belongs to
+///    another group's key; plan membership alone does not answer that.
+/// 3. `require_full_cover` over that shape, so a commit that restores a claim's
+///    head while omitting one of its version or evidence rows is refused whole.
+///    The seal destroyed the plaintext, so an uncovered ciphertext row deleted
+///    here would be unrecoverable by anyone.
+///
+/// The body's `content_hash` is NOT one of those checks and cannot be: it is
+/// BLAKE3 over the caller's own supplied plaintext, self-consistent by
+/// construction, and the server holds no key with which to check the plaintext
+/// against the ciphertext it stored. That is precisely why the scoping
+/// predicates carry the whole weight.
+///
+/// **One job per CLAIM and not per evidence row.**
+/// `EpiGraphJob::EmbeddingGeneration` carries `claim_id` only, and
+/// `privatization_plan_items` has no evidence-kinded row for a per-evidence job
+/// to name. The evidence half of ops F14 is therefore deferred, with an owner,
+/// rather than silently reported as done. It is a functional gap and not a
+/// confidentiality one — the seal nulled the vector, which is the safe
+/// direction.
+///
+/// # Errors
+///
+/// `400` a hash mismatch, empty content, a claim outside the plan or an
+/// incomplete cover; `401` no auth context; `403` §6.6; `404` no such plan;
+/// `409` a plan that is not `mode='seal'` or is in a state no ceremony runs in;
+/// `500` a database fault.
+#[cfg(feature = "db")]
+pub async fn unseal_commit(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<UnsealCommitRequest>,
+) -> Result<Json<CommitResponse>, ApiError> {
+    use epigraph_db::repos::privatization::{
+        PrivatizationRepository, UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
+    };
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+    if plan.mode != "seal" {
+        return Err(ApiError::Conflict {
+            reason: format!("plan {plan_id} is mode='{}', not 'seal'", plan.mode),
+        });
+    }
+    // NOT `refuse_unless_sealable`, and NOT `refuse_if_expired`. Unsealing is
+    // the way BACK: it must still work while a revert is in flight, which is the
+    // one state `refuse_unless_sealable` forbids and the one in which an
+    // operator most needs it, and `unseal_manifest` already argues why the 4h
+    // TTL does not apply to the reverse direction. What is checked is that the
+    // plan reached a state in which a seal ceremony could have run at all — a
+    // `previewed` or `approved` plan has sealed nothing, so a commit against it
+    // is naming rows some other ceremony sealed.
+    if !matches!(
+        plan.state.as_str(),
+        "applied" | "applied_with_drift" | "reverting"
+    ) {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "plan {plan_id} is '{}'; an unseal ceremony runs only against a plan that was \
+                 applied",
+                plan.state
+            ),
+        });
+    }
+    if body.items.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "an unseal-commit with no items is not an unseal".to_string(),
+        });
+    }
+
+    let (mut maint, _bypass) = maintenance(&state).await?;
+
+    // 1. Every claim_id is a FROZEN item of this plan. The mirror of
+    //    `seal_commit` step 1, and for the same reason read in the other
+    //    direction: §6.6 authorised this actor over `plan.target_group_id`, so a
+    //    commit naming a claim outside the plan would spend that authority on a
+    //    row nobody approved — writing caller-supplied plaintext into it and
+    //    deleting the ciphertext that was the only remaining copy.
+    let claim_ids: Vec<Uuid> = body.items.iter().map(|i| i.claim_id).collect();
+    let frozen =
+        PrivatizationRepository::plan_contains_conn(&mut maint, plan_id, &claim_ids).await?;
+    if frozen.len() != claim_ids.len() {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "{} of {} claims in this commit are not items of plan {plan_id}",
+                claim_ids.len() - frozen.len(),
+                claim_ids.len()
+            ),
+        });
+    }
+
+    // 2. The ciphertext shape, read from the DATABASE and bound to this plan's
+    //    target group. A claim that is absent from it carries no ciphertext for
+    //    this group and is a no-op below, which is what makes a re-delivered
+    //    commit succeed rather than trip the cover check.
+    let shape = PrivatizationRepository::unseal_tcb_shape_conn(
+        &mut maint,
+        plan.target_group_id,
+        &claim_ids,
+    )
+    .await?;
+
+    let mut items: Vec<UnsealCommitItem> = Vec::with_capacity(body.items.len());
+    for item in &body.items {
+        // `claims_content_not_empty` would refuse this at the database with a
+        // 23514; refusing it here makes it a 400 with a sentence, and keeps an
+        // empty restore from being the thing that rolls back a whole batch.
+        if item.content.trim().is_empty() {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "the restored content for claim {} is empty; claims_content_not_empty \
+                     forbids it and an empty restore is indistinguishable from a lost plaintext",
+                    item.claim_id
+                ),
+            });
+        }
+        let content_hash = decode_hash(&item.content_hash_b64)?;
+        if content_hash != blake3::hash(item.content.as_bytes()).as_bytes() {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "content_hash for claim {} is not BLAKE3 over the restored plaintext",
+                    item.claim_id
+                ),
+            });
+        }
+        // 3. Cover. Only for a claim that IS sealed under this group: one that is
+        //    absent from `shape` has no ciphertext left to strand, and demanding
+        //    an empty cover from it would turn every re-delivered commit into a
+        //    400.
+        if let Some(s) = shape.iter().find(|s| s.claim_id == item.claim_id) {
+            require_full_cover(
+                item.claim_id,
+                "claim_version_encryption",
+                &s.version_ids,
+                &item.versions.iter().map(|v| v.id).collect::<Vec<_>>(),
+            )?;
+            require_full_cover(
+                item.claim_id,
+                "evidence_encryption",
+                &s.evidence_ids,
+                &item.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
+            )?;
+        }
+
+        items.push(UnsealCommitItem {
+            claim_id: item.claim_id,
+            content: item.content.clone(),
+            content_hash,
+            labels: item.labels.clone(),
+            properties: item.properties.clone(),
+            versions: item
+                .versions
+                .iter()
+                .map(|v| UnsealCommitVersion {
+                    id: v.id,
+                    content: v.content.clone(),
+                })
+                .collect(),
+            evidence: item
+                .evidence
+                .iter()
+                .map(|e| UnsealCommitEvidence {
+                    id: e.id,
+                    raw_content: e.raw_content.clone(),
+                    properties: e.properties.clone(),
+                })
+                .collect(),
+        });
+    }
+
+    // ONE correlation id for the whole request, threaded into both the audit
+    // rows and the follow-up job, so a ceremony can be reassembled from either
+    // end. The audit rows are the surface a group admin reads back to see what
+    // an unseal did, and a NULL there makes them unjoinable to everything else
+    // the same request wrote.
+    let correlation_id = new_correlation_id();
+    let mut tx = sqlx::Connection::begin(&mut *maint)
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+    PrivatizationRepository::begin_batch_conn(&mut tx)
+        .await
+        .map_err(plan_write_error)?;
+    let restored =
+        PrivatizationRepository::unseal_claims_conn(&mut tx, plan.target_group_id, &items)
+            .await
+            .map_err(plan_write_error)?;
+
+    for claim_id in &restored {
+        let job = epigraph_jobs::EpiGraphJob::EmbeddingGeneration {
+            claim_id: *claim_id,
+        };
+        let payload = serde_json::to_value(&job).map_err(|e| {
+            tracing::error!(target: "tenancy.privatization", error = %e, "embedding job payload");
+            ApiError::InternalError {
+                message: "Failed to encode the re-embedding job".to_string(),
+            }
+        })?;
+        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
+            .await
+            .map_err(plan_write_error)?;
+    }
+
+    // Unsealing is the OTHER way a group answers a rotation: a claim whose
+    // ciphertext row is gone is not a row still bound to a retired epoch. Without
+    // this enqueue the only producer of the check is `seal_commit`, so a group
+    // that unseals everything rather than re-sealing it keeps
+    // `reseal_required_at` set forever with nothing able to observe that the
+    // stale count reached zero. The handler is idempotent and does no
+    // cryptography, so enqueueing it is cheap and re-enqueueing it is harmless.
+    if !restored.is_empty() {
+        let job = epigraph_jobs::EpiGraphJob::PrivatizationReseal {
+            group_id: plan.target_group_id,
+            dispatched_by: actor,
+            correlation_id: correlation_id.clone(),
+        };
+        let payload = serde_json::to_value(&job).map_err(|e| {
+            tracing::error!(target: "tenancy.privatization", error = %e, "reseal job payload");
+            ApiError::InternalError {
+                message: "Failed to encode the reseal check job".to_string(),
+            }
+        })?;
+        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
+            .await
+            .map_err(plan_write_error)?;
+    }
+
+    PrivatizationRepository::record_seal_audit_conn(
+        &mut tx,
+        plan_id,
+        actor,
+        "item.unseal",
+        &restored,
+        false,
+        Some(&correlation_id),
+    )
+    .await
+    .map_err(plan_write_error)?;
+    tx.commit()
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    let committed = restored.len();
+    Ok(Json(CommitResponse {
+        plan_id,
+        committed,
+        already_done: items.len() - committed,
+    }))
+}
+
+// =============================================================================
 // HELPERS (db feature)
 // =============================================================================
+
+/// Refuse a plan that cannot be sealed yet.
+///
+/// Two conditions, and the second is the ordering invariant: §6.5.5 says
+/// "restrict first, then seal", and migration 081's
+/// `claim_encryption_no_public_sealed` raises `42501` if it is not honoured.
+/// Catching it here makes it a 409 with a sentence rather than a 500 carrying a
+/// SQLSTATE.
+#[cfg(feature = "db")]
+fn refuse_unless_sealable(
+    plan: &epigraph_db::repos::privatization::PlanRow,
+) -> Result<(), ApiError> {
+    if plan.mode != "seal" {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "plan {} is mode='{}'; only a seal plan has a manifest",
+                plan.id, plan.mode
+            ),
+        });
+    }
+    if !matches!(plan.state.as_str(), "applied" | "applied_with_drift") {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "plan {} is '{}'; a seal ceremony runs only after the plan has been applied, \
+                 because a claim that is still public cannot be sealed",
+                plan.id, plan.state
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The manifest page size: default 500, ceiling 500 (§6.5.6).
+#[cfg(feature = "db")]
+fn manifest_limit(requested: Option<i64>) -> Result<i64, ApiError> {
+    const MAX: i64 = 500;
+    match requested {
+        None => Ok(MAX),
+        Some(n) if (1..=MAX).contains(&n) => Ok(n),
+        Some(n) => Err(ApiError::BadRequest {
+            message: format!("limit must be between 1 and {MAX}, got {n}"),
+        }),
+    }
+}
+
+/// BLAKE3 over a page's `(claim_id, version ids…, evidence ids…)`, `b3:` + hex.
+///
+/// The SHAPE of the TCB, not its bytes. Recomputable from the database at
+/// commit time, which is what lets seal-commit notice a version or evidence row
+/// that appeared after the manifest was served.
+#[cfg(feature = "db")]
+fn manifest_digest(items: impl Iterator<Item = (Uuid, Vec<Uuid>, Vec<Uuid>)>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (claim_id, mut versions, mut evidence) in items {
+        hasher.update(claim_id.as_bytes());
+        versions.sort_unstable();
+        evidence.sort_unstable();
+        hasher.update(b"v");
+        for v in versions {
+            hasher.update(v.as_bytes());
+        }
+        hasher.update(b"e");
+        for e in evidence {
+            hasher.update(e.as_bytes());
+        }
+    }
+    format!("b3:{}", hex::encode(hasher.finalize().as_bytes()))
+}
+
+/// Decode one base64 ciphertext and run §6.5.6's three checks on it.
+///
+/// `EncryptedPayload::from_bytes` carries the `>= 28 bytes` and `<= 10 MiB`
+/// guards; the modulus is this function's. The server can check the modulus and
+/// nothing else about the padding, because it never sees a plaintext — which is
+/// why the padding target is the STORED BLOB rather than the plaintext. See
+/// `epigraph_privacy::padding`.
+#[cfg(feature = "db")]
+fn decode_ciphertext(b64: &str, field: &str, pad_to: i32) -> Result<Vec<u8>, ApiError> {
+    use base64::Engine as _;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| ApiError::BadRequest {
+            message: format!("{field} ciphertext is not valid base64: {e}"),
+        })?;
+    epigraph_crypto::EncryptedPayload::from_bytes(&bytes).map_err(|e| ApiError::BadRequest {
+        message: format!("{field} ciphertext is not a well-formed encrypted payload: {e}"),
+    })?;
+    if pad_to > 0 {
+        let modulus = usize::try_from(pad_to).unwrap_or(1);
+        if bytes.len() % modulus != 0 {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "{field} ciphertext is {} bytes, which is not a multiple of this plan's \
+                     pad_to={pad_to}. Length padding is what stops a stored ciphertext length \
+                     from being a function of its plaintext length",
+                    bytes.len()
+                ),
+            });
+        }
+    }
+    Ok(bytes)
+}
+
+/// Decode a base64 BLAKE3 digest, refusing anything that is not 32 bytes.
+///
+/// `claims_content_hash_length` pins the column to exactly 32; catching it here
+/// makes a wrong length a 400 rather than a 500 carrying `23514`.
+#[cfg(feature = "db")]
+fn decode_hash(b64: &str) -> Result<Vec<u8>, ApiError> {
+    use base64::Engine as _;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| ApiError::BadRequest {
+            message: format!("content_hash is not valid base64: {e}"),
+        })?;
+    if bytes.len() != 32 {
+        return Err(ApiError::BadRequest {
+            message: format!("content_hash must be 32 bytes, got {}", bytes.len()),
+        });
+    }
+    Ok(bytes)
+}
+
+/// Refuse unless `supplied` covers every id in `required`.
+///
+/// The all-or-nothing rule, per table. It refuses on a MISSING id and tolerates
+/// an extra one only in the sense that the length check catches it: a commit
+/// naming a row that is not in the shape has already failed the digest.
+#[cfg(feature = "db")]
+fn require_full_cover(
+    claim_id: Uuid,
+    table: &str,
+    required: &[Uuid],
+    supplied: &[Uuid],
+) -> Result<(), ApiError> {
+    let have: std::collections::BTreeSet<Uuid> = supplied.iter().copied().collect();
+    let missing: Vec<Uuid> = required
+        .iter()
+        .copied()
+        .filter(|id| !have.contains(id))
+        .collect();
+    if missing.is_empty() && have.len() == required.len() {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest {
+        message: format!(
+            "the commit for claim {claim_id} covers {} of {} {table} rows. FINAL-PLAN §6.5.4's \
+             TCB is a set: a commit missing any member is refused, not partially applied",
+            have.len(),
+            required.len()
+        ),
+    })
+}
+
+/// Write the dual log §6.5.6 requires for a manifest read.
+///
+/// `security_events` is principal-keyed and records that THIS agent was served
+/// the page; `privatization_audit` is plan-keyed and is what a group admin can
+/// read back. Neither substitutes for the other, and the entity ids stay out of
+/// `security_events` for the reason `dispatch` gives: its policy is keyed on the
+/// principal, not on the target group.
+#[cfg(feature = "db")]
+async fn log_manifest_read(
+    state: &AppState,
+    plan: &epigraph_db::repos::privatization::PlanRow,
+    actor: Uuid,
+    action: &str,
+    served: usize,
+    digest: &str,
+) -> Result<(), ApiError> {
+    use epigraph_db::repos::privatization::{PlanAuditEntry, PrivatizationRepository};
+    use epigraph_db::repos::security_event::{SecurityEventRepository, SecurityEventRow};
+
+    let correlation_id = new_correlation_id();
+    let (mut maint, _bypass) = maintenance(state).await?;
+    let mut tx = sqlx::Connection::begin(&mut *maint)
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    SecurityEventRepository::log_conn(
+        &mut tx,
+        &SecurityEventRow {
+            id: Uuid::new_v4(),
+            event_type: action.to_string(),
+            agent_id: Some(actor),
+            success: Some(true),
+            details: serde_json::json!({
+                "plan_id": plan.id,
+                "target_group_id": plan.target_group_id,
+                "items_served": served,
+                "manifest_digest": digest,
+            }),
+            ip_address: None,
+            user_agent: None,
+            correlation_id: Some(correlation_id.clone()),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+
+    PrivatizationRepository::record_plan_audit_conn(
+        &mut tx,
+        PlanAuditEntry {
+            plan_id: plan.id,
+            actor_agent_id: actor,
+            action,
+            kind: None,
+            entity_id: None,
+            plan_digest: plan.plan_digest.as_deref(),
+            correlation_id: Some(&correlation_id),
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+
+    tx.commit()
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))
+}
 
 /// Re-run FINAL-PLAN §6.6's four conditions against a plan's own target group.
 ///
@@ -2415,6 +3693,74 @@ pub async fn get_audit(
     State(_state): State<AppState>,
     Query(_params): Query<AuditQueryParams>,
 ) -> Result<Json<AuditResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `GET /api/v1/admin/privatization/plans/:id/seal-manifest` without the `db`
+/// feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn seal_manifest(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+    Query(_params): Query<ManifestQuery>,
+) -> Result<Json<SealManifest>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/seal-commit` without the `db`
+/// feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn seal_commit(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+    Json(_body): Json<SealCommitRequest>,
+) -> Result<Json<CommitResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `GET /api/v1/admin/privatization/plans/:id/unseal-manifest` without the `db`
+/// feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn unseal_manifest(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+    Query(_params): Query<ManifestQuery>,
+) -> Result<Json<UnsealManifest>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/unseal-commit` without the `db`
+/// feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn unseal_commit(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+    Json(_body): Json<UnsealCommitRequest>,
+) -> Result<Json<CommitResponse>, ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "Privatization requires database".to_string(),
     })

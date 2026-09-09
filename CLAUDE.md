@@ -143,14 +143,60 @@ If you add a third path that flips `is_current = false`, add the matching
 
 ```sql
 SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
-         AND NOT ('telemetry' = ANY(labels)) AND (properties->>'event') IS NULL) AS live_missing,
-       COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present
+         AND NOT ('telemetry' = ANY(labels)) AND (properties->>'event') IS NULL
+         -- A SEALED claim is not an embedding gap. Keyed on `claim_encryption`,
+         -- never on `visibility`: a restricted claim keeps its embedding on
+         -- purpose, and keying on visibility would hide every group-private row.
+         AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)
+         -- Nor is an unseal in flight. BOUNDED, deliberately: `unseal-commit`
+         -- enqueues one embedding_generation job per restored claim, and the
+         -- shipped job runner registers no embedding handler to drain that
+         -- queue (`bin/server.rs`). Without the 24h bound this clause
+         -- would hide an unsealed claim from `live_missing` forever, which is
+         -- the failure mode the audit exists to catch. Keep the bound until a
+         -- handler is registered; a non-zero count of jobs older than it is
+         -- itself the signal that one is needed.
+         --
+         -- THE PAYLOAD PATH IS `#>> '{EmbeddingGeneration,claim_id}'`, NOT
+         -- `->>'claim_id'`. `EpiGraphJob` is an externally tagged serde enum, so
+         -- the row reads {"EmbeddingGeneration": {"claim_id": "…"}}; the flat
+         -- spelling matches nothing and turns this clause into a no-op.
+         AND NOT EXISTS (SELECT 1 FROM jobs j
+                          WHERE j.job_type = 'embedding_generation'
+                            AND j.state IN ('pending','running')
+                            AND j.created_at > now() - interval '24 hours'
+                            AND j.payload #>> '{EmbeddingGeneration,claim_id}'
+                                = claims.id::text)
+       ) AS live_missing,
+       COUNT(*) FILTER (WHERE NOT is_current AND embedding IS NOT NULL) AS stale_present,
+       -- A sealed claim that still carries a plaintext-derived vector is a
+       -- CONFIDENTIALITY VIOLATION, not an embedding gap. Must be zero.
+       -- BOTH vector columns: `embedding_3072` (migration 027) is a second live
+       -- ANN column, written by `epigraph-cli reembed` and read by recall at
+       -- centroid_dim=3072. A clause naming only `embedding` reports zero while
+       -- the other column still holds a vector derived from the sealed text.
+       COUNT(*) FILTER (WHERE (embedding IS NOT NULL OR embedding_3072 IS NOT NULL)
+         AND EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)
+       ) AS sealed_with_embedding
 FROM claims;
+
+-- AND THE SAME CLAUSE OVER `evidence`, which the audit above cannot see.
+-- Evidence carries its own `embedding` and `embedding_3072`, and an audit
+-- scoped to `claims` alone reports zero while a sealed claim's evidence keeps a
+-- plaintext-derived vector. Must be 0.
+SELECT COUNT(*) FROM evidence e
+ WHERE (e.embedding IS NOT NULL OR e.embedding_3072 IS NOT NULL)
+   AND EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = e.claim_id);
 ```
 
-Both should trend toward zero. `live_missing` growing means a write path is
-bypassing the embedder; `stale_present` growing means a cleanup path is
-missing the null. Track via `system_stats` if exposed; otherwise spot-check.
+`live_missing` and `stale_present` should trend toward zero. `live_missing`
+growing means a write path is bypassing the embedder; `stale_present` growing
+means a cleanup path is missing the null. Track via `system_stats` if exposed;
+otherwise spot-check.
+
+**`sealed_with_embedding > 0` on either table is a page-the-on-call condition,
+not a backlog item.** It means a row whose content is ciphertext still carries a
+vector computed from the plaintext.
 
 <!-- BEGIN epistemic-commit-protocol (managed block — keep these markers; edit the source at ~/.epistemic-commit-protocol.md and re-run the propagator) -->
 
