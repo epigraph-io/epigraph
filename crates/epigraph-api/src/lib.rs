@@ -10,6 +10,7 @@ pub mod routes;
 pub mod security;
 pub mod services;
 pub mod state;
+pub mod tenancy_disclosure;
 #[cfg(feature = "db")]
 pub mod tenancy_gauge;
 pub mod tls;

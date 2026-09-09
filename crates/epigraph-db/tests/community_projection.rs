@@ -229,6 +229,118 @@ async fn remove_member_revokes_the_projected_membership(pool: PgPool) {
     );
 }
 
+/// The community removal path must record the SAME re-key obligation the group
+/// removal path does — FINAL-PLAN §6.7 point 2.
+///
+/// `remove_member` here revokes a projected `group_memberships` row, and
+/// `create` above projects the community onto a real tenancy group with its own
+/// `group_key_epochs` row. So the revoked agent keeps a share that still opens
+/// everything sealed before the rotation, exactly as it would through
+/// `GroupMembershipRepository::revoke_member_unless_last_admin`. Marking on only
+/// one of the two paths would leave `epigraph_groups_reseal_required` reporting
+/// its healthy value for a group that owes a re-key, and the group route's own
+/// tests cannot see this one — nothing in `group_rotation.rs` or
+/// `group_lifecycle.rs` drives `CommunityRepository`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn remove_member_records_the_reseal_obligation(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "reseal-member").await;
+    let row = CommunityRepository::create(&pool, "geology", None, None, None, None)
+        .await
+        .expect("create community");
+    let perspective = seed_perspective(&pool, Some(agent), "p").await;
+
+    CommunityRepository::add_member(&pool, Some(agent), row.id, perspective)
+        .await
+        .expect("add member");
+
+    let before: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT reseal_required_at FROM groups WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read mark");
+    assert!(
+        before.is_none(),
+        "CALIBRATION: nothing is owed before the removal, or the assertion below measures nothing"
+    );
+
+    let removed = CommunityRepository::remove_member(&pool, Some(agent), row.id, perspective)
+        .await
+        .expect("remove member");
+    assert_eq!(removed, MembershipOutcome::Applied);
+
+    let after: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT reseal_required_at FROM groups WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read mark");
+    assert!(
+        after.is_some(),
+        "a removal on this path leaves the same debt as one on the group path, and the system \
+         must record it rather than reporting the group as clean"
+    );
+
+    let statuses: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT epoch, status FROM group_key_epochs WHERE group_id = $1 ORDER BY epoch",
+    )
+    .bind(row.id)
+    .fetch_all(&pool)
+    .await
+    .expect("read epoch rows");
+    assert_eq!(
+        statuses,
+        vec![(0, "rotating".to_string())],
+        "the epoch carries the mark; `rotating` keeps the group usable while the debt stands"
+    );
+}
+
+/// A removal that revokes NOTHING must mark nothing.
+///
+/// The `NOT EXISTS` guard in `remove_member` deliberately keeps the projected
+/// membership alive when the agent's other perspective still justifies it. An
+/// unguarded mark would then charge a group a re-key obligation for a removal
+/// that changed no membership at all — and because the timestamp is `COALESCE`d
+/// and nothing in this release clears it, that false debt would be permanent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_removal_that_revokes_nothing_records_no_obligation(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "no-op-member").await;
+    let row = CommunityRepository::create(&pool, "botany", None, None, None, None)
+        .await
+        .expect("create community");
+    let p1 = seed_perspective(&pool, Some(agent), "p1").await;
+    let p2 = seed_perspective(&pool, Some(agent), "p2").await;
+
+    CommunityRepository::add_member(&pool, Some(agent), row.id, p1)
+        .await
+        .expect("add p1");
+    CommunityRepository::add_member(&pool, Some(agent), row.id, p2)
+        .await
+        .expect("add p2");
+
+    CommunityRepository::remove_member(&pool, Some(agent), row.id, p1)
+        .await
+        .expect("remove p1");
+
+    assert_eq!(
+        live_membership(&pool, row.id, agent).await,
+        1,
+        "CALIBRATION: the second perspective keeps the membership live, so nothing was revoked"
+    );
+
+    let mark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT reseal_required_at FROM groups WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read mark");
+    assert!(
+        mark.is_none(),
+        "no membership was revoked, so no re-key is owed; the obligation is COALESCEd and \
+         nothing in this release clears it, so a false mark here would never go away"
+    );
+}
+
 /// Removing ONE of an agent's two perspectives must NOT cut its access.
 ///
 /// Two perspectives owned by one agent both project onto the single

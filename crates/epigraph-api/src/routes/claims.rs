@@ -68,7 +68,8 @@ pub struct CreateClaimRequest {
     /// Base64-encoded ciphertext (client-encrypted content)
     #[serde(default)]
     pub encrypted_content: Option<String>,
-    /// Encryption epoch — must match an active epoch for the group
+    /// Encryption epoch — must match the group's current epoch (`active`, or
+    /// `rotating` while a removal's re-key obligation is outstanding)
     #[serde(default)]
     pub encryption_epoch: Option<i32>,
     /// Optional labels to assign on creation (e.g., ["ndi-roadmap", "fet-sensing"])
@@ -292,7 +293,7 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 /// For encrypted claims (privacy_tier == "fully_private"):
 /// - group_id, encrypted_content, and encryption_epoch are required
 /// - Agent must be a member of the specified group
-/// - encryption_epoch must match the group's active epoch
+/// - encryption_epoch must match the group's current epoch
 /// - Claim + encryption metadata are written atomically in a transaction
 #[cfg(feature = "db")]
 pub async fn create_claim(
@@ -365,28 +366,33 @@ pub async fn create_claim(
             });
         }
 
-        // Verify epoch is active
-        let active_epoch = GroupKeyEpochRepository::get_active_epoch(&state.db_pool, group_id)
+        // Verify the claim is sealed under the group's CURRENT epoch, which is
+        // `active` or — while a removal's re-key obligation is outstanding —
+        // `rotating`. The strings below say "current" rather than "active"
+        // because the row this accepts may be either, and an error that names
+        // the wrong status sends the caller looking for a state the database
+        // does not report.
+        let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
             .await
             .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to query active epoch: {e}"),
+                message: format!("Failed to query current epoch: {e}"),
             })?;
-        let active_epoch_num = match active_epoch {
+        let current_epoch_num = match current_epoch {
             Some(e) => e.epoch,
             None => {
                 return Err(ApiError::ValidationError {
                     field: "encryption_epoch".to_string(),
-                    reason: "No active epoch found for this group".to_string(),
+                    reason: "No current epoch found for this group".to_string(),
                 });
             }
         };
-        if request.encryption_epoch.unwrap() != active_epoch_num {
+        if request.encryption_epoch.unwrap() != current_epoch_num {
             return Err(ApiError::ValidationError {
                 field: "encryption_epoch".to_string(),
                 reason: format!(
-                    "Epoch {} is not the active epoch (active: {})",
+                    "Epoch {} is not the group's current epoch (current: {})",
                     request.encryption_epoch.unwrap(),
-                    active_epoch_num,
+                    current_epoch_num,
                 ),
             });
         }

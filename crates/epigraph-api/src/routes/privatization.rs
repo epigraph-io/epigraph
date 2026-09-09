@@ -281,6 +281,27 @@ pub struct PlanPreview {
     pub warnings: Vec<String>,
     /// `item_count > 1000 OR authors_losing_count > 0`.
     pub requires_second_approver: bool,
+    /// What applying this plan does and does not revoke.
+    pub side_effects: SideEffects,
+}
+
+/// FINAL-PLAN §6.7 point 1's third home for the revocation disclosure.
+///
+/// The plan requires the sentence in three places, and this is the one an
+/// operator reads BEFORE acting rather than after: a privatization preview is
+/// the moment someone decides whether moving a subgraph into a group is
+/// sufficient, and "we can revoke it later" is the belief that decision most
+/// often rests on.
+///
+/// PR-20's *Acceptance* line names only two of the three homes. §6.7 point 1
+/// names three, and it is the substantive specification; the two-item list is
+/// an abbreviation of it, not a descope. Recorded in
+/// `docs/tenancy/progress.json` under `plan_corrections`.
+#[derive(Serialize, Debug)]
+pub struct SideEffects {
+    /// The §6.7 sentence, verbatim, from one constant shared with the rotate
+    /// response — see [`crate::tenancy_disclosure`].
+    pub revocation: &'static str,
 }
 
 /// `counts` in the preview.
@@ -889,6 +910,9 @@ pub async fn create_plan(
         warnings,
         requires_second_approver: selection.item_count() > SECOND_APPROVER_ITEM_THRESHOLD
             || authors_losing > 0,
+        side_effects: SideEffects {
+            revocation: crate::tenancy_disclosure::ROTATION_DOES_NOT_REVOKE_PAST_ACCESS,
+        },
     };
 
     Ok((axum::http::StatusCode::CREATED, Json(response)))

@@ -151,7 +151,7 @@ pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
 pub use evidence_encryption::{EvidenceEncryptionRepository, EvidenceEncryptionRow};
 pub use group::{GroupRepository, GroupRow};
-pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow};
+pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
 pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
 pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};

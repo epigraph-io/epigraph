@@ -471,6 +471,30 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          077 (section 8), which is what gates the row once step 11d lands.",
     ),
     (
+        "group_membership.rs",
+        "get_member_role_conn",
+        "READ of `group_memberships`, which carries neither `visibility` nor `owner_group_id` — it \
+         is not in migration 062's tier_a array and schema_contract.rs pins its eight columns — so \
+         there is no predicate a Viewer could be spent on. It answers the authorization question \
+         itself (is this principal an admin of THIS group) for POST /groups/:id/rotate, on the \
+         same ScopedPool::begin_as transaction that performs the rotation, so the decision and \
+         the write cannot be taken on different connections. Its tenancy backstop is migration \
+         077 section 7's group_memberships_tenancy policy, which selects on the CONNECTION.",
+    ),
+    (
+        "group_key_epoch.rs",
+        "rotate_conn",
+        "Two READs with nothing to filter on. The `group_memberships` read is the live roster the \
+         rotation locks FOR UPDATE, and that table carries neither `visibility` nor \
+         `owner_group_id` — it is not in migration 062's tier_a array — so there is no predicate \
+         a Viewer could be spent on; narrowing it to a viewer's own memberships would break the \
+         very contract the function enforces, which is that the submission covers EVERY live \
+         member. The `groups` read is `properties->>'kms_key_ref'` on the one group the caller \
+         has already been authorised as an admin of, on this same stamped transaction. Its \
+         tenancy backstop is migration 077 section 7's group_memberships_tenancy policy and the \
+         groups_tenancy policy, both of which select on the CONNECTION.",
+    ),
+    (
         "oauth_client.rs",
         "get_by_id_conn",
         "READ, but of a table with NO tenancy at all. `oauth_clients` has neither `visibility` nor \

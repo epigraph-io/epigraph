@@ -368,3 +368,89 @@ user input, and `acquire_as` has no request-path callers at all — but the natu
 reading of the `allow_declassify` conclusion above is that the tenancy GUCs are
 different in kind. They are not. Recorded as
 `D-PR17-tenancy-gucs-are-pgc-userset`.
+
+## What rotation and member removal actually revoke (PR-20)
+
+Two operations in this system are commonly read as "revoke access", and they do
+two different things. Neither does what the phrase implies.
+
+**Removing a member** (`DELETE /api/v1/groups/:id/members/:agent_id`) sets
+`group_memberships.revoked_at`. From the removed agent's *next request* onward
+they resolve to a `Viewer` without that group, so RLS and the in-query predicate
+both stop returning the group's rows to them. Membership is deliberately not in
+the JWT, so this is immediate rather than "when the token expires". That half is
+strong.
+
+**Rotating the key** (`POST /api/v1/groups/:id/rotate`) retires epoch N, creates
+epoch N+1 and re-wraps the new key for every live member, in one transaction. It
+does **not** re-encrypt anything. Every `claim_encryption` row stays bound to the
+epoch it was sealed under, through `claim_encryption_epoch_fkey`. Retired epochs
+are kept, and the revoked member's `group_memberships` row is kept too, with its
+`wrapped_key_share` intact.
+
+So, stated plainly, and this is the sentence to quote when someone asks:
+
+> A member removed at epoch N who kept their share can decrypt every claim sealed before the rotation, forever. Rotation gates only future ciphertext.
+
+The same sentence is returned in the body of every successful rotation, and in
+the `side_effects.revocation` field of a privatization plan preview. It is one
+constant in the source (`epigraph_api::tenancy_disclosure`) with a test asserting
+all three copies agree, because a disclosure that drifts is a disclosure that
+stops being read.
+
+### What follows from that
+
+A removal therefore leaves a **debt**, and the system records it rather than
+pretending otherwise:
+
+- `groups.reseal_required_at` is set on the first unrotated removal. It is not
+  reset by later removals — the debt dates from when it was incurred — and it is
+  surfaced on `GET /api/v1/groups/:id`. Both removal paths record it:
+  `DELETE /api/v1/groups/:id/members/:agent_id` and
+  `DELETE /api/v1/communities/:id/members/:perspective_id`, the second of which
+  revokes a projected group membership and so leaves exactly the same debt.
+- The group's current key epoch moves to `status = 'rotating'`. This is a mark,
+  not a shutdown: the group keeps accepting members and sealing new claims under
+  that epoch until an admin rotates. That has a forward cost, and it is the
+  deliberate trade for not turning every removal into a write outage: content
+  written while the mark is outstanding is sealed under the same epoch key the
+  removed member may still hold, and a member added during the window is pinned
+  to that epoch too. The exposure extends forward in time, not only backward
+  over what was already sealed, which is why the window is meant to be short.
+- `epigraph_groups_reseal_required` counts groups whose debt is more than seven
+  days old. Zero is the healthy value; `-1` means the sampler has not run yet.
+  **In this release the series only ever rises.** Nothing clears
+  `reseal_required_at` — rotation deliberately does not, and the re-seal handler
+  that would is not built — so read it as "groups that have ever incurred an
+  unrotated removal older than seven days", not "groups currently owing one". An
+  alert wired to it will not clear when an admin remediates.
+
+Nothing re-seals automatically, and that is deliberate. Re-sealing needs the
+group key, which the server does not have and by design will never have. The
+server can mark the obligation, measure it, and (in a later release) prepare the
+manifest; only a key-holding admin can complete it. A job that could only ever
+fail would turn a stated, visible gap into a red queue nobody trusts.
+
+### Rotation is refused when the outgoing key is unrecoverable
+
+`POST /api/v1/groups/:id/rotate` answers `409` unless the epoch it is about to
+retire is recoverable — either that epoch row already carries a `wrapped_key`, or
+the group carries a `properties->>'kms_key_ref'` naming an external escrow.
+Retiring an epoch whose key nobody can produce does not hide the content sealed
+under it; it destroys it, silently, in an operation that reads like routine
+hygiene.
+
+**The request carries no key material of its own, and that is a deliberate
+limit.** The server cannot check that a blob offered as "the outgoing group key"
+is one, so accepting one would make the gate satisfiable by any value at all —
+and the gate is the only thing standing between a routine operation and content
+nobody can ever read again. `kms_key_ref` is the production satisfier: under
+both custody models in §5.4 of the plan, `group_key_epochs.wrapped_key` stays
+`NULL` by design.
+
+The rotation also refuses (`400`) a submission that does not carry a re-wrapped
+share for exactly the live roster, and one that names any member twice. A member
+skipped by a rotation would hold a share for a retired epoch and be unable to
+read anything written afterwards — an accidental removal dressed as a key
+change; two shares for one member are two answers to one question, which the
+server declines to resolve by picking the last.

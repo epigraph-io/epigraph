@@ -76,11 +76,14 @@ impl GroupMembershipRepository {
     /// `rows_affected()` and returned `Ok(())` unconditionally, so removing a
     /// non-member was a silent HTTP 204 and told the caller nothing.
     ///
-    /// Deliberately does NOT set `group_key_epochs.status = 'rotating'` or
-    /// `groups.reseal_required_at`. Revocation without a key rotation leaves the
-    /// removed member able to decrypt anything they already hold; making the
-    /// rotation obligation explicit is PR-20's job, and doing half of it here
-    /// would look like the obligation was already discharged.
+    /// **This function has no callers and is not the removal path.** PR-20's
+    /// `group_key_epochs.status = 'rotating'` and `groups.reseal_required_at`
+    /// writes live in [`Self::revoke_member_unless_last_admin`], which is what
+    /// `DELETE /api/v1/groups/:id/members/:agent_id` actually calls. FINAL-PLAN
+    /// PR-20's *Files* line names `remove_member`; measured on this tree, that
+    /// name resolves here, to a function nothing invokes, so following it
+    /// literally would have marked nothing on any real removal. The correction
+    /// is recorded in `docs/tenancy/progress.json`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -126,6 +129,43 @@ impl GroupMembershipRepository {
     /// The follow-up read runs in the same transaction and only discriminates
     /// *why* zero rows changed.
     ///
+    /// # PR-20: the removal MARKS the rotation obligation
+    ///
+    /// On the `Revoked` arm only, and in the same transaction, this now records
+    /// FINAL-PLAN §6.7's obligation: `groups.reseal_required_at` is set and the
+    /// group's current key epoch moves to `status = 'rotating'`. The removed
+    /// member keeps a share that still decrypts everything sealed before the
+    /// rotation, so revocation on its own discharges nothing, and an obligation
+    /// nobody can see is one nobody services.
+    ///
+    /// It MARKS and does not enqueue. §6.7 is explicit that an automatic
+    /// re-seal is deliberately not built: re-sealing needs the group key, which
+    /// by §6.5.6 the server does not have, so a job scheduled here could only
+    /// ever fail.
+    ///
+    /// Both writes are on the `Revoked` arm alone. The loser of the concurrent
+    /// last-admin race sees `rows_affected() == 0` and returns `LastAdmin`; it
+    /// revoked nobody and must mark nothing.
+    ///
+    /// `COALESCE(reseal_required_at, now())` rather than the plan's bare
+    /// `now()`, and this is a deliberate documented deviation: the obligation
+    /// dates from the FIRST unrotated removal. A bare `now()` restarts the
+    /// clock on every subsequent removal, so a group with steady membership
+    /// churn would never age past the seven days §6.7's gauge measures — the
+    /// groups most in need of the alert would be exactly the ones excluded from
+    /// it. Rotation does not clear the field either (see
+    /// `GroupKeyEpochRepository::rotate_conn`); §6.7 point 3 gives that to the
+    /// re-seal handler, when the last `claim_encryption` row has actually
+    /// moved.
+    ///
+    /// Lock order across the three tables is `group_memberships`, then
+    /// `groups`, then `group_key_epochs`. `GroupKeyEpochRepository::rotate_conn`
+    /// takes the same two it needs in the same relative order — roster first,
+    /// epoch row second — for exactly this reason: the reverse would let a
+    /// rotation holding the epoch row wait on a removal holding the roster
+    /// while the removal waited on the epoch row. Two concurrent removals
+    /// serialise on the first table and cannot deadlock on the later two.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails.
     #[instrument(skip(pool))]
@@ -161,6 +201,38 @@ impl GroupMembershipRepository {
         .await?;
 
         let outcome = if result.rows_affected() > 0 {
+            // FINAL-PLAN §6.7 point 2, in the transaction that did the
+            // revoking. See this function's doc comment for why the timestamp
+            // is COALESCEd and why nothing is enqueued.
+            sqlx::query(
+                r#"
+                UPDATE groups
+                SET reseal_required_at = COALESCE(reseal_required_at, now())
+                WHERE id = $1
+                "#,
+            )
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // The mark goes on the epoch row because `groups.status` cannot
+            // hold it: `groups_status_check` admits only
+            // active|suspended|deprovisioned, while
+            // `group_key_epochs_status_check` admits active|rotating|retired.
+            // The group stays usable — `GroupKeyEpochRepository::get_current_epoch`
+            // treats `rotating` as current — so a removal records a debt
+            // rather than causing an outage.
+            sqlx::query(
+                r#"
+                UPDATE group_key_epochs
+                SET status = 'rotating'
+                WHERE group_id = $1 AND status = 'active'
+                "#,
+            )
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+
             RevokeOutcome::Revoked
         } else {
             // Zero rows: either no live membership at all, or the guard bit.
@@ -292,6 +364,44 @@ impl GroupMembershipRepository {
         .bind(group_id)
         .bind(agent_id)
         .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|r| r.0))
+    }
+
+    /// [`Self::get_member_role`] over a borrowed connection.
+    ///
+    /// Exists for `POST /api/v1/groups/:id/rotate`, whose whole body runs on
+    /// one `ScopedPool::begin_as` transaction: the handler must decide
+    /// authorization on the SAME stamped connection that performs the rotation,
+    /// and it must reach the raw application pool nowhere, because
+    /// `crates/epigraph-db/tests/no_unscoped_pool.rs` holds
+    /// `crates/epigraph-api/src/routes/groups.rs` at an exact site count with
+    /// no headroom above [`HIGH_WATER`](no_unscoped_pool).
+    ///
+    /// A sibling rather than a signature change on `get_member_role`: making
+    /// that function generic over `sqlx::PgExecutor` would move it into
+    /// `visibility_lint.rs`'s `EXECUTOR_WITHOUT_VIEWER` register and rewrite
+    /// two call sites this PR has no reason to touch.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn get_member_role_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"
+            SELECT role FROM group_memberships
+            WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(group_id)
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
         .await?;
 
         Ok(row.map(|r| r.0))
