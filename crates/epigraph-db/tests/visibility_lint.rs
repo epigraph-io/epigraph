@@ -701,6 +701,110 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          three FORCE-protected tables read back through a policy. Never a response body.",
     ),
     (
+        "privatization.rs",
+        "active_epoch_conn",
+        "READ of `group_key_epochs`, returning ONE integer and no ids. That table carries neither \
+         `visibility` nor `owner_group_id` — it is keyed on `group_id` and is not in migration \
+         062's tier_a array — so there is no predicate a Viewer could be spent on. Its tenancy \
+         backstop is migration 077 section 8's group_key_epochs policy, which selects on the \
+         CONNECTION. The group whose epoch it resolves is the plan's own `target_group_id`, which \
+         the caller has already been authorised against under FINAL-PLAN §6.6.",
+    ),
+    (
+        "privatization.rs",
+        "plan_contains_conn",
+        "READ of `privatization_plan_items`, projecting the INTERSECTION of a caller-supplied id \
+         list with a plan's frozen set — so it returns only ids the caller already named, and can \
+         disclose nothing the caller did not already hold. It is the check that a seal-commit \
+         names only claims an operator actually approved. `privatization_plan_items` has no \
+         `visibility` column; migration 087's read policy on the plan tables selects on the \
+         CONNECTION, and the caller has already been authorised for this plan under §6.6.",
+    ),
+    (
+        "privatization.rs",
+        "record_seal_audit_conn",
+        "WRITE, append-only, of `privatization_audit`, and the first writer of that table's \
+         `before_sealed` / `after_sealed` columns. It appends one row per entity inside the same \
+         transaction as the seal or unseal it attests to; there is no read whose result could \
+         widen. `privatization_audit` carries no `visibility` column and is gated on the READ side \
+         by migration 082's `privatization_audit_read` policy.",
+    ),
+    (
+        "privatization.rs",
+        "seal_tcb_shape_conn",
+        "READ of `claim_versions` and `evidence`, projecting IDS ONLY and no content. It answers \
+         the completeness question for FINAL-PLAN §6.5.6 — which rows a seal-commit must cover — \
+         and a viewer-filtered answer is the failure it exists to prevent: a shape narrowed to what \
+         the actor can read would declare a commit complete while a version row the actor cannot \
+         see keeps its plaintext. Its only caller has already been authorised under §6.6 for the \
+         plan whose frozen item set bounds the id list, and the ids reach a refusal message, never \
+         a content projection.",
+    ),
+    (
+        "privatization.rs",
+        "seal_claims_conn",
+        "WRITE, and the whole §6.5.4 mutation: it writes the three encryption tables and empties \
+         `claims`, `claim_versions`, `evidence` and `harvester_fragments` of plaintext. Every one \
+         of those tables is in migration 077's protected set, so the `WITH CHECK` on the \
+         maintenance connection is the control, not a read predicate. It is bounded to the ids its \
+         own first statement inserted, which is what makes the set that gains a ciphertext row and \
+         the set that loses its plaintext the same set.",
+    ),
+    (
+        "privatization.rs",
+        "unseal_manifest_page_conn",
+        "READ of `claim_encryption`, `claim_version_encryption` and `evidence_encryption`, which \
+         carry `group_id` but no `visibility`, and whose projection is CIPHERTEXT bound to a key \
+         the server does not hold. There is no plaintext for a predicate to protect. Their tenancy \
+         backstop is migration 077's `enc` policy loop, which selects on the CONNECTION; the \
+         authority for knowing WHICH claims are sealed is §6.6's, checked in the route.",
+    ),
+    (
+        "privatization.rs",
+        "unseal_claims_conn",
+        "WRITE, and the widest one in this module: it writes CLIENT-SUPPLIED plaintext into \
+         `claims`, `claim_versions` and `evidence`. The maintenance connection is why it can write \
+         at all, so 077's `WITH CHECK` is not the constraint on WHAT it writes and must not be \
+         cited as one. What bounds it is, in order: the caller proves every claim id is a frozen \
+         item of the plan whose target group §6.6 authorised the actor over; the head UPDATE \
+         additionally requires a `claim_encryption` row bound to THAT group, so a claim sealed \
+         under another group's key is unreachable; the version and evidence UPDATEs carry the \
+         parent claim id through the `unnest` and match on it, so a row id is addressable only \
+         through the claim it belongs to; and the ciphertext DELETEs are keyed on what was \
+         restored, so an incomplete commit strands a ciphertext row rather than destroying the \
+         only remaining copy of a plaintext. The server cannot check the plaintext it is handed — \
+         it holds no key — so these predicates are the whole of the protection.",
+    ),
+    (
+        "privatization.rs",
+        "unseal_tcb_shape_conn",
+        "READ of `claim_encryption`, `claim_version_encryption` and `evidence_encryption`, \
+         projecting IDS ONLY and no ciphertext, for claim ids the caller already named and only \
+         where the row is bound to the plan's target group. It answers the unseal-side cover \
+         question — which ciphertext rows a commit must account for — for a caller that has \
+         already passed §6.6 and plan membership. A scoped viewer has no predicate to contribute: \
+         there is no plaintext here and the group binding is an explicit argument rather than a \
+         viewer-derived one.",
+    ),
+    (
+        "privatization.rs",
+        "stale_epoch_seal_count_conn",
+        "READ of the three encryption tables and `group_key_epochs`, returning ONE integer and no \
+         ids. It answers §6.7 point 3's completion question — are any of this group's ciphertext \
+         rows still bound to a retired epoch — for a JOB HANDLER that has no requesting principal. \
+         A count narrowed to a viewer's own groups would answer zero for the operator who most \
+         needs the real number.",
+    ),
+    (
+        "privatization.rs",
+        "clear_reseal_required_conn",
+        "WRITE of one column on one `groups` row, and the ONLY writer of `reseal_required_at` back \
+         to NULL. `groups` carries no `visibility`; migration 077 section 7's groups_tenancy policy \
+         is its control and selects on the CONNECTION. Its single caller is the reseal job handler, \
+         which calls it only after `stale_epoch_seal_count_conn` has returned zero on the same \
+         transaction.",
+    ),
+    (
         "security_event.rs",
         "log_conn",
         "WRITE, append-only, of `security_events`. The connection is a parameter so the event and \

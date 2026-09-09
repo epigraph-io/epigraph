@@ -110,6 +110,12 @@ wiremock = "0.6"  # HTTP fixture for OAuth provider integration tests
 rsa = "0.9"  # RSA keypair fixture for OAuth tests
 pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
 toml = "0.8"  # provider config TOML parsing in tests
+# `tests/privatization_seal.rs` only. The seal ceremony is client-driven, so an
+# end-to-end route test has to play the client — pad, derive an epoch key, and
+# produce a field-tagged ciphertext exactly as `epigraph-privatize` does.
+# Hand-rolling those bytes would test this file's idea of the wire format
+# instead of the one the CLI writes.
+epigraph-privacy = { workspace = true }
 
 [[test]]
 name = "boot_secret_gate_test"

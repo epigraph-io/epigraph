@@ -454,3 +454,125 @@ skipped by a rotation would hold a share for a retired epoch and be unable to
 read anything written afterwards — an accidental removal dressed as a key
 change; two shares for one member are two answers to one question, which the
 server declines to resolve by picking the last.
+
+## `restrict` and `seal`: two privatization modes, one of them irreversible (PR-21)
+
+A D4 privatization plan runs in one of two modes, and the difference is not a
+setting — it is a different set of guarantees, a different cost, and a different
+answer to "can we undo this".
+
+### `restrict` is the default, and it is fully reversible
+
+`restrict` sets `visibility='group'` and `owner_group_id=<target>` and touches
+nothing else. `content` keeps its plaintext, `content_tsv` is untouched, and
+**the embedding is retained on purpose**.
+
+That last one looks like an oversight and is not. `content`, `content_tsv` and
+`embedding` are three columns of the **same row**, and row-level security is
+row-level: the predicate that hides one hides all three, atomically. Retaining
+the embedding therefore leaks nothing beyond what retaining `content` already
+leaks — and `restrict` retains `content` by definition. Dropping it would cost
+the owning group its own semantic recall and buy exactly zero confidentiality.
+
+Because nothing was destroyed, **`POST …/revert` puts everything back.** It
+walks the plan's items in the mirror order, restores each row's captured
+`before_visibility` / `before_owner_group_id`, and re-runs the boundary-edge
+meet. There is no re-derivation, no re-embedding, and no new code path — which
+is the single strongest argument for `restrict` being the default, and the
+reason it is said out loud here rather than left in a design document.
+
+`restrict` is right for roughly 95% of privatizations. The threat it does not
+cover — `pg_dump`, physical and logical replicas, filesystem backups, anyone
+with the database role — is a **hosting** problem, and hosting has answers for
+it that apply uniformly and cost less than per-row application cryptography.
+
+### `seal` is for data whose confidentiality must survive the operator
+
+`seal` is `restrict` **plus** client-side encryption: regulatory holds, NDA
+corpora, cross-tenant SaaS. The server never holds the key, so it can neither
+seal nor unseal; a key-holding admin drives the ceremony with
+`epigraph-privatize`, and the server stores ciphertext and enforces who may
+fetch the row that holds it.
+
+**The whole point of `seal` is that nothing derived from the plaintext is left
+behind.** That is a set, not a column, and the set is written out below so that
+a future change to any of these tables can be checked against it.
+
+#### The SEAL trusted computing base
+
+| Column | On seal | Restored by unseal |
+|---|---|---|
+| `claims.content` | → `'[sealed:x<id-without-hyphens>]'`; ciphertext to `claim_encryption.encrypted_content` | yes, from client plaintext |
+| `claims.content_hash` | → BLAKE3 over the **ciphertext** | yes, verified against the client plaintext |
+| `claims.content_tsv` | follows `content` — `GENERATED ALWAYS`, no code | yes, the same way |
+| `claims.embedding` | → `NULL` | via an enqueued `embedding_generation` job — a marker, not yet a restoration; see the gaps below |
+| `claims.embedding_3072` | → `NULL` | **not restored** — see the gap below |
+| `claims.labels` | → `ARRAY[]::text[]`; ciphertext to `claim_encryption.encrypted_labels` | yes |
+| `claims.properties` | → `'{}'::jsonb`; ciphertext to `claim_encryption.encrypted_properties` | yes |
+| `claim_versions.content` | → sentinel; ciphertext to `claim_version_encryption` | yes |
+| `evidence.raw_content` | → `'[sealed]'`; ciphertext to `evidence_encryption` | yes |
+| `evidence.embedding`, `evidence.embedding_3072` | → `NULL` | **not restored** — see the gap below |
+| `evidence.properties` | → `'{}'`; ciphertext to `evidence_encryption.encrypted_properties` | yes |
+| `triples`, `entity_mentions`, `experiment_entity_mentions`, `reasoning_traces`, `challenges`, `experiment_triples` | rows **DELETED** | **no** — re-extraction is a separate, explicit operation |
+| `harvester_fragments.content_text`, `.context_window` | blanked, including a fragment cited by claims outside the plan | **no, and not recoverable** — the fragment text *is* the source |
+
+Deleting the derived extractions rather than encrypting them is deliberate: they
+are re-derivable from the plaintext, and encrypting each one would multiply the
+key ceremony by a table shape apiece for no confidentiality gain. The preview's
+`side_effects` block names every one of them before an admin clicks.
+
+A commit that covers only part of that set is **refused, not partially
+applied**. A partial seal is worse than none: it reports success while the
+plaintext is one `pg_dump` away.
+
+#### What `seal` costs
+
+- **No semantic recall inside the group.** The vector is gone and the server
+  cannot recompute it. This is a real product cost, taken deliberately.
+- **The extractions are gone**, and `harvester_fragments` source text is gone
+  for good. A fragment is one row and can be cited by several claims, so a
+  fragment shared with a claim OUTSIDE the plan is blanked for that claim too.
+  The alternative — skipping shared fragments — would leave the sealed claim's
+  own source text readable, which is the direction a seal exists to prevent. The
+  preview's `unrecoverable` line states the over-reach before the admin clicks.
+- **It is not server-reversible.** Only a key holder can unseal, and a `seal`
+  plan cannot be reverted to `public` until every one of its items has been
+  unsealed. A sealed claim can never be declassified: the database refuses it
+  with `42501` and there is no override.
+- **Ciphertext length is padded, not hidden.** `pad_to` buckets the stored
+  length so a one-byte and a two-hundred-byte plaintext are indistinguishable at
+  `pad_to=256`; a nine-kilobyte one is still distinguishable from both.
+
+#### Rotation does not re-seal, and re-sealing is a ceremony
+
+As the previous section says, rotating a group key does not re-encrypt anything.
+Every `claim_encryption` row stays bound to the epoch it was sealed under, and
+`groups.reseal_required_at` is set on member removal to say so. Clearing it
+requires a key holder to run `epigraph-privatize reseal`, which unseals under the
+retiring epoch's key and re-seals under the new one. The server marks and
+measures; it cannot complete the ceremony, and a job that could only ever fail
+is deliberately not built.
+
+#### Three known gaps in what unseal restores, stated rather than left to be found
+
+Unseal enqueues one `embedding_generation` job per restored **claim**. Three
+things that does not amount to:
+
+- **No handler drains that queue.** `crates/epigraph-api/src/bin/server.rs`
+  registers five job handlers and none of them is an embedding handler, so today
+  the enqueued job is a MARKER of what is owed rather than a restoration. The
+  actual recovery path after an unseal is `epigraph-cli reembed`. This is also
+  why the CLAUDE.md audit clause that hides an unseal-in-flight from
+  `live_missing` is bounded to 24 hours: without the bound an unsealed claim
+  would be hidden from the audit forever, and a non-zero count of
+  `embedding_generation` jobs older than the bound is itself the signal that a
+  handler is needed.
+- **It does not name an evidence row.** The job payload carries a claim id and
+  there is no evidence-shaped variant, so an unsealed evidence row keeps NULL
+  vectors until a backfill reaches it.
+- **It does not restore `embedding_3072` on either table.** That column is
+  written by `epigraph-cli reembed`, which is a separate operation from the job.
+
+All three are functional gaps and none is a confidentiality one — the seal nulled
+the vectors, which is the safe direction. An operator who wants full recall back
+after an unseal runs `epigraph-cli reembed`.

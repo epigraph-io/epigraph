@@ -15,7 +15,9 @@ use epigraph_api::{create_router, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
     cluster_graph::ClusterGraphHandler,
-    privatization::{PrivatizationApplyHandler, PrivatizationRevertHandler},
+    privatization::{
+        PrivatizationApplyHandler, PrivatizationResealHandler, PrivatizationRevertHandler,
+    },
     theme_cluster_rebuild::ThemeClusterRebuildHandler,
     JobQueue, JobRunner, PostgresJobQueue,
 };
@@ -620,6 +622,14 @@ async fn main() {
             &job_scoped,
         ))));
         runner.register_handler(Arc::new(PrivatizationRevertHandler::new(Arc::clone(
+            &job_scoped,
+        ))));
+        // The third handler (§6.7 point 3). It is the ONLY thing that may clear
+        // `groups.reseal_required_at`, so an unregistered one leaves every
+        // rotated group flagged forever and the
+        // `epigraph_groups_reseal_required` gauge climbing with nothing able to
+        // bring it down.
+        runner.register_handler(Arc::new(PrivatizationResealHandler::new(Arc::clone(
             &job_scoped,
         ))));
 

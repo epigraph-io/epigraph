@@ -53,4 +53,13 @@ pub enum PrivacyError {
     /// An underlying cryptographic operation failed.
     #[error("Crypto error: {0}")]
     Crypto(#[from] epigraph_crypto::CryptoError),
+
+    /// A length-padding operation could not be performed or undone.
+    ///
+    /// Raised by [`crate::padding`] only. It is separate from
+    /// [`Self::Crypto`] because the two fail for opposite reasons: a crypto
+    /// error means the bytes were not authentic, and a padding error means they
+    /// were authentic and were shaped by a different scheme.
+    #[error("Padding error: {reason}")]
+    Padding { reason: String },
 }

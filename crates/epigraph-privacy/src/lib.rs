@@ -30,15 +30,22 @@
 //!
 //! # Padding
 //!
-//! Ciphertext length leaks plaintext length. The remedy is applied by the
-//! caller: [`encryptor::encrypt_content`] takes already-padded bytes and
-//! returns them unchanged on decrypt. This crate neither pads nor unpads.
+//! Ciphertext length leaks plaintext length. [`encryptor::encrypt_content`]
+//! still takes already-padded bytes and returns them unchanged on decrypt — the
+//! encryptor is deliberately ignorant of the scheme. **PR-19's module doc said
+//! this crate "neither pads nor unpads"; PR-21 adds [`padding`], and the
+//! separation it described is preserved rather than dropped**: padding is a
+//! sibling module the caller composes, not a step the encryptor performs, so a
+//! caller with its own scheme still passes bytes straight through.
 
 pub mod encryptor;
 pub mod errors;
 pub mod group;
+pub mod padding;
 pub mod rewrap;
 pub mod tier;
+
+pub use padding::{pad, stored_len, unpad, PAD_BUCKETS, PAYLOAD_OVERHEAD};
 
 pub use encryptor::{
     decrypt_claim_content, decrypt_content, decrypt_edge_properties, decrypt_evidence_content,
