@@ -162,12 +162,19 @@
 //! `epigraph_bypass()` is true, the policy admits every row, and the read
 //! becomes the cross-tenant oracle §6.5.2 documents.
 //!
-//! UPDATE and DELETE on both tables remain uncovered by any policy and remain
-//! registered in `rls_enforcement.rs::DELIBERATELY_UNCOVERED`. Approving a plan
-//! is an UPDATE, so nothing here approves, applies or reverts one.
+//! Migration **088** adds the UPDATE policies — bypass-only on both `USING` and
+//! `WITH CHECK` — and the two matching rows are deleted from
+//! `rls_enforcement.rs::DELIBERATELY_UNCOVERED` in the same commit, because that
+//! register is exact in both directions. DELETE stays uncovered on both tables
+//! and stays registered: a plan is the record that a privatization was attempted
+//! and is never deleted.
 //!
-//! Nothing here mutates `claims.visibility`, `claims.owner_group_id`, or any
-//! other tenancy column. Applying a plan is a separate, later surface.
+//! So this module DOES now mutate `claims.visibility` and
+//! `claims.owner_group_id` — see "Apply / revert" below. Everything above the
+//! `APPLY / REVERT` banner is still read-only; everything below it runs on the
+//! MAINTENANCE connection, is unreachable from the app role, and is NOT where
+//! the authorization lives. FINAL-PLAN §6.5.5's re-validation in
+//! `epigraph-jobs/src/privatization.rs` is.
 //!
 //! # The two passes are now distinguishable BY TYPE
 //!
@@ -462,6 +469,19 @@ pub const MAX_BOUNDARY_EDGE_SAMPLE: i64 = 1000;
 /// TTL, migration 080 has no column for it, and 080 is applied and frozen. The
 /// value is therefore derived by the serialising layer from `created_at`, and
 /// naming it here as if it were stored would be the drift this series refuses.
+///
+/// # The apply-time columns are here, and they are the LIVE PROGRESS half
+///
+/// `approved_by`, `approved_at`, `dispatched_by`, `cursor_depth` and
+/// `drift_ids` were absent while nothing could write them. They are added by the
+/// slice that makes them move, which is what `F-PR18b-preview-schema-is-a-subset`
+/// assigns here: §6.5.7 gives `GET /plans/:id` "preview + live progress", and
+/// live progress IS the cursor and the per-item state.
+///
+/// `drift_ids` is exposed as a COUNT and not as the array. The ids are claim
+/// ids that a reader of this row may not be entitled to read — administering a
+/// plan's target group is not the same property as being able to read every
+/// claim the drift rescan found — and this struct crosses no viewer.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PlanRow {
     /// The plan's id.
@@ -486,9 +506,33 @@ pub struct PlanRow {
     pub pad_to: i32,
     /// The agent that created the plan.
     pub created_by: Uuid,
+    /// The second instance admin that approved it, if any.
+    pub approved_by: Option<Uuid>,
+    /// When the approval was given.
+    pub approved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The agent whose `apply` flipped the plan to `applying`.
+    pub dispatched_by: Option<Uuid>,
+    /// The depth band the last committed batch reached. Apply walks deepest
+    /// first, so this DESCENDS as the job progresses.
+    pub cursor_depth: Option<i32>,
+    /// How many restatement-tier drifts the post-apply rescan found. A COUNT;
+    /// see the type's doc for why the ids do not travel on this struct.
+    pub drift_count: i64,
     /// When the plan was created. The TTL is measured from here.
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// The columns of `privatization_plans` the projection above serves, spelled
+/// once so `load_plan_conn`, `list_plans_conn` and the `FOR UPDATE` re-read
+/// cannot drift apart.
+///
+/// `drift_ids` is projected as `cardinality(...)`, which is what makes the array
+/// itself unable to leave the database through this struct.
+const PLAN_ROW_COLUMNS: &str = "p.id, p.state, p.mode, p.target_group_id, p.plan_digest, \
+     p.item_count, p.authors_losing_count, p.acknowledge_author_loss, \
+     p.on_conflict, p.pad_to, p.created_by, p.approved_by, p.approved_at, \
+     p.dispatched_by, p.cursor_depth, \
+     cardinality(p.drift_ids)::bigint AS drift_count, p.created_at";
 
 /// One row of a plan's frozen item set.
 ///
@@ -509,6 +553,214 @@ pub struct PlanItemRow {
     pub via: Option<String>,
     /// `pending`|`applied`|`skipped`|`failed`|`reverted`.
     pub state: String,
+}
+
+/// One locked row of a plan's remaining work, as the apply/revert batch sees it.
+///
+/// Distinct from [`PlanItemRow`], which is the READ-surface projection and
+/// carries `via` and `state` for rendering. This one carries the `before_*`
+/// tenancy the revert restores and omits everything the batch does not need, so
+/// a batch of 50 does not materialise 50 rendering strings.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PlanWorkItem {
+    /// `claim` or `evidence`. Every item this build produces is a `claim`.
+    pub kind: String,
+    /// The selected entity.
+    pub entity_id: Uuid,
+    /// Hops from the nearest seed. The batch order's primary key.
+    pub depth: i32,
+    /// The visibility captured at freeze time; what a revert restores.
+    pub before_visibility: String,
+    /// The owning group captured at freeze time.
+    pub before_owner_group_id: Uuid,
+}
+
+/// A state transition [`PrivatizationRepository::transition_plan_conn`] performs.
+///
+/// An enum rather than four functions, so the guard conditions that make each
+/// transition safe live in ONE statement each and next to each other. See that
+/// function's doc for what is checked here and what is checked by 080's
+/// `pp_four_eyes` CHECK and 081's approver guard.
+#[derive(Debug, Clone, Copy)]
+pub enum PlanTransition<'a> {
+    /// The second instance admin approves. Refused unless the plan is
+    /// `previewed` and carries no approver yet.
+    Approve {
+        /// The approving agent. Never `created_by` — `pp_four_eyes` is what
+        /// makes that true rather than this type.
+        approver: Uuid,
+    },
+    /// The HTTP layer flips the plan into a running state and hands it to the
+    /// queue. The cursor is cleared, because a re-dispatch restarts the walk
+    /// from the item states rather than from a stale position.
+    Dispatch {
+        /// The agent whose `apply` or `revert` this is.
+        dispatched_by: Uuid,
+        /// `applying` or `reverting`.
+        to_state: &'a str,
+        /// The states this transition is legal from. A plan in any other state
+        /// is untouched and the caller sees a zero row count.
+        from_states: &'a [String],
+    },
+    /// The handler records the last committed batch's position.
+    Cursor {
+        /// `claim` or `evidence`.
+        kind: &'a str,
+        /// The depth band the batch ended in.
+        depth: i32,
+        /// The last entity in the batch's total order.
+        id: Uuid,
+    },
+    /// The handler records the post-apply rescan's answer, and NOTHING else.
+    ///
+    /// Separate from [`Self::Finish`] on purpose. The rescan runs while the plan
+    /// is still `applying`, and an arm that wrote `state` as well would have to
+    /// name the state the plan is already in — which is an unconditional write
+    /// of `applying` that would resurrect a plan an operator aborted a moment
+    /// earlier.
+    Drift {
+        /// The restatement-tier ids the rescan found.
+        ids: &'a [Uuid],
+    },
+    /// The handler records a terminal state.
+    ///
+    /// CONDITIONAL on the state it expects to find, for the same reason
+    /// [`Self::Dispatch`] is: `POST …/abort` can commit between the last batch
+    /// and this write, and a terminal state written over `failed` undoes the
+    /// operator's decision one statement later.
+    Finish {
+        /// `applied`|`applied_with_drift`|`failed`|`reverted`.
+        state: &'a str,
+        /// The states this transition is legal from. An empty slice means
+        /// unconditional, which is what `abort` itself uses.
+        from_states: &'a [String],
+    },
+}
+
+/// One PLAN-level `privatization_audit` row.
+///
+/// The item-level rows are written set-based by
+/// [`PrivatizationRepository::record_item_audit_conn`], which reads the
+/// before/after tenancy out of the database rather than taking it as an
+/// argument; this shape is for the events that describe the PLAN — creation,
+/// approval, dispatch, abort, drift — where there is no entity tenancy to
+/// record.
+#[derive(Debug, Clone, Copy)]
+pub struct PlanAuditEntry<'a> {
+    /// The plan this row describes.
+    pub plan_id: Uuid,
+    /// The agent the action is attributed to.
+    pub actor_agent_id: Uuid,
+    /// `plan.create`|`plan.approve`|`plan.dispatch`|`plan.abort`|`plan.drift`.
+    pub action: &'a str,
+    /// `claim` or `evidence` when the row is about one entity.
+    pub kind: Option<&'a str>,
+    /// The entity, for `plan.drift`.
+    pub entity_id: Option<Uuid>,
+    /// The digest the action was taken against.
+    pub plan_digest: Option<&'a [u8]>,
+    /// Matches `security_events.correlation_id` for the same request.
+    pub correlation_id: Option<&'a str>,
+}
+
+/// Which way a per-item audit row is read off the two tables.
+///
+/// `privatization_plan_items.before_visibility` is written ONCE, by
+/// [`UnfilteredSelection::freeze_into`], and nothing mutates it — it is the
+/// pre-APPLY image for the whole life of the plan. So the same projection cannot
+/// serve both directions: on revert it is the value the restore is writing, not
+/// the value the row is coming from, and a row that recorded it in the `before`
+/// column would say `public -> public` about an operation that went
+/// `group -> public`. That is a wrong value on a shipped read surface —
+/// `GET /admin/privatization/audit` serves both columns verbatim — and the audit
+/// trail is what D4 leans on for after-the-fact accountability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemAuditDirection {
+    /// Written AFTER the tenancy write. `before` is the frozen pre-apply pair,
+    /// `after` is the row as it now stands.
+    Apply,
+    /// Written BEFORE the tenancy write. `before` is the row as it stands — the
+    /// tenancy the apply gave it — and `after` is the frozen pre-apply pair the
+    /// restore is about to write back.
+    ///
+    /// It carries the same stamp predicate as
+    /// [`PrivatizationRepository::restore_claims_conn`], so the set of rows
+    /// audited and the set of rows moved are the same set by construction rather
+    /// than by the two statements happening to agree.
+    Revert,
+}
+
+/// One batch of per-item audit rows.
+///
+/// A struct rather than eight positional parameters, on the
+/// [`PlanAuditEntry`] precedent: `plan_id`, `actor_agent_id` and
+/// `target_group_id` are all `Uuid` and all three have been transposed at least
+/// once in review.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemAuditBatch<'a> {
+    /// The plan whose items these are.
+    pub plan_id: Uuid,
+    /// The agent the batch is attributed to.
+    pub actor_agent_id: Uuid,
+    /// `item.apply` or `item.revert`.
+    pub action: &'a str,
+    /// The entities in this batch.
+    pub entity_ids: &'a [Uuid],
+    /// Matches `security_events.correlation_id` for the dispatching request.
+    pub correlation_id: Option<&'a str>,
+    /// Which projection, and therefore which side of the tenancy write.
+    pub direction: ItemAuditDirection,
+    /// The plan's target group. Used by [`ItemAuditDirection::Revert`]'s stamp
+    /// predicate; ignored on apply.
+    pub target_group_id: Uuid,
+}
+
+/// Filters for `GET /admin/privatization/audit`.
+///
+/// There is deliberately no `actor_agent_id` filter and no free-text search: the
+/// scoping that matters is migration 083's policy, and a filter the policy does
+/// not narrow invites a caller to believe the absence of rows is an answer about
+/// the corpus rather than about their own authority.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuditQuery {
+    /// Restrict to one plan.
+    pub plan_id: Option<Uuid>,
+    /// Restrict to one entity.
+    pub entity_id: Option<Uuid>,
+    /// Only rows at or after this instant.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Page size. The caller clamps.
+    pub limit: i64,
+}
+
+/// One `privatization_audit` row, as 083's policy admits it.
+///
+/// `before_owner_group_id` / `after_owner_group_id` are NOT projected. They are
+/// group ids rather than claim ids, so they are a smaller disclosure than
+/// `entity_id`, but they are also not part of any acceptance clause and this
+/// surface is the one §6.5.8 calls the most sensitive read in the system.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuditRow {
+    /// The audit row's own id.
+    pub id: i64,
+    /// The plan.
+    pub plan_id: Uuid,
+    /// Who did it.
+    pub actor_agent_id: Uuid,
+    /// What they did.
+    pub action: String,
+    /// `claim`|`evidence`, when the row is about one entity.
+    pub kind: Option<String>,
+    /// The entity. Present only where 083's policy admitted the entity arm.
+    pub entity_id: Option<Uuid>,
+    /// Tenancy before the action.
+    pub before_visibility: Option<String>,
+    /// Tenancy after the action.
+    pub after_visibility: Option<String>,
+    /// Matches the `security_events` row for the same request.
+    pub correlation_id: Option<String>,
+    /// When.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Everything [`PrivatizationRepository::create_previewed_plan`] writes.
@@ -1411,15 +1663,11 @@ impl PrivatizationRepository {
         conn: &mut PgConnection,
         plan_id: Uuid,
     ) -> Result<Option<PlanRow>, DbError> {
-        sqlx::query_as::<_, PlanRow>(
-            r#"
-            SELECT p.id, p.state, p.mode, p.target_group_id, p.plan_digest,
-                   p.item_count, p.authors_losing_count, p.acknowledge_author_loss,
-                   p.on_conflict, p.pad_to, p.created_by, p.created_at
-              FROM public.privatization_plans p
-             WHERE p.id = $1
-            "#,
-        )
+        sqlx::query_as::<_, PlanRow>(&format!(
+            "SELECT {PLAN_ROW_COLUMNS}
+               FROM public.privatization_plans p
+              WHERE p.id = $1"
+        ))
         .bind(plan_id)
         .fetch_optional(&mut *conn)
         .await
@@ -1467,11 +1715,9 @@ impl PrivatizationRepository {
         target_group_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<PlanRow>, DbError> {
-        sqlx::query_as::<_, PlanRow>(
+        sqlx::query_as::<_, PlanRow>(&format!(
             r#"
-            SELECT p.id, p.state, p.mode, p.target_group_id, p.plan_digest,
-                   p.item_count, p.authors_losing_count, p.acknowledge_author_loss,
-                   p.on_conflict, p.pad_to, p.created_by, p.created_at
+            SELECT {PLAN_ROW_COLUMNS}
               FROM public.privatization_plans p
              WHERE ($1::text IS NULL OR p.state = $1)
                AND ($2::uuid IS NULL OR p.target_group_id = $2)
@@ -1480,8 +1726,8 @@ impl PrivatizationRepository {
                AND public.epigraph_is_group_admin(p.target_group_id)
              ORDER BY p.created_at DESC, p.id
              LIMIT $3
-            "#,
-        )
+            "#
+        ))
         .bind(state)
         .bind(target_group_id)
         .bind(limit)
@@ -1512,12 +1758,20 @@ impl PrivatizationRepository {
     /// page must never be named.
     ///
     /// An offset is safe here for a reason specific to this table rather than as
-    /// a general preference: the item set is FROZEN at plan creation, both plan
-    /// tables have no UPDATE and no DELETE policy under `FORCE`, and the
-    /// cardinality is already disclosed to this same caller as
+    /// a general preference: the item set is FROZEN at plan creation, this table
+    /// has no DELETE policy under `FORCE` and its only INSERT is the freeze, and
+    /// the cardinality is already disclosed to this same caller as
     /// `privatization_plans.item_count`. So the set cannot shift under a reader,
     /// there is no skipped-row hazard, and the offset discloses nothing the plan
     /// row did not.
+    ///
+    /// **Migration 088 adds an UPDATE policy and the argument survives it,
+    /// deliberately checked rather than assumed.** What 088 lets the apply
+    /// handler move is `state`, `applied_at` and `error`. The `ORDER BY` is
+    /// `(kind, entity_id)`, neither of which is writable by any policy, so a
+    /// concurrent apply changes what a page SAYS and never which rows are on it.
+    /// A keyset over `state` would not have that property, which is a second
+    /// reason not to reintroduce one.
     ///
     /// A negative `offset` is a Postgres error, so the CALLER must reject one
     /// before it reaches here; `routes/privatization.rs::parse_cursor` does.
@@ -1554,19 +1808,24 @@ impl PrivatizationRepository {
     /// # Why the row is inserted already `previewed`, and not updated into it
     ///
     /// The natural shape — INSERT `state='selecting'`, run the selection, UPDATE
-    /// the digest and counts and move to `previewed` — **cannot work**, and the
-    /// reason is a control rather than an inconvenience. Both plan tables are
-    /// `FORCE ROW LEVEL SECURITY` and migration 087 covers SELECT and INSERT
-    /// only; under FORCE an uncovered command is denied to EVERY role, bypass
-    /// included, so that UPDATE fails with `new row violates row-level security
-    /// policy` no matter which connection issues it. `DELIBERATELY_UNCOVERED`
-    /// assigns `(privatization_plans, UPDATE)` to the apply/revert slice, and
-    /// this slice does not take it.
+    /// the digest and counts and move to `previewed` — was IMPOSSIBLE when this
+    /// function was written: migration 087 covered SELECT and INSERT only, and
+    /// under `FORCE` an uncovered command is denied to EVERY role, bypass
+    /// included.
     ///
-    /// So the selection runs FIRST and the plan row is written once, with its
-    /// digest, its counts and its terminal-for-this-slice state already in it.
-    /// Nothing here ever needs to mutate a plan, which is also why this slice
-    /// ships no `approve`: approving is an UPDATE.
+    /// **Migration 088 has since added the UPDATE policy, so the shape is now
+    /// merely wrong rather than impossible, and the argument for writing the row
+    /// COMPLETE is worth restating because the mechanical obstacle is gone.**
+    /// `plan_digest` and `item_count` describe the frozen set. A row that exists
+    /// with a placeholder digest is a row another connection can read — 087's
+    /// SELECT policy admits it the instant it commits — and a `previewed` plan
+    /// whose digest does not describe its items is exactly what
+    /// `apply`'s staleness check exists to refuse. Writing it once, after the
+    /// selection, means that window never opens.
+    ///
+    /// The `approve`/`apply`/`abort`/`revert` transitions are
+    /// [`Self::transition_plan_conn`]'s, and each is conditional on the state it
+    /// expects to find for the same reason.
     ///
     /// 087's INSERT arm is `epigraph_bypass()` only, and 080 REVOKEs INSERT on
     /// this table from `epigraph_app`, so this cannot succeed anywhere else.
@@ -1612,6 +1871,1148 @@ impl PrivatizationRepository {
         .fetch_one(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    // =====================================================================
+    // APPLY / REVERT — the plan state machine, and the batch mutation.
+    //
+    // Everything below runs on the MAINTENANCE connection and is unreachable
+    // from any other. Two independent reasons, and both are load-bearing:
+    //
+    //   * migration 080 REVOKEs INSERT, UPDATE and DELETE on both plan tables
+    //     FROM `epigraph_app`, and
+    //   * migration 088's UPDATE policies on both tables have a single
+    //     `epigraph_bypass()` / `epigraph_definer_bypass()` disjunct.
+    //
+    // AND NONE OF THAT IS THE AUTHORIZATION. On this connection
+    // `epigraph_bypass()` is true, so every RLS `WITH CHECK`, the
+    // `writable_groups` gate and 074's declassification guard are things this
+    // code can satisfy at will. FINAL-PLAN §6.5.5's re-validation in the job
+    // handler is what decides whether a plan may move, and these functions are
+    // the primitives it decides WITH. A caller that skips the re-validation and
+    // calls `transition_plan_conn` directly gets an unapproved, stale-digest
+    // privatization with no error — which is why the handler carries the
+    // re-read `FOR UPDATE` and this module carries none of it.
+    //
+    // NAMED `*_conn` TO THE LAST ONE. `visibility_lint.rs`'s conn lint selects
+    // on the SUFFIX, so a viewer-less connection-taking repo function called
+    // anything else is invisible to it, to the viewer-spending lint and to the
+    // executor lint at once. Each is enumerated in `CONN_WITHOUT_VIEWER` with
+    // its reason.
+    // =====================================================================
+
+    /// Re-read a plan `FOR UPDATE`, for the handler's re-validation.
+    ///
+    /// The row lock is the point: FINAL-PLAN §6.5.5 requires the six conditions
+    /// to be checked against a row nothing else can move between the check and
+    /// the state flip. `FOR UPDATE` and not `FOR NO KEY UPDATE`, because the
+    /// flip that follows is an UPDATE of `state`.
+    ///
+    /// Returns `None` when no such plan exists. On a stamped app connection it
+    /// would also return `None` for a plan 087's SELECT policy hides, which is
+    /// why this must be given the maintenance connection: a handler that read a
+    /// filtered `None` would abort a legitimate plan.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault, including `55P03 lock_not_available` when
+    /// the caller has set a `lock_timeout` and another transaction holds the row.
+    pub async fn load_plan_for_update_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+    ) -> Result<Option<PlanRow>, DbError> {
+        sqlx::query_as::<_, PlanRow>(&format!(
+            "SELECT {PLAN_ROW_COLUMNS}
+               FROM public.privatization_plans p
+              WHERE p.id = $1
+                FOR UPDATE"
+        ))
+        .bind(plan_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Move a plan through its state machine.
+    ///
+    /// One function rather than five, because all five arms are the same
+    /// decision — "this plan may now be in that state" — and splitting them
+    /// spreads the guard conditions over five `WHERE` clauses that then drift.
+    /// Every arm is CONDITIONAL on the state it expects to find, and returns the
+    /// affected row count so the caller can tell "moved" from "someone else
+    /// moved it first" without a second read.
+    ///
+    /// # The guards live in the `WHERE`, not in the caller
+    ///
+    /// [`PlanTransition::Approve`] refuses a plan that is not `previewed` or
+    /// that already carries an approver, so a double approval is a zero row
+    /// count rather than a silent overwrite of the first approver's identity.
+    /// [`PlanTransition::Dispatch`] refuses any state outside `from_states`, so
+    /// two concurrent `apply` calls cannot both flip a plan to `applying` and
+    /// enqueue two jobs against it.
+    ///
+    /// # What this does NOT check
+    ///
+    /// The four-eyes rule and the approver's group-admin status. Those are
+    /// migration 080's `pp_four_eyes` CHECK and 081's
+    /// `epigraph_privatization_approver_guard`, which bind this connection too —
+    /// a trigger and a constraint are not RLS and `epigraph_bypass()` does not
+    /// reach them. The route checks them first so the refusal carries a reason;
+    /// the database is what makes the refusal true.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault, including `23514` from `pp_four_eyes` and
+    /// `42501` from the approver guard.
+    pub async fn transition_plan_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        transition: PlanTransition<'_>,
+    ) -> Result<u64, DbError> {
+        let result = match transition {
+            PlanTransition::Approve { approver } => {
+                sqlx::query(
+                    r#"
+                    UPDATE public.privatization_plans
+                       SET approved_by = $2, approved_at = now(),
+                           state = 'approved', updated_at = now()
+                     WHERE id = $1 AND state = 'previewed' AND approved_by IS NULL
+                    "#,
+                )
+                .bind(plan_id)
+                .bind(approver)
+                .execute(&mut *conn)
+                .await
+            }
+            PlanTransition::Dispatch {
+                dispatched_by,
+                to_state,
+                from_states,
+            } => {
+                sqlx::query(
+                    r#"
+                    UPDATE public.privatization_plans
+                       SET state = $3, dispatched_by = $2,
+                           cursor_kind = NULL, cursor_depth = NULL, cursor_id = NULL,
+                           updated_at = now()
+                     WHERE id = $1 AND state = ANY($4)
+                    "#,
+                )
+                .bind(plan_id)
+                .bind(dispatched_by)
+                .bind(to_state)
+                .bind(from_states)
+                .execute(&mut *conn)
+                .await
+            }
+            PlanTransition::Cursor { kind, depth, id } => {
+                sqlx::query(
+                    r#"
+                    UPDATE public.privatization_plans
+                       SET cursor_kind = $2, cursor_depth = $3, cursor_id = $4,
+                           updated_at = now()
+                     WHERE id = $1
+                    "#,
+                )
+                .bind(plan_id)
+                .bind(kind)
+                .bind(depth)
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+            }
+            PlanTransition::Drift { ids } => {
+                sqlx::query(
+                    r#"
+                    UPDATE public.privatization_plans
+                       SET drift_ids = $2, updated_at = now()
+                     WHERE id = $1
+                    "#,
+                )
+                .bind(plan_id)
+                .bind(ids)
+                .execute(&mut *conn)
+                .await
+            }
+            PlanTransition::Finish { state, from_states } => {
+                sqlx::query(
+                    r#"
+                    UPDATE public.privatization_plans
+                       SET state = $2, updated_at = now()
+                     WHERE id = $1
+                       AND (cardinality($3::text[]) = 0 OR state = ANY($3))
+                    "#,
+                )
+                .bind(plan_id)
+                .bind(state)
+                .bind(from_states)
+                .execute(&mut *conn)
+                .await
+            }
+        };
+        result
+            .map(|r| r.rows_affected())
+            .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Recompute the plan digest FROM THE FROZEN ITEMS, at dispatch time.
+    ///
+    /// FINAL-PLAN §6.5.5 is explicit that the handler compares the stored
+    /// `plan_digest` against "a digest recomputed from `privatization_plan_items`
+    /// at dispatch time" rather than trusting the stored value. Reading the
+    /// stored value twice and comparing it with itself is the shape that passes
+    /// a test and checks nothing.
+    ///
+    /// The ordering here does not matter: [`Self::plan_digest`] sorts and
+    /// dedupes, so the digest is a property of the SET.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn frozen_digest_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+    ) -> Result<[u8; 32], DbError> {
+        let rows = sqlx::query_as::<_, (String, Uuid)>(
+            r#"
+            SELECT i.kind, i.entity_id
+              FROM public.privatization_plan_items i
+             WHERE i.plan_id = $1
+            "#,
+        )
+        .bind(plan_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        Ok(Self::plan_digest(&rows))
+    }
+
+    /// Is `agent_id` a LIVE `role='admin'` member of `group_id`?
+    ///
+    /// FINAL-PLAN §6.5.5 requires this to be re-checked at dispatch, "because
+    /// membership can be revoked between approve and dispatch". Migration 081's
+    /// approver guard enforces it on the approving UPDATE and cannot enforce it
+    /// afterwards; this is the dispatch-time half.
+    ///
+    /// Written as a direct `group_memberships` read rather than through
+    /// `epigraph_is_group_admin`, whose `EXECUTE` is granted to
+    /// `epigraph_maintenance` alone and which reads the SESSION principal rather
+    /// than an argument — the question here is about the APPROVER, who is not
+    /// the session principal on a job connection.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn is_live_group_admin_conn(
+        conn: &mut PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM public.group_memberships m
+                 WHERE m.group_id = $1
+                   AND m.agent_id = $2
+                   AND m.role = 'admin'
+                   AND m.revoked_at IS NULL)
+            "#,
+        )
+        .bind(group_id)
+        .bind(agent_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Take the ONE global privatization advisory lock and bound the batch.
+    ///
+    /// # Why one global lock and not one per plan (ops F12)
+    ///
+    /// `privatization_one_active_per_group` is unique on `target_group_id`, so
+    /// two plans against DIFFERENT groups can be in flight at once and can touch
+    /// the same boundary `edges` rows in opposite orders. `ClaimRepository::consolidate`
+    /// independently takes `SELECT … FROM claims … FOR UPDATE` and then rewrites
+    /// the edge set — the opposite lock order to this batch. Deepest-first
+    /// guarantees the downward-closure invariant, not lock order. FINAL-PLAN
+    /// §6.5.5's fix is one global lock, and there is no stated need for
+    /// concurrent plans.
+    ///
+    /// `pg_advisory_xact_lock` and not the session form: the lock must be
+    /// released by the COMMIT that ends the batch, including the commit that
+    /// happens when a `kill -9` closes the connection.
+    ///
+    /// # The two `SET LOCAL` bounds
+    ///
+    /// `lock_timeout = '3s'` and `statement_timeout = '60s'`, both from
+    /// §6.5.5's ops-F11 correction. They are `LOCAL`, so they end with the
+    /// transaction rather than outliving it on a pooled connection — the hazard
+    /// [`Self::select`]'s doc records at length for the session-scope spelling.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault. A `55P03` here means another privatization
+    /// batch holds the lock, which is a retry rather than a refusal.
+    pub async fn begin_batch_conn(conn: &mut PgConnection) -> Result<(), DbError> {
+        // ORDER MATTERS. `lock_timeout` is set BEFORE the advisory lock is
+        // taken, or the very first thing this function does is an unbounded
+        // wait — which is the wait the bound exists for.
+        for statement in [
+            "SET LOCAL lock_timeout = '3s'",
+            "SET LOCAL statement_timeout = '60s'",
+            "SELECT pg_advisory_xact_lock(hashtext('epigraph.privatization'))",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *conn)
+                .await
+                .map_err(|source| DbError::QueryFailed { source })?;
+        }
+        Ok(())
+    }
+
+    /// One batch of a plan's remaining work, LOCKED.
+    ///
+    /// # `FOR UPDATE`, never `SKIP LOCKED`
+    ///
+    /// FINAL-PLAN §6.5.5 says so in those words, and the reason is that every
+    /// item must be processed exactly once. `SKIP LOCKED` would silently leave
+    /// a contended item `pending` while the plan advanced to `applied`, which is
+    /// a privatization that reports success over a public claim.
+    ///
+    /// # The order IS the invariant
+    ///
+    /// `deepest_first` selects `ORDER BY depth DESC` for apply and
+    /// `ORDER BY depth ASC` for revert. §6.5.5: at every commit boundary the
+    /// private set is closed downward under the content-derivation relation, so
+    /// a `kill -9` leaves a downward-closed prefix private rather than a private
+    /// parent with public `decomposes_to` children. Revert is the mirror.
+    ///
+    /// The secondary keys (`kind`, `entity_id`) make the order TOTAL, which is
+    /// what makes `privatization_resume.rs`'s "the final state equals the
+    /// uninterrupted result" assertion meaningful rather than probabilistic.
+    ///
+    /// # `kind = 'claim'` matches what the batch can actually move
+    ///
+    /// [`UnfilteredSelection::freeze_into`] is the only writer of
+    /// `privatization_plan_items` and writes `'claim'` for every row, so today
+    /// this predicate excludes nothing. It is here because
+    /// [`Self::mark_items_conn`], [`Self::restrict_claims_conn`] and
+    /// [`Self::record_item_audit_conn`] all act on claims only: an item of some
+    /// other kind would be selected by every batch, marked by none, and the
+    /// batch loop would not terminate. PR-21's seal work is the slice most
+    /// likely to add an `evidence` row, and a non-terminating loop holding the
+    /// global privatization lock is the wrong way to find that out.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn next_batch_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        item_state: &str,
+        deepest_first: bool,
+        limit: i64,
+    ) -> Result<Vec<PlanWorkItem>, DbError> {
+        let order = if deepest_first { "DESC" } else { "ASC" };
+        sqlx::query_as::<_, PlanWorkItem>(&format!(
+            "SELECT i.kind, i.entity_id, i.depth,
+                    i.before_visibility, i.before_owner_group_id
+               FROM public.privatization_plan_items i
+              WHERE i.plan_id = $1 AND i.state = $2 AND i.kind = 'claim'
+              ORDER BY i.depth {order}, i.kind, i.entity_id
+              LIMIT $3
+                FOR UPDATE"
+        ))
+        .bind(plan_id)
+        .bind(item_state)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Move a batch of items to a terminal per-item state.
+    ///
+    /// `applied_at` is stamped on every transition and not only on `applied`,
+    /// because the column records WHEN THE ITEM WAS LAST DECIDED; a `failed`
+    /// item with a NULL timestamp is indistinguishable from one the handler
+    /// never reached.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn mark_items_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        kind: &str,
+        entity_ids: &[Uuid],
+        state: &str,
+        error: Option<&str>,
+    ) -> Result<u64, DbError> {
+        if entity_ids.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query(
+            r#"
+            UPDATE public.privatization_plan_items i
+               SET state = $4, applied_at = now(), error = $5
+             WHERE i.plan_id = $1 AND i.kind = $2 AND i.entity_id = ANY($3)
+            "#,
+        )
+        .bind(plan_id)
+        .bind(kind)
+        .bind(entity_ids)
+        .bind(state)
+        .bind(error)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// `restrict`: move a batch of claims into the target group.
+    ///
+    /// This is the whole of `restrict` mode. `content`, `content_tsv` and
+    /// `embedding` are NOT in the statement — FINAL-PLAN §6.5.4's argument is
+    /// that they are three columns of the same row, RLS is row-level, and the
+    /// predicate that hides one hides all three atomically, so retaining them
+    /// leaks nothing beyond what retaining `content` already leaks. That is what
+    /// makes acceptance clause 6's bit-identity assertion true by construction
+    /// rather than by care.
+    ///
+    /// # It fans out through a trigger, and that is deliberate
+    ///
+    /// Migration 072's statement-level `AFTER UPDATE` on `claims`
+    /// (`epigraph_propagate_tenancy`) copies the new tenancy to seventeen
+    /// derived tables, to `harvester_fragments` through the provenance join, and
+    /// recomputes the `edges` meet over BOTH endpoints. So this one statement is
+    /// the claims UPDATE, the evidence UPDATE and most of the boundary-edge meet
+    /// §6.5.5 lists as three separate steps. **That is a correction to the plan,
+    /// which was written before 072 existed in this form.** What the trigger
+    /// does NOT do is widen an edge — its `NOT (e.visibility = 'group' AND
+    /// m.v = 'public')` guard — which is why revert still needs
+    /// [`Self::recompute_boundary_meet_conn`] explicitly.
+    ///
+    /// # The `IS DISTINCT FROM` guard is what makes a batch re-runnable
+    ///
+    /// A re-dispatched job that re-processes a committed batch changes no row,
+    /// fires no trigger (072's firing gate is the same comparison) and writes no
+    /// derived row. §6.5.5's ops-F11 correction requires exactly this, and the
+    /// previous revision's claim that it already held was false for nine of ten
+    /// propagation arms.
+    ///
+    /// # IT RETURNS THE IDS IT CHANGED, AND THE CALLER MUST USE THEM
+    ///
+    /// The same `IS DISTINCT FROM` guard that makes a batch re-runnable also
+    /// means a row already sitting in the target group is a NO-OP for this plan.
+    /// That is an ordinary thing for a plan frozen while the row was public to
+    /// meet — two plans against the same target group with overlapping frozen
+    /// sets is not a race, because `privatization_one_active_per_group` excludes
+    /// only CONCURRENT running plans. An item marked `applied` on the strength
+    /// of having been looked at rather than moved would make the revert path
+    /// write this plan's selection-time pre-image over a row this plan never
+    /// changed, and that pre-image is typically `public`. So the return value is
+    /// the set of rows this statement actually moved, and
+    /// `epigraph-jobs::privatization::run_batch` marks the remainder `skipped`.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn restrict_claims_conn(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+        target_group_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE public.claims c
+               SET visibility = 'group', owner_group_id = $2, updated_at = now()
+             WHERE c.id = ANY($1)
+               AND (c.visibility IS DISTINCT FROM 'group'
+                    OR c.owner_group_id IS DISTINCT FROM $2)
+            RETURNING c.id
+            "#,
+        )
+        .bind(claim_ids)
+        .bind(target_group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Restore a batch of claims to the tenancy the freeze recorded.
+    ///
+    /// The `before_visibility` / `before_owner_group_id` columns were read from
+    /// `claims` in the same statement that wrote the item row
+    /// ([`UnfilteredSelection::freeze_into`]), so this restores the state at
+    /// SELECTION time rather than a value that has been round-tripping through
+    /// Rust since.
+    ///
+    /// # IT RESTORES ONLY ROWS THAT STILL CARRY THIS PLAN'S STAMP
+    ///
+    /// `target_group_id` is not decoration and it is not an optimisation. The
+    /// statement writes a SELECTION-TIME pre-image, and the only rows for which
+    /// that pre-image is the right answer are the ones whose tenancy is still
+    /// the one this plan wrote: `visibility = 'group'` and
+    /// `owner_group_id = target_group_id`. A row that some other decision now
+    /// owns — `privatization_one_active_per_group` is unique on
+    /// `target_group_id`, not per claim, so a second plan against a different
+    /// group is an ordinary thing to exist — is LEFT ALONE, and its tenancy is
+    /// whatever that decision made it rather than whatever this plan saw before
+    /// it. Fail-closed is the direction that matters here, because this is the
+    /// one statement in the subsystem that can widen a row's tenancy.
+    ///
+    /// # It sets `epigraph.allow_declassify`, and that is the admin surface
+    ///
+    /// Migration 074's `claims_block_widening` refuses `group` → `public`
+    /// unconditionally unless `epigraph.allow_declassify = 'yes'`, and its own
+    /// comment names "the admin declassification surface" as the thing that sets
+    /// it. This is that surface: a revert of a `restrict` plan is the ONE
+    /// declassification the system performs, it is audited row by row, and it
+    /// restores a value the database itself recorded rather than one a caller
+    /// supplied.
+    ///
+    /// `SET LOCAL`, so the permission ends with the batch transaction. A session
+    /// scope `SET` would leave it armed on a pooled connection for whatever ran
+    /// next — the hazard [`Self::select`] documents for `statement_timeout`,
+    /// with a far worse payload.
+    ///
+    /// **The sealed arm of that guard is NOT reachable from here and must not
+    /// be.** It has no GUC override by design (sec F11), so a revert of a plan
+    /// with a still-sealed item fails `42501` rather than producing a public row
+    /// whose content is a stub. FINAL-PLAN ops-F13 requires the route to refuse
+    /// such a plan with a 409 and a count BEFORE dispatch; this is the backstop.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn restore_claims_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        claim_ids: &[Uuid],
+        target_group_id: Uuid,
+    ) -> Result<u64, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        sqlx::query(
+            r#"
+            UPDATE public.claims c
+               SET visibility = i.before_visibility,
+                   owner_group_id = i.before_owner_group_id,
+                   updated_at = now()
+              FROM public.privatization_plan_items i
+             WHERE i.plan_id = $1
+               AND i.kind = 'claim'
+               AND i.entity_id = ANY($2)
+               AND c.id = i.entity_id
+               AND c.visibility = 'group'
+               AND c.owner_group_id = $3
+               AND (c.visibility IS DISTINCT FROM i.before_visibility
+                    OR c.owner_group_id IS DISTINCT FROM i.before_owner_group_id)
+            "#,
+        )
+        .bind(plan_id)
+        .bind(claim_ids)
+        .bind(target_group_id)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Re-run the endpoint meet over every edge touching this batch.
+    ///
+    /// FINAL-PLAN §6.5.3: an edge is visible iff both endpoints are, so edge
+    /// tenancy is the MEET of its endpoints' tenancies. Migration 066(b) applies
+    /// it on write and cannot apply it here, because it is `BEFORE INSERT OR
+    /// UPDATE OF source_id, target_id` and privatization changes neither.
+    ///
+    /// # Why this exists when 072's propagation trigger already recomputes edges
+    ///
+    /// The trigger carries `AND NOT (e.visibility = 'group' AND m.v = 'public')`
+    /// — it narrows an edge and refuses to widen one. That is right for a
+    /// stamping trigger and wrong for a REVERT, which must be able to return an
+    /// edge between two restored-public claims to `public`. Without this
+    /// statement a reverted plan leaves its boundary edges `group`-visible
+    /// forever, which is a privatization that reports itself undone and is not.
+    /// It is idempotent, so running it on the apply path too costs a scan and
+    /// buys agreement between the two directions.
+    ///
+    /// # `ORDER BY e.id` (ops F12)
+    ///
+    /// In the `ep` CTE, exactly where §6.5.3 puts it. Migration 072's header is
+    /// right that an `ORDER BY` inside a subquery of `UPDATE … FROM` is a
+    /// planner hint rather than a guaranteed lock order — which is why the
+    /// GLOBAL advisory lock in [`Self::begin_batch_conn`] is the actual control
+    /// and this is the cheap agreement with it.
+    ///
+    /// # The `COALESCE(…, 'public')` on a missing endpoint
+    ///
+    /// Deliberate, and §6.5.3 states it: an edge pointing at a `frame`, `agent`,
+    /// `paper` or `task` has no tenancy, contributes `public` to the meet, and
+    /// must never BLOCK a privatization.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn recompute_boundary_meet_conn(
+        conn: &mut PgConnection,
+        entity_ids: &[Uuid],
+    ) -> Result<u64, DbError> {
+        if entity_ids.is_empty() {
+            return Ok(0);
+        }
+        sqlx::query(
+            r#"
+            WITH ep AS (
+              SELECT e.id,
+                     COALESCE(s.v, 'public')::text AS sv,
+                     COALESCE(s.g, '00000000-0000-0000-0000-000000000000'::uuid) AS sg,
+                     COALESCE(t.v, 'public')::text AS tv,
+                     COALESCE(t.g, '00000000-0000-0000-0000-000000000000'::uuid) AS tg
+                FROM public.edges e
+                CROSS JOIN LATERAL public.epigraph_node_tenancy(e.source_id, e.source_type) s
+                CROSS JOIN LATERAL public.epigraph_node_tenancy(e.target_id, e.target_type) t
+               WHERE e.source_id = ANY($1) OR e.target_id = ANY($1)
+               ORDER BY e.id
+            ), meet AS (
+              SELECT ep.id,
+                     (CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
+                           THEN 'public' ELSE 'group' END)::varchar(16) AS v,
+                     CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
+                               THEN '00000000-0000-0000-0000-000000000000'::uuid
+                          WHEN ep.sv = 'public' THEN ep.tg
+                          ELSE ep.sg END AS g,
+                     CASE WHEN ep.sv = 'group' AND ep.tv = 'group' AND ep.sg <> ep.tg
+                               THEN ep.tg ELSE NULL END AS co
+                FROM ep
+            )
+            UPDATE public.edges e
+               SET visibility = m.v, owner_group_id = m.g, co_owner_group_id = m.co
+              FROM meet m
+             WHERE m.id = e.id
+               AND m.g IS NOT NULL
+               AND (e.visibility, e.owner_group_id, e.co_owner_group_id)
+                   IS DISTINCT FROM (m.v, m.g, m.co)
+            "#,
+        )
+        .bind(entity_ids)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// How many of a `mode='seal'` plan's items are still sealed (ops F13).
+    ///
+    /// FINAL-PLAN §6.5.5 permits `revert` on a `mode='seal'` plan once every
+    /// item is unsealed, and requires a `409` carrying this count otherwise.
+    ///
+    /// # THE `mode = 'seal'` PREDICATE IS THE WHOLE CORRECTNESS OF THIS COUNT
+    ///
+    /// `claim_encryption` is migration 060's table and belongs to the
+    /// pre-existing encrypted-subgraph feature, which writes it from the
+    /// ordinary claims surface and has nothing to do with D4 seal mode. Counting
+    /// every encryption row joined to the plan's items would therefore refuse
+    /// the revert of a `restrict` plan whose frozen set happens to contain an
+    /// already-encrypted claim — a plan that sealed nothing, and whose full
+    /// reversibility is the property §6.5.4 puts the most weight on. Nothing in
+    /// the selection path filters such a claim out: `resolve_seeds` accepts any
+    /// id, and the closure and the content-lineage hull both run under the
+    /// bypass viewer.
+    ///
+    /// So the count is scoped to seal-mode plans. What is still NOT shipped is
+    /// the seal path that could make it non-zero through the product —
+    /// `crates/epigraph-privacy` does not exist, `seal` is PR-21's, and
+    /// `routes/privatization.rs::create_plan` returns `501` for it — so this
+    /// returns 0 for every plan the ROUTE can create today. It is here so that
+    /// the refusal arrives with the seal mode rather than after it.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn sealed_item_count_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+    ) -> Result<i64, DbError> {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT count(*)
+              FROM public.claim_encryption ce
+              JOIN public.privatization_plan_items i
+                ON i.entity_id = ce.claim_id AND i.kind = 'claim'
+              JOIN public.privatization_plans p
+                ON p.id = i.plan_id AND p.mode = 'seal'
+             WHERE i.plan_id = $1
+            "#,
+        )
+        .bind(plan_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Enqueue the apply/revert job, on the connection that flipped the plan.
+    ///
+    /// # Why the route enqueues through a repo function and not through the job
+    /// queue's own client
+    ///
+    /// FINAL-PLAN §6.5.5 says it plainly — "the route enqueues through a repo
+    /// function on the maintenance pool" — and the reason is that the state flip
+    /// and the enqueue must be ONE transaction. Split across two connections, a
+    /// crash between them leaves either a plan in `applying` that no job will
+    /// ever pick up (a 202 that never happens) or a job for a plan that was
+    /// never flipped (which the handler refuses on condition 1, correctly, but
+    /// noisily and after the fact).
+    ///
+    /// # Plain enqueue, NOT `enqueue_unique_pending`
+    ///
+    /// `PostgresJobQueue::enqueue_unique_pending` guards on `job_type` plus
+    /// `state = 'pending'` and discriminates nothing about the payload, so a
+    /// second plan's apply would be silently dropped while the first is queued.
+    /// A privatization that reports 202 and never runs is the failure this
+    /// function's shape refuses.
+    ///
+    /// # `max_retries` IS AN ATTEMPT BUDGET, NOT A COUNT OF RETRIES AFTER THE
+    /// FIRST
+    ///
+    /// `JobRunner`'s worker loop evaluates `job.retry_count >= job.max_retries`
+    /// BEFORE it calls `handler.handle`, and marks the job `failed` when it
+    /// holds. So the row's invariant at first dequeue is
+    /// `retry_count < max_retries`, and a row inserted with `(0, 0)` is failed
+    /// without the handler ever running — a 202 that never happens, which is the
+    /// failure this function's shape exists to refuse.
+    ///
+    /// `1` is therefore the value that means what `JobHandler::max_retries() =
+    /// 0` means on these two handlers: exactly ONE attempt, no exponential
+    /// ladder. Recovery from a partial apply is the stale-job reaper
+    /// re-dispatching, which re-runs the full re-validation, not a retry into
+    /// the same lock timeout. (`JobHandler::max_retries` is not consulted by the
+    /// runner at all — the row's column is the only load-bearing number — which
+    /// is why this one is spelled out here rather than inferred.)
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault. A `42501` here is migration 077's
+    /// `jobs_app` policy refusing the connection, which is the answer for every
+    /// role but the maintenance one.
+    pub async fn enqueue_job_conn(
+        conn: &mut PgConnection,
+        job_type: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, DbError> {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO public.jobs
+                   (id, job_type, payload, state, retry_count, max_retries,
+                    created_at, updated_at)
+            VALUES (gen_random_uuid(), $1, $2, 'pending', 0, 1, now(), now())
+            RETURNING id
+            "#,
+        )
+        .bind(job_type)
+        .bind(payload)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// The entity ids of a plan's items in `state='applied'`.
+    ///
+    /// The seed set of the post-apply drift rescan, and the ONLY place in this
+    /// module where a bare `Vec<Uuid>` of plan items leaves a function without
+    /// an actor's viewer in sight. That is sound for exactly one reason and it
+    /// is worth being explicit about: its single caller is a JOB HANDLER, which
+    /// has no requesting principal to filter against, and the ids' only
+    /// destinations are `privatization_plans.drift_ids`, the frozen item set of
+    /// a follow-up plan, and `privatization_audit` — three `FORCE`-protected
+    /// tables that are read back through a policy. They do not reach a response
+    /// body. A request-path caller that wanted this list would need
+    /// [`Self::load_plan_items_conn`] and the rendering pass instead.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn applied_entity_ids_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT i.entity_id
+              FROM public.privatization_plan_items i
+             WHERE i.plan_id = $1 AND i.kind = 'claim' AND i.state = 'applied'
+             ORDER BY i.entity_id
+            "#,
+        )
+        .bind(plan_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Per-state item counts, for `GET /plans/:id`'s live progress block.
+    ///
+    /// Discharges the apply-time half of `F-PR18b-preview-schema-is-a-subset`:
+    /// §6.5.7 gives that row "preview + live progress", and progress is the
+    /// cursor plus this histogram. Counts only — the entity ids behind them are
+    /// [`Self::load_plan_items_conn`]'s, and reach the wire only through
+    /// [`Self::visible_previews`].
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn item_state_counts_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+    ) -> Result<BTreeMap<String, i64>, DbError> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT i.state, count(*)
+              FROM public.privatization_plan_items i
+             WHERE i.plan_id = $1
+             GROUP BY i.state
+             ORDER BY i.state
+            "#,
+        )
+        .bind(plan_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Append one PLAN-level row to `privatization_audit`.
+    ///
+    /// The table is append-only by three independent controls (082's
+    /// `privatization_audit_no_mutate` trigger, its `REVOKE UPDATE, DELETE`, and
+    /// the absence of an UPDATE or DELETE policy), so there is nothing here that
+    /// can rewrite history — only add to it.
+    ///
+    /// FINAL-PLAN §6.5.5: "Every refusal writes `privatization_audit(action=
+    /// 'plan.abort')` and sets `state='failed'`." Both halves are the caller's
+    /// to sequence; this is the first half's primitive.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_plan_audit_conn(
+        conn: &mut PgConnection,
+        entry: PlanAuditEntry<'_>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    plan_digest, correlation_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(entry.plan_id)
+        .bind(entry.actor_agent_id)
+        .bind(entry.action)
+        .bind(entry.kind)
+        .bind(entry.entity_id)
+        .bind(entry.plan_digest)
+        .bind(entry.correlation_id)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Append one audit row PER ITEM in a batch, set-based.
+    ///
+    /// The before/after tenancy pair is read from `privatization_plan_items` and
+    /// `claims` in the SAME statement, so the audit row describes the rows as
+    /// the database holds them rather than as Rust believed them to be. A
+    /// row-at-a-time loop over 50 items would also be 50 round trips inside a
+    /// transaction holding the global privatization lock.
+    ///
+    /// Which projection, and therefore which side of the tenancy write this must
+    /// be called on, is [`ItemAuditDirection`]'s doc.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_item_audit_conn(
+        conn: &mut PgConnection,
+        batch: ItemAuditBatch<'_>,
+    ) -> Result<u64, DbError> {
+        if batch.entity_ids.is_empty() {
+            return Ok(0);
+        }
+        // Both fragments are compile-time literals chosen by an enum; nothing a
+        // caller supplies reaches the statement text.
+        let (pair, stamp) = match batch.direction {
+            ItemAuditDirection::Apply => (
+                "i.before_visibility, i.before_owner_group_id, c.visibility, c.owner_group_id",
+                "",
+            ),
+            ItemAuditDirection::Revert => (
+                "c.visibility, c.owner_group_id, i.before_visibility, i.before_owner_group_id",
+                "AND c.visibility = 'group' AND c.owner_group_id = $6",
+            ),
+        };
+        let sql = format!(
+            "INSERT INTO public.privatization_audit
+                    (plan_id, actor_agent_id, action, kind, entity_id,
+                     before_visibility, before_owner_group_id,
+                     after_visibility, after_owner_group_id, correlation_id)
+             SELECT $1, $2, $3, 'claim', i.entity_id, {pair}, $5
+               FROM public.privatization_plan_items i
+               JOIN public.claims c ON c.id = i.entity_id
+              WHERE i.plan_id = $1 AND i.kind = 'claim' AND i.entity_id = ANY($4) {stamp}"
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(batch.plan_id)
+            .bind(batch.actor_agent_id)
+            .bind(batch.action)
+            .bind(batch.entity_ids)
+            .bind(batch.correlation_id);
+        if batch.direction == ItemAuditDirection::Revert {
+            query = query.bind(batch.target_group_id);
+        }
+        query
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// One page of `privatization_audit`, through migration 083's read policy.
+    ///
+    /// # This must be given a STAMPED APP connection
+    ///
+    /// `privatization_audit` has no `visibility` column; its tenancy IS 083's
+    /// `privatization_audit_read` policy, which admits plan-level rows to any
+    /// instance admin and entity-level rows only where the caller administers
+    /// the plan's target group. That resolves through a sub-select over
+    /// `privatization_plans`, which migration 087's own SELECT policy filters —
+    /// so the scoping is two policies deep and BOTH are properties of the
+    /// connection. On the maintenance connection `epigraph_bypass()` is true and
+    /// this becomes the instance-wide oracle §6.5.8 argues against.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn load_audit_conn(
+        conn: &mut PgConnection,
+        query: AuditQuery,
+    ) -> Result<Vec<AuditRow>, DbError> {
+        sqlx::query_as::<_, AuditRow>(
+            r#"
+            SELECT a.id, a.plan_id, a.actor_agent_id, a.action, a.kind, a.entity_id,
+                   a.before_visibility, a.after_visibility, a.correlation_id, a.created_at
+              FROM public.privatization_audit a
+             WHERE ($1::uuid IS NULL OR a.plan_id = $1)
+               AND ($2::uuid IS NULL OR a.entity_id = $2)
+               AND ($3::timestamptz IS NULL OR a.created_at >= $3)
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT $4
+            "#,
+        )
+        .bind(query.plan_id)
+        .bind(query.entity_id)
+        .bind(query.since)
+        .bind(query.limit)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Persist the post-apply drift rescan as a follow-up plan in `previewed`.
+    ///
+    /// FINAL-PLAN §6.5.5's sec-F9 fix. The rescan's answer to what the frozen
+    /// selection does not cover is a NEW plan against the same target group, in
+    /// `previewed`, so an operator reviews and applies it through the ordinary
+    /// four-eyes surface rather than the handler privatizing rows nobody
+    /// selected.
+    ///
+    /// # It lives in this crate and not in the handler, on purpose
+    ///
+    /// Building the follow-up needs [`UnfilteredSelection::from_selected`],
+    /// which is a test-only escape hatch fenced off from the request path by
+    /// `locked_decisions.rs::d4_the_request_path_reaches_privatization_only_through_the_composed_entry_point`.
+    /// Doing it here keeps the hatch inside the module that owns it instead of
+    /// spreading it to a crate that lint does not scan.
+    ///
+    /// Migration 081's plan guard fires on the INSERT, so a target group that
+    /// has since lost its admin plurality refuses the follow-up rather than
+    /// silently creating one nobody can approve.
+    ///
+    /// # `authors_losing_count` IS COMPUTED, NOT ASSERTED
+    ///
+    /// That column is not bookkeeping. Three independent gates key on
+    /// `authors_losing_count > 0` — `routes/privatization.rs::apply_plan`'s
+    /// second-approver `428`, the handler's re-validation condition 2, and
+    /// condition 5's `acknowledge_author_loss` requirement — and `mode` is
+    /// inherited from the source plan. A follow-up written with a hardcoded zero
+    /// would route a plan that costs authors access to their own claims through
+    /// the single-approver path, which is the one shape the four-eyes rule
+    /// exists to refuse. So this runs the same
+    /// [`Self::authors_losing_own_claims`] pass `create_plan` runs, under the
+    /// bypass viewer the rescan already holds, and a fault there refuses the
+    /// follow-up rather than downgrading it.
+    ///
+    /// The `selector` describes the DRIFT SET rather than an empty seed list,
+    /// because the follow-up's review surface is the four-eyes surface: an
+    /// operator asked to approve it must be able to see what it covers.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault, including the guard's `RAISE`.
+    pub async fn create_followup_drift_plan_conn(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        source: &PlanRow,
+        drift: &[SelectedClaim],
+        created_by: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        if drift.is_empty() {
+            return Ok(None);
+        }
+        let selection = UnfilteredSelection::from_selected(drift.to_vec());
+        let digest = selection.digest();
+        let authors_losing = selection
+            .authors_losing_own_claims(&mut *conn, viewer, source.target_group_id)
+            .await?;
+        let selector = serde_json::json!({
+            "seeds": { "ids": { "claims": selection.ids() } },
+            "origin": { "drift_rescan_of": source.id },
+        });
+        let (plan_id, _) = Self::create_previewed_plan(
+            &mut *conn,
+            NewPlan {
+                mode: &source.mode,
+                target_group_id: source.target_group_id,
+                selector: &selector,
+                on_conflict: &source.on_conflict,
+                pad_to: source.pad_to,
+                created_by,
+                plan_digest: &digest,
+                item_count: i32::try_from(selection.item_count()).unwrap_or(i32::MAX),
+                authors_losing_count: i32::try_from(authors_losing).unwrap_or(i32::MAX),
+            },
+        )
+        .await?;
+        selection.freeze_into(&mut *conn, plan_id).await?;
+        Ok(Some(plan_id))
+    }
+
+    /// The post-apply restatement-tier drift rescan (sec F9).
+    ///
+    /// One hop out from the applied set along the RESTATEMENT tier only, plus
+    /// the mandatory content-lineage hull over the result, minus everything the
+    /// plan already covers. What is left is a claim that restates private
+    /// content and is not itself private.
+    ///
+    /// # Depth 1, restatement tier, and nothing wider
+    ///
+    /// §6.5.5 says "re-run the closure at depth 1 over the applied set,
+    /// restricted to the restatement tier, plus `epigraph_content_lineage_hull`
+    /// over the applied ids". A wider rescan would report every claim that
+    /// merely CITES a private one, which is not a leak and would make the
+    /// follow-up plan an ever-growing privatization of the corpus.
+    ///
+    /// # It goes through the repo hull, not the SQL function
+    ///
+    /// `F-PR18a-hull-sibling-arm-is-one-hop` is closed at THIS layer — the
+    /// re-seeding loop in [`Self::select_content_lineage_hull`] — and not in the
+    /// DDL, so a caller that reached `epigraph_content_lineage_hull` directly
+    /// would re-open it. This calls the repo function.
+    ///
+    /// # Authority
+    ///
+    /// `viewer` is the BYPASS viewer, for the reason every selection function
+    /// takes one: a rescan narrowed to what someone can see reports less drift
+    /// than exists. There is NO ACTOR VIEWER on this path at all — a job handler
+    /// has no requesting principal — and the answer to
+    /// `F-PR18a-selection-functions-are-invoker-bound-only-on-a-stamped-connection`'s
+    /// second question is therefore that the returned ids are NOT re-filtered
+    /// before leaving this function. They do not leave the process: their only
+    /// destinations are `privatization_plans.drift_ids`, the frozen item set of
+    /// the follow-up plan, and `privatization_audit`. All three are
+    /// `FORCE`-protected tables read back through a policy.
+    ///
+    /// # Errors
+    ///
+    /// [`SelectionRefusal`] for a bad request; [`DbError`] for a query fault.
+    pub async fn restatement_drift_conn(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        applied: &[Uuid],
+        node_cap: i32,
+    ) -> Result<Vec<SelectedClaim>, SelectionError> {
+        if applied.is_empty() {
+            return Ok(Vec::new());
+        }
+        let edge_types: Vec<String> = RESTATEMENT_EDGE_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let closure = Self::select_closure(
+            conn,
+            viewer,
+            ClosureRequest {
+                seeds: applied,
+                edge_types: &edge_types,
+                direction: ClosureDirection::Both,
+                max_depth: 1,
+                node_cap,
+            },
+        )
+        .await?;
+        let hulled = Self::select_content_lineage_hull(conn, viewer, &closure, node_cap).await?;
+
+        let already: std::collections::BTreeSet<Uuid> = applied.iter().copied().collect();
+        let candidates: Vec<Uuid> = hulled
+            .iter()
+            .map(|c| c.claim_id)
+            .filter(|id| !already.contains(id))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // STILL PUBLIC is the whole question. A candidate that is already
+        // `group` is not drift — it may be private for an unrelated reason, and
+        // re-privatizing it into this plan's target group would be a seizure the
+        // operator did not ask for.
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id
+              FROM public.claims c
+             WHERE c.id = ANY($1)
+               AND c.visibility = 'public'
+               /* {VISIBILITY:c} */
+             ORDER BY c.id
+            "#,
+            2,
+        );
+        let mut query = sqlx::query_scalar::<_, Uuid>(&sql).bind(&candidates);
+        if let Some(groups) = viewer.group_bind() {
+            query = query.bind(groups);
+        }
+        let still_public: std::collections::BTreeSet<Uuid> = query
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?
+            .into_iter()
+            .collect();
+
+        Ok(hulled
+            .into_iter()
+            .filter(|c| still_public.contains(&c.claim_id))
+            .collect())
     }
 
     // =====================================================================

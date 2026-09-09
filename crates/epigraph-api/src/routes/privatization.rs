@@ -75,19 +75,39 @@
 //! counted may not appear in either. `PrivatizationRepository::load_plan_items_conn`
 //! carries the argument for why an offset is sound over this particular table.
 //!
-//! # What this module does NOT do, and why
+//! # Nothing here applies anything
 //!
-//! `approve`, `apply`, `abort`, `revert`, the seal/unseal manifest ceremony and
-//! `GET /audit` are absent. Approving a plan is an UPDATE of
-//! `privatization_plans`, and that table has no UPDATE policy: migration 087
-//! covers SELECT and INSERT only, `rls_enforcement.rs::DELIBERATELY_UNCOVERED`
-//! assigns the UPDATE pair to the apply/revert slice, and under `FORCE` an
-//! uncovered command is denied to every role including a bypass connection. So
-//! FINAL-PLAN's PR-18 acceptance clauses 3 and 4 — `approve` by `created_by`,
-//! and `approve` by an instance admin who does not administer the target group,
-//! both 409 — are NOT discharged here. The database halves of both exist (080's
-//! `pp_four_eyes` CHECK and 081's `epigraph_privatization_approver_guard`);
-//! their HTTP halves need the UPDATE policy first.
+//! `approve`, `apply`, `abort` and `revert` now exist, and none of them moves a
+//! claim. FINAL-PLAN §6.5.5: not one transaction, a job. `apply` validates,
+//! writes a `security_events` row, flips `state='applying'`, enqueues and
+//! returns `202`; the rows move in `epigraph-jobs/src/privatization.rs`, which
+//! **re-validates every one of those decisions from the database before it
+//! touches a row (sec F5)**. What these four routes decide is what the OPERATOR
+//! is told.
+//!
+//! The UPDATE policies that make them possible are migration **088**'s. Under
+//! `FORCE` a command with no policy is denied to every role including a bypass
+//! connection, which is why the preview slice shipped four read routes and
+//! stopped; `rls_enforcement.rs::DELIBERATELY_UNCOVERED` assigned both UPDATE
+//! pairs to this slice by name and both rows are deleted in the same commit as
+//! the migration.
+//!
+//! # What this module still does NOT do, and why
+//!
+//! The seal/unseal manifest ceremony (`seal-manifest`, `seal-commit`,
+//! `unseal-manifest`, `unseal-commit`) is absent: it is a key ceremony over
+//! `crates/epigraph-privacy`, which does not exist, and `create_plan` still
+//! answers `501` for `mode="seal"`. The MCP tools §6.5.7 names are absent too;
+//! they discharge no acceptance clause and are recorded as descoped in
+//! `docs/tenancy/progress.json` rather than shipped ahead of the surface they
+//! would mirror.
+//!
+//! `PATCH /claims/:id/visibility` — the plan's "retained sugar, rewritten" — is
+//! **not** created here. There is nothing to rewrite: no such route exists in
+//! this tree, so shipping it would be creating a NEW single-request
+//! declassification/reclassification power, which is the shape PR-11 and PR-14
+//! deleted (`assign_ownership`, `update_partition`). That is a decision for a
+//! slice that argues it, not a side effect of building the plan surface.
 
 use axum::{
     extract::{Path, Query, State},
@@ -324,7 +344,21 @@ pub struct PlanListResponse {
     pub plans: Vec<PlanSummary>,
 }
 
-/// One row of `GET /plans`.
+/// One row of `GET /plans`, and the body of `GET /plans/:id`.
+///
+/// # The apply-time block is the LIVE PROGRESS half of §6.5.7
+///
+/// `F-PR18b-preview-schema-is-a-subset` records that §6.5.7 gives
+/// `GET /plans/:id` "preview + live progress" and that 18b served a summary,
+/// because live progress is the cursor and the per-item state and nothing could
+/// produce either. This slice produces both, so the fields arrive with the code
+/// that moves them.
+///
+/// **`drift_count`, not `drift_ids`.** The drift set is a list of claim ids that
+/// a plan administrator may not be entitled to READ — administering a target
+/// group is not the same property as being able to read every claim the rescan
+/// found — and this response crosses no `Viewer`. The ids are reachable through
+/// the follow-up plan's own item list, where the rendering pass applies.
 #[derive(Serialize, Debug)]
 pub struct PlanSummary {
     /// The plan's id.
@@ -339,10 +373,116 @@ pub struct PlanSummary {
     pub item_count: i32,
     /// Distinct authors who would lose access to their own claims.
     pub authors_losing_count: i32,
+    /// The second instance admin who approved, if any.
+    pub approved_by: Option<Uuid>,
+    /// When the approval was given.
+    pub approved_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The agent whose `apply` or `revert` dispatched the job.
+    pub dispatched_by: Option<Uuid>,
+    /// The depth band the last committed batch reached. Apply walks deepest
+    /// first, so this DESCENDS while a plan is `applying`.
+    pub cursor_depth: Option<i32>,
+    /// How many restatement-tier drifts the post-apply rescan found.
+    pub drift_count: i64,
+    /// `item state -> count`. Served by `GET /plans/:id` and `null` on the list
+    /// endpoint, which would otherwise run one aggregate per row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items_by_state: Option<std::collections::BTreeMap<String, i64>>,
     /// When the plan was created.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Derived: `created_at + 4h`.
     pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `POST /plans/:id/apply` body.
+#[derive(Deserialize, Debug, Clone)]
+pub struct ApplyRequest {
+    /// The `b3:`-prefixed digest the preview returned. An apply that does not
+    /// echo the CURRENT digest is refused with `409`: the corpus has moved and
+    /// the operator is approving a plan they have not seen.
+    pub plan_digest: String,
+    /// Required when `mode='seal'` and the plan costs an author access to their
+    /// own claims.
+    #[serde(default)]
+    pub acknowledge_author_loss: Option<bool>,
+}
+
+/// `POST /plans/:id/revert` body.
+#[derive(Deserialize, Debug, Clone)]
+pub struct RevertRequest {
+    /// The digest, echoed for the same reason `apply` echoes it.
+    pub plan_digest: String,
+}
+
+/// The `202` body of `apply` and `revert`.
+#[derive(Serialize, Debug)]
+pub struct DispatchResponse {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// The enqueued job.
+    pub job_id: Uuid,
+    /// `applying` or `reverting`.
+    pub state: String,
+    /// The correlation id shared by this request's `security_events` row, the
+    /// job payload and every `privatization_audit` row the run writes. It is
+    /// what makes the three joinable after the fact.
+    pub correlation_id: String,
+}
+
+/// The `200` body of `approve` and `abort`.
+#[derive(Serialize, Debug)]
+pub struct PlanStateResponse {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// Its new state.
+    pub state: String,
+}
+
+/// `GET /admin/privatization/audit` query.
+#[derive(Deserialize, Debug, Default)]
+pub struct AuditQueryParams {
+    /// Restrict to one plan.
+    pub plan_id: Option<Uuid>,
+    /// Restrict to one entity.
+    pub entity_id: Option<Uuid>,
+    /// Only rows at or after this instant.
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Page size, clamped to `MAX_PAGE`.
+    pub limit: Option<i64>,
+}
+
+/// `GET /admin/privatization/audit` body.
+#[derive(Serialize, Debug)]
+pub struct AuditResponse {
+    /// The rows migration 083's policy admitted.
+    pub events: Vec<AuditEvent>,
+}
+
+/// One audit row.
+#[derive(Serialize, Debug)]
+pub struct AuditEvent {
+    /// The row's own id.
+    pub id: i64,
+    /// The plan.
+    pub plan_id: Uuid,
+    /// Who acted.
+    pub actor_agent_id: Uuid,
+    /// What they did.
+    pub action: String,
+    /// `claim`|`evidence`, when the row is about one entity.
+    pub kind: Option<String>,
+    /// The entity. Present only where migration 083's policy admitted the
+    /// entity-level arm — an instance admin who does not administer the plan's
+    /// target group sees the plan-level rows and not this.
+    pub entity_id: Option<Uuid>,
+    /// Tenancy before the action.
+    pub before_visibility: Option<String>,
+    /// Tenancy after the action.
+    pub after_visibility: Option<String>,
+    /// Joins this row to a `security_events` row and to a job payload.
+    pub correlation_id: Option<String>,
+    /// When.
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// `GET /plans/:id/items` body.
@@ -838,18 +978,20 @@ pub async fn get_plan(
         });
     };
 
-    let mut read = state.read_as(&viewer).await.map_err(scoped_read_error)?;
-    let plan = PrivatizationRepository::load_plan_conn(&mut read, plan_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "privatization plan".to_string(),
-            id: plan_id.to_string(),
-        })?;
-    read.commit().await.map_err(scoped_read_error)?;
-
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
     require_plan_authority(&state, auth, plan.target_group_id).await?;
 
-    Ok(Json(summarise(plan)))
+    // THE LIVE PROGRESS BLOCK, on the ACTOR's connection. 087's policy on
+    // `privatization_plan_items` is what makes this a histogram of THIS
+    // caller's plan rather than of any plan whose id they can guess, and the
+    // aggregate returns counts and no entity ids either way.
+    let mut read = state.read_as(&viewer).await.map_err(scoped_read_error)?;
+    let by_state = PrivatizationRepository::item_state_counts_conn(&mut read, plan_id).await?;
+    read.commit().await.map_err(scoped_read_error)?;
+
+    let mut summary = summarise(plan);
+    summary.items_by_state = Some(by_state);
+    Ok(Json(summary))
 }
 
 /// `GET /api/v1/admin/privatization/plans/:id/items` — one page of the frozen
@@ -967,6 +1109,556 @@ pub async fn get_plan_items(
 }
 
 // =============================================================================
+// APPROVE / APPLY / ABORT / REVERT — the state-changing surface.
+//
+// Every one of the four has the same skeleton and the order of its steps is the
+// control, not a style:
+//
+//   1. load the plan on the ACTOR's stamped connection. Migration 087's SELECT
+//      policy is what decides whether the plan exists FOR THIS CALLER, and a
+//      plan they do not administer is a 404 rather than a 403 — distinguishing
+//      the two would be an existence oracle over every other admin's plans.
+//   2. `require_plan_authority` against the plan's OWN `target_group_id`, on the
+//      maintenance connection, so the refusal is a 403 with a reason (sec F7b).
+//   3. the route's own preconditions — TTL, digest, approver, mode — each with
+//      its own status, so an operator can tell "go and get an approval" (428)
+//      from "the plan moved" (409) from "re-run the preview" (410).
+//   4. ONE transaction on the maintenance connection: the `security_events`
+//      row, the conditional state flip, the audit row and the enqueue.
+//
+// STEP 4 IS ONE TRANSACTION AND THAT IS §6.5.5's SIXTH CONDITION. The handler
+// refuses to dispatch unless `dispatched_by` matches the `agent_id` on the
+// `security_events` row for this `correlation_id`; an event written on a
+// different connection can commit while the flip rolls back, leaving a
+// correlation id that would authorise a plan nobody dispatched.
+//
+// NONE OF THIS IS THE AUTHORIZATION FOR THE MUTATION. FINAL-PLAN §6.5.5: "The
+// handler re-validates. The HTTP layer's checks are not the authorization
+// (sec F5)." What these four routes decide is what the OPERATOR is told; what
+// the rows do is decided again, from the database, in
+// `epigraph-jobs/src/privatization.rs`.
+// =============================================================================
+
+/// `POST /api/v1/admin/privatization/plans/:id/approve` — the second pair of
+/// eyes.
+///
+/// # Acceptance clause 3 is here; clause 4 is a 404 or a 403, never a 409
+///
+/// FINAL-PLAN's PR-18 acceptance line asks for two 409s on this route: "approve
+/// by `created_by`" and "approve by an instance admin who is not an admin of the
+/// target group". The first is below and is a 409.
+///
+/// **The second is a 404 where migration 087's read policy binds, and a 403 from
+/// §6.6's condition 4 where it does not** — a superuser or `BYPASSRLS`
+/// connection, which is what a test fixture usually has. 087's
+/// `privatization_plans_read` requires instance-admin AND
+/// group-admin-of-target, so where the policy applies an instance admin who does
+/// not administer the target group cannot see the plan at all and step 1 answers
+/// before step 3 can; where it does not, step 2 answers. Both are strictly more
+/// conservative than the specified 409 — both disclose less — and returning 409
+/// would require the handler to tell a caller that a plan they may not read
+/// exists. The divergence is recorded in `docs/tenancy/progress.json`, and the
+/// regression asserts the DISJUNCTION rather than pinning either status, so a
+/// fixture's connection posture is not encoded as a contract.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` any of FINAL-PLAN §6.6's four conditions;
+/// `404` no such plan, or one the caller may not read; `409` the actor is the
+/// plan's author, or the plan is not `previewed`, or it already has an approver;
+/// `410` the plan has aged out; `500` a database fault.
+#[cfg(feature = "db")]
+pub async fn approve_plan(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<PlanStateResponse>, ApiError> {
+    use epigraph_db::repos::privatization::{PlanTransition, PrivatizationRepository};
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+
+    refuse_if_expired(&plan)?;
+
+    // FOUR EYES. Migration 080's `pp_four_eyes` CHECK says the same thing and
+    // binds the maintenance connection too; this is here so the answer is a 409
+    // with a sentence rather than a 500 carrying `23514`.
+    if actor == plan.created_by {
+        return Err(ApiError::Conflict {
+            reason: "a plan cannot be approved by the agent that created it; a second instance \
+                     admin who also administers the target group must approve"
+                .to_string(),
+        });
+    }
+    if plan.state != "previewed" {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "a plan can only be approved while it is 'previewed'; this one is \
+                             '{}'",
+                plan.state
+            ),
+        });
+    }
+
+    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut tx = sqlx::Connection::begin(&mut *maint)
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+    let moved = PrivatizationRepository::transition_plan_conn(
+        &mut tx,
+        plan_id,
+        PlanTransition::Approve { approver: actor },
+    )
+    .await
+    .map_err(plan_write_error)?;
+    if moved == 0 {
+        // The `WHERE` refused: something moved the plan between the read above
+        // and this statement. A 409 and not a 500 — the database's answer is
+        // "no", not "broken".
+        return Err(ApiError::Conflict {
+            reason: "the plan moved while it was being approved; re-read it and try again"
+                .to_string(),
+        });
+    }
+    PrivatizationRepository::record_plan_audit_conn(
+        &mut tx,
+        epigraph_db::repos::privatization::PlanAuditEntry {
+            plan_id,
+            actor_agent_id: actor,
+            action: "plan.approve",
+            kind: None,
+            entity_id: None,
+            plan_digest: plan.plan_digest.as_deref(),
+            correlation_id: None,
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+    tx.commit()
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    Ok(Json(PlanStateResponse {
+        plan_id,
+        state: "approved".to_string(),
+    }))
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/apply` — validate, flip, enqueue,
+/// `202`.
+///
+/// # It does not apply anything
+///
+/// FINAL-PLAN §6.5.5: not one transaction, a job. This handler's whole output is
+/// a `jobs` row and a plan in `applying`; the rows move in
+/// `epigraph-jobs/src/privatization.rs`, which re-validates every condition
+/// below from the database before touching one.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` any of FINAL-PLAN §6.6's four conditions;
+/// `404` no such plan, or one the caller may not read; `409` a stale digest or a
+/// plan that is not `previewed`/`approved`; `410` a plan older than the preview
+/// TTL; `428` a plan that needs a second approver or an author-loss
+/// acknowledgement; `500` a database fault.
+#[cfg(feature = "db")]
+pub async fn apply_plan(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<ApplyRequest>,
+) -> Result<(axum::http::StatusCode, Json<DispatchResponse>), ApiError> {
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+
+    refuse_if_expired(&plan)?;
+    refuse_stale_digest(&plan, &body.plan_digest)?;
+
+    if !matches!(plan.state.as_str(), "previewed" | "approved") {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "a plan can only be applied from 'previewed' or 'approved'; this one is '{}'",
+                plan.state
+            ),
+        });
+    }
+
+    // §6.5.5's refusal thresholds. A 428 and not a 403: the caller is
+    // authorized, the plan is well-formed, and the missing thing is an approval
+    // they can go and get. The threshold is restated from the same two numbers
+    // `create_plan` uses to set `requires_second_approver`, so a preview that
+    // says "you will need an approver" and an apply that demands one cannot
+    // disagree.
+    let needs_second = plan.item_count
+        > i32::try_from(SECOND_APPROVER_ITEM_THRESHOLD).unwrap_or(i32::MAX)
+        || plan.authors_losing_count > 0;
+    if needs_second {
+        match plan.approved_by {
+            None => {
+                return Err(ApiError::PreconditionRequired {
+                    reason: "this plan needs a second instance admin, who must also administer \
+                             the target group, to approve it before it can be applied"
+                        .to_string(),
+                })
+            }
+            Some(approver) if approver == plan.created_by => {
+                return Err(ApiError::PreconditionRequired {
+                    reason: "the recorded approver is the plan's own author; a different \
+                             instance admin must approve"
+                        .to_string(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    // Unreachable while `create_plan` returns 501 for `mode='seal'`; written
+    // because the acknowledgement is a property of the PLAN and the check
+    // belongs with the other thresholds rather than arriving with PR-21.
+    if plan.mode == "seal"
+        && plan.authors_losing_count > 0
+        && !(plan.acknowledge_author_loss || body.acknowledge_author_loss.unwrap_or(false))
+    {
+        return Err(ApiError::PreconditionRequired {
+            reason: "this seal plan would cost authors access to their own claims; re-send with \
+                     acknowledge_author_loss=true"
+                .to_string(),
+        });
+    }
+
+    dispatch(
+        &state,
+        &plan,
+        actor,
+        "applying",
+        &["previewed".to_string(), "approved".to_string()],
+        DispatchKind::Apply,
+    )
+    .await
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/abort` — stop a run in flight.
+///
+/// §6.5.5: "To stop: `POST …/abort` sets `state='failed'`; the applied prefix
+/// stays applied. Then `POST …/revert` un-applies exactly the items with
+/// `state='applied'`." So this is deliberately NOT an undo — it is a stop, and
+/// the undo is a separate, audited, digest-echoing request.
+///
+/// The running handler re-reads the plan state at every batch boundary behind
+/// the same global advisory lock, so an abort that commits here is seen by the
+/// next batch and the run stops without writing a terminal state over it.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` any of FINAL-PLAN §6.6's four conditions;
+/// `404` no such plan, or one the caller may not read; `409` a plan that is not
+/// running; `500` a database fault.
+#[cfg(feature = "db")]
+pub async fn abort_plan(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+) -> Result<Json<PlanStateResponse>, ApiError> {
+    use epigraph_db::repos::privatization::{PlanTransition, PrivatizationRepository};
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+
+    if !matches!(plan.state.as_str(), "applying" | "reverting") {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "only a running plan can be aborted; this one is '{}'",
+                plan.state
+            ),
+        });
+    }
+
+    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut tx = sqlx::Connection::begin(&mut *maint)
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+    let moved = PrivatizationRepository::transition_plan_conn(
+        &mut tx,
+        plan_id,
+        PlanTransition::Finish {
+            state: "failed",
+            // NOT the empty list. The state check above read the plan before
+            // this transaction opened, and the job handler's terminal write can
+            // commit in between; an unconditional `failed` would stamp itself
+            // over an `applied` that every item and every claim agree with, and
+            // report a successful run as failed to `GET /plans/:id` and to the
+            // audit timeline. `failed` is IN the list, so a double abort still
+            // matches and stays idempotent rather than becoming a 409.
+            from_states: &[
+                "applying".to_string(),
+                "reverting".to_string(),
+                "failed".to_string(),
+            ],
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+    if moved == 0 {
+        // The transaction is dropped un-committed, so no `plan.abort` row is
+        // written for an abort that aborted nothing.
+        return Err(ApiError::Conflict {
+            reason: "the plan reached a terminal state while it was being aborted; re-read it"
+                .to_string(),
+        });
+    }
+    PrivatizationRepository::record_plan_audit_conn(
+        &mut tx,
+        epigraph_db::repos::privatization::PlanAuditEntry {
+            plan_id,
+            actor_agent_id: actor,
+            action: "plan.abort",
+            kind: None,
+            entity_id: None,
+            plan_digest: plan.plan_digest.as_deref(),
+            correlation_id: None,
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+    tx.commit()
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    Ok(Json(PlanStateResponse {
+        plan_id,
+        state: "failed".to_string(),
+    }))
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/revert` — un-apply the items that
+/// were applied.
+///
+/// # `restrict` is fully reversible, and clause 10 is not met by this build
+///
+/// §6.5.5's strongest argument for `restrict` as the default is that `content`,
+/// `content_tsv` and `embedding` are never touched, so a revert is a tenancy
+/// UPDATE and nothing else. That half ships here.
+///
+/// FINAL-PLAN's acceptance clause 10 also asks that a `mode='seal'` plan whose
+/// items are all unsealed can be reverted and one with sealed items returns
+/// `409` with the still-sealed count. **The 409 arm ships and the positive arm
+/// cannot be exercised**: `crates/epigraph-privacy` does not exist, `seal` mode
+/// is PR-21's, and `create_plan` returns `501` for it — so no plan this build
+/// can create has a sealed item. That is stated rather than faked.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` any of FINAL-PLAN §6.6's four conditions;
+/// `404` no such plan, or one the caller may not read; `409` a stale digest, a
+/// plan that has not been applied, or one with sealed items; `500` a database
+/// fault.
+#[cfg(feature = "db")]
+pub async fn revert_plan(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Path(plan_id): Path<Uuid>,
+    Json(body): Json<RevertRequest>,
+) -> Result<(axum::http::StatusCode, Json<DispatchResponse>), ApiError> {
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+
+    let plan = load_plan_for_actor(&state, &viewer, plan_id).await?;
+    let actor = require_plan_authority(&state, auth, plan.target_group_id).await?;
+
+    // NO TTL CHECK. The 4 h window is on ACTING ON A PREVIEW, and a revert acts
+    // on what was applied. A plan that can never be reverted after four hours is
+    // not "fully reversible", which is the property §6.5.5 puts the most weight
+    // on.
+    refuse_stale_digest(&plan, &body.plan_digest)?;
+
+    if !matches!(
+        plan.state.as_str(),
+        "applied" | "applied_with_drift" | "failed"
+    ) {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "only an applied or aborted plan can be reverted; this one is '{}'",
+                plan.state
+            ),
+        });
+    }
+
+    // THE COUNT IS SCOPED TO SEAL-MODE PLANS, in the statement itself. That
+    // matters here because `claim_encryption` belongs to the pre-existing
+    // encrypted-subgraph feature, not to D4: a `restrict` plan whose frozen set
+    // contains an already-encrypted claim sealed nothing, and refusing its
+    // revert would defeat the full reversibility §6.5.4 leans on hardest.
+    let (mut maint, _bypass) = maintenance(&state).await?;
+    let sealed = PrivatizationRepository::sealed_item_count_conn(&mut maint, plan_id)
+        .await
+        .map_err(plan_write_error)?;
+    drop(maint);
+    if sealed > 0 {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "{sealed} of this plan's items are still sealed; unseal them before reverting. \
+                 A sealed claim cannot be made public — its content is ciphertext no reader is \
+                 entitled to."
+            ),
+        });
+    }
+
+    dispatch(
+        &state,
+        &plan,
+        actor,
+        "reverting",
+        &[
+            "applied".to_string(),
+            "applied_with_drift".to_string(),
+            "failed".to_string(),
+        ],
+        DispatchKind::Revert,
+    )
+    .await
+}
+
+/// `GET /api/v1/admin/privatization/audit` — the privatization timeline.
+///
+/// # Why it is an HTTP route at all (§6.5.8)
+///
+/// The security critique proposed moving the instance-wide view to an
+/// `epigraph_maintenance` CLI query. It was refused: that role bypasses RLS
+/// entirely and writes no `security_events` row, so it would make the most
+/// sensitive read in the system LESS controlled and LESS observable than the
+/// route it replaced. An auditor gets plan-level rows for every plan they
+/// administer, entity ids only where migration 083's policy admits the entity
+/// arm, and **every read of this endpoint writes its own `security_events`
+/// row**.
+///
+/// # It runs on the ACTOR's stamped connection, and that is the whole control
+///
+/// `privatization_audit` has no `visibility` column. Its tenancy is 083's
+/// policy, resolved through a sub-select over `privatization_plans` that 087's
+/// policy filters in turn — two policies deep, both properties of the
+/// CONNECTION. Reusing the maintenance connection this handler also holds would
+/// return every row in the instance and pass every test.
+///
+/// # Errors
+///
+/// `401` no auth context; `403` without the `instance:admin` scope; `500` a
+/// database fault.
+#[cfg(feature = "db")]
+pub async fn get_audit(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    Query(params): Query<AuditQueryParams>,
+) -> Result<Json<AuditResponse>, ApiError> {
+    use epigraph_db::repos::privatization::{AuditQuery, PrivatizationRepository};
+    use epigraph_db::repos::security_event::SecurityEventRepository;
+
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["instance:admin"])?;
+    let Some(actor) = auth.agent_id else {
+        return Err(ApiError::Unauthorized {
+            reason: "this token carries no agent identity".to_string(),
+        });
+    };
+
+    let limit = params.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+
+    // THE AUDIT ROW IS WRITTEN BEFORE THE READ, not after. A reader who
+    // disconnects mid-response, or a query that faults, has still made the
+    // request; an audit trail that records only successful reads is one that
+    // can be emptied by failing.
+    //
+    // `success` is therefore `None` and not `true`. At this point the read has
+    // not happened, and a hardcoded `true` would make the column carry no
+    // information at all for this event type. `Option<bool>` already has a value
+    // for "attempted, outcome not yet known".
+    {
+        let (mut maint, _bypass) = maintenance(&state).await?;
+        SecurityEventRepository::log_conn(
+            &mut maint,
+            &epigraph_db::repos::security_event::SecurityEventRow {
+                id: Uuid::new_v4(),
+                event_type: AUDIT_READ_EVENT_TYPE.to_string(),
+                agent_id: Some(actor),
+                success: None,
+                details: serde_json::json!({
+                    "plan_id": params.plan_id,
+                    "entity_id": params.entity_id,
+                    "limit": limit,
+                }),
+                ip_address: None,
+                user_agent: None,
+                correlation_id: Some(new_correlation_id()),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .map_err(plan_write_error)?;
+    }
+
+    let mut read = state.read_as(&viewer).await.map_err(scoped_read_error)?;
+    let rows = PrivatizationRepository::load_audit_conn(
+        &mut read,
+        AuditQuery {
+            plan_id: params.plan_id,
+            entity_id: params.entity_id,
+            since: params.since,
+            limit,
+        },
+    )
+    .await?;
+    read.commit().await.map_err(scoped_read_error)?;
+
+    Ok(Json(AuditResponse {
+        events: rows
+            .into_iter()
+            .map(|r| AuditEvent {
+                id: r.id,
+                plan_id: r.plan_id,
+                actor_agent_id: r.actor_agent_id,
+                action: r.action,
+                kind: r.kind,
+                entity_id: r.entity_id,
+                before_visibility: r.before_visibility,
+                after_visibility: r.after_visibility,
+                correlation_id: r.correlation_id,
+                created_at: r.created_at,
+            })
+            .collect(),
+    }))
+}
+
+// =============================================================================
 // HELPERS (db feature)
 // =============================================================================
 
@@ -976,34 +1668,327 @@ pub async fn get_plan_items(
 /// `require_instance_admin_for_group`'s doc gives: the plurality and role checks
 /// count `group_memberships` rows, which migration 077's policy narrows on the
 /// actor's connection.
+///
+/// Returns the caller's `agent_id`, so a handler that needs to attribute a write
+/// cannot proceed with `None` and cannot re-derive it from a different source.
 #[cfg(feature = "db")]
 async fn require_plan_authority(
     state: &AppState,
     auth: &crate::middleware::bearer::AuthContext,
     target_group_id: Uuid,
-) -> Result<(), ApiError> {
+) -> Result<Uuid, ApiError> {
+    let (mut maint, _bypass) = maintenance(state).await?;
+    crate::middleware::instance_authz::require_instance_admin_for_group(
+        auth,
+        target_group_id,
+        &mut maint,
+    )
+    .await
+}
+
+/// The maintenance connection, with the one reason this surface grants a bypass
+/// under.
+///
+/// `SystemReason::PrivatizationSelection` is used for the authority check, the
+/// selection, the state flips and the enqueue alike. It is not stretched: the
+/// reason space is a CLOSED, monotonically decreasing register
+/// (`viewer_ratchet.rs` asserts `SystemReason::ALL.len()` never grows), and the
+/// question every one of those statements answers is the same one — "may this
+/// operator privatize this group's subgraph". The apply-side reason,
+/// `SystemReason::PrivatizationApply`, belongs to the JOB, which is where the
+/// rows actually move.
+#[cfg(feature = "db")]
+async fn maintenance(
+    state: &AppState,
+) -> Result<
+    (
+        epigraph_db::MaintenanceConn<'_>,
+        epigraph_db::visibility::Viewer,
+    ),
+    ApiError,
+> {
     use epigraph_db::visibility::SystemReason;
 
-    let (mut maint, _bypass) = state
+    state
         .maintenance_viewer(SystemReason::PrivatizationSelection)
         .await
         .map_err(|e| {
             tracing::error!(
                 target: "tenancy.privatization",
                 error = %e,
-                "could not acquire the maintenance connection for the authority check"
+                "could not acquire the maintenance connection"
             );
             ApiError::InternalError {
                 message: "Failed to acquire a maintenance connection".to_string(),
             }
-        })?;
-    crate::middleware::instance_authz::require_instance_admin_for_group(
-        auth,
-        target_group_id,
-        &mut maint,
-    )
-    .await?;
+        })
+}
+
+/// Load a plan on the ACTOR's own stamped connection, or 404.
+///
+/// Step 1 of the four-step skeleton this module's mid-file banner describes. The
+/// 404 is 087's SELECT policy answering, not a handler decision, and it is a 404
+/// rather than a 403 on purpose: distinguishing "no such plan" from "a plan you
+/// may not read" is an existence oracle over every other admin's plans.
+#[cfg(feature = "db")]
+async fn load_plan_for_actor(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    plan_id: Uuid,
+) -> Result<epigraph_db::repos::privatization::PlanRow, ApiError> {
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let mut read = state.read_as(viewer).await.map_err(scoped_read_error)?;
+    let plan = PrivatizationRepository::load_plan_conn(&mut read, plan_id).await?;
+    // COMMITTED BEFORE THE CALLER ACQUIRES FROM THE MAINTENANCE POOL. Holding
+    // this open across that acquire pins one connection from each of two pools
+    // for the width of a request, and the maintenance pool is deliberately the
+    // smallest in the process.
+    read.commit().await.map_err(scoped_read_error)?;
+
+    plan.ok_or_else(|| ApiError::NotFound {
+        entity: "privatization plan".to_string(),
+        id: plan_id.to_string(),
+    })
+}
+
+/// `410 Gone` once a plan is older than the preview TTL.
+///
+/// §6.5.5's refusal thresholds: "Plan older than 4 h → `410 Gone`". The window
+/// is on ACTING ON A PREVIEW — the corpus moves, and a four-hour-old selection
+/// is a description of a graph that no longer exists. `revert` deliberately does
+/// not call this; see its doc.
+#[cfg(feature = "db")]
+fn refuse_if_expired(plan: &epigraph_db::repos::privatization::PlanRow) -> Result<(), ApiError> {
+    let expires_at = plan.created_at + chrono::Duration::hours(PLAN_TTL_HOURS);
+    if chrono::Utc::now() > expires_at {
+        return Err(ApiError::Gone {
+            reason: format!(
+                "this preview expired at {expires_at}; re-run the selection. A frozen plan \
+                 describes the graph as it was, and the graph has had {PLAN_TTL_HOURS} hours to \
+                 move"
+            ),
+        });
+    }
     Ok(())
+}
+
+/// `409` unless the caller echoed the plan's CURRENT digest (acceptance clause 2).
+///
+/// # It is compared as bytes, after a strict parse
+///
+/// The wire form is `b3:` plus 64 lowercase hex characters, which is what
+/// `create_plan` emits. A malformed token is the SAME 409 as a wrong one and not
+/// a 400: both mean "you did not echo the digest of the plan you are applying",
+/// and splitting them tells a caller whether their guess was well-formed.
+///
+/// The comparison is `==` on `[u8]` and not `constant_time_eq`. The digest is
+/// not a secret — `create_plan` returns it and `GET /plans/:id` would too — it
+/// is a STALENESS token, so there is nothing for a timing oracle to recover that
+/// the caller was not already given.
+///
+/// # What the digest does NOT bind
+///
+/// `PrivatizationRepository::plan_digest` covers the selection SET and not
+/// `target_group_id`, `mode`, `on_conflict` or `pad_to`. So this proves the
+/// corpus has not moved under the plan; it does not prove the caller is applying
+/// the plan they think they are. That is what `plan_id` in the path is for, and
+/// the repo function's doc says so.
+#[cfg(feature = "db")]
+fn refuse_stale_digest(
+    plan: &epigraph_db::repos::privatization::PlanRow,
+    echoed: &str,
+) -> Result<(), ApiError> {
+    let stale = || ApiError::Conflict {
+        reason: "the plan_digest you echoed is not this plan's current digest; the selection has \
+                 moved underneath the plan. Re-run the preview and review it before applying"
+            .to_string(),
+    };
+    let Some(stored) = plan.plan_digest.as_deref() else {
+        return Err(stale());
+    };
+    let Some(hex_digits) = echoed.strip_prefix("b3:") else {
+        return Err(stale());
+    };
+    let Ok(bytes) = hex::decode(hex_digits) else {
+        return Err(stale());
+    };
+    if bytes != stored {
+        return Err(stale());
+    }
+    Ok(())
+}
+
+/// Which job a dispatch enqueues.
+#[cfg(feature = "db")]
+#[derive(Clone, Copy)]
+enum DispatchKind {
+    /// `privatization_apply`.
+    Apply,
+    /// `privatization_revert`.
+    Revert,
+}
+
+/// The `security_events.event_type` `GET /audit` writes.
+///
+/// §6.5.7's `/audit` row: "every read writes a `security_events` row". A distinct
+/// type from [`DISPATCH_EVENT_TYPE`], because an audit READ and a privatization
+/// DISPATCH are different events and a single type would make the timeline
+/// unfilterable.
+#[cfg(feature = "db")]
+const AUDIT_READ_EVENT_TYPE: &str = "privatization_audit_read";
+
+/// The `security_events.event_type` `apply`/`revert` write and the job handler's
+/// sixth condition looks for.
+#[cfg(feature = "db")]
+const DISPATCH_EVENT_TYPE: &str = epigraph_jobs::privatization::DISPATCH_EVENT_TYPE;
+
+/// A fresh correlation id: 32 hex characters, inside `varchar(64)`.
+///
+/// Hyphenless so the same token is a legal `security_events.correlation_id`, a
+/// legal `privatization_audit.correlation_id` and a legal JSON string without
+/// any per-surface reformatting that could make three tables disagree about
+/// which request they describe.
+#[cfg(feature = "db")]
+fn new_correlation_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+/// The one transaction that turns an authorized request into a running plan.
+///
+/// The `security_events` row, the CONDITIONAL state flip, the audit row and the
+/// `jobs` row, in that order, on one maintenance connection, committed together.
+///
+/// # Why all four and not three
+///
+/// FINAL-PLAN §6.5.5's sixth re-validation condition is that `dispatched_by`
+/// matches the `agent_id` on the `security_events` row the HTTP layer wrote for
+/// this `correlation_id`. `privatization_plans` has no `correlation_id` column —
+/// migration 080 is applied and frozen — so the token rides in the job payload,
+/// and the event and the flip must commit or roll back together or that
+/// condition compares two facts from different worlds.
+///
+/// # The flip is conditional and a zero row count is a 409
+///
+/// `PlanTransition::Dispatch` carries `WHERE state = ANY($4)`. Two concurrent
+/// `apply` calls therefore cannot both flip the plan and enqueue two jobs
+/// against it; the loser is told the plan moved.
+#[cfg(feature = "db")]
+async fn dispatch(
+    state: &AppState,
+    plan: &epigraph_db::repos::privatization::PlanRow,
+    actor: Uuid,
+    to_state: &str,
+    from_states: &[String],
+    kind: DispatchKind,
+) -> Result<(axum::http::StatusCode, Json<DispatchResponse>), ApiError> {
+    use epigraph_db::repos::privatization::{
+        PlanAuditEntry, PlanTransition, PrivatizationRepository,
+    };
+    use epigraph_db::repos::security_event::{SecurityEventRepository, SecurityEventRow};
+
+    let correlation_id = new_correlation_id();
+    let job = match kind {
+        DispatchKind::Apply => epigraph_jobs::EpiGraphJob::PrivatizationApply {
+            plan_id: plan.id,
+            dispatched_by: actor,
+            correlation_id: correlation_id.clone(),
+        },
+        DispatchKind::Revert => epigraph_jobs::EpiGraphJob::PrivatizationRevert {
+            plan_id: plan.id,
+            dispatched_by: actor,
+            correlation_id: correlation_id.clone(),
+        },
+    };
+    let job_type = job.job_type().to_string();
+    let payload = serde_json::to_value(&job).map_err(|e| {
+        tracing::error!(target: "tenancy.privatization", error = %e, "job payload");
+        ApiError::InternalError {
+            message: "Failed to encode the privatization job".to_string(),
+        }
+    })?;
+
+    let (mut maint, _bypass) = maintenance(state).await?;
+    let mut tx = sqlx::Connection::begin(&mut *maint)
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    SecurityEventRepository::log_conn(
+        &mut tx,
+        &SecurityEventRow {
+            id: Uuid::new_v4(),
+            event_type: DISPATCH_EVENT_TYPE.to_string(),
+            agent_id: Some(actor),
+            success: Some(true),
+            // The plan id and the target state, and NOT the item ids or any
+            // content. `security_events` is read by a principal-keyed policy,
+            // not by a group-admin one, so its `details` must not carry the
+            // entity ids `privatization_plan_items` exists to fence.
+            details: serde_json::json!({
+                "plan_id": plan.id,
+                "target_group_id": plan.target_group_id,
+                "to_state": to_state,
+                "item_count": plan.item_count,
+            }),
+            ip_address: None,
+            user_agent: None,
+            correlation_id: Some(correlation_id.clone()),
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+
+    let moved = PrivatizationRepository::transition_plan_conn(
+        &mut tx,
+        plan.id,
+        PlanTransition::Dispatch {
+            dispatched_by: actor,
+            to_state,
+            from_states,
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+    if moved == 0 {
+        return Err(ApiError::Conflict {
+            reason: "the plan moved while it was being dispatched; re-read it and try again"
+                .to_string(),
+        });
+    }
+
+    PrivatizationRepository::record_plan_audit_conn(
+        &mut tx,
+        PlanAuditEntry {
+            plan_id: plan.id,
+            actor_agent_id: actor,
+            action: "plan.dispatch",
+            kind: None,
+            entity_id: None,
+            plan_digest: plan.plan_digest.as_deref(),
+            correlation_id: Some(&correlation_id),
+        },
+    )
+    .await
+    .map_err(plan_write_error)?;
+
+    let job_id = PrivatizationRepository::enqueue_job_conn(&mut tx, &job_type, &payload)
+        .await
+        .map_err(plan_write_error)?;
+
+    tx.commit()
+        .await
+        .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
+
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(DispatchResponse {
+            plan_id: plan.id,
+            job_id,
+            state: to_state.to_string(),
+            correlation_id,
+        }),
+    ))
 }
 
 /// Resolve the selector's seed arm to claim ids, unfiltered.
@@ -1118,6 +2103,10 @@ async fn resolve_seeds(
 }
 
 /// Map a plan row onto the list/summary shape, deriving `expires_at`.
+///
+/// `items_by_state` is `None` here and filled in by `get_plan` alone: the list
+/// endpoint would otherwise run one aggregate per row, and a page of five
+/// hundred plans is five hundred `GROUP BY`s to serve a field nobody asked for.
 #[cfg(feature = "db")]
 fn summarise(row: epigraph_db::repos::privatization::PlanRow) -> PlanSummary {
     PlanSummary {
@@ -1127,6 +2116,12 @@ fn summarise(row: epigraph_db::repos::privatization::PlanRow) -> PlanSummary {
         target_group_id: row.target_group_id,
         item_count: row.item_count,
         authors_losing_count: row.authors_losing_count,
+        approved_by: row.approved_by,
+        approved_at: row.approved_at,
+        dispatched_by: row.dispatched_by,
+        cursor_depth: row.cursor_depth,
+        drift_count: row.drift_count,
+        items_by_state: None,
         created_at: row.created_at,
         expires_at: row.created_at + chrono::Duration::hours(PLAN_TTL_HOURS),
     }
@@ -1315,6 +2310,84 @@ pub async fn get_plan_items(
     Path(_plan_id): Path<Uuid>,
     Query(_params): Query<PlanItemQuery>,
 ) -> Result<Json<PlanItemsResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/approve` without the `db`
+/// feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn approve_plan(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+) -> Result<Json<PlanStateResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/apply` without the `db` feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn apply_plan(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+    Json(_body): Json<ApplyRequest>,
+) -> Result<Json<DispatchResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/abort` without the `db` feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn abort_plan(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+) -> Result<Json<PlanStateResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `POST /api/v1/admin/privatization/plans/:id/revert` without the `db` feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn revert_plan(
+    State(_state): State<AppState>,
+    Path(_plan_id): Path<Uuid>,
+    Json(_body): Json<RevertRequest>,
+) -> Result<Json<DispatchResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "Privatization requires database".to_string(),
+    })
+}
+
+/// `GET /api/v1/admin/privatization/audit` without the `db` feature.
+///
+/// # Errors
+///
+/// Always `503`.
+#[cfg(not(feature = "db"))]
+pub async fn get_audit(
+    State(_state): State<AppState>,
+    Query(_params): Query<AuditQueryParams>,
+) -> Result<Json<AuditResponse>, ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "Privatization requires database".to_string(),
     })

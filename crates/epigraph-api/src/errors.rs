@@ -209,6 +209,33 @@ pub enum ApiError {
     /// ship the semantics."
     #[error("Not implemented: {feature}")]
     NotImplemented { feature: String },
+
+    /// `428 Precondition Required` — the request is well-formed and authorized,
+    /// and a precondition the SERVER requires has not been met yet.
+    ///
+    /// Distinct from `Conflict` (409, "the state you named is not the state
+    /// there is") and from `Forbidden` (403, "you may not do this at all"). It
+    /// means: do this other thing first, then repeat this request unchanged.
+    ///
+    /// FINAL-PLAN §6.5.7 gives `POST /admin/privatization/plans/:id/apply` a
+    /// `428` for a plan that needs a second approver, and the distinction is
+    /// operationally real: a 403 tells an operator they lack authority, a 409
+    /// tells them the plan moved, and only a 428 tells them to go and get an
+    /// approval. Collapsing it into 409 was considered and refused — the three
+    /// refusals on that one route would then be indistinguishable by status.
+    #[error("Precondition required: {reason}")]
+    PreconditionRequired { reason: String },
+
+    /// `410 Gone` — the resource existed, still exists as a record, and has
+    /// aged out of the window in which it may be acted on.
+    ///
+    /// FINAL-PLAN §6.5.5's refusal thresholds: "Plan older than 4 h → `410
+    /// Gone`". Not a `404`, because the plan is still readable and its audit
+    /// trail still matters; not a `409`, because no state changed and re-reading
+    /// will not help. The client's next action is to re-run the preview, and
+    /// only a status that says "this specific thing has expired" carries that.
+    #[error("Gone: {reason}")]
+    Gone { reason: String },
 }
 
 /// JSON error response structure
@@ -296,6 +323,16 @@ impl IntoResponse for ApiError {
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
                 Some(serde_json::json!({ "feature": feature })),
+            ),
+            ApiError::PreconditionRequired { reason } => (
+                StatusCode::PRECONDITION_REQUIRED,
+                "PreconditionRequired",
+                Some(serde_json::json!({ "reason": reason })),
+            ),
+            ApiError::Gone { reason } => (
+                StatusCode::GONE,
+                "Gone",
+                Some(serde_json::json!({ "reason": reason })),
             ),
         };
 

@@ -279,6 +279,97 @@ async fn delete_is_denied_on_instance_admins_even_for_the_maintenance_role(pool:
     assert_eq!(count, 1, "the row must survive the attempted DELETE");
 }
 
+/// Migration 088's UPDATE policies admit the maintenance role and nobody else.
+///
+/// # Why this needs its own test when `rls_enforcement.rs` already checks the
+/// polcmd matrix
+///
+/// That test asserts a policy EXISTS for the pair; this asserts what it lets
+/// through. Those are different claims, and the failure this one catches is the
+/// one that would be invisible: a policy whose expression admits an app session
+/// covers the pair perfectly well.
+///
+/// # BOTH directions, and the app-role half is the one that rots
+///
+/// A test that only showed the maintenance UPDATE succeeding would pass on a
+/// `FOR ALL … USING (true)` policy. A test that only showed the app UPDATE
+/// failing would pass on the state of the tree BEFORE 088, where no role could
+/// update at all and `approve` was impossible. So both.
+///
+/// The app-role denial here arrives from the GRANT layer — migration 080 REVOKEs
+/// UPDATE on both tables from `epigraph_app` — rather than from the policy, and
+/// that is the honest description rather than a weaker one: two independent
+/// controls say no, and if the REVOKE were ever loosened 088's policy is what
+/// would still say it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_plan_state_machine_is_updatable_on_the_maintenance_role_and_not_on_the_app_role(
+    pool: PgPool,
+) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "state-machine").await;
+    backdate_group(&pool, group).await;
+    add_admin(&pool, group, "sm-co-1").await;
+    add_admin(&pool, group, "sm-co-2").await;
+    let plan = insert_plan(&pool, group, author)
+        .await
+        .expect("the guard admits a mature, plural target group");
+
+    // ---- the app role. ----
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let denied = sqlx::query("UPDATE privatization_plans SET state = 'approved' WHERE id = $1")
+        .bind(plan)
+        .execute(&app)
+        .await;
+    assert!(
+        denied.is_err(),
+        "the app role must not be able to move a plan's state. Two controls say so — 080's \
+         REVOKE and 088's bypass-only policy — and a success here means both are gone"
+    );
+    let denied_items =
+        sqlx::query("UPDATE privatization_plan_items SET state = 'applied' WHERE plan_id = $1")
+            .bind(plan)
+            .execute(&app)
+            .await;
+    assert!(
+        denied_items.is_err(),
+        "the app role must not be able to mark an item applied; per-item state is the job \
+         handler's and its authority is the re-validation, not a request"
+    );
+
+    // ---- the maintenance role. ----
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let moved = sqlx::query("UPDATE privatization_plans SET state = 'applying' WHERE id = $1")
+        .bind(plan)
+        .execute(&maint)
+        .await
+        .expect("migration 088 must admit the maintenance role, or approve/apply cannot exist")
+        .rows_affected();
+    assert_eq!(
+        moved, 1,
+        "an UPDATE that matches zero rows on the maintenance role is what the tree looked like \
+         BEFORE 088; this assertion is what tells the two apart"
+    );
+
+    // DELETE stays denied on both tables, on both roles. `FOR ALL` would have
+    // covered it silently, and a plan is the record that a privatization was
+    // attempted.
+    for pool_under_test in [&app, &maint] {
+        let deleted = sqlx::query("DELETE FROM privatization_plans WHERE id = $1")
+            .bind(plan)
+            .execute(pool_under_test)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0);
+        assert_eq!(deleted, 0, "no DELETE policy means no plan is deletable");
+    }
+    let survives: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM privatization_plans WHERE id = $1")
+            .bind(plan)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(survives, 1);
+}
+
 /// Migration 081's plan guard refuses a target group an actor could manufacture.
 ///
 /// "Group admin in the target group" prevented nothing on its own:

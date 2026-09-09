@@ -30,8 +30,9 @@ use axum::Json;
 use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::privatization::{
-    create_plan, get_plan, get_plan_items, list_plans, ClosureBody, CreatePlanRequest,
-    PlanItemQuery, PlanListQuery, PlanSeeds, SeedIds, SeedPredicate,
+    abort_plan, apply_plan, approve_plan, create_plan, get_plan, get_plan_items, list_plans,
+    ApplyRequest, ClosureBody, CreatePlanRequest, PlanItemQuery, PlanListQuery, PlanSeeds, SeedIds,
+    SeedPredicate,
 };
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_auth::{AuthContext, ClientType};
@@ -39,7 +40,9 @@ use epigraph_db::repos::instance_admin::InstanceAdminRepository;
 use epigraph_db::visibility::Viewer;
 use sqlx::PgPool;
 use uuid::Uuid;
-use viewer_fixture::{downgraded_pool, scoped_pool, seed_agent_with_group, seed_group_claim};
+use viewer_fixture::{
+    downgraded_pool, scoped_pool, seed_agent_with_group, seed_group_claim, seed_public_claim,
+};
 
 // ===========================================================================
 // The happy path, and the sec-F7 response shape.
@@ -732,4 +735,448 @@ async fn add_admin(pool: &PgPool, group: Uuid, label: &str) -> Uuid {
     .await
     .expect("seed co-admin membership");
     agent
+}
+
+// ===========================================================================
+// PR-18's apply-time surface: approve, apply, abort.
+//
+// Acceptance clauses 2 and 3 live here. Clause 4 does NOT, and its absence is
+// the finding rather than an omission — see
+// `an_instance_admin_who_does_not_administer_the_target_gets_404_not_409`.
+// ===========================================================================
+
+/// **Acceptance clause 3.** `approve` by the plan's own author is a `409`.
+///
+/// Two independent controls say so and both are exercised. The handler compares
+/// the actor with `created_by` and answers with a sentence; migration 080's
+/// `pp_four_eyes` CHECK would raise `23514` on the same UPDATE if the handler
+/// forgot. The assertion is on the 409 because that is the clause, and the
+/// calibration below — a DIFFERENT admin's approval succeeding — is what makes
+/// it a measurement of four-eyes rather than of an approve route that never
+/// worked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn approve_by_the_plans_own_author_is_refused_with_409(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "four eyes").await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+
+    let err = approve_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect_err("the author must not be able to approve their own plan");
+    assert!(
+        matches!(&err, ApiError::Conflict { reason } if reason.contains("created it")),
+        "expected a four-eyes 409, got {err:?}"
+    );
+
+    // CALIBRATION. A second instance admin who also administers the target group
+    // CAN approve. Without this the assertion above is satisfied by an approve
+    // route that refuses everybody.
+    let second = add_admin(&pool, world.target_group, "second-eyes").await;
+    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
+    InstanceAdminRepository::grant(&maint, second, None, Some("route-test"))
+        .await
+        .expect("grant the second admin");
+    let Json(approved) = approve_plan(
+        ViewerExtractor(Viewer::resolve(&pool, second).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(auth_for(second))),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect("a second instance admin who administers the target group must be able to approve");
+    assert_eq!(approved.state, "approved");
+}
+
+/// **Acceptance clause 2.** `apply` with a stale digest is a `409`.
+///
+/// The digest is the staleness token: it covers the SELECTION SET, so echoing
+/// the wrong one means the caller is applying a plan whose contents they have
+/// not seen. The calibration is the same request with the CORRECT digest
+/// returning `202`, which is what tells a 409-for-everything apart from a 409
+/// for the reason under test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_with_a_stale_digest_is_refused_with_409(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "digest subject").await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+
+    for wrong in [
+        // A well-formed digest of a different set.
+        format!("b3:{}", "00".repeat(32)),
+        // A malformed token. The SAME 409, deliberately: both mean "you did not
+        // echo this plan's digest", and splitting them tells a caller whether
+        // their guess was well-formed.
+        "not-a-digest".to_string(),
+        preview.plan_digest.replace("b3:", ""),
+    ] {
+        let err = apply_plan(
+            ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+            State(state.clone()),
+            Some(axum::Extension(world.auth())),
+            Path(preview.plan_id),
+            Json(ApplyRequest {
+                plan_digest: wrong.clone(),
+                acknowledge_author_loss: None,
+            }),
+        )
+        .await
+        .expect_err("a stale or malformed digest must be refused");
+        assert!(
+            matches!(&err, ApiError::Conflict { .. }),
+            "expected a 409 for digest {wrong:?}, got {err:?}"
+        );
+    }
+
+    let plan_state: String =
+        sqlx::query_scalar("SELECT state FROM privatization_plans WHERE id = $1")
+            .bind(preview.plan_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the plan state");
+    assert_eq!(
+        plan_state, "previewed",
+        "a refused apply must not move the plan"
+    );
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("count jobs");
+    assert_eq!(queued, 0, "a refused apply must enqueue nothing");
+
+    // CALIBRATION: the correct digest is accepted.
+    let (status, Json(dispatched)) = apply_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+        Json(ApplyRequest {
+            plan_digest: preview.plan_digest.clone(),
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect("the plan's own digest must be accepted");
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    assert_eq!(dispatched.state, "applying");
+}
+
+/// `apply` writes the `security_events` row the handler's sixth condition looks
+/// for, flips the plan and enqueues exactly one job — all or nothing.
+///
+/// The three are asserted together because they are ONE transaction and the
+/// reason they are is the sixth condition: an event that commits while the flip
+/// rolls back leaves a correlation id that would authorise a plan nobody
+/// dispatched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_writes_the_event_flips_the_plan_and_enqueues_one_job(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "dispatch subject").await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+
+    let (_, Json(dispatched)) = apply_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+        Json(ApplyRequest {
+            plan_digest: preview.plan_digest.clone(),
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect("apply");
+
+    let attributed: Option<Uuid> = sqlx::query_scalar(
+        "SELECT agent_id FROM security_events \
+          WHERE event_type = 'privatization_dispatch' AND correlation_id = $1",
+    )
+    .bind(&dispatched.correlation_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("read the dispatch event");
+    assert_eq!(
+        attributed,
+        Some(world.actor),
+        "the dispatch must be audited and attributed, or the handler refuses it on condition 6"
+    );
+
+    let (job_type, payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT job_type, payload FROM jobs WHERE id = $1")
+            .bind(dispatched.job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the enqueued job");
+    assert_eq!(job_type, "privatization_apply");
+    assert_eq!(
+        payload["PrivatizationApply"]["correlation_id"],
+        serde_json::json!(dispatched.correlation_id),
+        "the correlation id must ride in the payload; `privatization_plans` has no column for it"
+    );
+
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("count jobs");
+    assert_eq!(jobs, 1, "exactly one job per dispatch");
+
+    // A second apply against a plan that is already `applying` is refused by the
+    // conditional flip, so two operators racing cannot enqueue two runs.
+    let err = apply_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+        Json(ApplyRequest {
+            plan_digest: preview.plan_digest,
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect_err("a plan already applying must not be dispatched twice");
+    assert!(matches!(&err, ApiError::Conflict { .. }), "got {err:?}");
+}
+
+/// The job `apply` enqueues survives its own dequeue and reaches a handler.
+///
+/// # Why this goes through `PostgresJobQueue::dequeue` and not through
+/// `JobHandler::handle`
+///
+/// Every other regression in this slice constructs the handler and calls it
+/// directly, which is correct for what those tests measure and structurally
+/// blind to this: `JobRunner`'s worker loop evaluates
+/// `job.retry_count >= job.max_retries` and marks the job `failed` BEFORE it
+/// looks a handler up, so a row whose two columns are both `0` is failed without
+/// the handler ever running. The route would still write its `security_events`
+/// row, flip the plan to `applying` and return `202` with a job id, and nothing
+/// would ever move a claim — with no automatic recovery, because
+/// `recover_stale_jobs` only resets jobs in `state='running'`.
+///
+/// So the assertion is on the row as the QUEUE reads it back: the runner's
+/// precondition, `retry_count < max_retries`, must hold at first dequeue. That
+/// is the invariant, stated where the invariant lives, rather than a restatement
+/// of the literal in the INSERT.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_enqueued_job_satisfies_the_runners_precondition_at_first_dequeue(pool: PgPool) {
+    use epigraph_jobs::{JobQueue, PostgresJobQueue};
+
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "dequeue subject").await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+
+    let (_, Json(dispatched)) = apply_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+        Json(ApplyRequest {
+            plan_digest: preview.plan_digest,
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect("apply");
+
+    let queue = PostgresJobQueue::new(pool.clone());
+    let job = queue
+        .dequeue()
+        .await
+        .expect("the enqueued job must be dequeueable");
+    assert_eq!(job.id, dispatched.job_id.into());
+    assert_eq!(job.job_type, "privatization_apply");
+    assert!(
+        job.retry_count < job.max_retries,
+        "the runner fails a job whose retry_count has already reached max_retries, BEFORE it \
+         invokes the handler — so a job dequeued with retry_count={} and max_retries={} would \
+         never run, and the 202 this dispatch returned would be a privatization that never \
+         happens",
+        job.retry_count,
+        job.max_retries
+    );
+    assert_eq!(
+        job.max_retries, 1,
+        "one attempt and no retry ladder: recovery from a partial apply is the stale-job reaper \
+         re-dispatching, which re-runs the full re-validation"
+    );
+}
+
+/// `abort` stops a running plan and is refused on one that is not running.
+///
+/// §6.5.5: abort "sets `state='failed'`; the applied prefix stays applied". It
+/// is deliberately not an undo — the undo is `revert`, which echoes the digest
+/// and is separately audited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn abort_stops_a_running_plan_and_refuses_one_that_is_not(pool: PgPool) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "abort subject").await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+
+    let err = abort_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect_err("a previewed plan is not running and cannot be aborted");
+    assert!(matches!(&err, ApiError::Conflict { .. }), "got {err:?}");
+
+    let _ = apply_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+        Json(ApplyRequest {
+            plan_digest: preview.plan_digest,
+            acknowledge_author_loss: None,
+        }),
+    )
+    .await
+    .expect("apply");
+
+    let Json(aborted) = abort_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(world.auth())),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect("a running plan can be aborted");
+    assert_eq!(aborted.state, "failed");
+
+    let actions: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM privatization_audit WHERE plan_id = $1 ORDER BY id")
+            .bind(preview.plan_id)
+            .fetch_all(&pool)
+            .await
+            .expect("read the audit trail");
+    assert!(
+        actions.iter().any(|a| a == "plan.dispatch") && actions.iter().any(|a| a == "plan.abort"),
+        "both the dispatch and the abort must be audited, got {actions:?}"
+    );
+}
+
+/// **Acceptance clause 4, and the divergence it produces.** An instance admin
+/// who does NOT administer the target group is refused — and NOT with the `409`
+/// the plan specifies.
+///
+/// FINAL-PLAN's PR-18 acceptance line asks for a 409 on "approve by an instance
+/// admin who is not an admin of the target group". This build cannot answer that
+/// way, because two earlier controls answer first and both of them are the §6.6
+/// conjunction rather than the four-eyes rule:
+///
+/// * in PRODUCTION, migration 087's `privatization_plans_read` requires
+///   instance-admin AND group-admin-of-target, so the plan is not visible and
+///   `load_plan_for_actor` answers `404`;
+/// * on ANY connection where that policy does not bind — including this fixture,
+///   whose `scoped` pool is the `#[sqlx::test]` superuser — `require_plan_authority`
+///   answers `403` on §6.6's fourth condition.
+///
+/// Both are strictly MORE conservative than the specified 409: a 409 would have
+/// to tell a caller that a plan they may not read exists, and distinguishing
+/// "wrong approver" from "no such plan" is an existence oracle over every other
+/// admin's plans. The assertion is therefore on the DISJUNCTION, with 409
+/// excluded by name, and the divergence is recorded in
+/// `docs/tenancy/progress.json` rather than papered over.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_instance_admin_who_does_not_administer_the_target_is_refused_but_not_with_409(
+    pool: PgPool,
+) {
+    let world = World::seed(&pool).await;
+    let state = split_state(&pool).await;
+    let claim = seed_public_claim(&pool, world.actor, "outsider subject").await;
+
+    let (_, Json(preview)) = create_plan(
+        ViewerExtractor(Viewer::resolve(&pool, world.actor).await.expect("resolve")),
+        State(state.clone()),
+        Some(axum::Extension(world.auth())),
+        Json(plan_body(world.target_group, vec![claim])),
+    )
+    .await
+    .expect("create the plan");
+
+    // An instance admin with no membership in the target group at all.
+    let (outsider, _) = seed_agent_with_group(&pool, "outsider").await;
+    let maint = downgraded_pool(&pool, "epigraph_maintenance").await;
+    InstanceAdminRepository::grant(&maint, outsider, None, Some("route-test"))
+        .await
+        .expect("grant the outsider instance admin");
+
+    let err = approve_plan(
+        ViewerExtractor(Viewer::resolve(&pool, outsider).await.expect("resolve")),
+        State(state),
+        Some(axum::Extension(auth_for(outsider))),
+        Path(preview.plan_id),
+    )
+    .await
+    .expect_err("an instance admin who does not administer the target must be refused");
+    assert!(
+        matches!(&err, ApiError::Forbidden { .. } | ApiError::NotFound { .. }),
+        "expected the §6.6 check or the read policy to answer, got {err:?}"
+    );
+    assert!(
+        !matches!(&err, ApiError::Conflict { .. }),
+        "a 409 here would mean the caller learned that a plan they may not read exists, which is \
+         the cross-tenant read FINAL-PLAN §6.5.2 records"
+    );
+
+    let plan_state: String =
+        sqlx::query_scalar("SELECT state FROM privatization_plans WHERE id = $1")
+            .bind(preview.plan_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the plan state");
+    assert_eq!(
+        plan_state, "previewed",
+        "a refused approve must not move the plan"
+    );
 }
