@@ -510,6 +510,192 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement into a join on `claims` would be a viewer-less read of tenanted content and must \
          take a `&Viewer` instead of inheriting this entry.",
     ),
+    // ---- PR-18 (18c): the apply/revert state machine. --------------------
+    //
+    // Nineteen entries at once, and the shape of the argument is the same for
+    // all of them, so it is stated here rather than nineteen times: NONE of
+    // `privatization_plans`, `privatization_plan_items` or `privatization_audit`
+    // has a `visibility` column or an `owner_group_id`, so there is no predicate
+    // for a `Viewer` to splice and a `Viewer` parameter could not be spent. Their
+    // tenancy is migrations 083/087/088's policies, which select on the
+    // CONNECTION. Each entry below says which connection it must be given and
+    // what goes wrong on the other one, because that — not a viewer — is the
+    // control.
+    (
+        "privatization.rs",
+        "load_plan_for_update_conn",
+        "READ of `privatization_plans` with `FOR UPDATE`, for the job handler's re-validation. \
+         MUST be the maintenance connection: on a stamped app connection 087's SELECT policy \
+         hides a plan the session does not administer, and a job handler has no session principal \
+         at all, so it would read `None` for every plan and abort legitimate work. The row lock is \
+         the point — the six conditions must be checked against a row nothing can move before the \
+         state flip.",
+    ),
+    (
+        "privatization.rs",
+        "transition_plan_conn",
+        "WRITE. The plan state machine (approve / dispatch / cursor / finish), authorised by \
+         migration 088's bypass-only UPDATE policy and by 080's `pp_four_eyes` CHECK and 081's \
+         approver guard, which bind the maintenance connection too. There is nothing to filter: \
+         every arm names one plan by primary key and returns a row COUNT, never a row.",
+    ),
+    (
+        "privatization.rs",
+        "frozen_digest_conn",
+        "READ of `privatization_plan_items`, projecting `(kind, entity_id)` into a BLAKE3 digest \
+         and returning 32 bytes. The entity ids never leave the function, which is why this is not \
+         the disclosure `load_plan_items_conn` is fenced against. Maintenance connection: the \
+         digest must describe the WHOLE frozen set, and a policy-filtered subset would hash to \
+         something else and refuse every apply.",
+    ),
+    (
+        "privatization.rs",
+        "is_live_group_admin_conn",
+        "READ of `group_memberships`, which carries no `visibility` column. MUST be the \
+         maintenance connection: migration 077's policy narrows that table to what the session can \
+         see, and this asks about the APPROVER rather than about the session, so on an app \
+         connection an authorised approver reads as revoked. Returns a boolean and no rows.",
+    ),
+    (
+        "privatization.rs",
+        "begin_batch_conn",
+        "Neither read nor write: `SET LOCAL lock_timeout`, `SET LOCAL statement_timeout` and the \
+         one global `pg_advisory_xact_lock` every privatization batch serialises on (ops F12). It \
+         touches no table, so there is no tenancy to filter; it takes a connection because a \
+         `SET LOCAL` and an advisory lock are properties of a transaction rather than of a pool.",
+    ),
+    (
+        "privatization.rs",
+        "next_batch_conn",
+        "READ of `privatization_plan_items` with `FOR UPDATE`, one batch of work. Its projection \
+         DOES carry entity ids, and the reason that is not a disclosure is that its ONLY caller is \
+         a job handler with no requesting principal, whose use of those ids is to write them into \
+         `claims` and `privatization_audit`. Maintenance connection: a filtered batch would leave \
+         items pending while the plan advanced to `applied`.",
+    ),
+    (
+        "privatization.rs",
+        "mark_items_conn",
+        "WRITE of `privatization_plan_items.state`, authorised by migration 088's bypass-only \
+         UPDATE policy. Takes the ids the batch has just processed and returns a row count; there \
+         is no read whose result reaches a caller.",
+    ),
+    (
+        "privatization.rs",
+        "restrict_claims_conn",
+        "WRITE of `claims.visibility` and `claims.owner_group_id` — the whole of `restrict` mode. \
+         This is a tenanted table, and it takes no `Viewer` because a viewer predicate on a \
+         privatization UPDATE would narrow it to what somebody can already see, which is the \
+         opposite of the operation. The authorisation is FINAL-PLAN §6.5.5's re-validation in the \
+         job handler; the D4 admin surface is what §0.1 grants this write to.",
+    ),
+    (
+        "privatization.rs",
+        "restore_claims_conn",
+        "WRITE of `claims.visibility` and `claims.owner_group_id`, restoring the values the freeze \
+         captured. Same argument as `restrict_claims_conn` and one addition: it sets \
+         `epigraph.allow_declassify` for the transaction, which migration 074's own comment names \
+         'the admin declassification surface'. It restores a value the database recorded rather \
+         than one a caller supplied, and the sealed arm of that guard has no override and is not \
+         reachable from here.",
+    ),
+    (
+        "privatization.rs",
+        "recompute_boundary_meet_conn",
+        "WRITE of `edges` tenancy — the endpoint meet (§6.5.3), re-run after a batch. `edges` is \
+         tenanted and takes no `Viewer` for `restrict_claims_conn`'s reason: the meet is computed \
+         FROM the endpoints' stored tenancy through `epigraph_node_tenancy`, so a viewer-narrowed \
+         read of the endpoints would compute a meet from rows it could see and stamp the rest \
+         wrong.",
+    ),
+    (
+        "privatization.rs",
+        "sealed_item_count_conn",
+        "READ of `claim_encryption` joined to `privatization_plan_items`, returning a COUNT and no \
+         ids. It answers ops-F13's question — may this plan be reverted — and the count is the \
+         number the 409 carries. Maintenance connection, because a filtered count would report \
+         zero sealed items to a caller who cannot read them and permit a revert that then fails \
+         `42501` mid-batch.",
+    ),
+    (
+        "privatization.rs",
+        "item_state_counts_conn",
+        "READ of `privatization_plan_items`, GROUPed to `state -> count`. Serves `GET /plans/:id`'s \
+         live-progress block, so it MUST be given the actor's STAMPED app connection: 087's policy \
+         is what makes it a histogram of a plan the caller administers. It returns counts and no \
+         entity ids either way, which is why a policy-filtered result is the right answer here and \
+         a wrong one for `frozen_digest_conn` two entries up.",
+    ),
+    (
+        "privatization.rs",
+        "record_plan_audit_conn",
+        "WRITE, append-only. `privatization_audit` is append-only by three independent controls \
+         (082's trigger, its REVOKE, and the absence of an UPDATE or DELETE policy), so there is \
+         nothing here that can rewrite history. An append has no rows to filter.",
+    ),
+    (
+        "privatization.rs",
+        "record_item_audit_conn",
+        "WRITE, append-only, set-based. Reads `privatization_plan_items` and `claims` INSIDE the \
+         INSERT so the audit row describes the rows at the end of the batch transaction rather \
+         than what Rust believed at the start of it. Maintenance connection: a filtered read there \
+         would silently write fewer audit rows than items processed.",
+    ),
+    (
+        "privatization.rs",
+        "load_audit_conn",
+        "READ of `privatization_audit`, serving `GET /admin/privatization/audit`. MUST be the \
+         actor's STAMPED app connection. Its tenancy is migration 083's `privatization_audit_read`, \
+         which admits plan-level rows to an instance admin and entity-level rows only where the \
+         caller administers the plan's target group — resolved through a sub-select over \
+         `privatization_plans` that 087's policy filters in turn. Two policies deep, both \
+         properties of the connection; on the maintenance connection this is the instance-wide \
+         read FINAL-PLAN §6.5.8 argues against.",
+    ),
+    // NOTE: `create_followup_drift_plan_conn` was in this list and is NOT any
+    // more. It now takes the bypass `&Viewer` so it can COMPUTE the follow-up
+    // plan's `authors_losing_count` instead of asserting zero, which puts it
+    // under `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`
+    // instead — the stronger of the two lints. Removing it here is the exact
+    // half of that change; this register is exact in both directions.
+    (
+        "privatization.rs",
+        "enqueue_job_conn",
+        "WRITE of `jobs`, on the connection that flipped the plan, so the state change and the \
+         enqueue commit together. `jobs` has no `visibility` column; migration 077's `jobs_app` \
+         policy is what gates it, and its `WITH CHECK` refuses `privatization_*` job types from the \
+         app role. Returns the new job id and reads nothing.",
+    ),
+    (
+        "privatization.rs",
+        "applied_entity_ids_conn",
+        "READ of `privatization_plan_items`, projecting the entity ids of items in \
+         `state='applied'` as the drift rescan's seed set. This is the one function in the module \
+         that hands a bare id list to a caller without an actor's viewer in sight; it is sound \
+         because its single caller is a JOB HANDLER with no requesting principal, and the ids' only \
+         destinations are `drift_ids`, a follow-up plan's frozen items and `privatization_audit` — \
+         three FORCE-protected tables read back through a policy. Never a response body.",
+    ),
+    (
+        "security_event.rs",
+        "log_conn",
+        "WRITE, append-only, of `security_events`. The connection is a parameter so the event and \
+         the plan state flip it attests to commit in ONE transaction: FINAL-PLAN §6.5.5's sixth \
+         re-validation condition compares the two, and an event written on a separate pool \
+         connection can commit while the flip rolls back. No `RETURNING`, because PostgreSQL \
+         applies the SELECT policy to a `RETURNING` projection and an event about another \
+         principal would be refused while the identical bare INSERT succeeds.",
+    ),
+    (
+        "security_event.rs",
+        "correlation_is_attributed_to_conn",
+        "READ of `security_events`, returning a BOOLEAN and no rows. It is the machine form of \
+         FINAL-PLAN §6.5.5's sixth condition. MUST be the maintenance connection: migration 077's \
+         `security_events_read` is keyed on the session principal and a job handler has none, so on \
+         an app connection it answers `false` for every correlation id and the handler refuses \
+         every plan. It fails CLOSED in both directions — a missing row and a wrong agent are the \
+         same answer.",
+    ),
     (
         "provenance.rs",
         "append_conn",

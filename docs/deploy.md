@@ -544,12 +544,37 @@ grants, not merely membership of `epigraph_maintenance`. Enumerate them
 alongside the `GRANT` below before the first non-superuser deploy.
 
 **Connection budget.** The api process now opens API(10) + jobs(8) +
-maintenance(2) = **20** connections at boot, up from 18. The maintenance pool is
-separate from the job pool on purpose: sharing it would give the request-path
-maintenance read the job pool's 45-minute `statement_timeout`. That pool has
-exactly one consumer — `GET /api/v1/claims/needing-embeddings` — and that
-handler runs its statement *on the connection it leases from the pool*, which is
-what makes the pool load-bearing rather than decorative.
+maintenance(4) = **22** connections at boot. The maintenance pool is separate
+from the job pool on purpose: sharing it would give the request-path maintenance
+read the job pool's 45-minute `statement_timeout`. Every consumer runs its
+statement *on the connection it leases from the pool*, which is what makes the
+pool load-bearing rather than decorative.
+
+**Why the maintenance pool went from 2 to 4, in PR-18's apply slice.** It was
+sized at 2 when it had one consumer — `GET /api/v1/claims/needing-embeddings`,
+an occasional operator-triggered read. It now also serves the whole D4 admin
+surface: plan creation, and the FINAL-PLAN §6.6 authority check that
+`GET /plans/:id`, `GET /plans/:id/items`, `approve`, `apply`, `abort`, `revert`
+and `GET /audit` each perform. That is a change of KIND as well as of number —
+an operator-triggered read became a caller-facing route.
+
+Two properties bound what the resize has to cover, and both are held in code
+rather than assumed:
+
+* **No request pins more than one of these connections at a time.** Every D4
+  handler commits its application-pool transaction before acquiring here, and
+  the state-changing routes release the authority-check connection before
+  acquiring the one their transaction runs on.
+* **The job handlers do NOT draw from this pool.** They take the job pool
+  (`ScopedPool`, 8 connections, its own statement timeout), so a running
+  privatization consumes none of the four.
+
+So four connections admit four concurrent admin requests, where two admitted
+two. This is a deliberate, reviewed availability change to the request path and
+not a side effect: an operator running an approval while a colleague walks a
+plan's item pages and the embedding enumerator is mid-sweep was previously one
+request away from an acquire-timeout. If you are tuning `max_connections` on the
+server, the api process's share is now 22 per replica.
 
 **Fleet-wide pool sizing changed.** `MaintenancePool` uses one cap of 11 (10 for
 work, 1 for the connection the bypass lease holds) for every converted CLI

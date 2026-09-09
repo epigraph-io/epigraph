@@ -14,7 +14,9 @@ use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryCo
 use epigraph_api::{create_router, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
-    cluster_graph::ClusterGraphHandler, theme_cluster_rebuild::ThemeClusterRebuildHandler,
+    cluster_graph::ClusterGraphHandler,
+    privatization::{PrivatizationApplyHandler, PrivatizationRevertHandler},
+    theme_cluster_rebuild::ThemeClusterRebuildHandler,
     JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
@@ -264,7 +266,7 @@ async fn main() {
 
     // Create application state — connect to PostgreSQL when db feature is enabled
     #[cfg(feature = "db")]
-    let (state, job_pool) = {
+    let (state, job_pool, job_scoped) = {
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set when running with db feature");
         tracing::info!("Connecting to PostgreSQL...");
@@ -406,6 +408,14 @@ async fn main() {
         .await
         .expect("Failed to create background job pool");
         let job_pool = job_scoped.inner().clone();
+        // The SAME pool, kept as a `ScopedPool` rather than only as its inner
+        // `PgPool`, because the D4 privatization handlers need
+        // `unscoped_for_maintenance` — the only mint of the `MaintenanceLease`
+        // that `Viewer::system` requires, and therefore the only way the
+        // post-apply drift rescan can run unfiltered. The other two handlers
+        // take the bare pool and cannot obtain a bypass viewer at all, which is
+        // the right default.
+        let job_scoped = Arc::new(job_scoped);
 
         // A THIRD, deliberately small pool, and not a reuse of `job_pool`.
         //
@@ -419,42 +429,47 @@ async fn main() {
         // rather than leaving it idling.)
         //
         // CONSUMERS: `routes/claims.rs::find_claims_needing_embeddings` (the
-        // `claims:admin` embedding-gap enumerator) and, from PR-18's third
-        // slice, `routes/privatization.rs` — `create_plan` for the whole
-        // authorize/select/freeze span, and `require_plan_authority` once per
-        // `get_plan` / `get_plan_items`. That is a change of KIND as well as of
-        // number: it was an occasional operator-triggered read and it now
-        // includes a caller-facing read path.
+        // `claims:admin` embedding-gap enumerator) and the whole of
+        // `routes/privatization.rs` — `create_plan` for the authorize/select/
+        // freeze span, `require_plan_authority` once per `get_plan`,
+        // `get_plan_items`, `approve`, `apply`, `abort`, `revert` and
+        // `get_audit`, and the one transaction each state-changing route runs
+        // its `security_events` row, state flip, audit row and enqueue in. That
+        // is a change of KIND as well as of number: it was an occasional
+        // operator-triggered read and it is now a caller-facing admin surface.
         //
-        // THE SIZE BELOW WAS DELIBERATELY NOT REVISITED IN THAT SLICE, and the
-        // reason is this comment's own next paragraph — a change to the
-        // connection budget is an availability change to the request path, and
-        // smuggling one inside a feature PR is the "unreviewable second
-        // decision" it warns about. The mitigation taken instead was to stop
-        // any single request holding a connection from two pools at once:
-        // `get_plan` and `get_plan_items` both commit their application
-        // transaction before acquiring from here. Re-sizing is filed with an
-        // owner in `docs/tenancy/progress.json`.
+        // THE SIZE WAS REVISITED IN PR-18's APPLY SLICE AND RAISED FROM 2 TO 4.
+        // It was deliberately NOT revisited in the preview slice, on the
+        // argument that a connection-budget change is an availability change to
+        // the request path and smuggling one inside a feature PR is an
+        // unreviewable second decision. That argument is why this one is
+        // written out here and in `docs/deploy.md` §1c-bis rather than left as a
+        // diff to a literal.
         //
-        // Handing that route the job pool instead would silently give it the
-        // 45-minute `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`, which is an
-        // availability change to the request path smuggled inside a
-        // pool-plumbing change — exactly the "unreviewable second decision"
-        // `ScopedPool::connect`'s own doc warns about. Two connections: this
-        // was sized for an occasional operator-triggered read, not a work
-        // queue. Each in-flight request pins one, so a third concurrent call
-        // waits on the acquire timeout; that was acceptable for an admin-scoped
-        // backfill enumerator, and whether it remains so now that an
-        // instance-admin route also draws from here is the open question named
-        // above.
+        // What bounds the resize, and both properties are held in code:
+        //
+        //   * No request pins more than one of these at a time. Every D4
+        //     handler commits its application-pool transaction before acquiring
+        //     here, and the state-changing routes release the authority-check
+        //     connection before acquiring the one their transaction runs on.
+        //   * The privatization JOB HANDLERS do not draw from this pool at all.
+        //     They take `job_scoped` below, with its own 45-minute statement
+        //     timeout, so a running privatization consumes none of the four.
+        //
+        // Four admits four concurrent admin requests where two admitted two.
+        //
+        // Handing these routes the job pool instead would silently give them
+        // the 45-minute `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`, which is a
+        // different availability change smuggled inside a pool-plumbing change
+        // — exactly what `ScopedPool::connect`'s own doc warns about.
         //
         // Connection budget at boot is therefore API(10) + jobs(8) +
-        // maintenance(2) = 20, up from 18. See `docs/deploy.md` §1c-bis.
+        // maintenance(4) = 22. See `docs/deploy.md` §1c-bis.
         let maintenance_pool = epigraph_db::ScopedPool::connect_with_options(
             &maintenance_url,
             guc_mode,
             epigraph_db::ScopedPoolOptions {
-                max_connections: 2,
+                max_connections: 4,
                 ..Default::default()
             },
         )
@@ -535,7 +550,7 @@ async fn main() {
             .await
             .expect("refusing to serve: RLS posture assertion failed");
 
-        (state, job_pool)
+        (state, job_pool, job_scoped)
     };
 
     #[cfg(not(feature = "db"))]
@@ -590,6 +605,23 @@ async fn main() {
             Arc::clone(&handler_pool),
             Arc::clone(&queue_for_theme_cron),
         )));
+        // D4 privatization. BOTH must be registered, and the failure mode if one
+        // is not is silent and unbounded: `POST …/apply` has already returned
+        // `202` and flipped the plan to `applying`, so an unregistered job type
+        // leaves the plan mid-flight forever with no error anywhere. Nothing in
+        // the tree asserts handler/job-type parity, which is why they are
+        // registered next to the enqueue's own comment rather than filed under
+        // "add a handler when convenient".
+        //
+        // THIS BLOCK IS SKIPPED WHOLESALE WHEN `EPIGRAPH_DISABLE_JOBS=1`, which
+        // is a supported sidecar mode. A deployment that serves the D4 admin
+        // routes must not set it; `docs/deploy.md` §1c-bis carries the pairing.
+        runner.register_handler(Arc::new(PrivatizationApplyHandler::new(Arc::clone(
+            &job_scoped,
+        ))));
+        runner.register_handler(Arc::new(PrivatizationRevertHandler::new(Arc::clone(
+            &job_scoped,
+        ))));
 
         tokio::spawn(async move {
             runner.start().await;

@@ -581,6 +581,26 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/admin/privatization/plans/:id/items",
             get(privatization::get_plan_items),
         )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/approve",
+            post(privatization::approve_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/apply",
+            post(privatization::apply_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/abort",
+            post(privatization::abort_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/revert",
+            post(privatization::revert_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/audit",
+            get(privatization::get_audit),
+        )
         .route("/api/v1/graph/communities/overview", get(graph::overview))
         .route("/api/v1/graph/communities/:id/expand", get(graph::expand))
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
@@ -1347,6 +1367,26 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/privatization/plans/:id/items",
             get(privatization::get_plan_items),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/approve",
+            post(privatization::approve_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/apply",
+            post(privatization::apply_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/abort",
+            post(privatization::abort_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/revert",
+            post(privatization::revert_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/audit",
+            get(privatization::get_audit),
         );
 
     // Authentication for `protected`: OAuth2 Bearer, unconditionally.

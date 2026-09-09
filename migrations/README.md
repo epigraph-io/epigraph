@@ -69,7 +69,8 @@ Current reservation:
   | **085** | PR-10 | `webhook_subscriptions` — **claimed 2026-09-03**, was headroom |
   | **086** | PR-24 | `epigraph_claim_tenancy_by_ids` `SECURITY DEFINER` read helper — **claimed 2026-09-06**, was headroom |
   | **087** | PR-18 (delivered as 18b) | SELECT + INSERT policies on `privatization_plans` and `privatization_plan_items` — **claimed 2026-09-08**, was headroom |
-  | **088–090** | — | remaining headroom |
+  | **088** | PR-18 (delivered as 18c) | UPDATE policies on `privatization_plans` and `privatization_plan_items` — **claimed 2026-09-08**, was headroom |
+  | **089–090** | — | remaining headroom |
 
   **The post-shift numbers, pinned.** THIS TABLE IS AUTHORITATIVE; plan §3.1's
   own columns are not, and neither is `docs/tenancy/FINAL-PLAN.md`. Derive
@@ -97,6 +98,7 @@ Current reservation:
   | **084** | PR-22 | retire `ownership` |
   | **085** | PR-10 | `webhook_subscriptions` (durable webhook registrations, `agent_id` FK) |
   | **087** | PR-18 (18b) | SELECT + INSERT policies on `privatization_plans` and `privatization_plan_items`. **The plan specifies no policy for either table** — fourteen `CREATE POLICY` blocks in `docs/tenancy/FINAL-PLAN.md`, none naming them — so this file designs them from 082/083's two templates and says so in its own header. Read is instance-admin **AND** group-admin-of-target (§6.5.2 point 2); write is bypass-only, matching 083's `instance_admins` shape, because 080 already REVOKEs DML from `epigraph_app`. **Side effect on a table it does not touch:** 083's `privatization_audit_read` entity arm resolves its sub-select over `privatization_plans` and therefore activates. UPDATE and DELETE stay uncovered and stay registered in `rls_enforcement.rs::DELIBERATELY_UNCOVERED`. File: `087_privatization_plan_policies.sql`. **Throwaway only.** |
+  | **088** | PR-18 (18c) | UPDATE policies on `privatization_plans` and `privatization_plan_items`, bypass-only on both `USING` and `WITH CHECK`. **The plan assigns this slice migrations "076/077/078/079", which are PR-16's and PR-17's under the +4 shift and are applied and frozen** — so the number comes from this table's headroom instead. Every state transition in the apply/approve/abort/revert surface is an UPDATE of one of these two tables, and under `FORCE` an uncovered command is denied to every role including a bypass connection, so the whole surface is blocked without this file. DELETE stays uncovered on both tables and stays registered in `rls_enforcement.rs::DELIBERATELY_UNCOVERED`; the two UPDATE rows are deleted from that register in the same commit, because it is exact in both directions. File: `088_privatization_plan_state_policies.sql`. **Throwaway only.** |
 
   **PR-10 takes 085, NOT the 081 `docs/tenancy/FINAL-PLAN.md` names.** The
   plan's PR-10 note says its migration "takes the next unused number in the

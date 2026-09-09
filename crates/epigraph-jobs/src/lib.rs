@@ -62,6 +62,7 @@ pub use db_reputation_service::DbReputationService;
 
 pub mod cluster_graph;
 pub mod coordination;
+pub mod privatization;
 pub mod theme_cluster_rebuild;
 
 pub use coordination::{
@@ -746,6 +747,43 @@ pub enum EpiGraphJob {
         /// to `true` to avoid redoing work on idle days.
         skip_if_unchanged: bool,
     },
+
+    /// Apply a D4 privatization plan (FINAL-PLAN §6.5.5).
+    ///
+    /// **The three fields are not the authorization and must not be read as
+    /// it.** They are the claim the enqueuer makes about itself; the handler
+    /// re-derives every one of them from the database before it touches a row,
+    /// and refuses the whole plan when they disagree. See
+    /// `crate::privatization` for the six conditions.
+    ///
+    /// `correlation_id` ties this job to the `security_events` row the HTTP
+    /// layer wrote for the same request. `privatization_plans` has no
+    /// `correlation_id` column — migration 080 is applied and frozen — so the
+    /// value rides in the payload, and the handler's check is that a
+    /// `privatization_dispatch` event with this correlation id is attributed to
+    /// `dispatched_by`.
+    PrivatizationApply {
+        /// The plan to apply.
+        plan_id: Uuid,
+        /// The agent whose `POST …/apply` this is.
+        dispatched_by: Uuid,
+        /// Matches `security_events.correlation_id` for the dispatching request.
+        correlation_id: String,
+    },
+
+    /// Un-apply a D4 privatization plan, restoring each item's captured
+    /// `before_visibility` / `before_owner_group_id`.
+    ///
+    /// The mirror of [`Self::PrivatizationApply`] in every respect including the
+    /// warning above: the handler re-validates.
+    PrivatizationRevert {
+        /// The plan to revert.
+        plan_id: Uuid,
+        /// The agent whose `POST …/revert` this is.
+        dispatched_by: Uuid,
+        /// Matches `security_events.correlation_id` for the dispatching request.
+        correlation_id: String,
+    },
 }
 
 impl EpiGraphJob {
@@ -760,6 +798,11 @@ impl EpiGraphJob {
             Self::DataCleanup { .. } => "data_cleanup",
             Self::ClusterGraph { .. } => "cluster_graph",
             Self::ThemeClusterRebuild { .. } => "theme_cluster_rebuild",
+            // The three names migration 077's `jobs_app` WITH CHECK already
+            // spells. They must agree EXACTLY or the policy arm that refuses an
+            // app-role enqueue of privatization work stops matching.
+            Self::PrivatizationApply { .. } => crate::privatization::APPLY_JOB_TYPE,
+            Self::PrivatizationRevert { .. } => crate::privatization::REVERT_JOB_TYPE,
         }
     }
 

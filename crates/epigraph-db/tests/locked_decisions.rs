@@ -989,6 +989,114 @@ async fn d4_the_audit_tables_are_append_only_by_a_trigger_not_only_by_a_policy(p
     }
 }
 
+/// **D4, locked.** A plan's STATE MACHINE is writable on a bypass connection and
+/// on nothing else.
+///
+/// # The decision this locks
+///
+/// FINAL-PLAN §0.2 requires that a PR which changes a policy extends this file,
+/// and migration 088 changes two. It gives `privatization_plans` and
+/// `privatization_plan_items` their UPDATE policies, which is what makes
+/// `approve`, `apply`, `abort` and `revert` possible at all — under `FORCE` a
+/// command with no policy is denied to every role, `epigraph_maintenance`
+/// included, because `epigraph_bypass()` is a function evaluated INSIDE a policy
+/// expression and with no policy there is nothing to evaluate.
+///
+/// What is locked is that the widening stops there. The read policies (087) let
+/// an instance admin who administers the target group SELECT; the UPDATE
+/// policies deliberately do NOT mirror that conjunction, because the batch that
+/// advances `privatization_plan_items.state` has just rewritten `claims` in the
+/// same transaction and must be able to write both. So a state transition is
+/// reachable only from the connection the job handler runs on, and the
+/// authorization for it is FINAL-PLAN §6.5.5's re-validation rather than this
+/// policy.
+///
+/// # Read from `pg_policy`, never from the migration text
+///
+/// §0.2's D4 predicate says so in those words. A migration that was edited, or
+/// one whose `CREATE POLICY` was shadowed by a later `DROP`, is invisible to a
+/// source scan and visible here.
+///
+/// # DELETE stays uncovered on both tables and that is asserted too
+///
+/// The inverse direction is the half that rots. "088 added an UPDATE policy" is
+/// satisfied by a migration that also added `FOR ALL`, which would silently make
+/// a plan deletable — and a plan is the record that a privatization was
+/// attempted. `rls_enforcement.rs::DELIBERATELY_UNCOVERED` still carries both
+/// DELETE rows; this is the catalog-side statement of the same fact.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d4_the_plan_state_machine_is_writable_only_on_a_bypass_connection(pool: PgPool) {
+    for table in ["privatization_plans", "privatization_plan_items"] {
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT p.polname::text, p.polcmd::text, \
+                    pg_get_expr(p.polqual, p.polrelid), \
+                    pg_get_expr(p.polwithcheck, p.polrelid) \
+               FROM pg_policy p \
+              WHERE p.polrelid = ($1 || '')::regclass \
+              ORDER BY p.polname",
+        )
+        .bind(format!("public.{table}"))
+        .fetch_all(&pool)
+        .await
+        .expect("policy catalog probe");
+
+        let cmds: BTreeSet<String> = rows.iter().map(|(_, c, _, _)| c.clone()).collect();
+        // `polcmd` is one character: 'r' SELECT, 'a' INSERT, 'w' UPDATE,
+        // 'd' DELETE, '*' ALL.
+        assert!(
+            cmds.contains("w"),
+            "{table} has no UPDATE policy. Under FORCE that denies every state transition to \
+             every role including the maintenance connection, so approve/apply/abort/revert \
+             cannot exist. Migration 088 is what installs it; policies present: {rows:?}"
+        );
+        assert!(
+            !cmds.contains("d"),
+            "{table} has acquired a DELETE policy. A plan is the record that a privatization was \
+             attempted and is never deleted; items cascade with their plan. \
+             rls_enforcement.rs::DELIBERATELY_UNCOVERED still records the pair as uncovered, and \
+             that register is exact in both directions."
+        );
+        assert!(
+            !cmds.contains("*"),
+            "{table} has acquired a FOR ALL policy. Every write policy on this surface stops \
+             short of FOR ALL on purpose (083's instance_admins pair is the template), so a \
+             command nobody has asked for stays denied rather than arriving as a side effect."
+        );
+
+        let update = rows
+            .iter()
+            .find(|(_, c, _, _)| c == "w")
+            .expect("checked above");
+        let (name, _, qual, with_check) = update;
+        let qual = qual.as_deref().unwrap_or_default();
+        let with_check = with_check.as_deref().unwrap_or_default();
+        assert!(
+            !qual.is_empty() && !with_check.is_empty(),
+            "{table}.{name} must spell USING and WITH CHECK explicitly. They answer different \
+             questions — which rows are candidates, and whether the row produced is legal — and a \
+             reader who has to derive one from the other cannot tell an intentional asymmetry \
+             from an omission."
+        );
+        for (clause, expr) in [("USING", qual), ("WITH CHECK", with_check)] {
+            assert!(
+                expr.contains("epigraph_bypass"),
+                "{table}.{name}'s {clause} does not name epigraph_bypass(). A write arm on this \
+                 surface that admits a non-bypass session is a state transition issued from the \
+                 request path, which is the split migration 088's header refuses. Got: {expr}"
+            );
+            for forbidden in ["epigraph_is_instance_admin", "epigraph_is_group_admin"] {
+                assert!(
+                    !expr.contains(forbidden),
+                    "{table}.{name}'s {clause} names {forbidden}. That is 087's READ conjunction, \
+                     and mirroring it here would let a state transition be issued on a connection \
+                     that cannot also write `claims` in the same transaction — which makes a \
+                     partially applied batch reachable. Got: {expr}"
+                );
+            }
+        }
+    }
+}
+
 /// **D4, locked.** The D4 write surface is admin-only because there is NO
 /// request-path write surface at all.
 ///

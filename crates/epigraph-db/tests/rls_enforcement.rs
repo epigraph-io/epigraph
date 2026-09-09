@@ -115,36 +115,34 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
     // commit — which is the property that makes the eight rows worth their
     // weight rather than boilerplate.
     //
-    // AMENDED TWICE. The first amendment recorded that 18b's SECOND slice did
-    // not do what the paragraph above predicts: it shipped the selection pass as
-    // a repo-layer computation with no route, no persisted plan and therefore no
-    // policy, because adding one needs a migration and no number was assigned to
-    // it. THE THIRD SLICE CLAIMED 087 AND DID. The four SELECT/INSERT pairs the
-    // paragraph above predicted are gone from this register, deleted in the same
-    // commit as `migrations/087_privatization_plan_policies.sql`, which is the
-    // property that makes the remaining rows worth their weight.
+    // AMENDED THREE TIMES. The first amendment recorded that 18b's SECOND slice
+    // did not do what the paragraph above predicts: it shipped the selection
+    // pass as a repo-layer computation with no route, no persisted plan and
+    // therefore no policy, because adding one needs a migration and no number
+    // was assigned to it. THE THIRD SLICE CLAIMED 087 AND DID. The four
+    // SELECT/INSERT pairs the paragraph above predicted are gone from this
+    // register, deleted in the same commit as
+    // `migrations/087_privatization_plan_policies.sql`.
     //
-    // What is left is UPDATE and DELETE on both tables, and their owners are
-    // unchanged. Migration 080's header states the whole-slice expectation and
-    // is FROZEN by the applied-checksum rule, so it cannot be corrected there;
-    // that disagreement is recorded rather than resolved by silence, which is
-    // this register's own culture rule.
-    (
-        "privatization_plans",
-        "UPDATE",
-        "State transitions (approve, dispatch, cursor advance) are 18c's \
-         apply/revert handlers, on the maintenance pool.",
-    ),
+    // THE FOURTH SLICE CLAIMED 088 AND TOOK BOTH UPDATE PAIRS. They were
+    // assigned here by name — "State transitions (approve, dispatch, cursor
+    // advance) are 18c's apply/revert handlers, on the maintenance pool" and
+    // "Per-item state (applied/skipped/failed/reverted) is 18c's handler" — and
+    // `migrations/088_privatization_plan_state_policies.sql` is that slice
+    // arriving. Both rows are deleted in the same commit as the migration,
+    // which is the property that makes this register worth its weight rather
+    // than being a comment style.
+    //
+    // What is left is DELETE on both tables, and their owners are unchanged.
+    // Migration 080's header states the whole-slice expectation and is FROZEN by
+    // the applied-checksum rule, so it cannot be corrected there; that
+    // disagreement is recorded rather than resolved by silence, which is this
+    // register's own culture rule.
     (
         "privatization_plans",
         "DELETE",
         "A plan is the record that a privatization was attempted and is never \
          deleted. Nothing is expected to claim this pair.",
-    ),
-    (
-        "privatization_plan_items",
-        "UPDATE",
-        "Per-item state (applied/skipped/failed/reverted) is 18c's handler.",
     ),
     (
         "privatization_plan_items",
@@ -991,12 +989,19 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         (
             "jobs_app",
             "privatization_apply",
-            "The `job_type NOT IN ('privatization_*')` arm is row-only and is FORWARD-STAGING \
-             for PR-18, which is why it is unreachable today: the queue runs on the maintenance \
-             pool (bin/server.rs builds job_pool from maintenance_url), and jobs_app's USING is \
-             bypass-only, so no non-bypass role reaches this WITH CHECK at all. It cannot be a \
-             read grant for the same reason. Delete it or key it on the session when PR-18 adds \
-             the job types it names.",
+            "The `job_type NOT IN ('privatization_*')` arm is row-only. Its instruction here used \
+             to be 'delete it or key it on the session when PR-18 adds the job types it names'. \
+             PR-18's apply slice ADDS THEM — `epigraph_jobs::privatization::APPLY_JOB_TYPE` and \
+             `REVERT_JOB_TYPE` are these literals, pinned by a unit test in that module — and the \
+             arm is KEPT rather than deleted or rewritten. Deleting it would remove the only thing \
+             that distinguishes privatization work from ordinary work on an INSERT, and this is an \
+             INSERT arm: `WITH CHECK` is evaluated for a non-bypass role even though `jobs_app`'s \
+             `USING` is bypass-only, because a plain INSERT reads no existing row. Rewriting it to \
+             name a session helper would change what it means, not how it is spelled — the \
+             predicate is about the WORK, and the session identity is already covered by the two \
+             disjuncts above it. The production enqueue is \
+             `PrivatizationRepository::enqueue_job_conn` on the maintenance connection, which the \
+             first disjunct admits.",
         ),
         (
             "security_events_append",
