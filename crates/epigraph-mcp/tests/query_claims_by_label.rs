@@ -158,10 +158,11 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 /// sees full content + real hash while a STRANGER sees it **not at all**.
 ///
 /// **CORRECTED FOR PR-12.** This comment used to say the stranger sees
-/// `"[REDACTED]"` + a blank hash. Migration 071 transcribes the `ownership` row
-/// into the tenancy columns, so the stranger's `Viewer` now excludes the row
-/// and the result set simply does not contain it — which subsumes both old
-/// assertions and discloses less.
+/// `"[REDACTED]"` + a blank hash. The claim's tenancy columns carry the
+/// privacy — migration 071 transcribed them from an `ownership` row until PR-22
+/// retired the table, and the fixture writes them directly now — so the
+/// stranger's `Viewer` excludes the row and the result set simply does not
+/// contain it, which subsumes both old assertions and discloses less.
 ///
 /// **CORRECTED AGAIN FOR PR-14.** This paragraph used to close by pointing at
 /// `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts` and at
@@ -179,15 +180,7 @@ async fn query_by_label_hides_private_content_from_strangers(pool: PgPool) {
     let claim_id = seed_claim(&pool, owner, &["backlog"], true, None).await;
     let expected_content = format!("test claim {}", claim_id.as_uuid());
 
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim_id.as_uuid())
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("seed private ownership");
+    common::seed_private_tenancy(&pool, claim_id.as_uuid(), owner).await;
 
     let server = build_test_server(pool.clone());
 
@@ -201,9 +194,8 @@ async fn query_by_label_hides_private_content_from_strangers(pool: PgPool) {
     };
 
     // PR-12: resolve the Viewer for the acting principal, as production does.
-    // Migration 071 transcribes the `ownership` row into the tenancy columns, so
-    // an empty-group `public_viewer` can no longer see this claim at all — not
-    // even as its owner.
+    // The claim is group-private in the tenancy columns, so an empty-group
+    // `public_viewer` cannot see it at all — not even as its owner.
     let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
         .await
         .expect("resolve owner viewer");

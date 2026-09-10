@@ -291,10 +291,18 @@ pub struct ConflictStats {
 ///   extractors are deliberately left in this order — `viewer_route_table_lint`
 ///   reads handler signature shape, and re-baselining a lint in the same change
 ///   that fixes a mechanism defect would hide one behind the other.
-/// * **Authenticated → visible-set aggregates.** `:owner_id` keeps its meaning —
-///   it is still the `ownership.owner_id` / `perspectives.owner_agent_id` being
-///   asked about. The viewer predicate is an additional `AND`, never a
-///   reinterpretation of the path parameter as a group id.
+/// * **Authenticated → visible-set aggregates.** `:owner_id` is still an AGENT
+///   uuid and the viewer predicate is still an additional `AND`, never a
+///   reinterpretation of the path parameter as a group id. **What it is matched
+///   against changed in PR-22**: `ownership.owner_id` no longer exists —
+///   migration 084 retired the relation — so the owned-node set is now
+///   `claims.agent_id` UNION `perspectives.owner_agent_id`. The first of those
+///   is the claim's AUTHOR, taken from the request body at write time, not an
+///   owner of record and not a credential; see the module doc of
+///   `epigraph_db::repos::structural` for what that does and does not permit.
+///   Four node types (`evidence`, `community`, `context`, `frame`) can no longer
+///   appear in `node_counts`, and the owned set otherwise WIDENS from "nodes
+///   with an explicit ownership row" to "nodes the agent authored".
 /// * **An epsilon that disables the noise → `claims:admin` or 403.** Exact
 ///   counts are an administrative capability, not a query-string option.
 ///

@@ -43,7 +43,7 @@ use common::build_test_server;
 
 // The `REDACTED` constant is GONE, and its absence is the point. Every
 // assertion in this file that once read `content == "[REDACTED]"` is now an
-// absence assertion: migration 071 transcribes `ownership` into the tenancy
+// absence assertion: the private claims here carry group tenancy in their own
 // columns, so the Viewer predicate drops the row before any handler can blank
 // it. Redaction on this path is not merely unused — it is unreachable.
 //
@@ -59,9 +59,9 @@ use common::build_test_server;
 // what `mcp_requester(Some(auth), _)` resolves a bearer to). The stranger
 // assertion is the discriminating one: on `origin/main` it returned A's
 // content. PR-12 tightened the required disposition from `"[REDACTED]"` to
-// ABSENT — migration 071 puts the ownership row into the tenancy columns, so
-// the stranger's Viewer excludes the claim rather than returning a blanked
-// body. Strictly less disclosure: the stranger no longer learns it exists.
+// ABSENT — the claim is group-private in its own tenancy columns, so the
+// stranger's Viewer excludes it rather than returning a blanked body. Strictly
+// less disclosure: the stranger no longer learns it exists.
 #[sqlx::test(migrations = "../../migrations")]
 async fn http_owner_sees_content_stranger_sees_nothing(pool: PgPool) {
     let owner = seed_agent(&pool).await;
@@ -145,17 +145,16 @@ async fn stdio_fallback_uses_server_identity(pool: PgPool) {
     assert_claim_absent_with(&server, &stdio_viewer, foreign_id).await;
 }
 
-// ── Case: public (ownership-less) non-regression for ANY requester ───────────
+// ── Case: a public claim is a non-regression for ANY requester ───────────────
 //
-// A claim with no `ownership` row is public: `check_content_access` returns
-// `Full` regardless of requester. The spec requires this hold "for any
-// requester (including `None`)", so we assert all three: owner, stranger, and
-// the anonymous stdio `None`. This guards against an over-eager redaction that
-// fails closed on public rows.
+// A claim never privatised stays ('public', world) and every Viewer admits it.
+// The spec requires this hold "for any requester (including `None`)", so we
+// assert all three: owner, stranger, and the anonymous stdio `None`. This
+// guards against an over-eager filter that fails closed on public rows.
 #[sqlx::test(migrations = "../../migrations")]
 async fn public_claim_is_never_redacted(pool: PgPool) {
     let owner = seed_agent(&pool).await;
-    let claim_id = seed_claim(&pool, owner).await; // no ownership row → public
+    let claim_id = seed_claim(&pool, owner).await; // never privatised → public
     let expected = format!("test claim {}", claim_id.as_uuid());
 
     let server = build_test_server(pool.clone());
@@ -269,8 +268,8 @@ async fn server_agent_id(pool: &PgPool) -> Uuid {
 /// `visibility='public'` — so the Viewer predicate matched every row and the
 /// requester decided everything.
 ///
-/// Migration 071 transcribes `ownership` into the tenancy columns, so the Viewer
-/// is now the FIRST filter. An empty-group viewer cannot see a private claim at
+/// That fixture now writes the tenancy columns themselves, so the Viewer is the
+/// FIRST filter. An empty-group viewer cannot see a private claim at
 /// all — not even the OWNER'S. Keeping it would assert against a principal that
 /// cannot exist in production, where `Viewer::resolve` runs on the authenticated
 /// agent and viewer and requester are therefore the same principal.
@@ -386,16 +385,14 @@ async fn assert_claim_absent_with(
     );
 }
 
+/// Make `claim_id` readable only by `owner`'s personal group.
+///
+/// It wrote a `partition_type = 'private'` row into `ownership` until PR-22 and
+/// let migration 071's `ownership_transcribe` trigger stamp the claim's tenancy
+/// columns. Migration 084 retires the table; the shared fixture now does both
+/// halves and asserts the post-condition.
 async fn seed_private_ownership(pool: &PgPool, claim_id: ClaimId, owner: Uuid) {
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim_id.as_uuid())
-    .bind(owner)
-    .execute(pool)
-    .await
-    .expect("seed private ownership");
+    common::seed_private_tenancy(pool, claim_id.as_uuid(), owner).await;
 }
 
 fn parse_claim(result: &CallToolResult) -> Value {

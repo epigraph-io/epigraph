@@ -61,12 +61,14 @@
 //! after its walk and RESETS `last_id` to NULL if anything is left, so a re-run
 //! genuinely retries rather than looking complete.
 //!
-//! # Legacy `ownership` rows
+//! # Legacy `ownership` rows — retired in PR-22
 //!
-//! Migration 071 installs only an `AFTER INSERT OR UPDATE` trigger, so rows
-//! already in `ownership` when it applied are never transcribed —
-//! and `verify` fails on exactly those, permanently. `transcribe_legacy_ownership`
-//! re-fires the trigger over them; see its doc comment.
+//! This binary used to carry a `transcribe_legacy_ownership` pass and two
+//! `verify` checks over the `ownership` table. Migration 084 retires that table,
+//! and its second pre-flight now holds the gate those checks held: it refuses to
+//! drop the table while any non-public row lacks a `tenancy_transcription_log`
+//! entry. See the comment where the pass used to live for why that ordering is
+//! what makes the retirement safe.
 //!
 //! # `verify` keys on LIVE COUNTS, not on the `complete` boolean
 //!
@@ -308,7 +310,6 @@ async fn run(pool: &PgPool, batch_size: i64, dry_run: bool) -> anyhow::Result<()
     backfill_agent_keyed(pool, "perspectives", "owner_agent_id").await?;
     backfill_agent_keyed(pool, "recall_events", "agent_id").await?;
     backfill_harvester_fragments(pool).await?;
-    transcribe_legacy_ownership(pool, batch_size).await?;
 
     // The remaining entities are either trigger-propagated (the 17 claim-derived
     // tables and `edges`) or have nothing to derive from (`frames`, `contexts`).
@@ -649,122 +650,20 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-fire migration 071's `ownership_transcribe` trigger over every
-/// `ownership` row that predates it.
-///
-/// # Why this arm has to exist — `verify` is otherwise unpassable
-///
-/// Migration 071 installs **only** `CREATE TRIGGER ownership_transcribe AFTER
-/// INSERT OR UPDATE ON public.ownership`. It contains no one-time pass over the
-/// rows already in the table, so on any database that held `ownership` rows
-/// before the migration those rows are never transcribed. `verify` counts
-/// exactly them, in two checks:
-///
-/// * *"N non-public ownership row(s) map to a still-public claim"*, and
-/// * *"N non-public ownership row(s) have no transcription log row"*.
-///
-/// Without this pass those failures are **unclearable by anything in the PR**,
-/// and since `run` calls `verify` at the end, `run` exits 1 forever too. That
-/// would make the plan's own acceptance line — *"every `ownership` row it
-/// transcribes writes a `tenancy_transcription_log` row"* — true only
-/// vacuously, because it would transcribe zero. It also leaves 071's stated
-/// purpose unmet for the legacy corpus: a pre-existing `private` row would keep
-/// its claim at `visibility = 'public'`, which is precisely the silent
-/// divergence 071's header says it exists to prevent.
-///
-/// Severity in production is contingent on `HANDOFF.md` §4 **M1** (the
-/// `ownership` row census), which has never been performed — but every staging
-/// and development database hits it, and the deliverable must be correct
-/// regardless.
-///
-/// # `SET owner_id = owner_id` is deliberate
-///
-/// The trigger is `FOR EACH ROW`, so any UPDATE re-fires it; writing a column
-/// back to itself changes no information while still producing a `NEW` record.
-/// Transcription is idempotent by construction (every stamping UPDATE in 071
-/// carries `IS DISTINCT FROM`, and the ledger insert is `ON CONFLICT DO
-/// UPDATE`), so a re-run is a no-op rather than a second transition.
-///
-/// # The selection is "no ledger row", not "all rows"
-///
-/// 071 writes a `tenancy_transcription_log` row for **every** partition_type,
-/// including `public`. So "has no ledger row" is exactly "was never seen by the
-/// trigger" — the legacy set — and a second `run` selects nothing.
-///
-/// # One bad row must not kill the walk
-///
-/// 071 RAISEs `23514` rather than stamp a group with no live members. A single
-/// such row inside a 5,000-row batch would abort the whole batch and, without
-/// this fallback, the whole backfill — leaving the operator with no way
-/// forward. On a batch failure each row is retried alone; the offenders are
-/// named on stderr and left for `verify` to fail on, which is the fail-closed
-/// outcome.
-async fn transcribe_legacy_ownership(pool: &PgPool, batch_size: i64) -> anyhow::Result<()> {
-    let mut cursor: Option<Uuid> = None;
-    let mut total: i64 = 0;
-    let mut refused: i64 = 0;
-
-    loop {
-        let ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT o.node_id FROM ownership o
-              WHERE NOT EXISTS (SELECT 1 FROM tenancy_transcription_log l
-                                 WHERE l.node_id = o.node_id)
-                AND ($1::uuid IS NULL OR o.node_id > $1)
-              ORDER BY o.node_id
-              LIMIT $2",
-        )
-        .bind(cursor)
-        .bind(batch_size)
-        .fetch_all(pool)
-        .await?;
-
-        if ids.is_empty() {
-            break;
-        }
-        cursor = Some(*ids.last().expect("non-empty batch"));
-
-        match sqlx::query("UPDATE ownership SET owner_id = owner_id WHERE node_id = ANY($1)")
-            .bind(&ids)
-            .execute(pool)
-            .await
-        {
-            Ok(r) => total += r.rows_affected() as i64,
-            Err(batch_err) => {
-                tracing::warn!(
-                    error = %batch_err,
-                    batch = ids.len(),
-                    "ownership transcription batch failed; retrying row by row"
-                );
-                for id in &ids {
-                    match sqlx::query("UPDATE ownership SET owner_id = owner_id WHERE node_id = $1")
-                        .bind(id)
-                        .execute(pool)
-                        .await
-                    {
-                        Ok(r) => total += r.rows_affected() as i64,
-                        Err(e) => {
-                            refused += 1;
-                            eprintln!(
-                                "REFUSED: ownership.node_id = {id} could not be transcribed: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if refused > 0 {
-        tracing::warn!(
-            transcribed = total,
-            refused,
-            "some legacy ownership rows were refused by migration 071; `verify` will name them"
-        );
-    } else {
-        tracing::info!(transcribed = total, "legacy ownership rows transcribed");
-    }
-    Ok(())
-}
+// `transcribe_legacy_ownership` lived here until PR-22.
+//
+// It re-fired migration 071's `ownership_transcribe` trigger over every
+// `ownership` row that predated the trigger, by writing `owner_id` back to
+// itself, and it was what made `verify`'s two `ownership` checks clearable at
+// all. Migration 084 retires the table, so the pass has nothing left to walk.
+//
+// THE ORDER MATTERS AND IT IS NOT INCIDENTAL. Retiring the transcription pass is
+// only safe because transcription is complete, and 084's second pre-flight is
+// what proves it: the migration refuses to drop the table while any non-public
+// row lacks a `tenancy_transcription_log` entry. The gate moved from a binary an
+// operator has to remember to run into the migration that does the destructive
+// thing; it was not removed. `docs/deploy.md` records the same sequence from the
+// operator's side.
 
 /// Settle the entities this binary does not stamp directly.
 ///
@@ -903,8 +802,11 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 // verify
 // =============================================================================
 
-/// The six `SECURITY DEFINER` bodies migrations 070 and 071 install, whose owner
-/// must satisfy `epigraph_definer_bypass()`.
+/// The five `SECURITY DEFINER` bodies migration 070 installs, whose owner must
+/// satisfy `epigraph_definer_bypass()`.
+///
+/// It was six until PR-22: 071's `epigraph_ownership_transcribe` is dropped by
+/// migration 084 with the table it wrote through.
 ///
 /// Migration 086's read helper is subject to the same check but lives in
 /// [`DEFERRED_DEFINER_FUNCTIONS`]; [`applicable_definer_functions`] joins the
@@ -949,9 +851,9 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// migration you are not supposed to have applied yet".
 ///
 /// So the 086 entry is skipped **only while the FUNCTION ITSELF is absent from
-/// `pg_proc`**, by [`applicable_definer_functions`]. The six from 070/071 keep
-/// their unconditional semantics: those ARE the migrations 11c applies, so a
-/// missing one there is a real finding.
+/// `pg_proc`**, by [`applicable_definer_functions`]. The five from 070 keep
+/// their unconditional semantics: that IS a migration 11c applies, so a missing
+/// one there is a real finding.
 ///
 /// ## The gate reads `pg_proc`, NOT `_sqlx_migrations` (PR-24 land phase)
 ///
@@ -975,7 +877,10 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
     "epigraph_propagate_tenancy",
-    "epigraph_ownership_transcribe",
+    // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
+    // Migration 084 drops the function with the table it wrote through, so an
+    // unconditional entry would report `does not exist` on every database at
+    // head and block a working deploy.
 ];
 
 /// Definer bodies installed by a migration LATER than the ones 11c applies, as
@@ -1037,7 +942,7 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
     Ok(out)
 }
 
-/// Assert that migrations 070/071/086 actually re-owned their `SECURITY DEFINER`
+/// Assert that migrations 070/086 actually re-owned their `SECURITY DEFINER`
 /// bodies. Returns the number of failing checks.
 ///
 /// # Why this is a `verify` check and not a migration assertion
@@ -1059,7 +964,10 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
 ///   An app-owned body is RLS-filtered the moment PR-17 arms the predicate.
 /// * **071 — an OUTAGE.** `epigraph_definer_bypass()` is
 ///   `pg_has_role(CURRENT_USER, …)` evaluated as the FUNCTION OWNER, so an
-///   app-owned shim returns false and every `ownership` write raises 42501.
+///   app-owned shim returned false and every `ownership` write raised 42501.
+///   Historical since PR-22: migration 084 drops both the table and 071's shim,
+///   so this arm has no subject left and its entry is gone from
+///   [`DEFINER_FUNCTIONS`]. The other three arms are unaffected.
 /// * **086 — a DEGRADED READ CONTROL (PR-24).** `epigraph_claim_tenancy_by_ids`
 ///   reaches `claims` only through `claims_tenancy`'s definer-bypass disjunct.
 ///   An app-owned body is policy-filtered like any other reader, so it returns
@@ -1073,12 +981,12 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
 /// loop). `verify`'s exit code is the documented week-11c pre-flight, so the
 /// check belongs here, where an operator can act on it.
 ///
-/// A missing FUNCTION is reported too: 070/071/086 may have been rolled back
+/// A missing FUNCTION is reported too: 070/086 may have been rolled back
 /// without the code being rolled back with them.
 async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     // The role must exist at all. `epigraph_definer_bypass()` is written to
-    // return FALSE rather than error when it is missing, so 071's shim would
-    // raise 42501 on every ownership write with no other signal.
+    // return FALSE rather than error when it is missing, so every definer body
+    // below is silently downgraded with no other signal.
     let role_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
             .bind(MAINTENANCE_ROLE)
@@ -1087,10 +995,10 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     if !role_exists {
         eprintln!(
             "FAIL: role '{MAINTENANCE_ROLE}' does not exist. Migration 060 only RAISE NOTICEs \
-             when the migration role lacks CREATEROLE, and 070, 071 and 086 then SKIP their \
-             ALTER FUNCTION ... OWNER TO, so all three migrations reported success with the \
+             when the migration role lacks CREATEROLE, and 070 and 086 then SKIP their \
+             ALTER FUNCTION ... OWNER TO, so both migrations reported success with the \
              control absent. This branch returns BEFORE the per-function checks below, so \
-             none of them ran. Provision the role out of band and re-apply 070, 071 and 086."
+             none of them ran. Provision the role out of band and re-apply 070 and 086."
         );
         return Ok(1);
     }
@@ -1109,7 +1017,7 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
         // a body owned by a role that is a MEMBER of epigraph_maintenance, and
         // a superuser-owned body (pg_has_role is true of a superuser for every
         // role). A deploy gate that blocks a working configuration, whose only
-        // documented remedy is "re-apply 070 and 071", would not clear.
+        // documented remedy is "re-apply 070", would not clear.
         //
         // MEASURED on the throwaway: pg_has_role('epigraph_app', ..) = false,
         // ('epigraph_maintenance', ..) = true, ('epigraph', ..) = true
@@ -1134,7 +1042,7 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 failures += 1;
                 eprintln!(
                     "FAIL: SECURITY DEFINER function public.{f} does not exist. \
-                     Apply migrations 070, 071 and 086 before running this."
+                     Apply migrations 070 and 086 before running this."
                 );
             }
             Some((_, true)) => {}
@@ -1142,13 +1050,12 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 failures += 1;
                 eprintln!(
                     "FAIL: public.{f} is owned by '{rolname}', which is not a member of \
-                     '{MAINTENANCE_ROLE}'. Migrations 070/071/086 skip their ALTER FUNCTION \
+                     '{MAINTENANCE_ROLE}'. Migrations 070/086 skip their ALTER FUNCTION \
                      when the role is absent (060 only NOTICEs on insufficient_privilege), so \
                      this is a SILENT no-op: 070's bodies become RLS-filtered at PR-17 -- arm \
-                     (b) then stamps a private endpoint PUBLIC -- 071's shim raises 42501 on \
-                     every ownership write, and 086's read helper returns fewer rows with no \
-                     error, which degrades the read-side suppression control it backs. \
-                     Re-apply 070, 071 and 086 with the role provisioned."
+                     (b) then stamps a private endpoint PUBLIC -- and 086's read helper returns \
+                     fewer rows with no error, which degrades the read-side suppression control \
+                     it backs. Re-apply 070 and 086 with the role provisioned."
                 );
             }
         }
@@ -1204,36 +1111,29 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
         print_offenders(pool, "evidence").await?;
     }
 
-    // The transcription check: a non-public ownership row whose claim is still
-    // public means the 071 shim did not fire (or predates it).
-    let untranscribed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ownership o
-           JOIN claims c ON c.id = o.node_id
-          WHERE o.node_type = 'claim'
-            AND o.partition_type <> 'public'
-            AND c.visibility = 'public'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if untranscribed > 0 {
-        failures += 1;
-        eprintln!("FAIL: {untranscribed} non-public ownership row(s) map to a still-public claim.");
-    }
-
-    // And a ledger row for every non-public ownership row — migration 084's
-    // pre-flight reads exactly this.
-    let unlogged: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ownership o
-          WHERE o.partition_type <> 'public'
-            AND NOT EXISTS (SELECT 1 FROM tenancy_transcription_log l
-                             WHERE l.node_id = o.node_id)",
-    )
-    .fetch_one(pool)
-    .await?;
-    if unlogged > 0 {
-        failures += 1;
-        eprintln!("FAIL: {unlogged} non-public ownership row(s) have no transcription log row.");
-    }
+    // Two `ownership` checks lived here until PR-22: a non-public row whose
+    // claim was still public (`untranscribed`), and a non-public row with no
+    // `tenancy_transcription_log` entry (`unlogged`). Migration 084 retires the
+    // table. ONLY ONE OF THE TWO MOVED, AND THIS SAYS SO RATHER THAN IMPLYING
+    // BOTH DID.
+    //
+    // `unlogged` IS migration 084's pre-flight (2) — superseded exactly, then
+    // STRENGTHENED: the pre-flight additionally requires the ledger entry to
+    // record the partition the row currently holds, because the ledger is
+    // `node_id PRIMARY KEY` overwritten on every firing and a presence-only
+    // check is satisfied by a stale entry. That gate did not disappear; it moved
+    // into the statement that does the destructive thing, where an operator
+    // cannot skip it.
+    //
+    // `untranscribed` HAS NO COUNTERPART IN 084 AND DELIBERATELY GETS NONE. As a
+    // third pre-flight it would false-positive on a legitimate declassification,
+    // which leaves a stale non-public `ownership` row behind by design. A node
+    // can therefore satisfy pre-flight (2) while its claim never actually landed
+    // non-public, and 084 will not refuse. That check is carried by DEPLOY ORDER
+    // instead — `docs/deploy.md` steps 1-2 require running this binary and
+    // confirming `verify` exits 0 on the release that STILL HAS this check,
+    // before 084 is applied. An operator who skips step 2 loses a check that
+    // used to exist.
 
     // `edges` is NOT blanket-exempt. A world-owned edge is legitimate exactly
     // when BOTH its endpoints are public — that is 070 arm (b)'s

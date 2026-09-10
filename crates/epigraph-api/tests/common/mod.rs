@@ -545,64 +545,176 @@ pub async fn seed_frame_with_claim(pool: &PgPool, claim_id: Uuid) -> Uuid {
     frame_id
 }
 
-/// Mark `node_id` (a claim) as a `private` partition owned by `owner_id`.
+/// Resolve `owner_id`'s personal group, minting it and the owner's membership
+/// if it does not exist.
 ///
-/// **What this helper does changed under the fixture's feet, twice.** It writes
-/// an `ownership` row, and it always has. Until PR-12 that row was consulted
-/// only by `check_content_access`, which returned Full to `owner_id` and
-/// Redacted to everyone else, while `claims.visibility` stayed `'public'`.
-/// Migration 071 made the write a WRITE-THROUGH: the `ownership_transcribe`
-/// trigger stamps the claim's tenancy columns to `('group', <owner's personal
-/// group>)` in the same statement. PR-14 then deleted `check_content_access`,
-/// so the trigger's effect is the whole mechanism.
+/// The `ownership` fixtures below used to reach this shape indirectly: they
+/// wrote an `ownership` row and migration 071's `ownership_transcribe` trigger
+/// resolved-or-minted the personal group and stamped the claim. PR-22 retires
+/// that table, so the fixtures do the two halves themselves and this is the
+/// first — copied from 071's fallback arm, including the reasons:
+///
+/// * **Two ways to identify a personal group, and both are needed.** The
+///   canonical one is `ensure_personal_group`'s deterministic
+///   `did:epigraph:personal:<agent uuid>` key, but the semantics are
+///   `kind = 'personal'` created by this agent, and every copy of
+///   `tests/viewer_fixture.rs::seed_agent_with_group` mints one under a
+///   `did:epigraph:test:` key instead. Matching only the did_key would mint a
+///   SECOND personal group for an agent that already has one.
+/// * **The membership is not optional and the conflict target is the
+///   composite.** An untargeted `DO NOTHING` silently no-ops against a revoked
+///   row, leaving the agent with no live membership in its own personal group,
+///   permanently.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn personal_group_of(pool: &PgPool, owner_id: Uuid) -> Uuid {
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM groups \
+          WHERE (did_key = 'did:epigraph:personal:' || $1::text) \
+             OR (kind = 'personal' AND created_by_agent_id = $1) \
+          ORDER BY (did_key = 'did:epigraph:personal:' || $1::text) DESC, created_at ASC \
+          LIMIT 1",
+    )
+    .bind(owner_id)
+    .fetch_optional(pool)
+    .await
+    .expect("resolve personal group");
+
+    let group = match existing {
+        Some(g) => g,
+        None => sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('personal:' || $1::text, 'did:epigraph:personal:' || $1::text, \
+                     ''::bytea, 'personal', $1) \
+             ON CONFLICT (did_key) DO UPDATE SET updated_at = now() RETURNING id",
+        )
+        .bind(owner_id)
+        .fetch_one(pool)
+        .await
+        .expect("mint personal group"),
+    };
+
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin') \
+         ON CONFLICT (group_id, agent_id, epoch) \
+         DO UPDATE SET revoked_at = NULL, role = 'admin'",
+    )
+    .bind(group)
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("revive personal group membership");
+
+    group
+}
+
+/// Stamp `claim_id` `('group', group_id)` and CHECK that it landed.
+///
+/// The read-back is the reason this is a function rather than three inlined
+/// UPDATEs. `read_path_authz_test.rs` runs sixteen authorization tests through
+/// the two fixtures below; a fixture that silently stamped the wrong visibility
+/// would leave every one of them green while testing nothing, because they all
+/// assert that a stranger sees LESS. Asserting the post-condition here is what
+/// makes "the stranger saw nothing" mean "the row was private".
+async fn stamp_group_private(pool: &PgPool, claim_id: Uuid, group_id: Uuid) {
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(claim_id)
+        .bind(group_id)
+        .execute(pool)
+        .await
+        .expect("stamp the claim group-private");
+
+    let got: Option<(String, Uuid)> =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read the stamped claim back");
+    assert_eq!(
+        got,
+        Some(("group".to_string(), group_id)),
+        "the fixture must leave claim {claim_id} at ('group', {group_id}); a \
+         mis-stamped fixture makes every 'a stranger sees nothing' assertion \
+         vacuous"
+    );
+}
+
+/// Make claim `node_id` readable only by `owner_id`'s personal group.
+///
+/// **This wrote an `ownership` row until PR-22, and what that row DID changed
+/// twice before it was retired.** Until PR-12 it was consulted only by
+/// `check_content_access`, which returned Full to `owner_id` and Redacted to
+/// everyone else while `claims.visibility` stayed `'public'`. Migration 071 made
+/// the write a WRITE-THROUGH: the `ownership_transcribe` trigger stamped the
+/// claim's tenancy columns to `('group', <owner's personal group>)` in the same
+/// statement, and PR-14 deleted `check_content_access`, so the trigger's effect
+/// became the whole mechanism. Migration 084 then retired the table, and this
+/// fixture writes the tenancy columns the trigger used to write — the same end
+/// state, one indirection fewer.
 ///
 /// Read it as: this seeds a row that `owner_id`'s `Viewer` admits and a
-/// stranger's `Viewer` excludes. It no longer sets up a redaction decision;
-/// there is no decision, only a predicate on the read.
+/// stranger's `Viewer` excludes.
 ///
-/// `node_type` is NOT NULL with a CHECK constraint, so it must be 'claim'.
-/// Create the claim first with
-/// `seed_claim_with_agent(pool, content, owner_id)` so the owner agent row
-/// exists.
+/// Create the claim first with `seed_claim_with_agent(pool, content, owner_id)`
+/// so the owner agent row exists.
 #[allow(
     dead_code,
     reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
 )]
 pub async fn seed_private_ownership(pool: &PgPool, node_id: Uuid, owner_id: Uuid) {
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2) \
-         ON CONFLICT (node_id) DO UPDATE SET partition_type = 'private', owner_id = $2",
-    )
-    .bind(node_id)
-    .bind(owner_id)
-    .execute(pool)
-    .await
-    .expect("seed private ownership");
+    let group = personal_group_of(pool, owner_id).await;
+    stamp_group_private(pool, node_id, group).await;
 }
 
-/// Mark `node_id` (a claim) as a `community` partition owned by `owner_id` and
-/// gated by `community_id`.
+/// Make claim `node_id` readable by `community_id`'s projected group, falling
+/// back to `owner_id`'s personal group when no community resolves.
 ///
 /// The counterpart to [`seed_private_ownership`] for the arm that, until PR-05,
 /// NO test in this repository exercised — every fixture in the suite wrote
-/// `'private'`. Until PR-14, `check_content_access` returned Full only to a
-/// requester whose agent owns a perspective in `community_id` (a two-hop join
-/// through `community_members`) and Redacted to everyone else. That pass is
-/// deleted: 071's `ownership_transcribe` trigger now projects the community
-/// onto the claim's tenancy columns and the `Viewer` decides, so a non-member
-/// gets an ABSENCE rather than a placeholder. Pass `None` for `community_id` to
-/// reach the owner-only fallback.
+/// `'private'`. Pass `None` for `community_id` to reach the owner-only fallback.
 ///
-/// Writes `community_id`, NEVER `encryption_key_id`. Before migration 068 the
-/// gating community lived stringified in `encryption_key_id`, a `text` column
-/// whose name meant something else entirely; a fixture that still wrote it
-/// would keep passing while the production writer had moved on. Migration 068's
-/// `ownership_key_id_is_uuid` CHECK also refuses any non-UUID value there now.
+/// # The three arms are migration 071's, not new policy
 ///
-/// Create the claim, the owner agent, the community, the member's perspective
-/// and the `community_members` row first; this helper writes only the
-/// `ownership` row.
+/// The `ownership_transcribe` trigger this replaces resolved a
+/// `partition_type = 'community'` row in exactly this order, and the ordering is
+/// a reviewed decision in each case:
+///
+/// * a community that resolves AND whose projected group has a live member
+///   stamps `('group', community_id)` — the projection is ID-preserving
+///   (migration 068), so a community's group id IS its community id;
+/// * a community with no projectable member falls back to the owner's personal
+///   group rather than stamping a group nobody is in, which would make the node
+///   unreadable by everyone including its owner;
+/// * a NULL or dangling `community_id` is a legacy shape, not an error path, and
+///   also falls back — fail-closed, still `'group'`, still not public.
+///
+/// **The owner is deliberately NOT added to the community group.** On the
+/// community arm, ownership alone does not grant access once a community
+/// resolves; membership is the whole test. 071 says so at length and names the
+/// assertion that states it.
+///
+/// # PR-22: ONLY THE FIRST ARM HAS A CALLER, AND THAT IS A KNOWN GAP
+///
+/// This helper hand-writes 071's resolution because PR-22 retires the trigger
+/// that used to perform it. The two FALLBACK arms are therefore newly written
+/// code with **no caller in this crate**: the sole call site,
+/// `read_path_authz_test.rs::get_claim_community_member_sees_content_and_outsider_does_not`,
+/// passes `Some(community)` with a live member and takes arm one.
+///
+/// The arms were inherited from
+/// `tenancy_triggers.rs::an_empty_community_falls_back_to_the_owner_rather_than_a_black_hole`
+/// and `::a_dangling_community_reference_falls_back_to_the_owner_not_a_raise`,
+/// which were the only executable statements of that behaviour anywhere in the
+/// tree and which PR-22 deletes with the shim. Do not read their absence as
+/// evidence the fallbacks are covered — they are not, and
+/// [`stamp_group_private`]'s read-back cannot discriminate WHICH arm ran,
+/// because it asserts against whatever group the resolver just returned. In the
+/// one live test the member-sees-200 assertion does discriminate, so nothing is
+/// green-but-vacuous today; the discrimination just lives in the caller by luck
+/// rather than in this fixture by design. Tracked as a follow-up.
 #[allow(
     dead_code,
     reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
@@ -613,18 +725,25 @@ pub async fn seed_community_ownership(
     owner_id: Uuid,
     community_id: Option<Uuid>,
 ) {
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3) \
-         ON CONFLICT (node_id) DO UPDATE SET partition_type = 'community', \
-             owner_id = $2, community_id = $3, encryption_key_id = NULL",
-    )
-    .bind(node_id)
-    .bind(owner_id)
-    .bind(community_id)
-    .execute(pool)
-    .await
-    .expect("seed community ownership");
+    let resolved: Option<Uuid> = match community_id {
+        None => None,
+        Some(c) => sqlx::query_scalar(
+            "SELECT g.id FROM groups g \
+              WHERE g.id = $1 AND g.kind = 'community' \
+                AND EXISTS (SELECT 1 FROM group_memberships m \
+                             WHERE m.group_id = g.id AND m.revoked_at IS NULL)",
+        )
+        .bind(c)
+        .fetch_optional(pool)
+        .await
+        .expect("resolve the projected community group"),
+    };
+
+    let group = match resolved {
+        Some(g) => g,
+        None => personal_group_of(pool, owner_id).await,
+    };
+    stamp_group_private(pool, node_id, group).await;
 }
 
 /// Create a community and put `agent` in it the ONLY way the community
@@ -687,6 +806,52 @@ pub async fn seed_community_with_member(pool: &PgPool, agent_id: Uuid) -> Uuid {
         .execute(pool)
         .await
         .expect("seed community membership");
+
+    // THE PROJECTION, which migration 071's shim used to replay on the fixture's
+    // behalf and PR-22 retired with it. It is not optional: `Viewer::resolve`
+    // reads `group_memberships`, not `community_members`, so a community with no
+    // projected group and no projected members produces a claim nobody can read
+    // — including the member this helper exists to create.
+    //
+    // Shapes copied from migration 068 and `CommunityRepository::create`, which
+    // copied them from 068 for the same reason: ID-PRESERVING, the
+    // `did:epigraph:community:` key, `public_key = ''::bytea` (060's
+    // `groups_public_key_shape` requires `octet_length = 0` for every
+    // `kind <> 'team'`), and `role = 'reader'` because `community_members`
+    // attests read interest and says nothing about write authority.
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_at) \
+         SELECT c.id, c.name, 'did:epigraph:community:' || c.id::text, ''::bytea, \
+                'community', c.created_at \
+           FROM communities c WHERE c.id = $1 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(community_id)
+    .execute(pool)
+    .await
+    .expect("project the community onto a group");
+
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status) \
+         VALUES ($1, 0, NULL, 'active') ON CONFLICT DO NOTHING",
+    )
+    .bind(community_id)
+    .execute(pool)
+    .await
+    .expect("project the community's epoch 0");
+
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         SELECT DISTINCT cm.community_id, p.owner_agent_id, ''::bytea, 0, 'reader' \
+           FROM community_members cm \
+           JOIN perspectives p ON p.id = cm.perspective_id \
+          WHERE cm.community_id = $1 AND p.owner_agent_id IS NOT NULL \
+         ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL",
+    )
+    .bind(community_id)
+    .execute(pool)
+    .await
+    .expect("project the community's memberships");
 
     community_id
 }
