@@ -1,7 +1,8 @@
 # Design: EpiGraph belief graphs as short-term memory for the Pi coding harness
 
-**Status:** design / feasibility assessment. No code landed yet.
-**Upstream surveyed:** [`earendil-works/pi`](https://github.com/earendil-works/pi) @ `main`, 2026-09-09.
+**Status:** milestone 1 implemented in [`experiments/pi-belief-memory/`](../../../experiments/pi-belief-memory/).
+**Upstream surveyed:** [`earendil-works/pi`](https://github.com/earendil-works/pi) @ `main`, 2026-09-09;
+implementation typechecks against `@earendil-works/pi-coding-agent` 0.85.1.
 
 ## The proposal
 
@@ -272,21 +273,69 @@ stable position so an unchanged render is byte-identical and the cache survives.
 | Verbatim detail loss | Exact strings in claim `properties`, never paraphrased into content |
 | Divergence from upstream | Extension API only, no fork — upstream churn risk limited to the three hook signatures |
 
-## Proposed first milestone
+## First milestone — implemented
 
-A single self-contained Pi extension implementing A1 + B1:
+`experiments/pi-belief-memory/` implements A1 + B1 as a single self-contained
+Pi extension: `session_before_compact` handler, graph model with merge and
+supersede semantics, budgeted renderer with a reserved "refuted" section,
+fallback to default compaction on any extraction failure, and `/beliefs` for
+inspection. 81 tests, clean typecheck against upstream's own types.
 
-1. `session_before_compact` handler: extract → merge → render → return
-   `{ compaction: { summary, firstKeptEntryId, tokensBefore, details: graph } }`.
-2. Graph model + merge semantics (insert, evidence-attach, supersede, refute).
-3. Budgeted renderer with a reserved "refuted" section.
-4. Fall back to default compaction on any extraction failure.
-5. `pi.registerCommand("beliefs", …)` to dump the current graph for inspection.
+### Read-only hydration moved into milestone 1
 
-Evaluation: run the same long coding task through default compaction and
-through the extension, and measure re-litigation — how often the agent
-re-proposes something already refuted before the compaction boundary. That is
-the metric the prose summary loses on, so it is the one worth measuring first.
+The original plan deferred all kernel contact to A2. One piece of it earned
+promotion: **read-only** hydration, seeding the session graph from long-term
+memory at compaction time.
+
+The reason is that it costs almost nothing once both sides speak the same
+representation. Recall returns claims that already carry belief intervals and
+already sit in a web of epistemic edges, so hydration is a graph-into-graph
+merge rather than a text splice — `[Bel, Pl]` maps back onto a mass function
+exactly, and `GET /api/v1/claims/:id/neighborhood` brings the supports and
+contradicts structure across already in place instead of re-deriving it.
+
+The provenance pointer is what makes this more than a convenience. Every
+hydrated node renders as `⟨epigraph:UUID⟩`, so the block stays honest about its
+own lossiness: the one-line summary stands in for a full record — evidence,
+provenance chain, mass function, challenges — that an agent can fetch with
+`get_claim` when the summary is not enough. Short-term memory becomes an index
+into long-term memory rather than a lossy copy of it.
+
+Two invariants this has to respect, both encoded in the implementation:
+
+- Hydrated evidence edges are applied with `applyEvidence: false`. The kernel
+  already folded them into the belief it reported; re-applying them locally
+  would count the same evidence twice.
+- A neighbour fetched without an epistemic interval starts **vacuous**, not
+  borrowing its seed's belief. "We pulled this in because it was adjacent" is
+  not evidence for it.
+
+What stays deferred to A2 is the **write** direction, and for the reason the
+axis-A section already gives: session-scoped hypotheses written into a durable
+ledger pollute claim state unless they land under a session perspective with
+the not-embedded-by-default treatment host telemetry already gets.
+
+### Evaluation, still to run
+
+Run the same long coding task through default compaction and through the
+extension, and measure re-litigation — how often the agent re-proposes
+something already refuted before the compaction boundary. That is the metric
+the prose summary loses on, so it is the one worth measuring first.
+
+### One finding worth recording
+
+Section membership cannot rank by BetP. Dempster's rule normalizes conflict
+away by dividing through by `(1 - K)`, so a hypothesis held at 0.7 and then
+killed by a direct observation lands near **BetP 0.40** — while its refute mass
+outweighs its support mass roughly two to one. Ranking by the point estimate
+files every refuted approach under "open" and loses the single signal the whole
+block exists to carry. The implementation tests `refute > support` instead, and
+prints refuting mass rather than BetP in that section.
+
+This is a general caution for anything that projects a mass function to a
+scalar and then thresholds it: BetP is the right thing to *sort* by and the
+wrong thing to *classify* by, because normalization has already discarded the
+disagreement that made the claim interesting.
 
 ## Source references
 
