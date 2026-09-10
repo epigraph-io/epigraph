@@ -110,7 +110,8 @@ impl GroupMembershipRepository {
 
     /// Revoke a member, refusing to revoke the group's LAST live admin.
     ///
-    /// **One statement, one snapshot.** The route used to do this as
+    /// **The rows the decision reads are locked before the decision is made.**
+    /// The route used to do this as
     /// `get_member_role` -> `count_live_admins_excluding` -> `remove_member`,
     /// three round-trips on the pool with no transaction. That is check-then-act
     /// across three snapshots: two concurrent removals of admins A and B, when A
@@ -121,10 +122,43 @@ impl GroupMembershipRepository {
     /// check against a roster that includes the other" was the reasoning error:
     /// they both do pass, *because* each sees the other.
     ///
-    /// The `EXISTS` subquery is evaluated by the same `UPDATE` that writes, so
-    /// the two serialise on the row locks the `UPDATE` takes: the loser of the
-    /// race re-evaluates its subquery against the winner's committed state under
-    /// READ COMMITTED and finds no other live admin.
+    /// Folding the count into the writing `UPDATE` is NECESSARY BUT NOT
+    /// SUFFICIENT, and this doc comment used to claim otherwise — it said the
+    /// two removals "serialise on the row locks the `UPDATE` takes". They do
+    /// not. An `UPDATE` locks the row it WRITES, not the rows its `WHERE`
+    /// clause READS. Removals of admins A and B write different rows, so they
+    /// never block each other, and each one's `EXISTS` reads the other's row
+    /// without locking it: both still see a second live admin, both proceed,
+    /// and the group still ends with zero admins. One statement is one
+    /// snapshot; it is just not a snapshot anyone else is excluded from.
+    ///
+    /// So the transaction OPENS by locking the group's ENTIRE live roster —
+    /// `WHERE group_id = $1 AND revoked_at IS NULL ORDER BY agent_id
+    /// FOR UPDATE`. That set contains every row the guard subsequently touches:
+    /// the rows its `EXISTS` can match (the subquery only narrows the roster
+    /// further, with `agent_id <> $2` and `role = 'admin'`) AND the target row
+    /// the `UPDATE` writes. Any two concurrent removals in the same group
+    /// therefore ask for the same rows before either decides, so the second
+    /// cannot reach the guard until the first commits. When it unblocks, READ
+    /// COMMITTED re-applies the lock statement's own qual to the newly
+    /// committed row version: a just-revoked member drops out of the set rather
+    /// than raising a serialization failure, and the guard `UPDATE` that
+    /// follows takes a fresh statement snapshot that includes the winner's
+    /// commit. The loser's `EXISTS` therefore finds no other live admin, and it
+    /// refuses.
+    ///
+    /// The roster, not just the admin rows, is deliberate. Locking only the
+    /// admins would be enough for the guard itself, but it would leave the
+    /// target row of a non-admin removal outside the ordered lock set, to be
+    /// picked up later by the `UPDATE`; see the lock-order section below for
+    /// why every `group_memberships` row this transaction touches must be
+    /// acquired by that one ordered statement.
+    ///
+    /// Locking ZERO rows means the group has no live member at all — so, a
+    /// fortiori, no live admin. That is benign, and deliberately not an early
+    /// return: the guard `UPDATE` then matches nothing, the follow-up read
+    /// finds no live row either, and the caller gets `NotAMember`, which is the
+    /// same answer it got before this lock existed.
     ///
     /// The follow-up read runs in the same transaction and only discriminates
     /// *why* zero rows changed.
@@ -159,12 +193,40 @@ impl GroupMembershipRepository {
     /// moved.
     ///
     /// Lock order across the three tables is `group_memberships`, then
-    /// `groups`, then `group_key_epochs`. `GroupKeyEpochRepository::rotate_conn`
-    /// takes the same two it needs in the same relative order — roster first,
-    /// epoch row second — for exactly this reason: the reverse would let a
-    /// rotation holding the epoch row wait on a removal holding the roster
-    /// while the removal waited on the epoch row. Two concurrent removals
-    /// serialise on the first table and cannot deadlock on the later two.
+    /// `groups`, then `group_key_epochs`, and the `FOR UPDATE` above does NOT
+    /// change it: it is on `group_memberships`, the table this transaction
+    /// already took first. That is why it was preferred to locking the
+    /// `groups` row instead — no site in this codebase takes a `groups` row
+    /// lock, and introducing one here would invert the order against
+    /// `CommunityRepository::remove_member`, which holds a `group_memberships`
+    /// row while it writes `groups` for the SAME id (the community projection
+    /// is id-preserving). `GroupKeyEpochRepository::rotate_conn` takes the same
+    /// two it needs in the same relative order — roster first, epoch row
+    /// second — for exactly this reason: the reverse would let a rotation
+    /// holding the epoch row wait on a removal holding the roster while the
+    /// removal waited on the epoch row.
+    ///
+    /// WITHIN `group_memberships`, EVERY row this transaction locks is acquired
+    /// by that one opening statement, and it selects the same rows in the same
+    /// order as `rotate_conn`'s roster lock: same table, same predicate, same
+    /// `ORDER BY` (the two literals differ only in line breaks). The
+    /// guard `UPDATE`'s own row lock is not an additional acquisition: the
+    /// target is already in the roster, so the `UPDATE` re-takes a lock the
+    /// transaction holds. That is what makes the ordering argument true rather
+    /// than merely plausible — a rotation and a removal on one group request
+    /// the identical row set in the identical `agent_id` order, so they queue.
+    /// Narrowing the lock statement (to admins only, say) would break this,
+    /// because a non-admin target would then be acquired AFTER rows that sort
+    /// above it. Two concurrent removals of DIFFERENT members of one group both
+    /// still succeed; they serialise on the shared roster, and neither is
+    /// refused.
+    ///
+    /// `FOR UPDATE` does not prevent an `INSERT`, so a concurrent `add_member`
+    /// can still add an admin the lock set never saw. That direction is safe
+    /// here — it can only make the guard's `EXISTS` true, i.e. permit a removal
+    /// that leaves the group with the admin just added — and it is the same
+    /// pre-existing check-then-act in `add_member` that `rotate_conn` names.
+    /// This function does not close it and does not claim to.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails.
@@ -175,6 +237,38 @@ impl GroupMembershipRepository {
         agent_id: Uuid,
     ) -> Result<RevokeOutcome, DbError> {
         let mut tx = pool.begin().await?;
+
+        // THE ROWS THE GUARD READS AND WRITES, LOCKED BEFORE IT READS THEM.
+        // The `UPDATE` below locks only the row it writes; this locks the whole
+        // live roster, which contains both that row and every row its `EXISTS`
+        // consults. The predicate and the `ORDER BY` are IDENTICAL to
+        // `GroupKeyEpochRepository::rotate_conn`'s roster lock — same table,
+        // same qual, same order — so the two functions request the same rows in
+        // the same sequence. Keep them identical: this is the whole of the
+        // ordering argument in the doc comment. See that comment for the READ
+        // COMMITTED re-evaluation that makes the loser refuse, and for why zero
+        // locked rows is benign.
+        //
+        // The binding exists only to feed the debug line below; the LOCK is the
+        // point, not the rows. Do not delete the query along with the log.
+        let locked_roster: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT agent_id
+            FROM group_memberships
+            WHERE group_id = $1
+              AND revoked_at IS NULL
+            ORDER BY agent_id
+            FOR UPDATE
+            "#,
+        )
+        .bind(group_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        tracing::debug!(
+            locked_roster = locked_roster.len(),
+            "last-admin guard: locked the group's live roster"
+        );
 
         let result = sqlx::query(
             r#"

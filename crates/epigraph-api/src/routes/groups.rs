@@ -491,7 +491,8 @@ pub async fn remove_member(
             id: group_id.to_string(),
         })?;
 
-    // Last-admin guard AND the revoke, in ONE statement in ONE transaction.
+    // Last-admin guard AND the revoke, in ONE transaction, over rows the same
+    // transaction locked before it decided.
     //
     // This was three separate round-trips on the pool — get_member_role, then
     // count_live_admins_excluding, then remove_member — guarded by the claim
@@ -501,6 +502,12 @@ pub async fn remove_member(
     // concurrent DELETE for each, both DO pass, precisely because each sees the
     // other, and the group ends with zero admins — the exact outcome the guard
     // exists to prevent, with no break-glass path.
+    //
+    // Folding the three round-trips into one statement narrowed that window
+    // but did not close it — an UPDATE locks the row it writes, not the rows
+    // its WHERE clause reads. The repo function now locks the group's live
+    // roster first; see its doc comment. This route is unchanged by that:
+    // the three outcomes and their statuses are exactly as before.
     let outcome = GroupMembershipRepository::revoke_member_unless_last_admin(
         &state.db_pool,
         group_id,
