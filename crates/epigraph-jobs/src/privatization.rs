@@ -79,19 +79,28 @@
 //! takes the opposite lock order to this batch. There is no stated need for
 //! concurrent privatizations.
 //!
-//! # What is NOT here
+//! # The third handler, and what it can and cannot do
 //!
-//! `PrivatizationResealHandler`. §6.5.5 names three handlers; the third reseals
-//! group-key-rotated ciphertext, and `seal` mode is PR-21's —
-//! `routes/privatization.rs::create_plan` still returns `501` for it. The
-//! sealing primitives now exist in `crates/epigraph-privacy`, but they are
-//! client-side by construction: no server-side job can reseal content whose key
-//! the server does not hold, so this handler waits on the manifest ceremony
-//! that carries the ciphertext, not on the encryptor.
+//! [`PrivatizationResealHandler`] is here as of PR-21, and it is deliberately
+//! the smallest of the three. §6.5.5 sketched it as driving "the same two-phase
+//! manifest protocol (unseal under N, re-seal under N+1)"; a server-side job
+//! cannot, because the key is the one thing the server does not hold. §6.7's
+//! own closing paragraph is the binding reading: "The server can mark, measure
+//! and prepare the manifest; only a key-holding admin can complete it.
+//! Automating a job that can only ever fail would convert a stated, visible gap
+//! into a red queue nobody trusts."
 //!
-//! Migration 077's `jobs_app` policy already names
-//! `privatization_reseal` and keeps naming it; the job type exists in the policy
-//! and has no producer, which is the same forward-staging that file describes.
+//! So the ceremony is the CLI's, through the seal/unseal routes, and this
+//! handler is the only thing in the system that may clear
+//! `groups.reseal_required_at` — after measuring that nothing is still bound to
+//! a retired epoch. PR-20 deliberately does not clear it, because rotation
+//! moves no `claim_encryption` row.
+//!
+//! It is keyed on a GROUP rather than a plan. FINAL-PLAN §6.7 says
+//! `mode='reseal'`; migration 080's applied, frozen `pp_mode_check` admits only
+//! `restrict` and `seal`, so a reseal plan cannot be persisted and PR-21 is
+//! assigned no migration. Recorded as a plan correction rather than worked
+//! around with DDL.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -119,6 +128,14 @@ pub const APPLY_JOB_TYPE: &str = "privatization_apply";
 
 /// The `jobs.job_type` migration 077's `jobs_app` policy names for revert.
 pub const REVERT_JOB_TYPE: &str = "privatization_revert";
+
+/// The `jobs.job_type` migration 077's `jobs_app` policy names for reseal.
+///
+/// The policy has spelled this string since 077 landed and had no producer
+/// until PR-21. It must match the policy literal EXACTLY, for the reason
+/// [`APPLY_JOB_TYPE`] gives: a drifted spelling is not refused for the app role
+/// and raises nothing.
+pub const RESEAL_JOB_TYPE: &str = "privatization_reseal";
 
 /// The `security_events.event_type` the dispatching route writes and condition 6
 /// looks for.
@@ -1069,6 +1086,135 @@ async fn rescan_for_drift_inner(
 fn processing_failed<E: std::fmt::Display>(e: E) -> JobError {
     JobError::ProcessingFailed {
         message: format!("privatization: {e}"),
+    }
+}
+
+// =============================================================================
+// RESEAL (§6.7 point 3)
+// =============================================================================
+
+/// Observe that a group's re-seal is finished, and clear its flag.
+///
+/// See this module's header for why it does no crypto and why it is keyed on a
+/// group rather than on a plan.
+pub struct PrivatizationResealHandler {
+    pool: Arc<ScopedPool>,
+}
+
+impl PrivatizationResealHandler {
+    /// Bind a handler to the maintenance-DSN pool.
+    ///
+    /// Same pool as its two siblings, and `ScopedPool` rather than the
+    /// `MaintenancePool` §6.5.5's sketch names, for the reason recorded on
+    /// [`PrivatizationApplyHandler::new`]: `epigraph-jobs` does not and should
+    /// not depend on `epigraph-cli`.
+    #[must_use]
+    pub const fn new(pool: Arc<ScopedPool>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl JobHandler for PrivatizationResealHandler {
+    async fn handle(&self, job: &Job) -> Result<JobResult, JobError> {
+        let started = std::time::Instant::now();
+
+        let decoded: EpiGraphJob =
+            serde_json::from_value(job.payload.clone()).map_err(|e| JobError::PayloadError {
+                message: format!("privatization reseal payload is not an EpiGraphJob: {e}"),
+            })?;
+        let EpiGraphJob::PrivatizationReseal {
+            group_id,
+            dispatched_by,
+            correlation_id,
+        } = decoded
+        else {
+            return Err(JobError::PayloadError {
+                message: format!(
+                    "expected a {RESEAL_JOB_TYPE} payload, got {}",
+                    decoded.job_type()
+                ),
+            });
+        };
+
+        // `SystemReason::PrivatizationReseal` has existed since PR-04 and had no
+        // consumer until now. It is NOT reused from the apply path: the reason
+        // register is closed and monotone (`viewer_ratchet.rs`), and this slot
+        // was reserved for exactly this authority — measuring a group's
+        // ciphertext epochs and clearing one column — which is a narrower thing
+        // than moving rows into a group.
+        let (mut conn, _lease) = self
+            .pool
+            .unscoped_for_maintenance(SystemReason::PrivatizationReseal)
+            .await
+            .map_err(processing_failed)?;
+
+        let mut tx =
+            sqlx::Connection::begin(&mut *conn)
+                .await
+                .map_err(|e| JobError::ProcessingFailed {
+                    message: format!("privatization: could not open the reseal transaction: {e}"),
+                })?;
+        PrivatizationRepository::begin_batch_conn(&mut tx)
+            .await
+            .map_err(processing_failed)?;
+
+        let stale = PrivatizationRepository::stale_epoch_seal_count_conn(&mut tx, group_id)
+            .await
+            .map_err(processing_failed)?;
+
+        // NOT AN ERROR, AND THAT IS THE DESIGN. An unfinished re-seal is the
+        // normal state of a group between a member removal and the admin's next
+        // key ceremony. Failing the job would put a red row in the queue for a
+        // condition only a human with a key can clear, which §6.7 names as the
+        // thing not to build. The flag stays set; the gauge keeps counting.
+        let cleared = if stale == 0 {
+            PrivatizationRepository::clear_reseal_required_conn(&mut tx, group_id)
+                .await
+                .map_err(processing_failed)?
+        } else {
+            0
+        };
+
+        tx.commit().await.map_err(|e| JobError::ProcessingFailed {
+            message: format!("privatization: could not commit the reseal check: {e}"),
+        })?;
+
+        let mut extra = HashMap::new();
+        extra.insert("group_id".to_string(), serde_json::json!(group_id));
+        extra.insert("stale_epoch_rows".to_string(), serde_json::json!(stale));
+        extra.insert("flag_cleared".to_string(), serde_json::json!(cleared == 1));
+        extra.insert(
+            "correlation_id".to_string(),
+            serde_json::json!(correlation_id),
+        );
+        extra.insert(
+            "dispatched_by".to_string(),
+            serde_json::json!(dispatched_by),
+        );
+
+        Ok(JobResult {
+            output: serde_json::json!({
+                "group_id": group_id,
+                "stale_epoch_rows": stale,
+                "flag_cleared": cleared == 1,
+            }),
+            execution_duration: started.elapsed(),
+            metadata: JobResultMetadata {
+                worker_id: Some("privatization".to_string()),
+                items_processed: Some(cleared),
+                extra,
+            },
+        })
+    }
+
+    fn job_type(&self) -> &str {
+        RESEAL_JOB_TYPE
+    }
+
+    /// See [`PrivatizationApplyHandler::max_retries`].
+    fn max_retries(&self) -> u32 {
+        0
     }
 }
 

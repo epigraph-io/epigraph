@@ -600,6 +600,27 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/admin/privatization/plans/:id/revert",
             post(privatization::revert_plan),
         )
+        // The §6.5.6 seal ceremony. `seal-manifest` is the one route in this
+        // process that streams plaintext the caller may not otherwise read, so
+        // it is protected-router-only and never appears in the anonymous
+        // allowlist. Deliberately NOT exposed over MCP (§6.5.7): an agent tool
+        // is the wrong shape for a key ceremony.
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-manifest",
+            get(privatization::seal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-commit",
+            post(privatization::seal_commit),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-manifest",
+            get(privatization::unseal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-commit",
+            post(privatization::unseal_commit),
+        )
         .route(
             "/api/v1/admin/privatization/audit",
             get(privatization::get_audit),
@@ -1386,6 +1407,27 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/admin/privatization/plans/:id/revert",
             post(privatization::revert_plan),
+        )
+        // The §6.5.6 seal ceremony. `seal-manifest` is the one route in this
+        // process that streams plaintext the caller may not otherwise read, so
+        // it is protected-router-only and never appears in the anonymous
+        // allowlist. Deliberately NOT exposed over MCP (§6.5.7): an agent tool
+        // is the wrong shape for a key ceremony.
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-manifest",
+            get(privatization::seal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-commit",
+            post(privatization::seal_commit),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-manifest",
+            get(privatization::unseal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-commit",
+            post(privatization::unseal_commit),
         )
         .route(
             "/api/v1/admin/privatization/audit",

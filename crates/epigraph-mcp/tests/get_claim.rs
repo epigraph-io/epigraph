@@ -85,10 +85,10 @@ async fn get_claim_returns_labels_and_retirement_state(pool: PgPool) {
 ///
 /// **The stranger disposition changed in PR-12 and this comment says so
 /// deliberately.** It used to be `content == "[REDACTED]"` plus
-/// `content_hash == ""`. Migration 071 now transcribes the `ownership` row into
-/// the tenancy columns, so the stranger's `Viewer` excludes the row entirely
-/// and `get_claim` reports not-found — which subsumes both old assertions and
-/// leaks strictly less, because the stranger no longer learns the claim exists.
+/// `content_hash == ""`. The claim is group-private in its own tenancy columns,
+/// so the stranger's `Viewer` excludes the row entirely and `get_claim` reports
+/// not-found — which subsumes both old assertions and leaks strictly less,
+/// because the stranger no longer learns the claim exists.
 ///
 /// The blanking branch it used to exercise is NOT untested: see
 /// [`get_claim_blanks_the_content_hash_when_it_redacts`] below for the live
@@ -101,23 +101,14 @@ async fn get_claim_hides_private_content_from_strangers(pool: PgPool) {
     let expected_content = format!("test claim {}", claim_id.as_uuid());
 
     // Mark the claim private, owned by `owner`.
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim_id.as_uuid())
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("seed private ownership");
+    common::seed_private_tenancy(&pool, claim_id.as_uuid(), owner).await;
 
     let server = build_test_server(pool.clone());
 
     // PR-12: the Viewer must be resolved for the acting principal, as it is in
-    // production (`Viewer::resolve` runs on the authenticated agent). Migration
-    // 071 transcribes the `ownership` row into the tenancy columns, so an
-    // empty-group `public_viewer` can no longer see this claim AT ALL — not even
-    // as its owner.
+    // production (`Viewer::resolve` runs on the authenticated agent). The claim
+    // is group-private, so an empty-group `public_viewer` cannot see it AT ALL —
+    // not even as its owner.
     let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
         .await
         .expect("resolve owner viewer");
@@ -186,117 +177,41 @@ async fn get_claim_hides_private_content_from_strangers(pool: PgPool) {
     }
 }
 
-/// The read path decides on the row's own tenancy columns, and on nothing else.
-///
-/// # What this replaces, and why it is a re-point rather than a deletion
-///
-/// This case was `get_claim_blanks_the_content_hash_when_it_redacts` through
-/// PR-13. It asserted `content == "[REDACTED]"` and `content_hash == ""`, and
-/// its own message called the first of those a PRECONDITION: *"this must be the
-/// BLANKING branch, not the absence one."* PR-14 deletes the blanking branch, so
-/// that assertion is false by construction.
-///
-/// The half it protected — that `content_hash` is an unsalted `BLAKE3(content)`
-/// and so must never be returned beside a body the caller may not read — is now
-/// closed by construction rather than by assertion: no branch returns a claim
-/// WITHOUT its content, so the two fields cannot disagree in any response.
-///
-/// The FIXTURE, however, is the only executable statement of a deploy-ordering
-/// constraint, and re-pointing it costs nothing. It constructs a row whose
-/// legacy `ownership` record and whose tenancy columns DISAGREE — the shape
-/// `epigraph-tenancy-backfill`'s `transcribe_legacy_ownership` arm exists to
-/// reconcile, reproduced by suppressing migration 071's write-through trigger
-/// for a single INSERT. Before PR-14 two different stores were consulted on the
-/// way to one answer; after it, exactly one is. This test asserts that
-/// singularity directly: the tenancy columns say readable, so the row is
-/// returned, whatever `ownership` says about it.
-///
-/// # Reading a failure
-///
-/// If this starts failing with an absence or a blanked field, the read path has
-/// re-acquired a second source of truth. That is a design change, not a bug fix:
-/// state which one in the PR body and update this test in the same commit.
-///
-/// The operational consequence of the singularity is recorded as
-/// `D-PR14-transcription-is-a-deploy-prerequisite` in
-/// `docs/tenancy/progress.json`, and in `docs/deploy.md` and `docs/tenancy.md`:
-/// the transcription pass must complete BEFORE this release rolls, because
-/// afterwards nothing but the columns is consulted.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_read_path_does_not_consult_the_legacy_ownership_table(pool: PgPool) {
-    let owner = seed_agent(&pool).await;
-    // NOT `seed_agent` twice: it binds a FIXED public key and
-    // `agents_public_key_unique` rejects the second call. A stranger needs no
-    // `agents` row anyway — `Viewer::resolve` on an unknown principal yields a
-    // correct, empty `Scoped` viewer, which is exactly what a stranger is.
-    let stranger = Uuid::new_v4();
-    let claim_id = seed_claim(&pool, owner, &[], true, None).await;
-    let expected_content = format!("test claim {}", claim_id.as_uuid());
+// `the_read_path_does_not_consult_the_legacy_ownership_table` lived here until
+// PR-22, and it is DELETED rather than ported.
+//
+// It manufactured a row whose legacy `ownership` record and whose tenancy
+// columns DISAGREED — by suppressing migration 071's write-through trigger for a
+// single INSERT — and asserted that the read path answered from the columns.
+// Migration 084 removes the relation, so there is no second store left to
+// disagree with and no way to construct the case. The property is now carried by
+// the schema instead of by an assertion, and
+// `epigraph-db/tests/retire_ownership_preflight.rs::the_ownership_relation_is_retired_at_head`
+// is what pins the schema.
+//
+// The half that test also protected — that `content_hash` is an unsalted
+// `BLAKE3(content)` and must never be returned beside a body the caller may not
+// read — was already closed by construction in PR-14: no branch returns a claim
+// WITHOUT its content, so the two fields cannot disagree in any response.
+// `epigraph-api/tests/no_redaction_sentinel.rs` keeps it that way.
+//
+// The deploy-ordering constraint it was the only executable statement of —
+// `D-PR14-transcription-is-a-deploy-prerequisite` — is now carried by migration
+// 084's second pre-flight, which refuses to drop the table while any non-public
+// row lacks a `tenancy_transcription_log` entry recording the partition that row
+// currently holds. It runs on the database being deployed rather than on a
+// fixture, which is the respect in which it is the better instrument.
+//
+// It is NOT a superset of what this test asserted, and the difference is stated
+// rather than glossed. This test manufactured a DISAGREEMENT between an
+// `ownership` row and the tenancy columns and asserted the read path ignored
+// the former; after 084 there is one store, so there is nothing left to
+// disagree with and the assertion has no subject. The pre-flight is a
+// deploy-time guard, not a read-path assertion, and the remaining half of the
+// deploy ordering — a non-public `ownership` row whose claim is still public —
+// is carried by `docs/deploy.md` steps 1-2, not by the migration.
 
-    // The legacy shape: an `ownership` row written while 071's write-through
-    // trigger was not there. The claim's tenancy columns stay ('public', world).
-    sqlx::query("ALTER TABLE ownership DISABLE TRIGGER ownership_transcribe")
-        .execute(&pool)
-        .await
-        .expect("disable the transcription trigger");
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim_id.as_uuid())
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("seed an untranscribed ownership row");
-    sqlx::query("ALTER TABLE ownership ENABLE TRIGGER ownership_transcribe")
-        .execute(&pool)
-        .await
-        .expect("re-enable the transcription trigger");
-
-    let still_public: String =
-        sqlx::query_scalar("SELECT visibility::text FROM claims WHERE id = $1")
-            .bind(claim_id.as_uuid())
-            .fetch_one(&pool)
-            .await
-            .expect("read visibility");
-    assert_eq!(
-        still_public, "public",
-        "precondition: the two stores must actually DISAGREE, or this test is \
-         not exercising the case it was written for"
-    );
-
-    let server = build_test_server(pool.clone());
-    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
-        .await
-        .expect("resolve stranger viewer");
-
-    let body = parse_claim(
-        &get_claim(
-            &server,
-            &stranger_viewer,
-            GetClaimParams {
-                claim_id: claim_id.as_uuid().to_string(),
-                frame_id: None,
-                perspective_id: None,
-            },
-        )
-        .await
-        .expect("the tenancy columns admit this row, so get_claim must RETURN it"),
-    );
-
-    assert_eq!(
-        body["content"].as_str().unwrap(),
-        expected_content,
-        "the tenancy columns are the sole source of truth on the read path; a \
-         disagreeing `ownership` record must not change the answer"
-    );
-    assert!(
-        !body["content_hash"].as_str().unwrap().is_empty(),
-        "there is no branch left that returns a claim without its content, so \
-         there is none that blanks its hash either — a blank hash here means a \
-         partial-disclosure shape has been reintroduced"
-    );
-}
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 fn parse_claim(result: &CallToolResult) -> Value {
     let text = result

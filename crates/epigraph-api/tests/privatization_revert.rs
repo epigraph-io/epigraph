@@ -4,21 +4,21 @@
 //! `embedding`; **`seal` revert is permitted once unsealed and 409s while
 //! sealed** (ops F13)."
 //!
-//! # Acceptance clause 10 is HALF-MET and the half that is missing is named
+//! # Acceptance clause 10, and what PR-21 changed about it
 //!
 //! The 409 arm ships and is asserted below, against a `mode='seal'` plan
-//! persisted through the repository — the ROUTE returns `501` for `seal`,
-//! because the seal path itself is PR-21's, but migration 080's `pp_mode_check`
-//! admits the value so the refusal can be measured against the mode it is about.
-//! The positive arm — a seal plan whose items were genuinely sealed and then
-//! unsealed CAN be reverted — cannot be exercised by this build, because
-//! nothing in the product writes a seal: the encryptor exists, but the manifest
-//! ceremony that would carry its output to the server is PR-21's. What is
-//! asserted instead is the same request accepted once the
-//! encryption row is gone, which measures the refusal's CONDITION rather than a
-//! revert that never worked.
+//! persisted through the repository (see
+//! `privatization_fixture::create_plan_with_mode` for why that path still
+//! exists now that the route also answers for `seal`).
 //!
-//! Stated here rather than faked, per the PR body.
+//! When this file was written the positive arm — a seal plan whose items were
+//! genuinely sealed and then unsealed CAN be reverted — was unexercisable,
+//! because nothing in the product wrote a seal. **PR-21 changed that**: the
+//! manifest ceremony is in `privatization_seal.rs`, which drives a real seal and
+//! a real unseal through the routes. What this file still measures is the
+//! refusal's CONDITION — the same request accepted once the encryption row is
+//! gone — against a stub ciphertext, which keeps the revert assertions
+//! independent of the key ceremony's own correctness.
 
 #[path = "privatization_fixture.rs"]
 mod fx;

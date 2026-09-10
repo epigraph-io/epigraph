@@ -219,9 +219,10 @@ Callers of any of them now get **404, not 401**.
 **Those endpoints are removed, not relocated.** There is no replacement
 reclassification surface in this release. After PR-14 no HTTP route and no MCP
 tool can change an existing node's partition: tenancy is stamped at INSERT by
-migration 070's inherit trigger and by 071's write-through shim on the legacy
-`ownership` table, and nothing else writes `claims.visibility` or
-`claims.owner_group_id`. A claim created public stays public until a
+migration 070's inherit trigger and by 074's per-table `_require_tenancy`
+guards, and nothing else writes `claims.visibility` or `claims.owner_group_id`.
+(071's write-through shim on the legacy `ownership` table was the third such
+writer until PR-22 retired both.) A claim created public stays public until a
 reclassification surface returns — PR-16 owns the write-side predicate, and no
 PR before it restores one. Plan accordingly if your rollout assumed you could
 demote a claim after the fact.
@@ -242,6 +243,31 @@ client that pattern-matched on the placeholder string.
 `ownership` table; the tenancy columns are the sole source of truth. Run
 `epigraph-tenancy-backfill` to completion and confirm its `verify` step reports
 zero outstanding rows **before** rolling out this release.
+
+**Deploy order for PR-22 — and this is the LAST point at which the backfill's
+transcription pass exists.** Migration 084 DROPS `public.ownership`. Its second
+pre-flight refuses to run while any non-public row lacks a
+`tenancy_transcription_log` entry, and PR-22 retires the transcription pass and
+the two `verify` checks that cleared exactly that condition — safely, and only
+because the pre-flight proves the condition is already met. So:
+
+1. run `epigraph-tenancy-backfill run` to completion on the RELEASE THAT STILL
+   HAS IT, i.e. before deploying PR-22's binaries;
+2. confirm `epigraph-tenancy-backfill verify` exits 0;
+3. then apply 084.
+
+If 084's pre-flight raises, do not work around it. `refusing to DROP ownership:
+N non-public row(s) were never transcribed` means those nodes' declarations
+never reached a visibility column and dropping them would silently widen the
+nodes; `... N quarantined encryption_key_id row(s) are untriaged` means rows
+naming an encryption key that no longer resolves. Both are operator action
+items. The plan sequences 084 "one release after PR-14"; production has not
+deployed this series at all, so **the operator decides what that means here** —
+the mechanical requirement is (1)-(3) above, not a particular release count.
+
+084 is a **one-way door** and `sqlx migrate revert` does not exist in this tree.
+`docs/runbooks/084-undo.sql` recreates the EMPTY SHAPE only; read it before
+applying 084 to anything you cannot rebuild.
 
 #### One route needs more than a token
 

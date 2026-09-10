@@ -50,7 +50,7 @@ async fn query_claims_hides_only_the_private_claim_per_id(pool: PgPool) {
     let public_owner = seed_agent(&pool).await;
     let private_owner = seed_agent(&pool).await;
 
-    // Public claim (no ownership row → treated as public). Truth 0.80.
+    // Public claim: never privatised, so it stays ('public', world). Truth 0.80.
     let public_id = seed_claim(&pool, public_owner, 0.80).await;
     let public_content = format!("test claim {}", public_id.as_uuid());
 
@@ -58,15 +58,7 @@ async fn query_claims_hides_only_the_private_claim_per_id(pool: PgPool) {
     // value so `list_by_truth_range`'s ordering is deterministic and the two
     // rows are unambiguous.
     let private_id = seed_claim(&pool, private_owner, 0.20).await;
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(private_id.as_uuid())
-    .bind(private_owner)
-    .execute(&pool)
-    .await
-    .expect("seed private ownership");
+    common::seed_private_tenancy(&pool, private_id.as_uuid(), private_owner).await;
 
     let server = build_test_server(pool.clone());
 

@@ -42,6 +42,11 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+/// The retired `ownership` relation. See
+/// [`the_pr16_migrations_can_be_applied_twice`] for why a PR-16 test needs it.
+#[path = "retired_ownership_scaffold.rs"]
+mod retired_ownership;
+
 use epigraph_db::{ClaimRepository, ConsolidateMode};
 use sqlx::{Executor, PgPool, Row};
 use uuid::Uuid;
@@ -1267,8 +1272,27 @@ async fn migrations_075_and_076_validate_every_tenancy_constraint(pool: PgPool) 
 /// that aborted on `SET LOCAL lock_timeout = '3s'` is re-run on the next
 /// restart. A migration that is not re-runnable turns a transient lock wait
 /// into a permanent deploy outage.
+///
+/// # PR-22: the replay scaffolds `public.ownership`
+///
+/// 076 references `public.ownership`, and migration 084 retires the relation,
+/// so the scaffold below restores it for the duration of the replay and drops
+/// it again. It is deliberately BARE: 001's shape plus 068's `community_id`,
+/// and none of the three constraints. 076 therefore takes its
+/// `NOT convalidated` branch to false and validates nothing, which is the
+/// correct outcome and keeps this a test of 076's re-runnability rather than of
+/// a fabricated constraint set.
+///
+/// The reason the scaffold is required rather than optional is tracked as
+/// `F-PR22-A` in `docs/tenancy/progress.json`; 076 is applied and frozen, so it
+/// is not corrected here. Analysis held outside this repository.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_pr16_migrations_can_be_applied_twice(pool: PgPool) {
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        retired_ownership::scaffold_table(&mut conn).await;
+    }
+
     for file in [
         "074_tenancy_required.sql",
         "075_validate_tenancy_claims.sql",
@@ -1283,6 +1307,23 @@ async fn the_pr16_migrations_can_be_applied_twice(pool: PgPool) {
             panic!("{file} must be idempotent, but re-applying it failed: {e}")
         });
     }
+
+    // Put the database back at head: the scaffold is a fixture, not a state this
+    // test is entitled to leave behind.
+    pool.execute("DROP TABLE IF EXISTS public.ownership")
+        .await
+        .expect("drop the scaffold");
+    let still_there: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public.ownership')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+    assert!(
+        still_there.is_none(),
+        "the scaffold must not outlive the replay: migration 084 retired this \
+         relation and a test that leaves it behind is asserting against a schema \
+         that does not exist"
+    );
 
     // And the re-application did not undo anything: A1 still holds.
     let offenders: i64 = sqlx::query_scalar(

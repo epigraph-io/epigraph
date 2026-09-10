@@ -14,92 +14,158 @@
 //! requires SQL to live here, and — more to the point — a `&Viewer` cannot be
 //! spent by a statement the repo layer never sees.
 //!
-//! **The plan (§4.8) says "three queries". There are nine.** The three it names
-//! are the three that join `ownership`; five more join `ownership` too, and a
-//! ninth (`community_membership_count`) reaches the owner through
-//! `perspectives.owner_agent_id` and never touches `ownership` at all. Filtering
-//! three and leaving six is the `belief_at_time` single-spend shape, so all nine
-//! are converted.
+//! **The plan (§4.8) says "three queries". There are nine.**
 //!
-//! # DEVIATION from plan §4.8: the `ownership` join is KEPT, not replaced
+//! # PR-22: the `ownership` join is gone, and the owner relation CHANGED IN BOTH
+//! # DIRECTIONS
 //!
-//! Plan §4.8 step 2 says, verbatim: *"the `ownership` join is replaced by
-//! `claims.owner_group_id` / `claims.agent_id`"*, and gives its rationale in the
-//! same paragraph — `ownership` *"is dropped by PR-22"*.
+//! Migration 084 retires `public.ownership`, so the eight functions that joined
+//! it were rewritten here — the obligation PR-08 recorded as
+//! `D-PR22-structural-ownership-join` in `docs/tenancy/progress.json`. PR-08
+//! declined the plan's prescribed substitution because `ownership` carried a
+//! `node_type` breakdown across six tables that `claims.owner_group_id` /
+//! `claims.agent_id` cannot express. That objection was correct and it is not
+//! answered here; it is **conceded**, because after 084 there is no relation
+//! left that could answer it.
 //!
-//! **That instruction is not followed here, deliberately.** All eight
-//! `ownership`-touching functions still read `FROM ownership o WHERE
-//! o.owner_id = $1` or `JOIN ownership o`; what changed is that each now
-//! additionally requires the owned node to be visible in its own table (the
-//! `node_type`-dispatched `EXISTS` described below). Two reasons the
-//! substitution is not available:
+//! **Exactly two tables name an owning agent: `claims.agent_id` and
+//! `perspectives.owner_agent_id`.** Measured against the schema at migration
+//! 084: `evidence`, `frames`, `contexts` and `communities` carry
+//! `(visibility, owner_group_id)` and no agent column at all. So the owned-node
+//! set is a two-arm `UNION ALL` over those two tables, and four `node_type`
+//! values that `ownership_node_type_check` used to admit — `evidence`,
+//! `community`, `context`, `frame` — can no longer appear in any count.
 //!
-//! * The endpoint returns a **breakdown by `ownership.node_type`** across six
-//!   tables (`claims`, `evidence`, `perspectives`, `communities`, `contexts`,
-//!   `frames`). `claims.owner_group_id` / `claims.agent_id` describe claims
-//!   only, so they cannot produce that breakdown at all — five of the seven
-//!   node types would silently vanish from `node_counts`.
-//! * [`temporal_bins`] bins on **`ownership.created_at`**, which has no
-//!   counterpart on `claims`; `claims.created_at` is the claim's creation, not
-//!   the ownership assertion's.
+//! That is the same fail-closed rule this module already applied to
+//! `node_type = 'agent'`: a node whose owner cannot be determined is not
+//! counted, because D1 forbids treating "cannot classify" as public. What
+//! changed is only how many node types it reaches. **It is a narrowing of the
+//! endpoint's contract and it is stated in the PR body**; the response *shape*
+//! is unchanged, because `node_counts` is a list of `(node_type, count)` pairs
+//! and a type with no rows simply produces none.
 //!
-//! The deviation is recorded here AND in `docs/tenancy/progress.json`
-//! (`prs.done` PR-08 `files_line_reconciliation`), with a `deferred_obligations`
-//! entry, because the consequence outlives this PR: **when PR-22 drops
-//! `ownership`, all eight functions in this module must be rewritten**, and
-//! nothing else in the tree records that.
+//! Deriving evidence ownership through its parent claim's author was considered
+//! and rejected: it would attribute to the owner evidence that a *different*
+//! agent attached to the owner's claim, which is a wrong answer rather than a
+//! missing one.
 //!
-//! # `ownership` is not `tier_a`, and that shapes four of the nine
+//! ## …AND THE DOMINANT DIRECTION IS A WIDENING
 //!
-//! Migration 062 gives `visibility` / `owner_group_id` to `claims`, `evidence`,
-//! `edges`, `frames`, `contexts`, `perspectives`, `communities`,
-//! `claim_frames`, `ds_combined_beliefs` and the rest of `tier_a`. It does NOT
-//! give them to `ownership`, to `community_members`, or to `agents`. So
-//! `Viewer::predicate_fragment` — which names `{alias}.visibility` and
-//! `{alias}.owner_group_id` — has nothing to bind to on an `ownership` row.
+//! The four lost node types are the *visible* half of the change and the
+//! smaller one. Nothing ever auto-populated `ownership`: not one of the 90
+//! migration files inserts a row into it, and its only writers were
+//! `OwnershipRepository::assign` / `assign_with_community`, whose HTTP route and
+//! MCP tools PR-14 deleted. So the OLD owned set was "nodes for which somebody
+//! explicitly wrote an ownership row" — in practice near-empty on a database
+//! that never called those writers — and the NEW one is the agent's entire
+//! authored corpus. [`node_counts`], [`degrees`], [`edge_counts`],
+//! [`temporal_bins`], [`clustering_coefficients`], [`belief_intervals`],
+//! [`frame_coverage`] and [`conflict_coefficients`] all move that way.
 //!
-//! [`StructuralRepository::node_counts`], [`temporal_bins`], [`degrees`] and
-//! [`clustering_coefficients`] enumerate `ownership` directly. Rather than
-//! annotate them `VISIBILITY-EXEMPT:` — which `visibility_lint.rs` says is
-//! presumptively "a leak being annotated rather than fixed" on a read path —
-//! each requires the owned node to be visible **in its own table**, via a
-//! `node_type`-dispatched `EXISTS` over the six `tier_a` tables
-//! `ownership_node_type_check` admits (`claims`, `evidence`, `perspectives`,
-//! `communities`, `contexts`, `frames`).
+//! **The direction is certain; the magnitude is exactly the unmeasured M1.** An
+//! operator's numbers can go from near-zero to full-corpus in a single release,
+//! and no test in the tree can catch it — `structural_features_authz.rs`'s
+//! corpus called `seed_ownership` for every node it created, so the old and new
+//! statements agree exactly on that fixture. Stating it here is the only place a
+//! reader will find it before deploying.
 //!
-//! Two classes of row therefore drop out of those four counts, deliberately and
-//! fail-closed:
+//! [`node_counts`]: StructuralRepository::node_counts
+//! [`belief_intervals`]: StructuralRepository::belief_intervals
+//! [`frame_coverage`]: StructuralRepository::frame_coverage
+//! [`conflict_coefficients`]: StructuralRepository::conflict_coefficients
 //!
-//! * `node_type = 'agent'` — `agents` carries no tenancy columns, so there is no
-//!   predicate that could decide it. D1 forbids treating "cannot classify" as
-//!   public.
-//! * an `ownership` row whose `node_id` names no surviving row — `ownership` has
-//!   no FK to the tables it points at, so these exist. The `EXISTS` drops them.
+//! ## THE NEW KEY IS AN AUTHOR FIELD, AND IT IS NOT A CREDENTIAL
+//!
+//! `claims.agent_id` is inserted from the **request body** by
+//! `epigraph_api::routes::claims::create_claim`, whose own comment says at
+//! length that "the body's `agent_id` is NOT a credential and never was, and
+//! nothing downstream may treat it as one". `GET
+//! /api/v1/structural-features/:owner_id` is now a downstream consumer of it: a
+//! caller holding `claims:write` who posts a public claim naming a victim's
+//! agent id has that claim counted in every subsequent structural read for the
+//! victim.
+//!
+//! **That is attribution injection into a caller-facing read, not a
+//! confidentiality leak.** Every statement here is still `AND`-ed with a
+//! correctly spliced viewer predicate, so no private row and no private
+//! *existence* is disclosed by it; what an attacker can do is inflate someone
+//! else's public counts.
+//!
+//! It was accepted rather than solved because no other key preserves the
+//! subject. `:owner_id` is an agent uuid and `claims.owner_group_id` is a GROUP
+//! uuid, so substituting it would silently turn this into a different endpoint.
+//! The honest framing of the change is not "trustworthy key → untrustworthy
+//! key" but **dead-but-not-caller-settable → live-but-uncredentialed**:
+//! `ownership` had no writer at all after PR-14. Recorded as a new consumer of
+//! the open half of `D-PR16-claim-authorship-is-not-a-credential` in
+//! `docs/tenancy/progress.json`, owned by the write-side gate.
+//!
+//! The two arms cannot overlap — `claims.id` and `perspectives.id` are distinct
+//! primary keys in distinct tables — so `UNION ALL` neither double-counts nor
+//! needs a `DISTINCT`, and [`clustering_coefficients`]' `GROUP BY node_id` sees
+//! one row per node.
+//!
+//! ## A NODE IS A ROW, NOT A LINEAGE — and that is a change worth stating
+//!
+//! `ownership.node_id` named a claim **version**, not a lineage — `claims` gives
+//! every version its own `id` (`claims_pkey PRIMARY KEY (id)`, plus `supersedes`
+//! and `is_current`), so the `node_id PRIMARY KEY` permitted one row per
+//! version and bounded nothing about a lineage. Whatever multiplicity
+//! `ownership` actually carried per lineage was a property of who called
+//! `assign_ownership`, not of the constraint. (An earlier revision of this
+//! paragraph derived "at most one row per lineage" from the PK; that derivation
+//! is wrong and the conclusion below never depended on it.)
+//!
+//! What matters is the `claims` arm, which has no `is_current` filter: every
+//! version of a superseded lineage is a node. An author with deep lineages
+//! therefore reports more nodes than before.
+//!
+//! No filter is added, deliberately. `edges.source_id` / `target_id` name a
+//! specific claim VERSION, so counting rows is what keeps [`degrees`],
+//! [`edge_counts`] and [`clustering_coefficients`] internally consistent with
+//! each other: a node that can carry an edge is a node that must appear in the
+//! degree distribution. Restricting to `is_current` would have been a new
+//! semantic invented here, and it would have made a superseded claim's edges
+//! incident on nothing.
+//!
+//! [`degrees`]: StructuralRepository::degrees
+//!
+//! ## [`temporal_bins`] now bins the NODE's `created_at`
+//!
+//! It used to bin `ownership.created_at`, the moment the ownership assertion was
+//! written. That column is gone and has no counterpart, so the bins are now the
+//! moment the node itself was created (`claims.created_at` /
+//! `perspectives.created_at`). For a corpus whose ownership rows were written at
+//! node creation the two agree; for one where a node changed hands they do not.
 //!
 //! [`temporal_bins`]: StructuralRepository::temporal_bins
-//! [`degrees`]: StructuralRepository::degrees
 //! [`clustering_coefficients`]: StructuralRepository::clustering_coefficients
 //!
-//! # Recorded residual: `edges` — the co-ownership half is closed
+//! # `F-edge-count-double-counts` is CLOSED here
 //!
-//! [`edge_counts`], [`degrees`] and [`clustering_coefficients`] now filter
-//! `edges` with [`Viewer::edge_predicate_fragment`], through the
+//! [`edge_counts`] used to join `ownership` on
+//! `(e.source_id = o.node_id OR e.target_id = o.node_id)`, so an edge with both
+//! endpoints owned by `owner_id` was counted twice and the Laplace sensitivity
+//! of the field was 2 while `maybe_add_noise` assumed 1. PR-08 and PR-13 both
+//! deferred the fix to this PR — PR-13's stated reason was that 084 retires the
+//! join anyway, so rewriting it earlier was work that would be thrown away.
+//! The rewritten statement tests ownership with a single `EXISTS`, so each
+//! visible edge contributes exactly once and the sensitivity is 1. The
+//! acceptance numbers in
+//! `crates/epigraph-api/tests/structural_features_authz.rs` were re-derived from
+//! the corpus rather than adjusted.
+//!
+//! [`edge_counts`]: StructuralRepository::edge_counts
+//!
+//! # Every count is a VISIBLE-SET count
+//!
+//! Both arms of the owned-node set carry `/* {VISIBILITY:<alias>} */`, and the
+//! `edges` legs carry [`Viewer::edge_predicate_fragment`] through the
 //! `/* {EDGE_VISIBILITY:<alias>} */` spelling (PR-13). An edge whose two
 //! endpoints belong to different groups G and H is therefore visible only to a
 //! principal in BOTH, rather than to anyone in the single group the edge row's
 //! `owner_group_id` happened to name.
 //!
-//! What is NOT fixed here is `F-edge-count-double-counts`: [`edge_counts`]
-//! joins `ownership` on `(e.source_id = o.node_id OR e.target_id = o.node_id)`,
-//! so an edge whose two endpoints are both owned by `owner_id` is counted
-//! twice, and `maybe_add_noise` assumes a Laplace sensitivity of 1. PR-08
-//! declined it because fixing it rewrites the acceptance numbers in
-//! `structural_features_authz.rs`; PR-13 declines it for the same reason plus
-//! one more — PR-22's migration 084 retires `ownership`, so a rewrite of this
-//! join now is work that gets thrown away. Still open in
-//! `docs/tenancy/progress.json`, re-assigned there.
-//!
-//! [`edge_counts`]: StructuralRepository::edge_counts
 //! [`Viewer::edge_predicate_fragment`]: crate::visibility::Viewer::edge_predicate_fragment
 //!
 //! # No write path
@@ -107,12 +173,12 @@
 //! Every function here is a `SELECT`. PR-16 owns the write-side predicate and
 //! nothing in this module touches it.
 //!
-//! # Why the `node_type` disjunction is copy-pasted four times
+//! # Why the owned-node union is copy-pasted rather than hoisted
 //!
 //! `visibility_lint.rs::every_spliced_statement_carries_the_canonical_marker_spelling`
 //! requires the marker text to appear in the **body of the function that calls
 //! `splice`**. Hoisting the shared fragment into a module-level `const` would
-//! move it out of all four bodies and make that check pass vacuously while the
+//! move it out of every body and make that check pass vacuously while the
 //! statements still carried markers. The duplication is the price of keeping the
 //! lint honest.
 
@@ -167,11 +233,11 @@ pub type BeliefIntervalRow = (Option<f64>, Option<f64>, Option<f64>);
 pub struct StructuralRepository;
 
 impl StructuralRepository {
-    /// Node counts by `ownership.node_type`, restricted to nodes the viewer can
-    /// see in the node's own table.
+    /// Node counts by node type, restricted to nodes the viewer can see.
     ///
-    /// `node_type = 'agent'` rows and rows pointing at a deleted node are
-    /// excluded — see the module docs.
+    /// Two types can appear — `claim` and `perspective` — because those are the
+    /// only two tables that name an owning agent after migration 084. See the
+    /// module docs for what left with `ownership` and why nothing replaces it.
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
@@ -185,28 +251,17 @@ impl StructuralRepository {
         let sql = viewer.splice(
             r#"
             SELECT o.node_type, COUNT(*) as count
-            FROM ownership o
-            WHERE o.owner_id = $1
-              AND (
-                   (o.node_type = 'claim'
-                    AND EXISTS (SELECT 1 FROM claims vc
-                                WHERE vc.id = o.node_id /* {VISIBILITY:vc} */))
-                OR (o.node_type = 'evidence'
-                    AND EXISTS (SELECT 1 FROM evidence ve
-                                WHERE ve.id = o.node_id /* {VISIBILITY:ve} */))
-                OR (o.node_type = 'perspective'
-                    AND EXISTS (SELECT 1 FROM perspectives vp
-                                WHERE vp.id = o.node_id /* {VISIBILITY:vp} */))
-                OR (o.node_type = 'community'
-                    AND EXISTS (SELECT 1 FROM communities vm
-                                WHERE vm.id = o.node_id /* {VISIBILITY:vm} */))
-                OR (o.node_type = 'context'
-                    AND EXISTS (SELECT 1 FROM contexts vx
-                                WHERE vx.id = o.node_id /* {VISIBILITY:vx} */))
-                OR (o.node_type = 'frame'
-                    AND EXISTS (SELECT 1 FROM frames vf
-                                WHERE vf.id = o.node_id /* {VISIBILITY:vf} */))
-              )
+            FROM (
+                SELECT 'claim'::text AS node_type
+                FROM claims c
+                WHERE c.agent_id = $1
+                  /* {VISIBILITY:c} */
+                UNION ALL
+                SELECT 'perspective'::text
+                FROM perspectives p
+                WHERE p.owner_agent_id = $1
+                  /* {VISIBILITY:p} */
+            ) o
             GROUP BY o.node_type
             ORDER BY count DESC
             "#,
@@ -223,22 +278,15 @@ impl StructuralRepository {
     /// edges the viewer can see, and to edges incident on a node the viewer can
     /// see.
     ///
-    /// # The count is per (edge, owned endpoint) pair, NOT per edge
+    /// # One row per EDGE, not per (edge, owned endpoint) pair
     ///
-    /// The join is `ON (e.source_id = o.node_id OR e.target_id = o.node_id)`, so
-    /// an edge whose source AND target are both owned by `owner_id` is counted
-    /// **twice**. This is inherited verbatim from the pre-PR-08 inline statement
-    /// and is not introduced here, but PR-08 is the first thing to pin it as
-    /// expected output (`structural_features_authz.rs` asserts `SUPPORTS == 4`
-    /// for two seeded edges), so it is stated rather than left for the next
-    /// reader to rediscover from "edge counts by relationship".
-    ///
-    /// One consequence for the route layer: the Laplace sensitivity of this
-    /// field is 2, not 1, because adding one both-endpoints-owned edge changes
-    /// the count by two. `maybe_add_noise` assumes sensitivity 1. Still open as
-    /// `F-edge-count-double-counts`. PR-13 rewrote this statement's `edges`
-    /// PREDICATE and deliberately not its `ownership` JOIN — see the module docs
-    /// for why (the acceptance numbers, and PR-22 retiring `ownership`).
+    /// Ownership is tested with a single `EXISTS`, so an edge whose source AND
+    /// target are both owned by `owner_id` contributes **once**. The
+    /// `ownership` join this replaced was `ON (e.source_id = o.node_id OR
+    /// e.target_id = o.node_id)` and counted such an edge twice, which made the
+    /// Laplace sensitivity of this field 2 while `maybe_add_noise` assumed 1.
+    /// That is `F-edge-count-double-counts`, deferred by PR-08 and PR-13 and
+    /// closed here; see the module docs.
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
@@ -257,29 +305,20 @@ impl StructuralRepository {
             r#"
             SELECT e.relationship, COUNT(*) as count
             FROM edges e
-            JOIN ownership o ON (e.source_id = o.node_id OR e.target_id = o.node_id)
-            WHERE o.owner_id = $1
-              AND e.relationship = ANY($2)
+            WHERE e.relationship = ANY($2)
               /* {EDGE_VISIBILITY:e} */
-              AND (
-                   (o.node_type = 'claim'
-                    AND EXISTS (SELECT 1 FROM claims vc
-                                WHERE vc.id = o.node_id /* {VISIBILITY:vc} */))
-                OR (o.node_type = 'evidence'
-                    AND EXISTS (SELECT 1 FROM evidence ve
-                                WHERE ve.id = o.node_id /* {VISIBILITY:ve} */))
-                OR (o.node_type = 'perspective'
-                    AND EXISTS (SELECT 1 FROM perspectives vp
-                                WHERE vp.id = o.node_id /* {VISIBILITY:vp} */))
-                OR (o.node_type = 'community'
-                    AND EXISTS (SELECT 1 FROM communities vm
-                                WHERE vm.id = o.node_id /* {VISIBILITY:vm} */))
-                OR (o.node_type = 'context'
-                    AND EXISTS (SELECT 1 FROM contexts vx
-                                WHERE vx.id = o.node_id /* {VISIBILITY:vx} */))
-                OR (o.node_type = 'frame'
-                    AND EXISTS (SELECT 1 FROM frames vf
-                                WHERE vf.id = o.node_id /* {VISIBILITY:vf} */))
+              AND EXISTS (
+                    SELECT 1
+                    FROM claims c
+                    WHERE c.agent_id = $1
+                      AND (c.id = e.source_id OR c.id = e.target_id)
+                      /* {VISIBILITY:c} */
+                    UNION ALL
+                    SELECT 1
+                    FROM perspectives p
+                    WHERE p.owner_agent_id = $1
+                      AND (p.id = e.source_id OR p.id = e.target_id)
+                      /* {VISIBILITY:p} */
               )
             GROUP BY e.relationship
             ORDER BY count DESC
@@ -316,28 +355,17 @@ impl StructuralRepository {
                        (SELECT COUNT(*) FROM edges e
                          WHERE (e.source_id = o.node_id OR e.target_id = o.node_id)
                            /* {EDGE_VISIBILITY:e} */) as deg
-                FROM ownership o
-                WHERE o.owner_id = $1
-                  AND (
-                       (o.node_type = 'claim'
-                        AND EXISTS (SELECT 1 FROM claims vc
-                                    WHERE vc.id = o.node_id /* {VISIBILITY:vc} */))
-                    OR (o.node_type = 'evidence'
-                        AND EXISTS (SELECT 1 FROM evidence ve
-                                    WHERE ve.id = o.node_id /* {VISIBILITY:ve} */))
-                    OR (o.node_type = 'perspective'
-                        AND EXISTS (SELECT 1 FROM perspectives vp
-                                    WHERE vp.id = o.node_id /* {VISIBILITY:vp} */))
-                    OR (o.node_type = 'community'
-                        AND EXISTS (SELECT 1 FROM communities vm
-                                    WHERE vm.id = o.node_id /* {VISIBILITY:vm} */))
-                    OR (o.node_type = 'context'
-                        AND EXISTS (SELECT 1 FROM contexts vx
-                                    WHERE vx.id = o.node_id /* {VISIBILITY:vx} */))
-                    OR (o.node_type = 'frame'
-                        AND EXISTS (SELECT 1 FROM frames vf
-                                    WHERE vf.id = o.node_id /* {VISIBILITY:vf} */))
-                  )
+                FROM (
+                    SELECT c.id AS node_id
+                    FROM claims c
+                    WHERE c.agent_id = $1
+                      /* {VISIBILITY:c} */
+                    UNION ALL
+                    SELECT p.id
+                    FROM perspectives p
+                    WHERE p.owner_agent_id = $1
+                      /* {VISIBILITY:p} */
+                ) o
             ) sub
             "#,
             2,
@@ -365,9 +393,7 @@ impl StructuralRepository {
             r#"
             SELECT c.belief, c.plausibility, c.pignistic_prob
             FROM claims c
-            JOIN ownership o ON o.node_id = c.id
-            WHERE o.owner_id = $1
-              AND o.node_type = 'claim'
+            WHERE c.agent_id = $1
               AND c.belief IS NOT NULL
               AND c.plausibility IS NOT NULL
               /* {VISIBILITY:c} */
@@ -400,10 +426,8 @@ impl StructuralRepository {
             r#"
             SELECT COUNT(DISTINCT cf.frame_id) as count
             FROM claim_frames cf
-            JOIN ownership o ON o.node_id = cf.claim_id
             JOIN claims c ON c.id = cf.claim_id
-            WHERE o.owner_id = $1
-              AND o.node_type = 'claim'
+            WHERE c.agent_id = $1
               /* {VISIBILITY:cf} */
               /* {VISIBILITY:c} */
             "#,
@@ -416,8 +440,12 @@ impl StructuralRepository {
         Ok(q.fetch_one(executor).await?)
     }
 
-    /// Weekly bins of `ownership.created_at` over the last 30 days, restricted
-    /// to visible owned nodes.
+    /// Weekly bins of the owner's visible nodes over the last 30 days, by the
+    /// NODE's `created_at`.
+    ///
+    /// It binned `ownership.created_at` — the moment the ownership assertion was
+    /// written — until migration 084 retired that column. See the module docs
+    /// for what the two differ on.
     ///
     /// # Errors
     /// Returns [`DbError`] if the query fails.
@@ -433,29 +461,19 @@ impl StructuralRepository {
             SELECT
                 TO_CHAR(DATE_TRUNC('week', o.created_at), 'YYYY-MM-DD') as bin_label,
                 COUNT(*) as count
-            FROM ownership o
-            WHERE o.owner_id = $1
-              AND o.created_at >= NOW() - INTERVAL '30 days'
-              AND (
-                   (o.node_type = 'claim'
-                    AND EXISTS (SELECT 1 FROM claims vc
-                                WHERE vc.id = o.node_id /* {VISIBILITY:vc} */))
-                OR (o.node_type = 'evidence'
-                    AND EXISTS (SELECT 1 FROM evidence ve
-                                WHERE ve.id = o.node_id /* {VISIBILITY:ve} */))
-                OR (o.node_type = 'perspective'
-                    AND EXISTS (SELECT 1 FROM perspectives vp
-                                WHERE vp.id = o.node_id /* {VISIBILITY:vp} */))
-                OR (o.node_type = 'community'
-                    AND EXISTS (SELECT 1 FROM communities vm
-                                WHERE vm.id = o.node_id /* {VISIBILITY:vm} */))
-                OR (o.node_type = 'context'
-                    AND EXISTS (SELECT 1 FROM contexts vx
-                                WHERE vx.id = o.node_id /* {VISIBILITY:vx} */))
-                OR (o.node_type = 'frame'
-                    AND EXISTS (SELECT 1 FROM frames vf
-                                WHERE vf.id = o.node_id /* {VISIBILITY:vf} */))
-              )
+            FROM (
+                SELECT c.created_at
+                FROM claims c
+                WHERE c.agent_id = $1
+                  AND c.created_at >= NOW() - INTERVAL '30 days'
+                  /* {VISIBILITY:c} */
+                UNION ALL
+                SELECT p.created_at
+                FROM perspectives p
+                WHERE p.owner_agent_id = $1
+                  AND p.created_at >= NOW() - INTERVAL '30 days'
+                  /* {VISIBILITY:p} */
+            ) o
             GROUP BY DATE_TRUNC('week', o.created_at)
             ORDER BY DATE_TRUNC('week', o.created_at) ASC
             "#,
@@ -505,29 +523,15 @@ impl StructuralRepository {
         let sql = viewer.splice(
             r#"
             WITH owned_nodes AS (
-                SELECT o.node_id
-                FROM ownership o
-                WHERE o.owner_id = $1
-                  AND (
-                       (o.node_type = 'claim'
-                        AND EXISTS (SELECT 1 FROM claims vc
-                                    WHERE vc.id = o.node_id /* {VISIBILITY:vc} */))
-                    OR (o.node_type = 'evidence'
-                        AND EXISTS (SELECT 1 FROM evidence ve
-                                    WHERE ve.id = o.node_id /* {VISIBILITY:ve} */))
-                    OR (o.node_type = 'perspective'
-                        AND EXISTS (SELECT 1 FROM perspectives vp
-                                    WHERE vp.id = o.node_id /* {VISIBILITY:vp} */))
-                    OR (o.node_type = 'community'
-                        AND EXISTS (SELECT 1 FROM communities vm
-                                    WHERE vm.id = o.node_id /* {VISIBILITY:vm} */))
-                    OR (o.node_type = 'context'
-                        AND EXISTS (SELECT 1 FROM contexts vx
-                                    WHERE vx.id = o.node_id /* {VISIBILITY:vx} */))
-                    OR (o.node_type = 'frame'
-                        AND EXISTS (SELECT 1 FROM frames vf
-                                    WHERE vf.id = o.node_id /* {VISIBILITY:vf} */))
-                  )
+                SELECT c.id AS node_id
+                FROM claims c
+                WHERE c.agent_id = $1
+                  /* {VISIBILITY:c} */
+                UNION ALL
+                SELECT p.id
+                FROM perspectives p
+                WHERE p.owner_agent_id = $1
+                  /* {VISIBILITY:p} */
             ),
             node_degrees AS (
                 SELECT o.node_id, COUNT(*) as deg
@@ -574,8 +578,10 @@ impl StructuralRepository {
     /// Number of distinct communities the owner's visible perspectives belong
     /// to.
     ///
-    /// The only statement here that never touches `ownership`: it keys on
-    /// `perspectives.owner_agent_id`. `community_members` carries no tenancy
+    /// The one statement migration 084 did not change: it always keyed on
+    /// `perspectives.owner_agent_id`, which is now one of the two surviving
+    /// owner relations the rest of the module was rewritten onto.
+    /// `community_members` carries no tenancy
     /// columns, so both ends of the two-hop join are filtered instead — the
     /// perspective and the community are both `tier_a`.
     ///
@@ -627,10 +633,8 @@ impl StructuralRepository {
             r#"
             SELECT dcb.conflict_k
             FROM ds_combined_beliefs dcb
-            JOIN ownership o ON o.node_id = dcb.claim_id
             JOIN claims c ON c.id = dcb.claim_id
-            WHERE o.owner_id = $1
-              AND o.node_type = 'claim'
+            WHERE c.agent_id = $1
               AND dcb.scope_type = 'global'
               AND dcb.conflict_k IS NOT NULL
               /* {VISIBILITY:dcb} */

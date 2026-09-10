@@ -33,37 +33,10 @@ use viewer_fixture as fixture;
 
 const WORLD: Uuid = Uuid::nil();
 
-/// A **legacy** claim: `('public', <world group>)`, stamped explicitly.
-///
-/// PR-16. Before migration 074 this state was what an undeclared insert
-/// produced, via 062's `DEFAULT`. 074 drops the default, and an undeclared
-/// insert on the harness role now takes arm 4 and lands on the SEED group
-/// instead — so a test that needs the pre-tenancy shape has to build it.
-///
-/// Deliberately separate from [`insert_undeclared_claim`] rather than replacing
-/// it: after 074 the two mean different things, and this file wants each in
-/// different places.
-async fn insert_legacy_world_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
-    let id = Uuid::new_v4();
-    let mut hash = vec![0u8; 32];
-    for (i, b) in content.as_bytes().iter().enumerate() {
-        hash[i % 32] ^= *b;
-    }
-    sqlx::query(
-        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
-                             visibility, owner_group_id) \
-         VALUES ($1, $2, $3, 0.8, $4, true, 'public', \
-                 '00000000-0000-0000-0000-000000000000'::uuid)",
-    )
-    .bind(id)
-    .bind(content)
-    .bind(&hash)
-    .bind(agent)
-    .execute(pool)
-    .await
-    .expect("insert legacy world-owned claim");
-    id
-}
+// `insert_legacy_world_claim` lived here until PR-22. It built the pre-074
+// `('public', <world group>)` shape, and its only callers were the migration-071
+// shim cases deleted below. Removed rather than left behind an `#[allow]`: an
+// unused fixture is a fixture nobody is checking.
 
 /// Insert a claim the way an unpatched production call site does — naming
 /// neither tenancy column.
@@ -781,7 +754,10 @@ async fn propagation_function_is_owned_by_the_maintenance_role(pool: PgPool) {
         "epigraph_claims_require_tenancy",
         "epigraph_edges_tenancy",
         "epigraph_node_tenancy",
-        "epigraph_ownership_transcribe",
+        // `epigraph_ownership_transcribe` was the sixth name until PR-22.
+        // Migration 084 drops it with the table its trigger fired on, so an
+        // entry here would assert the existence of a function the migrator has
+        // just removed.
     ] {
         let owner: String = sqlx::query_scalar(
             "SELECT r.rolname FROM pg_proc p \
@@ -834,7 +810,7 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
         "SELECT t.tgname FROM pg_trigger t \
           WHERE NOT t.tgisinternal \
             AND (t.tgname IN ('claims_require_tenancy', 'edges_tenancy', \
-                              'claims_propagate_tenancy', 'ownership_transcribe') \
+                              'claims_propagate_tenancy') \
                  OR t.tgname LIKE '%\\_inherit\\_tenancy') \
             AND t.tgenabled <> 'O' \
           ORDER BY t.tgname",
@@ -852,510 +828,64 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
         "SELECT count(*) FROM pg_trigger t \
           WHERE NOT t.tgisinternal \
             AND (t.tgname IN ('claims_require_tenancy', 'edges_tenancy', \
-                              'claims_propagate_tenancy', 'ownership_transcribe') \
+                              'claims_propagate_tenancy') \
                  OR t.tgname LIKE '%\\_inherit\\_tenancy')",
     )
     .fetch_one(&pool)
     .await
     .expect("count tenancy triggers");
+    // 20 SINCE PR-22, and the fourth name is gone from both queries above.
+    // `ownership_transcribe` (migration 071) went with the table migration 084
+    // drops. Keeping the name in the IN-list while lowering the count would have
+    // made the vacuity guard self-fulfilling — it would still be looking for a
+    // trigger that cannot exist.
     assert_eq!(
-        armed, 21,
-        "expected 21 tenancy triggers (4 named + 17 claim-derived inheritors); \
+        armed, 20,
+        "expected 20 tenancy triggers (3 named + 17 claim-derived inheritors); \
          found {armed}. A changed count means arm (c)'s table set moved."
     );
 }
 
 // =============================================================================
-// Migration 071 — the ownership compat shim
+// Migration 071 — the ownership compat shim. DELETED IN PR-22.
 // =============================================================================
-
-/// Writing a `private` ownership row reclassifies the claim AND its evidence,
-/// and writes the ledger row migration 084's pre-flight reads.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_private_ownership_row_transcribes_into_the_tenancy_columns(pool: PgPool) {
-    let (agent, group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = insert_undeclared_claim(&pool, agent, "to be privatized").await;
-    let ev = insert_evidence(&pool, claim, "ev").await;
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .execute(&pool)
-    .await
-    .expect("write ownership");
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (group, "group".to_string()),
-        "a 'private' ownership row must reclassify the claim to its owner's personal group"
-    );
-    assert_eq!(
-        tenancy_of(&pool, "evidence", ev).await,
-        (group, "group".to_string()),
-        "and arm (d) must carry that to the claim's evidence in the same transaction"
-    );
-
-    let (node_type, from_partition, to_visibility): (String, String, String) = sqlx::query_as(
-        "SELECT node_type, from_partition, to_visibility FROM tenancy_transcription_log \
-          WHERE node_id = $1",
-    )
-    .bind(claim)
-    .fetch_one(&pool)
-    .await
-    .expect("ledger row must exist — migration 084 refuses to drop `ownership` without it");
-    assert_eq!(
-        (
-            node_type.as_str(),
-            from_partition.as_str(),
-            to_visibility.as_str()
-        ),
-        ("claim", "private", "group")
-    );
-}
-
-/// An owner with no personal group gets one MINTED — the shim must not refuse.
-///
-/// # Why materializing is the fail-closed answer, and refusing was not
-///
-/// An earlier revision of migration 071 RAISED here. That reads as strictness
-/// and is the opposite: refusing the write leaves the claim **public** when the
-/// caller explicitly asked for private. Failing open, dressed up as a guard.
-///
-/// Minting is not a "fallback to some other group" — the thing D2 and the plan
-/// actually forbid. It is the same idempotent act
-/// `AgentRepository::ensure_personal_group` performs on the OAuth mint path,
-/// and it yields a real group whose only live member is the owner, which is
-/// precisely what `private` means.
-///
-/// The ~1,198 orphan agents migration 057 documents make this the common case,
-/// not an edge case: an agent that has never authenticated has no personal
-/// group, and `ownership.owner_id` can name it.
-#[sqlx::test(migrations = "../../migrations")]
-async fn an_owner_with_no_personal_group_gets_one_minted(pool: PgPool) {
-    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let claim = insert_undeclared_claim(&pool, author, "claim").await;
-
-    // An agent with NO personal group under either identification.
-    let stranger = Uuid::new_v4();
-    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
-        .bind(stranger)
-        .bind(vec![42u8; 32])
-        .execute(&pool)
-        .await
-        .expect("seed groupless agent");
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim)
-    .bind(stranger)
-    .execute(&pool)
-    .await
-    .expect("the shim must mint the owner's personal group rather than refuse");
-
-    let (owner_group, vis) = tenancy_of(&pool, "claims", claim).await;
-    assert_eq!(
-        vis, "group",
-        "'private' must actually make the claim private"
-    );
-
-    let did_key: String = sqlx::query_scalar("SELECT did_key FROM groups WHERE id = $1")
-        .bind(owner_group)
-        .fetch_one(&pool)
-        .await
-        .expect("read the minted group");
-    assert_eq!(
-        did_key,
-        format!("did:epigraph:personal:{stranger}"),
-        "the minted group must carry the canonical did_key ensure_personal_group \
-         derives, or the two paths mint duplicates of each other"
-    );
-
-    // The property that makes this fail-CLOSED rather than a black hole.
-    let live: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM group_memberships \
-          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
-    )
-    .bind(owner_group)
-    .bind(stranger)
-    .fetch_one(&pool)
-    .await
-    .expect("count membership");
-    assert_eq!(
-        live, 1,
-        "the minted group must have the owner as a LIVE member; a group-visible \
-         row owned by a memberless group is unreadable by everyone including its \
-         owner, and 062's CHECK cannot catch it because an empty REAL group is \
-         not in its NOT IN list"
-    );
-
-    // And it is emphatically not world or seed.
-    assert_ne!(owner_group, WORLD);
-    let seed: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'seed'")
-        .fetch_one(&pool)
-        .await
-        .expect("seed group");
-    assert_ne!(owner_group, seed);
-}
-
-/// A `community` row whose `community_id` does not resolve falls back to the
-/// owner's personal group as `('group', personal)` — **it does not raise**.
-///
-/// This is a legacy shape, not a bug: before migration 068 the gating community
-/// lived stringified in `ownership.encryption_key_id`, and 068 created the
-/// `ownership_key_id_quarantine` VIEW precisely to REPORT the ones that did not
-/// resolve. `tenancy_coverage.rs::quarantine_reports_a_dangling_community_uuid`
-/// records the reviewed decision in its own assertion — such a row "must be
-/// REPORTED, not swallowed and not fatal" and must stay WRITABLE. A raise here
-/// would defeat the quarantine's entire purpose.
-///
-/// Falling back to the owner is fail-CLOSED: strictly more restrictive than
-/// public, on a real group with a real live member.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_dangling_community_reference_falls_back_to_the_owner_not_a_raise(pool: PgPool) {
-    let (agent, group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = insert_undeclared_claim(&pool, agent, "legacy community row").await;
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, encryption_key_id) \
-         VALUES ($1, 'claim', 'community', $2, $3::text)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .bind(Uuid::new_v4()) // a well-formed UUID naming no community
-    .execute(&pool)
-    .await
-    .expect("a dangling community UUID must stay WRITABLE so the quarantine view can report it");
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (group, "group".to_string()),
-        "an unresolvable community must fail CLOSED to the owner's personal group, \
-         not stay public"
-    );
-
-    // The quarantine view must still see it — that is the point of not raising.
-    let reported: Vec<Uuid> = sqlx::query_scalar("SELECT node_id FROM ownership_key_id_quarantine")
-        .fetch_all(&pool)
-        .await
-        .expect("quarantine read");
-    assert_eq!(reported, vec![claim]);
-
-    // And the ledger records the ORIGINAL partition, so PR-18's migration-080
-    // gate still sees the transition it is looking for.
-    let from_partition: String = sqlx::query_scalar(
-        "SELECT from_partition FROM tenancy_transcription_log WHERE node_id = $1",
-    )
-    .bind(claim)
-    .fetch_one(&pool)
-    .await
-    .expect("ledger row");
-    assert_eq!(from_partition, "community");
-}
-
-/// A `community` partition projects the community's group **and its members**.
-///
-/// Projecting the group without the members would produce `('group', G)` where
-/// G has zero live memberships — unreadable by everyone, including the
-/// community's own members. 062's `_group_needs_real_group` CHECK cannot catch
-/// it: that is a `NOT IN (world, seed)` list, and an empty REAL group passes.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_community_partition_projects_the_group_and_its_members(pool: PgPool) {
-    let (owner, _) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
-    let claim = insert_undeclared_claim(&pool, owner, "community claim").await;
-
-    // A community created by raw SQL — i.e. with NO projected group, the state
-    // migration 068's one-time snapshot leaves for anything created after it.
-    let community = Uuid::new_v4();
-    sqlx::query("INSERT INTO communities (id, name) VALUES ($1, 'physics')")
-        .bind(community)
-        .execute(&pool)
-        .await
-        .expect("seed community");
-    let perspective: Uuid = sqlx::query_scalar(
-        "INSERT INTO perspectives (name, owner_agent_id) VALUES ('p', $1) RETURNING id",
-    )
-    .bind(member)
-    .fetch_one(&pool)
-    .await
-    .expect("seed perspective");
-    sqlx::query("INSERT INTO community_members (community_id, perspective_id) VALUES ($1, $2)")
-        .bind(community)
-        .bind(perspective)
-        .execute(&pool)
-        .await
-        .expect("seed community member");
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3)",
-    )
-    .bind(claim)
-    .bind(owner)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("write community ownership");
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (community, "group".to_string()),
-        "migration 068's projection is ID-PRESERVING, so the group id IS the \
-         community id"
-    );
-
-    let member_live: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM group_memberships \
-          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
-    )
-    .bind(community)
-    .bind(member)
-    .fetch_one(&pool)
-    .await
-    .expect("count membership");
-    assert_eq!(
-        member_live, 1,
-        "the community's member must be projected into the group, or the claim is \
-         a black hole readable by nobody"
-    );
-
-    // THE DECLARING OWNER IS DELIBERATELY NOT PROJECTED IN.
-    //
-    // Adding them would guarantee the declaring agent can read back what it just
-    // declared — tempting, and wrong. `epigraph-mcp/tests/community_partition.rs::
-    // community_owner_who_is_not_a_member_is_redacted` states the reviewed
-    // decision in its own assertion: "on the community arm, ownership alone does
-    // NOT grant access once a community resolves — membership is the whole test.
-    // If you are changing this, change it on purpose." Projecting the owner in
-    // would change it by accident.
-    let owner_live: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM group_memberships \
-          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
-    )
-    .bind(community)
-    .bind(owner)
-    .fetch_one(&pool)
-    .await
-    .expect("count membership");
-    assert_eq!(
-        owner_live, 0,
-        "ownership alone must not grant community membership; the shim must not \
-         quietly add the declaring owner to the community's group"
-    );
-}
-
-/// A community with NO projectable members must not be stamped onto the node.
-///
-/// Its group would have zero live memberships — a row unreadable by EVERYONE,
-/// permanently. 062's `_group_needs_real_group` CHECK cannot catch this: it is a
-/// `NOT IN (world, seed)` list, and an empty REAL group passes straight through.
-/// The shim falls back to the owner's personal group, which is still `'group'`
-/// (fail-closed, not public) and readable by at least the declaring owner.
-#[sqlx::test(migrations = "../../migrations")]
-async fn an_empty_community_falls_back_to_the_owner_rather_than_a_black_hole(pool: PgPool) {
-    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = insert_undeclared_claim(&pool, owner, "claim").await;
-
-    let community = Uuid::new_v4();
-    sqlx::query("INSERT INTO communities (id, name) VALUES ($1, 'empty')")
-        .bind(community)
-        .execute(&pool)
-        .await
-        .expect("seed community");
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3)",
-    )
-    .bind(claim)
-    .bind(owner)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("write community ownership against an empty community");
-
-    let (stamped, vis) = tenancy_of(&pool, "claims", claim).await;
-    assert_eq!(
-        vis, "group",
-        "the fallback must stay fail-closed — never public"
-    );
-    assert_eq!(
-        stamped, owner_group,
-        "an empty community's group is a black hole; the shim must fall back to \
-         the owner's personal group instead of stamping it"
-    );
-    assert_ne!(stamped, community);
-}
-
-/// The ledger is keyed one row per node, so a re-classification OVERWRITES.
-///
-/// This is a known, documented defect, not an accident:
-/// `tenancy_transcription_log` is `node_id uuid PRIMARY KEY` and
-/// `schema_contract.rs` pins the 6-column shape in order, so PR-12 cannot add a
-/// sequence without a migration number — and 072–084 are all allocated. It does
-/// not block the consumer: migration 084's pre-flight reads this table for the
-/// EXISTENCE of a row per non-public `ownership` row, which last-write-wins
-/// still satisfies. What is lost is history.
-///
-/// Pinned as a test so the limitation is discovered here rather than by PR-18.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_transcription_ledger_is_last_write_wins(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = insert_undeclared_claim(&pool, agent, "reclassified twice").await;
-
-    let community = Uuid::new_v4();
-    sqlx::query("INSERT INTO communities (id, name) VALUES ($1, 'c')")
-        .bind(community)
-        .execute(&pool)
-        .await
-        .expect("seed community");
-    sqlx::query(
-        "INSERT INTO groups (id, display_name, did_key, public_key, kind) \
-         VALUES ($1, 'c', 'did:epigraph:community:' || $1::text, ''::bytea, 'community')",
-    )
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("project community group");
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .execute(&pool)
-    .await
-    .expect("first classification");
-
-    sqlx::query(
-        "UPDATE ownership SET partition_type = 'community', community_id = $2 WHERE node_id = $1",
-    )
-    .bind(claim)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("reclassify to community");
-
-    let rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM tenancy_transcription_log WHERE node_id = $1")
-            .bind(claim)
-            .fetch_one(&pool)
-            .await
-            .expect("count ledger rows");
-    assert_eq!(
-        rows, 1,
-        "node_id is the PRIMARY KEY, so a node can only ever have one ledger row"
-    );
-
-    let from_partition: String = sqlx::query_scalar(
-        "SELECT from_partition FROM tenancy_transcription_log WHERE node_id = $1",
-    )
-    .bind(claim)
-    .fetch_one(&pool)
-    .await
-    .expect("read ledger");
-    assert_eq!(
-        from_partition, "community",
-        "the ledger records the LAST transition, not the first — the 'private' \
-         step is gone. Documented in migration 071; migration 084's gate reads \
-         existence, not history."
-    );
-}
-
-/// **The shim never WIDENS.** A `partition_type = 'public'` ownership row must
-/// not declassify a claim that is already group-private.
-///
-/// # How this was found
-///
-/// Not by reasoning — by a red test.
-/// `epigraph-api/tests/structural_features_authz.rs::seed_corpus` stamps a
-/// `'public'` ownership row over all three of its claims as bookkeeping,
-/// including the one it deliberately seeded as `('group', owner_group)`. An
-/// earlier revision of migration 071 honoured that row and made the claim
-/// public, and
-/// `owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part` caught
-/// it: a stranger saw **3** claims where it must see 2.
-///
-/// A compat shim for a table on its way out must not be able to declassify
-/// content. Widening is the one direction that turns a bookkeeping write into a
-/// disclosure, and it is what PR-16's migration 074 `claims_block_widening`
-/// trigger exists to forbid.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_public_ownership_row_cannot_declassify_a_group_private_claim(pool: PgPool) {
-    let (agent, group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = fixture::seed_group_claim(&pool, agent, group, "already private").await;
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'public', $2)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .execute(&pool)
-    .await
-    .expect("a 'public' ownership row must be accepted, not raise");
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (group, "group".to_string()),
-        "a 'public' ownership row must NOT declassify an already group-private \
-         claim — that is a widening, and a compat shim must not be able to \
-         disclose content"
-    );
-
-    // The attempt is still LEDGERED, so a refused widening is visible rather
-    // than silent.
-    let logged: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM tenancy_transcription_log WHERE node_id = $1")
-            .bind(claim)
-            .fetch_one(&pool)
-            .await
-            .expect("count ledger rows");
-    assert_eq!(logged, 1, "the refused widening must still be recorded");
-}
-
-/// The converse: a `'public'` row on a claim that IS public still stamps the
-/// owner, so D2 ("a public row still has an OWNER") holds.
-///
-/// Without this, the no-widening guard above could be satisfied by a shim that
-/// simply ignores the `'public'` arm entirely.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_public_ownership_row_still_stamps_the_owner_on_a_public_claim(pool: PgPool) {
-    let (agent, group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    // PR-16: constructed, not defaulted. Migration 074 dropped 062's DEFAULT,
-    // so `insert_undeclared_claim` now lands on ('public', <seed group>) via
-    // arm 4. The state this test needs is the LEGACY one — a pre-tenancy row
-    // the backfill has not reached — and after 074 no write path produces it.
-    let claim = insert_legacy_world_claim(&pool, agent, "public claim").await;
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (WORLD, "public".to_string()),
-        "precondition: the claim is a legacy world-owned row"
-    );
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'public', $2)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .execute(&pool)
-    .await
-    .expect("write ownership");
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (group, "public".to_string()),
-        "D2: a public row still has an OWNER — world is a shape constant, not an \
-         owner. Visibility stays 'public'; only the owner is filled in."
-    );
-}
+//
+// Eleven cases lived here and in a second block at the end of this file, and
+// every one of them wrote a row into `public.ownership` and asserted what
+// migration 071's `ownership_transcribe` trigger did with it:
+//
+//   a_private_ownership_row_transcribes_into_the_tenancy_columns
+//   an_owner_with_no_personal_group_gets_one_minted
+//   a_dangling_community_reference_falls_back_to_the_owner_not_a_raise
+//   a_community_partition_projects_the_group_and_its_members
+//   an_empty_community_falls_back_to_the_owner_rather_than_a_black_hole
+//   the_transcription_ledger_is_last_write_wins
+//   a_public_ownership_row_cannot_declassify_a_group_private_claim
+//   a_public_ownership_row_still_stamps_the_owner_on_a_public_claim
+//   the_shim_refuses_to_transfer_a_private_node_into_a_strangers_group
+//   a_live_member_of_the_current_group_may_still_re_declare
+//   the_owner_of_record_may_move_its_own_node_between_groups
+//
+// Migration 084 drops the table AND the trigger AND
+// `public.epigraph_ownership_transcribe()`. There is no relation left to write
+// and no body left to fire, so these are removed rather than re-pointed: the
+// shim was a COMPATIBILITY layer with an announced end, and this is it.
+//
+// WHAT WAS BEING PROTECTED, AND WHERE IT IS NOW. The shim's job was to keep a
+// legacy `ownership` write from diverging from the tenancy columns — including
+// the two guards the transfer block existed for (never widen `group` to
+// `public`; never move a node into a group its current owners are not in). With
+// the table gone there is no writer to guard: the tenancy columns are the only
+// declaration, and migration 070's arm (a) / `claims_block_widening` and 074's
+// per-table `_require_tenancy` triggers are what enforce them. Those are
+// exercised by the arm (a) / arm (c) / arm (d) cases above and by
+// `tenancy_required.rs`, none of which mention `ownership`.
+//
+// The transcription LEDGER is not deleted with them. `tenancy_transcription_log`
+// survives 084 and is the only surviving record of what the dropped rows
+// declared; migration 084's second pre-flight reads it, and
+// `retire_ownership_preflight.rs` is what asserts the pre-flight refuses an
+// untranscribed non-public row.
 
 // =============================================================================
 // Arm (b) — the endpoint meet, and its no-widening gate
@@ -1837,245 +1367,5 @@ async fn arm_d_co_owns_a_cross_group_edge_rather_than_picking_a_side(pool: PgPoo
     assert_ne!(
         vis, "public",
         "an edge between two group-private claims is never public"
-    );
-}
-
-// =============================================================================
-// Migration 071 — the shim never TRANSFERS, not only never widens
-// =============================================================================
-
-/// **A stranger cannot move a group-private node into its own group with an
-/// `ownership` row.**
-///
-/// # The composition this closes, and why it is new in PR-12
-///
-/// `require_declassify_authority` (both `routes/ownership.rs` and
-/// `tools/perspectives.rs`) resolves `(None, Some(requested)) if requested ==
-/// principal.id()` to ALLOW — a node with no `ownership` row may be claimed to
-/// yourself. PR-11 filed that as a public→private denial of service, harmless
-/// while the row landed in an ACL table nothing read.
-///
-/// PR-12 makes that write land on the LIVE tenancy columns, and PR-12 also
-/// MANUFACTURES the victims: `ClaimRepository::supersede` writes no `ownership`
-/// row, so arm (a) stamps every superseded private claim's successor
-/// `('group', G)` with `owner_of_record = None` — i.e. self-claimable. Evidence
-/// is worse: no production path ever gives it an `ownership` row, arm (c)
-/// stamps it from its parent, and `evidence.raw_content` is a full second copy
-/// of the claim text. `node_type` is caller-supplied and unvalidated,
-/// `ownership.node_id` carries no FK, and MCP `assign_ownership` is gated at
-/// `claims:write`, not `claims:admin`.
-///
-/// A guard that blocked only group→public would leave all of that open. This
-/// asserts the transfer half.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_shim_refuses_to_transfer_a_private_node_into_a_strangers_group(pool: PgPool) {
-    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let (attacker, _) = fixture::seed_agent_with_group(&pool, "attacker").await;
-    let claim = fixture::seed_group_claim(&pool, owner, owner_group, "victim").await;
-    let evidence = insert_evidence(&pool, claim, "victim-evidence").await;
-    assert_eq!(
-        tenancy_of(&pool, "evidence", evidence).await,
-        (owner_group, "group".into()),
-        "precondition: arm (c) stamped the evidence from its parent claim"
-    );
-
-    // The self-claim `require_declassify_authority` permits: no prior
-    // `ownership` row, owner_id == the caller.
-    for (node, node_type) in [(claim, "claim"), (evidence, "evidence")] {
-        sqlx::query(
-            "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-             VALUES ($1, $2, 'private', $3)",
-        )
-        .bind(node)
-        .bind(node_type)
-        .bind(attacker)
-        .execute(&pool)
-        .await
-        .expect("the shim must DENY by matching no row, not by raising");
-    }
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (owner_group, "group".into()),
-        "a stranger's `ownership` row must not move a group-private claim into \
-         its own group — that is a confidentiality break, not the denial of \
-         service PR-11 filed"
-    );
-    assert_eq!(
-        tenancy_of(&pool, "evidence", evidence).await,
-        (owner_group, "group".into()),
-        "and evidence is the sharper case: raw_content is a full second copy of \
-         the claim text, and no production path ever gives it an ownership row"
-    );
-}
-
-/// The transfer guard has a membership escape hatch, and it is REQUIRED.
-///
-/// A bare "never change group" rule would also forbid the LEGITIMATE
-/// re-declaration migration 071's own header describes — private → community,
-/// which the MCP `update_partition` path and two fixtures perform. A declarer
-/// who is a live member of the node's CURRENT group is a co-owner expressing
-/// the existing owners' intent, which is what a transcriber is for; a stranger
-/// is not. This is the half that keeps the guard from being a wall.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_live_member_of_the_current_group_may_still_re_declare(pool: PgPool) {
-    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let claim = fixture::seed_group_claim(&pool, owner, owner_group, "mine").await;
-
-    // PR-16 RESHAPED THIS FIXTURE, AND IT IS STRONGER FOR IT.
-    //
-    // This block used to insert a SECOND group carrying the canonical
-    // `did:epigraph:personal:<owner>` key, because `seed_agent_with_group`
-    // used a test-local `did:epigraph:test:...` key and therefore did NOT
-    // produce the group `ensure_personal_group` resolves. PR-16 fixed that
-    // fixture — the two are now the same row — and this insert began failing on
-    // `groups_did_key_key`.
-    //
-    // Collapsing `second` onto `owner_group` would have made the assertion
-    // below VACUOUS: the claim's current group and the declarer's canonical
-    // personal group would be the same id, so "the shim resolved the canonical
-    // group" and "the shim left it where it was" become indistinguishable.
-    //
-    // So the claim is moved into a THIRD group instead — a community-kind group
-    // the owner is also a live member of. The discrimination survives:
-    // `current` is where the claim starts, `owner_group` is where the shim must
-    // land it.
-    let second = owner_group;
-    let current: Uuid = sqlx::query_scalar(
-        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
-         VALUES ('current', 'did:epigraph:current:' || $1::text, ''::bytea, 'community', $1) \
-         RETURNING id",
-    )
-    .bind(owner)
-    .fetch_one(&pool)
-    .await
-    .expect("seed the claim's current group");
-    sqlx::query(
-        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'admin')",
-    )
-    .bind(current)
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("seed membership in the claim's current group");
-    sqlx::query("UPDATE claims SET owner_group_id = $1 WHERE id = $2")
-        .bind(current)
-        .bind(claim)
-        .execute(&pool)
-        .await
-        .expect("move the claim into the current group");
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim)
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("insert ownership");
-
-    let (group, vis) = tenancy_of(&pool, "claims", claim).await;
-    assert_eq!(vis, "group");
-    assert_eq!(
-        group, second,
-        "the owner IS a live member of the claim's current group, so the shim \
-         must honour its re-declaration and resolve to the canonical personal \
-         group — refusing here would break the private → community path 071's \
-         header describes"
-    );
-}
-
-/// The OWNER OF RECORD may move its own node between groups — the second
-/// escape hatch, and the one a red test found.
-///
-/// # Why the membership hatch alone is not enough
-///
-/// `community_partition.rs::demoting_out_of_community_clears_the_gate` demotes a
-/// community-partitioned claim to `private`. The shim must move it from the
-/// community group to the OWNER's personal group — and the owner is
-/// deliberately NOT projected into the community group
-/// (`community_owner_who_is_not_a_member_is_redacted` pins that as a reviewed
-/// decision), so hatch (i) does not cover it.
-///
-/// Blocking it would be a WIDENING dressed as strictness: the demoted node
-/// would stay readable by every member of a community it has just left, which
-/// is the exact failure mode the guard exists against.
-///
-/// The attack stays closed because it is an INSERT. PR-11's
-/// `require_declassify_authority` permits a self-claim ONLY when there is no
-/// owner of record, so an attacker's write can never be `TG_OP = 'UPDATE'` with
-/// `OLD.owner_id = NEW.owner_id`; and with an owner of record present, that same
-/// function denies `(Some(victim), Some(attacker))` before the trigger runs.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_owner_of_record_may_move_its_own_node_between_groups(pool: PgPool) {
-    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
-
-    // A community whose group has a live member who is NOT the owner — the
-    // shape `demoting_out_of_community_clears_the_gate` builds.
-    let community: Uuid =
-        sqlx::query_scalar("INSERT INTO communities (name) VALUES ('demotable') RETURNING id")
-            .fetch_one(&pool)
-            .await
-            .expect("seed community");
-    sqlx::query(
-        "INSERT INTO groups (id, display_name, did_key, public_key, kind) \
-         VALUES ($1, 'demotable', 'did:epigraph:community:' || $1::text, ''::bytea, 'community')",
-    )
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("project the community group");
-    sqlx::query(
-        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'reader')",
-    )
-    .bind(community)
-    .bind(member)
-    .execute(&pool)
-    .await
-    .expect("seed the community membership");
-
-    let claim = insert_undeclared_claim(&pool, owner, "to be demoted").await;
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3)",
-    )
-    .bind(claim)
-    .bind(owner)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("assign to the community");
-    assert_eq!(
-        tenancy_of(&pool, "claims", claim).await,
-        (community, "group".into()),
-        "precondition: the claim is owned by the COMMUNITY group, which the owner \
-         is deliberately not a member of"
-    );
-
-    // The demotion: an UPDATE of the existing row, by the same owner_id.
-    sqlx::query(
-        "UPDATE ownership SET partition_type = 'private', community_id = NULL \
-          WHERE node_id = $1",
-    )
-    .bind(claim)
-    .execute(&pool)
-    .await
-    .expect("demote");
-
-    let (group, vis) = tenancy_of(&pool, "claims", claim).await;
-    assert_eq!(
-        (group, vis.as_str()),
-        (owner_group, "group"),
-        "the owner of record must be able to move its own node out of a group it \
-         is not a member of — refusing leaves the demoted node readable by every \
-         member of the community it has just left, which is a WIDENING"
-    );
-    assert_ne!(
-        group, community,
-        "and it must actually LEAVE the community group, not merely be relabelled"
     );
 }

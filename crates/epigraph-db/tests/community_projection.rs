@@ -386,47 +386,26 @@ async fn removing_one_of_two_perspectives_keeps_the_membership(pool: PgPool) {
     );
 }
 
-/// A community created through the repository can be used by migration 071's
-/// shim — the end-to-end reason `create` projecting matters.
-///
-/// The community is created WITH a creator, so its projected group has a live
-/// admin. That is load-bearing: the shim refuses to stamp a community group
-/// with no live members (it would be a row nobody could read) and falls back to
-/// the owner's personal group instead. A community created with `None` here
-/// would therefore exercise the fallback, not the projection — see
-/// `tenancy_triggers.rs::an_empty_community_falls_back_to_the_owner_rather_than_a_black_hole`
-/// for that path.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_repository_created_community_can_be_transcribed_by_the_shim(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "owner").await;
-    let row = CommunityRepository::create(&pool, "shimmable", None, None, None, Some(agent))
-        .await
-        .expect("create community");
-
-    let claim = fixture::seed_public_claim(&pool, agent, "to be community-owned").await;
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .bind(row.id)
-    .execute(&pool)
-    .await
-    .expect(
-        "the shim must resolve the community's projected group; before PR-12's \
-         create() fix this raised 23503 because no group row existed",
-    );
-
-    let (owner, vis): (Uuid, String) =
-        sqlx::query_as("SELECT owner_group_id, visibility::text FROM claims WHERE id = $1")
-            .bind(claim)
-            .fetch_one(&pool)
-            .await
-            .expect("read claim");
-    assert_eq!((owner, vis.as_str()), (row.id, "group"));
-}
+// `a_repository_created_community_can_be_transcribed_by_the_shim` lived here
+// until PR-22, and it is DELETED rather than ported.
+//
+// It wrote a `partition_type = 'community'` row into `ownership` and asserted
+// that migration 071's shim resolved the community's PROJECTED GROUP and stamped
+// the claim `('group', <community id>)` — the end-to-end reason
+// `CommunityRepository::create` projects at all. Before PR-12's `create()` fix
+// that INSERT raised 23503, because no `groups` row existed.
+//
+// Migration 084 drops the table and the shim, so the write it was made of cannot
+// be expressed. The property it demonstrated is NOT lost: the projection itself
+// is asserted directly by `create_projects_the_community_onto_a_group` and its
+// siblings above, and by
+// `tenancy_coverage.rs::every_community_projects_onto_a_group_and_its_members_onto_memberships`.
+// What is genuinely gone is the END-TO-END leg — "a claim gated on a
+// repository-created community is readable by that community's members" — and
+// that leg is now carried by
+// `epigraph-mcp/tests/community_partition.rs`, whose fixtures stamp the same
+// tenancy columns the shim used to stamp and whose cases 1-6 assert the whole
+// member / non-member / anonymous / fallback matrix over them.
 
 // =============================================================================
 // Closed membership — the authorization PR-12 owes because PR-12 is what makes

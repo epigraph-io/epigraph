@@ -95,7 +95,7 @@ Current reservation:
   | **081** | PR-18a | privatization guards: the plan guard (target-group maturity + admin plurality), the approver guard, and `claim_encryption_no_public_sealed`. No table, so nothing to FORCE. File: `081_privatization_guards.sql`. **Throwaway only.** |
   | **082** | PR-18a | `privatization_audit` (append-only) + the `security_events` hardening PR-17 deferred here: the shared `epigraph_audit_immutable` trigger on both tables and `REVOKE UPDATE, DELETE … FROM epigraph_app`. File: `082_privatization_audit.sql`. **Throwaway only.** |
   | **083** | PR-18a | `instance_admins` + `epigraph_is_instance_admin(uuid)`, plus the two policies 082 could not create before the function existed (`privatization_audit_read`, and `security_events_read`'s restored instance-admin disjunct). Seeds nothing. **Correction to the plan:** it prescribes no INSERT/UPDATE policy on `instance_admins`, which under `FORCE` denies the operator grant to every role; 083 ships a bypass-only INSERT and UPDATE pair instead, and stops short of `FOR ALL` so DELETE stays denied. File: `083_instance_admins.sql`. **Throwaway only.** |
-  | **084** | PR-22 | retire `ownership` |
+  | **084** | PR-22 | retire `ownership`. `DROP TABLE public.ownership` plus, EXPLICITLY and in their own statements, the `ownership_key_id_quarantine` VIEW (068) and `public.epigraph_ownership_transcribe()` (071) — `DROP TABLE` removes the two triggers but not the SECURITY DEFINER body behind one of them, and a CASCADE would take the view pre-flight (1) inspects. Gated on **two `DO $$` blocks that RAISE EXCEPTION**: an empty quarantine, and zero non-public rows without a `tenancy_transcription_log` entry. Both are sliced out by their `-- >>> PRE-FLIGHT n` sentinels and executed against a manufactured failing state by `crates/epigraph-db/tests/retire_ownership_preflight.rs` — a `#[sqlx::test]` body cannot seed the table, because the migrator has already dropped it. **ONE-WAY DOOR**; undo at `docs/runbooks/084-undo.sql`, which recreates the empty shape and states which columns are recoverable from the surviving ledger and which are not. **Applied to a throwaway database only, NOT to any deployed database.** |
   | **085** | PR-10 | `webhook_subscriptions` (durable webhook registrations, `agent_id` FK) |
   | **087** | PR-18 (18b) | SELECT + INSERT policies on `privatization_plans` and `privatization_plan_items`. **The plan specifies no policy for either table** — fourteen `CREATE POLICY` blocks in `docs/tenancy/FINAL-PLAN.md`, none naming them — so this file designs them from 082/083's two templates and says so in its own header. Read is instance-admin **AND** group-admin-of-target (§6.5.2 point 2); write is bypass-only, matching 083's `instance_admins` shape, because 080 already REVOKEs DML from `epigraph_app`. **Side effect on a table it does not touch:** 083's `privatization_audit_read` entity arm resolves its sub-select over `privatization_plans` and therefore activates. UPDATE and DELETE stay uncovered and stay registered in `rls_enforcement.rs::DELIBERATELY_UNCOVERED`. File: `087_privatization_plan_policies.sql`. **Throwaway only.** |
   | **088** | PR-18 (18c) | UPDATE policies on `privatization_plans` and `privatization_plan_items`, bypass-only on both `USING` and `WITH CHECK`. **The plan assigns this slice migrations "076/077/078/079", which are PR-16's and PR-17's under the +4 shift and are applied and frozen** — so the number comes from this table's headroom instead. Every state transition in the apply/approve/abort/revert surface is an UPDATE of one of these two tables, and under `FORCE` an uncovered command is denied to every role including a bypass connection, so the whole surface is blocked without this file. DELETE stays uncovered on both tables and stays registered in `rls_enforcement.rs::DELIBERATELY_UNCOVERED`; the two UPDATE rows are deleted from that register in the same commit, because it is exact in both directions. File: `088_privatization_plan_state_policies.sql`. **Throwaway only.** |
@@ -116,18 +116,23 @@ Current reservation:
 
   | Object | `relkind` | Created by | Dropped by |
   |---|---|---|---|
-  | `public.ownership_key_id_quarantine` | VIEW (`v`) | 068 | **084**, with the `ownership` table it reads. Its pre-flight is `SELECT count(*) FROM ownership_key_id_quarantine` — a non-empty result is an operator action item, and 084 must not `DROP TABLE ownership CASCADE` past it. |
+  | `public.ownership_key_id_quarantine` | VIEW (`v`) | 068 | **084 — DONE.** Dropped explicitly, in its own statement, AFTER the pre-flight that reads it (`SELECT count(*) FROM ownership_key_id_quarantine`); a non-empty result is an operator action item, and `DROP TABLE ownership CASCADE` would have destroyed the object the check inspects. `retire_ownership_preflight.rs::the_migration_declares_both_pre_flights` asserts that 084 contains no `CASCADE` and drops the view by name. |
   | `public.tenancy_exempt` | TABLE (`r`) | 069 | **never** — it is the §2.4 exemption registry and outlives the series. Listed here so it is not mistaken for scaffolding. |
 
-  A VIEW is deliberate for the quarantine (ops F20): a `CREATE TABLE AS`
+  A VIEW was deliberate for the quarantine (ops F20): a `CREATE TABLE AS`
   snapshot taken at 068 time cannot see a row that becomes unparseable
-  afterwards, so 084's pre-flight would pass over exactly the value it exists to
-  catch. It is created `WITH (security_invoker = true)` — a view without that
-  option executes as its OWNER and bypasses the invoker's policies once
-  migration 079 FORCEs RLS, which is the open finding migration 069 files
-  against `alternative_set` and `alt_set_decisions`. **Any VIEW added in this
-  range must set it.** Both properties are pinned by
-  `crates/epigraph-db/tests/tenancy_coverage.rs::ownership_key_id_quarantine_is_a_view`.
+  afterwards, so 084's pre-flight would have passed over exactly the value it
+  existed to catch. It was created `WITH (security_invoker = true)` — a view
+  without that option executes as its OWNER and bypasses the invoker's policies
+  once migration 079 FORCEs RLS, which is the open finding migration 069 files
+  against `alternative_set` and `alt_set_decisions`. **THE RULE STANDS: any VIEW
+  added in this range must set it.** Its example does not. PR-22 dropped the
+  view and with it
+  `crates/epigraph-db/tests/tenancy_coverage.rs::ownership_key_id_quarantine_is_a_view`,
+  which pinned both properties — a deliberate un-pinning, recorded here because
+  README named that test as the pin. The rule is still ratcheted, on the two
+  view exemptions in `tenancy_exempt`, by that file's
+  `the_two_view_exemptions_are_security_invoker`.
 
   **The app-role grant rule, from 077 onward.** Migration 077 grants
   `epigraph_app` SELECT/INSERT/UPDATE/DELETE `ON ALL TABLES IN SCHEMA public`.
@@ -259,6 +264,16 @@ Tables that exist in the field but have no owning code. Scheduled for an
 explicit `DROP TABLE IF EXISTS` inside the reserved 060–090 range — not dropped
 opportunistically, because on the databases where they exist they hold key
 material.
+
+- **`ownership`** — DROPPED by migration **084** (PR-22). The pre-tenancy ACL
+  table: one row per node, naming an agent and a coarse partition. Migration 071
+  demoted it to a write-through shim, PR-14 deleted its whole API surface, and
+  084 removed the relation, its view, its two triggers and 071's definer body.
+  Listed here so a `DROP TABLE ownership` in a later migration is recognised as a
+  duplicate rather than written afresh. `tenancy_transcription_log` (062)
+  survives and is the only record of what the dropped rows declared;
+  `docs/runbooks/084-undo.sql` is honest about what that does and does not
+  recover.
 
 - **`embedding_shares`**, **`re_encryption_keys`** — created by
   `epigraph-enterprise/migrations/001_initial_schema.sql`, never created by any

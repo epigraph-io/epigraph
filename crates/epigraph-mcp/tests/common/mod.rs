@@ -191,6 +191,102 @@ pub async fn seed_agent(pool: &PgPool) -> Uuid {
     id
 }
 
+/// Resolve `owner`'s personal group, minting it and the owner's live membership
+/// if absent, and return its id.
+///
+/// This is migration 071's fallback arm, lifted into a fixture. Until PR-22 the
+/// tests below reached it by writing a `partition_type = 'private'` row into
+/// `ownership` and letting the `ownership_transcribe` trigger resolve-or-mint
+/// the group and stamp the claim. Migration 084 retires that table, so the
+/// fixture does both halves itself.
+///
+/// **Two ways to identify a personal group, and both are needed.** The canonical
+/// one is the deterministic `did:epigraph:personal:<agent uuid>` key, but the
+/// semantics are `kind = 'personal'` created by this agent, and
+/// `tests/viewer_fixture.rs::seed_agent_with_group` mints one under a
+/// `did:epigraph:test:` key instead. **The membership targets the composite
+/// `(group_id, agent_id, epoch)` and REVIVES**, because an untargeted
+/// `DO NOTHING` no-ops against a revoked row and leaves the agent with no live
+/// membership in its own personal group.
+pub async fn personal_group_of(pool: &PgPool, owner: Uuid) -> Uuid {
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM groups \
+          WHERE (did_key = 'did:epigraph:personal:' || $1::text) \
+             OR (kind = 'personal' AND created_by_agent_id = $1) \
+          ORDER BY (did_key = 'did:epigraph:personal:' || $1::text) DESC, created_at ASC \
+          LIMIT 1",
+    )
+    .bind(owner)
+    .fetch_optional(pool)
+    .await
+    .expect("resolve personal group");
+
+    let group = match existing {
+        Some(g) => g,
+        None => sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('personal:' || $1::text, 'did:epigraph:personal:' || $1::text, \
+                     ''::bytea, 'personal', $1) \
+             ON CONFLICT (did_key) DO UPDATE SET updated_at = now() RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("mint personal group"),
+    };
+
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin') \
+         ON CONFLICT (group_id, agent_id, epoch) \
+         DO UPDATE SET revoked_at = NULL, role = 'admin'",
+    )
+    .bind(group)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("revive personal group membership");
+
+    group
+}
+
+/// Make `claim_id` readable only by `owner`'s personal group, and CHECK that it
+/// landed.
+///
+/// The read-back is not decoration. Every caller asserts that a STRANGER sees
+/// less, and a fixture that silently failed to privatise the row would leave all
+/// of them green while testing nothing — the failure mode is invisible in
+/// exactly the tests that exist to catch it.
+pub async fn seed_private_tenancy(pool: &PgPool, claim_id: Uuid, owner: Uuid) -> Uuid {
+    let group = personal_group_of(pool, owner).await;
+    stamp_group_private(pool, claim_id, group).await;
+    group
+}
+
+/// `UPDATE claims SET visibility = 'group', owner_group_id = $2`, with the
+/// post-condition asserted. See [`seed_private_tenancy`] for why.
+pub async fn stamp_group_private(pool: &PgPool, claim_id: Uuid, group: Uuid) {
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(claim_id)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("stamp the claim group-private");
+
+    let got: Option<(String, Uuid)> =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_optional(pool)
+            .await
+            .expect("read the stamped claim back");
+    assert_eq!(
+        got,
+        Some(("group".to_string(), group)),
+        "the fixture must leave claim {claim_id} at ('group', {group}); a \
+         mis-stamped fixture makes every absence assertion vacuous"
+    );
+}
+
 pub async fn seed_claim(pool: &PgPool, content: &str, truth: f64) -> Uuid {
     let agent = seed_agent(pool).await;
     let id = Uuid::new_v4();

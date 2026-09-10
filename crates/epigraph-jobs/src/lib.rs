@@ -784,6 +784,29 @@ pub enum EpiGraphJob {
         /// Matches `security_events.correlation_id` for the dispatching request.
         correlation_id: String,
     },
+
+    /// Finish a group's re-seal: clear `groups.reseal_required_at` once no
+    /// ciphertext row is still bound to a retired key epoch (§6.7 point 3).
+    ///
+    /// **It is keyed on a GROUP, not on a plan, and that is a correction to the
+    /// plan text.** FINAL-PLAN §6.7 describes reseal as `mode='reseal'`, and
+    /// migration 080's applied, frozen `pp_mode_check` admits only `restrict`
+    /// and `seal` — so a reseal plan is not representable without DDL, and
+    /// PR-21 is assigned no migration.
+    ///
+    /// It also does no crypto, which §6.7's own closing paragraph requires:
+    /// "re-sealing requires the group key, which by §6.5.6 the server does not
+    /// have. The server can mark, measure and prepare the manifest; only a
+    /// key-holding admin can complete it." The admin completes it through the
+    /// seal/unseal ceremony; this job is what OBSERVES completion.
+    PrivatizationReseal {
+        /// The group whose re-seal is being checked.
+        group_id: Uuid,
+        /// The agent whose commit triggered the check.
+        dispatched_by: Uuid,
+        /// Matches `security_events.correlation_id` for the triggering request.
+        correlation_id: String,
+    },
 }
 
 impl EpiGraphJob {
@@ -803,6 +826,7 @@ impl EpiGraphJob {
             // app-role enqueue of privatization work stops matching.
             Self::PrivatizationApply { .. } => crate::privatization::APPLY_JOB_TYPE,
             Self::PrivatizationRevert { .. } => crate::privatization::REVERT_JOB_TYPE,
+            Self::PrivatizationReseal { .. } => crate::privatization::RESEAL_JOB_TYPE,
         }
     }
 

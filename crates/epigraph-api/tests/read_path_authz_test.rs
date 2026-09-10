@@ -177,10 +177,12 @@ async fn get_claim_private_and_nonexistent_are_indistinguishable_to_a_stranger()
     // `visibility='public'`, so the viewer predicate returned the row and the
     // handler blanked its content to "[REDACTED]".
     //
-    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
-    // the claim is genuinely ('group', <owner's personal group>) and the
-    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
-    // blanked.
+    // PR-12 made the claim genuinely ('group', <owner's personal group>) via
+    // migration 071's shim, so the stranger's viewer predicate excludes it
+    // outright and the row is ABSENT, not blanked. PR-22 retires that shim with
+    // the `ownership` table; the fixture now stamps those tenancy columns
+    // DIRECTLY and asserts the read-back, so the end state is identical and no
+    // longer depends on a trigger.
     //
     // That is strictly less disclosure — a stranger no longer learns the claim
     // exists — and it is the end state plan PR-14 names: "delete redaction; a
@@ -309,10 +311,11 @@ async fn get_claim_community_member_sees_content_and_outsider_does_not() {
         .send()
         .await
         .unwrap();
-    // PR-12 TIGHTENING. Migration 071's shim transcribes the community ownership
-    // row into ('group', <the community's projected group>), so a non-member's
-    // viewer predicate excludes the claim outright rather than the handler
-    // blanking its content. A spoofed ?agent_id still does not launder anyone
+    // PR-12 TIGHTENING. The claim is group-private in its own tenancy columns —
+    // ('group', <the community's projected group>) — so a non-member's viewer
+    // predicate excludes it outright rather than the handler blanking its
+    // content. Migration 071's shim used to transcribe that from an `ownership`
+    // row; PR-22 retires both, and the fixture stamps the columns directly. A spoofed ?agent_id still does not launder anyone
     // into the community — that half of the property is unchanged and is what
     // the 404 now demonstrates.
     assert_eq!(
@@ -402,10 +405,12 @@ async fn list_claims_stranger_token_spoofed_owner_omits_the_private_claim() {
     // `visibility='public'`, so the viewer predicate returned the row and the
     // handler blanked its content to "[REDACTED]".
     //
-    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
-    // the claim is genuinely ('group', <owner's personal group>) and the
-    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
-    // blanked.
+    // PR-12 made the claim genuinely ('group', <owner's personal group>) via
+    // migration 071's shim, so the stranger's viewer predicate excludes it
+    // outright and the row is ABSENT, not blanked. PR-22 retires that shim with
+    // the `ownership` table; the fixture now stamps those tenancy columns
+    // DIRECTLY and asserts the read-back, so the end state is identical and no
+    // longer depends on a trigger.
     //
     // That is strictly less disclosure — a stranger no longer learns the claim
     // exists — and it is the end state plan PR-14 names: "delete redaction; a
@@ -461,10 +466,12 @@ async fn claims_by_belief_stranger_token_spoofed_owner_omits_the_private_claim()
     // `visibility='public'`, so the viewer predicate returned the row and the
     // handler blanked its content to "[REDACTED]".
     //
-    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
-    // the claim is genuinely ('group', <owner's personal group>) and the
-    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
-    // blanked.
+    // PR-12 made the claim genuinely ('group', <owner's personal group>) via
+    // migration 071's shim, so the stranger's viewer predicate excludes it
+    // outright and the row is ABSENT, not blanked. PR-22 retires that shim with
+    // the `ownership` table; the fixture now stamps those tenancy columns
+    // DIRECTLY and asserts the read-back, so the end state is identical and no
+    // longer depends on a trigger.
     //
     // That is strictly less disclosure — a stranger no longer learns the claim
     // exists — and it is the end state plan PR-14 names: "delete redaction; a
@@ -552,10 +559,12 @@ async fn frame_claims_sorted_stranger_token_spoofed_owner_omits_the_private_clai
     // `visibility='public'`, so the viewer predicate returned the row and the
     // handler blanked its content to "[REDACTED]".
     //
-    // The 071 compat shim now TRANSCRIBES that row into the tenancy columns, so
-    // the claim is genuinely ('group', <owner's personal group>) and the
-    // stranger's viewer predicate excludes it outright. The row is ABSENT, not
-    // blanked.
+    // PR-12 made the claim genuinely ('group', <owner's personal group>) via
+    // migration 071's shim, so the stranger's viewer predicate excludes it
+    // outright and the row is ABSENT, not blanked. PR-22 retires that shim with
+    // the `ownership` table; the fixture now stamps those tenancy columns
+    // DIRECTLY and asserts the read-back, so the end state is identical and no
+    // longer depends on a trigger.
     //
     // That is strictly less disclosure — a stranger no longer learns the claim
     // exists — and it is the end state plan PR-14 names: "delete redaction; a
@@ -1293,9 +1302,11 @@ async fn graph_query_stranger_token_spoofed_owner_omits_the_private_node() {
     // PR-12 TIGHTENING, completed by PR-14. graph_query used to blank the node
     // `label`, because `seed_private_ownership` wrote an ACL row that left the
     // claim `visibility='public'` and so still inside the viewer predicate.
-    // Migration 071's shim transcribes it into the tenancy columns, so the node
-    // is excluded from the result set entirely; PR-14 then deleted the blanking
-    // branch (`apply_partition_filter`) that would have handled it.
+    // The claim is group-private in its own tenancy columns (migration 071's
+    // shim transcribed it until PR-22 retired both the shim and the `ownership`
+    // table; the fixture now stamps them directly), so the node is excluded from
+    // the result set entirely; PR-14 then deleted the blanking branch
+    // (`apply_partition_filter`) that would have handled it.
     //
     // The WHERE clause selects exactly one row by its unique probe key, so
     // absence here is a real, specific measurement — not the windowing accident
