@@ -503,6 +503,100 @@
 //!   rests on `D-PR17-request-path-never-stamps-session-gucs` alone, which PR-25
 //!   does not discharge. **§9.2 step 11d remains blocked.**
 
+//! ## Status at PR-22
+//!
+//! **PR-22 ADDS A MIGRATION (084) and touches none of the four locked
+//! decisions.** This block is therefore an OBLIGATION, not a convention: §0.2's
+//! rejection trigger fires on *"a PR that changes an RLS policy, a route split,
+//! or a tenancy column and does not touch this file"*, and the `Status at PR-10`
+//! block above records that it was written *"explicitly, because it adds one
+//! (085, `webhook_subscriptions`) and the rejection trigger above is written to
+//! catch exactly the PR that adds a migration and leaves this file alone."*
+//!
+//! PR-22 retires the legacy `ownership` table. Migration 084 drops the relation,
+//! its `ownership_key_id_quarantine` VIEW, both its triggers and 071's
+//! `public.epigraph_ownership_transcribe()` definer body, behind two `DO $$`
+//! pre-flights that `RAISE EXCEPTION`. The Rust half deletes
+//! `repos/ownership.rs` and its two re-exports, retires
+//! `tenancy_backfill`'s `transcribe_legacy_ownership` pass and its two
+//! `ownership` `verify` checks, and rewrites the eight `ownership`-joining
+//! statements in `repos/structural.rs`.
+//!
+//! * **No RLS policy.** `ownership` was never in migration 077's policy set and
+//!   never in 079's FORCE array — measured: `relrowsecurity = false`,
+//!   `relforcerowsecurity = false`, zero `pg_policy` rows. So the drop removes
+//!   no policy, and `rls_enforcement.rs`'s `PROTECTED` and
+//!   `DELIBERATELY_UNCOVERED` registers need no edit and get none.
+//! * **No route split.** PR-14 already deleted the four HTTP routes and the
+//!   three MCP tools; there is nothing left to move.
+//!   `public_router_allowlist.rs` and `viewer_route_table_lint.rs` are
+//!   untouched, and no `FAIL_OPEN_SCOPE_SITES` row moves.
+//! * **No tenancy column.** `ownership` carried none — it is not in migration
+//!   062's `tier_a`, has no `claim_id` and no FK to `claims`, so it is in
+//!   neither §2.4 generator and needs no `tenancy_exempt` row. That registry's
+//!   cardinality-12 pin in `tenancy_coverage.rs` is untouched.
+//!   `schema_contract.rs` never referenced `ownership`; the three shapes it pins
+//!   (062's `tenancy_transcription_log`, `tenancy_backfill_progress`,
+//!   `tenancy_undeclared_writes`) all SURVIVE 084.
+//! * **The trigger inventory moves 21 → 20, and the name comes OUT of both
+//!   queries.** `ownership_transcribe` goes with its table.
+//!   [`d1_tenancy_stamping_triggers_are_armed`] and
+//!   `tenancy_triggers.rs::every_tenancy_trigger_is_enabled` are edited in the
+//!   same commit as the DDL. The name is removed from the `IN` lists rather than
+//!   only the count being lowered: leaving it would make the vacuity guard look
+//!   for a trigger that cannot exist, which is a self-fulfilling assertion.
+//! * **D1 — nothing becomes public by absence.** This is the decision the drop
+//!   is closest to, and the answer is that it strictly REDUCES the ways a node
+//!   can be undeclared. Before 084 a node's tenancy could be asserted in two
+//!   places — its own columns and an `ownership` row — and 071's shim existed
+//!   solely to stop them diverging. After 084 there is one place. Pre-flight (2)
+//!   is what makes that safe rather than merely tidy: it refuses the drop while
+//!   any non-public row lacks a `tenancy_transcription_log` entry **recording
+//!   the partition that row currently holds**. Say what the guard proves and no
+//!   more: the ledger is `node_id PRIMARY KEY`, overwritten on each firing and
+//!   written for every `partition_type` including `'public'`, so a
+//!   presence-only check would be satisfied by a stale entry and would NOT
+//!   establish that the row's *current* declaration ever reached a column. The
+//!   `from_partition` conjunct is what closes the difference. Dropping a row
+//!   whose non-public declaration lives nowhere else would silently widen its
+//!   node, which is precisely a D1 violation, and the migration refuses
+//!   instead. `retire_ownership_preflight.rs` asserts BOTH refusals — the
+//!   missing entry and the stale one — against manufactured failing states, and
+//!   pairs each with a passing control.
+//! * **D3 — no `Viewer` shape, constructor or `SystemReason` is added.**
+//!   `Viewer::system(` and `Viewer::bypass_bind` appear nowhere in the diff. The
+//!   eight rewritten `repos/structural.rs` statements each still take a
+//!   `&Viewer` and still spend it through `Viewer::splice`; every marker in the
+//!   new owned-node union is the canonical `/* {VISIBILITY:<alias>} */` or
+//!   `/* {EDGE_VISIBILITY:<alias>} */` spelling, the guarded
+//!   `if let Some(g) = viewer.group_bind()` bind is preserved at every site, and
+//!   the bind indices are unchanged (2, and 3 for `edge_counts`). **No new
+//!   `VISIBILITY-EXEMPT:` entry is taken**, and that is a decision rather than
+//!   luck: the obvious shortcut for a statement whose owner relation had just
+//!   been deleted would have been to annotate it, which
+//!   `visibility_lint.rs::EXPECTED_EXEMPTIONS` calls "a leak being annotated
+//!   rather than fixed" on a read path. The union filters both of its arms
+//!   instead. Deleting `repos/ownership.rs` removes SIX viewer-taking functions
+//!   from that lint's population and no exemption from its register.
+//! * **No write-side predicate.** PR-22 adds no `WITH CHECK`, no RLS policy and
+//!   no write-side SQL predicate, and no `PolicyGate::authorize` call site. The
+//!   `-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate`
+//!   markers in `repos/claim.rs` are unchanged. What PR-22 deletes is write
+//!   CODE that cannot survive its table — `OwnershipRepository` and
+//!   `transcribe_legacy_ownership` — which is a removal, not a gate.
+//! * **`no_unscoped_pool.rs` is untouched.** It scans
+//!   `crates/epigraph-api/src`; nothing in this diff is under that root, so
+//!   `UNCONVERTED`, `HIGH_WATER` and `HIGH_WATER_FILES` do not move.
+//! * **One deliberate UN-PINNING, said out loud.**
+//!   `tenancy_coverage.rs::ownership_key_id_quarantine_is_a_view` pinned two
+//!   properties of the quarantine view — that it was a VIEW rather than a
+//!   snapshot, and that it carried `security_invoker = true` — and
+//!   `migrations/README.md` named it as the pin for both. 084 drops the view, so
+//!   the test goes with it. The RULE it exemplified ("any VIEW added in the
+//!   060-090 range must set `security_invoker`") stands, is restated in README,
+//!   and is still ratcheted on the two view exemptions by
+//!   `tenancy_coverage.rs::the_two_view_exemptions_are_security_invoker`.
+
 use sqlx::PgPool;
 use std::collections::BTreeSet;
 
@@ -1507,7 +1601,7 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
         "SELECT t.tgname, t.tgenabled::text FROM pg_trigger t \
           WHERE NOT t.tgisinternal \
             AND (t.tgname IN ('claims_require_tenancy', 'edges_tenancy', \
-                              'claims_propagate_tenancy', 'ownership_transcribe') \
+                              'claims_propagate_tenancy') \
                  OR t.tgname LIKE '%\\_inherit\\_tenancy') \
           ORDER BY t.tgname",
     )
@@ -1515,11 +1609,22 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     .await
     .expect("read pg_trigger");
 
+    // 20 SINCE PR-22, NOT 21, AND THE FOURTH NAME IS GONE FROM THE IN-LIST.
+    //
+    // `ownership_transcribe` (migration 071) was the fourth named trigger.
+    // Migration 084 drops `public.ownership`, which drops the trigger with it,
+    // so the number had to move. It is stated here rather than merely edited
+    // because that is exactly the "silent edit" this assertion's own message
+    // warns about: the count changed for a REASON, and the reason is that the
+    // relation the trigger guarded no longer exists — not that arm (c)'s table
+    // set moved. The name is removed from the IN-list as well, so the query no
+    // longer looks for a trigger that cannot exist; leaving it would have made
+    // the count self-fulfilling.
     assert_eq!(
         rows.len(),
-        21,
-        "expected 21 tenancy triggers — 4 named (claims_require_tenancy, \
-         edges_tenancy, claims_propagate_tenancy, ownership_transcribe) plus one \
+        20,
+        "expected 20 tenancy triggers — 3 named (claims_require_tenancy, \
+         edges_tenancy, claims_propagate_tenancy) plus one \
          *_inherit_tenancy per claim-derived tier-A table (17). Found {}: {rows:?}. \
          A different count means migration 070 arm (c)'s table set moved, which \
          is a D1 change and needs a decision, not a silent edit.",

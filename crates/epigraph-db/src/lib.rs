@@ -94,17 +94,17 @@ pub use repos::{
     MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow, MembershipRow, MentionRow,
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
-    NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow, OwnershipRepository,
-    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition,
-    TripleRepository, TripleRow, WebhookSubscriptionRepository, WebhookSubscriptionRow,
-    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow, PaperRepository,
+    PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository, PatternTemplateRow,
+    PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository, ProvenanceEdge,
+    ProvenanceLogRow, ProvenanceNode, ProvenanceRepository, ReasoningTraceRepository,
+    RecallEventRepository, RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep,
+    RevokeOutcome, RotateOutcome, ScopedBeliefRepository, SecurityEventRepository,
+    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, TripleRepository, TripleRow,
+    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 
@@ -124,7 +124,6 @@ pub use repos::graph_view::{
     SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use repos::mass_function::MassFunctionRow;
-pub use repos::ownership::OwnershipRow;
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::ScopedBeliefRow;
 

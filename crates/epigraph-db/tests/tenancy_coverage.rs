@@ -56,6 +56,11 @@ const MIGRATION_069: &str = include_str!("../../../migrations/069_entity_types_t
 /// replay test that re-derived the SQL could not catch the file drifting.
 const MIGRATION_072: &str = include_str!("../../../migrations/072_edge_co_ownership.sql");
 
+/// The retired `ownership` relation, recreated inside a transaction so migration
+/// 068 can be replayed at head. See the module's own docs.
+#[path = "retired_ownership_scaffold.rs"]
+mod retired_ownership;
+
 /// Registered by migration 062's tier-A list by hand; neither generator's
 /// definition names them, so the union states them explicitly.
 const MANUAL_ADDITIONS: &[&str] = &["harvester_fragments", "edges"];
@@ -629,10 +634,25 @@ async fn all_23_core_types_are_classified(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_068_and_069_apply_twice(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_068)
-        .execute(&mut *tx)
-        .await
-        .expect("re-applying migration 068 must succeed");
+    // PR-22: `public.ownership` is dropped by migration 084, and half of 068
+    // operates on it, so the replay needs the relation back for the duration of
+    // this transaction. The scaffold is 001's and 068's own DDL, sliced out of
+    // the frozen files — see `retired_ownership_scaffold.rs`. The VIEW is
+    // deliberately not scaffolded: 068 creates it, and a pre-existing one would
+    // mask a `CREATE OR REPLACE` that had stopped working.
+    //
+    // 068 is therefore applied TWICE here rather than once, because against a
+    // fresh scaffold the first application is not a replay. That is a stronger
+    // exercise of its guards than the single re-application this test used to
+    // do: every `IF NOT EXISTS` / `pg_constraint` guard now sees both the absent
+    // and the present state in one test.
+    retired_ownership::scaffold_table(&mut tx).await;
+    for pass in 1..=2 {
+        sqlx::raw_sql(MIGRATION_068)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("applying migration 068, pass {pass}: {e}"));
+    }
     sqlx::raw_sql(MIGRATION_069)
         .execute(&mut *tx)
         .await
@@ -867,227 +887,38 @@ async fn migration_072_applies_twice(pool: PgPool) {
     }
 }
 
-/// PR-05's acceptance clause, made machine-checkable: the quarantine is a VIEW,
-/// not a `CREATE TABLE AS` snapshot.
-///
-/// The distinction is operational, not stylistic (ops F20). A snapshot taken at
-/// 068 time cannot see a row that becomes unparseable AFTERWARDS, so migration
-/// 084's pre-flight would pass over a value it was supposed to catch. A view is
-/// always current.
-#[sqlx::test(migrations = "../../migrations")]
-async fn ownership_key_id_quarantine_is_a_view(pool: PgPool) {
-    let kind: Option<String> = sqlx::query_scalar(
-        "SELECT relkind::text FROM pg_class \
-          WHERE relnamespace = 'public'::regnamespace \
-            AND relname = 'ownership_key_id_quarantine'",
-    )
-    .fetch_optional(&pool)
-    .await
-    .expect("relkind probe");
-    assert_eq!(
-        kind.as_deref(),
-        Some("v"),
-        "ownership_key_id_quarantine must be a VIEW ('v'); a table ('r') would be a \
-         snapshot that cannot see a value that goes bad after migration 068"
-    );
-
-    // AND `security_invoker = true`. `relkind = 'v'` alone is exactly what
-    // `alternative_set` / `alt_set_decisions` satisfy, and those two are in
-    // `tenancy_exempt` labelled "THIS IS AN OPEN RLS BYPASS" for the option
-    // this one sets. A view that exposes ownership metadata and executes as its
-    // OWNER after migration 079's FORCE would be the same finding, filed by the
-    // same PR that filed the finding.
-    let invoker: Option<bool> = sqlx::query_scalar(
-        "SELECT 'security_invoker=true' = ANY(c.reloptions) FROM pg_class c \
-          WHERE c.relnamespace = 'public'::regnamespace \
-            AND c.relname = 'ownership_key_id_quarantine'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("reloptions probe");
-    assert_eq!(
-        invoker,
-        Some(true),
-        "ownership_key_id_quarantine must be created WITH (security_invoker = true); \
-         without it the view runs as its owner and bypasses the invoker's RLS once \
-         migration 079 FORCEs it"
-    );
-
-    // Empty on a fresh database, which is what makes case 9 below discriminating.
-    let n: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM ownership_key_id_quarantine")
-        .fetch_one(&pool)
-        .await
-        .expect("quarantine count");
-    assert_eq!(n, 0, "a fresh database has nothing to quarantine");
-}
-
-/// The failure mode the plan's own 064 SQL would have hit in production, turned
-/// into a test: a well-formed UUID naming a community that no longer exists.
-///
-/// The plan's unguarded `UPDATE ... SET community_id = encryption_key_id::uuid`
-/// runs AFTER `ownership_community_fkey` is added, and `NOT VALID` exempts
-/// pre-existing rows from the back-check but NOT rows the same statement
-/// modifies — so a dangling UUID raises 23503 and rolls the whole migration
-/// back. `communities` has no cascade to `ownership`, so this state is reachable
-/// by ordinary use. Migration 068 adds `AND EXISTS (SELECT 1 FROM communities …)`
-/// so the value is REPORTED in the quarantine instead of aborting a deploy.
-#[sqlx::test(migrations = "../../migrations")]
-async fn quarantine_reports_a_dangling_community_uuid(pool: PgPool) {
-    let agent = seed_agent(&pool).await;
-    let node = uuid::Uuid::new_v4();
-    let dangling = uuid::Uuid::new_v4();
-
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, encryption_key_id) \
-         VALUES ($1, 'claim', 'community', $2, $3::text)",
-    )
-    .bind(node)
-    .bind(agent)
-    .bind(dangling)
-    .execute(&pool)
-    .await
-    .expect(
-        "a well-formed UUID naming no community must still be WRITABLE — \
-         ownership_key_id_is_uuid checks the shape, not the referent",
-    );
-
-    let reported: Vec<uuid::Uuid> =
-        sqlx::query_scalar("SELECT node_id FROM ownership_key_id_quarantine")
-            .fetch_all(&pool)
-            .await
-            .expect("quarantine read");
-    assert_eq!(
-        reported,
-        vec![node],
-        "a dangling community UUID must be REPORTED, not swallowed and not fatal"
-    );
-
-    // And the non-UUID legacy shape is refused outright, so no NEW junk accrues.
-    let err = sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, encryption_key_id) \
-         VALUES ($1, 'claim', 'community', $2, 'key-2026-001')",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .bind(agent)
-    .execute(&pool)
-    .await
-    .expect_err("a non-UUID encryption_key_id must be refused");
-    assert_eq!(
-        err.as_database_error().and_then(|e| e.constraint()),
-        Some("ownership_key_id_is_uuid")
-    );
-}
-
-/// The drain CLEARS ITS SOURCE, so `ownership_key_id_quarantine` means exactly
-/// "did not resolve" and nothing else.
-///
-/// Draining without clearing would leave the same UUID in two columns — the
-/// two-sources-of-truth this whole migration exists to remove — and would arm
-/// two later failures: the row enters the quarantine the moment `community_id`
-/// goes NULL (blocking migration 084's pre-flight with a value that DID
-/// resolve), and every subsequent UPDATE of it re-checks the `NOT VALID`
-/// `ownership_key_id_is_uuid` against a string nobody maintains.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_drain_clears_the_source_column(pool: PgPool) {
-    let agent = seed_agent(&pool).await;
-    let community: uuid::Uuid =
-        sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
-            .bind(format!("comm-{}", uuid::Uuid::new_v4()))
-            .fetch_one(&pool)
-            .await
-            .expect("seed community");
-    let node = uuid::Uuid::new_v4();
-
-    // A pre-068 row exactly as the old writer left it: the community UUID
-    // stringified into `encryption_key_id`, `community_id` untouched.
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, encryption_key_id) \
-         VALUES ($1, 'claim', 'community', $2, $3::text)",
-    )
-    .bind(node)
-    .bind(agent)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("seed legacy row");
-
-    let mut tx = pool.begin().await.expect("begin");
-    sqlx::raw_sql(MIGRATION_068)
-        .execute(&mut *tx)
-        .await
-        .expect("replay 068");
-
-    let (drained, leftover): (Option<uuid::Uuid>, Option<String>) =
-        sqlx::query_as("SELECT community_id, encryption_key_id FROM ownership WHERE node_id = $1")
-            .bind(node)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("post-drain read");
-    assert_eq!(
-        drained,
-        Some(community),
-        "the value must reach the typed column"
-    );
-    assert_eq!(
-        leftover, None,
-        "and must NOT also remain in encryption_key_id — a drained row carrying both \
-         is the two-sources-of-truth this migration removes"
-    );
-
-    let quarantined: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM ownership_key_id_quarantine")
-            .fetch_one(&mut *tx)
-            .await
-            .expect("quarantine count");
-    assert_eq!(
-        quarantined, 0,
-        "a resolvable value must not appear in the quarantine"
-    );
-}
-
-/// A gate on a row that is not on the community partition gates nothing today
-/// and is inherited by a later promotion to `community` — the exact hazard
-/// `OwnershipRepository::update_partition` argues against when it nulls
-/// `community_id` on demotion. One writer enforcing an invariant the other can
-/// pre-load is not an invariant; migration 068 enforces it structurally for
-/// every writer, in-tree or not.
-#[sqlx::test(migrations = "../../migrations")]
-async fn community_id_requires_the_community_partition(pool: PgPool) {
-    let agent = seed_agent(&pool).await;
-    let community: uuid::Uuid =
-        sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
-            .bind(format!("comm-{}", uuid::Uuid::new_v4()))
-            .fetch_one(&pool)
-            .await
-            .expect("seed community");
-
-    let err = sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'private', $2, $3)",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .bind(agent)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect_err("a community_id on a private row must be refused");
-    assert_eq!(
-        err.as_database_error().and_then(|e| e.constraint()),
-        Some("ownership_community_needs_community_partition")
-    );
-
-    // The same pair IS accepted on the community partition.
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3)",
-    )
-    .bind(uuid::Uuid::new_v4())
-    .bind(agent)
-    .bind(community)
-    .execute(&pool)
-    .await
-    .expect("community partition + community_id is the legal pair");
-}
+// FOUR `ownership` CASES LIVED HERE AND ARE DELETED IN PR-22.
+//
+//   ownership_key_id_quarantine_is_a_view      — that the quarantine is a VIEW
+//                                                (`relkind = 'v'`), not a
+//                                                `CREATE TABLE AS` snapshot, AND
+//                                                that it carries
+//                                                `security_invoker = true`
+//   quarantine_reports_a_dangling_community_uuid
+//   the_drain_clears_the_source_column
+//   community_id_requires_the_community_partition
+//
+// Migration 084 drops both the table and the view, so all four assert properties
+// of relations that do not exist at head.
+//
+// THE FIRST OF THEM IS A DELIBERATE UN-PINNING AND IT IS SAID OUT LOUD.
+// `migrations/README.md` named that test as the pin for BOTH properties of the
+// quarantine view, and its `Non-table objects` table states the general rule the
+// view was the example of: *any VIEW added in the 060–090 range must be created
+// `WITH (security_invoker = true)`*, because a view without it executes as its
+// OWNER and bypasses the invoker's policies once migration 079 FORCEs RLS. The
+// rule outlives its example. README's row is updated in the same change to
+// record that 084 has run and that the rule now stands on the two view
+// exemptions in `tenancy_exempt` — which
+// [`the_two_view_exemptions_are_security_invoker`] below still pins, in both
+// directions.
+//
+// What the other three protected — that a legacy `encryption_key_id` which does
+// not resolve is REPORTED rather than swallowed, and that the drain clears its
+// source so the quarantine means exactly "did not resolve" — was ultimately in
+// service of one thing: that migration 084's first pre-flight comes up empty.
+// That is now asserted against the migration itself, with a manufactured
+// non-empty quarantine, in `retire_ownership_preflight.rs`.
 
 /// PR-05's other two acceptance queries, over the migration's own projection.
 /// Both are trivially 0 on a fresh database, so this seeds a community first —
@@ -1138,8 +969,11 @@ async fn every_community_projects_onto_a_group_and_its_members_onto_memberships(
             .expect("seed membership");
     }
 
-    // Replay 068 so the projection sees the rows seeded above.
+    // Replay 068 so the projection sees the rows seeded above. The `ownership`
+    // half of 068 needs the relation migration 084 retired, so it is scaffolded
+    // inside this transaction first — see `retired_ownership_scaffold.rs`.
     let mut tx = pool.begin().await.expect("begin");
+    retired_ownership::scaffold_table(&mut tx).await;
     sqlx::raw_sql(MIGRATION_068)
         .execute(&mut *tx)
         .await

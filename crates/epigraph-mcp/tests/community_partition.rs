@@ -2,12 +2,9 @@
 //!
 //! # Why this file did not exist before
 //!
-//! `ownership.partition_type` admits three values, and until this file the test
-//! suite exercised two. EVERY existing fixture inserts `'private'` —
-//! `crates/epigraph-api/tests/common/mod.rs::seed_private_ownership`,
-//! `read_path_redaction.rs:248`, `query_claims_redaction.rs:41`,
-//! `query_claims_by_label.rs:164`, `get_claim.rs:91` — and no test in the
-//! workspace has ever written `partition_type = 'community'`. The entire
+//! `ownership.partition_type` admitted three values, and until this file the
+//! test suite exercised two: every fixture in the workspace wrote `'private'`,
+//! and no test had ever written `partition_type = 'community'`. The entire
 //! `"community"` arm of `epigraph_db::access_control::check_content_access`,
 //! including its two-hop `community_members ⋈ perspectives` membership join and
 //! its owner-only fallback, was unexecuted by any test.
@@ -19,6 +16,14 @@
 //! `ownership.community_id` with an FK to `communities`. A rewrite of an
 //! untested branch is a rewrite with no safety net; this is the net.
 //!
+//! # Where the gate lives NOW (PR-22)
+//!
+//! `ownership` is retired by migration 084. The community gate is a projected
+//! `groups` / `group_memberships` pair and the claim's own tenancy columns, and
+//! the fixtures below write exactly what migration 071's shim used to write on
+//! their behalf. The MATRIX is unchanged, which is the point: the arm was
+//! specified by these cases and it still passes them.
+//!
 //! # What is asserted
 //!
 //! The whole matrix the arm has: member, non-member, anonymous, the
@@ -26,10 +31,11 @@
 //! batch (`access_map`) path. Case 5 in particular pins behaviour NO test has
 //! ever asserted — that on the community arm, ownership alone does NOT grant
 //! access once a community resolves — so PR-14, which deletes this module, has
-//! to change it deliberately rather than silently. Cases 7–10 cover the write
-//! side and the two ways the decision can be wrong for reasons that are not
-//! about membership at all: a gate left on a partition that does not use it,
-//! and a query that FAILS rather than returning a row.
+//! to change it deliberately rather than silently. Case 10 covers the way the
+//! decision can be wrong for a reason that is not about membership at all: a
+//! query that FAILS rather than returning a row. Cases 7–9 covered the
+//! `OwnershipRepository` write side and are deleted with it; see the note where
+//! they used to be.
 //!
 //! The HTTP half of the same arm lives in
 //! `crates/epigraph-api/tests/read_path_authz_test.rs`
@@ -58,10 +64,10 @@ use common::build_test_server;
 
 // The `REDACTED` constant this file used to carry is GONE, and its absence is
 // the headline result of PR-12 on this surface. Every assertion here that once
-// read `content == "[REDACTED]"` is now an absence assertion, because migration
-// 071 transcribes `ownership` into the tenancy columns and the Viewer predicate
-// drops the row before any handler can blank it. Redaction is not merely
-// unused on the community arm — it is unreachable.
+// read `content == "[REDACTED]"` is now an absence assertion, because the claim
+// carries group tenancy in its own columns and the Viewer predicate drops the
+// row before any handler can blank it. Redaction is not merely unused on the
+// community arm — it is unreachable.
 //
 // That is exactly what plan PR-14 ("delete redaction; a non-visible row is
 // absent, not blanked") is scheduled to formalise, and what
@@ -148,11 +154,10 @@ async fn community_anonymous_requester_cannot_see_the_claim(pool: PgPool) {
 // ── 4. `community_id IS NULL` → owner-only fallback ────────────────────────
 //
 // This arm was previously reachable ONLY via an `encryption_key_id` that failed
-// `Uuid::parse_str`. Migration 068 removes the string parse entirely, so the
-// arm is now reached by a genuine `NULL` in the typed column — which is also
-// the state a legacy row lands in when its old `encryption_key_id` did not
-// resolve to a live community (it goes to `ownership_key_id_quarantine` and
-// `community_id` stays NULL).
+// `Uuid::parse_str`. Migration 068 removed the string parse, so the arm is
+// reached by a genuine absent community — which is also the state a legacy row
+// landed in when its old `encryption_key_id` did not resolve. The fixture
+// spells that as `None`.
 //
 // The fallback grants the OWNER full access. That is preserved verbatim from
 // the pre-068 behaviour, deliberately: PR-05 is a de-overloading change, and
@@ -233,7 +238,7 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
     let other_community = seed_community(&pool).await;
     join_community(&pool, community, member).await;
 
-    // (a) public — no ownership row at all. Truth 0.80.
+    // (a) public — never gated at all. Truth 0.80.
     let public_id = seed_claim_with_truth(&pool, owner, 0.80).await;
     let public_content = format!("test claim {}", public_id.as_uuid());
 
@@ -289,183 +294,31 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
     );
 }
 
-// ── 7. The write path agrees with the read path ────────────────────────────
+// ── 7, 8, 9. The `OwnershipRepository` cases, DELETED in PR-22 ─────────────
 //
-// `OwnershipRepository::assign_with_community` used to stringify the community
-// UUID into `encryption_key_id` (`repos/ownership.rs:101`, deleted in PR-05).
-// It now writes the typed column and binds `encryption_key_id` to NULL on BOTH
-// the insert and the conflict arm. This asserts the column the writer fills is
-// the column the reader reads — the exact seam the de-overloading could get
-// wrong while every other test stayed green, because the fixtures above write
-// the row by hand.
-#[sqlx::test(migrations = "../../migrations")]
-async fn assign_with_community_writes_the_column_access_control_reads(pool: PgPool) {
-    use epigraph_db::OwnershipRepository;
-
-    let owner = seed_agent(&pool).await;
-    let member = seed_agent(&pool).await;
-    let community = seed_community(&pool).await;
-    join_community(&pool, community, member).await;
-
-    let claim_id = seed_claim(&pool, owner).await;
-    let expected = format!("test claim {}", claim_id.as_uuid());
-
-    let row = OwnershipRepository::assign_with_community(
-        &pool,
-        claim_id.as_uuid(),
-        "claim",
-        "community",
-        owner,
-        Some(community),
-    )
-    .await
-    .expect("assign_with_community");
-
-    assert_eq!(row.community_id, Some(community));
-    assert!(
-        row.encryption_key_id.is_none(),
-        "the writer must leave encryption_key_id NULL; a stale value there while \
-         community_id went NULL would populate ownership_key_id_quarantine and \
-         block migration 084's pre-flight"
-    );
-
-    // Nothing ends up in the quarantine as a result of a normal write.
-    let quarantined: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM ownership_key_id_quarantine")
-            .fetch_one(&pool)
-            .await
-            .expect("quarantine count");
-    assert_eq!(quarantined, 0);
-
-    let server = build_test_server(pool.clone());
-    let body = get_claim_as(&server, &pool, claim_id, Some(member)).await;
-    assert_eq!(
-        body["content"].as_str().unwrap(),
-        expected,
-        "a row written by the repository must be readable by the access-control \
-         reader — same column, both sides"
-    );
-}
-
-// ── 8. Demotion out of the community partition clears the gate ─────────────
+// Three cases lived here and all three had `epigraph_db::OwnershipRepository` as
+// their subject:
 //
-// `update_partition` nulls `community_id` whenever the new partition is not
-// `community`, so a later re-promotion cannot silently reuse a community the
-// caller never named. Without that, demote-to-private then promote-to-community
-// would resurrect the old gate.
-#[sqlx::test(migrations = "../../migrations")]
-async fn demoting_out_of_community_clears_the_gate(pool: PgPool) {
-    use epigraph_db::OwnershipRepository;
-
-    let owner = seed_agent(&pool).await;
-    let member = seed_agent(&pool).await;
-    let community = seed_community(&pool).await;
-    join_community(&pool, community, member).await;
-
-    let claim_id = seed_claim(&pool, owner).await;
-    OwnershipRepository::assign_with_community(
-        &pool,
-        claim_id.as_uuid(),
-        "claim",
-        "community",
-        owner,
-        Some(community),
-    )
-    .await
-    .expect("assign");
-
-    // A LEGACY VALUE IN THE DEPRECATED COLUMN, PUT THERE BY HAND.
-    //
-    // Without this the test is vacuous with respect to `encryption_key_id`:
-    // `assign_with_community` binds it to NULL on both arms, so the field under
-    // test would always be NULL going in and an `update_partition` that failed
-    // to clear it would still pass. Migration 068 drains and clears every row
-    // it can, but nothing stops a row acquiring a value afterwards, and 084's
-    // pre-flight is what has to come up empty. UUID-shaped so it satisfies
-    // `ownership_key_id_is_uuid`.
-    sqlx::query("UPDATE ownership SET encryption_key_id = $2::text WHERE node_id = $1")
-        .bind(claim_id.as_uuid())
-        .bind(community)
-        .execute(&pool)
-        .await
-        .expect("plant a legacy encryption_key_id");
-
-    let demoted = OwnershipRepository::update_partition(&pool, claim_id.as_uuid(), "private")
-        .await
-        .expect("update_partition")
-        .expect("row");
-    assert_eq!(demoted.partition_type, "private");
-    assert_eq!(
-        demoted.community_id, None,
-        "leaving the community partition must clear community_id, or a later \
-         re-promotion inherits a gate nobody asked for"
-    );
-    assert!(
-        demoted.encryption_key_id.is_none(),
-        "the DEPRECATED string must be cleared in the same statement. Leaving it while \
-         community_id goes NULL is precisely the ownership_key_id_quarantine predicate: \
-         the row becomes indistinguishable from a value that never resolved, and blocks \
-         migration 084's pre-flight."
-    );
-
-    let quarantined: i64 =
-        sqlx::query_scalar("SELECT count(*)::bigint FROM ownership_key_id_quarantine")
-            .fetch_one(&pool)
-            .await
-            .expect("quarantine count");
-    assert_eq!(
-        quarantined, 0,
-        "demoting a node must not add a row to the 084 pre-flight's quarantine"
-    );
-
-    // The member (who is not the owner) now sees nothing: the row is private.
-    let server = build_test_server(pool.clone());
-    // PR-12 TIGHTENING: absent, not blanked. The demoted row is now
-    // ('group', <owner's personal group>), which the member is not in.
-    assert_claim_absent_for(&server, &pool, claim_id, Some(member)).await;
-}
-
-// ── 9. A gate may only exist on the partition that uses it ─────────────────
+//   7. `assign_with_community_writes_the_column_access_control_reads` — that the
+//      typed `community_id` column the writer fills is the one the reader reads,
+//      the seam PR-05's de-overloading of `encryption_key_id` could get wrong;
+//   8. `demoting_out_of_community_clears_the_gate` — that `update_partition`
+//      nulls both `community_id` and the deprecated string, so a later
+//      re-promotion cannot inherit a gate nobody named;
+//   9. `a_community_id_on_a_private_partition_is_refused` — that a gate may only
+//      exist on the partition that uses it.
 //
-// `update_partition` nulls `community_id` on demotion and argues (in its own
-// comment) that a stray gate would be "silently reused by a later
-// re-promotion". `assign_with_community` used to accept exactly that pair, so
-// the invariant one writer enforced the other could pre-load — and the MCP
-// `assign_ownership` tool passes `community_id` straight through from the
-// caller. Refused in the repository (a 400, with a reason) and again by the
-// database's `ownership_community_needs_community_partition` CHECK.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_community_id_on_a_private_partition_is_refused(pool: PgPool) {
-    use epigraph_db::OwnershipRepository;
-
-    let owner = seed_agent(&pool).await;
-    let community = seed_community(&pool).await;
-    let claim_id = seed_claim(&pool, owner).await;
-
-    let err = OwnershipRepository::assign_with_community(
-        &pool,
-        claim_id.as_uuid(),
-        "claim",
-        "private",
-        owner,
-        Some(community),
-    )
-    .await
-    .expect_err("a gate on a private row must be refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("community_id may only be set on partition_type 'community'"),
-        "the refusal must explain itself, not surface as a bare constraint name: {msg}"
-    );
-
-    // Nothing was written, so a later promotion cannot inherit anything.
-    let rows: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM ownership WHERE node_id = $1")
-        .bind(claim_id.as_uuid())
-        .fetch_one(&pool)
-        .await
-        .expect("ownership count");
-    assert_eq!(rows, 0);
-}
+// PR-22 deletes `repos/ownership.rs` and migration 084 drops the table, so all
+// three assert properties of code and columns that no longer exist. They are
+// removed rather than re-pointed: there is nothing to re-point them AT. The
+// community gate itself is still covered — cases 1 through 6 and 10 exercise it
+// end to end through the tenancy columns, which is where it now lives.
+//
+// What 8's `encryption_key_id` half was ultimately protecting — that migration
+// 084's quarantine pre-flight comes up empty — is now asserted directly against
+// the migration in
+// `epigraph-db/tests/retire_ownership_preflight.rs::pre_flight_1_refuses_an_untriaged_quarantine_row`
+// and its passing control.
 
 // ── 10. A FAILED lookup REFUSES; it does not publish (D1) ─────────────────
 //
@@ -535,36 +388,93 @@ async fn a_failed_read_refuses_rather_than_publishing(pool: PgPool) {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/// Seed an `ownership` row on the `community` partition.
+/// Gate claim `node_id` on `community_id`'s projected group, falling back to the
+/// owner's personal group when no community resolves.
 ///
-/// Writes `community_id`, NEVER `encryption_key_id` — that is the entire point
-/// of PR-05, and a fixture that wrote the old column would keep passing while
-/// the production writer had moved.
+/// **This wrote a `partition_type = 'community'` row into `ownership` until
+/// PR-22** and let migration 071's `ownership_transcribe` trigger project the
+/// community onto a group and stamp the claim. Migration 084 retires the table,
+/// so the fixture writes the tenancy columns the trigger used to write. The
+/// three arms are 071's, and each is a reviewed decision, not a convenience:
+///
+/// * a community whose projected group has a live member stamps
+///   `('group', community_id)` — migration 068's projection is ID-preserving, so
+///   a community's group id IS its community id;
+/// * a community with no projectable member falls back to the owner's personal
+///   group rather than stamping a group nobody is in, which would make the claim
+///   unreadable by everyone including its owner;
+/// * a NULL or dangling `community_id` is a LEGACY SHAPE, not an error path, and
+///   falls back the same way — fail-closed, still `'group'`, still not public.
+///
+/// **The owner is deliberately NOT added to the community group.** On the
+/// community arm, ownership alone does not grant access once a community
+/// resolves; membership is the whole test, and case 4 below asserts it.
 async fn seed_community_ownership(
     pool: &PgPool,
     node_id: ClaimId,
     owner_id: Uuid,
     community_id: Option<Uuid>,
 ) {
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id, community_id) \
-         VALUES ($1, 'claim', 'community', $2, $3)",
-    )
-    .bind(node_id.as_uuid())
-    .bind(owner_id)
-    .bind(community_id)
-    .execute(pool)
-    .await
-    .expect("seed community ownership");
+    let resolved: Option<Uuid> = match community_id {
+        None => None,
+        Some(c) => sqlx::query_scalar(
+            "SELECT g.id FROM groups g \
+              WHERE g.id = $1 AND g.kind = 'community' \
+                AND EXISTS (SELECT 1 FROM group_memberships m \
+                             WHERE m.group_id = g.id AND m.revoked_at IS NULL)",
+        )
+        .bind(c)
+        .fetch_optional(pool)
+        .await
+        .expect("resolve the projected community group"),
+    };
+
+    match resolved {
+        Some(g) => common::stamp_group_private(pool, node_id.as_uuid(), g).await,
+        None => {
+            common::seed_private_tenancy(pool, node_id.as_uuid(), owner_id).await;
+        }
+    }
 }
 
 /// `communities.name` is `UNIQUE varchar(200)`, so randomise it.
+///
+/// It also PROJECTS the community onto its ID-preserving group, which migration
+/// 071's shim used to replay on the fixture's behalf. Not optional:
+/// `Viewer::resolve` reads `group_memberships`, so a community with no projected
+/// group produces a claim nobody can read. Shapes copied from migration 068 and
+/// `CommunityRepository::create`, including `public_key = ''::bytea` — migration
+/// 060's `groups_public_key_shape` requires `octet_length = 0` for every
+/// `kind <> 'team'`.
 async fn seed_community(pool: &PgPool) -> Uuid {
-    sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
+    let id: Uuid = sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
         .bind(format!("community-{}", Uuid::new_v4()))
         .fetch_one(pool)
         .await
-        .expect("seed community")
+        .expect("seed community");
+
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_at) \
+         SELECT c.id, c.name, 'did:epigraph:community:' || c.id::text, ''::bytea, \
+                'community', c.created_at \
+           FROM communities c WHERE c.id = $1 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("project the community onto a group");
+
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status) \
+         VALUES ($1, 0, NULL, 'active') ON CONFLICT DO NOTHING",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("project the community's epoch 0");
+
+    id
 }
 
 /// `perspectives.owner_agent_id` is NULLABLE with an FK to `agents(id)`.
@@ -589,6 +499,25 @@ async fn join_community(pool: &PgPool, community: Uuid, agent: Uuid) {
         .execute(pool)
         .await
         .expect("join community");
+
+    // PROJECT the membership. `community_members` is the community's own
+    // registry; `group_memberships` is what `Viewer::resolve` reads, and
+    // migration 071's shim used to replay this projection whenever it stamped a
+    // community row. `role = 'reader'` for 068's stated reason: membership
+    // attests read interest and says nothing about write authority.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         SELECT g.id, p.owner_agent_id, ''::bytea, 0, 'reader' \
+           FROM perspectives p \
+           JOIN groups g ON g.id = $1 AND g.kind = 'community' \
+          WHERE p.id = $2 AND p.owner_agent_id IS NOT NULL \
+         ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL",
+    )
+    .bind(community)
+    .bind(perspective)
+    .execute(pool)
+    .await
+    .expect("project the community membership");
 }
 
 /// Resolve the Viewer for `requester`, or the public viewer when anonymous.
@@ -601,8 +530,8 @@ async fn join_community(pool: &PgPool, community: Uuid, agent: Uuid) {
 /// `check_content_access`'s two-hop join and the Viewer predicate matched every
 /// row (all content was `visibility='public'`).
 ///
-/// Migration 071 transcribes `ownership` into the tenancy columns, so the
-/// Viewer is now the FIRST filter and a viewer with no groups can no longer see
+/// The fixtures now write those tenancy columns directly, so the
+/// Viewer is the FIRST filter and a viewer with no groups cannot see
 /// a community-gated claim at all — regardless of who the `requester` says it
 /// is. Keeping the empty viewer would have made every test here assert against
 /// a principal that cannot exist in production: `Viewer::resolve` is called on

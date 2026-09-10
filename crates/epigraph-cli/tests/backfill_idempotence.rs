@@ -593,131 +593,41 @@ async fn dry_run_writes_nothing(pool: PgPool) {
     );
 }
 
-/// **An `ownership` row that predates migration 071 is transcribed by `run`.**
-///
-/// # The hole this closes
-///
-/// Migration 071 installs only `CREATE TRIGGER ownership_transcribe AFTER
-/// INSERT OR UPDATE ON public.ownership`. It performs no one-time pass, so a
-/// row already in the table when the migration applied is never transcribed —
-/// and `verify` counts exactly those rows, in two checks that were then
-/// **unclearable by anything in the PR**:
-///
-/// * "N non-public ownership row(s) map to a still-public claim", and
-/// * "N non-public ownership row(s) have no transcription log row".
-///
-/// `run` calls `verify` at the end, so `run` would have exited 1 forever too,
-/// and the plan's acceptance line ("every `ownership` row it transcribes writes
-/// a `tenancy_transcription_log` row") would have been satisfied only
-/// vacuously, by transcribing zero.
-///
-/// # Why the fixture disables the trigger
-///
-/// Every other fixture in this suite inserts AFTER 071 applied, so the trigger
-/// fires and the legacy shape is never exercised — which is precisely why the
-/// suite was structurally blind to this. Disabling the trigger for one INSERT
-/// reproduces the production shape: an `ownership` row whose claim is still
-/// `('public', world)` and which has no ledger row.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_ownership_row_is_transcribed_and_clears_verify(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
-    let claim = seed_undeclared_claim(&pool, agent, "legacy private").await;
+// `a_legacy_ownership_row_is_transcribed_and_clears_verify` lived here until
+// PR-22, and it is DELETED rather than ported.
+//
+// It reproduced the production shape a pre-071 `ownership` row leaves behind —
+// a claim still `('public', world)` with no `tenancy_transcription_log` entry,
+// manufactured by disabling the transcription trigger for one INSERT — and
+// asserted that `run`'s `transcribe_legacy_ownership` pass cleared it and that
+// `verify` went from exit 1 to exit 0 across it.
+//
+// PR-22 retires all three of those: the pass, the two `verify` checks it
+// cleared, and (in migration 084) the table itself. The subject is gone in every
+// direction.
+//
+// THE GATE DID NOT GO WITH THEM. Migration 084's second pre-flight carries the
+// `unlogged` predicate verbatim and RAISEs on it, so the condition this test
+// asserted `verify` reports is now the condition the DROP refuses to run under —
+// checked on the database being deployed rather than in a suite an operator has
+// to remember to run. The refusal and its passing control are
+// `epigraph-db/tests/retire_ownership_preflight.rs::pre_flight_2_refuses_an_untranscribed_non_public_row`
+// and `::pre_flight_2_passes_when_the_non_public_row_is_logged`.
 
-    sqlx::query("ALTER TABLE ownership DISABLE TRIGGER ownership_transcribe")
-        .execute(&pool)
-        .await
-        .expect("disable transcription trigger");
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim)
-    .bind(agent)
-    .execute(&pool)
-    .await
-    .expect("seed a pre-071 ownership row");
-    sqlx::query("ALTER TABLE ownership ENABLE TRIGGER ownership_transcribe")
-        .execute(&pool)
-        .await
-        .expect("re-enable transcription trigger");
-
-    // Precondition: the row is genuinely untranscribed and `verify` says so.
-    let vis: String = sqlx::query_scalar("SELECT visibility::text FROM claims WHERE id = $1")
-        .bind(claim)
-        .fetch_one(&pool)
-        .await
-        .expect("read visibility");
-    assert_eq!(
-        vis, "public",
-        "precondition: a legacy ownership row leaves its claim public — this is \
-         the divergence 071's header says the shim exists to prevent"
-    );
-    let logged: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM tenancy_transcription_log WHERE node_id = $1")
-            .bind(claim)
-            .fetch_one(&pool)
-            .await
-            .expect("count ledger rows");
-    assert_eq!(logged, 0, "precondition: no ledger row yet");
-
-    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
-    assert_eq!(
-        code, 1,
-        "verify must FAIL while a non-public ownership row maps to a public \
-         claim; stderr:\n{stderr}"
-    );
-
-    // The fix: `run` re-fires the trigger over every untranscribed row.
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
-    assert_eq!(
-        code, 0,
-        "run must transcribe the legacy row and then pass its own verify; \
-         stderr:\n{stderr}"
-    );
-
-    let vis: String = sqlx::query_scalar("SELECT visibility::text FROM claims WHERE id = $1")
-        .bind(claim)
-        .fetch_one(&pool)
-        .await
-        .expect("read visibility");
-    assert_eq!(
-        vis, "group",
-        "the legacy 'private' declaration must now be on the LIVE tenancy column"
-    );
-    let logged: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM tenancy_transcription_log WHERE node_id = $1")
-            .bind(claim)
-            .fetch_one(&pool)
-            .await
-            .expect("count ledger rows");
-    assert_eq!(
-        logged, 1,
-        "and migration 080's pre-flight reads this ledger row — the acceptance \
-         line is 'every ownership row it transcribes writes one'"
-    );
-
-    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
-    assert_eq!(code, 0, "verify must now pass; stderr:\n{stderr}");
-
-    // And it is idempotent: a second run selects nothing (every row now has a
-    // ledger row) and still exits 0.
-    let (code, stderr) = run_backfill(&pool, &["run"]).await;
-    assert_eq!(code, 0, "a second run must be a no-op; stderr:\n{stderr}");
-}
-
-/// `verify` fails if migrations 070/071's `SECURITY DEFINER` bodies were not
+/// `verify` fails if migration 070's `SECURITY DEFINER` bodies were not
 /// re-owned to `epigraph_maintenance`.
 ///
 /// # Why this check exists at all
 ///
-/// Both migrations wrap their `ALTER FUNCTION … OWNER TO epigraph_maintenance`
-/// in `IF EXISTS (SELECT 1 FROM pg_roles …)` and SILENTLY no-op when the role is
+/// The migration wraps its `ALTER FUNCTION … OWNER TO epigraph_maintenance`
+/// in `IF EXISTS (SELECT 1 FROM pg_roles …)` and SILENTLY no-ops when the role is
 /// absent — which migration 060 makes possible on purpose, because it only
-/// `RAISE NOTICE`s when the migration role lacks `CREATEROLE`. The two
-/// consequences are opposite and both invisible at deploy time: 070's arm (b)
-/// becomes RLS-filtered at PR-17 and stamps a private endpoint PUBLIC (a leak,
-/// not an error), while 071's shim raises 42501 on every `ownership` write (a
-/// total write outage). Nothing anywhere asserted the ALTER had happened.
+/// `RAISE NOTICE`s when the migration role lacks `CREATEROLE`. The consequence is
+/// invisible at deploy time: 070's arm (b) becomes RLS-filtered at PR-17 and
+/// stamps a private endpoint PUBLIC — a leak, not an error. Nothing anywhere
+/// asserted the ALTER had happened. (071's shim was the second, opposite
+/// consequence — a total write outage on `ownership` — until PR-22 retired both
+/// the shim and the table.)
 ///
 /// A hard failure inside the migration would be wrong — a failed migration
 /// records no row, so a missing role would become a permanent restart loop — so
@@ -759,8 +669,8 @@ async fn verify_fails_when_a_definer_body_is_not_maintenance_owned(pool: PgPool)
 /// `pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER')` evaluated as
 /// the function owner, and `pg_has_role` is true of a superuser for every role.
 /// String equality would have been strictly stricter than the runtime control
-/// it protects, and the documented remedy ("re-apply 070 and 071") would not
-/// have cleared it.
+/// it protects, and the documented remedy ("re-apply 070") would not have
+/// cleared it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_superuser_owned_definer_body_satisfies_verify(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;

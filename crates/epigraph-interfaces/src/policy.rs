@@ -111,7 +111,15 @@ pub enum ResourceKind {
     Edge,
     /// A row in `evidence`.
     Evidence,
-    /// A row in `ownership` — the legacy partition table.
+    /// A row in `ownership` — the legacy partition table, RETIRED by migration
+    /// 084 (PR-22).
+    ///
+    /// The variant is kept rather than deleted. `ResourceKind` is the vocabulary
+    /// a `PolicyGate` implementation matches on, `PolicyGate::authorize` still
+    /// has zero production callers pending the write-side gate, and narrowing a
+    /// public enum in this crate is an interface change that PR belongs to. It
+    /// names no live relation; do not read its presence as evidence that one
+    /// exists.
     Ownership,
     /// A row in `groups` or `group_memberships`.
     Group,

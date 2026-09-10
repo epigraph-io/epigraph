@@ -206,12 +206,15 @@ locked are stepped over. Run one.
    that have never authenticated).
 3. The entity arms: `claims`, `communities`, `perspectives`, `recall_events`,
    `harvester_fragments`.
-4. **Legacy `ownership` transcription** — migration 071 installs only an
-   `AFTER INSERT OR UPDATE` trigger, so rows already in `ownership` when it
-   applied were never transcribed. This pass re-fires the trigger over every
-   row that has no `tenancy_transcription_log` entry. Without it `verify` fails
-   permanently on any database that had `ownership` rows before 071.
-5. `settle_remaining`, then `verify`.
+4. `settle_remaining`, then `verify`.
+
+A fifth arm, **legacy `ownership` transcription**, ran between (3) and (4) until
+PR-22. It re-fired migration 071's write-through trigger over every `ownership`
+row with no `tenancy_transcription_log` entry, and `verify` carried two matching
+checks. Migration 084 retires the table, and its second pre-flight now holds
+that gate: it **refuses to drop `ownership`** while any non-public row lacks a
+ledger entry. Run the backfill to completion BEFORE applying 084 — if the
+pre-flight fires, that is what it is telling you.
 
 ### When the backfill leaves rows behind
 
@@ -238,43 +241,74 @@ Fixing the underlying rows means repointing `claims.agent_id` at a real agent
 FAIL: public.epigraph_node_tenancy is owned by 'epigraph_app', not 'epigraph_maintenance'.
 ```
 
-Migrations 070 and 071 skip their `ALTER FUNCTION … OWNER TO
-epigraph_maintenance` when that role does not exist, because migration 060 only
-`RAISE NOTICE`s if the migration role lacks `CREATEROLE`. The migrations still
-report success. Provision `epigraph_maintenance` out of band and **re-apply 070
-and 071** (both are idempotent). Deploying past this is not safe: 070's bodies
-become RLS-filtered at PR-17 and arm (b) then stamps a private endpoint public,
-and 071's shim raises 42501 on every `ownership` write.
+Migration 070 skips its `ALTER FUNCTION … OWNER TO epigraph_maintenance` when
+that role does not exist, because migration 060 only `RAISE NOTICE`s if the
+migration role lacks `CREATEROLE`. The migration still reports success. Provision
+`epigraph_maintenance` out of band and **re-apply 070** (it is idempotent).
+Deploying past this is not safe: 070's bodies become RLS-filtered at PR-17 and
+arm (b) then stamps a private endpoint public. Migration 086's read helper is
+subject to the same check; 071's shim was too, until PR-22 retired it.
 
-## The `ownership` table
+## The `ownership` table — RETIRED (PR-22, migration 084)
 
-`ownership` is the pre-tenancy ACL table. Migration 071 demotes it to a
-write-through shim: writing an `ownership` row now **reclassifies** the node and
-cascades. It is a compatibility surface with a scheduled death — **PR-14 deleted
-its API surface entirely** (`POST /api/v1/ownership`,
-`PUT /api/v1/ownership/:node_id`, `GET /api/v1/ownership/:node_id`,
-`GET /api/v1/agents/:id/owned-nodes`, and the MCP tools `assign_ownership`,
-`update_partition` and `get_ownership`) — and the table is dropped in migration
-084.
+`ownership` was the pre-tenancy ACL table: one row per node, naming an agent and
+a coarse partition (`public` / `community` / `private`). It no longer exists.
 
-Since PR-14 **nothing on the read path consults `ownership`**: the tenancy
-columns on the row are the sole source of truth. Completing the
-`epigraph-tenancy-backfill` transcription pass is therefore a prerequisite of
-deploying that release rather than a follow-up — see `docs/tenancy/progress.json`
-(PR-12's B5, and M1 under `blocked_measurements`, which sizes the pass).
+The retirement ran in three steps and each is still visible in the tree:
 
-**Nothing replaces the deleted surface, and that is a capability removal, not a
-relocation.** Between PR-14 and PR-16 there is no API and no MCP tool that can
-reclassify an existing node. Tenancy is stamped at INSERT — 070's inherit
-trigger, and 071's write-through shim for anyone still writing `ownership` — and
-no code path updates `claims.visibility` or `claims.owner_group_id` afterwards.
-`OwnershipRepository` (`crates/epigraph-db/src/repos/ownership.rs`) is retained
-deliberately with **zero production callers** — its only remaining users are the
-community-partition tests — until migration 084 drops the table. Do not delete
-it as dead code, and do not read its survival as evidence that a write path
-still exists.
+* **Migration 071** demoted it to a write-through shim — writing an `ownership`
+  row *reclassified* the node's tenancy columns and cascaded, and left a row in
+  `tenancy_transcription_log`.
+* **PR-14** deleted its API surface entirely: `POST /api/v1/ownership`,
+  `PUT /api/v1/ownership/:node_id`, `GET /api/v1/ownership/:node_id`,
+  `GET /api/v1/agents/:id/owned-nodes`, and the MCP tools `assign_ownership`,
+  `update_partition` and `get_ownership`.
+* **PR-22 / migration 084** dropped the table, the
+  `ownership_key_id_quarantine` view, the `ownership_transcribe` trigger and
+  `public.epigraph_ownership_transcribe()`, and deleted `OwnershipRepository`.
+  Two pre-flights gate the drop and both `RAISE EXCEPTION`: the quarantine view
+  must be empty, and every non-public row must already appear in
+  `tenancy_transcription_log`.
 
-If you are writing new code, do not write `ownership`.
+**The tenancy columns on the row are the sole source of truth, and now they are
+the only one that exists.** `tenancy_transcription_log` survives 084 and is the
+only surviving record of what the dropped rows declared —
+`node_type`, `from_partition`, `to_visibility`, `to_group_id` and
+`transcribed_at` per node. `ownership.created_at`, `updated_at`, `community_id`
+and `encryption_key_id` are gone. `docs/runbooks/084-undo.sql` recreates the
+empty shape and says so plainly; it does not bring the rows back.
+
+**What the endpoint census lost.** `GET /api/v1/structural-features/:owner_id`
+broke its node counts down by `ownership.node_type` across six tables. After 084
+only two tables name an owning agent — `claims.agent_id` and
+`perspectives.owner_agent_id` — so `evidence`, `community`, `context` and
+`frame` no longer appear in any count. That is the same fail-closed rule the
+endpoint already applied to `agent` rows: a node whose owner cannot be
+determined is not counted.
+
+**…and what it gained, which is the larger movement.** The census above is the
+narrowing; the *dominant* direction is a **widening**. Nothing ever
+auto-populated `ownership` — no migration inserts into it, and its only writers
+died with PR-14 — so the old owned set was "nodes with an explicit `ownership`
+row", in practice near-empty, and the new one is the agent's **entire authored
+corpus**. The `claims` arm also carries no `is_current` filter, so node identity
+moves from per-lineage to per-**version**. The direction is certain; the
+magnitude is exactly the unmeasured **M1**. Do not assume zero: an operator's
+numbers can move from near-zero to full-corpus in one release.
+
+**The new key is an author field, not a credential.** `claims.agent_id` is set
+from the request body at write time. This endpoint is now a consumer of it, so a
+caller with `claims:write` can inflate another agent's public counts. That is
+attribution injection into a caller-facing read, **not** a confidentiality leak
+— every statement still `AND`s the viewer predicate — and it is tracked against
+`D-PR16-claim-authorship-is-not-a-credential`, owned by the write-gate PR. See
+`crates/epigraph-db/src/repos/structural.rs`.
+
+**Nothing replaces the deleted write surface, and that is a capability removal,
+not a relocation.** There is still no API and no MCP tool that reclassifies an
+existing node. Tenancy is stamped at INSERT by migration 070's triggers and by
+074's per-table `_require_tenancy` guards; the write-side predicate is owned by
+the write-gate PR and is not shipped.
 
 ## Row-level security, and who may declassify (PR-17)
 

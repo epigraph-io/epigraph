@@ -43,7 +43,6 @@ pub mod mass_function;
 pub mod match_candidate;
 pub mod method;
 pub mod oauth_client;
-pub mod ownership;
 pub mod paper;
 pub mod pattern_template;
 pub mod perspective;
@@ -118,7 +117,6 @@ pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
-pub use ownership::OwnershipRepository;
 pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
 pub use perspective::PerspectiveRepository;
 pub use political::{

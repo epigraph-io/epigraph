@@ -39,10 +39,19 @@
 //! does neither. 071's community arm INSERTs the group from `communities` **on
 //! demand**, replays 068's membership projection, and — when no live membership
 //! results — sets `g := NULL` and falls through to the owner's personal group.
-//! There is no RAISE for an absent projected group, and two tests in this PR
-//! pin the fallback the old comment denied
-//! (`tenancy_triggers.rs::an_empty_community_falls_back_to_the_owner_rather_than_a_black_hole`
-//! and `::a_community_partition_projects_the_group_and_its_members`).
+//! There is no RAISE for an absent projected group.
+//!
+//! **PR-22 UPDATE — the two tests this paragraph used to cite are gone.** They
+//! were `tenancy_triggers.rs::an_empty_community_falls_back_to_the_owner_rather_than_a_black_hole`
+//! and `::a_community_partition_projects_the_group_and_its_members`, and
+//! migration 084 retires both the `ownership` table and 071's shim, so the
+//! fallback they pinned is **no longer executable anywhere** — there is no
+//! writer left to reach it. The correction above still stands as a statement
+//! about what 071 did; it simply no longer has a live pin, and this note is here
+//! so a reader who greps for those names does not conclude the coverage was
+//! dropped silently. What survives is the projection itself, which is what makes
+//! `create` load-bearing: `community_projection.rs::create_projects_the_community_onto_a_group`
+//! and `tenancy_coverage.rs::every_community_projects_onto_a_group_and_its_members_onto_memberships`.
 //!
 //! The real justification is narrower and does not need a false premise: the
 //! projection is a **standing invariant** that

@@ -65,30 +65,19 @@ async fn connect() -> (PgPool, String) {
     (pool, url)
 }
 
-async fn seed_ownership(pool: &PgPool, node_id: Uuid, node_type: &str, owner_id: Uuid) {
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, $2, 'public', $3) \
-         ON CONFLICT (node_id) DO UPDATE SET node_type = $2, owner_id = $3",
-    )
-    .bind(node_id)
-    .bind(node_type)
-    .bind(owner_id)
-    .execute(pool)
-    .await
-    .unwrap_or_else(|e| panic!("seed ownership row for {node_type} {node_id}: {e}"));
-}
-
 /// Build the corpus. Three owned claims — two `public`, one `group` — plus one
 /// public and one group-private edge, two frames, two combined beliefs, and two
 /// perspective/community pairs, so that **every one of the nine statements has
 /// something to hide and something to show**.
 ///
-/// It also writes one `node_type = 'agent'` ownership row. `agents` carries no
-/// tenancy columns, so `repos::structural` cannot decide its visibility and
-/// excludes it fail-closed; the tests assert it is absent for BOTH principals,
-/// which is the only way that deliberate exclusion is distinguishable from an
-/// accident.
+/// # The corpus is what the counts are DERIVED from, not adjusted to
+///
+/// PR-22 rewrote all eight `ownership`-joining statements, so every number
+/// below was re-derived from these seeds rather than nudged. The two that moved
+/// are called out where they are asserted: the node-typed counts now include the
+/// two perspectives (the owned-node set is a union over `claims` and
+/// `perspectives`), and the edge counts are per EDGE rather than per
+/// (edge, owned endpoint) pair.
 async fn seed_corpus(pool: &PgPool, scopes: &[&str]) -> Corpus {
     let tag = Uuid::new_v4();
     let (owner_agent, owner_group) =
@@ -103,7 +92,6 @@ async fn seed_corpus(pool: &PgPool, scopes: &[&str]) -> Corpus {
             .await;
 
     for claim in [pub_a, pub_b, priv_c] {
-        seed_ownership(pool, claim, "claim", owner_agent).await;
         sqlx::query("UPDATE claims SET belief = 0.6, plausibility = 0.9, pignistic_prob = 0.75 WHERE id = $1")
             .bind(claim)
             .execute(pool)
@@ -111,8 +99,12 @@ async fn seed_corpus(pool: &PgPool, scopes: &[&str]) -> Corpus {
             .expect("populate belief columns");
     }
 
-    // A node type with no tenancy columns anywhere. Must vanish from every count.
-    seed_ownership(pool, Uuid::new_v4(), "agent", owner_agent).await;
+    // A `node_type = 'agent'` ownership row lived here until PR-22, with the
+    // assertion that it vanished from every count. Both are GONE rather than
+    // ported: after migration 084 the owned-node set is a union over `claims`
+    // and `perspectives`, so no arm of it can emit an `agent` row and an
+    // assertion that none appears would pass structurally, whatever the SQL
+    // did. A control that cannot fail is not a control.
 
     // A closed triangle pub_a — pub_b — priv_c — pub_a, of which exactly one
     // edge (pub_a → pub_b) is group-private. Three properties fall out of this
@@ -343,22 +335,30 @@ async fn owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part() {
          one — and seeing two rather than zero is what distinguishes a working \
          filter from a broken endpoint; got {snodes:?}"
     );
-    for (who, m) in [("owner", &onodes), ("stranger", &snodes)] {
-        assert!(
-            !m.contains_key("agent"),
-            "`agent` ownership rows carry no tenancy columns and are excluded \
-             fail-closed for every principal, including the {who}; got {m:?}"
-        );
-    }
+    // The second node type. `perspectives.owner_agent_id` is the other half of
+    // the owned-node union PR-22 rewrote onto, so a statement that dropped that
+    // arm — or that filtered it with the wrong alias — would show up here and
+    // nowhere else. Two for the owner, one for the stranger: the group-private
+    // perspective is exactly as invisible as the group-private claim.
+    assert_eq!(
+        onodes.get("perspective"),
+        Some(&2),
+        "the owner owns two perspectives; got {onodes:?}"
+    );
+    assert_eq!(
+        snodes.get("perspective"),
+        Some(&1),
+        "a stranger must see the PUBLIC perspective and not the group-private \
+         one; got {snodes:?}"
+    );
 
     // 2. edge_counts ────────────────────────────────────────────────────
     let oedges = counts(&o, "edge_counts", "relationship");
     let sedges = counts(&s, "edge_counts", "relationship");
     assert_eq!(
         oedges.get("RELATES_TO"),
-        Some(&2),
-        "the owner must see its own group-private edge, counted once per owned \
-         endpoint; got {oedges:?}"
+        Some(&1),
+        "the owner must see its own group-private edge, counted once; got {oedges:?}"
     );
     assert!(
         !sedges.contains_key("RELATES_TO"),
@@ -366,11 +366,18 @@ async fn owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part() {
          though both its endpoints are public claims ({{VISIBILITY:e}}); got \
          {sedges:?}"
     );
+    // ONE PER EDGE, NOT ONE PER OWNED ENDPOINT. This asserted 4 until PR-22:
+    // the retired `ownership` join was `ON (e.source_id = o.node_id OR
+    // e.target_id = o.node_id)`, so an edge with both endpoints owned by the
+    // same agent contributed twice — and the route layer's Laplace mechanism
+    // assumes a sensitivity of 1. PR-22 rewrote the statement to test ownership
+    // with a single EXISTS, which closes `F-edge-count-double-counts`; 2 is the
+    // number of SUPPORTS edges in the corpus, re-derived rather than adjusted.
     assert_eq!(
         oedges.get("SUPPORTS"),
-        Some(&4),
-        "each public edge is counted once per owned endpoint, and the owner owns \
-         both endpoints of both; got {oedges:?}"
+        Some(&2),
+        "each visible edge incident on an owned node is counted once, and there \
+         are two SUPPORTS edges; got {oedges:?}"
     );
     // PR-12 TIGHTENING: an edge is now the MEET of its endpoints.
     //
@@ -387,10 +394,9 @@ async fn owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part() {
     // trusting the writer.
     //
     // The discriminating power of this case is preserved, and is now carried by
-    // the two assertions around it: the owner still sees SUPPORTS 4 (so the
-    // edges exist and the endpoint-pair counting is unchanged), and the stranger
-    // still sees the two public CLAIMS (so this is edge filtering, not a dead
-    // endpoint).
+    // the two assertions around it: the owner still sees both SUPPORTS edges (so
+    // they exist and are counted), and the stranger still sees the two public
+    // CLAIMS (so this is edge filtering, not a dead endpoint).
     assert!(
         !sedges.contains_key("SUPPORTS"),
         "both SUPPORTS edges touch the group-private claim, so migration 070 arm \
@@ -401,27 +407,33 @@ async fn owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part() {
     // an `edge_counts` statement returning `{}` would pass.
     assert_eq!(
         sedges.get("CONTRADICTS"),
-        Some(&2),
+        Some(&1),
         "the stranger MUST count the public edge between two public claims — \
-         once per visible endpoint, the same convention the owner's counts use. \
-         An empty map here means the edge statement is dead, not that the \
-         filter works; got {sedges:?}"
+         once, the same convention the owner's counts use. An empty map here \
+         means the edge statement is dead, not that the filter works; got \
+         {sedges:?}"
     );
     assert_eq!(
         oedges.get("CONTRADICTS"),
-        Some(&2),
+        Some(&1),
         "and the owner counts it identically — the two principals differ only \
          on what is private; got {oedges:?}"
     );
 
     // 3. degree_stats ───────────────────────────────────────────────────
+    // Five and three, not three and two: PR-22's owned-node set spans `claims`
+    // AND `perspectives`, so the two perspectives enter the degree distribution
+    // at degree 0. The DIFFERENCE is what the assertion is about — the owner's
+    // private claim and private perspective are both absent for the stranger.
     assert_eq!(
-        o["degree_stats"]["total_nodes"], 3,
-        "degree distribution spans the owner's three visible claims: {o}"
+        o["degree_stats"]["total_nodes"], 5,
+        "degree distribution spans the owner's three visible claims and two \
+         visible perspectives: {o}"
     );
     assert_eq!(
-        s["degree_stats"]["total_nodes"], 2,
-        "a stranger's degree distribution must span only the visible nodes: {s}"
+        s["degree_stats"]["total_nodes"], 3,
+        "a stranger's degree distribution must span only the visible nodes — \
+         two public claims and one public perspective: {s}"
     );
 
     // 4. belief_stats ───────────────────────────────────────────────────
@@ -447,12 +459,11 @@ async fn owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part() {
     let obins: i64 = counts(&o, "temporal_bins", "bin_label").values().sum();
     let sbins: i64 = counts(&s, "temporal_bins", "bin_label").values().sum();
     assert_eq!(
-        obins, 3,
-        "the owner's activity bins must total its three visible nodes — the \
-         `agent` row is excluded from these too; got {obins}"
+        obins, 5,
+        "the owner's activity bins must total its five visible nodes; got {obins}"
     );
     assert_eq!(
-        sbins, 2,
+        sbins, 3,
         "a stranger's activity bins must total only the visible nodes; got {sbins}"
     );
 

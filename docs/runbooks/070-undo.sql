@@ -41,7 +41,18 @@ SET LOCAL lock_timeout = '3s';
 
 -- 071 first: the shim's UPDATEs fire 070 arm (d), so dropping it first means
 -- the window in between has no half-wired cascade.
-DROP TRIGGER IF EXISTS ownership_transcribe ON public.ownership;
+--
+-- GUARDED ON THE TABLE, NOT ONLY ON THE TRIGGER (PR-22). `DROP TRIGGER IF
+-- EXISTS ... ON public.ownership` guards the TRIGGER; if the RELATION is absent
+-- it still raises 42P01. Migration 084 drops `public.ownership`, so on any
+-- database at 084 or later this script would have aborted here — on its first
+-- statement, before undoing anything. The function is dropped unconditionally
+-- below because `DROP FUNCTION IF EXISTS` names no relation.
+DO $$ BEGIN
+  IF to_regclass('public.ownership') IS NOT NULL THEN
+    EXECUTE 'DROP TRIGGER IF EXISTS ownership_transcribe ON public.ownership';
+  END IF;
+END $$;
 DROP FUNCTION IF EXISTS public.epigraph_ownership_transcribe();
 
 -- 070 arm (d)
