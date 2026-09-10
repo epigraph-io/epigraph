@@ -468,6 +468,63 @@ impl EvidenceRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
+    /// Backfill `raw_content` on an evidence row the viewer may WRITE.
+    ///
+    /// **The first production call site of the write-side predicate** (PR-16,
+    /// delivered as 16b). The statement carries `/* {WRITABLE:e} */`, spliced by
+    /// [`crate::visibility::Viewer::splice_write`], which renders
+    /// `AND e.owner_group_id = ANY($3::uuid[])` and takes its array from
+    /// [`crate::visibility::Viewer::writable_bind`] — the `admin`/`writer`
+    /// subset — **not** from `group_bind()`.
+    ///
+    /// That distinction is the whole control, and it is invisible at a glance:
+    /// binding `group_bind()` here would compile, keep the fragment and the
+    /// bind arity identical, refuse every stranger exactly as it should, and
+    /// silently let a principal who can only READ a group rewrite that group's
+    /// evidence. `write_gate_evidence_update.rs` exists to fail in precisely
+    /// that case.
+    ///
+    /// # What this does NOT constrain
+    ///
+    /// A `WHERE` predicate decides which ROW a statement may touch. It says
+    /// nothing about the VALUES the `SET` clause assigns. This function only
+    /// ever assigns `raw_content`, so the gap is not reachable here — but a
+    /// future write fn that lets a caller assign `owner_group_id` is not made
+    /// safe by carrying this marker.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated. `false` when no row matched — which is
+    /// **either** "no such evidence" **or** "you may not write it", deliberately
+    /// indistinguishable: the caller maps it to 404, because a 403 would confirm
+    /// the existence of evidence in a group the caller cannot write to.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, raw_content))]
+    pub async fn update_raw_content<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+        raw_content: &str,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE evidence AS e SET raw_content = $2 \
+             WHERE e.id = $1 \
+               /* {WRITABLE:e} */",
+            3,
+        );
+        let uuid: Uuid = id.into();
+        let mut q = sqlx::query(&sql).bind(uuid).bind(raw_content);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "` and
+        // the statement therefore has no `$3` to fill. Binding unconditionally
+        // would over-supply the maintenance path by one parameter.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(executor).await?.rows_affected() > 0)
+    }
+
     /// Delete evidence by ID
     ///
     /// # Returns
