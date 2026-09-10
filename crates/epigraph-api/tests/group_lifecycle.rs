@@ -802,9 +802,18 @@ async fn creating_a_group_with_an_unknown_agent_principal_is_403_not_500(pool: P
 /// removals bounded each other; they do not, precisely because each sees the
 /// other.
 ///
-/// `revoke_member_unless_last_admin` folds the count into the writing `UPDATE`,
-/// so the loser re-evaluates its subquery against the winner's committed state
-/// under READ COMMITTED and finds no other live admin.
+/// Folding the count into the writing `UPDATE` narrowed that window without
+/// closing it: an `UPDATE` locks the row it writes, not the rows its `WHERE`
+/// clause reads, and the two removals write different rows.
+/// `revoke_member_unless_last_admin` now locks the group's whole live roster
+/// first — every row the guard reads AND the row it writes — so the loser waits
+/// for the winner to commit and then re-evaluates under READ COMMITTED and
+/// finds no other live admin.
+///
+/// THIS TEST IS NON-DETERMINISTIC BY NATURE and passed on the defective tree.
+/// It is kept because it is the acceptance shape and it did eventually catch
+/// the defect in CI; the deterministic companion is
+/// `the_guard_waits_for_the_admin_rows_its_decision_reads` below.
 #[sqlx::test(migrations = "../../migrations")]
 async fn two_concurrent_admin_removals_cannot_strand_a_group(pool: PgPool) {
     let a = seed_agent(&pool, "race-admin-a").await;
@@ -849,6 +858,342 @@ async fn two_concurrent_admin_removals_cannot_strand_a_group(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(survivors, 1, "exactly one admin must survive");
+}
+
+/// A connection to THIS test's database that the `#[sqlx::test]` pool does not
+/// own.
+///
+/// The probes below hold one row lock for the whole of a measurement, and that
+/// lock lives exactly as long as the session holding it. The pool the macro
+/// hands out is a poor place to keep it: it is capped at five connections,
+/// closes idle ones after a second, and draws its permits from a budget shared
+/// with every other test in the binary, so under a full-workspace run a lock
+/// parked on one of its connections is hostage to pool behaviour that has
+/// nothing to do with what is being measured. Opening our own connection makes
+/// the lock's lifetime ours.
+async fn a_connection_outside_the_test_pool(pool: &PgPool) -> sqlx::PgConnection {
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("current_database()");
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let (authority, query) = match base.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (base.as_str(), None),
+    };
+    let prefix = authority
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0;
+    let url = match query {
+        Some(q) => format!("{prefix}/{db}?{q}"),
+        None => format!("{prefix}/{db}"),
+    };
+    <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("open a connection outside the test pool")
+}
+
+/// Every session in this test's database, for a failure message.
+async fn sessions(pool: &PgPool) -> Vec<(i32, Option<String>, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT pid, state, wait_event_type, left(query, 100) \
+         FROM pg_stat_activity WHERE datname = current_database()",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+/// Wait until a backend in THIS test database is blocked on a lock, or until
+/// `task` returns. `true` means the wait was observed.
+///
+/// The probes below are about a row lock, so they must MEASURE the row lock
+/// rather than infer it from a stopwatch. An earlier revision slept a fixed
+/// 750ms and asserted `!is_finished()`; on a loaded host that reports whatever
+/// made the call return early — a refused connection, say — as if it were the
+/// guard deciding early, and it says nothing at all on a host slow enough that
+/// the call has not started. Every session in a `#[sqlx::test]` database is one
+/// of this test's own, so a `Lock` wait here is unambiguous.
+async fn a_backend_is_blocked_on_a_lock<T>(
+    pool: &PgPool,
+    task: &tokio::task::JoinHandle<T>,
+) -> bool {
+    for _ in 0..200 {
+        if task.is_finished() {
+            return false;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// THE DETERMINISTIC COMPANION to the test above, and the one that actually
+/// discriminates a fixed tree from a defective one.
+///
+/// The concurrent test is a coin flip: it was measured green 20 runs out of 20
+/// against the defect, so "it passed ten times" is not evidence of anything.
+/// This one asserts the property directly instead of hoping to observe its
+/// absence. With admins A and B, B's membership row is held by a separate
+/// transaction; the decision to remove A depends on that row, so the removal
+/// must WAIT for it. On the defective tree the removal never touched B's row
+/// and returned immediately.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_guard_waits_for_the_admin_rows_its_decision_reads(pool: PgPool) {
+    let a = seed_agent(&pool, "wait-admin-a").await;
+    let b = seed_agent(&pool, "wait-admin-b").await;
+    let (_, body) = create_group(&pool, &token(&["groups:write"], a), "Wait", "grp-wait").await;
+    let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
+
+    let admin = token(&["groups:admin"], a);
+    let (status, body) = send(
+        app(pool.clone()),
+        Method::POST,
+        &format!("/api/v1/groups/{group_id}/members"),
+        Some(&admin),
+        Some(json!({
+            "agent_id": b,
+            "wrapped_key_share": wrapped_share("share-wait"),
+            "role": "admin",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Hold B's row: the row on which "is A the last admin?" turns.
+    let mut own = a_connection_outside_the_test_pool(&pool).await;
+    let mut blocker = sqlx::Connection::begin(&mut own).await.expect("blocker tx");
+    sqlx::query(
+        "SELECT 1 FROM group_memberships \
+         WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(group_id)
+    .bind(b)
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("hold b's membership row");
+
+    let removal = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            epigraph_db::GroupMembershipRepository::revoke_member_unless_last_admin(
+                &pool, group_id, a,
+            )
+            .await
+        }
+    });
+
+    if !a_backend_is_blocked_on_a_lock(&pool, &removal).await {
+        let sessions = sessions(&pool).await;
+        let early = removal.await.expect("removal task panicked");
+        panic!(
+            "the removal decided whether A was the last admin without waiting \
+             for B's row, which is the row that decision reads; it returned \
+             {early:?}; sessions: {sessions:?}"
+        );
+    }
+
+    blocker.rollback().await.expect("release b's row");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), removal)
+        .await
+        .expect("the removal never unblocked after the lock was released")
+        .expect("removal task panicked")
+        .expect("revoke a");
+    assert_eq!(
+        outcome,
+        epigraph_db::RevokeOutcome::Revoked,
+        "A is not the last admin and must still be removable once the wait ends"
+    );
+}
+
+/// THE LOCK SET IS THE WHOLE LIVE ROSTER, NOT JUST THE ADMIN ROWS, and that is
+/// a deadlock-ordering property rather than a guard property.
+///
+/// `GroupKeyEpochRepository::rotate_conn` locks
+/// `group_id = $1 AND revoked_at IS NULL ORDER BY agent_id FOR UPDATE`.
+/// `revoke_member_unless_last_admin` must request the SAME rows in the SAME
+/// order, which means every `group_memberships` row it touches — including the
+/// target row its guard `UPDATE` writes — has to be acquired by that one
+/// ordered opening statement. If the lock statement is narrowed to
+/// `role = 'admin'`, a non-admin target falls outside it and is acquired later,
+/// out of `agent_id` order, and the two functions no longer agree.
+///
+/// This test pins it from the outside: hold a plain READER's row, then remove
+/// an admin who is NOT the last admin. Nothing about that removal's guard
+/// depends on the reader, so it blocks only if the reader's row is in the lock
+/// set. With the lock statement narrowed, the removal returns immediately and
+/// the assertion below fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lock_set_covers_every_live_member_not_only_the_admins(pool: PgPool) {
+    let admin_a = seed_agent(&pool, "roster-admin-a").await;
+    let admin_b = seed_agent(&pool, "roster-admin-b").await;
+    let reader_c = seed_agent(&pool, "roster-reader-c").await;
+    let (_, body) = create_group(
+        &pool,
+        &token(&["groups:write"], admin_a),
+        "Roster",
+        "grp-roster",
+    )
+    .await;
+    let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
+
+    let admin = token(&["groups:admin"], admin_a);
+    for (agent, role, seed) in [
+        (admin_b, "admin", "s-roster-b"),
+        (reader_c, "reader", "s-roster-c"),
+    ] {
+        let (status, body) = send(
+            app(pool.clone()),
+            Method::POST,
+            &format!("/api/v1/groups/{group_id}/members"),
+            Some(&admin),
+            Some(json!({
+                "agent_id": agent,
+                "wrapped_key_share": wrapped_share(seed),
+                "role": role,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    // Hold the READER's row — a row the last-admin decision does not consult.
+    let mut own = a_connection_outside_the_test_pool(&pool).await;
+    let mut blocker = sqlx::Connection::begin(&mut own).await.expect("blocker tx");
+    sqlx::query(
+        "SELECT 1 FROM group_memberships \
+         WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(group_id)
+    .bind(reader_c)
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("hold the reader's membership row");
+
+    let removal = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            epigraph_db::GroupMembershipRepository::revoke_member_unless_last_admin(
+                &pool, group_id, admin_a,
+            )
+            .await
+        }
+    });
+
+    if !a_backend_is_blocked_on_a_lock(&pool, &removal).await {
+        let sessions = sessions(&pool).await;
+        let early = removal.await.expect("removal task panicked");
+        panic!(
+            "the removal did not ask for the reader's row, so its \
+             group_memberships locks are not the single ordered set \
+             rotate_conn takes; it returned {early:?}; sessions: {sessions:?}"
+        );
+    }
+
+    blocker.rollback().await.expect("release the reader's row");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), removal)
+        .await
+        .expect("the removal never unblocked after the lock was released")
+        .expect("removal task panicked")
+        .expect("revoke admin a");
+    assert_eq!(
+        outcome,
+        epigraph_db::RevokeOutcome::Revoked,
+        "admin A is not the last admin and must still be removable"
+    );
+}
+
+/// Serialising the guard must not turn concurrent removals into a refusal.
+///
+/// Two readers of the same two-admin group are removed at once. Both
+/// transactions ask for the same live roster, in the same `agent_id` order, so
+/// they queue on it; both must still return `Revoked`, and the admins they
+/// locked must be untouched. This is also the positive control for removing a
+/// NON-admin member.
+///
+/// It is NOT evidence about lock ORDERING: two removals in one group request
+/// an identical row set, so no interleaving of them can acquire anything out
+/// of order. The ordering property is pinned by
+/// `the_lock_set_covers_every_live_member_not_only_the_admins` below, which is
+/// what fails if the lock statement is ever narrowed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_concurrent_removals_of_different_members_both_succeed(pool: PgPool) {
+    let admin_a = seed_agent(&pool, "pair-admin-a").await;
+    let admin_b = seed_agent(&pool, "pair-admin-b").await;
+    let reader_c = seed_agent(&pool, "pair-reader-c").await;
+    let reader_d = seed_agent(&pool, "pair-reader-d").await;
+    let (_, body) = create_group(
+        &pool,
+        &token(&["groups:write"], admin_a),
+        "Pair",
+        "grp-pair",
+    )
+    .await;
+    let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
+
+    let admin = token(&["groups:admin"], admin_a);
+    for (agent, role, seed) in [
+        (admin_b, "admin", "s-pair-b"),
+        (reader_c, "reader", "s-pair-c"),
+        (reader_d, "reader", "s-pair-d"),
+    ] {
+        let (status, body) = send(
+            app(pool.clone()),
+            Method::POST,
+            &format!("/api/v1/groups/{group_id}/members"),
+            Some(&admin),
+            Some(json!({
+                "agent_id": agent,
+                "wrapped_key_share": wrapped_share(seed),
+                "role": role,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    let (rc, rd) = tokio::join!(
+        epigraph_db::GroupMembershipRepository::revoke_member_unless_last_admin(
+            &pool, group_id, reader_c
+        ),
+        epigraph_db::GroupMembershipRepository::revoke_member_unless_last_admin(
+            &pool, group_id, reader_d
+        ),
+    );
+    assert_eq!(
+        rc.expect("remove reader c"),
+        epigraph_db::RevokeOutcome::Revoked
+    );
+    assert_eq!(
+        rd.expect("remove reader d"),
+        epigraph_db::RevokeOutcome::Revoked
+    );
+
+    let live_admins = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM group_memberships \
+         WHERE group_id = $1 AND role = 'admin' AND revoked_at IS NULL",
+    )
+    .bind(group_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        live_admins, 2,
+        "removing two readers must leave both admins live"
+    );
 }
 
 /// `count_live_admins_excluding` is no longer used by the removal guard (a
