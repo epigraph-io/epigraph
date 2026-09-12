@@ -124,21 +124,67 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str)] = &[
 /// spellings of a filter so all of them are read together.
 const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 
-/// The two ways a body can legitimately spend its viewer.
+/// The three ways a body can legitimately spend its viewer.
 ///
-/// `.splice(` is the marker path. `visibility = 'public'` is the leading
-/// disjunct of the static three-bind form the four `sqlx::query!` macro sites
-/// use — those cannot take a spliced literal, because the macro needs a
-/// compile-time literal of fixed arity, so they carry the predicate verbatim.
+/// `.splice(` is the READ marker path. `.splice_write(` is the WRITE marker path
+/// (PR-16, delivered as 16b). `visibility = 'public'` is the leading disjunct of
+/// the static three-bind form the four `sqlx::query!` macro sites use — those
+/// cannot take a spliced literal, because the macro needs a compile-time literal
+/// of fixed arity, so they carry the predicate verbatim.
 ///
-/// **`group_bind()` / `bypass_bind()` are deliberately NOT on this list**, even
-/// though an earlier draft accepted them. Binding a group array proves the
-/// caller supplied a parameter; it does not prove the SQL has a predicate that
-/// reads it. A `frame_claims_sorted`-shaped fail-open — `format!` the statement,
-/// omit the predicate, bind the array anyway — would pass a lint keyed on the
-/// accessor and fail this one. Requiring the predicate TEXT is what makes this
-/// check about the query rather than about the call.
-const SPENT_MARKERS: &[&str] = &[".splice(", "visibility = 'public'"];
+/// # Why `.splice_write(` belongs here, and why this is not a weakening
+///
+/// This lint's rule is that a viewer-taking fn running SQL must be shown to put
+/// a PREDICATE in the query — see the `group_bind()` paragraph below, which is
+/// the whole reason the list names query text and mechanisms rather than
+/// accessors. `Viewer::splice_write` is a predicate-installing mechanism by
+/// exactly the same construction `Viewer::splice` is: it panics when its input
+/// carries no `/* {WRITABLE:<alias>} */` marker, so it cannot return a string
+/// that lacks a predicate. Without this entry the lint reports a CORRECTLY GATED
+/// write as an unspent viewer — which it did, on
+/// `evidence.rs::update_raw_content`, the first site converted — and the only
+/// ways to silence it would be to annotate a gated function
+/// `VISIBILITY-EXEMPT:` or to stop taking a `&Viewer`. Both are worse than the
+/// false positive.
+///
+/// **THE LIMIT THIS ENTRY INHERITS, STATED PLAINLY.** These markers are matched
+/// by a SUBSTRING SCAN OVER THE FUNCTION BODY. The scan establishes that a
+/// predicate-installing mechanism was *called*; it does NOT establish that the
+/// string it returned is the one that reaches `sqlx::query`. A body that splices
+/// into an unused local and then executes a separately `format!`-built statement
+/// passes this check — which is the `frame_claims_sorted` shape named below.
+/// That limit is not new and `.splice_write(` does not widen it: `.splice(` has
+/// always had it, and closing it would need data-flow analysis this lint does
+/// not do. The write side is covered from the other direction by
+/// `write_gate_lint.rs::UNGATED_REPO_WRITES`, which keys on the SQL TEXT of the
+/// `UPDATE`/`DELETE` rather than on the call, so a spliced-but-unused local
+/// leaves the real statement visible there.
+///
+/// **THE GRANULARITY CONSEQUENCE, WHICH IS A SEPARATE LIMIT.** The scan clears a
+/// function whole. One `.splice_write(` anywhere in a body therefore spends the
+/// viewer for EVERY statement in that body — so a repo fn that splices its
+/// `UPDATE` and leaves an adjacent `SELECT` ungated is cleared HERE, by this
+/// list, on the strength of the write it did gate. The substring limit above is
+/// about whether the spliced string reaches `sqlx::query`; this one is about
+/// which statements a single spent marker is allowed to speak for, and adding
+/// `.splice_write(` widens the set of bodies in which the second limit can
+/// bite. `write_gate_lint.rs::a_partially_converted_function_is_not_silently_cleared`
+/// closes the mirror-image hole on the write side; nothing closes this one on
+/// the read side today, and per-statement classification is the fix for both.
+///
+/// Note the two are NOT interchangeable, and nothing here suggests they are:
+/// `splice` panics on a write marker and `splice_write` panics on a read one,
+/// because they bind different arrays. This list records that both are
+/// predicate-installing mechanisms, not that either fits anywhere.
+///
+/// **`group_bind()` / `bypass_bind()` / `writable_bind()` are deliberately NOT
+/// on this list**, even though an earlier draft accepted the first two. Binding
+/// a group array proves the caller supplied a parameter; it does not prove the
+/// SQL has a predicate that reads it. A `frame_claims_sorted`-shaped fail-open —
+/// `format!` the statement, omit the predicate, bind the array anyway — would
+/// pass a lint keyed on the accessor and fail this one. Requiring the predicate
+/// TEXT is what makes this check about the query rather than about the call.
+const SPENT_MARKERS: &[&str] = &[".splice(", ".splice_write(", "visibility = 'public'"];
 
 fn repos_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos")

@@ -144,8 +144,31 @@ pub const VISIBILITY_MARKER_PREFIX: &str = "/* {VISIBILITY:";
 /// other's markers.
 pub const EDGE_VISIBILITY_MARKER_PREFIX: &str = "/* {EDGE_VISIBILITY:";
 
+/// The WRITE-side spelling of the in-SQL tenancy marker (PR-16, delivered as 16b).
+///
+/// `/* {WRITABLE:<alias>} */` splices [`Viewer::writable_fragment`] — the
+/// **writable** group subset, bound from [`Viewer::writable_bind`] — into the
+/// `WHERE` clause of an `UPDATE` or `DELETE`, and is substituted by
+/// [`Viewer::splice_write`] rather than by [`Viewer::splice`].
+///
+/// # Why a third spelling rather than a flag on the existing one
+///
+/// The two predicates bind DIFFERENT arrays. A read binds
+/// [`Viewer::group_bind`] (every group the principal is a member of); a write
+/// binds [`Viewer::writable_bind`] (the `admin`/`writer` subset). The bind-arity
+/// invariant that makes the read mechanism safe — every marker in one statement
+/// resolves to ONE bind index — is only sound while all the markers in that
+/// statement want the SAME array. Mixing the spellings in one statement would
+/// silently authorize a write with a read's group set, which is the single
+/// likeliest way to build a write gate that is really a read gate; so
+/// [`Viewer::splice_write`] refuses a statement carrying both rather than
+/// growing a second bind index.
+///
+/// Deliberately not a substring of, and not containing, either read prefix.
+pub const WRITABLE_MARKER_PREFIX: &str = "/* {WRITABLE:";
+
 /// The closing half of the marker, split out so the two halves are never
-/// written as separate literals at a call site. Shared by both spellings.
+/// written as separate literals at a call site. Shared by all three spellings.
 const VISIBILITY_MARKER_SUFFIX: &str = "} */";
 
 /// Read authority for one principal, for one request.
@@ -495,6 +518,47 @@ impl Viewer {
         }
     }
 
+    /// The SQL this viewer contributes to a tenancy-aware **write**.
+    ///
+    /// The write-side counterpart of [`Self::predicate_fragment`], spliced by
+    /// `/* {WRITABLE:<alias>} */` into the `WHERE` clause of an `UPDATE` or a
+    /// `DELETE`. **Exactly two distinct strings**, one per shape, for the same
+    /// reason the read fragments are.
+    ///
+    /// Three differences from the read fragment, each load-bearing:
+    ///
+    /// * **The placeholder is `$W`, not `$V`.** It is filled from
+    ///   [`Self::writable_bind`] — the `admin`/`writer` subset — where the read
+    ///   fragments are filled from [`Self::group_bind`]. The distinct token is
+    ///   what makes "which array does this statement authorize against" legible
+    ///   in the fragment source, instead of inferable only from which accessor
+    ///   the call site happened to bind. A gate that reads correctly but binds
+    ///   the read array is a read gate wearing a write gate's clothes; it passes
+    ///   every test that only checks a stranger is refused, because a stranger
+    ///   is in neither set.
+    /// * **There is no `visibility = 'public'` disjunct.** Public is a READ
+    ///   grant. A row being world-readable says nothing about who may modify it,
+    ///   and carrying the read fragment's leading disjunct here would make every
+    ///   public row writable by every authenticated principal — the widest
+    ///   possible fail-open, spelled as an apparent symmetry.
+    /// * **It constrains WHICH ROW, never WHAT VALUE.** A `WHERE` predicate
+    ///   selects the rows a statement may touch; it cannot constrain the values
+    ///   a `SET` clause assigns. An `UPDATE … SET owner_group_id = <a group I
+    ///   write to>` on a row I may already write therefore still succeeds, and
+    ///   closing that requires a `WITH CHECK`-shaped control on the NEW row
+    ///   rather than a predicate on the old one.
+    ///
+    /// `Bypass` emits a single space, not an empty string, for the reason
+    /// [`Self::predicate_fragment`] documents — and it emits no `$W`, so a
+    /// bypass write binds nothing and the statement's arity is unchanged.
+    #[must_use]
+    pub const fn writable_fragment(&self) -> &'static str {
+        match self.shape {
+            ViewerShape::Scoped { .. } => " AND {alias}.owner_group_id = ANY($W::uuid[]) ",
+            ViewerShape::Bypass { .. } => " ",
+        }
+    }
+
     /// [`Self::predicate_fragment`] with its two placeholders filled in.
     ///
     /// `{alias}` becomes `alias`; `$V` becomes `$<bind_index>`. A `Bypass`
@@ -507,7 +571,7 @@ impl Viewer {
     /// statement already has.
     #[must_use]
     pub fn render_predicate(&self, alias: &str, bind_index: usize) -> String {
-        self.render_fragment(self.predicate_fragment(), alias, bind_index)
+        self.render_fragment(self.predicate_fragment(), alias, bind_index, "$V")
     }
 
     /// [`Self::edge_predicate_fragment`] with its placeholders filled in.
@@ -517,20 +581,44 @@ impl Viewer {
     /// binds [`Self::group_bind`] once. A `Bypass` viewer renders to `" "`.
     #[must_use]
     pub fn render_edge_predicate(&self, alias: &str, bind_index: usize) -> String {
-        self.render_fragment(self.edge_predicate_fragment(), alias, bind_index)
+        self.render_fragment(self.edge_predicate_fragment(), alias, bind_index, "$V")
     }
 
-    /// Shared substitution for both fragments.
+    /// [`Self::writable_fragment`] with its placeholders filled in.
+    ///
+    /// `{alias}` becomes `alias`; **`$W`** — not `$V` — becomes
+    /// `$<bind_index>`, and `bind_index` is the positional parameter the caller
+    /// will bind [`Self::writable_bind`] to. A `Bypass` viewer renders to `" "`
+    /// and therefore emits no bind at all.
+    #[must_use]
+    pub fn render_writable_predicate(&self, alias: &str, bind_index: usize) -> String {
+        self.render_fragment(self.writable_fragment(), alias, bind_index, "$W")
+    }
+
+    /// Shared substitution for all three fragments.
     ///
     /// `Bypass` short-circuits to `" "` rather than running `replace` over the
     /// bypass fragment, so a `Bypass` render can never emit a `$` — the
     /// property `a_bypass_splice_leaves_no_bind_and_no_placeholder` asserts.
-    fn render_fragment(&self, fragment: &'static str, alias: &str, bind_index: usize) -> String {
+    ///
+    /// `placeholder` is the fragment's bind token — `"$V"` for the two read
+    /// fragments, `"$W"` for the write one. It is a parameter rather than a
+    /// constant precisely so the two sides cannot share a token: a single
+    /// spelling would let a write fragment be rendered by a read call site, and
+    /// the resulting statement would bind the read array into the write
+    /// predicate with no textual evidence that anything was wrong.
+    fn render_fragment(
+        &self,
+        fragment: &'static str,
+        alias: &str,
+        bind_index: usize,
+        placeholder: &'static str,
+    ) -> String {
         match self.shape {
             ViewerShape::Bypass { .. } => " ".to_string(),
             ViewerShape::Scoped { .. } => fragment
                 .replace("{alias}", alias)
-                .replace("$V", &format!("${bind_index}")),
+                .replace(placeholder, &format!("${bind_index}")),
         }
     }
 
@@ -565,6 +653,15 @@ impl Viewer {
              marker. A read that takes a Viewer and does not filter on it is a \
              fail-open. SQL was:\n{sql}"
         );
+        assert!(
+            !sql.contains(WRITABLE_MARKER_PREFIX),
+            "Viewer::splice called on SQL carrying a \
+             {WRITABLE_MARKER_PREFIX}…{VISIBILITY_MARKER_SUFFIX} marker. The \
+             write marker binds writable_bind() and this function binds \
+             group_bind(); one statement cannot resolve both to the single bind \
+             index this mechanism guarantees. Use Viewer::splice_write, and do \
+             not mix the spellings in one statement. SQL was:\n{sql}"
+        );
 
         // Two passes. The edge spelling goes FIRST only for readability: the two
         // prefixes are disjoint strings and neither rendered fragment contains
@@ -575,12 +672,104 @@ impl Viewer {
             |v, alias| v.render_edge_predicate(alias, first_bind),
             sql,
         );
-        self.substitute_markers(
+        let out = self.substitute_markers(
             &edges_done,
             VISIBILITY_MARKER_PREFIX,
             |v, alias| v.render_predicate(alias, first_bind),
             sql,
-        )
+        );
+        Self::assert_no_residual_marker(&out, sql);
+        out
+    }
+
+    /// Replace every `/* {WRITABLE:<alias>} */` marker in `sql` with
+    /// [`Self::render_writable_predicate`] for that alias, at `first_bind`.
+    ///
+    /// The write-side twin of [`Self::splice`], and deliberately a SEPARATE
+    /// function rather than a third pass inside it. Every marker in one
+    /// statement resolves to the SAME bind index — the invariant that makes N
+    /// markers cost one bind — and that is only sound while every marker in the
+    /// statement wants the same array. This function's markers want
+    /// [`Self::writable_bind`]; `splice`'s want [`Self::group_bind`]. Keeping
+    /// them apart, and refusing a statement that carries both, preserves the
+    /// invariant byte-for-byte instead of quietly widening it.
+    ///
+    /// The conditional-bind idiom at the call site is the same one the read
+    /// sites use, and it is not optional:
+    ///
+    /// ```ignore
+    /// let sql = viewer.splice_write("UPDATE evidence AS e SET … WHERE e.id = $1 /* {WRITABLE:e} */", 3);
+    /// let mut q = sqlx::query(&sql).bind(id).bind(content);
+    /// if let Some(w) = viewer.writable_bind() { q = q.bind(w); }
+    /// ```
+    ///
+    /// A `Bypass` viewer renders `" "`, emits no `$3`, and must therefore bind
+    /// nothing; `writable_bind()` returning `None` for `Bypass` is what makes
+    /// the guard and the rendered arity agree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `sql` contains no `/* {WRITABLE:…} */` marker — the same
+    /// anti-fail-open control [`Self::splice`] carries, for the same reason: a
+    /// write that takes a `&Viewer` and does not constrain on it is a fail-open
+    /// that compiles and is invisible in a diff.
+    ///
+    /// Panics when `sql` also carries a read marker (see above), and when a
+    /// marker of any spelling survives into the output.
+    ///
+    /// Also panics on a marker that is opened and never closed.
+    #[must_use]
+    pub fn splice_write(&self, sql: &str, first_bind: usize) -> String {
+        assert!(
+            sql.contains(WRITABLE_MARKER_PREFIX),
+            "Viewer::splice_write called on SQL with no \
+             {WRITABLE_MARKER_PREFIX}…{VISIBILITY_MARKER_SUFFIX} marker. A write \
+             that takes a Viewer and does not constrain the rows it may touch is \
+             a fail-open. SQL was:\n{sql}"
+        );
+        assert!(
+            !sql.contains(VISIBILITY_MARKER_PREFIX) && !sql.contains(EDGE_VISIBILITY_MARKER_PREFIX),
+            "Viewer::splice_write called on SQL carrying a READ marker. The read \
+             predicate binds group_bind() — every group the principal can SEE — \
+             and this function binds writable_bind(); resolving both to one bind \
+             index would authorize a write against the read set. Split the \
+             statement, or filter the read half in a separate query. SQL was:\n{sql}"
+        );
+
+        let out = self.substitute_markers(
+            sql,
+            WRITABLE_MARKER_PREFIX,
+            |v, alias| v.render_writable_predicate(alias, first_bind),
+            sql,
+        );
+        Self::assert_no_residual_marker(&out, sql);
+        out
+    }
+
+    /// No marker of ANY spelling may survive into spliced output.
+    ///
+    /// This is not redundant with the input assertions, and it is the check that
+    /// catches the fail-open the write mechanism itself introduces: an
+    /// unsubstituted `/* {WRITABLE:e} */` is a **valid SQL comment**. It parses,
+    /// it executes, it gates nothing, and it is invisible in review because the
+    /// marker is right there in the statement looking like it did its job. The
+    /// missing-marker panic cannot catch it — the marker is present, it was
+    /// simply never replaced, which is what a marker spliced by the wrong
+    /// function or misspelled by one character produces.
+    fn assert_no_residual_marker(out: &str, original: &str) {
+        for prefix in [
+            VISIBILITY_MARKER_PREFIX,
+            EDGE_VISIBILITY_MARKER_PREFIX,
+            WRITABLE_MARKER_PREFIX,
+        ] {
+            assert!(
+                !out.contains(prefix),
+                "a {prefix}…{VISIBILITY_MARKER_SUFFIX} marker survived \
+                 substitution. An unsubstituted marker is a valid SQL comment: \
+                 the statement runs, unfiltered, and looks filtered. \
+                 SQL was:\n{original}\nrendered as:\n{out}"
+            );
+        }
     }
 
     /// One substitution pass for one marker spelling.
@@ -1112,5 +1301,191 @@ mod tests {
 
         assert_eq!(v.group_bind(), Some(&[g][..]));
         assert_eq!(v.writable_bind(), Some(&[g][..]));
+    }
+
+    // ── the write-side predicate (PR-16, delivered as 16b) ──────────────────
+    //
+    // Siblings of the read-side fragment tests above, which are deliberately
+    // left byte-identical: the write side must inherit the read side's
+    // invariants by re-asserting them, not by editing them. A read-side pin
+    // weakened as collateral of a write-side change is invisible to every
+    // ratchet in the tree.
+
+    #[test]
+    fn writable_fragment_has_exactly_two_distinct_values() {
+        let scoped = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let lease = MaintenanceLease::new();
+        let bypass = Viewer::system(&lease, SystemReason::DedupSweep);
+
+        // Same shape ⇒ same &'static str, regardless of the group set. The
+        // fragment is a property of the SHAPE, so a per-viewer fragment (the
+        // shape an injection bug would take) cannot arise.
+        let other_scoped = Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        assert_eq!(scoped.writable_fragment(), other_scoped.writable_fragment());
+        assert_ne!(scoped.writable_fragment(), bypass.writable_fragment());
+        assert_eq!(
+            bypass.writable_fragment(),
+            " ",
+            "the bypass write fragment must be a single space, not an empty \
+             string — it is spliced between SQL tokens"
+        );
+    }
+
+    #[test]
+    fn writable_fragment_binds_w_and_carries_no_public_disjunct() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let f = v.writable_fragment();
+
+        assert!(
+            f.contains("$W"),
+            "the write fragment must name $W, not $V: the distinct token is what \
+             makes 'which array authorizes this statement' readable in the \
+             fragment source rather than only at the call site"
+        );
+        assert!(
+            !f.contains("$V"),
+            "the write fragment must not name $V: {f}"
+        );
+        assert!(
+            !f.contains("visibility"),
+            "the write fragment must NOT carry a `visibility = 'public'` \
+             disjunct. Public is a READ grant; carrying it here would make every \
+             world-readable row writable by every authenticated principal: {f}"
+        );
+        assert!(f.contains("owner_group_id"), "{f}");
+    }
+
+    #[test]
+    fn a_write_splice_renders_the_writable_bind_index() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let out = v.splice_write(
+            "UPDATE evidence AS e SET raw_content = $2 WHERE e.id = $1 /* {WRITABLE:e} */",
+            3,
+        );
+
+        assert!(out.contains("e.owner_group_id = ANY($3::uuid[])"), "{out}");
+        assert!(
+            !out.contains("$W"),
+            "the placeholder must be replaced: {out}"
+        );
+        assert!(!out.contains("{alias}"), "{out}");
+        assert!(!out.contains(WRITABLE_MARKER_PREFIX), "{out}");
+    }
+
+    #[test]
+    fn two_write_markers_in_one_statement_share_one_bind() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+        let out = v.splice_write(
+            "WITH doomed AS (SELECT id FROM evidence e WHERE e.claim_id = $1 \
+               /* {WRITABLE:e} */) \
+             DELETE FROM evidence ev USING doomed d WHERE ev.id = d.id \
+               /* {WRITABLE:ev} */",
+            2,
+        );
+
+        // The read side's N-markers-to-one-bind invariant, re-asserted for the
+        // write spelling: two markers, two aliases, ONE bind index.
+        assert_eq!(
+            out.matches("$2::uuid[]").count(),
+            2,
+            "both write markers must resolve to the same bind index, or the \
+             call site's single `.bind(writable)` under-supplies the \
+             statement: {out}"
+        );
+        assert!(out.contains("e.owner_group_id"), "{out}");
+        assert!(out.contains("ev.owner_group_id"), "{out}");
+    }
+
+    #[test]
+    fn a_bypass_write_splice_leaves_no_bind_and_no_placeholder() {
+        let lease = MaintenanceLease::new();
+        let v = Viewer::system(&lease, SystemReason::PrivatizationApply);
+        let out = v.splice_write(
+            "DELETE FROM evidence e WHERE e.id = $1 /* {WRITABLE:e} */",
+            2,
+        );
+
+        assert!(
+            !out.contains('$') || out.matches('$').count() == 1,
+            "a bypass write splice must add no bind of its own: {out}"
+        );
+        assert!(!out.contains("$2"), "no writable bind is rendered: {out}");
+        assert!(!out.contains("{alias}"), "{out}");
+        assert!(!out.contains(WRITABLE_MARKER_PREFIX), "{out}");
+    }
+
+    /// `expected` names a fragment of the real message, not the two-character
+    /// substring `"no"` the two read-side siblings above use. `"no"` matches an
+    /// unwrap on `None` and most unrelated panics, so it pins that the call
+    /// panicked rather than that it panicked for the right reason. Those two are
+    /// pre-existing and are left alone deliberately — retrofitting them is a
+    /// separate change to code this PR does not otherwise touch.
+    #[test]
+    #[should_panic(expected = "splice_write called on SQL with no")]
+    fn write_splicing_a_marker_free_literal_panics() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        let _ = v.splice_write("UPDATE evidence SET raw_content = $2 WHERE id = $1", 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "READ marker")]
+    fn a_read_marker_in_a_write_splice_panics() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        // Mixing the spellings would resolve both to ONE bind index and
+        // authorize the write against the READ group set.
+        let _ = v.splice_write(
+            "UPDATE evidence AS e SET raw_content = $2 \
+             WHERE e.id = $1 /* {WRITABLE:e} */ /* {VISIBILITY:e} */",
+            3,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "splice_write")]
+    fn a_write_marker_in_a_read_splice_panics() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        let _ = v.splice(
+            "SELECT e.id FROM evidence e WHERE e.id = $1 \
+             /* {VISIBILITY:e} */ /* {WRITABLE:e} */",
+            2,
+        );
+    }
+
+    /// A marker of the OTHER spelling must not survive a splice.
+    ///
+    /// The residual check is what stands between the tree and the fail-open this
+    /// mechanism introduces: an unsubstituted marker is a valid SQL comment, so
+    /// the statement runs unfiltered while LOOKING filtered. Both panics above
+    /// are the input half; this is the output half, and it is asserted through
+    /// the public API rather than on the private helper so it cannot be
+    /// satisfied by a helper that is never called.
+    #[test]
+    fn no_marker_spelling_survives_its_own_splice() {
+        let v = Viewer::test_scoped(Uuid::new_v4(), vec![Uuid::new_v4()]);
+
+        let read = v.splice(
+            "SELECT e.id FROM evidence e JOIN edges ed ON ed.source_id = e.id \
+             WHERE e.id = $1 /* {VISIBILITY:e} */ /* {EDGE_VISIBILITY:ed} */",
+            2,
+        );
+        for prefix in [
+            VISIBILITY_MARKER_PREFIX,
+            EDGE_VISIBILITY_MARKER_PREFIX,
+            WRITABLE_MARKER_PREFIX,
+        ] {
+            assert!(!read.contains(prefix), "{prefix} survived: {read}");
+        }
+
+        let write = v.splice_write(
+            "DELETE FROM evidence e WHERE e.id = $1 /* {WRITABLE:e} */",
+            2,
+        );
+        for prefix in [
+            VISIBILITY_MARKER_PREFIX,
+            EDGE_VISIBILITY_MARKER_PREFIX,
+            WRITABLE_MARKER_PREFIX,
+        ] {
+            assert!(!write.contains(prefix), "{prefix} survived: {write}");
+        }
     }
 }

@@ -199,40 +199,74 @@ pub struct UpdateEvidenceRequest {
 /// PUT /api/v1/evidence/:id
 ///
 /// Currently supports backfilling raw_content on existing evidence.
+///
+/// # The write-side tenancy gate (PR-16, delivered as 16b)
+///
+/// This is the first handler behind the write-side predicate. Three things
+/// changed and each is load-bearing:
+///
+/// * The `UPDATE` moved out of this file into
+///   `EvidenceRepository::update_raw_content`, which carries a
+///   `/* {WRITABLE:e} */` marker. A route handler cannot carry a marker — it
+///   does not own the SQL — so a gate that lives here can only ever be a
+///   second, separately-forgettable check. This is the same structural argument
+///   `viewer_route_table_lint.rs` makes for reads.
+/// * The scope check is unconditional. It was `if let Some(..) = auth_ctx { .. }`
+///   with no `else`, which authorized nothing at all when the extension was
+///   absent.
+/// * A row the caller may not write is a **404, not a 403**. A 403 would confirm
+///   that evidence with this id exists inside a group the caller cannot write
+///   to, which is a disclosure the predicate was added to prevent.
+///
+/// The `record_provenance` block below deliberately keeps its
+/// `if let Some(..) = auth_ctx` shape. It is auth-OPTIONAL audit, not
+/// authorization, and it is counted by a different register.
 #[cfg(feature = "db")]
 pub async fn update_evidence(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateEvidenceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        // Accept either evidence:write or evidence:submit (naming inconsistency)
-        if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
-            return Err(crate::errors::ApiError::Forbidden {
-                reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
-            });
-        }
+    // An ABSENT auth context is a refusal, not a pass — the shape PR-18a
+    // prescribes. This route is on the `protected` chain, so the branch is
+    // unreachable today; writing it as a refusal is what stops the handler's
+    // correctness from depending on which router chain it is registered on.
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    // Accept either evidence:write or evidence:submit (naming inconsistency)
+    if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
+        return Err(crate::errors::ApiError::Forbidden {
+            reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
+        });
     }
 
-    if request.raw_content.is_none() {
+    let Some(ref content) = request.raw_content else {
         return Err(ApiError::ValidationError {
             field: "raw_content".to_string(),
             reason: "At least one field must be provided for update".to_string(),
         });
-    }
+    };
 
-    // Update raw_content via direct SQL (no repo method exists yet)
-    if let Some(ref content) = request.raw_content {
-        sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
-            .bind(id)
-            .bind(content)
-            .execute(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to update evidence: {e}"),
-            })?;
+    let updated = epigraph_db::repos::EvidenceRepository::update_raw_content(
+        &state.db_pool,
+        &viewer,
+        id.into(),
+        content,
+    )
+    .await?;
+
+    if !updated {
+        // Indistinguishable by design: "no such evidence" and "you may not write
+        // this evidence" are the same answer.
+        return Err(ApiError::NotFound {
+            entity: "evidence".to_string(),
+            id: id.to_string(),
+        });
     }
 
     // Record provenance

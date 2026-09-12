@@ -225,17 +225,40 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
 /// with no `else`, which performs no authorization at all when `AuthContext` is
-/// absent. Measured on **2026-09-02**.
+/// absent. Originally measured on **2026-09-02**.
 ///
-/// The plan's §4.13 puts this at 39; the verbatim idiom counts 37 in the tree
+/// The plan's §4.13 puts this at 39; the verbatim idiom counted 37 in the tree
 /// after PR-07 converted `crud.rs::get_theme_embeddings` (see the PR-07 entry in
-/// `docs/tenancy/progress.json` for the full reconciliation). The remainder are
-/// predominantly **write** paths and are assigned to PR-16.
+/// `docs/tenancy/progress.json` for the full reconciliation). PR-10 removed
+/// `webhooks.rs`'s 2 and PR-18a removed `audit.rs`'s 1, leaving **34
+/// occurrences of the idiom** across 7 files. The remainder are predominantly
+/// **write** paths and were assigned to PR-16.
+///
+/// # THIS REGISTER COUNTS SCOPE CHECKS ONLY (PR-16, delivered as 16b)
+///
+/// It used to count every occurrence of the `if let` LINE, and its doc comment
+/// claimed to be measuring `if let Some(..) = auth_ctx { check_scopes(..) }`.
+/// Those are not the same set. Classifying all 34 blocks by BODY shows **24
+/// contain a scope call** (`check_scopes(` or `has_scope(`) and **10 contain
+/// only `record_provenance(`** — no authorization of any kind.
+///
+/// That made a security ratchet walkable DOWNWARD by deleting a provenance
+/// call: a diff that removes an audit-trail write, fixing zero authorization,
+/// would have read as an improvement here. A register that can be satisfied by
+/// deleting something unrelated to the control it names is the same defect
+/// class this whole lint exists to catch — it looks like a control and gates
+/// nothing.
+///
+/// The fix is ADDITIVE, not a needle rewrite: the 10 provenance blocks move to
+/// [`AUTH_OPTIONAL_PROVENANCE_SITES`], the historical total is preserved by
+/// [`the_two_registers_sum_to_the_verbatim_idiom`], and a conversion that
+/// touches both kinds of block in one handler now decrements two different
+/// constants instead of one ambiguous one.
 ///
 /// Asserted exactly for the same monotonicity reason as above.
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     ("agent_keys.rs", 3),
-    ("agents.rs", 2),
+    ("agents.rs", 1),
     // `("audit.rs", 1)` REMOVED by PR-18a, on the PR-10 precedent recorded
     // below: `query_security_events` now takes the prescribed
     // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
@@ -248,9 +271,16 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // the sole per-principal narrowing on the table this route reads, and a
     // fail-open scope check on the caller-facing end of a policy being widened in
     // the same commit is not a debt worth carrying forward one more PR.
-    ("claims.rs", 2),
-    ("crud.rs", 11),
-    ("edges.rs", 9),
+    ("claims.rs", 1),
+    // 7 before PR-16/16b. `update_evidence` moved its `raw_content` UPDATE into
+    // `EvidenceRepository::update_raw_content` behind the write-side predicate,
+    // and took the prescribed
+    // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
+    // shape on the way. Its `record_provenance` block is a SEPARATE `if let`
+    // and is deliberately untouched — it is still counted, in the other
+    // register, where the count stays 4.
+    ("crud.rs", 6),
+    ("edges.rs", 5),
     ("papers.rs", 1),
     ("tasks.rs", 6),
     // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
@@ -262,6 +292,163 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // key the measurement can never produce and the assertion would fail on a
     // correct fix.
 ];
+
+/// The other half of the 34: `if let Some(..) = auth_ctx { record_provenance(..) }`
+/// blocks that contain NO scope call.
+///
+/// **These are not fail-open authorization.** They are auth-OPTIONAL provenance:
+/// the handler writes an audit-trail row when it has an `AuthContext` and skips
+/// it when it does not. The residual is a missing audit record, not an
+/// unauthorized write — a real gap, but a different one, and it is not fixed by
+/// the `let Some(..) else { return Err(Unauthorized) }` shape
+/// [`FAIL_OPEN_SCOPE_SITES`]'s failure message prescribes.
+///
+/// Registered separately rather than dropped, because the shape IS worth
+/// watching: a handler whose only use of `auth_ctx` is optional provenance has
+/// no authorization at all, and finding a NEW one is usually the sign of a new
+/// unauthenticated write path. It is a debt register, not a permission slip.
+const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
+    ("agents.rs", 1),
+    ("claims.rs", 1),
+    ("crud.rs", 4),
+    ("edges.rs", 4),
+];
+
+/// `UPDATE`/`DELETE` statements against a tenancy-scoped table, issued from a
+/// route handler.
+///
+/// # Why this is its own register and not a row in the write-gate lint
+///
+/// The remedy here is never "add a marker". A handler does not own its SQL, so
+/// it **cannot** carry a `/* {WRITABLE:<alias>} */` marker no matter how many
+/// extractors it declares — the same structural argument
+/// [`UNCOMPENSATED_INLINE_READS`] makes for reads, and the reason that register
+/// checks WHERE the SQL lives rather than whether the word `ViewerExtractor`
+/// appears. Every row here must first MOVE to `crates/epigraph-db/src/repos/`;
+/// only then can it be gated. `crates/epigraph-db/tests/write_gate_lint.rs`
+/// picks it up on the other side.
+///
+/// # crud.rs is absent, and that is this PR's decrement
+///
+/// It measured 1 — `update_evidence`'s inline
+/// `UPDATE evidence SET raw_content = $2 WHERE id = $1`, whose own comment read
+/// `no repo method exists yet`. PR-16 (delivered as 16b) moved it to
+/// `EvidenceRepository::update_raw_content` behind the write predicate, so the
+/// file measures 0. Removed rather than set to `0` for the reason the PR-10 note
+/// on [`FAIL_OPEN_SCOPE_SITES`] gives: the register is compared as a whole
+/// `BTreeMap` and a `0` row is a key the measurement can never produce.
+///
+/// # KNOWN UNDER-MEASUREMENT, stated rather than hidden
+///
+/// [`sqlx_call_offsets`] requires INVOCATION syntax — `sqlx::query(` — so
+/// `sqlx::query!` MACRO writes are not counted. `submit.rs` has one
+/// (`UPDATE claims SET trace_id = …`), which is why its count here is 4 and a
+/// plain grep of the file finds 5. The exclusion is inherited from the read-side
+/// scan, where it is what keeps prose out of the count, and it is left in place
+/// rather than special-cased: a macro write is unspliceable by construction and
+/// belongs in `write_gate_lint.rs::MACRO_WRITE_SITES`, whose remedy is a
+/// different mechanism. [`the_route_write_scanner_is_not_vacuous`] pins this
+/// behaviour so it stays a known limit rather than becoming an accident.
+///
+/// Everything else is debt. Do not add to it.
+const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
+    ("assess.rs", 1),
+    ("belief.rs", 1),
+    ("claims.rs", 4),
+    ("computation.rs", 2),
+    ("conventions.rs", 2),
+    ("hypothesis.rs", 2),
+    ("policies.rs", 4),
+    ("rag.rs", 2),
+    ("reasoning.rs", 2),
+    ("revoke_signature.rs", 1),
+    // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
+    ("submit.rs", 4),
+    ("workflows.rs", 4),
+];
+
+/// Tenancy-scoped tables whose route-layer writes this lint counts.
+///
+/// Duplicated from `write_gate_lint.rs::WRITE_GATED_TABLES` because an
+/// integration test in one crate cannot import one in another.
+///
+/// **NOTHING CROSS-CHECKS THE TWO COPIES.** An earlier revision of this comment
+/// claimed they were "cross-checked by that file's subset assertion against
+/// `TIER_A`". That was false twice over: the assertion in question reads only
+/// the *other* file's copy — it lives in the `epigraph-db` test binary and
+/// cannot see this constant at all, which is the very reason the constant is
+/// duplicated — and at the time the claim was written the two lists were not
+/// even equal. This copy carried 8 tables; the other carried 10.
+///
+/// The claim was worse than the divergence it papered over. A divergent register
+/// under-measures; a comment asserting a machine check that does not exist stops
+/// the next reader from looking, which is the same failure this whole PR exists
+/// to reject — a control that reads like a control and checks nothing.
+///
+/// The two lists are now equal by hand, and `claim_versions` /
+/// `harvester_fragments` are carried here even though
+/// `grep -rnE '(UPDATE|DELETE FROM) (public\.)?(claim_versions|harvester_fragments)'`
+/// over `src/routes/` currently returns nothing. They are a no-op today and
+/// correct the day a handler writes one. **Keep them equal by hand, and expect
+/// no test to tell you when you have not.**
+const WRITE_GATED_TABLES: &[&str] = &[
+    "challenges",
+    "claim_versions",
+    "claims",
+    "edges",
+    "evidence",
+    "frames",
+    "harvester_fragments",
+    "mass_functions",
+    "perspectives",
+    "recall_events",
+];
+
+/// Does `region` issue an `UPDATE`/`DELETE` against a scoped table?
+///
+/// The trailing-character check is load-bearing: `crud.rs` writes
+/// `UPDATE edges_staging`, a staging table that carries no tenancy columns at
+/// all, and a prefix match would charge it as `edges` — inflating a security
+/// register with a row no conversion can remove, and hiding this PR's actual
+/// decrement behind it.
+fn writes_scoped_table(region: &str) -> bool {
+    for table in WRITE_GATED_TABLES {
+        for verb in [
+            format!("UPDATE {table}"),
+            format!("UPDATE public.{table}"),
+            format!("DELETE FROM {table}"),
+            format!("DELETE FROM public.{table}"),
+        ] {
+            let mut from = 0usize;
+            while let Some(rel) = region[from..].find(&verb) {
+                let at = from + rel;
+                from = at + verb.len();
+                let tail = region[at + verb.len()..].chars().next();
+                if tail.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn measure_route_layer_writes() -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for (name, src) in route_files() {
+        let mut n = 0usize;
+        for at in sqlx_call_offsets(&src) {
+            if writes_scoped_table(&resolved_region(&src, at)) {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            counts.insert(name, n);
+        }
+    }
+    counts
+}
 
 fn routes_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes")
@@ -503,16 +690,157 @@ fn measure_inline_claim_content_reads() -> BTreeMap<String, usize> {
     counts
 }
 
-fn measure_fail_open_scope_sites() -> BTreeMap<String, usize> {
-    let needle = "if let Some(axum::Extension(ref auth)) = auth_ctx";
+/// The one spelling of the optional-`AuthContext` idiom, shared by both
+/// registers so they cannot drift to two different definitions of "the site".
+const AUTH_CTX_NEEDLE: &str = "if let Some(axum::Extension(ref auth)) = auth_ctx";
+
+/// The brace-balanced block starting at the first `{` at or after `from`.
+///
+/// String literals (normal and raw) and line comments are skipped, so a brace
+/// inside SQL text or inside a comment cannot unbalance the depth count — the
+/// same care [`arg_region`] takes with parentheses, for the same reason.
+///
+/// Returns the remainder of the source when the block never closes, which makes
+/// an unbalanced file over-count rather than silently classify as `Other`.
+fn balanced_block(src: &str, from: usize) -> &str {
+    let b = src.as_bytes();
+    let n = src.len();
+    let Some(start) = src[from..].find('{').map(|i| from + i) else {
+        return &src[from..];
+    };
+    let mut j = start;
+    let mut depth = 0usize;
+    while j < n {
+        // Raw string: r"…", r#"…"#, r##"…"##
+        if b[j] == b'r' && j + 1 < n && (b[j + 1] == b'#' || b[j + 1] == b'"') {
+            let mut k = j + 1;
+            let mut hashes = 0usize;
+            while k < n && b[k] == b'#' {
+                hashes += 1;
+                k += 1;
+            }
+            if k < n && b[k] == b'"' {
+                let mut term = String::from('"');
+                for _ in 0..hashes {
+                    term.push('#');
+                }
+                j = match src[k + 1..].find(&term) {
+                    Some(e) => k + 1 + e + term.len(),
+                    None => n,
+                };
+                continue;
+            }
+        }
+        match b[j] {
+            b'"' => {
+                let mut k = j + 1;
+                while k < n {
+                    if b[k] == b'\\' {
+                        k += 2;
+                        continue;
+                    }
+                    if b[k] == b'"' {
+                        break;
+                    }
+                    k += 1;
+                }
+                j = k + 1;
+                continue;
+            }
+            b'\'' if j + 2 < n && b[j + 2] == b'\'' => {
+                // A char literal such as `'{'`. Skip it wholesale.
+                j += 3;
+                continue;
+            }
+            b'/' if j + 1 < n && b[j + 1] == b'/' => {
+                j = src[j..].find('\n').map_or(n, |e| j + e + 1);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let mut e = j + 1;
+                    while e < n && !src.is_char_boundary(e) {
+                        e += 1;
+                    }
+                    return &src[start..e];
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    &src[start..]
+}
+
+/// What one `if let Some(..) = auth_ctx { .. }` block actually does.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum AuthCtxBlock {
+    /// The block calls `check_scopes(` or `has_scope(` — a real authorization
+    /// decision, skipped entirely when `AuthContext` is absent.
+    ScopeCheck,
+    /// The block calls `record_provenance(` and performs no scope check — an
+    /// audit-trail write, not authorization.
+    ProvenanceOnly,
+    /// Neither. Not a category the tree has today; a new one must be classified
+    /// deliberately rather than fall into either register by default.
+    Unclassified,
+}
+
+/// Classify every occurrence of [`AUTH_CTX_NEEDLE`] by its block body.
+///
+/// A block containing BOTH a scope call and a provenance call is a
+/// [`AuthCtxBlock::ScopeCheck`]: the authorization is the property worth
+/// tracking, and charging it to the provenance register would let a real
+/// fail-open hide behind an audit write.
+fn classify_auth_ctx_block(block: &str) -> AuthCtxBlock {
+    if block.contains("check_scopes(") || block.contains("has_scope(") {
+        AuthCtxBlock::ScopeCheck
+    } else if block.contains("record_provenance(") {
+        AuthCtxBlock::ProvenanceOnly
+    } else {
+        AuthCtxBlock::Unclassified
+    }
+}
+
+/// Per-file counts of `auth_ctx` blocks matching `kind`.
+fn measure_auth_ctx_sites(kind: AuthCtxBlock) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for (name, src) in route_files() {
-        let n = src.matches(needle).count();
+        let mut n = 0usize;
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(AUTH_CTX_NEEDLE) {
+            let at = from + rel;
+            from = at + AUTH_CTX_NEEDLE.len();
+            if classify_auth_ctx_block(balanced_block(&src, at)) == kind {
+                n += 1;
+            }
+        }
         if n > 0 {
             counts.insert(name, n);
         }
     }
     counts
+}
+
+fn measure_fail_open_scope_sites() -> BTreeMap<String, usize> {
+    measure_auth_ctx_sites(AuthCtxBlock::ScopeCheck)
+}
+
+fn measure_auth_optional_provenance_sites() -> BTreeMap<String, usize> {
+    measure_auth_ctx_sites(AuthCtxBlock::ProvenanceOnly)
+}
+
+/// Total occurrences of the verbatim idiom, unclassified.
+///
+/// This is what [`measure_fail_open_scope_sites`] counted before PR-16/16b split
+/// the register, and it is preserved so the split can be proved lossless.
+fn measure_verbatim_auth_ctx_idiom() -> usize {
+    route_files()
+        .iter()
+        .map(|(_, src)| src.matches(AUTH_CTX_NEEDLE).count())
+        .sum()
 }
 
 fn expected(list: &[(&str, usize)]) -> BTreeMap<String, usize> {
@@ -661,6 +989,320 @@ fn fail_open_scope_check_sites_do_not_increase() {
          then check scopes unconditionally (see \
          `crud.rs::get_theme_embeddings`). Then LOWER the number here.\n",
         diff_report(&actual, &want)
+    );
+}
+
+#[test]
+fn route_layer_writes_to_scoped_tables_do_not_increase() {
+    let actual = measure_route_layer_writes();
+    let want = expected(ROUTE_LAYER_WRITES);
+    assert_eq!(
+        actual,
+        want,
+        "\n\nRoute-layer write ratchet failed.\n{}\n\n\
+         A `sqlx::query*` call in crates/epigraph-api/src/routes/ issues an \
+         `UPDATE`/`DELETE` against a tenancy-scoped table. A handler cannot \
+         carry a `/* {{WRITABLE:...}} */` marker — it does not own the SQL — so \
+         such a write is ungateable by a `Viewer` no matter what the handler's \
+         signature declares.\n\n\
+         Fix: move the statement into crates/epigraph-db/src/repos/, add the \
+         marker, call `viewer.splice_write(..)`, and bind \
+         `viewer.writable_bind()`. See `crud.rs::update_evidence` → \
+         `EvidenceRepository::update_raw_content`. Then LOWER the number here. \
+         Never raise it.\n",
+        diff_report(&actual, &want)
+    );
+}
+
+/// **The self-test for the route-write scanner**, over synthetic source.
+///
+/// Without it, a refactor of [`writes_scoped_table`] could go green against the
+/// current tree while quietly measuring nothing — the failure this whole PR
+/// exists to avoid, reproduced inside its own ratchet. The fixtures are strings,
+/// so this cannot be satisfied by editing the routes directory.
+#[test]
+fn the_route_write_scanner_is_not_vacuous() {
+    let inline = r#"sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1").bind(id);"#;
+    let offsets = sqlx_call_offsets(inline);
+    assert_eq!(offsets.len(), 1);
+    assert!(
+        writes_scoped_table(&resolved_region(inline, offsets[0])),
+        "an inline scoped-table UPDATE must be counted"
+    );
+
+    // The `frame_claims_sorted` shape on the write side: statement built above
+    // the call. A forward-only scan scores it clean.
+    let deferred = r#"
+        let sql = format!("DELETE FROM claims WHERE id = ANY($1) {extra}");
+        let _ = sqlx::query(&sql).bind(ids).execute(pool).await;
+    "#;
+    let offsets = sqlx_call_offsets(deferred);
+    assert_eq!(offsets.len(), 1);
+    assert!(
+        writes_scoped_table(&resolved_region(deferred, offsets[0])),
+        "a `let sql = format!(..); sqlx::query(&sql)` write MUST be counted"
+    );
+
+    // `edges_staging` carries no tenancy columns. Charging it as `edges` would
+    // inflate the register with a row no conversion can remove — and would have
+    // hidden this PR's crud.rs decrement behind it.
+    let staging = r#"sqlx::query("UPDATE edges_staging SET state = 'done' WHERE id = $1");"#;
+    let offsets = sqlx_call_offsets(staging);
+    assert_eq!(offsets.len(), 1);
+    assert!(
+        !writes_scoped_table(&resolved_region(staging, offsets[0])),
+        "`UPDATE edges_staging` must not be charged as `UPDATE edges`"
+    );
+
+    // A READ on a scoped table is not a write.
+    let read = r#"sqlx::query_as("SELECT id FROM claims WHERE id = $1").bind(id);"#;
+    let offsets = sqlx_call_offsets(read);
+    assert!(!writes_scoped_table(&resolved_region(read, offsets[0])));
+
+    // The documented under-measurement: a macro write is not an invocation the
+    // offset scan recognises. Asserted so the limit is a decision on record
+    // rather than a surprise the next reader has to rediscover.
+    let macro_write = "sqlx::query!(\"UPDATE claims SET trace_id = $1 WHERE id = $2\", t, id);";
+    assert!(
+        sqlx_call_offsets(macro_write).is_empty(),
+        "`sqlx::query!` is deliberately outside this scan — see the \
+         ROUTE_LAYER_WRITES doc comment. If this now returns a site, the \
+         register is under-stated and submit.rs must go 4 → 5."
+    );
+}
+
+/// `crud.rs` must not grow an inline scoped-table write again.
+///
+/// A targeted guard beside the count, on the precedent of
+/// [`the_two_handlers_pr07_fixed_stay_fixed`]: a revert of PR-16's conversion
+/// should fail by NAME and not only by a total moving, because the total can be
+/// held constant by an unrelated deletion elsewhere in the file.
+///
+/// # The window is self-sizing, and it has to be
+///
+/// An earlier revision took a FIXED 2600-byte window. That number covered the
+/// handler with 94 bytes to spare — the next `\npub async fn ` (the
+/// `#[cfg(not(feature = "db"))]` stub of the same name) began 2506 bytes in — so
+/// the `!window.contains("UPDATE evidence")` assertion was as strong as it read,
+/// but only by that margin, and in the wrong direction on both sides: 95 bytes
+/// of new code inside the handler would have pushed the tail of the function out
+/// of the window and let an inline `UPDATE evidence` return unseen, while the
+/// bytes it DID cover past the handler belonged to a neighbouring function.
+/// A guard whose correctness depends on a hand-tuned byte count silently stops
+/// guarding the day someone adds a line. The window now ends where the next
+/// item begins.
+#[test]
+fn update_evidence_routes_through_the_gated_repo_fn() {
+    let src = std::fs::read_to_string(routes_dir().join("crud.rs")).expect("read crud.rs");
+    let at = src
+        .find("pub async fn update_evidence")
+        .expect("update_evidence handler still exists");
+    // From the handler to the start of the next top-level item, whatever its
+    // length. `\npub ` is the item boundary in this file; falling back to EOF
+    // keeps the last handler in the file covered rather than empty.
+    let head = at + "pub async fn update_evidence".len();
+    let rest = &src[head..];
+    // The EARLIEST boundary of either spelling, not the first one tried: the
+    // `#[cfg(not(feature = "db"))]` stub of this same handler is introduced by
+    // its attribute, so keying only on `\npub ` would pull that attribute line
+    // into the window.
+    let end = [rest.find("\npub "), rest.find("\n#[cfg(")]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(src.len(), |rel| head + rel);
+    let window = &src[at..end];
+    assert!(
+        window.len() > 400,
+        "the self-sized window collapsed to {} bytes — the item-boundary search \
+         matched inside the handler instead of after it, and every assertion \
+         below would pass vacuously",
+        window.len()
+    );
+
+    assert!(
+        window.contains("EvidenceRepository::update_raw_content"),
+        "update_evidence no longer routes through the write-gated repo fn; \
+         holding a Viewer and issuing the UPDATE inline is the exact fail-open \
+         PR-16 (delivered as 16b) fixed"
+    );
+    assert!(
+        !window.contains("UPDATE evidence"),
+        "update_evidence has an inline `UPDATE evidence` again"
+    );
+    assert!(
+        window.contains("ViewerExtractor"),
+        "update_evidence lost its ViewerExtractor, so the repo call cannot be \
+         supplying a real write authority"
+    );
+}
+
+#[test]
+fn auth_optional_provenance_sites_do_not_increase() {
+    let actual = measure_auth_optional_provenance_sites();
+    let want = expected(AUTH_OPTIONAL_PROVENANCE_SITES);
+    assert_eq!(
+        actual,
+        want,
+        "\n\nAuth-optional provenance ratchet failed.\n{}\n\n\
+         `if let Some(axum::Extension(ref auth)) = auth_ctx {{ record_provenance(..) }}` \
+         writes an audit-trail row when an `AuthContext` is present and silently \
+         writes nothing when it is not. That is NOT a fail-open scope check — \
+         there is no scope check in the block at all — which is why it is \
+         counted here and not in FAIL_OPEN_SCOPE_SITES.\n\n\
+         A NEW entry usually means a new write path that performs no \
+         authorization whatsoever, so read it as that before reading it as an \
+         audit gap.\n",
+        diff_report(&actual, &want)
+    );
+}
+
+/// The split of the old single register must be LOSSLESS.
+///
+/// Before PR-16/16b, `FAIL_OPEN_SCOPE_SITES` counted every occurrence of
+/// [`AUTH_CTX_NEEDLE`] regardless of what the block did. This asserts that the
+/// two registers still account for exactly those occurrences and nothing else,
+/// so the split cannot have quietly dropped a site — the failure mode that would
+/// turn a security ratchet into a smaller number that means less.
+///
+/// The `Unclassified` assertion is the sharp half: a block that neither checks a
+/// scope nor records provenance is a shape neither register describes, and it
+/// must be classified deliberately in a diff rather than vanish from both totals.
+#[test]
+fn the_two_registers_sum_to_the_verbatim_idiom() {
+    let scope: usize = measure_fail_open_scope_sites().values().sum();
+    let prov: usize = measure_auth_optional_provenance_sites().values().sum();
+    let unclassified: usize = measure_auth_ctx_sites(AuthCtxBlock::Unclassified)
+        .values()
+        .sum();
+    let verbatim = measure_verbatim_auth_ctx_idiom();
+
+    assert_eq!(
+        unclassified, 0,
+        "an `if let Some(..) = auth_ctx {{ .. }}` block calls neither \
+         `check_scopes(`/`has_scope(` nor `record_provenance(`. It belongs in \
+         one of the two registers — decide which and say so — rather than in \
+         neither, where no ratchet watches it."
+    );
+    assert_eq!(
+        scope + prov,
+        verbatim,
+        "the two registers no longer account for every occurrence of the \
+         idiom ({scope} scope + {prov} provenance != {verbatim} verbatim). The \
+         split of the pre-16b register must stay lossless: a site that falls out \
+         of both totals is a site nothing watches."
+    );
+    assert_eq!(
+        scope + prov,
+        expected(FAIL_OPEN_SCOPE_SITES).values().sum::<usize>()
+            + expected(AUTH_OPTIONAL_PROVENANCE_SITES)
+                .values()
+                .sum::<usize>(),
+        "the registers disagree with the measurement; the two per-register \
+         ratchets above will name the file"
+    );
+}
+
+/// **The self-test for the classifier, over synthetic source.**
+///
+/// The register split is only worth anything if the classifier actually reads
+/// the BLOCK. A classifier that read the `if let` line alone would put every
+/// site in one bucket and the sum test above would still pass — the exact
+/// "looks like a control, measures nothing" failure the split was written to
+/// remove.
+///
+/// The fixtures are synthetic strings, so this test cannot be made to pass by
+/// editing the routes directory.
+#[test]
+fn the_auth_ctx_classifier_is_not_vacuous() {
+    let scope = r#"
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            if !auth.has_scope("evidence:write") {
+                return Err(ApiError::Forbidden { reason: "nope".to_string() });
+            }
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(scope, 0)),
+        AuthCtxBlock::ScopeCheck
+    );
+
+    let prov = r#"
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            let hash = blake3::hash(id.as_bytes());
+            if let Err(e) = record_provenance(&pool, auth, "evidence", id).await {
+                tracing::warn!(error = %e, "failed");
+            }
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(prov, 0)),
+        AuthCtxBlock::ProvenanceOnly
+    );
+
+    // A block doing BOTH is a scope check, not a provenance site: charging it to
+    // the provenance register would let a real fail-open hide behind an audit
+    // write.
+    let both = r#"
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            check_scopes(auth, &["claims:write"])?;
+            record_provenance(&pool, auth, "claims", id).await.ok();
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(both, 0)),
+        AuthCtxBlock::ScopeCheck
+    );
+
+    // Neither: must NOT silently land in a register.
+    let neither = r#"
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            tracing::debug!(agent = %auth.agent_id, "hello");
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(neither, 0)),
+        AuthCtxBlock::Unclassified
+    );
+
+    // The block scanner must not stop at a brace inside a string literal, nor
+    // run past the block's own close into a following scope check. Both errors
+    // would misclassify a real site.
+    let braces_in_sql = r#"
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            record_provenance(&pool, auth, "{not a block}", id).await.ok();
+        }
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            check_scopes(auth, &["claims:write"])?;
+        }
+    "#;
+    let first = balanced_block(braces_in_sql, 0);
+    assert_eq!(
+        classify_auth_ctx_block(first),
+        AuthCtxBlock::ProvenanceOnly,
+        "a brace inside a string literal must not close the block early, and \
+         the region must not bleed into the NEXT `if let` — this fixture is \
+         built so either error flips the verdict to ScopeCheck"
+    );
+    assert!(
+        !first.contains("check_scopes("),
+        "the block region bled into the following statement"
+    );
+
+    // A nested block must not close the outer one.
+    let nested = r#"
+        if let Some(axum::Extension(ref auth)) = auth_ctx {
+            if request.raw_content.is_none() {
+                return Err(ApiError::ValidationError { field: "x".to_string() });
+            }
+            check_scopes(auth, &["evidence:write"])?;
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(nested, 0)),
+        AuthCtxBlock::ScopeCheck,
+        "a nested `{{ }}` must not terminate the outer block before the scope \
+         call is reached"
     );
 }
 
