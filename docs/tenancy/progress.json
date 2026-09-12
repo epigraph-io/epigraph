@@ -1815,16 +1815,6 @@
       "decision_group": "unauthenticated-listener-posture"
     },
     {
-      "id": "F-unauthenticated-server-agent-id-resolved-once-at-boot",
-      "where": "crates/epigraph-mcp/src/main.rs",
-      "what": "A transient database failure at startup permanently disables every content tool on the --allow-unauthenticated-http listener for the life of the process",
-      "detail": "On error the code logs and stores None, which request_viewer turns into a hard refusal until restart. Before PR-09 the same listener resolved lazily per request and would start working again once the database recovered. The fail-closed choice is right; the once-only caching is the problem. Environment-specific weight: reference_postgres_static_ip_boot_race means Postgres losing its address on reboot is a recurring event here, so a co-scheduled MCP restart can land in exactly this window, and the symptom ('token carries no agent principal' from every tool) does not point at a boot-time DB blip. Fix: hold the id behind an Arc<OnceCell<Uuid>> that request_viewer can lazily re-resolve when it is None, keeping the boot attempt as a warm-up plus the loud error log.",
-      "disposition": "FIX-SCHEDULED",
-      "disposition_note": "An availability defect with a fix the finding already specifies. Weighted up by this deployment: Postgres losing its address on reboot is a recurring local event, so the boot window is reachable in practice.",
-      "disposition_date": "2026-09-12",
-      "fix_batch": "tenancy/fix-authz-hygiene"
-    },
-    {
       "id": "F-http-tenancy-coverage-is-two-of-four-handlers",
       "where": "crates/epigraph-api/tests/tenant_isolation_http.rs",
       "what": "PR-09 changes four HTTP handlers and adds an HTTP-level test for two of them",
@@ -1858,19 +1848,6 @@
       "fix_batch": "tenancy/fix-lint-robustness"
     },
     {
-      "id": "F-PR10-unknown-claim-id-delivers",
-      "found_by": "PR-10 land-phase critic",
-      "what": "The webhook fan-out treats 'the payload names a claim id with no `claims` row' as visible-and-deliver. routes/batch.rs::batch_create_claims exercises that branch on every request: it inserts only into AppState::claim_store and publishes a ClaimSubmitted per claim, so the claim id, submitting agent id and truth value reach every active subscription with no tenancy decision made.",
-      "why_it_matters": "hidden_claim_ids' contract ('an id that names no row at all is not returned') is right for PR-09's use - redacting rows already fetched from a viewer-scoped source - and permissive for a delivery decision to an arbitrary external URL. PR-12 will not fix it, because the row still will not exist. NOT a PR-10 regression: before PR-10 every event went to every subscriber unconditionally.",
-      "why_not_fixed_in_pr10": "Both in-scope fixes are wrong. Suppressing on named-but-absent would suppress nearly everything, because payload_uuids also collects agent, frame and workflow ids. Narrowing the scan to declared claim ids is the key allowlist PR-09 rejected verbatim. The doc now names the branch instead of asserting it away.",
-      "suggested_fix": "Either make batch_create_claims persist (it has no auth extractor either, so it needs its own PR), or stop it publishing ClaimSubmitted for rows that do not exist.",
-      "owner": "PR-12 or the PR that authenticates routes/batch.rs",
-      "disposition": "FIX-SCHEDULED",
-      "disposition_note": "Owner was 'PR-12 or the PR that authenticates routes/batch.rs'; PR-12 is delivered and no such PR is scheduled. Takes the second of the two fixes the finding itself endorses, which is the one that does not require an allowlist the plan rejected.",
-      "disposition_date": "2026-09-12",
-      "fix_batch": "tenancy/fix-authz-hygiene"
-    },
-    {
       "id": "F-PR10-claimless-variants-carry-non-claim-content",
       "found_by": "PR-10 land-phase critic",
       "what": "EpiGraphEvent::AgentSuspended carries SuspensionReason::{PolicyViolation, SecurityConcern, Administrative}, each with a `details: String` of operator-authored free text, plus suspended_by; ReputationChanged carries per-agent scores. Neither names a claim, so the payload-derived tenancy filter has nothing to act on and both are delivered to every active subscriber.",
@@ -1882,18 +1859,6 @@
       "disposition_note": "Conditional on a publisher that does not exist: no production code publishes either variant. The stated owner -- the PR that adds the first one -- is the right trigger and cannot be scheduled before that PR exists.",
       "disposition_date": "2026-09-12",
       "accepted_because": "no production publisher exists"
-    },
-    {
-      "id": "F-PR10-admin-stats-unscoped",
-      "found_by": "PR-10 land-phase critic",
-      "what": "routes/admin.rs::system_stats takes no auth extractor and no check_scopes - only State(state) - and is registered on the `protected` router in both chains, so any authenticated principal with any scope reads the whole SystemStats aggregate, including WebhookStats { webhook_count }.",
-      "why_it_matters": "PR-10's boot hydration widens webhook_count from a per-process artefact to the cardinality of webhook_subscriptions across every tenant. A count, not content - but it is the one unfiltered path out of AppState::webhook_store, and it falsified the invariant repos/webhook.rs::list_active's doc originally rested its no-Viewer exemption on. That doc is corrected; the route is not.",
-      "suggested_fix": "Gate system_stats behind claims:admin, or drop webhook_count from SystemStats, or make it count only the caller's rows. Note admin.rs:1017 and :1137 both assert on webhook_count.",
-      "owner": "PR-16",
-      "disposition": "FIX-SCHEDULED",
-      "disposition_note": "Re-measured on 0f6f8b02: the handler still takes State(state) alone. PR-16 was its owner and shipped as 16a+16b without touching routes/admin.rs, so it is definitively not discharged.",
-      "disposition_date": "2026-09-12",
-      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR10-webhook-store-no-cross-process-invalidation",
@@ -1908,18 +1873,6 @@
       "accepted_because": "single-instance deployment; the condition is unreachable"
     },
     {
-      "id": "F-PR10-agentless-principal-resolves-to-public-only",
-      "found_by": "PR-10 land-phase critic",
-      "what": "Viewer::resolve (visibility.rs:269) returns Ok(Viewer{Scoped{group_ids: []}}) for a principal with no `agents` row, because GroupMembershipRepository::list_live_for_agent returns an empty Vec rather than an error. agent_may_receive therefore does NOT fail closed for a deleted agent - it demotes the subscription to a public-only subscriber.",
-      "why_it_matters": "Combined with the fact that migration 085's ON DELETE CASCADE removes the ROW but nothing evicts AppState::webhook_store, a running process keeps delivering public-visibility claims to a deleted agent's endpoint until it restarts. Wider than it will eventually be: with migration 062 defaulting visibility to 'public' and nothing transcribing ownership until PR-12, 'public-only' is currently close to 'everything'.",
-      "suggested_fix": "Have agent_may_receive (or Viewer::resolve itself) distinguish 'agent exists with no groups' from 'agent does not exist', and fail closed on the latter. Both branches are now named in agent_may_receive's doc so the 'fails closed' list is honest.",
-      "owner": "PR-12",
-      "disposition": "FIX-SCHEDULED",
-      "disposition_note": "Owner was PR-12, which is delivered without closing it. The finding carries its own fix: distinguish 'agent exists with no groups' from 'no agents row' and fail closed on the latter.",
-      "disposition_date": "2026-09-12",
-      "fix_batch": "tenancy/fix-authz-hygiene"
-    },
-    {
       "id": "F-PR10-no-db-test-cfg-never-compiles",
       "found_by": "PR-10 land-phase critic",
       "what": "`cargo check -p epigraph-api --no-default-features --all-targets --locked` -> EXIT=101. PRE-EXISTING: the same command at the base commit 3503911f -> EXIT=101 with 35 errors, including `missing field owner_id in initializer of state::WebhookSubscription`. No gate in the four-command set compiles cfg(all(test, not(feature=\"db\"))), so this had never been measured.",
@@ -1930,32 +1883,6 @@
       "disposition_note": "Merged with F-PR28-nodb-lib-test-build: one defect recorded twice. Re-measured, and it is structural rather than a list of errors to fix -- ci.yml states that the test targets cannot pass under --no-default-features because this crate's dev-dependencies on epigraph-db and sqlx are non-optional, so the test targets link Postgres regardless of the feature flag. Closing it means making those dev-dependencies optional. Accepted with the reason stated and deliberately NOT folded into a cleanup batch, because it is a dependency-graph change and not hygiene. PRE-EXISTING: it failed identically at the base commit.",
       "disposition_date": "2026-09-12",
       "accepted_because": "structural: requires making non-optional dev-dependencies optional"
-    },
-    {
-      "id": "F-PR10-webhook-url-unvalidated",
-      "found_by": "PR-10 land-phase critic",
-      "what": "register_webhook validates only that the URL is non-empty (and migration 085's `CHECK (btrim(url) <> '')` mirrors exactly that), so any caller with webhooks:write can register a link-local metadata address or a loopback port and have the api POST signed event payloads there.",
-      "why_it_matters": "Pre-existing and out of PR-10's ledgered scope, but PR-10 changes the blast radius: an SSRF-shaped target was a process-lifetime condition and is now a durable row that boot hydration re-arms on every deploy.",
-      "suggested_fix": "Scheme allowlist plus a private-range/link-local denylist at registration time.",
-      "owner": "unassigned",
-      "disposition": "FIX-SCHEDULED",
-      "disposition_note": "Re-measured on 0f6f8b02: registration still validates only non-emptiness. The fix states a positive policy and states what that policy does not cover.",
-      "disposition_date": "2026-09-12",
-      "fix_batch": "tenancy/fix-authz-hygiene"
-    },
-    {
-      "id": "F-PR11-community-membership-is-self-service",
-      "found_by": "PR-11 land-phase critic",
-      "what": "routes/community.rs::add_member takes only a ViewerExtractor and State - no scope extractor, no community-admin check, and no requirement that the perspective being added belongs to the caller. remove_member has neither a Viewer nor a scope extractor.",
-      "why_it_matters": "It routes around the declassification control PR-11 just hardened, for the whole `community` partition. access_control.rs::check_content_access's \"community\" arm returns ContentAccess::Full to any requester owning a perspective that is a member of the gating community, so instead of calling the now-gated update_partition, any authenticated agent creates a perspective, POSTs it into the gating community, and reads everything behind it. The two existence pre-checks are viewer-filtered, but migration 062 defaults visibility to 'public', so on today's corpus that filter excludes nothing. remove_member is the integrity twin: any authenticated agent can evict any perspective from any community.",
-      "suggested_fix": "A require_community_admin-shaped membership check plus a scope extractor, mirroring groups::add_member (which takes RequireScopeGroupsAdmin AND calls group_authz::require_group_admin).",
-      "owner": "PR-16 for the scope extractor and the admin-shaped rule; PR-12 closed the self-service grant and the self-service eviction.",
-      "status": "SUBSTANTIALLY CLOSED BY PR-12, and PR-12 is why it had to be. Projecting the membership moved the hole out of check_content_access's community arm (which PR-14 deletes) and into the group_memberships / Viewer::resolve control plane, which SURVIVES PR-14 and is armed by PR-17 - i.e. it was on its way from a soon-to-be-deleted ACL bug to a durable tenancy bypass. CommunityRepository::add_member and ::remove_member now enforce CLOSED MEMBERSHIP (the acting agent must hold a live membership in the community's projected group; bootstrap exception only when that group has none, because migration 068 left every projected group with zero administrators by design; remove_member additionally always permits removing your own perspective). remove_member's handler, which previously extracted nothing at all, now takes a ViewerExtractor, and create_community passes the authenticated creator so a community created through the route is never in the bootstrap state. Gating only the PROJECTION would not have worked: 071's shim replays it out of community_members on every community-partitioned ownership write.",
-      "residual": "The rule is deliberately weaker than the suggested require_community_admin: community groups have no admins to require. A community whose group is genuinely memberless is still open to the first joiner, and no scope extractor was added. Both are PR-16's, with its viewer_route_table_lint.rs set.",
-      "disposition": "FIX-SCHEDULED",
-      "disposition_note": "Substantially closed by PR-12 already. This pass takes the stated residual (no scope extractor) since PR-16 owned it and is delivered. The other residual -- a genuinely memberless community group is open to the first joiner -- is a consequence of migration 068 projecting groups with zero administrators and stays open under F-PR12-community-groups-still-have-no-admin.",
-      "disposition_date": "2026-09-12",
-      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR11-tool-viewer-coverage-lint-matches-comments",
@@ -1982,10 +1909,10 @@
     {
       "id": "F-PR12-community-groups-still-have-no-admin",
       "what": "CommunityRepository::create now sets groups.created_by_agent_id and an admin membership WHEN A CREATOR IS KNOWN, but POST /api/v1/communities extracts no AuthContext and passes None. The communities migration 068 already projected have no creator column to derive one from either.",
-      "status": "Partially closed by PR-12.",
-      "owner": "PR-16 for the route authentication (its viewer_route_table_lint.rs set), PR-18 for the pre-existing projected groups.",
+      "status": "Route-authentication half closed by measurement 2026-09-12 by tenancy/fix-authz-hygiene. Projected-groups half open.",
+      "owner": "PR-18 for the pre-existing projected groups; the route-authentication half is closed by measurement.",
       "disposition": "FIX-SCHEDULED",
-      "disposition_note": "Takes the route-authentication half only: the creator is knowable at the route and is currently passed as None. The pre-existing projected groups half stays open and is re-labelled CONVERSION-TAIL-adjacent under its own entry.",
+      "disposition_note": "ROUTE-AUTHENTICATION HALF CLOSED BY MEASUREMENT by tenancy/fix-authz-hygiene, NOT BY A FIX. The finding's own words -- \"POST /api/v1/communities extracts no AuthContext and passes None\" -- are STALE. Measured on this tree: routes/community.rs::create_community (the db arm) takes ViewerExtractor(viewer) and passes viewer.principal() as the creator argument to CommunityRepository::create, above a doc comment that explains the choice and notes the route is on the protected chain so ViewerExtractor already 401s an unauthenticated caller. Its repo-layer counterpart community_projection.rs::a_known_creator_becomes_the_projected_groups_admin already passes. The measurement IS the evidence and no test was written, because no fix was made. The PROJECTED-GROUPS half is NOT closed and is not reachable from route auth, so nothing in this batch touches it; it also absorbs the second residual F-PR11-community-membership-is-self-service hands over. Location migrations/068_communities_to_groups.sql and epigraph-db/src/repos/community.rs; owner PR-18. Analysis held outside this repository, as `2026-09-12-F-PR12-projected-community-groups.md` in the operator's private record. REVIEW PASS 2026-09-12, same batch: the adversarial review observed that routes/community.rs::create_community, while it does supply a creator, carried no scope extractor at all, so creating a community - which creates a projected groups row and installs the caller as its role='admin' member - cost less than POST /api/v1/groups charges for the same effect, and this batch's own gating of the two membership writes had sharpened that asymmetry rather than flattening it. FIXED in this batch: create_community now takes RequireScopeGroupsWrite, matching routes/groups.rs::create_group tier for tier (groups:write is the create tier and is in the read-write role, so epigraph-wo is unaffected). That is a THIRD thing, not either half of this finding: it is not the route-authentication half (closed by measurement above) and not the projected-groups half (still open). Tests: create_community_without_groups_write_returns_403_and_creates_nothing asserts the absence of the row, not the status code; create_community_with_groups_write_still_succeeds is the positive control. Mutation proof recorded in the PR body. THIS ENTRY REMAINS OPEN for the projected-groups half; owner PR-18.",
       "disposition_date": "2026-09-12",
       "fix_batch": "tenancy/fix-authz-hygiene"
     },
@@ -2272,6 +2199,18 @@
       "disposition_note": "Its own stated owner is structurally correct and cannot be brought forward: the repair cannot edit the migration it concerns, so it belongs to whichever future migration next needs that object. Detail stays outside this repository.",
       "disposition_date": "2026-09-12",
       "accepted_because": "the repair cannot edit an applied migration; owner is a future migration"
+    },
+    {
+      "id": "F-FAH-A1",
+      "where": "crates/epigraph-api/src/routes/reasoning.rs",
+      "what": "routes/reasoning.rs::analyze and its load_edges_from_db helper need the conversion this workstream applies elsewhere. Raised by the adversarial review of tenancy/fix-authz-hygiene; adjacent to that batch's routes/batch.rs change and deliberately not widened into by it. Analysis held outside this repository, as `2026-09-12-F-FAH-A1-reasoning-analyze-surface.md` in the operator's private record.",
+      "detail": "Filed so the surface is tracked as a finding with an owner rather than only as one row of no_unscoped_pool.rs's conversion register, which is a counter and not a finding. Shape of the eventual fix is the same as the PR-26/28/29 conversion shards.",
+      "status": "OPEN. Filed 2026-09-12 by tenancy/fix-authz-hygiene; not fixed by it.",
+      "assigned": "CONVERSION-TAIL",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Filed by tenancy/fix-authz-hygiene's review pass, NOT fixed by it: this batch's specification is seven named findings and this is not one of them, and the fix is a scheduled conversion shard rather than a hygiene change. Location routes/reasoning.rs::analyze; owner CONVERSION-TAIL. Analysis held outside this repository, as `2026-09-12-F-FAH-A1-reasoning-analyze-surface.md` in the operator's private record.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "conversion-tail"
     }
   ],
   "closed_findings": [
@@ -2456,6 +2395,84 @@
       "disposition_note": "MIS-STATED, measured on 0f6f8b02. get_webhook takes RequirePrincipal and refuses when sub.agent_id is not the caller, so it is not readable by an arbitrary caller. What remains true is narrow and not a defect: an owner can read their own inactive subscription by id. There is no deactivation path in the tree, so the state is unreachable, and an owner reading their own deactivated registration is the behaviour one would choose anyway.",
       "disposition_date": "2026-09-12",
       "status": "closed 2026-09-12 by the findings-disposition pass"
+    },
+    {
+      "id": "F-unauthenticated-server-agent-id-resolved-once-at-boot",
+      "where": "crates/epigraph-mcp/src/main.rs",
+      "what": "A transient database failure at startup permanently disables every content tool on the --allow-unauthenticated-http listener for the life of the process",
+      "detail": "On error the code logs and stores None, which request_viewer turns into a hard refusal until restart. Before PR-09 the same listener resolved lazily per request and would start working again once the database recovered. The fail-closed choice is right; the once-only caching is the problem. Environment-specific weight: reference_postgres_static_ip_boot_race means Postgres losing its address on reboot is a recurring event here, so a co-scheduled MCP restart can land in exactly this window, and the symptom ('token carries no agent principal' from every tool) does not point at a boot-time DB blip. Fix: hold the id behind an Arc<OnceCell<Uuid>> that request_viewer can lazily re-resolve when it is None, keeping the boot attempt as a warm-up plus the loud error log.",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED by tenancy/fix-authz-hygiene. The middleware state is now auth::UnauthenticatedPrincipal -- a boot-time warm-up plus a ServerPrincipalSource consulted whenever the warm-up is absent -- instead of an Option<Uuid> snapshot, so an unresolved id is re-attempted per request rather than being a process-lifetime verdict. The boot attempt and its loud error log are kept. The fail-closed behaviour is unchanged: while unresolved, the injected context carries no principal and content tools refuse. CORRECTION TO THE FINDING'S FIX SITE: the cell cannot live in tools::viewer::request_viewer, which sees only (server, auth) and cannot distinguish an unresolved listener from a real Bearer token carrying no agent principal -- a distinction PR-09 installed as a deliberate hard refusal and locked_decisions.rs::d3_mcp_viewer_acquisition_does_not_flatten_a_client_id pins by source text. request_viewer is therefore untouched. No further caching was added because EpiGraphMcpFull::agent_id already stores only on success and so already retries. tests/http_auth_test.rs::boot_unauth_router passes UnauthenticatedPrincipal::unresolvable() in place of None. Mutation proof: collapsing the warm-up check to `return self.warm;` makes an_unresolved_boot_snapshot_is_retried_on_the_next_request observe no principal on the second request. REVIEW PASS 2026-09-12, same batch: the adversarial review observed that an unbounded per-request retry traded one defect for another. Re-measured and confirmed on this tree: server.rs::EpiGraphMcpFull::agent_id takes agent_db_id.lock().await and HOLDS that guard across every database await inside it, and its not-found arm writes (AgentRepository::create, set_llm_properties, ensure_personal_group). So during exactly the outage the fix exists to survive, concurrent requests on the --allow-unauthenticated-http listener would serialize on one mutex, each paying a pool-acquire timeout, making tail latency N x timeout where the pre-fix behaviour at least answered instantly. FIXED in this batch: UnauthenticatedPrincipal now carries a cooldown (DEFAULT_RESOLUTION_COOLDOWN, 5s) and a shared last_attempt stamp taken BEFORE the source is consulted and cleared on success, so a burst during an outage collapses to roughly one attempt per interval and a healthy resolver is never throttled. The FAIL-CLOSED VERDICT IS UNCHANGED: a throttled request yields the same None an unresolved principal already yielded. The pre-existing retry test now runs with with_cooldown(Duration::ZERO) so it still observes one attempt per request and measures the retry rather than the bound; two tests added -- a_failed_resolution_is_not_retried_again_within_the_cooldown (20 requests, 1 attempt, and every response still carries no principal) and a_succeeding_resolution_is_never_throttled (the over-suppression control). Mutation proof recorded in the PR body.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene",
+      "status": "closed 2026-09-12 by tenancy/fix-authz-hygiene"
+    },
+    {
+      "id": "F-PR10-unknown-claim-id-delivers",
+      "found_by": "PR-10 land-phase critic",
+      "what": "The webhook fan-out treats 'the payload names a claim id with no `claims` row' as visible-and-deliver. routes/batch.rs::batch_create_claims exercises that branch on every request: it inserts only into AppState::claim_store and publishes a ClaimSubmitted per claim, so the claim id, submitting agent id and truth value reach every active subscription with no tenancy decision made.",
+      "why_it_matters": "hidden_claim_ids' contract ('an id that names no row at all is not returned') is right for PR-09's use - redacting rows already fetched from a viewer-scoped source - and permissive for a delivery decision to an arbitrary external URL. PR-12 will not fix it, because the row still will not exist. NOT a PR-10 regression: before PR-10 every event went to every subscriber unconditionally.",
+      "why_not_fixed_in_pr10": "Both in-scope fixes are wrong. Suppressing on named-but-absent would suppress nearly everything, because payload_uuids also collects agent, frame and workflow ids. Narrowing the scan to declared claim ids is the key allowlist PR-09 rejected verbatim. The doc now names the branch instead of asserting it away.",
+      "suggested_fix": "Either make batch_create_claims persist (it has no auth extractor either, so it needs its own PR), or stop it publishing ClaimSubmitted for rows that do not exist.",
+      "owner": "PR-12 or the PR that authenticates routes/batch.rs",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED by tenancy/fix-authz-hygiene, taking the second of the two fixes the finding endorses. routes/batch.rs::batch_create_claims no longer publishes ClaimSubmitted. MEASUREMENT THE FINDING DID NOT STATE: the handler's only persistence is AppState::claim_store, which nothing drains into claims, and validate_batch_item mints a fresh claim uuid and a fresh AgentId per item -- so \"stop publishing for rows that do not exist\" reduces here to publishing nothing at all, and an existence query would have been a round trip whose answer is always \"none\". The other fix (make it persist) stays deferred: it needs SQL in the repo layer, an ownership decision at INSERT under migration 074's require-tenancy guards, and an auth extractor this handler still does not have. No in-process consumer keys on ClaimSubmitted, so the observable effect is that batch-imported ids stop reaching external subscriptions and stop occupying the event-bus history. The filter itself is unchanged and its permissive branch is still documented in routes/webhooks.rs; what changed is the caller that exercised it. The pinned assertion the recon warned about (test_batch_publishes_events_for_each_created_claim) sits in a cfg(all(test, not(feature = \"db\"))) module that no configuration compiles; it is inverted for honesty, and the live assertion is tests/batch_publish_test.rs. Mutation proof: restoring the publish loop makes a_batch_import_creates_its_claims_and_publishes_no_event observe 2 events.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene",
+      "status": "closed 2026-09-12 by tenancy/fix-authz-hygiene"
+    },
+    {
+      "id": "F-PR10-admin-stats-unscoped",
+      "found_by": "PR-10 land-phase critic",
+      "what": "routes/admin.rs::system_stats takes no auth extractor and no check_scopes - only State(state) - and is registered on the `protected` router in both chains, so any authenticated principal with any scope reads the whole SystemStats aggregate, including WebhookStats { webhook_count }.",
+      "why_it_matters": "PR-10's boot hydration widens webhook_count from a per-process artefact to the cardinality of webhook_subscriptions across every tenant. A count, not content - but it is the one unfiltered path out of AppState::webhook_store, and it falsified the invariant repos/webhook.rs::list_active's doc originally rested its no-Viewer exemption on. That doc is corrected; the route is not.",
+      "suggested_fix": "Gate system_stats behind claims:admin, or drop webhook_count from SystemStats, or make it count only the caller's rows. Note admin.rs:1017 and :1137 both assert on webhook_count.",
+      "owner": "PR-16",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED by tenancy/fix-authz-hygiene. Re-measured: routes/admin.rs::system_stats took State(state) alone. It now takes the RequireScopeAdmin extractor, so claims:admin is required; one definition serves both create_router chains because the handler is not cfg-split. The first of the three fixes the finding offered was taken; narrowing webhook_count per caller would have put a read of webhook_subscriptions in a route handler, and dropping the field would have removed a metric an operator legitimately watches. AVAILABILITY COST, recorded because it is a breaking change: claims:admin is in ADMIN_ONLY_SCOPES, so every epigraph-ro and epigraph-wo token, every agent auto-provisioned by POST /api/v1/agents and every DCR-registered public client now gets 403 here; docs/deploy.md gains a section 1a saying so. The finding's line numbers (admin.rs:1017 and :1137) were stale AND those assertions sit in a cfg(all(test, not(feature = \"db\"))) module that no configuration compiles, so they were never coverage; the live assertions are tests/admin_stats_scope_test.rs. repos/webhook.rs::list_active's doc, which narrated this gap as open, is corrected. Mutation proof: RequireScopeAdmin -> RequireScopeWrite makes system_stats_with_claims_write_returns_403 observe 200.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene",
+      "status": "closed 2026-09-12 by tenancy/fix-authz-hygiene"
+    },
+    {
+      "id": "F-PR10-agentless-principal-resolves-to-public-only",
+      "found_by": "PR-10 land-phase critic",
+      "what": "Viewer::resolve (visibility.rs:269) returns Ok(Viewer{Scoped{group_ids: []}}) for a principal with no `agents` row, because GroupMembershipRepository::list_live_for_agent returns an empty Vec rather than an error. agent_may_receive therefore does NOT fail closed for a deleted agent - it demotes the subscription to a public-only subscriber.",
+      "why_it_matters": "Combined with the fact that migration 085's ON DELETE CASCADE removes the ROW but nothing evicts AppState::webhook_store, a running process keeps delivering public-visibility claims to a deleted agent's endpoint until it restarts. Wider than it will eventually be: with migration 062 defaulting visibility to 'public' and nothing transcribing ownership until PR-12, 'public-only' is currently close to 'everything'.",
+      "suggested_fix": "Have agent_may_receive (or Viewer::resolve itself) distinguish 'agent exists with no groups' from 'agent does not exist', and fail closed on the latter. Both branches are now named in agent_may_receive's doc so the 'fails closed' list is honest.",
+      "owner": "PR-12",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED by tenancy/fix-authz-hygiene. Re-measured and reproduced. The fix is local to the webhook fan-out, not to Viewer::resolve: routes/webhooks.rs::agent_principal_exists probes AgentRepository::get_by_id and retain_visible_subscriptions drops any subscription whose principal names no agents row, logging a missing principal and a failed probe differently. Viewer::resolve is untouched, because \"an empty membership set is not an error\" is its documented and correct contract for every other caller, including the nil principal that five test crates resolve. No new SQL (get_by_id exists and takes no Viewer), so no visibility_lint exemption and no .sqlx regeneration. MEASUREMENT THAT NARROWS THE FINDING: the probe is placed alongside the agent_id == None partition, above the payload-names-no-uuid early-out, but relocating it below that early-out was tried and changed no test outcome, because every EpiGraphEvent variant serialises at least one uuid and the early-out is unreachable from any current publisher. The placement is a robustness choice, not an observable difference, and is documented as such rather than claimed. Mutation proof: OR-ing the existence verdict away makes a_subscription_whose_agent_row_is_gone_is_never_delivered_to observe the deleted principal's subscription in the attempted set.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene",
+      "status": "closed 2026-09-12 by tenancy/fix-authz-hygiene"
+    },
+    {
+      "id": "F-PR10-webhook-url-unvalidated",
+      "found_by": "PR-10 land-phase critic",
+      "what": "register_webhook validates only that the URL is non-empty (and migration 085's `CHECK (btrim(url) <> '')` mirrors exactly that), so any caller with webhooks:write can register a link-local metadata address or a loopback port and have the api POST signed event payloads there.",
+      "why_it_matters": "Pre-existing and out of PR-10's ledgered scope, but PR-10 changes the blast radius: an SSRF-shaped target was a process-lifetime condition and is now a durable row that boot hydration re-arms on every deploy.",
+      "suggested_fix": "Scheme allowlist plus a private-range/link-local denylist at registration time.",
+      "owner": "unassigned",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED by tenancy/fix-authz-hygiene. Re-measured: register_webhook validated only url.trim().is_empty(). It now also requires an http/https scheme and refuses loopback, link-local, private-range and unspecified IP literals (IPv4-mapped IPv6 unwrapped first), via routes/webhooks.rs::validate_webhook_url. The policy STATES WHAT IT DOES NOT COVER, in the function doc and in tests/webhook_url_policy_test.rs: DNS rebinding is out of scope because the check runs at registration against the supplied literal and resolves nothing; validation applies at registration, so rows already in webhook_subscriptions are grandfathered and re-armed by boot hydration on every deploy; migration 085's CHECK (btrim(url) <> '') is unchanged; and it is a denylist of internal targets, not an allowlist of permitted ones. No new dependency (url 2 was already a direct one). Mutation proof: discarding the validator's verdict makes an_internal_or_non_http_delivery_target_is_refused observe 201 on an IPv4 loopback target. REVIEW PASS 2026-09-12, same batch: the adversarial review observed that a policy judging IP LITERALS only refused the literal spelling of loopback and accepted the ordinary one, and that the new test's own control pinned a loopback NAME at 201 -- recording the gap as intended behaviour, which is worse than the gap. WIDENED: validate_webhook_url now also refuses the names RFC 6761 reserves to loopback (localhost, and anything under .localhost), case-insensitively with a trailing root dot stripped, via a static denylist. This does NOT move the no-resolution boundary: those names are reserved to loopback by definition rather than by a record that could change, so no resolver is consulted and every other name is still accepted on its face. The control fixture was moved to a name under .example (RFC 2606), which never resolves and has no loopback semantics, so it pins 'names are not resolved' and nothing else. Four spellings added to an_internal_or_non_http_delivery_target_is_refused's table. Mutation proof recorded in the PR body. NOT adopted: 100.64.0.0/10, because Ipv4Addr::is_shared is unstable and the 'this is not an allowlist' disclaimer already covers it.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene",
+      "status": "closed 2026-09-12 by tenancy/fix-authz-hygiene"
+    },
+    {
+      "id": "F-PR11-community-membership-is-self-service",
+      "found_by": "PR-11 land-phase critic",
+      "what": "routes/community.rs::add_member takes only a ViewerExtractor and State - no scope extractor, no community-admin check, and no requirement that the perspective being added belongs to the caller. remove_member has neither a Viewer nor a scope extractor.",
+      "why_it_matters": "It routes around the declassification control PR-11 just hardened, for the whole `community` partition. access_control.rs::check_content_access's \"community\" arm returns ContentAccess::Full to any requester owning a perspective that is a member of the gating community, so instead of calling the now-gated update_partition, any authenticated agent creates a perspective, POSTs it into the gating community, and reads everything behind it. The two existence pre-checks are viewer-filtered, but migration 062 defaults visibility to 'public', so on today's corpus that filter excludes nothing. remove_member is the integrity twin: any authenticated agent can evict any perspective from any community.",
+      "suggested_fix": "A require_community_admin-shaped membership check plus a scope extractor, mirroring groups::add_member (which takes RequireScopeGroupsAdmin AND calls group_authz::require_group_admin).",
+      "owner": "PR-16 for the scope extractor and the admin-shaped rule; PR-12 closed the self-service grant and the self-service eviction.",
+      "status": "SUBSTANTIALLY CLOSED BY PR-12, and PR-12 is why it had to be. Projecting the membership moved the hole out of check_content_access's community arm (which PR-14 deletes) and into the group_memberships / Viewer::resolve control plane, which SURVIVES PR-14 and is armed by PR-17 - i.e. it was on its way from a soon-to-be-deleted ACL bug to a durable tenancy bypass. CommunityRepository::add_member and ::remove_member now enforce CLOSED MEMBERSHIP (the acting agent must hold a live membership in the community's projected group; bootstrap exception only when that group has none, because migration 068 left every projected group with zero administrators by design; remove_member additionally always permits removing your own perspective). remove_member's handler, which previously extracted nothing at all, now takes a ViewerExtractor, and create_community passes the authenticated creator so a community created through the route is never in the bootstrap state. Gating only the PROJECTION would not have worked: 071's shim replays it out of community_members on every community-partitioned ownership write. FULLY CLOSED 2026-09-12 by tenancy/fix-authz-hygiene, which added the one thing PR-12 left: the scope extractor on both membership writes.",
+      "residual": "The rule is deliberately weaker than the suggested require_community_admin: community groups have no admins to require, so a community whose projected group is genuinely memberless is still open to the first joiner. That is the ONLY surviving residual of this finding, it is a consequence of migration 068 rather than of route authorization, and it is handed to F-PR12-community-groups-still-have-no-admin; owner PR-18. The scope extractor this field previously listed as outstanding was added 2026-09-12 by tenancy/fix-authz-hygiene.",
+      "disposition": "CLOSED",
+      "disposition_note": "CLOSED by tenancy/fix-authz-hygiene, taking the stated scope-extractor residual only. routes/community.rs::add_member and ::remove_member now take RequireScopeGroupsAdmin, mirroring routes/groups.rs: scope AND membership, never OR, with the membership half staying in CommunityRepository where both writers reach it. groups:admin rather than groups:write because canonical_scopes.rs states that groups:write gates CREATING a group while managing an existing group's membership needs groups:admin plus membership -- and migration 068 projects a community onto a groups row ID-preservingly, so a membership granted here is the same group_memberships row POST /api/v1/groups/:id/members grants. AVAILABILITY COST: groups:admin is in ADMIN_ONLY_SCOPES, so every epigraph-ro and epigraph-wo token and every auto-provisioned agent now gets 403 on both routes. The rejected alternative was minting a communities:write scope, on the precedent routes/webhooks.rs::list_webhooks set when it declined a webhooks:read scope. CORRECTION: the recon's claim that remove_member has neither a Viewer nor a scope extractor is half stale -- PR-12 added ViewerExtractor; only the scope was missing. The memberless-projected-group residual this finding names is NOT closed, is not reachable from route authorization, and stays under F-PR12-community-groups-still-have-no-admin; owner PR-18. (An earlier revision of this note referred to it as 'the second residual', an ordinal that no longer matched the rewritten `residual` field above.) Mutation proof: RequireScopeGroupsAdmin -> RequireScopeGroupsWrite makes add_member_without_groups_admin_returns_403 and remove_member_without_groups_admin_returns_403_and_leaves_the_row observe 204.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     }
   ],
   "halted": null,
