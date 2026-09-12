@@ -462,6 +462,14 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 ///
 /// Keyed on `(file, fn)` the same way [`EXPECTED_EXEMPTIONS`] is, so a new
 /// entry is a visible diff naming the function.
+///
+/// # The last eleven entries arrived with a selector change, not a tree change
+///
+/// The block at the end of this array, under its own banner comment, is the
+/// register the widened selector produced. Those eleven functions were in the
+/// tree before and are unchanged by it; what changed is that the lint can now
+/// see them. Read them as a first review, not as a regression — and read the
+/// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
@@ -877,56 +885,197 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          caller has already performed in the same transaction; there is no read whose result could \
          widen.",
     ),
+    // ---------------------------------------------------------------------
+    // Surfaced by the SIGNATURE selector, not by any change to these
+    // functions. Every entry below already existed and already took a
+    // `&mut PgConnection` without a `Viewer`; the previous name-suffix rule
+    // simply did not look at them. Each was read individually for this
+    // register.
+    // ---------------------------------------------------------------------
+    (
+        "agent.rs",
+        "ensure_for_client",
+        "WRITE, plus the two lookups it needs. Locks one `oauth_clients` row `FOR UPDATE`, may \
+         adopt an existing `agents` row by public key, and links the two. Neither table is \
+         tenancy-partitioned: `oauth_clients` has no `visibility` and no `owner_group_id` at all, \
+         and `agents` is deliberately `USING (true)` under migration 077 because authorship has to \
+         render on a public claim. The PII on `agents.properties` is narrowed by the repo-layer \
+         projection in `public_profile`, which this function does not use and does not return.",
+    ),
+    (
+        "agent.rs",
+        "ensure_personal_group",
+        "WRITE, idempotent, of one `groups` row via `epigraph_ensure_personal_group`. `groups` \
+         carries no `visibility`; migration 077 section 7's groups_tenancy policy is its control \
+         and selects on the CONNECTION. It resolves a NAMED agent's own personal group and returns \
+         only that group's id — the agent id is the caller's input, so no row the caller did not \
+         already name can come back.",
+    ),
+    (
+        "agent.rs",
+        "public_key_if_signer",
+        "READ of `agents`, projecting `public_key` for one id already held by the caller, and only \
+         where `key_kind = 'ed25519'`. `agents` is deliberately not tenancy-partitioned — \
+         migration 077's policy on it is `USING (true)` with its own `VISIBILITY-EXEMPT` marker, \
+         because authorship must render on a public claim. The `key_kind` filter is itself the \
+         narrowing this function exists for: it is what signature verification calls so that a \
+         derived OAuth placeholder's bytes can never be mistaken for a signer's key.",
+    ),
+    (
+        "claim.rs",
+        "default_decl_for_author",
+        "Runs NO SQL of its own. It wraps `personal_group_of` — registered immediately below, and \
+         subject to this same lint — in a `TenancyDecl` for a named agent. Registered rather than \
+         skipped: this lint has no delegating-wrapper exception today, and adding one would widen \
+         what it cannot see in the same change that widens what it can. A register row is a \
+         visible diff; a new skip rule is not.",
+    ),
+    (
+        "claim.rs",
+        "personal_group_of",
+        "READ of `groups` by the deterministic `did:epigraph:personal:<agent_uuid>` key, falling \
+         back to `AgentRepository::ensure_personal_group` when absent. `groups` carries no \
+         `visibility` column; migration 077 section 7's groups_tenancy policy is its control and \
+         selects on the CONNECTION. The agent id is the caller's own input and one group id is the \
+         entire result, so there is no set a predicate could narrow.",
+    ),
+    (
+        "claim.rs",
+        "create_with_tx",
+        "WRITE path into `claims` (LEGACY content-hash dedup), plus the dedup SELECT that is part \
+         of the mutation. Migration 077's `WITH CHECK` rather than a read predicate is the \
+         control, exactly as for the `*_conn` writes above. The dedup read already carries its own \
+         `VISIBILITY-EXEMPT` marker in the SQL; note that marker is INERT for \
+         `the_exemption_set_is_exactly_what_was_reviewed`, which inspects only viewer-taking \
+         functions, and this one takes no viewer.",
+    ),
+    (
+        "claim.rs",
+        "create_strict",
+        "WRITE into `claims`, a single INSERT with an explicit `visibility` and `owner_group_id` \
+         supplied by the caller's `TenancyDecl`. It is the D1-compliant creation path: ownership \
+         is a required argument rather than a column default, and migration 077's `WITH CHECK` is \
+         what refuses a declaration the writer may not make. `RETURNING` projects back only the \
+         row this statement just inserted.",
+    ),
+    (
+        "instance_admin.rs",
+        "privatization_authority",
+        "READ of `group_memberships` and `groups`, returning four scalars and no ids. It MUST run \
+         unfiltered on the maintenance connection and its own doc says why: a count of a target \
+         group's other live admins narrowed to what the CALLER can see would report zero for a \
+         caller who cannot see the roster, and refuse — a fail-closed wrong answer that is \
+         indistinguishable from the true one. A viewer predicate here would corrupt the \
+         authorisation decision rather than protect it.",
+    ),
+    (
+        "oauth_client.rs",
+        "set_agent_id",
+        "WRITE of one column, write-once. `oauth_clients` has no tenancy at all — neither \
+         `visibility` nor `owner_group_id` — the same absent-column argument as `get_by_id_conn` \
+         above. The `AND agent_id IS NULL` guard is the control that matters here: it makes the \
+         link unrebindable, so a re-mint or a raced first-mint can never transfer the ownership \
+         and membership decisions made under the old identity.",
+    ),
+    (
+        "privatization.rs",
+        "create_previewed_plan",
+        "WRITE of one `privatization_plans` row in the `previewed` state. `privatization_plans` \
+         has NO tenancy column at all — no `visibility`, no `owner_group_id` — the same argument \
+         `load_plan_conn` above makes for reads of it. Migration 087's policies plus the guard \
+         that `RAISE`s (which the route maps to 403) are the control on who may create one.",
+    ),
+    (
+        "privatization.rs",
+        "freeze_into",
+        "WRITE into `privatization_plan_items`, whose `INSERT ... SELECT` joins `claims` to record \
+         each item's prior state. It belongs to the SELECTION pass, which this module's own docs \
+         require to run UNFILTERED under a bypass viewer: a selection narrowed to what the actor \
+         can see would silently omit exactly the rows privatization exists to catch and then \
+         report success. Nothing crosses to the caller — the return value is the row COUNT, and \
+         ids and content are re-filtered under the actor's own viewer by `visible_previews`.",
+    ),
 ];
 
-/// A `*_conn` sibling must spend a viewer, or say in writing why it has none.
+/// A connection-taking repo fn must spend a viewer, or say in writing why it
+/// has none.
 ///
-/// # Why the name and not the signature
+/// # Why this rule exists at all
 ///
 /// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] inspects only
-/// functions whose PARAMETER LIST mentions `Viewer`. A `*_conn` sibling that
-/// simply omits the `Viewer` parameter is therefore invisible to it — and PR-23
-/// made `*_conn` siblings the standard conversion shape for the 391 sites
-/// `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this rule, a
-/// sibling written without a viewer would pass BOTH controls: this file would
-/// not inspect it, and the ratchet would count its call site as converted
+/// functions whose PARAMETER LIST mentions `Viewer`. A connection-taking
+/// function that simply omits the `Viewer` parameter is therefore invisible to
+/// it — and PR-23 made `*_conn` siblings the standard conversion shape for the
+/// 391 sites `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this
+/// rule, a sibling written without a viewer would pass BOTH controls: this file
+/// would not inspect it, and the ratchet would count its call site as converted
 /// because the `.db_pool` access is gone. The two together would certify
 /// "converted" for a read that filters on nothing.
 ///
-/// So the key is the NAME. Seventeen `*_conn` functions exist today; five take a
-/// `Viewer` (`ClaimRepository::{get_by_id_conn, list_conn, count_conn}` and,
-/// from PR-26, `LineageRepository::{get_lineage_conn, get_descendants_conn}`)
-/// and the twelve below are enumerated with reasons. Seven of the twelve are
-/// writes, where migration 077's `WITH CHECK` rather than a read predicate is
-/// the control.
+/// # The selector is the SIGNATURE, and was the NAME until this change
 ///
-/// # The name rule is also the hole, and PR-18 fell in it
+/// The rule used to be "the name ends `_conn` **and** the parameter list
+/// mentions `PgConnection`". The name half was the hole, and PR-18 fell in it:
+/// its third slice shipped `load_plan`, `list_plans` and `load_plan_items`
+/// viewer-less and connection-taking, registered nowhere, purely because of what
+/// they were called — and they were RENAMED to earn their registration rather
+/// than the lint being widened. Renaming to satisfy a lint is not a fix; it
+/// teaches the next author that the control is a spelling convention.
 ///
-/// Keying on the name means a viewer-less `&mut PgConnection` read called
-/// anything else is invisible to all three registers in this file at once.
-/// PR-18's third slice shipped `load_plan`, `list_plans` and `load_plan_items`
-/// exactly that way — reads of the plan tables, one of them projecting entity
-/// ids — and they were registered nowhere. They are the last three entries in
-/// [`CONN_WITHOUT_VIEWER`] and were RENAMED to earn them. The alternative,
-/// widening the selector to "parameter list mentions `PgConnection`", is a
-/// larger change to this lint's contract than a route slice should make; it is
-/// recorded as a follow-up rather than done here.
+/// PR-18's own doc recorded the widening — "parameter list mentions
+/// `PgConnection`" — as a deferred follow-up, on the grounds that it changes
+/// this lint's contract across the whole repo layer and a route slice should not
+/// make that decision alone. This change IS that follow-up, so the reason for
+/// deferring no longer applies.
 ///
-/// Counted by this test's own rule — name ends `_conn` AND the parameter list
-/// mentions `PgConnection` — not by a bare grep for `_conn`, which finds a
-/// fifteenth (`ClaimRepository::patch_claim_atomic_conn`, whose parameter is a
-/// `Transaction` rather than a `PgConnection`). Quote the rule with the number.
+/// **The cost was real and is paid in [`CONN_WITHOUT_VIEWER`], not hidden.** The
+/// widening surfaced **eleven** previously-unreviewed functions and the register
+/// went 43 → 54. None of them changed; the scanner's vision did. Each was read
+/// individually and carries its own reason naming the table.
+///
+/// # Measured, by this test's own rule, at the time of the widening
+///
+/// Eighty-one repo fns take a `PgConnection` in their parameter list: 27 take a
+/// `Viewer` and the 54 below are enumerated with reasons. Fifty-two functions
+/// have a name ending `_conn`, which is why a bare grep disagrees with the
+/// register in both directions — it catches
+/// `ClaimRepository::patch_claim_atomic_conn` (whose parameter is a
+/// `Transaction`, not a `PgConnection`, so this rule correctly skips it) and it
+/// misses all eleven of the functions the widening added. Quote the rule with
+/// the number; the two are not interchangeable.
+///
+/// # What this rule still cannot see
+///
+/// Two residuals, and the second is about SCOPE rather than spelling. Naming
+/// only the first would leave this paragraph asserting safety by omission — the
+/// defect species this whole batch exists to remove.
+///
+/// 1. **Spelling.** A `Transaction` parameter, as the `patch_claim_atomic_conn`
+///    case shows. The generic `E: sqlx::PgExecutor<'e>` spelling is covered
+///    separately by [`every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt`];
+///    between the two, the remaining uncovered executor spelling is the
+///    transaction.
+/// 2. **Scan root.** [`repo_files`] is a NON-RECURSIVE `read_dir` of
+///    `crates/epigraph-db/src/repos/`, so all three registers see that directory
+///    and nothing else. `repos/` has no subdirectories today, so nothing inside
+///    the root is missed; but a connection-taking function written anywhere else
+///    — a route, a middleware, a job, `epigraph-db/src/pool.rs` — is outside
+///    every register here. Those live under their own controls, not this one.
+///    Widening the root is a contract change of the same size as the name →
+///    signature widening this test just made, and is left as a follow-up rather
+///    than smuggled in beside it.
 #[test]
 fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
     let mut without: Vec<(String, String)> = Vec::new();
     let mut with_viewer = 0usize;
 
     for f in repo_fns() {
-        if !f.name.ends_with("_conn") {
-            continue;
-        }
-        // `repo_fns` does not strip comments, so a doc line that spells out a
-        // signature could otherwise register as a declaration.
+        // THE SIGNATURE, NOT THE NAME. `repo_fns` does not strip comments, and
+        // this predicate is also what keeps a doc line that spells out a
+        // signature from registering as a declaration — a `///` line quoting
+        // `fn foo(` parses as a declaration whose "parameter list" is whatever
+        // follows, and it will not mention `PgConnection` unless the prose
+        // genuinely reproduces the whole signature.
         if !f.params.contains("PgConnection") {
             continue;
         }
@@ -939,16 +1088,19 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
     without.sort();
     without.dedup();
 
+    // Floors, not measurements. 81 and 27 at the widening; these sit well below
+    // so that a shard deleting real functions does not have to edit them, while
+    // a scanner that stopped matching declarations still falls through.
     assert!(
-        with_viewer + without.len() >= 12,
-        "found only {} `*_conn` repo fns — the scanner is not matching declarations and this \
-         lint would pass vacuously",
+        with_viewer + without.len() >= 60,
+        "found only {} connection-taking repo fns — the scanner is not matching declarations and \
+         this lint would pass vacuously",
         with_viewer + without.len()
     );
     assert!(
-        with_viewer >= 3,
-        "no `*_conn` sibling takes a Viewer any more ({with_viewer} found). The conversion shape \
-         PR-23 established has been abandoned; that is a decision, not a refactor."
+        with_viewer >= 15,
+        "only {with_viewer} connection-taking repo fns take a Viewer. The conversion shape PR-23 \
+         established has been abandoned; that is a decision, not a refactor."
     );
 
     let mut want: Vec<(String, String)> = CONN_WITHOUT_VIEWER
@@ -959,8 +1111,9 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 
     assert_eq!(
         without, want,
-        "\n\nThe set of viewer-less `*_conn` repo fns changed. A `*_conn` sibling is the shape a \
-         conversion shard writes when it moves a handler onto `AppState::read_as`, and one \
+        "\n\nThe set of viewer-less connection-taking repo fns changed. A `&mut PgConnection` \
+         parameter is the shape a conversion shard writes when it moves a handler onto \
+         `AppState::read_as` — whatever the function is CALLED — and one \
          written WITHOUT a Viewer is invisible to \
          `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer` AND counts as converted in \
          `no_unscoped_pool.rs`. If the new function is a read, give it a `&Viewer` and splice the \
@@ -1101,6 +1254,108 @@ fn every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt() {
             reason.len()
         );
     }
+}
+
+/// The unconditional `unwrap_or(&[])` bind form and a SPLICED statement must
+/// never appear in the same repo function.
+///
+/// # What the hazard is, in terms of the mechanism
+///
+/// `Viewer::render_fragment` short-circuits a `Bypass` viewer to `" "`, so a
+/// `Bypass` splice "can never emit a `$`". `group_bind()` returns `None` for
+/// `Bypass` to match, and `splice_write`'s own doc states the consequence: the
+/// conditional bind at the call site "is not optional" — `writable_bind()`
+/// returning `None` for `Bypass` "is what makes the guard and the rendered arity
+/// agree". `unwrap_or(&[])` discards exactly that `None`. On a spliced string it
+/// binds a parameter the rendered SQL has no placeholder for, so the guard and
+/// the arity disagree and the statement's correctness depends on which viewer
+/// shape arrives at runtime.
+///
+/// # Why this is a lint and not a bug report
+///
+/// `F-unconditional-group-bind-on-base` alleged this was live. It was CLOSED as
+/// not-reproducible: the sites that `unwrap_or(&[])` are all FIXED-ARITY
+/// statements — `sqlx::query!` macro sites, which need a compile-time literal
+/// and so carry the predicate verbatim, plus one static `query_as` — where the
+/// predicate is unconditionally present and the bind always has its placeholder.
+/// Re-measured here at the time this lint was written and still true: **zero**
+/// functions combine the two.
+///
+/// A measurement that has to be redone by hand is not a control. This keeps the
+/// finding closed by construction, so the next author who adds `unwrap_or(&[])`
+/// beside a splice learns it from a build failure rather than from a re-audit
+/// that may not happen.
+///
+/// # The granularity is the FUNCTION, and that is a deliberate over-approximation
+///
+/// It reports a function that has a spliced statement somewhere and an
+/// unconditional bind somewhere, without proving they are the same statement.
+/// That direction is the safe one — it can only refuse a mixture, never permit
+/// one — and it matches the granularity the rest of this file already uses for
+/// [`SPENT_MARKERS`]. A function that legitimately needs both would be a real
+/// finding to argue in review, not a false alarm to suppress: today none exists.
+#[test]
+fn no_spliced_statement_binds_the_unconditional_group_array() {
+    // The form that discards the `None` a Bypass viewer produces.
+    const UNCONDITIONAL_BINDS: &[&str] = &[
+        "group_bind().unwrap_or(",
+        "writable_bind().unwrap_or(",
+        "bypass_bind().unwrap_or(",
+    ];
+    // The forms that build a statement whose predicate can be absent.
+    const SPLICED: &[&str] = &[".splice(", ".splice_write("];
+
+    let fns = repo_fns();
+    let mut offenders = Vec::new();
+    let mut spliced_fns = 0usize;
+    let mut unconditional_fns = 0usize;
+
+    for f in &fns {
+        let splices = SPLICED.iter().any(|m| f.body.contains(m));
+        let unconditional = UNCONDITIONAL_BINDS.iter().any(|m| f.body.contains(m));
+        if splices {
+            spliced_fns += 1;
+        }
+        if unconditional {
+            unconditional_fns += 1;
+        }
+        if splices && unconditional {
+            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
+        }
+    }
+
+    // NON-VACUITY, both halves. A scanner that matched no splices, or no
+    // unconditional binds, would report a clean tree forever — and this lint's
+    // whole claim is that the two populations are large and DISJOINT, which is
+    // only worth asserting while both are non-empty. Floors, not measurements:
+    // 180 spliced and 30 unconditional when this was written.
+    assert!(
+        spliced_fns >= 120,
+        "found only {spliced_fns} repo fns that splice a viewer — the scanner is not matching \
+         bodies and this lint would pass vacuously over an empty set"
+    );
+    assert!(
+        unconditional_fns >= 20,
+        "found only {unconditional_fns} repo fns using the unconditional `unwrap_or` bind form. \
+         That form is legitimate at a fixed-arity macro site, and this lint's claim is that it \
+         never meets a splice — if the population is empty, the claim is vacuous"
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "\n\nThese repo functions build a SPLICED statement and also bind a viewer array with \
+         the unconditional `unwrap_or(..)` form:\n{}\n\n\
+         A `Bypass` viewer renders the fragment as a single space and emits no placeholder, so \
+         `group_bind()` / `writable_bind()` return `None` and the call site must bind nothing. \
+         `unwrap_or(&[])` discards that `None` and binds anyway, so the guard and the rendered \
+         arity disagree.\n\n\
+         Fix: use the conditional form the mechanism is built around —\n\
+         `if let Some(g) = viewer.group_bind() {{ q = q.bind(g); }}`\n\n\
+         The unconditional form is correct ONLY at a `sqlx::query!` macro site, where the \
+         predicate is a compile-time literal of fixed arity and its placeholder is always \
+         present. Those sites do not splice, which is why the two never meet.\n",
+        offenders.join("\n")
+    );
 }
 
 /// The lint and the repo layer must not drift to spellings of the marker that

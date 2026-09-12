@@ -5,17 +5,25 @@
 //! `docs/tenancy/FINAL-PLAN.md` §6.4 sketches this as a scan over the tool
 //! *modules*, asserting each `crates/epigraph-mcp/src/tools/<x>.rs` contains
 //! `mcp_viewer(`. Measured on this tree, **the only file under `src/tools/`
-//! that mentions `request_viewer` is `viewer.rs`, which defines it.** Viewer
+//! that calls `request_viewer` is `viewer.rs`, which defines it.** Viewer
 //! acquisition happens in the `#[tool_router]` bodies in `src/server.rs`, on
 //! the other side of the dispatch boundary, and the tool module receives an
-//! already-resolved `&Viewer` as a parameter. The sketched test fails for all
-//! 86 tools before PR-09 and all 86 after, so it measures nothing. The
+//! already-resolved `&Viewer` as a parameter. The sketched test fails for
+//! every tool before PR-09 and every tool after, so it measures nothing. The
 //! `TOOL_MODULE_MAP` it calls for is unnecessary.
+//!
+//! (An earlier revision of this paragraph said "all 86 tools", twice. The tree
+//! has 83 `#[tool(` attributes and the number is not what the argument turns
+//! on, so it is stated as a rule rather than re-pinned to a count that will
+//! drift again. [`the_three_categories_partition_every_tool`] is where the
+//! live count is actually asserted.)
 //!
 //! What actually carries the property is the dispatch body, so that is what
 //! this file parses: walk `#[tool(` → `async fn <name>` → the next `#[tool(`,
-//! and classify the span by which of `request_viewer` / `maintenance_viewer` it
-//! contains.
+//! and classify the span by whether it CALLS `request_viewer(` or
+//! `maintenance_viewer(` — over comment-stripped source, so prose naming either
+//! helper is not an acquisition. See [`server_src`] for why both narrowings are
+//! there.
 //!
 //! # The ratchet
 //!
@@ -35,6 +43,9 @@
 //! `no_inline_sql_in_tools.rs`. This file is only the acquisition half, and
 //! saying so is part of not over-claiming it.
 
+mod lint_text;
+
+use lint_text::strip_comments;
 use std::path::{Path, PathBuf};
 
 /// Tools whose dispatch body acquires **no** viewer, as measured on
@@ -135,6 +146,37 @@ fn server_rs() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs")
 }
 
+/// `src/server.rs` as the scanners must see it: **comments removed**.
+///
+/// Every classification in this file is a substring search over a dispatch
+/// body, so unstripped it cannot tell an acquisition from a comment mentioning
+/// one. That defect has already been paid for twice over, in opposite
+/// directions:
+///
+/// * **Loud** — `viewer_acquisition_lives_in_server_rs_not_in_the_tool_modules`
+///   went red on a doc paragraph in `tools/perspectives.rs` that explained which
+///   principal the stdio transport resolves. The fix was to reword prose. A lint
+///   a comment can break trains contributors not to name what they document.
+/// * **Silent, and the one that matters** — [`tools`] classifies a dispatch span
+///   as having acquired a viewer on the same kind of substring. A tool whose
+///   body merely MENTIONED the helper would be counted as having acquired one,
+///   never reach [`EXPECTED_TOOLS_WITHOUT_A_VIEWER`], and leave
+///   `every_content_reading_tool_derives_a_viewer` green. A coverage control
+///   that can be satisfied by prose is the "looks like a control, measures
+///   nothing" shape this whole file exists to avoid.
+///
+/// Only the first was reported. Both are closed here, because they are one
+/// mechanism in one function and fixing the reported half alone would have left
+/// the unreported half in the same file.
+///
+/// **Stripping moved no number.** Measured before the change: 83 `#[tool(`
+/// attributes, 61 `Request` / 3 `Maintenance` / 19 `None`, and the tool-module
+/// mention set `["viewer.rs"]` — all byte-identical stripped and unstripped. The
+/// hazard is closed without re-baselining anything.
+fn server_src() -> String {
+    strip_comments(&std::fs::read_to_string(server_rs()).expect("read server.rs"))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Acquisition {
     Request,
@@ -148,6 +190,29 @@ enum Acquisition {
 /// the last). That is exact for this file because `#[tool(` appears nowhere
 /// else in it — [`the_span_delimiter_is_unambiguous`] checks that rather than
 /// assuming it.
+///
+/// **`src` must be comment-stripped** — pass [`server_src`], not a raw read.
+/// The acquisition test below is a substring search, and on raw source a
+/// dispatch body that mentions the helper in prose while acquiring nothing would
+/// be classified as having acquired one.
+///
+/// The needles require the CALL position (`request_viewer(`), not the bare
+/// identifier, which narrows a PROSE mention of the helper to one that also
+/// writes the open parenthesis.
+///
+/// **It does not rule out a string literal, and an earlier revision of this
+/// paragraph claimed it did.** `strip_comments` preserves string contents by
+/// design, so a `tracing` format string, an error message or a
+/// `#[tool(description = ...)]` blob containing the call text WOULD classify the
+/// span as [`Acquisition::Request`] — the silent direction, because such a tool
+/// never reaches `EXPECTED_TOOLS_WITHOUT_A_VIEWER` and
+/// [`every_content_reading_tool_derives_a_viewer`] stays green. Measured on the
+/// tree as it stands: every `request_viewer` occurrence in `server.rs` is a real
+/// call, and both non-call `maintenance_viewer` hits are doc comments, which
+/// stripping removes. So the population is clean today and the residual is
+/// stated rather than closed; blanking string contents as well as comments is
+/// the fix, and it would move this crate's registers, so it is not folded in
+/// beside a doc correction.
 fn tools(src: &str) -> Vec<(String, Acquisition)> {
     let mut starts: Vec<usize> = src.match_indices("#[tool(").map(|(i, _)| i).collect();
     starts.push(src.len());
@@ -164,9 +229,9 @@ fn tools(src: &str) -> Vec<(String, Acquisition)> {
             .unwrap_or(rest.len());
         let name = rest[..end].to_string();
 
-        let acq = if body.contains("request_viewer") {
+        let acq = if body.contains("request_viewer(") {
             Acquisition::Request
-        } else if body.contains("maintenance_viewer") {
+        } else if body.contains("maintenance_viewer(") {
             Acquisition::Maintenance
         } else {
             Acquisition::None
@@ -178,7 +243,7 @@ fn tools(src: &str) -> Vec<(String, Acquisition)> {
 
 #[test]
 fn every_content_reading_tool_derives_a_viewer() {
-    let src = std::fs::read_to_string(server_rs()).expect("read server.rs");
+    let src = server_src();
     let all = tools(&src);
 
     let mut without: Vec<String> = all
@@ -209,7 +274,7 @@ fn every_content_reading_tool_derives_a_viewer() {
 
 #[test]
 fn the_maintenance_bypass_set_is_exactly_what_was_reviewed() {
-    let src = std::fs::read_to_string(server_rs()).expect("read server.rs");
+    let src = server_src();
     let mut maint: Vec<String> = tools(&src)
         .iter()
         .filter(|(_, a)| *a == Acquisition::Maintenance)
@@ -238,7 +303,7 @@ fn the_maintenance_bypass_set_is_exactly_what_was_reviewed() {
 /// assertions above pass on a shrinking population.
 #[test]
 fn the_three_categories_partition_every_tool() {
-    let src = std::fs::read_to_string(server_rs()).expect("read server.rs");
+    let src = server_src();
     let all = tools(&src);
     let attrs = src.matches("#[tool(").count();
 
@@ -274,6 +339,9 @@ fn the_three_categories_partition_every_tool() {
 /// is what an attribute always does and a string literal never does.
 #[test]
 fn the_span_delimiter_is_unambiguous() {
+    // RAW, deliberately. This is a property of the file as written, and reading
+    // it through `server_src` would let comment stripping conceal exactly the
+    // ambiguity being checked.
     let src = std::fs::read_to_string(server_rs()).expect("read server.rs");
     let total = src.matches("#[tool(").count();
     let line_initial = src
@@ -286,6 +354,18 @@ fn the_span_delimiter_is_unambiguous() {
          line — one is inside a string or comment, and the span parser would \
          mis-slice there"
     );
+
+    // The delimiter must also survive stripping unchanged. If the two counts
+    // ever diverge, a `#[tool(` lives in a comment: the scanners below would
+    // slice one set of spans and this test would have certified another, so the
+    // two halves of the file would be reasoning about different populations.
+    assert_eq!(
+        total,
+        server_src().matches("#[tool(").count(),
+        "the `#[tool(` count changes when comments are stripped, so at least \
+         one delimiter is inside a comment. Span slicing and this delimiter \
+         check would then disagree about how many tools exist."
+    );
 }
 
 /// The plan's own version of this test is unsatisfiable, and this records why.
@@ -293,33 +373,56 @@ fn the_span_delimiter_is_unambiguous() {
 /// Plan §6.4 asserts each tool module contains `mcp_viewer(`. If someone
 /// re-reads the plan and re-derives that test, this failure explains the
 /// situation instead of letting them "fix" the source to match.
+///
+/// # Two defects fixed here, neither of which changed the result
+///
+/// It scanned RAW source for the bare identifier, so a doc paragraph naming the
+/// helper failed the test — which is what happened during PR-11's land phase,
+/// and the remedy was to reword prose rather than to change any code. It now
+/// scans stripped source for the CALL position.
+///
+/// It also compared an unsorted `Vec` built from `read_dir` order against a
+/// literal. With one match that could not be observed; with two it would compare
+/// order-dependently against directory order and fail or pass by accident. The
+/// list is sorted before the comparison.
 #[test]
 fn viewer_acquisition_lives_in_server_rs_not_in_the_tool_modules() {
     let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools");
     let mut mentioning = Vec::new();
+    let mut scanned = 0usize;
     for entry in std::fs::read_dir(&tools_dir).expect("read tools dir") {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }
+        scanned += 1;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap()
             .to_string();
-        if std::fs::read_to_string(&path)
-            .expect("read")
-            .contains("request_viewer")
+        if strip_comments(&std::fs::read_to_string(&path).expect("read"))
+            .contains("request_viewer(")
         {
             mentioning.push(name);
         }
     }
+    mentioning.sort();
+
+    // A scan that found nothing is a broken scanner, not a clean tree — and
+    // `viewer.rs` itself is the witness that the needle can match at all.
+    assert!(
+        scanned > 10,
+        "scanned only {scanned} files under src/tools/; the scan root is wrong \
+         and this lint would assert nothing"
+    );
+
     assert_eq!(
         mentioning,
         vec!["viewer.rs".to_string()],
         "plan §6.4 sketches this coverage test as a scan of the tool modules for \
          a `mcp_viewer(` call. Acquisition happens in server.rs's #[tool_router] \
-         bodies; the only tools/ file that names request_viewer is the one that \
+         bodies; the only tools/ file that CALLS request_viewer is the one that \
          defines it. If that changes, revisit every_content_reading_tool_derives_a_viewer."
     );
 }

@@ -13,6 +13,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Bound the job. Every job here inherited GitHub's 6-hour default, so a
+    # hung step burned six hours and left the merge watcher reporting "pending"
+    # with no signal to act on — PR-19 saw one step run ~40 minutes against a
+    # 7-12 minute norm with nothing to compare it to. 90 minutes is ~7x the
+    # observed norm: a real slowdown still finishes, a hang is cut off with a
+    # named cause.
+    timeout-minutes: 90
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -260,6 +267,9 @@ jobs:
   audit:
     name: Security audit (advisory)
     runs-on: ubuntu-latest
+    # Same bound as `test`. `continue-on-error` makes a FAILURE advisory; it
+    # does nothing about a HANG, which still occupies a runner for six hours.
+    timeout-minutes: 90
     continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
