@@ -1719,7 +1719,7 @@
       "status": "open, re-scoped by PR-13 to the five graph_view node projections plus rag_hybrid_context plus semantic_graph_neighbors, and scope-qualified to epigraph-db with the MCP recall.rs residual named separately",
       "assigned": "PR-16 (the PR that arms tenancy REQUIRED and therefore owns the read-path completeness the RLS policies in PR-17 will assume). PR-13 deliberately converted only reads that already had a predicate and says so in its PR body; the residual needs one PR that ADDS predicates to never-filtered statements, with one set of acceptance numbers.",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -1732,7 +1732,7 @@
       "assigned": "TRIAGED BY PR-14, PARTLY DISCHARGED. Previously: 'PR-09 for the MCP mirror; the API remainder is unassigned and MUST be triaged before PR-14 deletes check_content_access' -- that triage is DONE and this field disagreed with its own `detail`. Outcome: edges.rs's 4 sites moved into the repo layer behind spliced Viewer predicates (0 remain); claims.rs's 3 are `#[cfg(test)]` read-backs and are not a disclosure surface at all; the 13 UNCOMPENSATED sites across 8 files were NOT touched and are the whole remaining debt. They now have no filter AND no post-pass -- PR-14 deleted the pass they were once wrongly believed to sit behind -- so they are LIVE, not latent, once the backfill completes (which docs/deploy.md makes a precondition of shipping this release). Owner: unassigned; PROPOSED PR-16, which already owns the write-side predicate for the same files. Same proposal as the sibling finding F-viewer-single-spend-unmechanised.",
       "deadline": "PR-12 for the UNCOMPENSATED set - they have no second line of defence today and become live disclosure the moment ownership lands in the tenancy columns. PR-14 for the compensated two, when check_content_access is deleted. The single 'PR-14' deadline previously recorded here was wrong for nine of the eleven files.",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -1744,7 +1744,7 @@
       "assigned": "PR-16, or a route-layer PR that can move the SQL into the repo layer; PR-13 declined the edges half explicitly",
       "pr23_disposition": "STILL OPEN, and its files (routes/belief.rs 17, routes/political.rs 12, routes/graph_neighborhood.rs 2) are all in the unconverted register above, so a shard cannot close them without touching it. Not taken here: it is inline-SQL relocation into the repo layer, a different change from plumbing the GUCs.",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -1755,7 +1755,7 @@
       "status": "open",
       "assigned": "PR-16 (write-side predicate)",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -1778,7 +1778,7 @@
       "status": "open",
       "assigned": "PR-16 — travels with F-edges-unfiltered's residual (neighborhood_compound_nodes is one of the never-filtered statements PR-13 left open, so the two must be fixed by the same pass over graph_view.rs)",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -1789,7 +1789,7 @@
       "status": "open",
       "assigned": "TRIAGED BY PR-14, NOT DISCHARGED. progress.json said 'unassigned; triage before PR-14', so here is the triage. PR-14 does not review the ~50 unread single-spend handlers and does not claim to: it is a deletion PR whose surface is the redaction pass, not the handler population. What it DOES change is the risk profile, in the adverse direction - until PR-14 a single-spend handler that leaked could still be caught by the check_content_access post-pass on the two files that had one (claims.rs, edges.rs), and that net is now gone everywhere. Offsetting that, PR-14 moved all four of edges.rs's counted inline reads into the repo layer, which removes the file with the densest concentration of them from the register entirely. NET: the finding is unchanged in size and its mechanism gap is unchanged; it needs an owner. Proposed owner PR-16, which is already the owner of FAIL_OPEN_SCOPE_SITES over the same handler population and would be re-reading these files anyway.",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -2043,7 +2043,7 @@
       "status": "open; pointed to from the two walks' in-code comments, detail held privately",
       "assigned": "the conversion-shard series -- the repair is SQL work with its own evidence and not a connection swap, so it must not be attached to a shard that is only moving call sites",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -2055,7 +2055,7 @@
       "assigned": "the conversion-shard series -- owed BEFORE the next walk-shaped handler is converted; a shard that converts more sites does not discharge it",
       "correction": "APPENDED BY PR-18a, 2026-09-08, NOT a rewrite of the original measurement. The `what` field above carries a WRONG pool figure: it says the request pool is 8. The API pool is ScopedPoolOptions::default() = 10; 8 is the JOBS pool. PR-29's Land declined to edit another PR's dated record and reported it as a follow-up, which was the right call -- this is that follow-up, discharged the way the register's own practice prescribes (append a correction, leave the original measurement legible).",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -2149,7 +2149,7 @@
       "status": "open",
       "assigned": "the conversion-shard series",
       "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered or from 'the conversion-shard series', which is not a scheduled PR and therefore was not an owner. Naming the tail explicitly is the honest disposition: this is real remaining work with no owner today, and scheduling it is an operator decision.",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
       "disposition_date": "2026-09-12"
     },
     {
@@ -2466,7 +2466,7 @@
       "FIX-SCHEDULED": "A named branch in this cleanup fixes it, with a mutation proof.",
       "OPERATOR-DECISION": "Blocked on a decision only the operator can make. Recorded in the operator's pending-decisions record.",
       "ACCEPTED": "Carried deliberately. Needs no owner, and the reason it needs none is stated.",
-      "CONVERSION-TAIL": "Belongs to the unnumbered conversion tail (the remaining .db_pool call sites that gate FORCE-RLS). That tail is NOT a scheduled PR and has no owner today; saying so is the point of this label.",
+      "CONVERSION-TAIL": "Belongs to the unnumbered conversion tail (the remaining .db_pool call sites that gate FORCE-RLS). That tail is not a scheduled PR and has no owner TODAY, which is what this label records. It is explicitly a CANDIDATE FOR SCHEDULING, not a decision that the work will not be done -- the operator may well schedule it. The label exists so the absence of a current owner is visible instead of being hidden behind an owner that does not exist.",
       "CLOSED": "Re-measured on 0f6f8b02 and moved to closed_findings, with the measurement recorded.",
       "EMPTY-NEEDS-RE-DERIVATION": "The finding's detail was redacted from this public repository and the private record it points to was never written. The finding is empty and must be re-derived from the code before it can be disposed."
     },
@@ -2490,13 +2490,13 @@
     "operator_decisions_outstanding": [
       "privacy-budget-mechanism",
       "unauthenticated-listener-posture",
-      "schedule-or-accept-the-conversion-tail",
+      "schedule the conversion tail (the operator has indicated it is likely to be done; sequencing is the open question, not whether)",
       "F-PR29-A2",
       "F-PR18b-A1",
       "re-derive the six EMPTY-NEEDS-RE-DERIVATION findings (investigation, not a decision, but it is unscheduled work the operator should know about)"
     ],
     "audits": {
-      "conversion_tail_bucket": "Audited every finding that landed in CONVERSION-TAIL. Three did not belong and were moved: a trigger-migration repair, a pre-existing events coverage limit, and an unimplemented response field. The tail means the remaining .db_pool call sites; anything else in that bucket is mislabelled, which is the same laundering this pass exists to stop.",
+      "conversion_tail_bucket": "Audited every finding that landed in CONVERSION-TAIL. Three did not belong and were moved: a trigger-migration repair, a pre-existing events coverage limit, and an unimplemented response field. The tail means the remaining .db_pool call sites; anything else in that bucket is mislabelled, which is the same laundering this pass exists to stop. The label means 'no owner today and a candidate for scheduling'; an earlier draft of this entry overstated it as 'nobody is going to do this', which is not what the absence of a current owner establishes.",
       "private_record_existence": "Audited all twelve findings whose public text defers detail to a record outside this repository. Six point at a record that does not exist. Those six are re-labelled EMPTY-NEEDS-RE-DERIVATION. Four have a real record and one needed none (its public text is self-contained). The lesson is recorded because the redaction discipline is correct and its second half was being skipped."
     }
   }
