@@ -111,19 +111,20 @@ impl WebhookSubscriptionRepository {
     /// serialises subscription CONTENT — `routes/webhooks.rs::list_webhooks`
     /// and `::get_webhook` — is ownership-filtered by the handler.
     ///
-    /// One path out of the store is NOT ownership-filtered, and stating the
-    /// invariant without it would be stating a falsehood:
-    /// `routes/admin.rs::system_stats` takes no auth extractor and no scope
-    /// check and returns `WebhookStats { webhook_count: store.len() }` to any
-    /// authenticated principal. It discloses a CARDINALITY, never a url, a
-    /// secret or an owner — but hydrating from this function does widen what
-    /// that cardinality means, from "subscriptions registered during this
-    /// process's lifetime" to "rows in `webhook_subscriptions`, across every
-    /// tenant". That widening is recorded in `docs/tenancy/progress.json`
-    /// (`behaviour_changes`) and the scope gate is left to a follow-up rather
-    /// than bolted on here: `SystemStats` is a fourteen-field aggregate whose
-    /// other thirteen fields have their own callers and two of whose tests
-    /// assert on `webhook_count`.
+    /// One path out of the store does not filter on ownership:
+    /// `routes/admin.rs::system_stats` returns
+    /// `WebhookStats { webhook_count: store.len() }`. It discloses a
+    /// CARDINALITY, never a url, a secret or an owner — but hydrating from this
+    /// function widens what that cardinality means, from "subscriptions
+    /// registered during this process's lifetime" to "rows in
+    /// `webhook_subscriptions`, across every tenant". That widening is recorded
+    /// in `docs/tenancy/progress.json` (`behaviour_changes`), and the follow-up
+    /// the earlier revision of this comment deferred has now landed:
+    /// `system_stats` requires `claims:admin` (an extractor, not an in-handler
+    /// check). So the cross-tenant cardinality is readable by an administrative
+    /// principal rather than by any authenticated one. The count is still not
+    /// per-caller — narrowing it would put a read of this table inside a route
+    /// handler — and that remains the deliberate shape.
     ///
     /// # Errors
     /// [`DbError`] on any database error.

@@ -280,6 +280,97 @@ async fn a_subscription_with_no_principal_is_never_delivered_to() {
     }
 }
 
+/// A subscription whose `agents` row is gone is delivered to under NO
+/// circumstances — including for an event naming no claim at all.
+///
+/// # The condition, and why it is reachable
+///
+/// `webhook_subscriptions.agent_id` is `NOT NULL REFERENCES agents(id) ON DELETE
+/// CASCADE`, so deleting an agent removes the row from the TABLE. Nothing evicts
+/// it from `AppState::webhook_store`, and the store is what the fan-out reads, so
+/// a running process kept the subscription until it restarted. This fixture
+/// reproduces that exactly: delete the agent, leave the in-memory store
+/// populated.
+///
+/// # Why the second event is here
+///
+/// `Viewer::resolve` returns a scoped viewer over zero groups for a principal
+/// with no `agents` row — indistinguishable from a real agent with no memberships
+/// — so the deleted agent was demoted to a public-only subscriber rather than
+/// refused. The first event exercises that through the claim-visibility path.
+/// The second is a variant that carries **no claim id at all**, i.e. the one
+/// `an_event_naming_no_claim_is_still_delivered` above pins as deliverable: the
+/// refusal must come from the missing principal and not from the absence of a
+/// claim to check, so the pair distinguishes the two reasons a subscription can
+/// go quiet.
+///
+/// It is NOT a test of where in `retain_visible_subscriptions` the check sits.
+/// Measured: every `EpiGraphEvent` variant serialises at least one uuid, so
+/// `payload_uuids` never returns empty for a real event and the
+/// `ids.is_empty()` early-out is unreachable from any current publisher.
+///
+/// The surviving subscriber is in the same store for both events, which is what
+/// distinguishes "the deleted principal was refused" from "the fan-out went
+/// silent".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_whose_agent_row_is_gone_is_never_delivered_to() {
+    let pool = test_pool().await;
+    let (survivor, _survivor_group) = fixture::seed_agent_with_group(&pool, "noagent-live").await;
+    let (deleted, _deleted_group) = fixture::seed_agent_with_group(&pool, "noagent-gone").await;
+    // Authored by the SURVIVOR, so deleting the other agent is not blocked by a
+    // claim referencing it.
+    let public_claim = fixture::seed_public_claim(&pool, survivor, "no-agent-row control").await;
+
+    let gone_sub = unreachable_sub(Some(deleted));
+    let live_sub = unreachable_sub(Some(survivor));
+    let store = store_of(&[gone_sub.clone(), live_sub.clone()]);
+
+    sqlx::query("DELETE FROM agents WHERE id = $1")
+        .bind(deleted)
+        .execute(&pool)
+        .await
+        .expect("delete the subscriber's agent row");
+    let still_there: i64 = sqlx::query_scalar("SELECT count(*) FROM agents WHERE id = $1")
+        .bind(deleted)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_there, 0, "fixture precondition: the agent is gone");
+
+    for (event, what) in [
+        (claim_submitted(public_claim, survivor), "a public claim"),
+        (
+            epigraph_events::EpiGraphEvent::AgentCreated {
+                agent_id: epigraph_core::AgentId::from(survivor),
+                role: epigraph_core::domain::AgentRole::Analyst,
+            },
+            "an event naming no claim",
+        ),
+    ] {
+        let results = deliver_event(
+            &reqwest::Client::new(),
+            &pool,
+            &store,
+            &event,
+            &fast_config(),
+        )
+        .await;
+        let attempted: Vec<Uuid> = results.iter().map(|r| r.subscription_id).collect();
+        assert!(
+            !attempted.contains(&gone_sub.id),
+            "{what}: a subscription whose principal no longer exists has no reading \
+             authority to resolve and must not be delivered to — not even as a \
+             public-only subscriber; got {attempted:?}"
+        );
+        assert!(
+            attempted.contains(&live_sub.id),
+            "control ({what}): the surviving subscriber must still receive it, or \
+             this is a fan-out that went silent rather than a fail-closed one; \
+             got {attempted:?}"
+        );
+    }
+}
+
 /// The event-type filter still works, and it composes with the tenancy filter
 /// rather than replacing it.
 #[tokio::test(flavor = "multi_thread")]

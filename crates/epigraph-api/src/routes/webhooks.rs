@@ -797,10 +797,19 @@ pub fn subscriptions_matching(
 ///
 /// # Cost
 ///
-/// Two round trips per DISTINCT AGENT per event (`Viewer::resolve`, then one
-/// batched `hidden_claim_ids` over every uuid in the payload), and zero when
-/// the payload names no uuid at all. Not per subscription: `ids` is fixed
-/// within a call, so the verdict is memoised on `agent_id`.
+/// Per DISTINCT AGENT per event, not per subscription (`ids` is fixed within a
+/// call, so both verdicts are memoised on `agent_id`):
+///
+/// * one round trip always — the principal-existence probe, which runs whether
+///   or not the payload names a uuid;
+/// * two more when the payload names at least one uuid (`Viewer::resolve`, then
+///   one batched `hidden_claim_ids` over every uuid in the payload).
+///
+/// An earlier revision said "and zero when the payload names no uuid at all".
+/// That early-out is still here and still skips the *visibility* work, but it no
+/// longer skips the *authority* work. In practice the distinction costs nothing:
+/// every `EpiGraphEvent` variant serialises at least one uuid, so no real event
+/// takes the early-out and the per-agent cost is three round trips either way.
 ///
 /// # Everything here fails closed
 ///
@@ -809,29 +818,43 @@ pub fn subscriptions_matching(
 ///   column `NOT NULL`, so this is unreachable for a persisted row; it is
 ///   reachable for a row deserialised from somewhere else, and that is exactly
 ///   when a fall-through would hurt.
+/// * `agent_id` names no `agents` row → **dropped**. Same category as the
+///   bullet above and therefore checked in the same place: a principal that does
+///   not exist has no reading authority to resolve, and that fact does not depend
+///   on what the payload happens to name. (What that placement does and does not
+///   buy is measured in a comment at the site; today it is a robustness choice,
+///   not an observable difference.) `Viewer::resolve` cannot make this distinction on
+///   its own — `GroupMembershipRepository::list_live_for_agent` returns an empty
+///   `Vec` for a non-existent agent, which is indistinguishable from a real
+///   agent with no memberships, and "an empty membership set is not an error" is
+///   `Viewer::resolve`'s documented and correct contract for every other caller.
+///   So the distinction is made here, by [`agent_principal_exists`], and
+///   `visibility.rs` is untouched. Why it matters: `agent_id` is `NOT NULL
+///   REFERENCES agents(id) ON DELETE CASCADE`, so deleting an agent removes the
+///   subscription from the TABLE — but nothing evicts it from
+///   `AppState::webhook_store`, so before this check a running process kept
+///   delivering to a deleted agent's endpoint, as a public-only subscriber,
+///   until it restarted.
 /// * `Viewer::resolve` errors → **dropped**, logged at error.
 /// * `hidden_claim_ids` errors → **dropped**, logged at error.
+/// * the existence probe errors → **dropped**, logged at error, and
+///   distinguished in the log from "the principal does not exist". A database
+///   outage is not evidence that an agent was deleted.
 ///
-/// # Two branches that do NOT fail closed, and are not oversights
+/// # One branch that does NOT fail closed, and is not an oversight
 ///
-/// The heading above is about the branches this function controls. Two
-/// conditions resolve permissively and are named here so the list is honest:
+/// The heading above is about the branches this function controls. One
+/// condition still resolves permissively and is named here so the list is
+/// honest:
 ///
 /// * **A payload uuid that names no `claims` row.** `hidden_claim_ids` returns
 ///   only existing-but-invisible ids, by documented contract, so an unknown id
 ///   contributes nothing and the event is delivered. See this module's
 ///   "What this filter does NOT decide" for why both available fixes are
-///   worse than the condition, and `open_findings` in
-///   `docs/tenancy/progress.json` for the owner.
-/// * **A principal that names no `agents` row.**
-///   `Viewer::resolve` → `GroupMembershipRepository::list_live_for_agent`
-///   returns an empty `Vec` for an agent that does not exist rather than an
-///   error, so the subscription is demoted to a public-only viewer instead of
-///   being dropped. `agent_id` is `NOT NULL REFERENCES agents(id) ON DELETE
-///   CASCADE`, so the row is removed from the TABLE the moment its agent is —
-///   but nothing evicts it from `AppState::webhook_store`, so a running
-///   process keeps the subscription until it restarts. Both halves are filed;
-///   neither is invented policy here.
+///   worse than the condition. The branch is unchanged: what changed is that
+///   `routes/batch.rs::batch_create_claims` no longer exercises it, having
+///   stopped publishing events for claims it never persisted. The permissive
+///   contract itself is still permissive, and this bullet stays because of it.
 ///
 /// A database outage therefore stops webhook delivery rather than flooding
 /// every subscriber with every tenant's claims. That is the intended trade and
@@ -870,12 +893,58 @@ async fn retain_visible_subscriptions(
         );
     }
 
+    // A principal that does not EXIST is the same category as no principal at
+    // all, so it is filtered here, alongside the `agent_id == None` partition and
+    // above the "payload names no uuid" early-out, rather than inside
+    // `agent_may_receive`.
+    //
+    // BE PRECISE ABOUT WHAT THAT PLACEMENT BUYS, because it is less than it
+    // looks. Measured: every one of `EpiGraphEvent`'s variants carries at least
+    // one uuid in its serialised form, so `payload_uuids` never returns an empty
+    // set for a real event and the early-out below is not reachable from any
+    // current publisher. Relocating this filter under the early-out therefore
+    // changes no observable behaviour today — verified by doing it and watching
+    // `webhook_tenancy.rs` stay green. It is placed here because the rule it
+    // implements ("no resolvable principal, no delivery") does not depend on what
+    // the payload names, and the alternative is correct only by the accident that
+    // no variant is uuid-free. A new variant that was would silently reopen it.
+    //
+    // Memoised per distinct agent for the same reason the visibility verdict is:
+    // an instance with N subscribers must not cost N round trips per event.
+    let mut exists: std::collections::HashMap<Uuid, bool> = std::collections::HashMap::new();
+    let mut resolvable = Vec::with_capacity(attributed.len());
+    for sub in attributed {
+        let agent_id = sub.agent_id.expect("partitioned on is_some");
+        if let std::collections::hash_map::Entry::Vacant(slot) = exists.entry(agent_id) {
+            slot.insert(agent_principal_exists(pool, agent_id).await);
+        }
+        if exists.get(&agent_id).copied().unwrap_or(false) {
+            resolvable.push(sub);
+        } else {
+            // `reason` discriminates this from the visibility suppression at the
+            // bottom of this function, which logs the same message string at the
+            // same target. The subscription-level line is the one an operator
+            // greps when a specific endpoint goes quiet, so it is the line that
+            // must name the cause; `agent_principal_exists` splits it further,
+            // per agent, into deleted-principal vs probe-failed.
+            tracing::warn!(
+                target: "webhook.delivery.suppressed",
+                subscription_id = %sub.id,
+                agent_id = %agent_id,
+                reason = "principal_unresolvable",
+                "webhook suppressed for this subscription"
+            );
+        }
+    }
+    let attributed = resolvable;
+
     let ids = crate::routes::events::payload_uuids(payload);
     if ids.is_empty() {
         // No uuid-shaped token anywhere in the document, so no claim can be
         // named by it and there is nothing for a viewer to decide. Same
         // early-out, for the same reason, as
-        // `routes/events::retain_visible_events`.
+        // `routes/events::retain_visible_events`. Note what it no longer skips:
+        // the principal-existence filter above runs first, unconditionally.
         return attributed;
     }
 
@@ -916,15 +985,77 @@ async fn retain_visible_subscriptions(
     keep
 }
 
+/// Does `agent_id` name a live `agents` row?
+///
+/// `false` when it does not, and `false` when the probe cannot answer. The two
+/// cases are logged with different `reason`s, because they are different facts:
+/// one says a principal was deleted, the other says the database is unreachable,
+/// and an operator staring at silent webhooks needs to know which.
+///
+/// # Why this is a separate probe rather than a change to `Viewer::resolve`
+///
+/// `Viewer::resolve` reads `group_memberships` and documents that "an empty
+/// membership set is not an error: it yields a `Scoped` viewer over zero groups,
+/// which can still read public rows". That contract is correct for its other
+/// callers — an agent inserted by a fixture or a CLI bin has no personal group
+/// and therefore no membership, and that is a correct empty `Scoped` viewer, not
+/// an error. It is also relied on by the nil principal, which is resolved from
+/// the shared viewer fixture in five test crates and is certainly not in
+/// `agents`. So the existence question is asked here, at the one caller for whom
+/// "this principal does not exist" must mean "refuse", instead of being pushed
+/// into a shared constructor where it would change every scoped read in the
+/// tree and add a round trip to `middleware/bearer.rs` on every request.
+///
+/// # Existence, not content
+///
+/// `AgentRepository::get_by_id` takes no `Viewer` and this function discloses
+/// nothing from the row it fetches — only whether the fetch found one. It is an
+/// identity probe on the *subscriber*, on behalf of the subscriber, not a read
+/// of another principal's data, which is why it is not a `visibility_lint`
+/// exemption and needs none.
+#[cfg(feature = "db")]
+async fn agent_principal_exists(pool: &sqlx::PgPool, agent_id: Uuid) -> bool {
+    match epigraph_db::AgentRepository::get_by_id(pool, epigraph_core::AgentId::from(agent_id))
+        .await
+    {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::warn!(
+                target: "webhook.delivery.suppressed",
+                agent_id = %agent_id,
+                reason = "principal_does_not_exist",
+                "webhook suppressed: the subscription's principal names no agent, so no \
+                 reading authority can be resolved for it"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "webhook.delivery.suppressed",
+                agent_id = %agent_id,
+                error = %e,
+                reason = "principal_probe_failed",
+                "webhook suppressed: could not determine whether the subscription's \
+                 principal still exists"
+            );
+            false
+        }
+    }
+}
+
 /// May `agent_id` be told about an event whose payload names `ids`?
 ///
 /// `true` only when a `Viewer` resolves AND the visibility probe succeeds AND
 /// it reports nothing hidden. Every branch this function *decides* returns
 /// `false` on failure — see [`retain_visible_subscriptions`]'s doc for why each
-/// one fails closed, and, in the same doc, for the two conditions that resolve
-/// permissively before this function can see them (a uuid naming no `claims`
-/// row, and a principal naming no `agents` row). Those are named there rather
-/// than silently absent from a "fails closed" list.
+/// one fails closed, and, in the same doc, for the one condition that resolves
+/// permissively before this function can see it (a uuid naming no `claims`
+/// row). That one is named there rather than silently absent from a "fails
+/// closed" list.
+///
+/// This function is reached only for a principal [`agent_principal_exists`] has
+/// already confirmed, so the empty group set it may resolve means "a real agent
+/// with no memberships" and nothing else.
 ///
 /// Split out so the three failure branches are one function's worth of code
 /// that a reviewer reads together, rather than three arms interleaved with the
