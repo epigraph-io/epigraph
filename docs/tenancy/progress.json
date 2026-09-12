@@ -1681,7 +1681,11 @@
       "what": "Nothing tracks cumulative epsilon across requests, so every noised count is recoverable by averaging repeated queries",
       "detail": "The Laplace mechanism is applied per request with no accounting. A caller holding only claims:read issues N requests at the default epsilon and averages; the estimator converges on the true count at rate 1/sqrt(N). MAX_UNPRIVILEGED_EPSILON closes the SINGLE-REQUEST exact read (see the PR-08 entry's scope_addition_epsilon_ceiling) and must not be read as closing this. Recorded because the ceiling could otherwise be mistaken for a full fix. A real budget needs per-principal state and a refusal when it is exhausted, which is a design decision no acceptance line in the plan authorizes.",
       "status": "open",
-      "assigned": "unassigned - needs a privacy-budget design decision before it can be scoped"
+      "assigned": "unassigned - needs a privacy-budget design decision before it can be scoped",
+      "disposition": "OPERATOR-DECISION",
+      "disposition_note": "Head of a group of three. A cumulative-epsilon budget needs per-principal state and a refusal when exhausted; no acceptance line in the plan authorises that shape. One decision resolves this, F-structural-moments-exact and F-structural-support-exact together.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "privacy-budget-mechanism"
     },
     {
       "id": "F-structural-moments-exact",
@@ -1689,7 +1693,11 @@
       "what": "The means, variances and maxima of the four moment blocks are exact at every epsilon",
       "detail": "degree_stats.mean/variance/max_degree, belief_stats.mean_interval_width/variance_interval_width/mean_pignistic, clustering_stats.mean/variance and conflict_stats.mean/max are computed in process from unnoised rows and are returned exact. PR-08 fixed the COUNT components of these blocks (see critic finding M3), which was an authorization bypass because degree_stats.total_nodes is the same quantity as the sum of the noised node_counts. The moments are a different problem: the sensitivity-1 count mechanism is not defined for a mean or a maximum, and adding count-shaped noise to a mean would be a worse lie than leaving it exact. max_degree is the sharpest of them - it is an exact order statistic of the visible degree distribution. Bounded: these are all visible-set quantities, so this is a mechanism gap, not a tenancy leak.",
       "status": "open, documented in the module docs",
-      "assigned": "unassigned - needs the same privacy-budget/mechanism design decision as F-structural-no-privacy-budget"
+      "assigned": "unassigned - needs the same privacy-budget/mechanism design decision as F-structural-no-privacy-budget",
+      "disposition": "OPERATOR-DECISION",
+      "disposition_note": "Same decision as F-structural-no-privacy-budget. Bounded to visible-set quantities, so it is a mechanism gap and not a tenancy leak; adding count-shaped noise to a mean would be a worse answer than leaving it exact and documented.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "privacy-budget-mechanism"
     },
     {
       "id": "F-structural-support-exact",
@@ -1697,7 +1705,11 @@
       "what": "The Laplace mechanism noises histogram MAGNITUDES but never histogram SUPPORT, so the absence of a key is an unnoised exact zero",
       "detail": "All three statements GROUP BY, so a key whose true visible count is zero produces no row and maybe_add_noise is never called for it. A caller therefore learns exactly which node types the owner owns, exactly which coarse relationship types are present, and exactly which weeks in the last 30 days had activity, at any epsilon. Existence facts are what the visibility predicate protects elsewhere in this PR. NOT FIXED IN PR-08 DELIBERATELY: the fix (enumerate the closed key domains - COARSE_EDGE_TYPES, the six ownership_node_type_check values, the 30-day week bins - and emit a noised row for every key including the zeros) would destroy owner_sees_the_whole_subgraph_and_a_stranger_only_its_public_part's `assert!(!sedges.contains_key(\"RELATES_TO\"))`, which is a load-bearing tenancy assertion. Bounded: the support is still the VISIBLE-SET support, so this is a mechanism gap, not a tenancy leak.",
       "status": "open, documented in the module docs",
-      "assigned": "unassigned - triage with F-structural-moments-exact"
+      "assigned": "unassigned - triage with F-structural-moments-exact",
+      "disposition": "OPERATOR-DECISION",
+      "disposition_note": "Same decision as F-structural-no-privacy-budget.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "privacy-budget-mechanism"
     },
     {
       "id": "F-edges-unfiltered",
@@ -1705,7 +1717,10 @@
       "what": "`edges` carries tenancy columns but is not viewer-filtered inside the graph projections",
       "detail": "NARROWED BY PR-13, NOT CLOSED. PR-13 shipped edges.co_owner_group_id (migration 072) and Viewer::edge_predicate_fragment, and converted every `edges` read that ALREADY carried a visibility predicate — 62 marker tokens across 17 repo files plus 15 static `sqlx::query!` transcriptions in edge.rs (8), paper.rs (4), claim.rs (2) and provenance_chain.rs (1); 19 repo files in total. See the PR-13 ledger entry's `read_path_conversion_counts` for the counting definition. The functions named in `where` are the residual: they carry NO edges marker at all, so each needs a predicate ADDED with its own JOIN-vs-WHERE placement reasoning, not a fragment swapped — in a `LEFT JOIN ... ON` used for suppression (alternative_set.rs's `existing`) adding a filter is itself the fail-open. CORRECTED IN THE LAND PHASE: an earlier revision of this entry listed only the five graph_view functions plus rag_hybrid_context and read as exhaustive. It omitted claim.rs::semantic_graph_neighbors, which is the STRONGEST member of the class — it projects e.source_id, e.target_id and e.relationship (rag_hybrid_context's residual is a scalar edge_count) and is reached in production from epigraph-api/src/routes/search.rs. The graph_view module doc previously claimed ALL its traversals were unfiltered; that was stale (subgraph_edges has been filtered since PR-07's M8) and is corrected in place. Still bounded: the returned rows are claims-filtered, so this discloses STRUCTURE and a degree scalar, never content.",
       "status": "open, re-scoped by PR-13 to the five graph_view node projections plus rag_hybrid_context plus semantic_graph_neighbors, and scope-qualified to epigraph-db with the MCP recall.rs residual named separately",
-      "assigned": "PR-16 (the PR that arms tenancy REQUIRED and therefore owns the read-path completeness the RLS policies in PR-17 will assume). PR-13 deliberately converted only reads that already had a predicate and says so in its PR body; the residual needs one PR that ADDS predicates to never-filtered statements, with one set of acceptance numbers."
+      "assigned": "PR-16 (the PR that arms tenancy REQUIRED and therefore owns the read-path completeness the RLS policies in PR-17 will assume). PR-13 deliberately converted only reads that already had a predicate and says so in its PR body; the residual needs one PR that ADDS predicates to never-filtered statements, with one set of acceptance numbers.",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-inline-claim-content-reads",
@@ -1715,15 +1730,10 @@
       "status": "open, ratcheted",
       "ratchet": "crates/epigraph-api/tests/viewer_route_table_lint.rs asserts TEST_ONLY_INLINE_READS (renamed from COMPENSATED_INLINE_READS by PR-14) and UNCOMPENSATED_INLINE_READS EXACTLY, plus the_two_registers_are_disjoint and a_format_built_statement_is_counted (a self-test against synthetic fixtures, so the measurement's own blind spots cannot reopen).",
       "assigned": "TRIAGED BY PR-14, PARTLY DISCHARGED. Previously: 'PR-09 for the MCP mirror; the API remainder is unassigned and MUST be triaged before PR-14 deletes check_content_access' -- that triage is DONE and this field disagreed with its own `detail`. Outcome: edges.rs's 4 sites moved into the repo layer behind spliced Viewer predicates (0 remain); claims.rs's 3 are `#[cfg(test)]` read-backs and are not a disclosure surface at all; the 13 UNCOMPENSATED sites across 8 files were NOT touched and are the whole remaining debt. They now have no filter AND no post-pass -- PR-14 deleted the pass they were once wrongly believed to sit behind -- so they are LIVE, not latent, once the backfill completes (which docs/deploy.md makes a precondition of shipping this release). Owner: unassigned; PROPOSED PR-16, which already owns the write-side predicate for the same files. Same proposal as the sibling finding F-viewer-single-spend-unmechanised.",
-      "deadline": "PR-12 for the UNCOMPENSATED set - they have no second line of defence today and become live disclosure the moment ownership lands in the tenancy columns. PR-14 for the compensated two, when check_content_access is deleted. The single 'PR-14' deadline previously recorded here was wrong for nine of the eleven files."
-    },
-    {
-      "id": "F-not-db-build-unverified",
-      "where": "crates/epigraph-api/src/middleware/bearer.rs (the #[cfg(not(feature = \"db\"))] ViewerExtractor)",
-      "what": "RESOLVED-ON-BRANCH. The not(db) parity shim is now both CI-gated and executed locally.",
-      "detail": "The previous entry said 'the prescribed gate never compiles this configuration' while bearer.rs's own doc and public_router_allowlist.rs's header both asserted that .github/workflows/ci.yml gates `cargo check -p epigraph-api --no-default-features --locked`. The ledger and the code were asserting opposite things. The code is right: ci.yml line 171 runs exactly that step, deliberately scoped lib+bins rather than --all-targets because epigraph-api's [dev-dependencies] on epigraph-db and sqlx are non-optional. It has also now been executed locally in a SEPARATE target dir (/home/jeremy/.cargo-target-nodb) - a warm shared dir holding default-feature artifacts returns exit 0 on a tree that fails cold, which produced a false green twice on this project.",
-      "status": "closed on this branch; kept in open_findings until merge so the reconciliation is not lost",
-      "assigned": "none - ci.yml is the standing gate"
+      "deadline": "PR-12 for the UNCOMPENSATED set - they have no second line of defence today and become live disclosure the moment ownership lands in the tenancy columns. PR-14 for the compensated two, when check_content_access is deleted. The single 'PR-14' deadline previously recorded here was wrong for nine of the eleven files.",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-aggregate-existence-oracles",
@@ -1732,7 +1742,10 @@
       "detail": "`SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k) FROM mass_functions WHERE frame_id = $1`; `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)` deciding 404-vs-200; two `SELECT COUNT(*) FROM edges ... relationship = 'decomposes_to'` deciding center_kind. mass_functions, claims and edges are all tier_a, so all three are filterable and the fix is a parameter rather than a redesign. These disclose existence and cardinality, never text. NOT FIXED IN PR-07: they are outside the inline-content-read class the lint polices and outside this PR's charter, and bundling them would have made the diff harder to review than the leaks it is about. Raised by the adversarial review as minor. PR-13 did NOT take the edges half. The two `COUNT(*) FROM edges ... relationship = 'decomposes_to'` in routes/graph_neighborhood.rs::claim_compound_neighborhood are INLINE IN A HANDLER, so filtering them means moving the SQL into the repo layer (CLAUDE.md) and editing viewer_route_table_lint.rs's COMPENSATED_INLINE_READS exact-count ratchet — a route-layer change, not the migration-and-fragment change PR-13's Files line describes.",
       "status": "open",
       "assigned": "PR-16, or a route-layer PR that can move the SQL into the repo layer; PR-13 declined the edges half explicitly",
-      "pr23_disposition": "STILL OPEN, and its files (routes/belief.rs 17, routes/political.rs 12, routes/graph_neighborhood.rs 2) are all in the unconverted register above, so a shard cannot close them without touching it. Not taken here: it is inline-SQL relocation into the repo layer, a different change from plumbing the GUCs."
+      "pr23_disposition": "STILL OPEN, and its files (routes/belief.rs 17, routes/political.rs 12, routes/graph_neighborhood.rs 2) are all in the unconverted register above, so a shard cannot close them without touching it. Not taken here: it is inline-SQL relocation into the repo layer, a different change from plumbing the GUCs.",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-write-authz-reads-unfiltered",
@@ -1740,7 +1753,10 @@
       "what": "Write-path authorization reads run unfiltered while the handler holds a Viewer",
       "detail": "`SELECT agent_id FROM claims WHERE id = $1` is the ownership check the supersede decision rests on; `SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)` is deprecate_workflow's only existence gate. They let a principal act on a claim it cannot read. Consistent with the deliberate PR-16 deferral documented in repos/evidence.rs::delete, but unlike the repo-layer deferrals these carry no such comment at the site and no ratchet tracks them.",
       "status": "open",
-      "assigned": "PR-16 (write-side predicate)"
+      "assigned": "PR-16 (write-side predicate)",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-fail-open-ratchet-single-spelling",
@@ -1748,7 +1764,11 @@
       "what": "The fail-open ratchet counts ONE literal spelling of the idiom, so a variant spelling raises no error",
       "detail": "The needle is `if let Some(axum::Extension(ref auth)) = auth_ctx`. agents.rs::create_agent uses the same idiom in two forms the needle misses: `= &auth_ctx` (trailing &) and `Some(axum::Extension(auth))` (no ref). The ratchet is therefore monotone only against one transcription. Separately, the register's rationale ('harmless only because a ViewerExtractor earlier in the same signature 401s first') does not hold for create_agent, which has no ViewerExtractor and no other auth extractor - nothing in that handler 401s and the agents:write scope is simply unchecked when AuthContext is absent. NOT FIXED IN PR-07: re-baselining that ratchet in the same PR that re-baselines the content-read register would have meant two simultaneous redefinitions, and the second would have hidden the first.",
       "status": "open",
-      "assigned": "PR-16, which owns the write-path fail-opens the ratchet tracks"
+      "assigned": "PR-16, which owns the write-path fail-opens the ratchet tracks",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Same batch, same class as F-PR10-fail-open-lint-counts-comments.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-lint-robustness"
     },
     {
       "id": "F-atom-count-cardinality",
@@ -1756,7 +1776,10 @@
       "what": "atom_count is derived from an `atoms` CTE filtered only on claim_neighborhood_membership, not on claims",
       "detail": "The CTE carries /* {VISIBILITY:m} */ only; the returned atom_count therefore tells a stranger how many atoms a compound decomposes into, including atoms whose claims rows it cannot read. No invisible content escapes - the final SELECT filters the compound's own claims row. Inert today because claim_neighborhood_membership.visibility defaults to 'public'. Reportable because MassFunctionRepository::count_for_claim's doc, added by this same PR, spends a paragraph forbidding exactly this shape ('a bare COUNT(*) here would be a cardinality oracle'), and applying that standard in one file and not two files away is an inconsistency worth recording.",
       "status": "open",
-      "assigned": "PR-16 — travels with F-edges-unfiltered's residual (neighborhood_compound_nodes is one of the never-filtered statements PR-13 left open, so the two must be fixed by the same pass over graph_view.rs)"
+      "assigned": "PR-16 — travels with F-edges-unfiltered's residual (neighborhood_compound_nodes is one of the never-filtered statements PR-13 left open, so the two must be fixed by the same pass over graph_view.rs)",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-single-spend-handlers-unreviewed",
@@ -1764,7 +1787,10 @@
       "what": "No mechanical check distinguishes a handler that spends its Viewer on the content read from one that spends it on an unrelated scalar",
       "detail": "All 97 handlers reference `viewer` at least once, so there are no literally-unused Viewers; the live defect class is SINGLE-SPEND. Both hypothesis_status (B1) and belief_at_time (M5) were single-spend handlers, and both were found by opening the file rather than by any scan. The adversarial review hand-read roughly a dozen of the 62; the remaining ~50 are unreviewed by any mechanism. The widened viewer_route_table_lint now catches the subset whose second read is an inline tier_a projection - which is what caught the belief_at_time shape - but a handler whose leak is in a repo function it calls with the wrong argument is still invisible.",
       "status": "open",
-      "assigned": "TRIAGED BY PR-14, NOT DISCHARGED. progress.json said 'unassigned; triage before PR-14', so here is the triage. PR-14 does not review the ~50 unread single-spend handlers and does not claim to: it is a deletion PR whose surface is the redaction pass, not the handler population. What it DOES change is the risk profile, in the adverse direction - until PR-14 a single-spend handler that leaked could still be caught by the check_content_access post-pass on the two files that had one (claims.rs, edges.rs), and that net is now gone everywhere. Offsetting that, PR-14 moved all four of edges.rs's counted inline reads into the repo layer, which removes the file with the densest concentration of them from the register entirely. NET: the finding is unchanged in size and its mechanism gap is unchanged; it needs an owner. Proposed owner PR-16, which is already the owner of FAIL_OPEN_SCOPE_SITES over the same handler population and would be re-reading these files anyway."
+      "assigned": "TRIAGED BY PR-14, NOT DISCHARGED. progress.json said 'unassigned; triage before PR-14', so here is the triage. PR-14 does not review the ~50 unread single-spend handlers and does not claim to: it is a deletion PR whose surface is the redaction pass, not the handler population. What it DOES change is the risk profile, in the adverse direction - until PR-14 a single-spend handler that leaked could still be caught by the check_content_access post-pass on the two files that had one (claims.rs, edges.rs), and that net is now gone everywhere. Offsetting that, PR-14 moved all four of edges.rs's counted inline reads into the repo layer, which removes the file with the densest concentration of them from the register entirely. NET: the finding is unchanged in size and its mechanism gap is unchanged; it needs an owner. Proposed owner PR-16, which is already the owner of FAIL_OPEN_SCOPE_SITES over the same handler population and would be re-reading these files anyway.",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-centroid-scoping-untested",
@@ -1772,37 +1798,51 @@
       "what": "No test asserts that a scoped caller's server-derived theme centroid excludes claims it cannot see",
       "detail": "The statement carries /* {VISIBILITY:c} */ on the averaged SELECT, so the predicate is present and visibility_lint.rs now enforces that it stays. But create_theme_with_centroid_averages_the_claims_when_no_centroid_is_sent uses a claims:admin token over an all-public fixture, so the tenancy half is unasserted. See the crud.rs_create_theme_with_centroid entry in PR-07's scope_substitution.",
       "status": "open",
-      "assigned": "PR-12 or PR-16, whichever first makes a non-admin caller reach this path"
-    },
-    {
-      "id": "F-unconditional-group-bind-on-base",
-      "where": "crates/epigraph-db/src/repos/agent.rs:1332",
-      "what": "A spliced statement binds viewer.group_bind().unwrap_or(&[]) unconditionally, which is a Postgres bind-arity error for a Bypass viewer",
-      "detail": "Viewer::render_predicate emits a single space for a Bypass shape, so the rendered statement references no $N while the bind is still supplied -> 'bind message supplies N parameters, but prepared statement requires M'. Fail-CLOSED and unreachable today (this path's viewer never comes from a MaintenanceLease). PR-09 converted all NINE sites it introduced or touched to the guarded `if let Some(g) = viewer.group_bind()` form used by ~165 existing sites, and left this pre-existing one alone rather than widening its diff. A Viewer::bind_groups(q) helper that makes the correct thing the only thing would close the class."
+      "assigned": "PR-12 or PR-16, whichever first makes a non-admin caller reach this path",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "A pure test gap: the predicate is present and lint-enforced, only the tenancy half of the assertion is missing. Owner was 'PR-12 or PR-16', both delivered.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-unauthenticated-http-holds-the-server-agents-group",
       "where": "crates/epigraph-mcp/src/auth.rs::unauthenticated_context",
       "what": "The --allow-unauthenticated-http listener now reads with the MCP server agent's group set, which is plausibly the largest group in the corpus after PR-12",
-      "detail": "Correctly labelled a widening in auth.rs, viewer.rs and server.rs, and genuinely mitigated today: that listener already injects every scope in SCOPE_MAP, so its holder has full write authority regardless, and migration 062 makes every row public. The forward-looking half is the reportable part - the MCP server agent authors every claim ingested over stdio, so under PR-12's ownership backfill its personal group is plausibly the single largest group in the corpus, and it is handed in one step to whoever holds one shared Caddy bearer token in front of a unix socket. 'Operators who do not want that should not run --allow-unauthenticated-http' is a fair position but it is a DIFFERENT bargain from the one the flag advertised. Options: resolve a dedicated zero-membership principal for that listener (public-only reads, fail-closed, flag keeps its old meaning), or refuse content-reading tools on it outright. Either way it belongs in docs/deploy.md, not only in a doc comment."
+      "detail": "Correctly labelled a widening in auth.rs, viewer.rs and server.rs, and genuinely mitigated today: that listener already injects every scope in SCOPE_MAP, so its holder has full write authority regardless, and migration 062 makes every row public. The forward-looking half is the reportable part - the MCP server agent authors every claim ingested over stdio, so under PR-12's ownership backfill its personal group is plausibly the single largest group in the corpus, and it is handed in one step to whoever holds one shared Caddy bearer token in front of a unix socket. 'Operators who do not want that should not run --allow-unauthenticated-http' is a fair position but it is a DIFFERENT bargain from the one the flag advertised. Options: resolve a dedicated zero-membership principal for that listener (public-only reads, fail-closed, flag keeps its old meaning), or refuse content-reading tools on it outright. Either way it belongs in docs/deploy.md, not only in a doc comment.",
+      "disposition": "OPERATOR-DECISION",
+      "disposition_note": "The finding names two candidate shapes (resolve a dedicated zero-membership principal for that listener, or refuse content-reading tools on it outright). Choosing between them changes the bargain the flag advertises to operators, which is the operator's call and not a reviewer's. Whichever is chosen belongs in docs/deploy.md.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "unauthenticated-listener-posture"
     },
     {
       "id": "F-unauthenticated-server-agent-id-resolved-once-at-boot",
       "where": "crates/epigraph-mcp/src/main.rs",
       "what": "A transient database failure at startup permanently disables every content tool on the --allow-unauthenticated-http listener for the life of the process",
-      "detail": "On error the code logs and stores None, which request_viewer turns into a hard refusal until restart. Before PR-09 the same listener resolved lazily per request and would start working again once the database recovered. The fail-closed choice is right; the once-only caching is the problem. Environment-specific weight: reference_postgres_static_ip_boot_race means Postgres losing its address on reboot is a recurring event here, so a co-scheduled MCP restart can land in exactly this window, and the symptom ('token carries no agent principal' from every tool) does not point at a boot-time DB blip. Fix: hold the id behind an Arc<OnceCell<Uuid>> that request_viewer can lazily re-resolve when it is None, keeping the boot attempt as a warm-up plus the loud error log."
+      "detail": "On error the code logs and stores None, which request_viewer turns into a hard refusal until restart. Before PR-09 the same listener resolved lazily per request and would start working again once the database recovered. The fail-closed choice is right; the once-only caching is the problem. Environment-specific weight: reference_postgres_static_ip_boot_race means Postgres losing its address on reboot is a recurring event here, so a co-scheduled MCP restart can land in exactly this window, and the symptom ('token carries no agent principal' from every tool) does not point at a boot-time DB blip. Fix: hold the id behind an Arc<OnceCell<Uuid>> that request_viewer can lazily re-resolve when it is None, keeping the boot attempt as a warm-up plus the loud error log.",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "An availability defect with a fix the finding already specifies. Weighted up by this deployment: Postgres losing its address on reboot is a recurring local event, so the boot window is reachable in practice.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-http-tenancy-coverage-is-two-of-four-handlers",
       "where": "crates/epigraph-api/tests/tenant_isolation_http.rs",
       "what": "PR-09 changes four HTTP handlers and adds an HTTP-level test for two of them",
-      "detail": "COVERED: routes/events.rs::list_events (list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring_buffer, killed by mutation M4) and routes/cross_source.rs::list_candidates (list_candidates_http_renders_the_excerpt_of_a_superseded_claim, killed by mutation M5). NOT COVERED at HTTP level: routes/events.rs::graph_snapshot and routes/cross_source.rs::get_cross_source_matches's new scoped 404. Both are covered at the repo layer - graph_snapshot replays the SAME EventRepository::list the covered case exercises, and the 404's underlying reads are covered by tenant_isolation_mcp.rs::find_cross_source_matches_hides_a_corroborates_edge_to_a_private_claim - and both are inert until PR-12 writes the first 'group' row. Recorded rather than asserted, which is the standard PR-09 applied to the inline-SQL acceptance line and to the parity claim; this is the third place it is owed. The gap that was NOT acceptable to record - list_candidates, the only regression class reachable on today's corpus - was closed with a test instead."
+      "detail": "COVERED: routes/events.rs::list_events (list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring_buffer, killed by mutation M4) and routes/cross_source.rs::list_candidates (list_candidates_http_renders_the_excerpt_of_a_superseded_claim, killed by mutation M5). NOT COVERED at HTTP level: routes/events.rs::graph_snapshot and routes/cross_source.rs::get_cross_source_matches's new scoped 404. Both are covered at the repo layer - graph_snapshot replays the SAME EventRepository::list the covered case exercises, and the 404's underlying reads are covered by tenant_isolation_mcp.rs::find_cross_source_matches_hides_a_corroborates_edge_to_a_private_claim - and both are inert until PR-12 writes the first 'group' row. Recorded rather than asserted, which is the standard PR-09 applied to the inline-SQL acceptance line and to the parity claim; this is the third place it is owed. The gap that was NOT acceptable to record - list_candidates, the only regression class reachable on today's corpus - was closed with a test instead.",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Both uncovered handlers are covered at the repo layer, so this is a coverage-depth gap rather than a live hole. It is taken now because it was explicitly 'recorded rather than asserted' three times and cleanup is when that debt is paid.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-graph-snapshot-scan-cost",
       "where": "crates/epigraph-api/src/routes/events.rs::graph_snapshot",
       "what": "graph_snapshot calls EventRepository::list(.., version + 1), which is now a regex plus two correlated EXISTS per row where it was a LEFT JOIN. REVISED BY PR-25: each of those two EXISTS is now a SECURITY DEFINER function invocation, not a primary-key probe.",
-      "detail": "The handler fetches all events up to `version` and filters client-side (a pre-existing shape, flagged in its own comment). PR-09 makes each scanned row pay one regexp_matches over payload::text plus a primary-key probe per uuid found. For a high graph version that is a near-full scan of `events` with per-row work that the previous LEFT JOIN did not have. No measurement was taken - the throwaway test database is not a workload - so this is a note, not a claim. Measure before optimising; the obvious fix is to push the `graph_version <= $n` bound into the repo function so the filter applies to a bounded row set. REVISED BY PR-25 (2026-09-06) -- the mechanism this entry describes is out of date and the correction belongs here, not only in the doc comment. PR-25 routes BOTH arms of the per-match suppression subquery through migration 086's public.epigraph_claim_tenancy_by_ids(uuid[]), so the per-uuid work is no longer 'a primary-key probe' but TWO invocations of a SECURITY DEFINER set-returning function. SECURITY DEFINER blocks SQL-function inlining, so the planner cannot see through either call and has no ROWS estimate for it, falling back to the SRF default for both correlated arms. The per-row cost is therefore strictly higher than when this finding was written, and the suggested fix -- pushing the `graph_version <= $n` bound into EventRepository::list so the predicate applies to a bounded row set -- is now worth MORE, not less. Still unmeasured; the throwaway is not a workload. PR-25 deliberately did not fix it: a ROWS estimate needs a CREATE OR REPLACE (a migration, out of scope, and it would in any case be wrong for hidden_claim_ids, which calls the same function with an N-element array), and pushing the bound down is a signature change."
+      "detail": "The handler fetches all events up to `version` and filters client-side (a pre-existing shape, flagged in its own comment). PR-09 makes each scanned row pay one regexp_matches over payload::text plus a primary-key probe per uuid found. For a high graph version that is a near-full scan of `events` with per-row work that the previous LEFT JOIN did not have. No measurement was taken - the throwaway test database is not a workload - so this is a note, not a claim. Measure before optimising; the obvious fix is to push the `graph_version <= $n` bound into the repo function so the filter applies to a bounded row set. REVISED BY PR-25 (2026-09-06) -- the mechanism this entry describes is out of date and the correction belongs here, not only in the doc comment. PR-25 routes BOTH arms of the per-match suppression subquery through migration 086's public.epigraph_claim_tenancy_by_ids(uuid[]), so the per-uuid work is no longer 'a primary-key probe' but TWO invocations of a SECURITY DEFINER set-returning function. SECURITY DEFINER blocks SQL-function inlining, so the planner cannot see through either call and has no ROWS estimate for it, falling back to the SRF default for both correlated arms. The per-row cost is therefore strictly higher than when this finding was written, and the suggested fix -- pushing the `graph_version <= $n` bound into EventRepository::list so the predicate applies to a bounded row set -- is now worth MORE, not less. Still unmeasured; the throwaway is not a workload. PR-25 deliberately did not fix it: a ROWS estimate needs a CREATE OR REPLACE (a migration, out of scope, and it would in any case be wrong for hidden_claim_ids, which calls the same function with an N-element array), and pushing the bound down is a signature change.",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Unmeasured by its own admission, twice: the throwaway test database is not a workload. The entry is more valuable as a measure-before-optimising note than as a speculative optimisation, and the fix it suggests is a signature change that would need a real workload to justify. Accepted as a standing performance note.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "unmeasured; needs a workload, not a patch"
     },
     {
       "id": "F-PR10-fail-open-lint-counts-comments",
@@ -1811,7 +1851,11 @@
       "workaround_taken": "The doc comment spells the idiom without the `axum::` path segment, and says why in place.",
       "why_it_matters": "Every one of the eight remaining FAIL_OPEN_SCOPE_SITES rows is assigned to PR-16, and each will hit this identically the moment its fix is documented. Compare no_bypass_in_handlers.rs, which strips `//` comments for exactly this reason - the two lints in the same repo disagree about whether a comment counts.",
       "suggested_fix": "Apply no_bypass_in_handlers.rs::strip_line_comments to the source before counting, in the PR that next lowers a row.",
-      "owner": "PR-16"
+      "owner": "PR-16",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Re-measured: a raw str::matches with no comment stripping is still the mechanism in more than one lint. A comment-stripping helper already exists in this tree (no_redaction_sentinel.rs) and is reused rather than re-written. Both directions are proved: a doc comment quoting the idiom must NOT trip the lint, and a real site MUST.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-lint-robustness"
     },
     {
       "id": "F-PR10-unknown-claim-id-delivers",
@@ -1820,7 +1864,11 @@
       "why_it_matters": "hidden_claim_ids' contract ('an id that names no row at all is not returned') is right for PR-09's use - redacting rows already fetched from a viewer-scoped source - and permissive for a delivery decision to an arbitrary external URL. PR-12 will not fix it, because the row still will not exist. NOT a PR-10 regression: before PR-10 every event went to every subscriber unconditionally.",
       "why_not_fixed_in_pr10": "Both in-scope fixes are wrong. Suppressing on named-but-absent would suppress nearly everything, because payload_uuids also collects agent, frame and workflow ids. Narrowing the scan to declared claim ids is the key allowlist PR-09 rejected verbatim. The doc now names the branch instead of asserting it away.",
       "suggested_fix": "Either make batch_create_claims persist (it has no auth extractor either, so it needs its own PR), or stop it publishing ClaimSubmitted for rows that do not exist.",
-      "owner": "PR-12 or the PR that authenticates routes/batch.rs"
+      "owner": "PR-12 or the PR that authenticates routes/batch.rs",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Owner was 'PR-12 or the PR that authenticates routes/batch.rs'; PR-12 is delivered and no such PR is scheduled. Takes the second of the two fixes the finding itself endorses, which is the one that does not require an allowlist the plan rejected.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR10-claimless-variants-carry-non-claim-content",
@@ -1829,7 +1877,11 @@
       "why_it_matters": "'No claim content' is the wrong predicate - the property the fan-out needs is 'no cross-tenant content'. LATENT, NOT LIVE: grep over crates/ finds zero production publishers of either variant; every construction site is in epigraph-events' own tests and its event_type() round-trip fixture. The risk is that the first real publisher inherits the hole silently.",
       "why_not_fixed_in_pr10": "Adding a delivery policy for a variant no code emits is policy without a requirement. The false claim in the module doc was withdrawn and the acceptance test was re-scoped so it no longer reads as blanket permission.",
       "suggested_fix": "When a publisher is added, restrict AgentSuspended and ReputationChanged to the affected agent's own subscriptions, and add a test that a SecurityConcern's `details` does not reach an unrelated subscriber.",
-      "owner": "the PR that adds the first production publisher of either variant"
+      "owner": "the PR that adds the first production publisher of either variant",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Conditional on a publisher that does not exist: no production code publishes either variant. The stated owner -- the PR that adds the first one -- is the right trigger and cannot be scheduled before that PR exists.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "no production publisher exists"
     },
     {
       "id": "F-PR10-admin-stats-unscoped",
@@ -1837,7 +1889,11 @@
       "what": "routes/admin.rs::system_stats takes no auth extractor and no check_scopes - only State(state) - and is registered on the `protected` router in both chains, so any authenticated principal with any scope reads the whole SystemStats aggregate, including WebhookStats { webhook_count }.",
       "why_it_matters": "PR-10's boot hydration widens webhook_count from a per-process artefact to the cardinality of webhook_subscriptions across every tenant. A count, not content - but it is the one unfiltered path out of AppState::webhook_store, and it falsified the invariant repos/webhook.rs::list_active's doc originally rested its no-Viewer exemption on. That doc is corrected; the route is not.",
       "suggested_fix": "Gate system_stats behind claims:admin, or drop webhook_count from SystemStats, or make it count only the caller's rows. Note admin.rs:1017 and :1137 both assert on webhook_count.",
-      "owner": "PR-16"
+      "owner": "PR-16",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Re-measured on 0f6f8b02: the handler still takes State(state) alone. PR-16 was its owner and shipped as 16a+16b without touching routes/admin.rs, so it is definitively not discharged.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR10-webhook-store-no-cross-process-invalidation",
@@ -1845,7 +1901,11 @@
       "what": "delete_webhook writes through to webhook_subscriptions and then removes the entry from ONE process's AppState::webhook_store; boot hydration puts every row in every process. Revocation is therefore not effective process-wide, and a delete routed to a process that never saw the row 404s from the cache before the repo call.",
       "why_it_matters": "Deployment-conditional: inert on the single-instance deployment this host runs, and the code makes no single-process assumption anywhere until PR-10's ledger stated one. A revoked endpoint keeps receiving HMAC-signed payloads from every other instance until it restarts.",
       "suggested_fix": "Read-through cache with a TTL, or an event-bus delete notification. See D-PR-webhook-store-invalidation.",
-      "owner": "unassigned - the first PR requiring a multi-instance api"
+      "owner": "unassigned - the first PR requiring a multi-instance api",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Conditional on a multi-instance api, which this deployment does not run. Fixing it now would add cross-process invalidation machinery with no way to test the condition it exists for.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "single-instance deployment; the condition is unreachable"
     },
     {
       "id": "F-PR10-agentless-principal-resolves-to-public-only",
@@ -1853,7 +1913,11 @@
       "what": "Viewer::resolve (visibility.rs:269) returns Ok(Viewer{Scoped{group_ids: []}}) for a principal with no `agents` row, because GroupMembershipRepository::list_live_for_agent returns an empty Vec rather than an error. agent_may_receive therefore does NOT fail closed for a deleted agent - it demotes the subscription to a public-only subscriber.",
       "why_it_matters": "Combined with the fact that migration 085's ON DELETE CASCADE removes the ROW but nothing evicts AppState::webhook_store, a running process keeps delivering public-visibility claims to a deleted agent's endpoint until it restarts. Wider than it will eventually be: with migration 062 defaulting visibility to 'public' and nothing transcribing ownership until PR-12, 'public-only' is currently close to 'everything'.",
       "suggested_fix": "Have agent_may_receive (or Viewer::resolve itself) distinguish 'agent exists with no groups' from 'agent does not exist', and fail closed on the latter. Both branches are now named in agent_may_receive's doc so the 'fails closed' list is honest.",
-      "owner": "PR-12"
+      "owner": "PR-12",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Owner was PR-12, which is delivered without closing it. The finding carries its own fix: distinguish 'agent exists with no groups' from 'no agents row' and fail closed on the latter.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR10-no-db-test-cfg-never-compiles",
@@ -1861,7 +1925,11 @@
       "what": "`cargo check -p epigraph-api --no-default-features --all-targets --locked` -> EXIT=101. PRE-EXISTING: the same command at the base commit 3503911f -> EXIT=101 with 35 errors, including `missing field owner_id in initializer of state::WebhookSubscription`. No gate in the four-command set compiles cfg(all(test, not(feature=\"db\"))), so this had never been measured.",
       "why_it_matters": "Everything under that cfg - routes/admin.rs's field-incomplete WebhookSubscription literal, admin.rs::test_system_stats_reflects_webhook_store, and the 25 tests in routes/webhooks.rs's `#[cfg(not(feature=\"db\"))] mod handler_tests` - is documentation, not coverage. Green CI was silence, not proof.",
       "suggested_fix": "Either repair the cfg so it compiles and add the command to the gate, or delete the modules. Not done inside a security PR.",
-      "owner": "PR-16"
+      "owner": "PR-16",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Merged with F-PR28-nodb-lib-test-build: one defect recorded twice. Re-measured, and it is structural rather than a list of errors to fix -- ci.yml states that the test targets cannot pass under --no-default-features because this crate's dev-dependencies on epigraph-db and sqlx are non-optional, so the test targets link Postgres regardless of the feature flag. Closing it means making those dev-dependencies optional. Accepted with the reason stated and deliberately NOT folded into a cleanup batch, because it is a dependency-graph change and not hygiene. PRE-EXISTING: it failed identically at the base commit.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "structural: requires making non-optional dev-dependencies optional"
     },
     {
       "id": "F-PR10-webhook-url-unvalidated",
@@ -1869,15 +1937,11 @@
       "what": "register_webhook validates only that the URL is non-empty (and migration 085's `CHECK (btrim(url) <> '')` mirrors exactly that), so any caller with webhooks:write can register a link-local metadata address or a loopback port and have the api POST signed event payloads there.",
       "why_it_matters": "Pre-existing and out of PR-10's ledgered scope, but PR-10 changes the blast radius: an SSRF-shaped target was a process-lifetime condition and is now a durable row that boot hydration re-arms on every deploy.",
       "suggested_fix": "Scheme allowlist plus a private-range/link-local denylist at registration time.",
-      "owner": "unassigned"
-    },
-    {
-      "id": "F-PR10-get-webhook-ignores-active",
-      "found_by": "PR-10 land-phase critic",
-      "what": "list_webhooks filters on sub.active; get_webhook does not. An inactive subscription would be invisible to list and readable by id.",
-      "why_it_matters": "Inert today - nothing anywhere sets active = false, so the column only ever holds its DEFAULT TRUE. It becomes a real list/get divergence, with the id-addressed route on the permissive side, the moment a deactivation path is added. Same class as the ownership divergence PR-10 fixed.",
-      "suggested_fix": "Add the active check to get_webhook in the PR that introduces deactivation.",
-      "owner": "the PR that adds a webhook deactivation path"
+      "owner": "unassigned",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Re-measured on 0f6f8b02: registration still validates only non-emptiness. The fix states a positive policy and states what that policy does not cover.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR11-community-membership-is-self-service",
@@ -1887,7 +1951,11 @@
       "suggested_fix": "A require_community_admin-shaped membership check plus a scope extractor, mirroring groups::add_member (which takes RequireScopeGroupsAdmin AND calls group_authz::require_group_admin).",
       "owner": "PR-16 for the scope extractor and the admin-shaped rule; PR-12 closed the self-service grant and the self-service eviction.",
       "status": "SUBSTANTIALLY CLOSED BY PR-12, and PR-12 is why it had to be. Projecting the membership moved the hole out of check_content_access's community arm (which PR-14 deletes) and into the group_memberships / Viewer::resolve control plane, which SURVIVES PR-14 and is armed by PR-17 - i.e. it was on its way from a soon-to-be-deleted ACL bug to a durable tenancy bypass. CommunityRepository::add_member and ::remove_member now enforce CLOSED MEMBERSHIP (the acting agent must hold a live membership in the community's projected group; bootstrap exception only when that group has none, because migration 068 left every projected group with zero administrators by design; remove_member additionally always permits removing your own perspective). remove_member's handler, which previously extracted nothing at all, now takes a ViewerExtractor, and create_community passes the authenticated creator so a community created through the route is never in the bootstrap state. Gating only the PROJECTION would not have worked: 071's shim replays it out of community_members on every community-partitioned ownership write.",
-      "residual": "The rule is deliberately weaker than the suggested require_community_admin: community groups have no admins to require. A community whose group is genuinely memberless is still open to the first joiner, and no scope extractor was added. Both are PR-16's, with its viewer_route_table_lint.rs set."
+      "residual": "The rule is deliberately weaker than the suggested require_community_admin: community groups have no admins to require. A community whose group is genuinely memberless is still open to the first joiner, and no scope extractor was added. Both are PR-16's, with its viewer_route_table_lint.rs set.",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Substantially closed by PR-12 already. This pass takes the stated residual (no scope extractor) since PR-16 owned it and is delivered. The other residual -- a genuinely memberless community group is open to the first joiner -- is a consequence of migration 068 projecting groups with zero administrators and stays open under F-PR12-community-groups-still-have-no-admin.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR11-tool-viewer-coverage-lint-matches-comments",
@@ -1895,38 +1963,62 @@
       "what": "tool_viewer_coverage.rs::viewer_acquisition_lives_in_server_rs_not_in_the_tool_modules does a raw `contains(\"request_viewer\")` over src/tools/*.rs, so a DOC COMMENT naming the helper fails the test.",
       "why_it_matters": "It cost this PR a red shard: a doc paragraph in perspectives.rs explaining which principal the stdio transport resolves tripped it, and the fix was to reword prose rather than change any code. Same class as F-PR10-fail-open-lint-counts-comments. A lint that a comment can break trains contributors to avoid naming the thing they are documenting.",
       "suggested_fix": "Strip comments before scanning, or match `request_viewer(` at a call position rather than the bare identifier.",
-      "owner": "unassigned"
+      "owner": "unassigned",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Same batch, same class.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-lint-robustness"
     },
     {
       "id": "F-PR12-harvester-fragment-insert-order",
       "what": "A harvester_fragments row inserted BEFORE its harvester_claim_provenance row is stamped by no trigger: arm (c) cannot cover the table (no claim_id) and arm (d) fires only on a claims UPDATE. It keeps ('public', world) permanently.",
       "status": "PR-12's backfill closes it for rows existing at backfill time; new rows in that order remain a gap.",
-      "owner": "PR-16 — PR-13 did not take it. The fix is a provenance-side AFTER INSERT trigger, which needs its own migration number, and PR-13's plan section assigns it only 072 and 073, both spent (edges.co_owner_group_id and its index)."
+      "owner": "PR-16 — PR-13 did not take it. The fix is a provenance-side AFTER INSERT trigger, which needs its own migration number, and PR-13's plan section assigns it only 072 and 073, both spent (edges.co_owner_group_id and its index).",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "NOT the conversion tail -- the repair is a provenance-side AFTER INSERT trigger, which is SQL work and not a connection swap. It was parked because its owner (PR-13) had no migration number to spend; 089-090 is headroom now, so the blocker is gone. Own branch, because it is the only item in this cleanup that claims a migration number.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-harvester-fragment-stamp"
     },
     {
       "id": "F-PR12-community-groups-still-have-no-admin",
       "what": "CommunityRepository::create now sets groups.created_by_agent_id and an admin membership WHEN A CREATOR IS KNOWN, but POST /api/v1/communities extracts no AuthContext and passes None. The communities migration 068 already projected have no creator column to derive one from either.",
       "status": "Partially closed by PR-12.",
-      "owner": "PR-16 for the route authentication (its viewer_route_table_lint.rs set), PR-18 for the pre-existing projected groups."
+      "owner": "PR-16 for the route authentication (its viewer_route_table_lint.rs set), PR-18 for the pre-existing projected groups.",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Takes the route-authentication half only: the creator is knowable at the route and is currently passed as None. The pre-existing projected groups half stays open and is re-labelled CONVERSION-TAIL-adjacent under its own entry.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-authz-hygiene"
     },
     {
       "id": "F-PR12-transcription-ledger-is-last-write-wins",
       "what": "tenancy_transcription_log is node_id PRIMARY KEY, so a node reclassified twice keeps only the last transition. schema_contract.rs pins the 6-column shape exactly and in order, so a sequence cannot be added without a migration number; 072-084 are allocated.",
       "status": "Accepted and pinned by a test. Migration 080's pre-flight reads existence, not history, so the gate is unaffected.",
-      "owner": "PR-18, if it ever needs the history."
+      "owner": "PR-18, if it ever needs the history.",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Already accepted and pinned by a test when it was written. The gate that depends on this table reads existence, not history, so nothing downstream is weakened. Re-confirmed as accepted rather than carried as an open defect.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "accepted by design and pinned by a test"
     },
     {
       "id": "F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable",
       "what": "epigraph_definer_bypass() is pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER') and CI connects as a superuser, for whom pg_has_role is true of every role. Arm (d)'s and the shim's 42501 assertions therefore CANNOT fire in the suite whatever the function owner is.",
       "status": "Mitigated, not closed. tenancy_triggers.rs::propagation_function_is_owned_by_the_maintenance_role asserts pg_proc.proowner and the EXECUTE grant from the CATALOG, which is owner-dependent and caller-independent, and is the honest instrument. A behavioural test would pass vacuously.",
-      "owner": "PR-17, which is when a non-superuser deploy role becomes load-bearing."
+      "owner": "PR-17, which is when a non-superuser deploy role becomes load-bearing.",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Owner was PR-17, which is delivered. Attempt a non-superuser role in the test harness so the 42501 arms can fire behaviourally instead of only through the catalog. If that turns out to require more than harness setup, the implementer is to report back rather than weaken the existing catalog assertion, which is the honest instrument and must stay.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-PR17-on-conflict-is-checked-against-the-using-clause",
       "raised_by": "PR-17",
       "owner": "every future PR that adds an RLS policy",
       "what": "`INSERT ... ON CONFLICT` is checked against the SELECT-side policy, so a provisioning arm present only in WITH CHECK is not enough. MEASURED, and it is not obvious from the PostgreSQL documentation.",
-      "detail": "On a FOR ALL policy the SELECT policy IS the USING clause. Measured as epigraph_app on the throwaway at head 079: a bare INSERT into group_memberships succeeded and the IDENTICAL statement with `ON CONFLICT ... DO UPDATE` -- and with `ON CONFLICT ... DO NOTHING` -- was refused with 42501, even with NO conflicting row present. `agents` was unaffected because its separate `agents_identity FOR SELECT USING (true)` satisfies the requirement. This is invisible to CI (superuser + BYPASSRLS) and it would have broken every token mint on the day 079 landed. PR-17 swept every ON CONFLICT site against a protected table and recorded the disposition of each; the app-pool ones are covered by arms in 077 and by rls_enforcement.rs, and the maintenance-pool ones (tenancy_backfill.rs, the CLI bins, PostgresJobQueue) are inert because epigraph_bypass() is true there."
+      "detail": "On a FOR ALL policy the SELECT policy IS the USING clause. Measured as epigraph_app on the throwaway at head 079: a bare INSERT into group_memberships succeeded and the IDENTICAL statement with `ON CONFLICT ... DO UPDATE` -- and with `ON CONFLICT ... DO NOTHING` -- was refused with 42501, even with NO conflicting row present. `agents` was unaffected because its separate `agents_identity FOR SELECT USING (true)` satisfies the requirement. This is invisible to CI (superuser + BYPASSRLS) and it would have broken every token mint on the day 079 landed. PR-17 swept every ON CONFLICT site against a protected table and recorded the disposition of each; the app-pool ones are covered by arms in 077 and by rls_enforcement.rs, and the maintenance-pool ones (tenancy_backfill.rs, the CLI bins, PostgresJobQueue) are inert because epigraph_bypass() is true there.",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Not a defect. It is a measured property of PostgreSQL that is not obvious from its documentation, recorded so a future policy author does not rediscover it the hard way. 'Every future PR that adds an RLS policy' is the correct permanent owner and needs no scheduling.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "a recorded lesson, not a defect"
     },
     {
       "id": "F-PR25-event-suppression-is-claims-keyed-only",
@@ -1937,7 +2029,11 @@
       "detail": "MECHANISM ONLY, per the public-repo disclosure rule; same register as F-PR23 and F-PR24. public.epigraph_claim_tenancy_by_ids(uuid[]) selects from public.claims, so a uuid naming a row in any other FORCEd tier-A table yields no rows: the existence arm is false, the outer NOT EXISTS is true, and the event is returned. That is the same branch as the deliberate 'names a uuid that resolves to no claims row' survivor documented on the function -- reached for the same reason, but for a row that DOES exist and IS tenanted. Live emitters of that shape in the tree today: epigraph-mcp/src/tools/edge_mutation.rs emits edge.deleted and edge.retired with payloads keyed on edge_id and carrying no source_id/target_id, and epigraph-api/src/routes/gaps.rs emits gap.surfaced keyed on challenge_id. Both `edges` and `challenges` are in migration 079's protected array and carry tenancy columns; `edges` additionally carries the co-ownership column PR-13 added. `events` itself carries no RLS (absent from 079's protected array and from 062's tier_a), so this predicate is the whole control on those surfaces. WHY MINOR RATHER THAN A BLOCKER: what such an event carries is opaque ids plus event_type / actor_id / created_at / severity metadata, not claim content. NOT ALREADY TRACKED: F-PR10-claimless-variants-carry-non-claim-content is scoped to the webhook EpiGraphEvent::{AgentSuspended, ReputationChanged} variants and the fan-out path, not to EventRepository::list.",
       "why_pr25_did_not_fix_it": "Widening it is a node_type-dispatched multi-table gate with its own JOIN-vs-WHERE placement reasoning -- exactly the class PR-13 explicitly declined to add inline -- and it would need either six more definer helpers or a widened 086 signature, i.e. a migration. PR-25's reviewable unit is one SQL string literal and its acceptance test. Filed rather than absorbed, because PR-25 is the change that DECLARES this predicate correct and the 'both halves now draw the same authority' language would otherwise read as a coverage claim.",
       "recorded_in": "EventRepository::list's `## Scope limit: the control is keyed to `claims` ONLY` doc section; routes/events.rs::graph_snapshot's doc block; locked_decisions.rs' `## Status at PR-25` block. All three were edited in the same pass so no shipped text over-claims coverage.",
-      "raised_on": "2026-09-06"
+      "raised_on": "2026-09-06",
+      "disposition": "ACCEPTED",
+      "disposition_note": "NOT the conversion tail. A coverage limit that predates PR-25 and is documented in its own right; its trigger -- whichever change next widens the events read path to more tables -- is correct and cannot be scheduled ahead of that change. Widening it now would mean designing the multi-table classification with no consumer to exercise it.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "a documented coverage limit whose trigger is a future read-path widening"
     },
     {
       "id": "F-PR26-trace-parents-followup",
@@ -1945,7 +2041,10 @@
       "what": "An open question about one statement's filtering behaviour. Detail withheld from this public repository; see the operator's private record.",
       "detail": "Detail deliberately withheld from this PUBLIC repository and held in the operator's private record; consult it before touching this statement. PRE-EXISTING: PR-26 changed which CONNECTION the statement runs on and nothing else. FILED BECAUSE NOTHING INDEXES IT: `every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer` keys on the FUNCTION, and the enclosing function spends the viewer four other times, so a per-statement question is invisible to it. An exemption marker is the WRONG instrument regardless: the lint keys exemptions on (file, fn), so it would exempt the whole walk and remove it from the spend control -- strictly worse than the question it would record.",
       "status": "open; pointed to from the two walks' in-code comments, detail held privately",
-      "assigned": "the conversion-shard series -- the repair is SQL work with its own evidence and not a connection swap, so it must not be attached to a shard that is only moving call sites"
+      "assigned": "the conversion-shard series -- the repair is SQL work with its own evidence and not a connection swap, so it must not be attached to a shard that is only moving call sites",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR26-lineage-holds-one-connection-for-n-round-trips",
@@ -1954,7 +2053,10 @@
       "detail": "AVAILABILITY, NOT FAIL-OPEN, and it is the cost side of the conversion rather than a defect in it. Before the conversion each of the 1 + 5 + N statements acquired and released, so lineage requests interleaved; now each in-flight request pins one handle for its whole duration. bin/server.rs builds the request pool at max_connections: 8 (the 2-connection pool is maintenance) and it serves EVERY route, so concurrent deep-lineage requests can make unrelated handlers wait at acquire_timeout. max_depth IS clamped (.min(MAX_LINEAGE_DEPTH)), so the walk's DEPTH is bounded, but nothing bounds its BRANCHING and the handler passes max_nodes: None, so N -- the per-node ClaimRepository::get_by_id_conn loop -- is the size of the visible result. Under SessionGucMode::Transaction the hold is an OPEN READ TRANSACTION for all N round trips, which also pins the vacuum horizon. direction=both doubles the walk on the same handle. DELIBERATELY NOT MITIGATED IN PR-26, WITH THE REASON RECORDED: passing a node cap here would truncate the response while `truncated` is computed from depth alone, i.e. it would under-serve SILENTLY -- the same fail-quiet class this series exists to remove -- so a cap needs a truncation signal designed with it. The real repair is to collapse the per-node loop into ONE batched viewer-scoped fetch (WHERE id = ANY($1)), which removes most of the hold time and is new repo surface with its own evidence. MATTERS BEYOND THIS FILE: routes/lineage.rs is the template ~50 shards copy, and a 40-site walk-shaped handler converted the same way multiplies this.",
       "status": "open, stated in the handler's own doc comment rather than left for a reviewer to find",
       "assigned": "the conversion-shard series -- owed BEFORE the next walk-shaped handler is converted; a shard that converts more sites does not discharge it",
-      "correction": "APPENDED BY PR-18a, 2026-09-08, NOT a rewrite of the original measurement. The `what` field above carries a WRONG pool figure: it says the request pool is 8. The API pool is ScopedPoolOptions::default() = 10; 8 is the JOBS pool. PR-29's Land declined to edit another PR's dated record and reported it as a follow-up, which was the right call -- this is that follow-up, discharged the way the register's own practice prescribes (append a correction, leave the original measurement legible)."
+      "correction": "APPENDED BY PR-18a, 2026-09-08, NOT a rewrite of the original measurement. The `what` field above carries a WRONG pool figure: it says the request pool is 8. The API pool is ScopedPoolOptions::default() = 10; 8 is the JOBS pool. PR-29's Land declined to edit another PR's dated record and reported it as a follow-up, which was the right call -- this is that follow-up, discharged the way the register's own practice prescribes (append a correction, leave the original measurement legible).",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR28-claims-list-projection",
@@ -1962,7 +2064,10 @@
       "what": "A pre-existing question about what these list reads project and what the constructor then supplies. Detail withheld from this PUBLIC repository; analysis held outside this repository.",
       "detail": "Analysis held outside this repository. PRE-EXISTING and NOT caused by the conversion: PR-28 changed which CONNECTION these reads run on and nothing else. Not an access-control matter. The repair is a projection change plus a construction change with a blast radius across every list caller, so it must not be attached to a shard that is only moving call sites.",
       "status": "open; detail held privately",
-      "assigned": "the conversion-shard series -- to be scheduled as its own change, not discharged by converting more sites"
+      "assigned": "the conversion-shard series -- to be scheduled as its own change, not discharged by converting more sites",
+      "disposition": "EMPTY-NEEDS-RE-DERIVATION",
+      "disposition_note": "EMPTY POINTER. This finding's public text says its detail is held outside this repository. Audited 2026-09-12: no such private record exists. The redaction was applied and the private record was never written, so the analysis is not held anywhere -- the finding names a location and a shape and carries no content. It cannot be accepted (there is no reasoning to accept), fixed (there is nothing to fix against) or deferred (nothing to defer). It must be re-derived from the code, and the re-derivation written to the operator's private record BEFORE this entry is disposed. This is the same failure already hit once in this series and it is systemic, not a one-off: redacting a finding without writing the private half destroys it.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR28-list-conn-duplicates-list",
@@ -1970,7 +2075,11 @@
       "what": "list_conn is a full hand-written copy of the generic ClaimRepository::list rather than a delegator, so one predicate exists in two SQL texts that must stay in sync by hand",
       "detail": "PR-27 rewrote count_conn to `Self::count(&mut *conn, viewer, search)` and left list_conn as a duplicate body. The two are IDENTICAL today -- verified at edit time: same seven projected columns, same two query shapes, same bind indices (4 / 3), same claim_from_row construction -- so this is a latent duplication surface and not a live defect. It is the class that produced get_by_id_conn's projection drift, and no gate can see it: visibility_lint.rs checks that each text carries a marker, not that two texts agree. OUT OF SCOPE FOR PR-28: it is a repo-layer change with a live caller in routes/claims.rs::list_claims, an unconverted file at 25 register sites, so collapsing it here would break atomic discipline and touch another shard's row.",
       "status": "open",
-      "assigned": "the shard that converts crates/epigraph-api/src/routes/claims.rs"
+      "assigned": "the shard that converts crates/epigraph-api/src/routes/claims.rs",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "One predicate in two hand-synchronised SQL texts. Owner was 'the shard that converts routes/claims.rs', which is unscheduled; the de-duplication does not need that shard.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-PR28-route-arm-extractor-parity",
@@ -1978,7 +2087,10 @@
       "what": "A pre-existing question about whether the two #[cfg] arms of a split handler declare the same extractors. Detail withheld from this PUBLIC repository; analysis held outside this repository.",
       "detail": "Analysis held outside this repository. PRE-EXISTING and NOT caused by the conversion. PR-28 brought crates/epigraph-api/src/routes/claims_query.rs::list_claims_query into line with crates/epigraph-api/src/routes/events.rs::list_events, which is the settled shape; the remainder is untouched. No gate in this series can observe the property: the workspace suite builds only the db configuration, and the no-default-features check type-checks the other arm without seeing which extractors it declares. A lint is the right control and cannot land in a conversion shard, because it would fail on the existing members.",
       "status": "open; detail held privately",
-      "assigned": "the conversion-shard series -- to be scheduled as its own change, one arm at a time behind a lint, not discharged by converting more sites"
+      "assigned": "the conversion-shard series -- to be scheduled as its own change, one arm at a time behind a lint, not discharged by converting more sites",
+      "disposition": "EMPTY-NEEDS-RE-DERIVATION",
+      "disposition_note": "EMPTY POINTER. This finding's public text says its detail is held outside this repository. Audited 2026-09-12: no such private record exists. The redaction was applied and the private record was never written, so the analysis is not held anywhere -- the finding names a location and a shape and carries no content. It cannot be accepted (there is no reasoning to accept), fixed (there is nothing to fix against) or deferred (nothing to defer). It must be re-derived from the code, and the re-derivation written to the operator's private record BEFORE this entry is disposed. This is the same failure already hit once in this series and it is systemic, not a one-off: redacting a finding without writing the private half destroys it.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR28-nodb-lib-test-build",
@@ -1986,7 +2098,11 @@
       "what": "The not(db) TEST build of epigraph-api does not compile, and has not for some time. Eleven errors in the lib-test target plus several integration-test targets, in modules unrelated to any current shard: missing AppState::with_db / with_db_and_signature_state, an out-of-date ApiConfig and WebhookSubscription initializer, a missing test_auth helper, and db-gated items named from not(db) test files.",
       "detail": "NOT A REGRESSION AND NOT CAUSED BY PR-28: demonstrated, not asserted -- the identical error set, same kinds and same modules, appears when the pre-change tree is checked out behind `git stash`, and claims_query.rs appears in neither set. It matters because it is the reason the ~20 not(db) validation tests in routes/claims_query.rs cannot be RUN, only type-checked, so the extractor parity 920496de restored has no runnable control behind it. Note the four gates in this series do not include --all-targets on the no-db check, so this breakage is invisible to them; the land pass added the flag ad hoc to find it.",
       "status": "open",
-      "assigned": "unowned -- needs an owner before the next shard that touches a not(db) handler arm"
+      "assigned": "unowned -- needs an owner before the next shard that touches a not(db) handler arm",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Duplicate of F-PR10-no-db-test-cfg-never-compiles; see that entry for the measurement and the reason. Kept as an entry so the duplication is visible rather than silently dropped.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "duplicate of F-PR10-no-db-test-cfg-never-compiles"
     },
     {
       "id": "F-PR28-route-error-text",
@@ -1994,7 +2110,11 @@
       "what": "An error-message hygiene question about how the statement branches build their 500 bodies, against the rule the two branches PR-28 ADDED in the same function state and follow.",
       "detail": "PRE-EXISTING at those sites: the conversion changed which executor each statement runs on and did not touch the error mapping, so the five branches are base text. It is filed rather than fixed because a conversion shard that also rewrites error handling stops being reviewable as a conversion. It is worth an owner because PR-28 is explicitly the template the remaining shards copy, so the next shard copying this file will copy the inconsistency along with the rule that forbids it.",
       "status": "open",
-      "assigned": "the conversion-shard series -- to be swept across the route layer once, not per shard"
+      "assigned": "the conversion-shard series -- to be swept across the route layer once, not per shard",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Hygiene only, and taken now for the reason the finding gives: this file is the template the remaining shards copy, so the inconsistency propagates if it is left.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-PR28-viewer-fixture-duplication",
@@ -2002,7 +2122,11 @@
       "what": "The two files are byte-identical hand-maintained copies -- confirmed identical at HEAD and identical at the base blob -- and PR-28 added the same 69 lines (seed_reasoning_trace, seed_evidence) to both by hand.",
       "detail": "PRE-EXISTING duplication that this shard extended rather than introduced. The two new helpers encode schema knowledge that is expensive to keep in sync: seed_reasoning_trace must both insert into reasoning_traces AND update the claim's trace_id, because claim_ids_by_methodology joins on c.trace_id = rt.id rather than on rt.claim_id; and both helpers omit tenancy columns on the strength of migration 070's unconditional inheritance arm. If a future migration adds a required column or changes that join, the two files drift and only one crate's tests fail. No control detects divergence.",
       "status": "open",
-      "assigned": "the conversion-shard series -- a shared test-support crate or an include! of one canonical file, whenever a third copy would otherwise be created"
+      "assigned": "the conversion-shard series -- a shared test-support crate or an include! of one canonical file, whenever a third copy would otherwise be created",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Confirmed on 0f6f8b02: viewer_fixture.rs exists in both epigraph-api/tests and epigraph-db/tests. Same class as F-PR28-list-conn-duplicates-list, separate commit.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-tests-depend-on-accumulated-shared-db-fixtures",
@@ -2011,7 +2135,11 @@
       "detail": "Demonstrated non-attributable in PR-29 by building BASE d9208e30 in a throwaway worktree and running it against the SAME database: all three binaries fail at base (2/2/1). The IDENTITY of the failing arms also VARIES between base and HEAD runs of the same binary -- graph_neighborhoods failed atomic+compound_returns at HEAD and compound_returns+compound_populates at base; claim_helper failed 2 at HEAD and a different 1 at base -- which is order/state dependence by definition. Assertions are of the form left 0 right 1, left 0 right 2, and 404 vs 200. None touches search/voids/methods/read_as. CONSEQUENCE FOR EVERY FUTURE GATE: two sequential runs against one shared database are NOT independent measurements, so a pass/fail disagreement between Verify and Land is expected and is NOT evidence about the diff. Non-attribution must rest on a base build, never on the disagreement. PR-29's ledger was corrected twice for treating sequential runs as independent evidence. FILED BY PR-18a, which is the first PR to touch progress.json since PR-29.",
       "status": "open",
       "assigned": "the conversion-shard series. Partially discharged: per-test isolation via #[sqlx::test] IS the mechanism, and it worked for the two epigraph-api binaries named above plus routes/search.rs. Remaining owner-work is epigraph-mcp's claim_helper_tests.rs (another slice) and the two epigraph-api files listed in `progress`.",
-      "progress": "PARTIALLY CLOSED -- 2 of the 3 named binaries are isolated; STATUS STAYS OPEN. CORRECTION TO THIS ENTRY'S OWN `where`, recorded rather than silently rewritten: it lists `crates/epigraph-api/tests/claim_helper_tests.rs`, which DOES NOT EXIST. The file is `crates/epigraph-mcp/tests/claim_helper_tests.rs` (ci.yml's epigraph-mcp step comment names it as the binary that adds a temporary CHECK constraint on `edges`). The `where` field is left as filed so the provenance of the mis-scoping survives; treat this note as the authority on the path. || CLOSED HERE: (a) graph_routes_test.rs -- 4 of its 6 arms converted to #[sqlx::test], and the four unfiltered DELETEs deleted from the shared helper common::seed_one_cluster (grep-verified sole caller). The other 2 arms assert 410/401 unconditionally, touch no table, and are deliberately left as #[tokio::test]. (b) graph_neighborhoods_test.rs -- all 3 arms converted, all 4 truncations removed. Every assertion is byte-identical; no test name lost, no #[ignore] added. Isolation was PROVEN, not assumed: decoy rows planted in the shared database (a 3-cluster run; 20 all-3072-centroid themes) left every arm green, which is only possible if the handler reads the per-test database -- and the decoys SURVIVED the run, which is what proves the truncations are gone. || FOUND BY THIS SHARD, NOT IN THE FINDING: `crates/epigraph-api/src/routes/search.rs::db_integration_tests` carried the same defect (unfiltered `UPDATE claims SET theme_id = NULL` + `DELETE FROM claim_themes`) and is now isolated too. It is called out because it is an IN-CRATE #[cfg(all(test, feature=\"db\"))] module under src/, so it is invisible to any inventory that walks crates/*/tests -- which is why it was missed. Future sweeps must scan src/ as well as tests/. || REMAINS, and epigraph-api STAYS SERIAL because of it. Exactly two files still issue unfiltered mutations in epigraph-api, verified by sweeping the whole crate after this change: build_from_bridges_test.rs (graph_cluster_runs, graph_clusters, cluster_edges, claim_cluster_membership, graph_neighborhoods, neighborhood_edges, claim_neighborhood_membership) and graph_themes_test.rs (neighborhood_edges, claim_neighborhood_membership, graph_neighborhoods). They are NOT converted here: there is grep evidence they exist but NO measured failure for them, and converting on borrowed evidence is how the incomplete inventories in this series were produced. They are harmless while cargo runs binaries serially and become hard blockers the moment epigraph-api's thread flag changes. Characterise them the way epigraph-db was characterised -- repeated runs at 4 threads, recording failing-arm identity per run -- before converting. || NAMED PREREQUISITE FOR epigraph-api EVER GOING PARALLEL, and it is NOT a database problem: tests/middleware/signature_tests.rs::test_constant_time_comparison_is_used times 10,000 iterations of an early-byte vs late-byte comparison and asserts the ratio stays within (0.5, 2.0). No per-test database, transaction or key scoping touches scheduler noise, and libtest has no per-test serialization primitive. The correct mechanism is to move it into its own test target with its own --test-threads=1 invocation while the rest of the package runs in parallel. WIDENING THE RATIO BOUNDS IS NOT A FIX -- it would destroy the timing-side-channel property the test exists to prove. Recorded so it is not later 'resolved' that way. || SECOND NAMED PREREQUISITE, MISSED BY THIS SHARD'S OWN INVENTORY AND ADDED ON REVIEW: process-global `std::env::set_var`, which is racy under threads and which Rust 2024 makes `unsafe` for that reason. Eight epigraph-api test files call it -- oauth_token_grant.rs, oauth_http.rs, oauth_redirect_flow.rs, idp_allowlist.rs, oauth_db.rs, oauth_authorization_code.rs, routes/submit_packet_tests.rs (seven of them writing per-provider OAuth client id/secret vars), and handler_audit_tests.rs. The inventory that produced the DELETE list above grepped for unfiltered database mutations only, which is the same source-limited sweep this entry criticises itself for two clauses earlier. This matters MORE after this shard than before it: api-test correctness now DEPENDS on the ambient `DATABASE_URL` being intact at runtime, because both `crates/epigraph-api/tests/viewer_fixture.rs::database_url_for` and `crates/epigraph-api/src/routes/search.rs::database_url_for` read it to reconstruct the per-test database URL, so a concurrent process-global write to it would point a handler at the wrong database -- exactly the silent-vacuous-pass these conversions exist to prevent. CLEARED, so it is not re-flagged: handler_audit_tests.rs is the only one that writes `DATABASE_URL`, it guards the write behind `if std::env::var(\"DATABASE_URL\").is_err()` (a no-op wherever the variable is already set, which includes CI), and that binary contains zero #[sqlx::test] arms. The other seven write only their own OAuth vars. So this is a prerequisite to DISCHARGE before epigraph-api goes parallel, not a live defect today."
+      "progress": "PARTIALLY CLOSED -- 2 of the 3 named binaries are isolated; STATUS STAYS OPEN. CORRECTION TO THIS ENTRY'S OWN `where`, recorded rather than silently rewritten: it lists `crates/epigraph-api/tests/claim_helper_tests.rs`, which DOES NOT EXIST. The file is `crates/epigraph-mcp/tests/claim_helper_tests.rs` (ci.yml's epigraph-mcp step comment names it as the binary that adds a temporary CHECK constraint on `edges`). The `where` field is left as filed so the provenance of the mis-scoping survives; treat this note as the authority on the path. || CLOSED HERE: (a) graph_routes_test.rs -- 4 of its 6 arms converted to #[sqlx::test], and the four unfiltered DELETEs deleted from the shared helper common::seed_one_cluster (grep-verified sole caller). The other 2 arms assert 410/401 unconditionally, touch no table, and are deliberately left as #[tokio::test]. (b) graph_neighborhoods_test.rs -- all 3 arms converted, all 4 truncations removed. Every assertion is byte-identical; no test name lost, no #[ignore] added. Isolation was PROVEN, not assumed: decoy rows planted in the shared database (a 3-cluster run; 20 all-3072-centroid themes) left every arm green, which is only possible if the handler reads the per-test database -- and the decoys SURVIVED the run, which is what proves the truncations are gone. || FOUND BY THIS SHARD, NOT IN THE FINDING: `crates/epigraph-api/src/routes/search.rs::db_integration_tests` carried the same defect (unfiltered `UPDATE claims SET theme_id = NULL` + `DELETE FROM claim_themes`) and is now isolated too. It is called out because it is an IN-CRATE #[cfg(all(test, feature=\"db\"))] module under src/, so it is invisible to any inventory that walks crates/*/tests -- which is why it was missed. Future sweeps must scan src/ as well as tests/. || REMAINS, and epigraph-api STAYS SERIAL because of it. Exactly two files still issue unfiltered mutations in epigraph-api, verified by sweeping the whole crate after this change: build_from_bridges_test.rs (graph_cluster_runs, graph_clusters, cluster_edges, claim_cluster_membership, graph_neighborhoods, neighborhood_edges, claim_neighborhood_membership) and graph_themes_test.rs (neighborhood_edges, claim_neighborhood_membership, graph_neighborhoods). They are NOT converted here: there is grep evidence they exist but NO measured failure for them, and converting on borrowed evidence is how the incomplete inventories in this series were produced. They are harmless while cargo runs binaries serially and become hard blockers the moment epigraph-api's thread flag changes. Characterise them the way epigraph-db was characterised -- repeated runs at 4 threads, recording failing-arm identity per run -- before converting. || NAMED PREREQUISITE FOR epigraph-api EVER GOING PARALLEL, and it is NOT a database problem: tests/middleware/signature_tests.rs::test_constant_time_comparison_is_used times 10,000 iterations of an early-byte vs late-byte comparison and asserts the ratio stays within (0.5, 2.0). No per-test database, transaction or key scoping touches scheduler noise, and libtest has no per-test serialization primitive. The correct mechanism is to move it into its own test target with its own --test-threads=1 invocation while the rest of the package runs in parallel. WIDENING THE RATIO BOUNDS IS NOT A FIX -- it would destroy the timing-side-channel property the test exists to prove. Recorded so it is not later 'resolved' that way. || SECOND NAMED PREREQUISITE, MISSED BY THIS SHARD'S OWN INVENTORY AND ADDED ON REVIEW: process-global `std::env::set_var`, which is racy under threads and which Rust 2024 makes `unsafe` for that reason. Eight epigraph-api test files call it -- oauth_token_grant.rs, oauth_http.rs, oauth_redirect_flow.rs, idp_allowlist.rs, oauth_db.rs, oauth_authorization_code.rs, routes/submit_packet_tests.rs (seven of them writing per-provider OAuth client id/secret vars), and handler_audit_tests.rs. The inventory that produced the DELETE list above grepped for unfiltered database mutations only, which is the same source-limited sweep this entry criticises itself for two clauses earlier. This matters MORE after this shard than before it: api-test correctness now DEPENDS on the ambient `DATABASE_URL` being intact at runtime, because both `crates/epigraph-api/tests/viewer_fixture.rs::database_url_for` and `crates/epigraph-api/src/routes/search.rs::database_url_for` read it to reconstruct the per-test database URL, so a concurrent process-global write to it would point a handler at the wrong database -- exactly the silent-vacuous-pass these conversions exist to prevent. CLEARED, so it is not re-flagged: handler_audit_tests.rs is the only one that writes `DATABASE_URL`, it guards the write behind `if std::env::var(\"DATABASE_URL\").is_err()` (a no-op wherever the variable is already set, which includes CI), and that binary contains zero #[sqlx::test] arms. The other seven write only their own OAuth vars. So this is a prerequisite to DISCHARGE before epigraph-api goes parallel, not a live defect today.",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "The mechanism is already proven in this tree for two binaries; this applies it to the remaining arms. A test that passes according to what an earlier test left behind is not evidence about the code under test.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-test-integrity"
     },
     {
       "id": "F-PR29-A1",
@@ -2019,7 +2147,10 @@
       "what": "Connection-hold footprint interacts with the shared request pool; analysis held outside this repository.",
       "detail": "Registered as an id, a location and an owner only. Raised during PR-29 and filed by PR-18a.",
       "status": "open",
-      "assigned": "the conversion-shard series"
+      "assigned": "the conversion-shard series",
+      "disposition": "CONVERSION-TAIL",
+      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR29-A2",
@@ -2027,7 +2158,11 @@
       "what": "Response projection question raised and answered during PR-29; analysis held outside this repository.",
       "detail": "Pre-existing and unchanged by PR-29. Low severity, blocks nothing. Registered as an id, a location and an owner only. Filed by PR-18a.",
       "status": "open",
-      "assigned": "the parent (product call)"
+      "assigned": "the parent (product call)",
+      "disposition": "OPERATOR-DECISION",
+      "disposition_note": "Product call. Already standing in the operator's pending-decisions record; unchanged by this pass.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "standalone"
     },
     {
       "id": "F-PR18a-B1",
@@ -2035,7 +2170,10 @@
       "what": "Read-scoping question on a pre-existing route whose sole per-principal narrowing mechanism migration 083 recreates and widens; analysis held outside this repository.",
       "detail": "Registered as an id, a location and an owner only. PR-18a converted this handler's fail-open scope check (FAIL_OPEN_SCOPE_SITES loses its audit.rs row) but deliberately did NOT convert the site onto the scoped read path, which is the conversion-shard series' unit of work. Raised and filed by PR-18a.",
       "status": "open",
-      "assigned": "the conversion-shard series"
+      "assigned": "the conversion-shard series",
+      "disposition": "EMPTY-NEEDS-RE-DERIVATION",
+      "disposition_note": "EMPTY POINTER. This finding's public text says its detail is held outside this repository. Audited 2026-09-12: no such private record exists. The redaction was applied and the private record was never written, so the analysis is not held anywhere -- the finding names a location and a shape and carries no content. It cannot be accepted (there is no reasoning to accept), fixed (there is nothing to fix against) or deferred (nothing to defer). It must be re-derived from the code, and the re-derivation written to the operator's private record BEFORE this entry is disposed. This is the same failure already hit once in this series and it is systemic, not a one-off: redacting a finding without writing the private half destroys it.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR18a-hull-sibling-arm-is-one-hop",
@@ -2044,7 +2182,11 @@
       "detail": "An UNDER-selection, which 080's header identifies as the direction that is NOT fail-closed for this function's purpose. The header originally claimed the whole content lineage 'transitively, in BOTH directions'; PR-18a trimmed that claim to what the code does and named the gap rather than closing it. Closing it means folding the step_lineage_id expansion into the recursive term as a third LATERAL branch -- a real change to what the hull selects, with no consumer in PR-18a to exercise it.",
       "status": "open",
       "assigned": "whichever slice next changes the hull DDL, or adds a second direct caller of epigraph_content_lineage_hull that does not go through PrivatizationRepository::select_content_lineage_hull",
-      "answered_by_pr18_18b": "CLOSED AT THE REPO LAYER ONLY. select_content_lineage_hull re-seeds epigraph_content_lineage_hull with everything found so far and repeats until a round adds nothing, which makes the sibling arm transitive and also completes a supersedes chain longer than the SQL walk's 64-hop bound -- both without altering applied DDL. privatization_hull.rs pins each fix with a calibration asserting that the RAW single call fails on the same fixture. THE FUNCTION ITSELF IS UNCHANGED, so any DIRECT caller of epigraph_content_lineage_hull still gets the one-hop sibling arm; that is why this stays open rather than moving to closed_findings."
+      "answered_by_pr18_18b": "CLOSED AT THE REPO LAYER ONLY. select_content_lineage_hull re-seeds epigraph_content_lineage_hull with everything found so far and repeats until a round adds nothing, which makes the sibling arm transitive and also completes a supersedes chain longer than the SQL walk's 64-hop bound -- both without altering applied DDL. privatization_hull.rs pins each fix with a calibration asserting that the RAW single call fails on the same fixture. THE FUNCTION ITSELF IS UNCHANGED, so any DIRECT caller of epigraph_content_lineage_hull still gets the one-hop sibling arm; that is why this stays open rather than moving to closed_findings.",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Closed at the repo layer by PR-18b's re-seeding loop, which makes the sibling arm transitive and is pinned by a calibration asserting the raw single call fails on the same fixture. What stays open is that the applied DDL is unchanged, so a hypothetical future DIRECT caller would get the one-hop arm. There is no such caller. Accepted as a guard note on the DDL, with the existing assignment -- whichever slice next changes that DDL -- as the correct trigger.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "closed at the repo layer and pinned; no direct caller exists"
     },
     {
       "id": "F-PR18b-A1",
@@ -2052,7 +2194,11 @@
       "what": "Response-assembly question raised and answered during PR-18's second slice; analysis held outside this repository.",
       "detail": "Registered as an id, a location and an owner only, deliberately. NO LONGER LATENT: PR-18's third slice ships crates/epigraph-api/src/routes/privatization.rs, which is the trigger its assignment names. The analysis remains held outside this repository and is deliberately not restated here or anywhere else in this diff. THE LAND PHASE COULD NOT DISCHARGE IT: the analysis is not reachable from this tree, so no one working from the diff can close it, and it needs the operator out of band. Landing PR-18 and closing this finding are different things; this is the second.",
       "status": "open",
-      "assigned": "the operator, out of band -- the review that its previous assignment named could not reach the analysis, and re-assigning it from inside the diff would be a guess"
+      "assigned": "the operator, out of band -- the review that its previous assignment named could not reach the analysis, and re-assigning it from inside the diff would be a guess",
+      "disposition": "OPERATOR-DECISION",
+      "disposition_note": "Assigned to the operator out of band and re-confirmed there. Re-assigning it from inside a diff would be a guess, which is why it was moved out of band in the first place.",
+      "disposition_date": "2026-09-12",
+      "decision_group": "standalone"
     },
     {
       "id": "F-PR18b-conn-lint-selects-on-the-name",
@@ -2060,7 +2206,11 @@
       "what": "The rule that a viewer-less connection-taking repo read must be registered keys on the function NAME ending in _conn, so one named anything else is invisible to it -- and to the viewer-spending lint and the executor lint as well.",
       "detail": "MEASURED ON THIS SLICE: load_plan, list_plans and load_plan_items shipped viewer-less, connection-taking and registered nowhere, purely because of their names. They were renamed and registered rather than the lint being widened, because changing the selector to 'the parameter list mentions PgConnection' changes this lint's contract across the whole repo layer and would arrive with a register of unreviewed entries -- a larger decision than a route slice should make on its own. The hole itself is unchanged and is now stated in the lint's own doc.",
       "status": "open",
-      "assigned": "the conversion-shard series, or whichever PR next adds an entry to CONN_WITHOUT_VIEWER"
+      "assigned": "the conversion-shard series, or whichever PR next adds an entry to CONN_WITHOUT_VIEWER",
+      "disposition": "FIX-SCHEDULED",
+      "disposition_note": "Same batch but a SEPARATE commit and a different mechanism: comment stripping does nothing for a lint that keys on a function-name suffix. This needs signature-based detection or an explicit registry, and it is the harder half.",
+      "disposition_date": "2026-09-12",
+      "fix_batch": "tenancy/fix-lint-robustness"
     },
     {
       "id": "F-PR18b-preview-schema-is-a-subset",
@@ -2070,7 +2220,11 @@
       "status": "open",
       "assigned": "The seal-mode share is DISCHARGED by PR-21. Still open and still assigned as before: whichever slice implements reachability_delta for the author array, and an unassigned pagination follow-up for GET /plans and the item filters.",
       "answered_by_pr18_18c": "THE APPLY-TIME SURFACES, which were this slice's share. GET /plans/:id now serves 6.5.7's 'preview + live progress': PlanSummary carries approved_by, approved_at, dispatched_by, cursor_depth, drift_count and an items_by_state histogram. drift_count and NOT drift_ids -- the drift set is claim ids a plan administrator may not be entitled to read, and this response crosses no Viewer. STILL OPEN and still assigned as before: GET /plans is unpaginated, GET /plans/:id/items omits the state/kind/depth filters, the seal-mode fields are PR-21's, and counts.authors_losing_own_claims stays a scalar until reachability_delta exists.",
-      "answered_by_pr21": "THE SEAL-MODE FIELDS. PlanPreview::side_effects now carries destroys_derived_rows (the exact table set the mutation DELETEs, pinned to it by a set-equality test), unrecoverable (the harvester_fragments loss, including the shared-fragment over-reach) and reversibility (that the server holds no key). A seal plan's preview states what a seal destroys before the admin clicks, which is what 6.5.4 asks of it. NOT closed as a whole: the GET /plans pagination and the item filters are untouched, and counts.authors_losing_own_claims is still a scalar."
+      "answered_by_pr21": "THE SEAL-MODE FIELDS. PlanPreview::side_effects now carries destroys_derived_rows (the exact table set the mutation DELETEs, pinned to it by a set-equality test), unrecoverable (the harvester_fragments loss, including the shared-fragment over-reach) and reversibility (that the server holds no key). A seal plan's preview states what a seal destroys before the admin clicks, which is what 6.5.4 asks of it. NOT closed as a whole: the GET /plans pagination and the item filters are untouched, and counts.authors_losing_own_claims is still a scalar.",
+      "disposition": "ACCEPTED",
+      "disposition_note": "NOT the conversion tail. The seal-mode share is discharged by PR-21; what remains is an unimplemented optional response field and unassigned pagination, i.e. absent functionality rather than a defect. Accepted as a documented subset, and the existing trigger (the slice that implements that field) is correct.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "a documented schema subset; remaining parts are unbuilt features, not defects"
     },
     {
       "id": "F-PR20-A",
@@ -2078,7 +2232,11 @@
       "owner": "the 9.2 step-11d credential-split work; NOT PR-20",
       "location": "migrations/077_rls_policies.sql, and the group write paths in crates/epigraph-api/src/routes/groups.rs",
       "what": "A posture question about the group write paths that becomes material only at 9.2 step 11d. Analysis held outside this repository.",
-      "status": "open"
+      "status": "open",
+      "disposition": "EMPTY-NEEDS-RE-DERIVATION",
+      "disposition_note": "EMPTY POINTER. This finding's public text says its detail is held outside this repository. Audited 2026-09-12: no such private record exists. The redaction was applied and the private record was never written, so the analysis is not held anywhere -- the finding names a location and a shape and carries no content. It cannot be accepted (there is no reasoning to accept), fixed (there is nothing to fix against) or deferred (nothing to defer). It must be re-derived from the code, and the re-derivation written to the operator's private record BEFORE this entry is disposed. This is the same failure already hit once in this series and it is systemic, not a one-off: redacting a finding without writing the private half destroys it.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "material only at a step that is deliberately not run"
     },
     {
       "id": "F-PR20-B",
@@ -2086,7 +2244,10 @@
       "owner": "the owner of the community/group projection surface; NOT PR-20",
       "location": "crates/epigraph-db/src/repos/community.rs::remove_member",
       "what": "A roster-invariant question about the second membership-removal path, pre-existing and unchanged by this PR, which recorded the re-key obligation there but did not alter what that path permits. Analysis held outside this repository.",
-      "status": "open"
+      "status": "open",
+      "disposition": "EMPTY-NEEDS-RE-DERIVATION",
+      "disposition_note": "EMPTY POINTER. This finding's public text says its detail is held outside this repository. Audited 2026-09-12: no such private record exists. The redaction was applied and the private record was never written, so the analysis is not held anywhere -- the finding names a location and a shape and carries no content. It cannot be accepted (there is no reasoning to accept), fixed (there is nothing to fix against) or deferred (nothing to defer). It must be re-derived from the code, and the re-derivation written to the operator's private record BEFORE this entry is disposed. This is the same failure already hit once in this series and it is systemic, not a one-off: redacting a finding without writing the private half destroys it.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR21-A",
@@ -2095,7 +2256,10 @@
       "where": "crates/epigraph-db/src/repos/privatization.rs::seal_manifest_page_conn",
       "what": "A hardening question on one read path in the privatization module. Analysis held outside this repository.",
       "detail": "Registered as an id, a location and an owner only, per this repository's disclosure rule. Not a defect in the shipped code and it blocks nothing; raised during the PR-21 review round and filed rather than fixed because the fix is a predicate change on a read path this PR does not otherwise touch.",
-      "status": "open"
+      "status": "open",
+      "disposition": "EMPTY-NEEDS-RE-DERIVATION",
+      "disposition_note": "EMPTY POINTER. This finding's public text says its detail is held outside this repository. Audited 2026-09-12: no such private record exists. The redaction was applied and the private record was never written, so the analysis is not held anywhere -- the finding names a location and a shape and carries no content. It cannot be accepted (there is no reasoning to accept), fixed (there is nothing to fix against) or deferred (nothing to defer). It must be re-derived from the code, and the re-derivation written to the operator's private record BEFORE this entry is disposed. This is the same failure already hit once in this series and it is systemic, not a one-off: redacting a finding without writing the private half destroys it.",
+      "disposition_date": "2026-09-12"
     },
     {
       "id": "F-PR22-A",
@@ -2103,7 +2267,11 @@
       "what": "A catalog guard in 076 does not hold at head, so a MANUAL re-application of 076 against a database at head fails. Analysis held outside this repository.",
       "detail": "Not described here. 076 IS APPLIED AND FROZEN: editing it changes its checksum and `sqlx migrate run` then refuses to start, which panics the api binary on restart for every database that has run this branch. So it is not corrected here. Scope: a manual re-application of 076 against a database already at head. Neither a fresh migrate nor a `lock_timeout` retry reaches it, because both run 076 at its own deploy step. `tenancy_required.rs::the_pr16_migrations_can_be_applied_twice` scaffolds the retired relation for the duration of its replay.",
       "status": "open, not described in this repository",
-      "assigned": "unassigned. Owner: whichever future migration next needs 076's array; it cannot edit 076."
+      "assigned": "unassigned. Owner: whichever future migration next needs 076's array; it cannot edit 076.",
+      "disposition": "ACCEPTED",
+      "disposition_note": "Its own stated owner is structurally correct and cannot be brought forward: the repair cannot edit the migration it concerns, so it belongs to whichever future migration next needs that object. Detail stays outside this repository.",
+      "disposition_date": "2026-09-12",
+      "accepted_because": "the repair cannot edit an applied migration; owner is a future migration"
     }
   ],
   "closed_findings": [
@@ -2255,7 +2423,81 @@
       "closed_by": "this change (branch tenancy/fix-zero-admin-race). A dedicated fix, outside the 22-PR sequence -- prs.total and prs.done are untouched.",
       "gate": "Full gate, real exit codes, all four re-run on the FINAL tree after the last comment edit, on the throwaway test database (port 5433, migration head 91). cargo fmt --all -- --check: 0. cargo clippy --workspace --all-targets --locked -- -D warnings: 0, and NOT a cached green -- all three changed sources were touched first and the run took 2m01s. cargo test --workspace --locked --no-fail-fast: 0, over 399 test binaries: 4329 passed, 0 failed, 72 ignored. cargo check -p epigraph-api --no-default-features --locked in a dedicated COLD target directory: 0 -- load-bearing because the diff touches routes/groups.rs. The genai feature gate was not required: all five required-features = [\"genai\"] targets are in epigraph-cli, which this diff does not touch. No sqlx::query!/query_as! macro is added or changed (the new SQL is runtime sqlx::query_as), so .sqlx/ needed no regeneration and git status over it is empty. NO MIGRATION added or modified: migrations/ is clean in git status and git diff, the fix is purely a locking change, and a count floor is not expressible as a uniqueness constraint.",
       "scope": "A DEDICATED FIX, outside the 22-PR sequence. docs/tenancy/FINAL-PLAN.md contains no zero-admin section at all, so the parent's recon brief is the specification. prs.total, prs.current (null), prs.failed, prs.halted (null) and prs.next are untouched and nothing is renumbered; prs.done gains ONE entry that carries no PR number, so the 22-PR sequence is unaffected and the fix is still visible to a reader who reads prs rather than closed_findings. Files: crates/epigraph-db/src/repos/group_membership.rs (the lock and its reasoning), crates/epigraph-api/src/routes/groups.rs (comment only -- no non-comment line changes), crates/epigraph-api/tests/group_lifecycle.rs (two new deterministic tests and one new positive control; nothing weakened, no #[ignore] added, and the pre-existing concurrent test's body is byte-unchanged), and this ledger. crates/epigraph-db/tests/locked_decisions.rs is deliberately untouched: this change alters no RLS policy, no route split and no tenancy column, which is the plan-SS0.2 statement that file's module doc requires a change outside the four locked decisions to make explicitly."
+    },
+    {
+      "id": "F-not-db-build-unverified",
+      "where": "crates/epigraph-api/src/middleware/bearer.rs (the #[cfg(not(feature = \"db\"))] ViewerExtractor)",
+      "what": "RESOLVED-ON-BRANCH. The not(db) parity shim is now both CI-gated and executed locally.",
+      "detail": "The previous entry said 'the prescribed gate never compiles this configuration' while bearer.rs's own doc and public_router_allowlist.rs's header both asserted that .github/workflows/ci.yml gates `cargo check -p epigraph-api --no-default-features --locked`. The ledger and the code were asserting opposite things. The code is right: ci.yml line 171 runs exactly that step, deliberately scoped lib+bins rather than --all-targets because epigraph-api's [dev-dependencies] on epigraph-db and sqlx are non-optional. It has also now been executed locally in a SEPARATE target dir (/home/jeremy/.cargo-target-nodb) - a warm shared dir holding default-feature artifacts returns exit 0 on a tree that fails cold, which produced a false green twice on this project.",
+      "status": "closed 2026-09-12 by the findings-disposition pass",
+      "assigned": "none - ci.yml is the standing gate",
+      "disposition": "CLOSED",
+      "disposition_note": "Bookkeeping. The entry said it was resolved on branch and kept open only until merge so the reconciliation was not lost; that merge has happened. Scope confirmed on 0f6f8b02: ci.yml gates the not(db) build at lib+bins and says in its own comment that it deliberately omits --all-targets. So this closes for the parity shim it was about, and does NOT close the test-target build, which is F-PR10-no-db-test-cfg-never-compiles / F-PR28-nodb-lib-test-build.",
+      "disposition_date": "2026-09-12"
+    },
+    {
+      "id": "F-unconditional-group-bind-on-base",
+      "where": "crates/epigraph-db/src/repos/agent.rs:1332",
+      "what": "A spliced statement binds viewer.group_bind().unwrap_or(&[]) unconditionally, which is a Postgres bind-arity error for a Bypass viewer",
+      "detail": "Viewer::render_predicate emits a single space for a Bypass shape, so the rendered statement references no $N while the bind is still supplied -> 'bind message supplies N parameters, but prepared statement requires M'. Fail-CLOSED and unreachable today (this path's viewer never comes from a MaintenanceLease). PR-09 converted all NINE sites it introduced or touched to the guarded `if let Some(g) = viewer.group_bind()` form used by ~165 existing sites, and left this pre-existing one alone rather than widening its diff. A Viewer::bind_groups(q) helper that makes the correct thing the only thing would close the class.",
+      "disposition": "CLOSED",
+      "disposition_note": "NOT REPRODUCIBLE on 0f6f8b02, measured rather than inferred. All 34 group_bind().unwrap_or(&[]) sites sit in fixed-arity statements whose predicate is unconditionally present in the SQL text -- 33 in sqlx::query! macro invocations and one in a static query_as string. The bind-arity hazard requires the array to be bound onto a SPLICED string, where the predicate can be removed while the bind remains; zero sites do that. Spliced sites use the conditional `if let Some(g) = viewer.group_bind()` form instead. A lint in tenancy/fix-lint-robustness keeps this false rather than leaving it to re-measurement.",
+      "disposition_date": "2026-09-12",
+      "status": "closed 2026-09-12 by the findings-disposition pass"
+    },
+    {
+      "id": "F-PR10-get-webhook-ignores-active",
+      "found_by": "PR-10 land-phase critic",
+      "what": "list_webhooks filters on sub.active; get_webhook does not. An inactive subscription would be invisible to list and readable by id.",
+      "why_it_matters": "Inert today - nothing anywhere sets active = false, so the column only ever holds its DEFAULT TRUE. It becomes a real list/get divergence, with the id-addressed route on the permissive side, the moment a deactivation path is added. Same class as the ownership divergence PR-10 fixed.",
+      "suggested_fix": "Add the active check to get_webhook in the PR that introduces deactivation.",
+      "owner": "the PR that adds a webhook deactivation path",
+      "disposition": "CLOSED",
+      "disposition_note": "MIS-STATED, measured on 0f6f8b02. get_webhook takes RequirePrincipal and refuses when sub.agent_id is not the caller, so it is not readable by an arbitrary caller. What remains true is narrow and not a defect: an owner can read their own inactive subscription by id. There is no deactivation path in the tree, so the state is unreachable, and an owner reading their own deactivated registration is the behaviour one would choose anyway.",
+      "disposition_date": "2026-09-12",
+      "status": "closed 2026-09-12 by the findings-disposition pass"
     }
   ],
-  "halted": null
+  "halted": null,
+  "findings_disposition_2026_09_12": {
+    "why": "All 54 open findings were carried with owners that had gone stale: eleven named PR-16, which is delivered, and a further group named 'the conversion-shard series', which is not a scheduled PR. An owner that does not exist is not an owner, so this pass gives every finding exactly one disposition from a closed vocabulary and says plainly which ones nobody is going to do.",
+    "measured_against": "0f6f8b02",
+    "vocabulary": {
+      "FIX-SCHEDULED": "A named branch in this cleanup fixes it, with a mutation proof.",
+      "OPERATOR-DECISION": "Blocked on a decision only the operator can make. Recorded in the operator's pending-decisions record.",
+      "ACCEPTED": "Carried deliberately. Needs no owner, and the reason it needs none is stated.",
+      "CONVERSION-TAIL": "Belongs to the unnumbered conversion tail (the remaining .db_pool call sites that gate FORCE-RLS). That tail is not a scheduled PR and has no owner TODAY, which is what this label records. It is explicitly a CANDIDATE FOR SCHEDULING, not a decision that the work will not be done -- the operator may well schedule it. The label exists so the absence of a current owner is visible instead of being hidden behind an owner that does not exist.",
+      "CLOSED": "Re-measured on 0f6f8b02 and moved to closed_findings, with the measurement recorded.",
+      "EMPTY-NEEDS-RE-DERIVATION": "The finding's detail was redacted from this public repository and the private record it points to was never written. The finding is empty and must be re-derived from the code before it can be disposed."
+    },
+    "counts": {
+      "OPERATOR-DECISION": 6,
+      "CONVERSION-TAIL": 9,
+      "FIX-SCHEDULED": 19,
+      "ACCEPTED": 11,
+      "EMPTY-NEEDS-RE-DERIVATION": 6,
+      "CLOSED": 3
+    },
+    "duplicates_merged": [
+      "F-PR10-no-db-test-cfg-never-compiles + F-PR28-nodb-lib-test-build -- one not(db) test-build defect recorded twice",
+      "F-structural-no-privacy-budget + F-structural-moments-exact + F-structural-support-exact -- three findings, one privacy-budget decision"
+    ],
+    "closed_on_re_measurement": [
+      "F-PR10-get-webhook-ignores-active",
+      "F-not-db-build-unverified",
+      "F-unconditional-group-bind-on-base"
+    ],
+    "operator_decisions_outstanding": [
+      "privacy-budget-mechanism",
+      "unauthenticated-listener-posture",
+      "schedule the conversion tail (the operator has indicated it is likely to be done; sequencing is the open question, not whether)",
+      "F-PR29-A2",
+      "F-PR18b-A1",
+      "re-derive the six EMPTY-NEEDS-RE-DERIVATION findings (investigation, not a decision, but it is unscheduled work the operator should know about)"
+    ],
+    "audits": {
+      "conversion_tail_bucket": "Audited every finding that landed in CONVERSION-TAIL. Three did not belong and were moved: a trigger-migration repair, a pre-existing events coverage limit, and an unimplemented response field. The tail means the remaining .db_pool call sites; anything else in that bucket is mislabelled, which is the same laundering this pass exists to stop. The label means 'no owner today and a candidate for scheduling'; an earlier draft of this entry overstated it as 'nobody is going to do this', which is not what the absence of a current owner establishes.",
+      "private_record_existence": "Audited all twelve findings whose public text defers detail to a record outside this repository. Six point at a record that does not exist. Those six are re-labelled EMPTY-NEEDS-RE-DERIVATION. Four have a real record and one needed none (its public text is self-contained). The lesson is recorded because the redaction discipline is correct and its second half was being skipped."
+    }
+  }
 }
