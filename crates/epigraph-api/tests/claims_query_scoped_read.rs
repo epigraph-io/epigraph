@@ -444,3 +444,96 @@ async fn the_evidence_type_prefetch_narrows_without_dropping_the_viewers_own_cla
         "a stranger's claim with document evidence must be absent; got {got:?}"
     );
 }
+
+// ── The 500 body, which is a different property from any of the above ───────
+
+/// A statement that FAILS on the viewer-stamped connection must answer with a
+/// fixed, opaque message — not with the database's own error text.
+///
+/// # Why this arm exists at all
+///
+/// `list_claims_query`'s two PR-28 branches (`read_as`'s refusal and
+/// `finish_scoped_read`'s) log the internal error and answer with a fixed
+/// literal. Its five STATEMENT branches used to interpolate the `sqlx` error
+/// into the body instead, and log nothing. Nothing in this tree asserted a 500
+/// body from this handler, in either shape — so the inconsistency was invisible
+/// to the gate, and this file is explicitly the template the remaining
+/// conversion shards copy.
+///
+/// # The mutilation, and why it is this one
+///
+/// `ClaimRepository::claim_ids_by_methodology` is the only one of the five that
+/// joins a table no other statement in the request touches, so renaming the
+/// column it filters on fails exactly one branch and leaves the handler
+/// otherwise intact. Renaming rather than dropping the table keeps the failure
+/// a plain "column does not exist" rather than a cascade of unrelated ones.
+/// The database is `#[sqlx::test]`'s throwaway, so nothing is restored.
+///
+/// # What this asserts, and what it does NOT
+///
+/// It asserts the BODY: the exact literal, and the absence of the identifier the
+/// driver's message would have carried. It does NOT assert that the
+/// `tracing::error!` half fired — `epigraph-api` carries no `tracing-test`
+/// dev-dependency, and adding one to assert a log line was out of scope for this
+/// change. The logging half is therefore covered by review only, and that is
+/// stated rather than implied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_statement_answers_with_an_opaque_body_not_the_driver_error(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "cq-opaque").await;
+    let claim = seed_group_claim(&pool, agent, group, "opaque-body fixture claim").await;
+    seed_reasoning_trace(&pool, claim, "deductive").await;
+
+    // CALIBRATION: the same request SUCCEEDS before the mutilation, so the error
+    // below is the mutilation and not a broken fixture. This also carries the
+    // positive direction the acceptance asks for — the legitimate caller is
+    // still served.
+    let ok = list(&pool, split_state(&pool).await, agent, methodology_params()).await;
+    assert!(
+        ids(&ok).contains(&claim),
+        "CALIBRATION: the methodology prefetch must serve the viewer's own claim \
+         before the column is renamed"
+    );
+
+    sqlx::query("ALTER TABLE reasoning_traces RENAME COLUMN reasoning_type TO reasoning_type_gone")
+        .execute(&pool)
+        .await
+        .expect("rename the column the methodology prefetch filters on");
+
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("resolve");
+    let err = list_claims_query(
+        ViewerExtractor(viewer),
+        State(split_state(&pool).await),
+        Query(methodology_params()),
+    )
+    .await
+    .expect_err("the methodology prefetch must fail once its column is gone");
+
+    let message = match err {
+        epigraph_api::errors::ApiError::InternalError { message } => message,
+        other => panic!("expected InternalError, got {other:?}"),
+    };
+
+    assert_eq!(
+        message, "Methodology filter query failed",
+        "the 500 body must be the fixed literal the two PR-28 branches use. \
+         `errors.rs` serialises `message` verbatim, so anything appended to it \
+         is disclosed to the caller."
+    );
+    assert!(
+        !message.contains("reasoning_type"),
+        "the body carried the name of the object the failing statement touched. \
+         The driver's error belongs in the log, not in the response body. \
+         Body: {message}"
+    );
+}
+
+/// `methodology = "deductive"` and nothing else — the shape that fires the
+/// prefetch and therefore forces the slow path.
+fn methodology_params() -> ClaimQueryParams {
+    ClaimQueryParams {
+        methodology: Some("deductive".to_string()),
+        ..base_params()
+    }
+}

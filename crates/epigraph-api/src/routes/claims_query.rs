@@ -351,9 +351,7 @@ pub async fn list_claims_query(
         Some(ref m) => {
             let ids = ClaimRepository::claim_ids_by_methodology(&mut *read, &viewer, m)
                 .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Methodology filter query failed: {}", e),
-                })?;
+                .map_err(|e| scoped_read_failure(&e, "Methodology filter query failed"))?;
             Some(ids.into_iter().collect())
         }
         None => None,
@@ -363,9 +361,7 @@ pub async fn list_claims_query(
         Some(ref et) => {
             let ids = ClaimRepository::claim_ids_by_evidence_type(&mut *read, &viewer, et)
                 .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Evidence type filter query failed: {}", e),
-                })?;
+                .map_err(|e| scoped_read_failure(&e, "Evidence type filter query failed"))?;
             Some(ids.into_iter().collect())
         }
         None => None,
@@ -396,9 +392,8 @@ pub async fn list_claims_query(
         // `SessionGucMode::Transaction` they are also the same transaction.
         let total = ClaimRepository::count(&mut *read, &viewer, params.content_contains.as_deref())
             .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Database count failed: {}", e),
-            })? as usize;
+            .map_err(|e| scoped_read_failure(&e, "Database count failed"))?
+            as usize;
 
         let rows = ClaimRepository::list(
             &mut *read,
@@ -408,9 +403,7 @@ pub async fn list_claims_query(
             params.content_contains.as_deref(),
         )
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Database query failed: {}", e),
-        })?;
+        .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
 
         crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
@@ -446,9 +439,7 @@ pub async fn list_claims_query(
         params.content_contains.as_deref(),
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Database query failed: {}", e),
-    })?;
+    .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
 
     // The last statement on this path. Everything below is in-memory, so the
     // connection is returned before the filtering, the sort and the pagination
@@ -544,6 +535,48 @@ pub async fn list_claims_query(
         limit,
         offset,
     }))
+}
+
+/// Log a failed statement on the viewer-stamped connection in full, and answer
+/// with an opaque `500`.
+///
+/// # Why this exists, and why it is not a nicer error message
+///
+/// The two branches PR-28 ADDED to [`list_claims_query`] — `read_as`'s refusal
+/// and `finish_scoped_read`'s — already follow one rule: emit
+/// `tracing::error!(target: "tenancy.scoped_read", error = %e, handler = …)` and
+/// return an `ApiError::InternalError` whose `message` is a FIXED literal.
+/// `errors.rs` serialises that `message` verbatim into the response body, so the
+/// literal is the whole of what a 500 discloses.
+///
+/// The five statement branches did not follow it: each built its body with
+/// `format!("… : {e}")` and logged nothing, so the driver's error went to the
+/// caller instead of to the operator. That is the opposite of the rule's intent
+/// in both directions at once — a driver error belongs in the log, not in the
+/// response body.
+///
+/// It was not fixed merely because it is untidy: [`list_claims_query`] is
+/// explicitly the template the remaining conversion shards copy, so a shard
+/// reading it would otherwise have found the rule stated in the `read_as`
+/// comment and five live counter-examples immediately below it.
+///
+/// `message` is `&'static str` rather than a `String` so this cannot be called
+/// with an interpolated argument.
+///
+/// `handler` is a literal because this helper is private and has exactly one
+/// caller. A shard that copies it into another route file must take the handler
+/// name as a parameter rather than inherit this one.
+#[cfg(feature = "db")]
+fn scoped_read_failure(e: &epigraph_db::DbError, message: &'static str) -> ApiError {
+    tracing::error!(
+        target: "tenancy.scoped_read",
+        error = %e,
+        handler = "list_claims_query",
+        "a statement failed on the viewer-stamped connection"
+    );
+    ApiError::InternalError {
+        message: message.to_string(),
+    }
 }
 
 /// List and filter claims from the in-memory claim store (no database)
