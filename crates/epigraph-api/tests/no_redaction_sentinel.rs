@@ -51,6 +51,9 @@
 //! the one spelling this codebase actually used, for eight years of git history,
 //! at ~20 sites.
 
+mod lint_text;
+
+use lint_text::strip_comments;
 use std::path::{Path, PathBuf};
 
 /// The literal that must not reappear in production code.
@@ -104,57 +107,6 @@ fn workspace_crates_dir() -> PathBuf {
         .parent()
         .expect("crates/ is the parent of this crate")
         .to_path_buf()
-}
-
-/// Remove `//` line comments and `/* */` block comments, respecting string
-/// literals so a `"//"` inside a SQL fragment does not truncate the line.
-///
-/// Deliberately simple and deliberately over-eager on one case: a `//` inside a
-/// raw string would be treated as a comment. That direction is safe — it can
-/// only cause the lint to see LESS code and so to under-report, never to fail a
-/// clean tree, and no scanned crate puts the sentinel in a raw string.
-fn strip_comments(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    let (mut in_str, mut in_line, mut in_block) = (false, false, false);
-    let mut quote = b'"';
-    while i < b.len() {
-        let c = b[i];
-        let next = b.get(i + 1).copied();
-        if in_line {
-            if c == b'\n' {
-                in_line = false;
-                out.push('\n');
-            }
-        } else if in_block {
-            if c == b'*' && next == Some(b'/') {
-                in_block = false;
-                i += 1;
-            }
-        } else if in_str {
-            if c == b'\\' {
-                i += 1; // skip the escaped byte
-            } else if c == quote {
-                in_str = false;
-            }
-            out.push(c as char);
-        } else if c == b'/' && next == Some(b'/') {
-            in_line = true;
-            i += 1;
-        } else if c == b'/' && next == Some(b'*') {
-            in_block = true;
-            i += 1;
-        } else {
-            if c == b'"' || c == b'\'' {
-                in_str = true;
-                quote = c;
-            }
-            out.push(c as char);
-        }
-        i += 1;
-    }
-    out
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -263,5 +215,78 @@ fn the_scanner_detects_the_sentinel_it_is_looking_for() {
     assert!(
         strip_comments(&url).contains(SENTINEL),
         "a `//` inside a string literal made the scanner drop real code"
+    );
+
+    // A LIFETIME MUST NOT PUT THE SCANNER IN STRING STATE. This is the
+    // regression fixture for the defect that made `strip_comments` a partial
+    // no-op: a `'` treated as a string delimiter has no partner, so everything
+    // after it — comments included — was copied through verbatim. Measured at
+    // 122 surviving comment lines in `epigraph-api/src/routes/` alone — counting
+    // lines whose first non-whitespace is `//` and which the shipped stripper
+    // blanks — which silently un-did the stripping this helper's callers depend
+    // on.
+    //
+    // `&'a` and `'static` are written with an ODD number of ticks on purpose:
+    // an even count happens to re-balance and would let the bug pass.
+    let after_lifetime = format!("fn f(x: &'a str) {{}}\n// {SENTINEL}\nlet y = 1;");
+    assert!(
+        !strip_comments(&after_lifetime).contains(SENTINEL),
+        "a lifetime tick left the scanner in string state and a comment survived"
+    );
+    let after_static = format!("const S: &'static str = \"s\";\n// {SENTINEL}\nlet z = 2;");
+    assert!(
+        !strip_comments(&after_static).contains(SENTINEL),
+        "a `'static` tick left the scanner in string state and a comment survived"
+    );
+
+    // …and a real char literal must still be treated as one, including the
+    // `'/'` case, whose contents would otherwise open a line comment and eat
+    // the rest of the line.
+    let char_lit = format!("let c = '/'; let d = '\\\\'; let e = \"{SENTINEL}\";");
+    assert!(
+        strip_comments(&char_lit).contains(SENTINEL),
+        "a char literal was mis-lexed and swallowed the code after it"
+    );
+
+    // THE ONE DOCUMENTED OVER-EAGERNESS, PINNED IN BOTH DIRECTIONS. This is the
+    // silent direction — over-suppression cannot announce itself, so it has to
+    // be measured rather than reasoned about.
+    //
+    // `strip_comments` does not lex raw strings. An odd number of inner `"`
+    // closes its string state early, and a `//` after that opens comment state
+    // inside what is really still string content. The fixture below is built so
+    // each half is decidable: the sentinel on the SAME line as the stray `//` is
+    // eaten, and the one on the NEXT line survives.
+    //
+    // The point is the bound. The damage stops at the newline, so the loss is
+    // one line rather than the rest of the file — which is exactly the
+    // difference between this and the lifetime defect above. If a future edit
+    // makes the first assertion pass, the over-eagerness is gone and this
+    // fixture should be simplified; if it makes the SECOND one fail, the
+    // stripper has started eating whole files again.
+    let raw = format!("let q = r#\"a \" // b\"#; let s = \"{SENTINEL}\";\nlet t = \"{SENTINEL}\";");
+    let stripped = strip_comments(&raw);
+    assert_eq!(
+        stripped.matches(SENTINEL).count(),
+        1,
+        "the raw-string over-eagerness is no longer bounded to one line; \
+         `strip_comments` ate more (or less) than the documented case"
+    );
+    assert!(
+        stripped
+            .lines()
+            .next()
+            .is_some_and(|l| !l.contains(SENTINEL)),
+        "documented behaviour: the rest of the line after a stray `//` inside a \
+         raw string is suppressed"
+    );
+    assert!(
+        stripped
+            .lines()
+            .nth(1)
+            .is_some_and(|l| l.contains(SENTINEL)),
+        "the stray `//` inside a raw string ran past its own newline and ate the \
+         FOLLOWING line of real code — that is unbounded over-suppression, and a \
+         sentinel that sees less code silently loses detections"
     );
 }

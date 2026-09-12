@@ -89,6 +89,9 @@
 //! the new measurement on **2026-09-02**; the ratchet is monotone from that
 //! baseline forward. Fixing the newly-surfaced sites is PR-12/PR-14/PR-16 work.
 
+mod lint_text;
+
+use lint_text::strip_comments;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -251,14 +254,33 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 ///
 /// The fix is ADDITIVE, not a needle rewrite: the 10 provenance blocks move to
 /// [`AUTH_OPTIONAL_PROVENANCE_SITES`], the historical total is preserved by
-/// [`the_two_registers_sum_to_the_verbatim_idiom`], and a conversion that
+/// [`the_registers_sum_to_the_verbatim_idiom`], and a conversion that
 /// touches both kinds of block in one handler now decrements two different
 /// constants instead of one ambiguous one.
+///
+/// # The "34" above is the PRE-WIDENING population and is no longer the total
+///
+/// Both paragraphs above were written when the scanner recognised ONE spelling
+/// of the idiom. It now recognises four (see [`AUTH_CTX_NEEDLES`]), and the
+/// population is **35**: 24 scope + 10 provenance + 1
+/// [`AUTH_OPTIONAL_WRITE_SITES`]. The 24 and the 10 survive unchanged — the
+/// extra block is `agents.rs::create_agent`'s OAuth-client arm, which the old
+/// needle could not see. **The tree did not change**; the scanner's vision did,
+/// and the two are recorded separately on purpose. The 34 is left in place
+/// rather than overwritten because the argument those paragraphs make is about
+/// the SPLIT, and rewriting the number would erase the evidence that the split
+/// was lossless when it was made.
 ///
 /// Asserted exactly for the same monotonicity reason as above.
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     ("agent_keys.rs", 3),
-    ("agents.rs", 1),
+    // 1 → 2 when the needle set widened from one spelling to four. NOT a new
+    // site and NOT a regression: `create_agent`'s `agents:write` check is
+    // written `if let Some(axum::Extension(ref auth)) = &auth_ctx` — the same
+    // idiom with a trailing `&` on the scrutinee — and the single-spelling
+    // needle could not see it. The block was always here; the register could
+    // not count it.
+    ("agents.rs", 2),
     // `("audit.rs", 1)` REMOVED by PR-18a, on the PR-10 precedent recorded
     // below: `query_security_events` now takes the prescribed
     // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
@@ -313,6 +335,66 @@ const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
     ("crud.rs", 4),
     ("edges.rs", 4),
 ];
+
+/// The third shape: `if let Some(..) = auth_ctx { .. Repository::.. }` blocks
+/// that neither check a scope nor record provenance.
+///
+/// # This register arrived with a wider needle, not with a new handler
+///
+/// It is empty against the single-spelling needle and has one entry against the
+/// four-spelling set, and **the tree did not change**. The entry is
+/// `agents.rs::create_agent`'s OAuth-client auto-provisioning arm, spelled
+/// `if let Some(axum::Extension(auth)) = &auth_ctx` — no `ref`, trailing `&` —
+/// which the old needle could not see. `AuthCtxBlock::Unclassified`'s own doc
+/// already said a block fitting neither register "must be classified
+/// deliberately rather than fall into either register by default"; widening the
+/// needle produced exactly that case, so this is the deliberate classification.
+///
+/// # What the shape means, and what it is NOT
+///
+/// It is not a fail-open scope check: no authorization happens in the block
+/// either way. It is not auth-optional provenance: no audit row is written. It
+/// is an effect that occurs only when a principal is present and silently does
+/// not occur when one is absent. Worth its own register because a NEW entry is
+/// usually a persistence path that has quietly become conditional on
+/// authentication.
+///
+/// # The `create_agent` entry, and its compensating control
+///
+/// `create_agent` declares no `ViewerExtractor`, so the route-level statement
+/// that its `agents:write` check is unconditional does not come from the
+/// handler's signature. It comes from the router: `POST /agents` and
+/// `POST /api/v1/agents` are registered on the `protected` router in
+/// `routes/mod.rs::create_router`, which is layered with `bearer_auth_middleware`
+/// — a total function that either injects an `AuthContext` or returns
+/// `Unauthorized`. The two-route public allowlist does not include them, and
+/// `public_router_allowlist.rs` pins that over both router variants. So on this
+/// route `auth_ctx` is always `Some` when the handler runs.
+///
+/// That control is ROUTER-LEVEL and order-independent. An earlier revision of
+/// this register stated it here only, while
+/// [`fail_open_scope_check_sites_do_not_increase`]'s failure message — the text
+/// a contributor actually reads when a row reddens — still attributed the safety
+/// to "a `ViewerExtractor` earlier in the same signature 401s first", which makes
+/// an authz control depend on axum parameter ORDER. Measured against the router
+/// table that is a weaker claim than the tree supports, and believing it a
+/// contributor could "fix" a row by reordering extractors and change nothing.
+/// **That message now carries the router-level statement itself**; this
+/// paragraph is the cross-reference, not the only copy. Two doc comments under
+/// `src/routes/` still carry the superseded framing — they are pre-existing and
+/// out of this batch's scope, recorded so the correction is not later assumed
+/// complete.
+///
+/// # The classifier's authorization predicate is a two-spelling allowlist
+///
+/// [`classify_auth_ctx_block`] recognises only `check_scopes(` and `has_scope(`.
+/// A block that spells its check some third way AND reaches the repo layer files
+/// HERE rather than in [`AuthCtxBlock::Unclassified`] — that is, under a heading
+/// that says no authorization happens in the block either way. It still errs
+/// safe, because this register is an exact set and a new entry reddens the
+/// build; but a NEW row must be read for an authorization call the classifier
+/// does not recognise before it is accepted as benign.
+const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 
 /// `UPDATE`/`DELETE` statements against a tenancy-scoped table, issued from a
 /// route handler.
@@ -454,6 +536,33 @@ fn routes_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes")
 }
 
+/// Every file under `src/routes/`, as `(file name, **comment-stripped** source)`.
+///
+/// # Why the source is stripped, and what it cost
+///
+/// Every scanner in this file — the two `auth_ctx` registers, the verbatim
+/// idiom total, [`measure_route_layer_writes`] and
+/// [`measure_inline_claim_content_reads`] — is a substring search, and all of
+/// them read their source through here. Unstripped, they could not tell a site
+/// from a doc comment QUOTING one. That is not hypothetical: PR-10 fixed both
+/// `webhooks.rs` fail-open sites, documented the idiom it had removed in
+/// `delete_webhook`'s doc comment, and the ratchet went red with
+/// `webhooks.rs: expected 0, found 1 [REGRESSION]`. The workaround was to
+/// misspell the idiom in prose. A lint that a comment can break teaches
+/// contributors not to name the thing they are documenting, which is the
+/// opposite of what these registers are for.
+///
+/// **Stripping moved no number here.** Measured over `src/routes/` before the
+/// change: the verbatim total (33), both register `BTreeMap`s, the
+/// `Unclassified` count (0), `ROUTE_LAYER_WRITES` and the inline-read map are
+/// byte-identical stripped and unstripped. So this closes a hazard without
+/// re-baselining a ratchet — the two are different events and conflating them
+/// is how a ratchet stops meaning anything.
+///
+/// The direction that would be dangerous is the other one: a stripper that ate
+/// real code would lower every register at once and stay lowered silently. See
+/// `lint_text::strip_comments` for why that argument has to be made per caller
+/// rather than inherited.
 fn route_files() -> Vec<(String, String)> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(routes_dir()).expect("read routes dir") {
@@ -466,7 +575,7 @@ fn route_files() -> Vec<(String, String)> {
             .and_then(|n| n.to_str())
             .expect("utf-8 file name")
             .to_string();
-        let body = std::fs::read_to_string(&path).expect("read route file");
+        let body = strip_comments(&std::fs::read_to_string(&path).expect("read route file"));
         out.push((name, body));
     }
     out.sort();
@@ -690,9 +799,42 @@ fn measure_inline_claim_content_reads() -> BTreeMap<String, usize> {
     counts
 }
 
-/// The one spelling of the optional-`AuthContext` idiom, shared by both
-/// registers so they cannot drift to two different definitions of "the site".
-const AUTH_CTX_NEEDLE: &str = "if let Some(axum::Extension(ref auth)) = auth_ctx";
+/// Every spelling of the optional-`AuthContext` idiom, shared by all registers
+/// so they cannot drift to different definitions of "the site".
+///
+/// # This was ONE spelling, and the ratchet was monotone only against it
+///
+/// The single needle was `if let Some(axum::Extension(ref auth)) = auth_ctx`.
+/// `routes/agents.rs::create_agent` writes the same idiom two ways that needle
+/// misses — with a trailing `&` on the scrutinee, and without the `ref` — so a
+/// site could be introduced, or an existing one re-spelled, and the register
+/// would not move. A ratchet that tracks a transcription rather than a shape is
+/// walkable by a rename.
+///
+/// # Every needle must stay anchored on `if let`, and that is not a style rule
+///
+/// `src/routes/` holds roughly fifty occurrences of the bare substring
+/// `Some(axum::Extension(`, and about eighteen of them are the PRESCRIBED FIXED
+/// SHAPE these registers exist to push handlers towards:
+/// `let Some(axum::Extension(ref auth)) = auth_ctx else { return Err(ApiError::Unauthorized { .. }) }`.
+/// Widening to the bare substring would charge the correct shape into a
+/// fail-open register, so a conversion would make the number go UP. The `if let`
+/// prefix is what distinguishes "the block is skipped when auth is absent" from
+/// "the request is refused when auth is absent".
+///
+/// # The four spellings are pairwise non-overlapping, so counting is sound
+///
+/// No needle here is a substring of another — `= auth_ctx` is not a substring of
+/// `= &auth_ctx`, and `(auth))` is not a substring of `(ref auth))` — so
+/// [`measure_verbatim_auth_ctx_idiom`] can sum `matches().count()` across the set
+/// without double-charging one site. A FIFTH spelling added later must preserve
+/// that property or the total silently over-counts.
+const AUTH_CTX_NEEDLES: &[&str] = &[
+    "if let Some(axum::Extension(ref auth)) = auth_ctx",
+    "if let Some(axum::Extension(ref auth)) = &auth_ctx",
+    "if let Some(axum::Extension(auth)) = auth_ctx",
+    "if let Some(axum::Extension(auth)) = &auth_ctx",
+];
 
 /// The brace-balanced block starting at the first `{` at or after `from`.
 ///
@@ -783,38 +925,67 @@ enum AuthCtxBlock {
     /// The block calls `record_provenance(` and performs no scope check — an
     /// audit-trail write, not authorization.
     ProvenanceOnly,
-    /// Neither. Not a category the tree has today; a new one must be classified
-    /// deliberately rather than fall into either register by default.
+    /// The block reaches the repo layer and performs neither a scope check nor a
+    /// provenance write: **auth-optional persistence**. Something is written
+    /// when an `AuthContext` is present and silently not written when it is
+    /// absent.
+    ///
+    /// This category was introduced by the needle widening, not by a change to
+    /// any handler. It exists because the widening surfaced a block that fits
+    /// neither of the other two and [`AuthCtxBlock::Unclassified`] must stay
+    /// empty to keep working as a sentinel.
+    AuthOptionalWrite,
+    /// None of the above. **Deliberately kept empty**: a block that binds the
+    /// principal and then neither authorizes, nor audits, nor persists is a
+    /// shape no register describes, and is most often what is left behind when
+    /// the body of a check is deleted. A new one must be classified
+    /// deliberately rather than fall into a register by default.
     Unclassified,
 }
 
-/// Classify every occurrence of [`AUTH_CTX_NEEDLE`] by its block body.
+/// Classify every occurrence of an [`AUTH_CTX_NEEDLES`] spelling by its block
+/// body.
 ///
-/// A block containing BOTH a scope call and a provenance call is a
+/// The order of the arms is the priority order, and it is load-bearing. A block
+/// containing BOTH a scope call and a provenance call is a
 /// [`AuthCtxBlock::ScopeCheck`]: the authorization is the property worth
 /// tracking, and charging it to the provenance register would let a real
-/// fail-open hide behind an audit write.
+/// fail-open hide behind an audit write. By the same argument a block that
+/// checks a scope AND persists is a `ScopeCheck` — it is not auth-optional at
+/// all, because the scope check refuses before the write.
+///
+/// [`AuthCtxBlock::AuthOptionalWrite`] is keyed on a repo-layer call
+/// (`Repository::`) rather than on "uses the principal for something". That is
+/// deliberate: a predicate as loose as "mentions `auth.`" would swallow a block
+/// whose only use of the principal is a `tracing::debug!` field, and with it the
+/// `Unclassified` sentinel. Requiring a persistence call keeps the third
+/// category about an EFFECT that does or does not happen.
 fn classify_auth_ctx_block(block: &str) -> AuthCtxBlock {
     if block.contains("check_scopes(") || block.contains("has_scope(") {
         AuthCtxBlock::ScopeCheck
     } else if block.contains("record_provenance(") {
         AuthCtxBlock::ProvenanceOnly
+    } else if block.contains("Repository::") {
+        AuthCtxBlock::AuthOptionalWrite
     } else {
         AuthCtxBlock::Unclassified
     }
 }
 
-/// Per-file counts of `auth_ctx` blocks matching `kind`.
+/// Per-file counts of `auth_ctx` blocks matching `kind`, over every spelling in
+/// [`AUTH_CTX_NEEDLES`].
 fn measure_auth_ctx_sites(kind: AuthCtxBlock) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for (name, src) in route_files() {
         let mut n = 0usize;
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find(AUTH_CTX_NEEDLE) {
-            let at = from + rel;
-            from = at + AUTH_CTX_NEEDLE.len();
-            if classify_auth_ctx_block(balanced_block(&src, at)) == kind {
-                n += 1;
+        for needle in AUTH_CTX_NEEDLES {
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find(needle) {
+                let at = from + rel;
+                from = at + needle.len();
+                if classify_auth_ctx_block(balanced_block(&src, at)) == kind {
+                    n += 1;
+                }
             }
         }
         if n > 0 {
@@ -832,15 +1003,137 @@ fn measure_auth_optional_provenance_sites() -> BTreeMap<String, usize> {
     measure_auth_ctx_sites(AuthCtxBlock::ProvenanceOnly)
 }
 
-/// Total occurrences of the verbatim idiom, unclassified.
+fn measure_auth_optional_write_sites() -> BTreeMap<String, usize> {
+    measure_auth_ctx_sites(AuthCtxBlock::AuthOptionalWrite)
+}
+
+/// Total occurrences of the idiom in every spelling, unclassified.
 ///
 /// This is what [`measure_fail_open_scope_sites`] counted before PR-16/16b split
 /// the register, and it is preserved so the split can be proved lossless.
+/// Summing across [`AUTH_CTX_NEEDLES`] is sound because no needle is a substring
+/// of another — see that constant's doc.
 fn measure_verbatim_auth_ctx_idiom() -> usize {
     route_files()
         .iter()
-        .map(|(_, src)| src.matches(AUTH_CTX_NEEDLE).count())
+        .map(|(_, src)| {
+            AUTH_CTX_NEEDLES
+                .iter()
+                .map(|n| src.matches(n).count())
+                .sum::<usize>()
+        })
         .sum()
+}
+
+/// The binder-agnostic substring every spelling of the idiom must contain.
+///
+/// [`AUTH_CTX_NEEDLES`] cannot be widened to this — it would charge the
+/// PRESCRIBED refusal shapes into a fail-open register — but it is exactly the
+/// right population to take a CENSUS over. See
+/// [`every_auth_ctx_occurrence_has_a_recognised_shape`].
+const AUTH_CTX_BARE: &str = "Some(axum::Extension(";
+
+/// Byte offsets of every [`AUTH_CTX_BARE`] occurrence.
+fn auth_ctx_offsets(src: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(AUTH_CTX_BARE) {
+        let at = from + rel;
+        out.push(at);
+        from = at + AUTH_CTX_BARE.len();
+    }
+    out
+}
+
+/// A bounded, char-boundary-safe forward window. Route files carry non-ASCII in
+/// their box-drawing section comments, so a naive slice can panic.
+fn window_after(src: &str, from: usize, len: usize) -> &str {
+    let mut e = (from + len).min(src.len());
+    while e > from && !src.is_char_boundary(e) {
+        e -= 1;
+    }
+    &src[from..e]
+}
+
+/// The SYNTACTIC shape an [`AUTH_CTX_BARE`] occurrence sits in, decided without
+/// consulting [`AUTH_CTX_NEEDLES`] at all.
+///
+/// Independence from the needle set is the whole point: it is what lets
+/// [`every_auth_ctx_occurrence_has_a_recognised_shape`] compare a shape-derived
+/// count against a needle-derived one and catch a spelling the needles miss.
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+enum AuthCtxShape {
+    /// `if let Some(axum::Extension(..)) = auth_ctx { .. }` — the conditional
+    /// shape the three registers measure. Every occurrence of this shape MUST
+    /// be found by [`AUTH_CTX_NEEDLES`] or a fail-open is invisible to all
+    /// three.
+    IfLet,
+    /// `let Some(axum::Extension(..)) = auth_ctx else { return Err(..) }` — the
+    /// prescribed refusal these registers push handlers towards.
+    LetElse,
+    /// `match auth_ctx { Some(axum::Extension(..)) => .., None => .. }` whose
+    /// arms include a `return Err(`. Equivalent in effect to `LetElse`: the
+    /// request is refused when the principal is absent.
+    MatchArmRefusing,
+    /// Anything else — including a `match` arm whose sibling `None` arm does
+    /// NOT refuse, which is a fail-open written as a `match` and is exactly as
+    /// invisible to the three registers as an unenumerated `if let` binder.
+    /// **Must stay empty**, for the same reason
+    /// [`AuthCtxBlock::Unclassified`] must.
+    Unknown,
+}
+
+/// Classify one [`AUTH_CTX_BARE`] occurrence by the syntax around it.
+///
+/// The prefix tests are ordered longest-first because `"if let"` and
+/// `"while let"` both end with `"let"`; reversing them would file every `if let`
+/// site as a prescribed refusal and empty the fail-open registers silently.
+fn classify_auth_ctx_shape(src: &str, at: usize) -> AuthCtxShape {
+    let before = src[..at].trim_end();
+    if before.ends_with("if let") {
+        return AuthCtxShape::IfLet;
+    }
+    if before.ends_with("while let") {
+        // Not a shape this tree uses. Routed to `Unknown` deliberately rather
+        // than to `LetElse` by the trailing-`let` test below.
+        return AuthCtxShape::Unknown;
+    }
+    // `at + AUTH_CTX_BARE.len() - 1` is the `(` that opens `Extension(`, but
+    // `arg_region` wants the OUTER one: `at + 4` is the `(` of `Some(`, and it
+    // is the first `(` at or after `at`, so the region it returns starts there.
+    let end = at + 4 + arg_region(src, at).len();
+    if before.ends_with("let") {
+        return if window_after(src, end, 200)
+            .split('{')
+            .next()
+            .unwrap_or("")
+            .contains("else")
+        {
+            AuthCtxShape::LetElse
+        } else {
+            // `let Some(..) = ..;` with no `else` is not a refusal. Whatever it
+            // is, it is not a shape any register describes.
+            AuthCtxShape::Unknown
+        };
+    }
+    if window_after(src, end, 8).trim_start().starts_with("=>") {
+        // A `match` arm. It is a refusal only if the match as a whole refuses —
+        // a `None => None` arm is a fail-open wearing a different syntax, and
+        // classifying every match arm as a refusal would be precisely the
+        // "control that reports safety it does not check" defect.
+        let Some(m) = src[..at].rfind("match ") else {
+            return AuthCtxShape::Unknown;
+        };
+        if at - m > 200 {
+            return AuthCtxShape::Unknown;
+        }
+        let arms = balanced_block(src, m);
+        if arms.contains("None") && arms.contains("return Err(") {
+            return AuthCtxShape::MatchArmRefusing;
+        }
+        return AuthCtxShape::Unknown;
+    }
+    AuthCtxShape::Unknown
 }
 
 fn expected(list: &[(&str, usize)]) -> BTreeMap<String, usize> {
@@ -982,9 +1275,15 @@ fn fail_open_scope_check_sites_do_not_increase() {
         "\n\nFail-open scope-check ratchet failed.\n{}\n\n\
          `if let Some(axum::Extension(ref auth)) = auth_ctx {{ check_scopes(..) }}` \
          performs NO authorization when `AuthContext` is absent. Where it is \
-         currently harmless, that is only because a `ViewerExtractor` earlier in \
-         the same signature 401s first — which makes an authz control depend on \
-         axum parameter ORDER.\n\n\
+         currently harmless, that is because the ROUTE is registered on the \
+         `protected` router in `routes/mod.rs::create_router`, which is layered \
+         with `bearer_auth_middleware` — a total function whose every arm either \
+         injects an `AuthContext` or returns `Unauthorized`, and whose two-route \
+         public allowlist `public_router_allowlist.rs` pins over both router \
+         variants. That control is router-level and ORDER-INDEPENDENT.\n\n\
+         So reordering axum extractors changes NOTHING here, and moving a route \
+         off `protected` changes everything. Do not read this register as a \
+         parameter-order problem.\n\n\
          Fix: `let auth = auth_ctx.ok_or(ApiError::Unauthorized {{ .. }})?.0;` \
          then check scopes unconditionally (see \
          `crud.rs::get_theme_embeddings`). Then LOWER the number here.\n",
@@ -1160,18 +1459,25 @@ fn auth_optional_provenance_sites_do_not_increase() {
 /// The split of the old single register must be LOSSLESS.
 ///
 /// Before PR-16/16b, `FAIL_OPEN_SCOPE_SITES` counted every occurrence of
-/// [`AUTH_CTX_NEEDLE`] regardless of what the block did. This asserts that the
+/// an [`AUTH_CTX_NEEDLES`] spelling regardless of what the block did. This asserts that the
 /// two registers still account for exactly those occurrences and nothing else,
 /// so the split cannot have quietly dropped a site — the failure mode that would
 /// turn a security ratchet into a smaller number that means less.
 ///
 /// The `Unclassified` assertion is the sharp half: a block that neither checks a
-/// scope nor records provenance is a shape neither register describes, and it
-/// must be classified deliberately in a diff rather than vanish from both totals.
+/// scope, nor records provenance, nor persists anything is a shape no register
+/// describes, and it must be classified deliberately in a diff rather than
+/// vanish from every total.
+///
+/// **The sum is over THREE registers since the needle widened.** It was two, and
+/// the third was added rather than relaxing `unclassified == 0` to `== 1` —
+/// which would have turned the sentinel off to accommodate the one case it
+/// correctly caught.
 #[test]
-fn the_two_registers_sum_to_the_verbatim_idiom() {
+fn the_registers_sum_to_the_verbatim_idiom() {
     let scope: usize = measure_fail_open_scope_sites().values().sum();
     let prov: usize = measure_auth_optional_provenance_sites().values().sum();
+    let write: usize = measure_auth_optional_write_sites().values().sum();
     let unclassified: usize = measure_auth_ctx_sites(AuthCtxBlock::Unclassified)
         .values()
         .sum();
@@ -1179,27 +1485,50 @@ fn the_two_registers_sum_to_the_verbatim_idiom() {
 
     assert_eq!(
         unclassified, 0,
-        "an `if let Some(..) = auth_ctx {{ .. }}` block calls neither \
-         `check_scopes(`/`has_scope(` nor `record_provenance(`. It belongs in \
-         one of the two registers — decide which and say so — rather than in \
-         neither, where no ratchet watches it."
+        "an `if let Some(..) = auth_ctx {{ .. }}` block calls none of \
+         `check_scopes(`/`has_scope(`, `record_provenance(`, or a \
+         `Repository::` method. It binds the principal and then does nothing \
+         with it that any register describes — which is what a deleted check \
+         leaves behind. Decide which register it belongs in and say so, rather \
+         than leaving it where no ratchet watches it."
     );
     assert_eq!(
-        scope + prov,
+        scope + prov + write,
         verbatim,
-        "the two registers no longer account for every occurrence of the \
-         idiom ({scope} scope + {prov} provenance != {verbatim} verbatim). The \
-         split of the pre-16b register must stay lossless: a site that falls out \
-         of both totals is a site nothing watches."
+        "the registers no longer account for every occurrence of the \
+         idiom ({scope} scope + {prov} provenance + {write} auth-optional write \
+         != {verbatim} verbatim). The split of the pre-16b register must stay \
+         lossless: a site that falls out of every total is a site nothing \
+         watches."
     );
     assert_eq!(
-        scope + prov,
+        scope + prov + write,
         expected(FAIL_OPEN_SCOPE_SITES).values().sum::<usize>()
             + expected(AUTH_OPTIONAL_PROVENANCE_SITES)
                 .values()
-                .sum::<usize>(),
-        "the registers disagree with the measurement; the two per-register \
+                .sum::<usize>()
+            + expected(AUTH_OPTIONAL_WRITE_SITES).values().sum::<usize>(),
+        "the registers disagree with the measurement; the three per-register \
          ratchets above will name the file"
+    );
+}
+
+/// The third register is a ratchet like the other two.
+#[test]
+fn auth_optional_write_sites_do_not_increase() {
+    let actual = measure_auth_optional_write_sites();
+    let want = expected(AUTH_OPTIONAL_WRITE_SITES);
+    assert_eq!(
+        actual,
+        want,
+        "\n\nAuth-optional write ratchet failed.\n{}\n\n\
+         An `if let Some(..) = auth_ctx {{ .. Repository::.. }}` block with no \
+         scope check and no provenance call performs a persistence step only \
+         when an `AuthContext` is present, and silently skips it otherwise.\n\n\
+         A NEW entry usually means a write path that has quietly become \
+         conditional on authentication without anyone deciding that it should \
+         be. Read it as that first.\n",
+        diff_report(&actual, &want)
     );
 }
 
@@ -1254,7 +1583,43 @@ fn the_auth_ctx_classifier_is_not_vacuous() {
         AuthCtxBlock::ScopeCheck
     );
 
-    // Neither: must NOT silently land in a register.
+    // Auth-optional persistence: a repo call with no scope check and no
+    // provenance write. This is the third category, and the fixture is
+    // synthetic so it cannot be satisfied by editing the routes directory.
+    let auth_optional_write = r#"
+        if let Some(axum::Extension(auth)) = &auth_ctx {
+            if let Err(e) = OAuthClientRepository::create(&state.db_pool, Some(auth.client_id)).await {
+                tracing::warn!(error = %e, "failed");
+            }
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(auth_optional_write, 0)),
+        AuthCtxBlock::AuthOptionalWrite
+    );
+
+    // A scope check WINS over a repo call in the same block: the handler is not
+    // auth-optional at all when the check refuses first. Without this arm the
+    // priority order could be reversed and a real fail-open would be filed as a
+    // benign auth-optional write.
+    let scope_and_write = r#"
+        if let Some(axum::Extension(ref auth)) = &auth_ctx {
+            check_scopes(auth, &["agents:write"])?;
+            AgentRepository::create_or_get(&state.db_pool, &agent).await?;
+        }
+    "#;
+    assert_eq!(
+        classify_auth_ctx_block(balanced_block(scope_and_write, 0)),
+        AuthCtxBlock::ScopeCheck,
+        "a block that checks a scope AND persists is a scope check; filing it \
+         as an auth-optional write would move a real fail-open into a register \
+         that does not claim to watch authorization"
+    );
+
+    // Neither: must NOT silently land in a register. Note this block DOES read
+    // the principal (`auth.agent_id`) — it is here to pin that "uses the
+    // principal" is not the third category's predicate, because a predicate
+    // that loose would empty the Unclassified sentinel.
     let neither = r#"
         if let Some(axum::Extension(ref auth)) = auth_ctx {
             tracing::debug!(agent = %auth.agent_id, "hello");
@@ -1304,6 +1669,252 @@ fn the_auth_ctx_classifier_is_not_vacuous() {
         "a nested `{{ }}` must not terminate the outer block before the scope \
          call is reached"
     );
+}
+
+/// **The self-test for the needle SET**, over synthetic source.
+///
+/// [`the_auth_ctx_classifier_is_not_vacuous`] hands the classifier a block
+/// directly and so proves nothing about which blocks are FOUND. Widening from
+/// one spelling to four is entirely a change to the finding step, so without
+/// this the widening ships unproven in the direction that matters: three of the
+/// four needles could be typos and every register would still be green.
+///
+/// The fixtures are synthetic strings and cannot be satisfied by editing the
+/// routes directory.
+#[test]
+fn the_needle_set_finds_every_spelling_and_nothing_prescribed() {
+    // 1. Each spelling is found, exactly once, by exactly one needle.
+    let fixtures = [
+        "if let Some(axum::Extension(ref auth)) = auth_ctx {",
+        "if let Some(axum::Extension(ref auth)) = &auth_ctx {",
+        "if let Some(axum::Extension(auth)) = auth_ctx {",
+        "if let Some(axum::Extension(auth)) = &auth_ctx {",
+    ];
+    for fixture in fixtures {
+        let hits: usize = AUTH_CTX_NEEDLES
+            .iter()
+            .map(|n| fixture.matches(n).count())
+            .sum();
+        assert_eq!(
+            hits, 1,
+            "the spelling `{fixture}` is matched {hits} times by the needle \
+             set; it must be matched exactly once or the totals are wrong"
+        );
+    }
+
+    // 2. No needle is a substring of another, which is what makes summing
+    //    `matches().count()` across the set sound rather than double-charging.
+    for a in AUTH_CTX_NEEDLES {
+        for b in AUTH_CTX_NEEDLES {
+            if a != b {
+                assert!(
+                    !a.contains(b),
+                    "needle `{b}` is a substring of `{a}`; the verbatim total \
+                     would count one site twice"
+                );
+            }
+        }
+    }
+
+    // 3. THE PRESCRIBED SHAPE MUST NOT BE CHARGED. This is the failure mode a
+    //    careless widening produces: `let Some(..) = auth_ctx else { return
+    //    Err(Unauthorized) }` is the FIX these registers push handlers towards,
+    //    and matching it would make a conversion increase the count.
+    let prescribed = r#"
+        let Some(axum::Extension(ref auth)) = auth_ctx else {
+            return Err(ApiError::Unauthorized { reason: "auth required".into() });
+        };
+        check_scopes(auth, &["claims:write"])?;
+    "#;
+    for n in AUTH_CTX_NEEDLES {
+        assert!(
+            !prescribed.contains(n),
+            "needle `{n}` matches the PRESCRIBED `let .. else` shape. A handler \
+             that adopts the fix would make a fail-open register go UP."
+        );
+    }
+}
+
+/// **The COMPLETENESS assertion for the needle set.**
+///
+/// # What [`the_needle_set_finds_every_spelling_and_nothing_prescribed`] does
+/// not prove
+///
+/// That test proves the four needles are SOUND — each matches its own spelling
+/// once, none is a substring of another, none charges the prescribed shape. It
+/// proves nothing about whether four is ALL of them, and
+/// [`measure_verbatim_auth_ctx_idiom`] defines the "verbatim total" as the
+/// needle sum, so [`the_registers_sum_to_the_verbatim_idiom`] is tautological
+/// with respect to coverage: a fifth spelling contributes zero to both sides.
+///
+/// Every needle hard-codes the binder name as `auth`, and this tree already
+/// uses others — `routes/claims.rs::create_claim` binds `ctx`, and two handlers
+/// bind `a` in a `match` arm. Both alternative binders are therefore idiomatic
+/// here, not hypothetical, and their conditional variants would be invisible to
+/// all three registers, to the lossless sum, and to the `unclassified == 0`
+/// sentinel (which only sees blocks the needles already found).
+///
+/// This batch exists to remove selectors narrower than the rule they claim to
+/// enforce. Leaving one in the file it rewrote would be the same defect.
+///
+/// # How the census closes it
+///
+/// [`classify_auth_ctx_shape`] decides each occurrence's shape from the
+/// SURROUNDING SYNTAX and never consults [`AUTH_CTX_NEEDLES`]. So
+/// `if_let == verbatim` compares two independent measurements of the same set,
+/// and a fifth `if let` spelling breaks it by name.
+///
+/// # Why the totals are floors and not pins
+///
+/// The critic that prompted this asked for `total` pinned at its measured
+/// value. It is deliberately NOT: `LetElse` and `MatchArmRefusing` are the
+/// CORRECT shapes, so a new correctly-written handler — or a conversion of an
+/// existing fail-open — raises them, and an exact pin would redden the build
+/// for the fix. That is the same "a conversion makes the number go UP" trap
+/// [`AUTH_CTX_NEEDLES`]' doc rejects for the needle set itself. The load-bearing
+/// half is the EQUATION: `Unknown == 0` with a named remainder, plus
+/// `if_let == verbatim`. The floors are floors, well under the measurement, and
+/// exist only so a scanner that stops matching fails instead of passing over an
+/// empty set.
+#[test]
+fn every_auth_ctx_occurrence_has_a_recognised_shape() {
+    let (mut if_let, mut let_else, mut match_arm) = (0usize, 0usize, 0usize);
+    let mut unknown: Vec<String> = Vec::new();
+    let mut total = 0usize;
+
+    for (name, src) in route_files() {
+        for at in auth_ctx_offsets(&src) {
+            total += 1;
+            match classify_auth_ctx_shape(&src, at) {
+                AuthCtxShape::IfLet => if_let += 1,
+                AuthCtxShape::LetElse => let_else += 1,
+                AuthCtxShape::MatchArmRefusing => match_arm += 1,
+                AuthCtxShape::Unknown => {
+                    let line = src[..at].matches('\n').count() + 1;
+                    unknown.push(format!("  {name}:{line}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        unknown.is_empty(),
+        "\n\nAn occurrence of `{AUTH_CTX_BARE}` sits in a shape no register \
+         describes:\n{}\n\n\
+         The recognised shapes are `if let` (measured by the three registers), \
+         `let .. else {{ return Err(..) }}`, and a `match` whose arms refuse. \
+         Anything else — notably a `match` arm whose sibling `None` arm does \
+         NOT refuse — is a fail-open that no ratchet in this file watches. \
+         Classify it deliberately rather than leaving it outside every total.\n",
+        unknown.join("\n")
+    );
+
+    assert_eq!(
+        if_let,
+        measure_verbatim_auth_ctx_idiom(),
+        "\n\nAUTH_CTX_NEEDLES is INCOMPLETE. {if_let} occurrences of \
+         `{AUTH_CTX_BARE}` are in the conditional `if let` shape, but the needle \
+         set finds only {}. The difference is a conditional binding of the \
+         principal that FAIL_OPEN_SCOPE_SITES, AUTH_OPTIONAL_PROVENANCE_SITES \
+         and AUTH_OPTIONAL_WRITE_SITES are all blind to — every needle \
+         hard-codes the binder name `auth`, and a different binder (this tree \
+         already uses `ctx` and `a` elsewhere) contributes zero to every \
+         register AND to the lossless sum.\n\n\
+         Fix: add the missing spelling to AUTH_CTX_NEEDLES, keeping the \
+         pairwise non-substring property that test asserts, and re-baseline the \
+         register the new site belongs to — as a VISION change, not a tree \
+         change.\n",
+        measure_verbatim_auth_ctx_idiom()
+    );
+
+    // Non-vacuity. Deliberately well under the measurements (53 / 16 / 2 at the
+    // time of writing) so that a correct conversion can move them upward
+    // without touching this test.
+    assert!(
+        total >= 40,
+        "only {total} `{AUTH_CTX_BARE}` occurrences found under src/routes/; \
+         the census is probably scanning the wrong text"
+    );
+    assert!(
+        let_else >= 12,
+        "only {let_else} prescribed `let .. else` refusals found; this shape is \
+         the fix the registers push towards and the scanner has stopped seeing it"
+    );
+    assert!(
+        match_arm >= 1,
+        "the refusing-`match` shape is no longer recognised; if the last one was \
+         converted, say so here rather than deleting the floor"
+    );
+}
+
+/// **The self-test for the shape classifier**, over synthetic source.
+///
+/// Without it the census ships with no proof it matches anything — a scanner
+/// asserting an equation between two counts that are both zero. The fixtures are
+/// strings, so this cannot be satisfied by editing the routes directory.
+#[test]
+fn the_auth_ctx_shape_classifier_is_not_vacuous() {
+    let one = |s: &str| {
+        let offs = auth_ctx_offsets(s);
+        assert_eq!(offs.len(), 1, "fixture must hold exactly one occurrence");
+        classify_auth_ctx_shape(s, offs[0])
+    };
+
+    // THE CASE THE CENSUS EXISTS FOR: the conditional shape with a binder the
+    // needle set does not enumerate. The classifier must see it AND the needles
+    // must not — that pair is what makes the equation fire.
+    let alien = "    if let Some(axum::Extension(ctx)) = &auth_ctx {\n        \
+                 AgentRepository::create(&pool).await.ok();\n    }\n";
+    assert_eq!(one(alien), AuthCtxShape::IfLet);
+    assert_eq!(
+        AUTH_CTX_NEEDLES
+            .iter()
+            .map(|n| alien.matches(n).count())
+            .sum::<usize>(),
+        0,
+        "if the needle set ever matches this fixture the census assertion is \
+         satisfied trivially and proves nothing; pick a binder it does not \
+         enumerate"
+    );
+
+    let enumerated = "    if let Some(axum::Extension(ref auth)) = auth_ctx {\n    }\n";
+    assert_eq!(one(enumerated), AuthCtxShape::IfLet);
+
+    let let_else = "    let Some(axum::Extension(ctx)) = &auth_ctx else {\n        \
+                    return Err(ApiError::Unauthorized { reason: \"x\".into() });\n    };\n";
+    assert_eq!(one(let_else), AuthCtxShape::LetElse);
+
+    let refusing_match = "    let auth = match auth_ctx {\n        \
+                          Some(axum::Extension(ref a)) => a.clone(),\n        \
+                          None => {\n            \
+                          return Err(ApiError::Unauthorized { reason: \"x\".into() });\n        \
+                          }\n    };\n";
+    assert_eq!(one(refusing_match), AuthCtxShape::MatchArmRefusing);
+
+    // A `match` that does NOT refuse is a fail-open in different syntax. Filing
+    // it as a refusal is the failure this arm pins.
+    let fail_open_match = "    let auth = match auth_ctx {\n        \
+                           Some(axum::Extension(ref a)) => Some(a.clone()),\n        \
+                           None => None,\n    };\n";
+    assert_eq!(
+        one(fail_open_match),
+        AuthCtxShape::Unknown,
+        "a `match` whose `None` arm yields instead of refusing must NOT be \
+         counted as a prescribed refusal"
+    );
+
+    // `let` with no `else` is not a refusal either.
+    let no_else = "    let Some(axum::Extension(ctx)) = auth_ctx;\n";
+    assert_eq!(one(no_else), AuthCtxShape::Unknown);
+
+    // A construction, not a pattern.
+    let construction = "    let ext = Some(axum::Extension(auth.clone()));\n";
+    assert_eq!(one(construction), AuthCtxShape::Unknown);
+
+    // `while let` ends with `let`; the prefix order must not file it as a
+    // prescribed refusal.
+    let while_let = "    while let Some(axum::Extension(a)) = queue.pop() {\n    }\n";
+    assert_eq!(one(while_let), AuthCtxShape::Unknown);
 }
 
 #[test]
