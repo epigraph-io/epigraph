@@ -487,41 +487,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let federation = federation.clone();
 
         // PR-09: resolve (and, on first boot, create) the server's own agent
-        // row + personal group once, here, so the
-        // `--allow-unauthenticated-http` middleware has a principal to inject.
-        // Best-effort: if it fails, the injected context carries `None` and the
-        // listener's content tools refuse rather than reading with an
-        // ill-defined identity — fail-closed, and loudly.
-        let unauthenticated_server_agent_id: Option<uuid::Uuid> = if cli.allow_unauthenticated_http
-        {
-            let probe = EpiGraphMcpFull::new_shared_with_federation(
-                pool.clone(),
-                signer.clone(),
-                embedder.clone(),
-                read_only,
-                federation.clone(),
-                llm_identity.clone(),
-            );
-            let probe = if identity_declared {
-                probe
-            } else {
-                probe.with_generated_signer_identity()
-            };
-            match probe.server_agent_id().await {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    tracing::error!(
-                        error = ?e,
-                        "could not resolve the server agent id for \
-                         --allow-unauthenticated-http; content tools on that listener \
-                         will refuse (no agent principal)"
-                    );
-                    None
+        // row + personal group, so the `--allow-unauthenticated-http` middleware
+        // has a principal to inject.
+        //
+        // The boot attempt is a WARM-UP, not the answer. It used to be the
+        // answer: its `Option<Uuid>` went straight into the middleware state, so
+        // a database that was briefly unreachable during startup left every
+        // content tool on this listener refusing for the life of the process,
+        // with no way back short of a restart. The fail-closed half is correct
+        // and unchanged — while the id is unresolved the injected context carries
+        // no principal and content tools refuse — but the listener now re-attempts
+        // per request. `UnauthenticatedPrincipal` holds the source for that; the
+        // caching lives in `EpiGraphMcpFull::agent_id`, which stores only on
+        // success and therefore already retries.
+        let unauthenticated_principal: epigraph_mcp::auth::UnauthenticatedPrincipal =
+            if cli.allow_unauthenticated_http {
+                let probe = EpiGraphMcpFull::new_shared_with_federation(
+                    pool.clone(),
+                    signer.clone(),
+                    embedder.clone(),
+                    read_only,
+                    federation.clone(),
+                    llm_identity.clone(),
+                );
+                let probe = if identity_declared {
+                    probe
+                } else {
+                    probe.with_generated_signer_identity()
+                };
+                let probe = Arc::new(probe);
+                let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
+                    probe.clone() as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
+                );
+                match probe.server_agent_id().await {
+                    Ok(id) => principal.warmed_with(id),
+                    Err(e) => {
+                        // Still loud. The difference is that it is no longer
+                        // terminal for the listener.
+                        tracing::error!(
+                            error = ?e,
+                            "could not resolve the server agent id for \
+                             --allow-unauthenticated-http at boot; content tools on that \
+                             listener refuse (no agent principal) until a later request \
+                             resolves it"
+                        );
+                        principal
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
+            };
 
         let service = StreamableHttpService::new(
             move || {
@@ -564,11 +579,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // missing auth context, making the flag misleading (bug be2a3391).
             // PR-09: the injected context carries the server's own agents.id,
             // so `tools::viewer::request_viewer` resolves the same viewer this
-            // process uses on stdio. Resolving it here (once, at boot) also
-            // creates the agent row and its personal group before the first
-            // request, rather than racing on the first concurrent tool call.
+            // process uses on stdio. Warming it above also creates the agent row
+            // and its personal group before the first request, rather than racing
+            // on the first concurrent tool call — while leaving a failed warm-up
+            // recoverable.
             router.layer(axum::middleware::from_fn_with_state(
-                unauthenticated_server_agent_id,
+                unauthenticated_principal,
                 epigraph_mcp::auth::inject_unauthenticated_context,
             ))
         } else {
