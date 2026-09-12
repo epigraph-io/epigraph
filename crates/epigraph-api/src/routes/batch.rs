@@ -15,7 +15,6 @@ use uuid::Uuid;
 use crate::errors::ApiError;
 use crate::state::AppState;
 use epigraph_core::{AgentId, Claim, TruthValue};
-use epigraph_events::EpiGraphEvent;
 
 // =============================================================================
 // SECURITY CONSTANTS
@@ -97,10 +96,17 @@ pub struct BatchClaimResult {
 ///
 /// - The batch must not exceed MAX_BATCH_SIZE (100) claims
 ///
-/// # Events
+/// # Events — none, deliberately
 ///
-/// A `ClaimSubmitted` event is published (fire-and-forget) for each
-/// successfully created claim.
+/// **No event is published.** This handler's only persistence is an insert into
+/// `AppState::claim_store`, an in-memory map that nothing drains into `claims`,
+/// and `validate_batch_item` mints a fresh claim uuid per item — so every
+/// `ClaimSubmitted` it used to publish carried an id naming no row. The webhook
+/// fan-out cannot make a tenancy decision about such an id (see
+/// `routes/webhooks.rs`'s "What this filter does NOT decide"), so those payloads
+/// reached every active external subscription unfiltered. The publish is gone
+/// rather than filtered; the reasoning, and why "make this handler persist"
+/// is a different PR, is at step 4 of the body.
 ///
 /// # Errors
 ///
@@ -161,20 +167,39 @@ pub async fn batch_create_claims(
         }
     }
 
-    // 4. Publish events for each created claim (fire-and-forget)
+    // 4. NO EVENT IS PUBLISHED, AND THAT IS THE FIX.
     //
-    // Event publishing must not fail the request. If the event bus is
-    // unavailable or the publish fails, the batch creation still succeeds.
-    for (_index, claim) in &valid_claims {
-        let _ = state
-            .event_bus
-            .publish(EpiGraphEvent::ClaimSubmitted {
-                claim_id: claim.id,
-                agent_id: claim.agent_id,
-                initial_truth: claim.truth_value,
-            })
-            .await;
-    }
+    // This handler used to publish one `EpiGraphEvent::ClaimSubmitted` per
+    // created claim. Step 3 above is the whole of its persistence: an insert
+    // into `AppState::claim_store`, an in-memory `HashMap` that
+    // `state.rs` documents as supplementing rather than replacing the database
+    // and that nothing ever drains. `validate_batch_item` mints a fresh claim
+    // uuid and a fresh `AgentId` per item. So every id in every event this
+    // handler published named no `claims` row and no `agents` row, ever.
+    //
+    // The webhook fan-out (`routes/webhooks.rs::retain_visible_subscriptions`)
+    // decides visibility by asking `ClaimRepository::hidden_claim_ids` which of
+    // the payload's uuids name claims that exist and are invisible. An id naming
+    // no row contributes nothing — its documented contract, and correct for its
+    // other caller. The consequence here was that a claim id, a synthetic agent
+    // id and a truth value went to every active external subscription with no
+    // tenancy decision made, on every batch import.
+    //
+    // Two fixes were available and the second is the one taken. Making this
+    // handler persist would make it a writer of `claims`, which needs SQL in the
+    // repo layer, an ownership decision at INSERT (migration 074's
+    // `_require_tenancy` guards RAISE without one), and an auth extractor this
+    // handler still does not have — three unrelated decisions, i.e. its own PR.
+    // Not publishing costs nothing that existed: no in-process logic keys on
+    // `ClaimSubmitted` (grep across the workspace finds producers, the webhook
+    // fan-out, and the `EventBus` history ring), so the observable effect is
+    // exactly that batch-imported ids stop being POSTed to external endpoints
+    // and stop occupying the event-bus history — which is the correct effect for
+    // rows that do not exist.
+    //
+    // A claim created through `POST /api/v1/claims/batch` is therefore not
+    // announced. If that becomes unacceptable, the answer is to make this
+    // handler persist, not to restore the publish.
 
     // 5. Sort results by index so they match the original request order
     results.sort_by_key(|r| r.index);
@@ -700,14 +725,22 @@ mod tests {
     // EVENT PUBLISHING TESTS
     // ==================================================================
 
-    /// Test that a ClaimSubmitted event is published for each successfully
-    /// created claim in a batch, and that failed items produce no events.
+    /// INVERTED. This test asserted that two `ClaimSubmitted` events were
+    /// published for two valid items. They were, and every one of them named a
+    /// claim id that no `claims` row ever carried, because this handler's only
+    /// persistence is `AppState::claim_store`. The handler no longer publishes;
+    /// see step 4 of its body. The creation half of the assertion is kept
+    /// unchanged and is the point: the fix must stop the announcement without
+    /// stopping the import.
+    ///
+    /// This module is not compiled (see the header above), so the live assertion
+    /// of the same property is `tests/batch_publish_test.rs`.
     #[tokio::test]
-    async fn test_batch_publishes_events_for_each_created_claim() {
+    async fn test_batch_publishes_no_events_because_it_persists_no_claims() {
         let state = test_state();
         let router = test_router(state.clone());
 
-        // 2 valid + 1 invalid = 2 events expected
+        // 2 valid + 1 invalid = 2 created, 0 events
         let body = serde_json::json!({
             "claims": [
                 { "content": "Valid claim A", "truth_value": 0.6 },
@@ -723,21 +756,13 @@ mod tests {
         assert_eq!(resp.created, 2);
         assert_eq!(resp.failed, 1);
 
-        // Verify exactly 2 events were published (one per valid claim)
+        // The import succeeded and announced nothing.
         assert_eq!(
             state.event_bus.history_size(),
-            2,
-            "Event bus should contain exactly 2 events (one per valid claim)"
+            0,
+            "a batch-imported claim has no `claims` row, so announcing it sends an \
+             id the fan-out cannot make a tenancy decision about"
         );
-
-        let history = state.event_bus.get_history().unwrap();
-        for entry in &history {
-            assert_eq!(
-                entry.event.event_type(),
-                "ClaimSubmitted",
-                "All batch events should be ClaimSubmitted"
-            );
-        }
     }
 
     /// Test that no events are published when all items in the batch fail validation.
