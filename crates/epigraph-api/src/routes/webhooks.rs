@@ -63,18 +63,25 @@
 //!
 //! * **A uuid naming no `claims` row does not suppress.** That is
 //!   `hidden_claim_ids`' documented contract ("an id that names no row at all
-//!   is not returned"), and it is load-bearing in the permissive direction:
-//!   `routes/batch.rs::batch_create_claims` inserts only into
-//!   `AppState::claim_store` and publishes a `ClaimSubmitted` per claim, so
-//!   those claim ids name no row and the event reaches every subscriber. The
-//!   two available in-scope fixes are both wrong. Suppressing on
+//!   is not returned"), and it remains permissive here. The two available
+//!   in-scope fixes to the FILTER are both wrong. Suppressing on
 //!   named-but-absent would suppress nearly everything, because `payload_uuids`
 //!   also collects agent, frame and workflow ids, none of which name a `claims`
 //!   row. Narrowing the scan to the ids an event *declares* as claim ids is the
-//!   key allowlist rejected three paragraphs up. So the fourth branch is named
-//!   here and in [`agent_may_receive`] instead of being left out of a
-//!   "fails closed" list it contradicts. It is not a PR-10 regression: before
-//!   this PR every event went to every subscriber unconditionally.
+//!   key allowlist rejected three paragraphs up. So the branch is named here and
+//!   in [`agent_may_receive`] instead of being left out of a "fails closed" list
+//!   it contradicts. It is not a PR-10 regression: before this PR every event
+//!   went to every subscriber unconditionally.
+//!
+//!   What has changed is the CALLER that exercised it.
+//!   `routes/batch.rs::batch_create_claims` inserted only into
+//!   `AppState::claim_store` — never into `claims` — and published a
+//!   `ClaimSubmitted` per item, so every batch import sent a claim id, a
+//!   synthetic agent id and a truth value to every active subscription with no
+//!   tenancy decision possible. That handler no longer publishes; the reasoning
+//!   is in its own doc. The filter is unchanged, so this bullet stands as a
+//!   statement about the filter. It is no longer reachable from a request path
+//!   that manufactures unknown claim ids on purpose.
 //! * **"No claim uuid" is not the same as "no cross-tenant content."** Four
 //!   variants (`ReputationChanged`, `AgentCreated`, `AgentSuspended`,
 //!   `WorkflowCompleted`) carry no `claim_id`, so this filter has nothing to
@@ -129,6 +136,180 @@ pub struct WebhookRegistration {
 /// A 32-character secret provides adequate entropy for HMAC-SHA256 signing.
 const MIN_SECRET_LENGTH: usize = 32;
 
+/// The two URL schemes a delivery target may use.
+const ALLOWED_WEBHOOK_SCHEMES: &[&str] = &["http", "https"];
+
+// =============================================================================
+// DELIVERY-TARGET POLICY
+// =============================================================================
+
+/// Is this URL an acceptable webhook delivery target?
+///
+/// Returns `Ok(())` when it is, or `Err(reason)` with a message safe to return
+/// to the caller (it repeats back only what the caller already supplied).
+///
+/// # The policy, positively
+///
+/// 1. The string must parse as an absolute URL.
+/// 2. Its scheme must be `http` or `https`. That excludes `file:`, `gopher:`,
+///    `ftp:`, `data:` and everything else `reqwest` might or might not attempt.
+/// 3. It must have a host.
+/// 4. If that host is an **IP literal**, it must not be loopback, link-local,
+///    a private range, or the unspecified address. IPv4-mapped IPv6 literals
+///    (`::ffff:127.0.0.1`) are unwrapped and judged as the IPv4 address they
+///    name, so the mapped spelling is not a way around rule 4.
+/// 5. If that host is a **name**, it must not be one of the names RFC 6761
+///    reserves to loopback: `localhost`, or anything under `.localhost`.
+///    Compared case-insensitively with a trailing root dot stripped.
+///
+/// # Rule 5 is a static denylist, not a resolution
+///
+/// It exists because rule 4 alone judged `http://127.0.0.1/hook` and accepted
+/// `http://localhost/hook` — the same socket, and the ordinary spelling of it.
+/// `url::Url::parse` yields `Host::Domain` for anything that is not a numeric
+/// literal, so without this rule the most likely internal target a caller types
+/// was the one spelling that got through.
+///
+/// This is NOT a retreat from "no DNS resolution here". RFC 6761 §6.3 reserves
+/// these names to loopback *by definition*: they are not loopback because a
+/// record says so today and might say otherwise tomorrow, which is precisely
+/// what makes them judgeable without a resolver. Every other name is still
+/// accepted on its face. The boundary drawn below is unmoved.
+///
+/// # What this policy does NOT cover — stated, not implied
+///
+/// * **DNS rebinding is not covered, and neither is any other name that
+///   resolves somewhere internal.** Rule 5 covers the names that are reserved to
+///   loopback; it does not and cannot cover a name that merely *resolves* to a
+///   private address — `internal-consumer.corp.example` is accepted, as is a
+///   name placed on the loopback line of the delivering host's `/etc/hosts`.
+///   The check runs at registration, against
+///   the literal the caller supplied. A *hostname* is accepted on its face; if
+///   it resolves to a private address at delivery time — either because it
+///   always did, or because the record changed afterwards — this function has
+///   already returned `Ok`. Closing that is a different control (egress policy
+///   on the delivering process, or resolve-and-recheck immediately before each
+///   POST), and no resolution happens here deliberately: resolving inside a
+///   request handler makes registration latency a function of DNS and makes
+///   this crate's tests depend on the network.
+/// * **It applies at REGISTRATION only, so existing rows are grandfathered.**
+///   `bin/server.rs` re-hydrates `AppState::webhook_store` from
+///   `WebhookSubscriptionRepository::list_active` on every boot, so any row
+///   already in `webhook_subscriptions` is re-armed on the next deploy without
+///   passing through here. Rows written before this check are unaffected by it;
+///   auditing them is an operator task, not something this function performs.
+/// * **Migration 085's constraint is unchanged.** `CHECK (btrim(url) <> '')`
+///   still mirrors only the non-empty check. That migration is applied; this
+///   policy lives in the handler, not the schema, and the schema was not
+///   touched.
+/// * **It is not an allowlist.** Any public host is accepted. This narrows the
+///   set of targets that are reachable-but-internal; it does not constrain who
+///   may be POSTed to.
+fn validate_webhook_url(raw: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| format!("Webhook URL is not a valid absolute URL: {e}"))?;
+
+    if !ALLOWED_WEBHOOK_SCHEMES.contains(&parsed.scheme()) {
+        return Err(format!(
+            "Webhook URL scheme must be one of {:?}, got {:?}",
+            ALLOWED_WEBHOOK_SCHEMES,
+            parsed.scheme()
+        ));
+    }
+
+    let Some(host) = parsed.host() else {
+        return Err("Webhook URL must name a host".to_string());
+    };
+
+    // IP LITERALS are judged as addresses. A NAME is judged only against the
+    // reserved-to-loopback set, and is otherwise accepted on its face — see
+    // "What this policy does NOT cover" above.
+    let addr = match host {
+        url::Host::Ipv4(v4) => std::net::IpAddr::V4(v4),
+        // An IPv4-mapped literal is the same destination written differently.
+        url::Host::Ipv6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        },
+        url::Host::Domain(name) => {
+            if is_reserved_loopback_name(name) {
+                return Err(format!(
+                    "Webhook URL must not target an internal address (loopback name \
+                     reserved by RFC 6761): {name}"
+                ));
+            }
+            return Ok(());
+        }
+    };
+
+    if let Some(category) = internal_address_category(addr) {
+        return Err(format!(
+            "Webhook URL must not target an internal address ({category}): {addr}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Is `name` one of the names RFC 6761 reserves to loopback?
+///
+/// `localhost` and any label under `.localhost`, compared case-insensitively
+/// with a single trailing root dot stripped (`localhost.` is the same name).
+///
+/// Deliberately only these. It is a special-use-name denylist, not a guess at
+/// which names might point somewhere internal: other reserved-ish names, and any
+/// name an operator has pointed at a private address in their own DNS or hosts
+/// file, are still accepted, because judging them would require either
+/// resolution or a guess about someone else's naming, and the policy above
+/// commits to neither. That boundary is stated there rather than narrowed here.
+fn is_reserved_loopback_name(name: &str) -> bool {
+    let n = name.trim_end_matches('.').to_ascii_lowercase();
+    n == "localhost" || n.ends_with(".localhost")
+}
+
+/// Name the reason `addr` is internal, or `None` if it is not.
+///
+/// The category is returned rather than a bare `bool` so the 400 says which
+/// rule the caller tripped.
+///
+/// IPv6 unique-local (`fc00::/7`) and link-local (`fe80::/10`) are checked from
+/// `segments()` rather than with `Ipv6Addr::is_unique_local` /
+/// `is_unicast_link_local`, which are unstable (`#![feature(ip)]`). The masks
+/// are the ones those methods use.
+fn internal_address_category(addr: std::net::IpAddr) -> Option<&'static str> {
+    match addr {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                Some("loopback")
+            } else if v4.is_link_local() {
+                // Covers 169.254.0.0/16, which is where cloud instance-metadata
+                // services live.
+                Some("link-local")
+            } else if v4.is_private() {
+                Some("private range")
+            } else if v4.is_unspecified() {
+                Some("unspecified")
+            } else {
+                None
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            if v6.is_loopback() {
+                Some("loopback")
+            } else if (first & 0xffc0) == 0xfe80 {
+                Some("link-local")
+            } else if (first & 0xfe00) == 0xfc00 {
+                Some("unique-local")
+            } else if v6.is_unspecified() {
+                Some("unspecified")
+            } else {
+                None
+            }
+        }
+    }
+}
+
 // =============================================================================
 // HMAC-SHA256 PAYLOAD SIGNING
 // =============================================================================
@@ -163,6 +344,24 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 /// event type filters, and a secret of at least 32 characters for
 /// HMAC-SHA256 payload signing.
 ///
+/// # Delivery-target policy
+///
+/// The URL is checked against [`validate_webhook_url`], which requires an
+/// `http`/`https` scheme and refuses loopback, link-local, private-range and
+/// unspecified IP **literals**. Read that function's doc for the four things
+/// this policy deliberately does not cover — chiefly that DNS rebinding is out
+/// of scope (a hostname is accepted on its face) and that the check applies at
+/// registration only, so rows already in `webhook_subscriptions` are
+/// grandfathered and re-armed by boot hydration on every deploy.
+///
+/// The check sits in the handler BODY, not in an extractor and not in the
+/// schema. Body, because it is a validation of the parsed payload and belongs
+/// next to the existing non-empty and secret-length checks — and because
+/// `negative_tests.rs::register_webhook_wrong_scope_with_malformed_body_returns_403_not_422`
+/// runs this handler against a deliberately dead pool, so the scope rejection
+/// must still precede anything that touches the database (this check touches
+/// nothing). Not the schema, because migration 085 is applied and unchanged.
+///
 /// # Write path — disclosed deliberately
 ///
 /// PR-10 makes this handler write to the database (`webhook_subscriptions`,
@@ -181,7 +380,9 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: Empty URL or secret shorter than 32 characters
+/// - 400 Bad Request: empty URL, a URL that fails
+///   [`validate_webhook_url`]'s scheme or internal-address rules, or a secret
+///   shorter than 32 characters
 /// - 401 Unauthorized: Missing or invalid Bearer token, or a token that names
 ///   no `agents.id`
 /// - 403 Forbidden: Missing `webhooks:write` scope
@@ -203,6 +404,14 @@ pub async fn register_webhook(
             message: "Webhook URL must not be empty".to_string(),
         });
     }
+
+    // 1b. Validate the delivery target against the scheme allowlist and the
+    //     internal-address denylist. Kept as a separate step from the
+    //     non-emptiness check above because that one, and only that one, is
+    //     mirrored by migration 085's `CHECK (btrim(url) <> '')`; this policy
+    //     lives here and nowhere else.
+    validate_webhook_url(registration.url.trim())
+        .map_err(|message| ApiError::BadRequest { message })?;
 
     // 2. Validate secret length (minimum 32 characters for adequate entropy)
     if registration.secret.len() < MIN_SECRET_LENGTH {
@@ -233,9 +442,17 @@ pub async fn register_webhook(
     };
 
     // 4. Create the subscription
+    //
+    // THE STORED URL IS THE ONE THAT WAS JUDGED. Steps 1 and 1b validate
+    // `registration.url.trim()`; storing the untrimmed string would leave the
+    // row differing from the value the policy actually inspected. The difference
+    // is only surrounding whitespace and `reqwest` would normalise or reject it
+    // at delivery time, so this is not a bypass being closed — it is the
+    // validated-versus-persisted divergence being removed before it can become
+    // one.
     let subscription = WebhookSubscription {
         id: Uuid::new_v4(),
-        url: registration.url,
+        url: registration.url.trim().to_string(),
         event_types: registration.event_types,
         created_at: Utc::now(),
         active: true,
