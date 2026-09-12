@@ -167,7 +167,7 @@ rg -n "ED25519|oauth|OAUTH|credentials" src/host/container.rs src/host/secrets*.
 - [ ] **Step 2: Wire the forward egress proxy**
 
 Uncomment/implement the proxy wiring at the location found in Step 1 so every agent container's
-egress routes through the proxy at `10.99.0.1:3128` with an explicit allowlist (matches the
+egress routes through the egress proxy on the internal network with an explicit allowlist (matches the
 already-working pattern used for `epiclaw` per `[[reference_epiclaw_egress_firewall]]`). Add a
 regression test that spins up a container and asserts an unallowlisted host is unreachable.
 
