@@ -3336,6 +3336,16 @@ impl ClaimRepository {
     }
 
     /// List claims with pagination within an existing transaction.
+    ///
+    /// Delegates to the generic form above, which accepts any executor —
+    /// `&mut PgConnection` included — so the visibility predicate exists in
+    /// exactly one SQL text. The hand-written duplicate this replaced was the
+    /// same drift class `count_conn` was collapsed for: two copies of one
+    /// tenancy predicate, only one of which a future fix reaches, and no gate
+    /// can see the divergence because each copy carries its own marker.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn list_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
@@ -3343,45 +3353,7 @@ impl ClaimRepository {
         offset: i64,
         search: Option<&str>,
     ) -> Result<Vec<Claim>, DbError> {
-        let search_pattern = search.map(|s| format!("%{}%", s));
-        let (query_str, vis_bind) = if search_pattern.is_some() {
-            (
-                r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims WHERE content ILIKE $3 /* {VISIBILITY:claims} */
-            ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
-                4,
-            )
-        } else {
-            (
-                r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims WHERE true /* {VISIBILITY:claims} */
-            ORDER BY created_at DESC LIMIT $1 OFFSET $2"#,
-                3,
-            )
-        };
-        let sql = viewer.splice(query_str, vis_bind);
-        let mut query = sqlx::query_as::<_, ClaimRow>(&sql).bind(limit).bind(offset);
-        if let Some(s) = search_pattern {
-            query = query.bind(s);
-        }
-        if let Some(g) = viewer.group_bind() {
-            query = query.bind(g);
-        }
-        let rows = query.fetch_all(&mut *conn).await?;
-        let mut claims = Vec::with_capacity(rows.len());
-        for row in rows {
-            let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
-                row.id,
-                row.content,
-                row.agent_id,
-                row.trace_id,
-                truth_value,
-                row.created_at,
-                row.updated_at,
-            ));
-        }
-        Ok(claims)
+        Self::list(&mut *conn, viewer, limit, offset, search).await
     }
 
     /// Count total number of claims within an existing transaction.
