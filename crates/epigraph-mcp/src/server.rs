@@ -107,7 +107,23 @@ impl EpiGraphMcpFull {
     pub async fn server_agent_id(&self) -> Result<uuid::Uuid, McpError> {
         self.agent_id().await
     }
+}
 
+/// Lets `auth::UnauthenticatedPrincipal` re-attempt the resolution on a later
+/// request instead of treating a boot-time failure as final.
+///
+/// No caching is added here because [`EpiGraphMcpFull::agent_id`] already has the
+/// right semantics: it writes `agent_db_id` only in the success arm, so a failed
+/// attempt leaves the cell empty and the next call tries again, while a
+/// successful one costs a mutex lock thereafter.
+#[async_trait::async_trait]
+impl crate::auth::ServerPrincipalSource for EpiGraphMcpFull {
+    async fn resolve_server_agent_id(&self) -> Result<uuid::Uuid, String> {
+        self.agent_id().await.map_err(|e| format!("{e:?}"))
+    }
+}
+
+impl EpiGraphMcpFull {
     /// Ensure agent exists in DB, return cached ID.
     ///
     /// # Tenancy (PR-09)

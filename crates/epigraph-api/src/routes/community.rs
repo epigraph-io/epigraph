@@ -5,9 +5,32 @@
 //! - `GET /api/v1/communities/:id` — get community with members
 //!
 //! Protected (POST/DELETE):
-//! - `POST /api/v1/communities` — create a community
+//! - `POST /api/v1/communities` — create a community (`groups:write`)
 //! - `POST /api/v1/communities/:id/members` — add perspective member
+//!   (`groups:admin` **and** live membership)
 //! - `DELETE /api/v1/communities/:id/members/:perspective_id` — remove member
+//!   (`groups:admin` **and** live membership, or own perspective)
+//!
+//! Every route here is on the `protected` chain, so all five take a token. The
+//! three writes take a scope on top of it, at the tier `routes/groups.rs` charges
+//! for the same effect: migration 068 projects a community onto a `groups` row
+//! ID-preservingly, so creating a community creates a group and a membership
+//! granted here is the same `group_memberships` row
+//! `POST /api/v1/groups/:id/members` grants. Create costs `groups:write` and
+//! managing an existing membership costs `groups:admin`, which is the split
+//! `epigraph_core::canonical_scopes` prescribes. See `create_community`'s and
+//! `add_member`'s docs for the arguments and for what each choice costs.
+//!
+//! **The create and manage tiers are deliberately different, and the gap is
+//! real.** A principal holding only `groups:write` can create a community and
+//! cannot then add a member to it — not even itself, and not even as the
+//! community's own sole live member. That is not an oversight here: it is
+//! `routes/groups.rs`'s existing shape, where `create_group` makes the caller the
+//! new group's `role='admin'` member *by construction* so no separate add is
+//! needed, and community creation gets the same treatment via
+//! `CommunityRepository::create`'s creator argument. Populating a community with
+//! *other* perspectives is admin-only. Stated here because a reader comparing the
+//! two scopes above will otherwise read the difference as an accident.
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -104,8 +127,40 @@ fn default_limit() -> i64 {
 /// Create a new community
 ///
 /// `POST /api/v1/communities`
+///
+/// # Requires `groups:write`
+///
+/// The same scope `routes/groups.rs::create_group` takes, for the same reason and
+/// at the same tier. `CommunityRepository::create` inserts a `groups` row —
+/// migration 068's ID-preserving projection — and, when the creator is `Some`,
+/// a `group_memberships` row at `role = 'admin'`. So this route creates a
+/// control-plane object and installs the caller as its administrator. Doing that
+/// for the price of any token, while the route that spells the same effect
+/// `POST /api/v1/groups` charges `groups:write`, is the cheaper-path asymmetry
+/// that [`add_member`]'s doc argues against one layer down; leaving it here
+/// while raising the two membership writes would have made the asymmetry
+/// sharper rather than flatter.
+///
+/// `groups:write` and not `groups:admin`: `canonical_scopes` states that
+/// `groups:write` is the CREATE tier ("any read-write principal may create a
+/// group; it becomes that group's sole `role='admin'` member by construction")
+/// and `groups:admin` the manage-an-existing-group tier. This is a create. The
+/// availability cost is correspondingly small — `groups:write` is in the
+/// read-write role, so `epigraph-wo` tokens keep working; `epigraph-ro` does not
+/// and did not need to.
+///
+/// The gate is an extractor rather than an in-handler check for the reason given
+/// on [`add_member`]: this handler takes a `Json` body, `FromRequestParts` runs
+/// first, and a wrong scope must be 403 rather than 422 (issue #128).
+///
+/// # Errors
+///
+/// - 401 Unauthorized: no token, or a token naming no `agents.id`
+/// - 403 Forbidden: missing `groups:write`
+/// - 422 Unprocessable Entity: a name outside 1..=200 characters
 #[cfg(feature = "db")]
 pub async fn create_community(
+    _scope: crate::middleware::bearer::RequireScopeGroupsWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<CreateCommunityRequest>,
@@ -212,8 +267,59 @@ pub async fn get_community(
 /// Add a perspective member to a community
 ///
 /// `POST /api/v1/communities/:id/members`
+///
+/// # Requires `groups:admin`
+///
+/// Scope AND membership, never OR — the shape `routes/groups.rs::add_member`
+/// already uses and the one `epigraph_core::canonical_scopes` prescribes for
+/// managing an existing group's membership. Membership is enforced in the repo
+/// layer (`CommunityRepository::add_member`: the acting agent must hold a live
+/// membership in the community's projected group, with a bootstrap exception for
+/// a group that has none). Scope was the missing half, and it is the half a
+/// scope-less route cannot supply: without it a token that may not manage a
+/// group through `POST /api/v1/groups/:id/members` could grant the same
+/// `group_memberships` row through this route, because migration 068 projects a
+/// community onto a group ID-preservingly and this handler's write is projected
+/// onto that group. Read authority granted here is read authority, however it
+/// was spelled.
+///
+/// `groups:admin` rather than `groups:write` because `groups:write` gates
+/// *creating* a group — "any read-write principal may create a group; it becomes
+/// that group's sole `role='admin'` member by construction, which is why managing
+/// an EXISTING group needs `groups:admin` plus membership rather than this
+/// scope", per `canonical_scopes`' own comment. This route manages an existing
+/// group's membership, so it takes the tier that names that operation. The
+/// repo-layer rule here is already *weaker* than `groups.rs`'s
+/// (`require_group_admin` demands a live `role='admin'` membership; a projected
+/// community group has no admins to demand, so "a live member" is the strongest
+/// available rule), which is a reason to match the scope tier rather than
+/// discount it: weakening both halves is what made this route the cheaper path.
+///
+/// **Availability cost.** `groups:admin` is in `ADMIN_ONLY_SCOPES`, so it is
+/// absent from `read_only_scopes()`, from the read-write role, from
+/// `AGENT_PROVISION_SCOPES` and from `PUBLIC_CLIENT_READ_SCOPES`. Every
+/// `epigraph-ro` and `epigraph-wo` token and every auto-provisioned agent now
+/// gets 403 on this route and on the DELETE below. The alternative considered
+/// was minting a `communities:write` scope, which would mean editing
+/// `canonical_scopes.rs`, its role-boundary assertions and `bootstrap_clients`;
+/// it was rejected on the precedent `routes/webhooks.rs::list_webhooks` set when
+/// it declined a `webhooks:read` scope for the same reason, and because a new
+/// scope would recreate the asymmetry this fix exists to remove.
+///
+/// The gate is an extractor, not an in-handler check: this handler takes a
+/// `Json` body, and `FromRequestParts` runs first, so a wrong scope is 403 rather
+/// than 422 (issue #128). It also introduces no occurrence of the optional-
+/// `Extension` idiom that `viewer_route_table_lint.rs` counts, so neither of that
+/// file's registers moves — `community.rs` appears in none of them.
+///
+/// # Errors
+///
+/// - 401 Unauthorized: no token, or a token naming no `agents.id`
+/// - 403 Forbidden: missing `groups:admin`, or not a live member of the community
+/// - 404 Not Found: no such community, or no such perspective
 #[cfg(feature = "db")]
 pub async fn add_member(
+    _scope: crate::middleware::bearer::RequireScopeGroupsAdmin,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(community_id): Path<Uuid>,
@@ -244,8 +350,11 @@ pub async fn add_member(
     // arms the predicate, so a stranger could create a perspective, POST it
     // into any community, and read that community's private corpus. The rule —
     // and why it is "a live member" and not "an admin" — is in
-    // `epigraph-db/src/repos/community.rs`'s module docs. Full route-level
-    // authorization is still PR-16's.
+    // `epigraph-db/src/repos/community.rs`'s module docs.
+    //
+    // This is the MEMBERSHIP half. The SCOPE half is the `RequireScopeGroupsAdmin`
+    // extractor in the signature, which ran before this body was entered. Both,
+    // never either: see the handler doc.
     match epigraph_db::CommunityRepository::add_member(
         pool,
         viewer.principal(),
@@ -282,8 +391,25 @@ pub async fn add_member(
 /// Remove a perspective member from a community
 ///
 /// `DELETE /api/v1/communities/:id/members/:perspective_id`
+///
+/// # Requires `groups:admin`
+///
+/// The integrity twin of [`add_member`], and gated identically for the same
+/// reason: the write revokes a projected `group_memberships` row, so it is
+/// group-membership management whichever route reaches it. See [`add_member`]'s
+/// doc for the scope-tier argument, the availability cost, and the rejected
+/// alternative. The repo layer keeps its own rule on top — a live member, or the
+/// perspective's own owner removing itself.
+///
+/// # Errors
+///
+/// - 401 Unauthorized: no token, or a token naming no `agents.id`
+/// - 403 Forbidden: missing `groups:admin`, or neither a live member nor the
+///   perspective's owner
+/// - 404 Not Found: no such membership
 #[cfg(feature = "db")]
 pub async fn remove_member(
+    _scope: crate::middleware::bearer::RequireScopeGroupsAdmin,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path((community_id, perspective_id)): Path<(Uuid, Uuid)>,
@@ -296,7 +422,9 @@ pub async fn remove_member(
     // now()` on the projected `group_memberships` row), which turns that from a
     // bookkeeping no-op into a denial of read against a legitimate member.
     // Adding the extractor here does not touch `viewer_route_table_lint.rs` —
-    // `community.rs` appears in neither of its registers.
+    // `community.rs` appears in neither of its registers. The scope half, which
+    // the viewer does not supply, is the `RequireScopeGroupsAdmin` extractor
+    // above it.
     match epigraph_db::CommunityRepository::remove_member(
         pool,
         viewer.principal(),

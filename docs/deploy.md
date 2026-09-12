@@ -204,7 +204,8 @@ embeddings or aggregates moved from the `public` router to `protected`. The
 notable ones: `GET /claims`, `GET /claims/:id`, `GET /api/v1/claims`,
 `GET /agents`, `GET /lineage/:claim_id`, `POST /api/v1/search/semantic`,
 **`GET /api/v1/query/rag`**, **`GET /api/v1/search/evidence`**,
-`GET /api/v1/admin/stats`, `GET /api/v1/themes/:id/embeddings`,
+`GET /api/v1/admin/stats` (see §1a — it now needs `claims:admin`, not merely a
+token), `GET /api/v1/themes/:id/embeddings`,
 `GET /api/v1/events`, all `/api/v1/graph/*`,
 all `/frames/*`, all `/belief*`, and every `/api/v1/perspectives*`,
 `/communities*`, `/contexts*`, `/workflows*`, `/methods*` and `/tasks*` read.
@@ -230,6 +231,102 @@ demote a claim after the fact.
 **The RAG and evidence-search public-access guarantees are revoked.** Announce
 this; anything scraping those two endpoints anonymously stops working the
 moment this deploys.
+
+### 1a. BREAKING — `GET /api/v1/admin/stats` now requires `claims:admin`
+
+A Bearer token is no longer sufficient. The handler took `State(state)` alone —
+no auth extractor, no scope check — so any authenticated principal holding any
+scope read the whole fourteen-field `SystemStats` aggregate. One of its fields,
+`webhooks.webhook_count`, stopped being a per-process artefact when boot
+hydration started filling `AppState::webhook_store` from
+`webhook_subscriptions`: it is now the cross-tenant cardinality of that table,
+and this route is the only unfiltered path out of the store.
+
+`claims:admin` is in `ADMIN_ONLY_SCOPES`, which means it is **not** in
+`read_only_scopes()`, **not** in the read-write role, **not** in
+`AGENT_PROVISION_SCOPES` and **not** in `PUBLIC_CLIENT_READ_SCOPES`. So every
+`epigraph-ro` token, every `epigraph-wo` token, every agent auto-provisioned by
+`POST /api/v1/agents` and every DCR-registered public client now receives
+**403** here. Point dashboards and monitoring at an `epigraph-admin` token, or
+mint a dedicated client with exactly `["claims:admin"]`.
+
+Two things that did NOT change, so nobody has to test for them: the response
+body shape is identical (including the `require_signatures` field documented
+below), and the MCP tool also called `system_stats` is a different aggregate —
+corpus counts, viewer-scoped, `claims:read` — and is untouched.
+
+### 1b. BREAKING — the community write routes now carry group scopes
+
+Three routes that took a bare Bearer token now take a scope as well:
+
+| route | scope now required |
+|---|---|
+| `POST /api/v1/communities` | `groups:write` |
+| `POST /api/v1/communities/:id/members` | `groups:admin` **and** live membership |
+| `DELETE /api/v1/communities/:id/members/:perspective_id` | `groups:admin` **and** live membership, or own perspective |
+
+Why: migration 068 projects every community onto a `groups` row
+ID-preservingly. Creating a community creates a group (and installs the creator
+as its `role='admin'` member); adding a community member writes the same
+`group_memberships` row `POST /api/v1/groups/:id/members` writes. §1 above
+already charges `groups:write` and `groups:admin` for those effects on the
+`/api/v1/groups/*` spelling — these routes were the cheaper path to the same
+grant, and now cost the same.
+
+**Availability.** `groups:admin` is in `ADMIN_ONLY_SCOPES`: not in
+`read_only_scopes()`, not in the read-write role, not in
+`AGENT_PROVISION_SCOPES`, not in `PUBLIC_CLIENT_READ_SCOPES`. So every
+`epigraph-ro` token, every `epigraph-wo` token and every agent auto-provisioned
+by `POST /api/v1/agents` now gets **403** on the two membership routes. Mint an
+`epigraph-admin` token, or a dedicated client with `["groups:admin"]`, for
+anything that manages community membership. `groups:write` is in the read-write
+role, so `epigraph-wo` keeps working on `POST /api/v1/communities` — only
+`epigraph-ro` loses it, and it could not write before either.
+
+**Expected consequence, so it is not mistaken for a bug.** A principal holding
+only `groups:write` can create a community and cannot then add another
+perspective to it. That mirrors `/api/v1/groups`: the creator becomes the new
+group's administrator by construction, so no separate add is needed to own what
+you made, but populating it with others is admin-only.
+
+If you re-ran `bootstrap_clients` for §1 you have already done the work for
+this section; §1's scopes are the ones these routes check.
+
+### 1c. `POST /api/v1/webhooks` now refuses internal delivery targets
+
+Registration validates the URL. **400** is returned for a scheme other than
+`http`/`https`, for a URL that does not parse or names no host, for an IP
+**literal** that is loopback, link-local, private-range or unspecified
+(including the IPv4-mapped IPv6 spelling of one), and for the names RFC 6761
+reserves to loopback (`localhost` and anything under `.localhost`).
+
+Three boundaries an operator should know rather than infer:
+
+* **It applies at registration only.** `bin/server.rs` re-hydrates
+  `AppState::webhook_store` from `webhook_subscriptions` on every boot, so rows
+  written before this release are grandfathered and are re-armed on each deploy
+  without passing through the check. Auditing them is an operator task. The
+  asymmetry is worth stating plainly: an existing subscription pointed at an
+  internal consumer keeps being delivered to, while **re-registering that same
+  URL after a redeploy now fails with 400**.
+* **It is not an allowlist and it does not resolve names.** Any other hostname
+  is accepted on its face, including one that resolves to a private address.
+  DNS rebinding is a different control (egress policy on the delivering
+  process).
+* **Migration 085 is unchanged.** Its `CHECK (btrim(url) <> '')` still mirrors
+  only the non-empty check; this policy lives in the handler.
+
+### 1d. `POST /api/v1/claims/batch` no longer publishes `ClaimSubmitted`
+
+That handler writes only to the in-memory `AppState::claim_store`, never to
+`claims`, so the ids it published named no row and the fan-out could make no
+tenancy decision about them. It now creates the claims and publishes nothing.
+
+Two observable effects, both small and both silent otherwise: a webhook
+subscriber filtering on `ClaimSubmitted` stops seeing batch imports, and
+`SystemStats.event_bus.history_size` stops counting them. No other subscriber is
+affected — `start_webhook_dispatcher` is the only wired `EventBus` consumer, and
+`GET /api/v1/events` reads the database rather than the in-memory ring.
 
 **Announce PR-14's read-path change in the same note.** A caller that used to
 receive a `200` whose claim `content` was the placeholder `"[REDACTED]"` now

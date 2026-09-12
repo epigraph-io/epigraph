@@ -131,15 +131,69 @@ pub struct ConfigSummary {
 /// instead by the separate internal `/metrics` listener that `bin/server.rs`
 /// binds, which is what a scraper should have been using anyway.
 ///
+/// # Requires `claims:admin`
+///
+/// Authentication was never the whole gate here. This handler took
+/// `State(state)` alone — no auth extractor, no `check_scopes` — so *any*
+/// authenticated principal holding *any* scope read the whole `SystemStats`
+/// aggregate. The part of that aggregate which is not a per-process artefact is
+/// `WebhookStats { webhook_count }`: boot hydration
+/// (`bin/server.rs` → `WebhookSubscriptionRepository::list_active`) fills
+/// `AppState::webhook_store` from the table, so the count is the cardinality of
+/// `webhook_subscriptions` across every tenant, and this route is the one
+/// unfiltered path out of that store. A count rather than content, but a
+/// cross-tenant one.
+///
+/// `claims:admin` is the gate rather than a per-caller narrowing of
+/// `webhook_count`, because narrowing it would mean reading
+/// `webhook_subscriptions` from this handler — SQL in a route file, against the
+/// standing rule that all SQL lives in `crates/epigraph-db/src/repos/` — and
+/// because the other twelve fields really are whole-instance operational
+/// metrics that no per-caller filter is defined for. Dropping the field instead
+/// was the third option and was rejected: an operator watching subscription
+/// drift is a legitimate reader, and the fix should move who may read, not what
+/// exists.
+///
+/// The gate is an **extractor**, not an in-handler check, for the reason
+/// `middleware::bearer::require_scope_extractor!` documents: `FromRequestParts`
+/// runs ahead of any body-consuming extractor, and the optional-`Extension`
+/// in-handler shape is the fail-open idiom `viewer_route_table_lint.rs`
+/// counts in `FAIL_OPEN_SCOPE_SITES`. One definition serves both `create_router`
+/// chains (this function is not `cfg`-split), so both registrations of
+/// `/api/v1/admin/stats` are covered by this one parameter.
+///
+/// **Availability cost, stated rather than implied.** `claims:admin` is in
+/// `epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES`: it is excluded from
+/// `read_only_scopes()` and from the read-write role, and absent from both
+/// `AGENT_PROVISION_SCOPES` and `PUBLIC_CLIENT_READ_SCOPES`. So every
+/// `epigraph-ro` and `epigraph-wo` token, every agent auto-provisioned by
+/// `POST /api/v1/agents`, and every DCR-registered public client now gets 403
+/// here. Operators pointing a dashboard at this route need an admin token or a
+/// client minted with `["claims:admin"]`.
+///
+/// The MCP tool of the same name (`epigraph-mcp/src/tools/batch.rs`) is a
+/// different aggregate — corpus counts, already `&Viewer`-scoped, mapped to
+/// `claims:read` — and is deliberately untouched. The two transports therefore
+/// answer different questions under different scopes; that asymmetry is
+/// recorded, not resolved here.
+///
 /// # Response
 ///
 /// Returns a `SystemStats` JSON object with nested subsystem metrics.
+///
+/// # Errors
+///
+/// - 401 Unauthorized: missing or invalid Bearer token
+/// - 403 Forbidden: authenticated but missing `claims:admin`
 ///
 /// # Performance
 ///
 /// This handler acquires read locks on several shared state objects.
 /// All locks are short-lived and released before the response is sent.
-pub async fn system_stats(State(state): State<AppState>) -> Json<SystemStats> {
+pub async fn system_stats(
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
+    State(state): State<AppState>,
+) -> Json<SystemStats> {
     // Gather event bus metrics (no lock needed - EventBus uses internal RwLock)
     let event_bus = EventBusStats {
         subscriber_count: state.event_bus.subscriber_count(),
@@ -1033,11 +1087,32 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    /// An `AuthContext` holding `claims:admin`, layered in place of the bearer
+    /// middleware so the routers below reach the handler body.
+    ///
+    /// `system_stats` now takes `RequireScopeAdmin`, which reads an
+    /// `AuthContext` out of the request extensions and 401s when there is none.
+    /// These routers mount the handler bare, so without this layer every
+    /// response-shape test below would assert on a 401 body instead of a
+    /// `SystemStats` one. The scope gate itself is asserted over the real
+    /// middleware stack in `tests/admin_stats_scope_test.rs`, which is compiled.
+    fn admin_auth() -> crate::middleware::bearer::AuthContext {
+        crate::middleware::bearer::AuthContext {
+            client_id: uuid::Uuid::new_v4(),
+            agent_id: Some(uuid::Uuid::new_v4()),
+            owner_id: None,
+            client_type: epigraph_auth::ClientType::Service,
+            scopes: vec!["claims:admin".to_string()],
+            jti: uuid::Uuid::new_v4(),
+        }
+    }
+
     /// Create a test router with just the admin stats endpoint
     fn test_router() -> Router {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/admin/stats", get(system_stats))
+            .layer(axum::Extension(admin_auth()))
             .with_state(state)
     }
 
@@ -1045,6 +1120,7 @@ mod tests {
     fn test_router_with_state(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/admin/stats", get(system_stats))
+            .layer(axum::Extension(admin_auth()))
             .with_state(state)
     }
 

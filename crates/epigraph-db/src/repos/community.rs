@@ -65,7 +65,7 @@
 //!
 //! ## Membership is CLOSED, and PR-12 is why that had to change here
 //!
-//! `POST /api/v1/communities/:id/members` performs no authorization beyond two
+//! `POST /api/v1/communities/:id/members` performed no authorization beyond two
 //! existence checks (`F-PR11-community-membership-is-self-service`, deferred by
 //! PR-11 to "the PR that owns community authorization"). Before PR-12 that hole
 //! lived only in `access_control.rs::check_content_access`'s community arm — a
@@ -92,9 +92,27 @@
 //!   perspective.
 //!
 //! This is deliberately weaker than "only an admin may add members": community
-//! groups have no admins to require. It is strictly stronger than nothing, it
-//! is fail-closed in the direction that matters (a stranger cannot let itself
-//! in), and the full route-level authorization remains PR-16's.
+//! groups have no admins to require. It is strictly stronger than nothing, and it
+//! is fail-closed in the direction that matters (a stranger cannot let itself in).
+//!
+//! ## The route-level half is now in place too
+//!
+//! Both handlers (`epigraph-api/src/routes/community.rs::add_member` and
+//! `::remove_member`) additionally require the `groups:admin` scope, via an
+//! extractor, mirroring `routes/groups.rs`. Scope AND membership, never OR. The
+//! reasoning — why `groups:admin` and not `groups:write`, and what it costs in
+//! availability — is on `add_member`'s doc comment there, not duplicated here.
+//! What this repo layer owns is unchanged: it is still the membership rule, and
+//! it is still the rule both writers reach.
+//!
+//! The bootstrap case above is a residual, not a closed question. It is tracked
+//! in `docs/tenancy/progress.json`; location
+//! `migrations/068_communities_to_groups.sql` and this file; owner PR-18.
+//! Analysis held outside this repository, as
+//! `2026-09-12-F-PR12-projected-community-groups.md` in the operator's private
+//! record. The filename is named on purpose: a bare "held privately" is
+//! unverifiable, and six earlier findings in this series were redacted into
+//! pointers whose record was never written.
 
 use crate::errors::DbError;
 use crate::repos::perspective::PerspectiveRow;

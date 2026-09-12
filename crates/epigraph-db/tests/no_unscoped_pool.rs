@@ -274,8 +274,9 @@
 //!   `routes/graph_neighborhood.rs::{compound_response, atomic_response}`,
 //!   `routes/independence.rs::analyze_independence`,
 //!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
-//!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_may_receive,
-//!   deliver_event}`, `routes/workflows.rs::{get_or_create_system_agent,
+//!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
+//!   agent_may_receive, deliver_event}`,
+//!   `routes/workflows.rs::{get_or_create_system_agent,
 //!   auto_wire_inserted_edges}`, `tenancy_gauge.rs::sample`. The webhook
 //!   fan-out is the one that matters most and the one this register cannot
 //!   see at all: its pool is handed over once in the EXEMPT `bin/server.rs` and
