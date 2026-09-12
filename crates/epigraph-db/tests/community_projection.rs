@@ -416,9 +416,13 @@ async fn removing_one_of_two_perspectives_keeps_the_membership(pool: PgPool) {
 ///
 /// # Why this is PR-12's problem and not PR-14's
 ///
-/// `POST /api/v1/communities/:id/members` performs no authorization
+/// `POST /api/v1/communities/:id/members` performed no authorization
 /// (`F-PR11-community-membership-is-self-service`, deferred by PR-11 to "the PR
-/// that owns community authorization"). Until PR-12 the consequence lived only
+/// that owns community authorization"). The route now also requires the
+/// `groups:admin` scope, but that is a scope gate and this is the membership
+/// rule: a token holding `groups:admin` is still not a member, so the rule below
+/// is what stops it, and it must hold in the repo layer because both writers
+/// reach it. Until PR-12 the consequence lived only
 /// in `access_control.rs::check_content_access`'s community arm — a table PR-14
 /// deletes. PR-12 moves it into the control plane that SURVIVES PR-14: the
 /// membership becomes a live `group_memberships` row, and `Viewer::resolve`

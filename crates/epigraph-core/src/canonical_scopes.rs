@@ -28,11 +28,21 @@
 /// exactly `["entity-types:write"]` (narrow, and distinct from
 /// `clients:admin`/`claims:admin`).
 ///
-/// `groups:admin` gates member management on an existing group
-/// (`POST /api/v1/groups/:id/members`, `DELETE .../members/:agent_id`). It is
-/// admin-only among the three canonical roles, but note it is NOT sufficient on
-/// its own: those routes ALSO require live `role='admin'` membership in the
-/// target group (`middleware/group_authz.rs`). Scope AND membership, never OR.
+/// `groups:admin` gates member management on an existing group — on
+/// `POST /api/v1/groups/:id/members` and `DELETE .../members/:agent_id`, and
+/// equally on `POST /api/v1/communities/:id/members` and
+/// `DELETE /api/v1/communities/:id/members/:perspective_id`, because migration
+/// 068 projects a community onto a `groups` row ID-preservingly and those two
+/// routes write the same `group_memberships` row the `/groups/` pair does.
+/// Enumerating only the `/groups/` spelling is what made the community route the
+/// cheaper path to the same grant. It is admin-only among the three canonical
+/// roles, but note it is NOT sufficient on
+/// its own: those routes ALSO require live membership in the
+/// target group — `role='admin'` for the `/groups/` pair
+/// (`middleware/group_authz.rs`), and, for the community pair, the weaker "a
+/// live member" rule `epigraph-db`'s `repos/community.rs` documents, because a
+/// projected community group may have no admin to demand. Scope AND membership,
+/// never OR, on all four.
 ///
 /// `instance:admin` is deliberately listed here and granted by **no**
 /// registration path: `/oauth/register` never hands it out (the DCR arm grants
