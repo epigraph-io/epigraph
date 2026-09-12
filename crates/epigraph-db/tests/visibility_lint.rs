@@ -1256,6 +1256,108 @@ fn every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt() {
     }
 }
 
+/// The unconditional `unwrap_or(&[])` bind form and a SPLICED statement must
+/// never appear in the same repo function.
+///
+/// # What the hazard is, in terms of the mechanism
+///
+/// `Viewer::render_fragment` short-circuits a `Bypass` viewer to `" "`, so a
+/// `Bypass` splice "can never emit a `$`". `group_bind()` returns `None` for
+/// `Bypass` to match, and `splice_write`'s own doc states the consequence: the
+/// conditional bind at the call site "is not optional" — `writable_bind()`
+/// returning `None` for `Bypass` "is what makes the guard and the rendered arity
+/// agree". `unwrap_or(&[])` discards exactly that `None`. On a spliced string it
+/// binds a parameter the rendered SQL has no placeholder for, so the guard and
+/// the arity disagree and the statement's correctness depends on which viewer
+/// shape arrives at runtime.
+///
+/// # Why this is a lint and not a bug report
+///
+/// `F-unconditional-group-bind-on-base` alleged this was live. It was CLOSED as
+/// not-reproducible: the sites that `unwrap_or(&[])` are all FIXED-ARITY
+/// statements — `sqlx::query!` macro sites, which need a compile-time literal
+/// and so carry the predicate verbatim, plus one static `query_as` — where the
+/// predicate is unconditionally present and the bind always has its placeholder.
+/// Re-measured here at the time this lint was written and still true: **zero**
+/// functions combine the two.
+///
+/// A measurement that has to be redone by hand is not a control. This keeps the
+/// finding closed by construction, so the next author who adds `unwrap_or(&[])`
+/// beside a splice learns it from a build failure rather than from a re-audit
+/// that may not happen.
+///
+/// # The granularity is the FUNCTION, and that is a deliberate over-approximation
+///
+/// It reports a function that has a spliced statement somewhere and an
+/// unconditional bind somewhere, without proving they are the same statement.
+/// That direction is the safe one — it can only refuse a mixture, never permit
+/// one — and it matches the granularity the rest of this file already uses for
+/// [`SPENT_MARKERS`]. A function that legitimately needs both would be a real
+/// finding to argue in review, not a false alarm to suppress: today none exists.
+#[test]
+fn no_spliced_statement_binds_the_unconditional_group_array() {
+    // The form that discards the `None` a Bypass viewer produces.
+    const UNCONDITIONAL_BINDS: &[&str] = &[
+        "group_bind().unwrap_or(",
+        "writable_bind().unwrap_or(",
+        "bypass_bind().unwrap_or(",
+    ];
+    // The forms that build a statement whose predicate can be absent.
+    const SPLICED: &[&str] = &[".splice(", ".splice_write("];
+
+    let fns = repo_fns();
+    let mut offenders = Vec::new();
+    let mut spliced_fns = 0usize;
+    let mut unconditional_fns = 0usize;
+
+    for f in &fns {
+        let splices = SPLICED.iter().any(|m| f.body.contains(m));
+        let unconditional = UNCONDITIONAL_BINDS.iter().any(|m| f.body.contains(m));
+        if splices {
+            spliced_fns += 1;
+        }
+        if unconditional {
+            unconditional_fns += 1;
+        }
+        if splices && unconditional {
+            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
+        }
+    }
+
+    // NON-VACUITY, both halves. A scanner that matched no splices, or no
+    // unconditional binds, would report a clean tree forever — and this lint's
+    // whole claim is that the two populations are large and DISJOINT, which is
+    // only worth asserting while both are non-empty. Floors, not measurements:
+    // 180 spliced and 30 unconditional when this was written.
+    assert!(
+        spliced_fns >= 120,
+        "found only {spliced_fns} repo fns that splice a viewer — the scanner is not matching \
+         bodies and this lint would pass vacuously over an empty set"
+    );
+    assert!(
+        unconditional_fns >= 20,
+        "found only {unconditional_fns} repo fns using the unconditional `unwrap_or` bind form. \
+         That form is legitimate at a fixed-arity macro site, and this lint's claim is that it \
+         never meets a splice — if the population is empty, the claim is vacuous"
+    );
+
+    assert!(
+        offenders.is_empty(),
+        "\n\nThese repo functions build a SPLICED statement and also bind a viewer array with \
+         the unconditional `unwrap_or(..)` form:\n{}\n\n\
+         A `Bypass` viewer renders the fragment as a single space and emits no placeholder, so \
+         `group_bind()` / `writable_bind()` return `None` and the call site must bind nothing. \
+         `unwrap_or(&[])` discards that `None` and binds anyway, so the guard and the rendered \
+         arity disagree.\n\n\
+         Fix: use the conditional form the mechanism is built around —\n\
+         `if let Some(g) = viewer.group_bind() {{ q = q.bind(g); }}`\n\n\
+         The unconditional form is correct ONLY at a `sqlx::query!` macro site, where the \
+         predicate is a compile-time literal of fixed arity and its placeholder is always \
+         present. Those sites do not splice, which is why the two never meet.\n",
+        offenders.join("\n")
+    );
+}
+
 /// The lint and the repo layer must not drift to spellings of the marker that
 /// only one of them knows.
 ///
