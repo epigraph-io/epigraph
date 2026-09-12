@@ -1764,6 +1764,22 @@ fn the_needle_set_finds_every_spelling_and_nothing_prescribed() {
 /// `if_let == verbatim` compares two independent measurements of the same set,
 /// and a fifth `if let` spelling breaks it by name.
 ///
+/// # The residual: this census is binder-agnostic but PATH-SENSITIVE
+///
+/// [`AUTH_CTX_BARE`] pins the fully-pathed `axum::Extension`. A handler that
+/// imported the type — `if let Some(Extension(ref auth)) = auth_ctx` — or wrote
+/// `axum::extract::Extension` would be outside the POPULATION, and so invisible
+/// to the needles, to all three registers, to the lossless sum, AND to this
+/// census. That is the same structural hole one level up, and stating it is the
+/// point: `routes/webhooks.rs` already establishes the bare spelling as a form
+/// written in this tree.
+///
+/// Measured over `src/routes/`: exactly one occurrence of either alternative
+/// spelling exists, and it is a doc comment, which [`route_files`] strips. So the
+/// population is complete on today's tree over one path prefix, and the residual
+/// is recorded rather than denied. Adding the alternatives to the offset scan is
+/// the fix if one is ever written; it would not move a register today.
+///
 /// # Why the totals are floors and not pins
 ///
 /// The critic that prompted this asked for `total` pinned at its measured
