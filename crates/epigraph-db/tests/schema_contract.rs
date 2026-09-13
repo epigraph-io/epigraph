@@ -835,10 +835,14 @@ async fn migration_062_refuses_a_nullable_visibility(pool: PgPool) {
 /// `claims_tenancy` by its definer-bypass disjunct. Its only access control is
 /// 086's `REVOKE EXECUTE … FROM PUBLIC` plus a single `GRANT` to `epigraph_app`.
 ///
-/// Postgres grants `EXECUTE` to `PUBLIC` by default on every
-/// `CREATE OR REPLACE FUNCTION`, so **any later migration that redefines this
-/// body — to widen the return set, add a column, or fix a plan — silently
-/// re-grants it to `PUBLIC`**, and nothing else in the workspace would notice:
+/// Postgres grants `EXECUTE` to `PUBLIC` by default on a first `CREATE FUNCTION`,
+/// so **any later migration that redefines this body with `DROP FUNCTION` +
+/// `CREATE` — to change the signature, or to rebuild it during a restore —
+/// silently restores that grant**, and nothing else in the workspace would notice:
+/// (`CREATE OR REPLACE` of the same signature does NOT: measured on PostgreSQL
+/// 16.13, replacement preserves `proacl`. This sentence said otherwise until the
+/// 089 batch re-measured it; the assertion below was always right, its stated
+/// reason was not.)
 /// `locked_decisions.rs::d4_migration_086_installs_no_policy` greps the 086 file
 /// for the word `REVOKE`, which stays true after such a re-grant, and neither
 /// `visibility_lint.rs` nor `no_unscoped_pool.rs` can see a read that goes
@@ -927,5 +931,123 @@ async fn migration_086_read_definer_is_revoked_from_public(pool: PgPool) {
          outage of both surfaces. 086's GRANT is guarded by the same pg_roles check as its \
          OWNER TO, so a cluster that provisions epigraph_app out of band AFTER 086 applies \
          gets the function with no grant."
+    );
+}
+
+/// Migration 089's stamping body must be `SECURITY DEFINER`, owned by
+/// `epigraph_maintenance`, and carry an EXPLICIT ACL that excludes `PUBLIC`.
+///
+/// # Why this needs its own catalog pin, and why the 086 test is the template
+///
+/// There is no generic sweep in this workspace asserting "every `prosecdef`
+/// function in `public` is revoked from `PUBLIC`". The only such assertions are
+/// bespoke and per-function — [`the_five_session_functions_exist`] for 067's
+/// five and [`migration_086_read_definer_is_revoked_from_public`] for 086's read
+/// helper. A missing or later-dropped `REVOKE` on 089's body would therefore be
+/// caught by nothing at all.
+///
+/// The hazard is a later `DROP FUNCTION` + `CREATE`, **not** a
+/// `CREATE OR REPLACE`. Measured on PostgreSQL 16.13: a first `CREATE` leaves
+/// `proacl` NULL and a NULL `proacl` IS the default grant, which includes
+/// `EXECUTE` to `PUBLIC`; `CREATE OR REPLACE` of the same signature PRESERVES the
+/// ACL; `DROP` + `CREATE` resets it to NULL and restores the `PUBLIC` grant
+/// silently. `proacl IS NOT NULL` is the assertion that catches that shape.
+///
+/// # The positive half is behavioural, not a GRANT, and the difference matters
+///
+/// 086's helper is CALLED by application Rust, so it needs an explicit `GRANT`
+/// to `epigraph_app` and that grant is pinned in its own test. 089's body is a
+/// TRIGGER function: Postgres checks `TRIGGER` privilege on the table when the
+/// trigger is created, not `EXECUTE` on the function when it fires, so no role
+/// grant is needed and adding one would widen the ACL for nothing. Migration
+/// 070's arm (c) body is the precedent — revoked from `PUBLIC`, granted to no
+/// application role, and firing on every ordinary application insert.
+///
+/// That makes the ACL half unfalsifiable on its own: a `REVOKE` that also broke
+/// the mechanism would look identical here.
+/// `tenancy_triggers.rs::migration_089_is_safe_to_re_run` supplies the
+/// behavioural control, asserting the trigger still stamps after a re-apply.
+///
+/// # Ownership is a coverage control here, and the catalog is where it is legible
+///
+/// 079 FORCEs row security on `harvester_fragments`, and
+/// `harvester_fragments_tenancy` admits a write only through
+/// `epigraph_bypass()`, `epigraph_definer_bypass()`, or a writable-group match.
+/// Measured out of band, from a genuine non-bypassing application-role session
+/// (this suite cannot ask — `epigraph_bypass()` reads `session_user`, which here
+/// is the superuser; see finding
+/// `F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable`): a body owned by
+/// a NON-member of `epigraph_maintenance` still stamps a link whose claim the
+/// writing session can already see, and stamps nothing — with no error — for a
+/// link whose claim it cannot, because the body's own read of `public.claims` is
+/// RLS-filtered too. So the ownership buys COVERAGE of the links the writer
+/// cannot see, and its loss is silent. Asserted from the catalog because the
+/// migration's own `ALTER FUNCTION … OWNER TO` sits inside a `pg_roles` guard
+/// that silently no-ops when 060 could only `RAISE NOTICE`.
+///
+/// Pinned by string equality here on purpose, where
+/// `tenancy_backfill.rs::verify_definer_ownership` uses `pg_has_role`. That is
+/// not an inconsistency: this test pins what migration 089 INSTALLS, the gate
+/// tolerates what a valid DEPLOY can produce (a member role, or a superuser).
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_089_stamping_definer_is_revoked_from_public(pool: PgPool) {
+    let meta: Option<(bool, String)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+           JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE n.nspname = 'public' \
+            AND p.proname = 'epigraph_inherit_fragment_tenancy_stmt'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner) =
+        meta.expect("public.epigraph_inherit_fragment_tenancy_stmt must exist (migration 089)");
+    assert!(
+        secdef,
+        "epigraph_inherit_fragment_tenancy_stmt must stay SECURITY DEFINER. 079 FORCEs row \
+         security on harvester_fragments, so an INVOKER body runs entirely under the writing \
+         session's own visibility and loses every link whose claim that session cannot read — \
+         silently, with no error."
+    );
+    assert_eq!(
+        owner, "epigraph_maintenance",
+        "it must be owned by epigraph_maintenance, whose membership is what \
+         epigraph_definer_bypass() tests inside the definer frame. Owned by a role that is not \
+         a member, the frame reads claims under harvester_fragments_tenancy and claims_tenancy \
+         like any other reader, so it stamps only what the writer could already see and stamps \
+         nothing, with no error, for the rest."
+    );
+
+    let public_can_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('public', \
+                'public.epigraph_inherit_fragment_tenancy_stmt()', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        !public_can_execute,
+        "epigraph_inherit_fragment_tenancy_stmt is EXECUTE-able by PUBLIC. It writes \
+         harvester_fragments with the maintenance role's authority, past that table's FORCEd \
+         policy, so a PUBLIC grant puts that write on a surface every role can reach directly. \
+         089's `REVOKE EXECUTE … FROM PUBLIC` is what keeps it off — required because a FIRST \
+         creation leaves proacl NULL, which IS the implicit PUBLIC grant. (A later CREATE OR \
+         REPLACE preserves the ACL and does NOT re-grant; DROP FUNCTION + CREATE does.)"
+    );
+
+    let acl: Option<String> = sqlx::query_scalar(
+        "SELECT proacl::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_inherit_fragment_tenancy_stmt'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("proacl lookup");
+    assert!(
+        acl.is_some(),
+        "epigraph_inherit_fragment_tenancy_stmt must carry an EXPLICIT ACL — a NULL proacl is \
+         the DEFAULT grant, which includes EXECUTE to PUBLIC. This is the assertion that fails \
+         when a later migration re-creates the body and forgets to repeat the REVOKE."
     );
 }

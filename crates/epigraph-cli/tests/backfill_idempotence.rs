@@ -1101,3 +1101,109 @@ async fn verify_still_checks_the_086_definer_when_its_migration_row_is_missing(p
         "a present function must never be skipped; stderr:\n{stderr}"
     );
 }
+
+/// The migration-089 addition to the same pre-flight is LIVE, not a list edit
+/// nobody exercises.
+///
+/// # Why the entry is deferred, and why that makes a test necessary
+///
+/// `epigraph_inherit_fragment_tenancy_stmt` is in
+/// `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`, not `DEFINER_FUNCTIONS`,
+/// for the structural reason 086's entry is: plan §9.2 runs this pre-flight at
+/// step 11c, and 089 is later than every migration 11c applies. An unconditional
+/// entry would report `does not exist` and block a correctly sequenced deploy —
+/// turning the control that prevents an outage into the outage.
+///
+/// A presence-gated entry is exactly the shape that can be right in the runbook
+/// and vacuous in CI. If the gate never opened, `verify` would stay green for a
+/// reason unrelated to this function's ownership, and 089's stamping body would
+/// be uninstrumented — which is the state this test exists to rule out. This
+/// half can only exercise the OPEN gate, because `#[sqlx::test]` applies every
+/// migration; the closed branch is covered generically by the two 086 tests
+/// above, which pin `applicable_definer_functions`' skip behaviour itself.
+///
+/// # What is at stake, scoped to what this branch of the gate reaches
+///
+/// The refusal asserted below is the PER-FUNCTION one, whose predicate is
+/// `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')`. It catches an owner
+/// that is not a member — an operator re-own, a restore, a migration runner that
+/// is neither a superuser nor a member. It deliberately does NOT catch a
+/// superuser-owned body, which passes and is correct (it satisfies
+/// `epigraph_definer_bypass()` and bypasses row security outright), and it is not
+/// the branch that reports a cluster where 060 could only `RAISE NOTICE`: there
+/// the role is ABSENT and `verify`'s role-existence branch returns first.
+///
+/// What a non-member owner costs is COVERAGE, not a silent total failure, and
+/// that distinction is measured rather than reasoned. Migration 079 FORCEs row
+/// security on `harvester_fragments`, whose policy admits a write through
+/// `epigraph_bypass()`, `epigraph_definer_bypass()`, or a writable-group match.
+/// On a scratch database at head, from a genuine non-bypassing application-role
+/// session, a non-member-owned body still stamped a link whose claim that session
+/// could already see — the writable-group disjunct carried it — and stamped
+/// nothing, with no error, for a link whose claim the session could not see,
+/// because the body's own read of `public.claims` is RLS-filtered too.
+///
+/// **This suite cannot ask that question at all.** `epigraph_bypass()` reads
+/// `session_user`, which in every `#[sqlx::test]` is the superuser, so the FORCEd
+/// policy is never the binding constraint here and the `epigraph_app` re-own
+/// below changes the CATALOG, not the behaviour. That is the pre-existing finding
+/// `F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable`, and it is why
+/// this test asserts the gate's exit code and message rather than a stamp.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_covers_the_089_stamping_definer_once_its_migration_is_applied(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    seed_undeclared_claim(&pool, agent, "ordinary").await;
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
+
+    // PREMISE: the gate is OPEN on this database. Without this the assertions
+    // below would all pass for the wrong reason — a skipped entry.
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_inherit_fragment_tenancy_stmt')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read pg_proc");
+    assert!(
+        present,
+        "089's function must exist for this test to mean anything — the entry under test is \
+         skipped when it does not"
+    );
+
+    // Install an owner that is NOT a member of epigraph_maintenance, which is
+    // the state this branch of the gate exists to refuse (an operator re-own, a
+    // restore, a non-member migration runner). Deliberately NOT described as
+    // "the missing-role deploy": on that cluster the ROLE is absent and
+    // verify's role-existence branch returns before this loop, and a
+    // superuser-owned body would pass here and should.
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_inherit_fragment_tenancy_stmt() OWNER TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-own 089's stamping body to the app role");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must refuse a deploy whose 089 stamping body is owned by a role that is not a \
+         member of epigraph_maintenance. Such a body reads claims under row security, so it \
+         stamps only the links the writing session could already see and silently stamps \
+         nothing for the rest — a coverage loss with no runtime signal, which is why the \
+         catalog gate is the instrument; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("epigraph_inherit_fragment_tenancy_stmt")
+            && stderr.contains("epigraph_maintenance"),
+        "and it must NAME the function and the required owner, or an operator cannot act on it; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(
+            "skipping the ownership check for public.epigraph_inherit_fragment_tenancy_stmt"
+        ),
+        "the gate must be OPEN here; if verify skipped the entry, this test is asserting nothing \
+         about it; stderr:\n{stderr}"
+    );
+}
