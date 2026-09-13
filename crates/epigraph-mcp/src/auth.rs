@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn unauthorized_response_advertises_resource_metadata() {
-        let url = "https://5-78-124-36.nip.io/.well-known/oauth-protected-resource";
+        let url = "https://mcp.example.com/.well-known/oauth-protected-resource";
         let resp = unauthorized(Some(url), "invalid_token");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let www = resp

@@ -232,7 +232,7 @@ mod tests {
     fn prod_like() -> HostAllowlist {
         // Mirrors the production shape: a loopback TCP listener plus the
         // proxy-facing name the operator adds.
-        HostAllowlist::for_tcp_listener("127.0.0.1:3100", &["5-78-124-36.nip.io".to_string()])
+        HostAllowlist::for_tcp_listener("127.0.0.1:3100", &["mcp.example.com".to_string()])
     }
 
     /// The attack itself: the browser sends the ATTACKER's hostname in `Host`
@@ -282,10 +282,10 @@ mod tests {
     #[test]
     fn operator_allowed_host_is_served_but_lookalikes_are_not() {
         let a = prod_like();
-        assert!(a.allows_host("5-78-124-36.nip.io"));
-        assert!(a.allows_host("5-78-124-36.nip.io:443"));
-        assert!(!a.allows_host("5-78-124-36.nip.io.evil.example"));
-        assert!(!a.allows_host("evil-5-78-124-36.nip.io"));
+        assert!(a.allows_host("mcp.example.com"));
+        assert!(a.allows_host("mcp.example.com:443"));
+        assert!(!a.allows_host("mcp.example.com.evil.example"));
+        assert!(!a.allows_host("evil-mcp.example.com"));
     }
 
     /// A hostile page that reaches the listener carries its own `Origin`. Even
@@ -313,7 +313,7 @@ mod tests {
         let a = prod_like();
         assert!(a.allows_origin("http://localhost:5173"));
         assert!(a.allows_origin("http://127.0.0.1:3100"));
-        assert!(a.allows_origin("https://5-78-124-36.nip.io"));
+        assert!(a.allows_origin("https://mcp.example.com"));
     }
 
     /// Degenerate authorities must normalize to `None` (fail closed) rather
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn wildcard_bind_does_not_allow_arbitrary_hosts() {
         let a = HostAllowlist::for_tcp_listener("0.0.0.0:3100", &[]);
-        assert!(!a.allows_host("5-78-124-36.nip.io"));
+        assert!(!a.allows_host("mcp.example.com"));
         assert!(!a.allows_host("evil.example"));
         assert!(a.allows_host("localhost"));
     }

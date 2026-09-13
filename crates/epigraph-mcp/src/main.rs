@@ -95,7 +95,7 @@ struct Cli {
     /// — is outside its allowlist, which is the DNS-rebinding defense rmcp 0.15
     /// does not provide. The allowlist always contains `localhost`, `127.0.0.1`,
     /// `::1` and the `--listen` authority; a reverse-proxied deployment must add
-    /// the public name the proxy forwards (e.g. `5-78-124-36.nip.io`), because
+    /// the public name the proxy forwards (e.g. `mcp.example.com`), because
     /// Caddy's `reverse_proxy` preserves the client's original `Host`.
     /// Ports are ignored in the comparison.
     #[arg(

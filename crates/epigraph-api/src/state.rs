@@ -297,7 +297,7 @@ pub struct ApiConfig {
     pub max_request_size: usize,
     /// Public HTTPS base URL this API is reachable at externally (no trailing slash),
     /// used to build OAuth discovery documents and consent/redirect links.
-    /// e.g. "https://5-78-124-36.nip.io"
+    /// e.g. "https://mcp.example.com"
     pub public_base_url: String,
     /// Re-open the pre-PR-02 identity posture: permit an external IdP to
     /// provision (and to refresh) an identity even when the provider configures
