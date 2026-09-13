@@ -202,22 +202,18 @@ async fn probe(embedder: &Arc<MockProvider>, text: &str) -> String {
     pgvec(&embedder.generate(text).await.expect("mock embed"))
 }
 
-// ── File-local seeding (deliberately NOT added to `viewer_fixture.rs`) ──
+// ── File-local seeding ──
 
 /// Give a seeded claim an `embedding`, so the vector-ranked reads can find it.
 ///
-/// `viewer_fixture::seed_group_claim` writes no embedding and every read this
-/// shard converts is embedding-ranked. Kept file-local rather than pushed into
-/// the fixture because both copies of `viewer_fixture.rs` are byte-identical and
-/// `F-PR28-viewer-fixture-duplication` is open; this mirrors what
-/// `tests/tenant_isolation_http.rs` already does.
+/// **This is now a one-line delegation, and the comment it replaces explains
+/// why it was not one before:** the body used to be file-local "because both
+/// copies of `viewer_fixture.rs` are byte-identical and
+/// `F-PR28-viewer-fixture-duplication` is open", i.e. adding a helper to the
+/// fixture meant adding it twice by hand. There is exactly one copy of the
+/// fixture now, so that reason is spent and the helper lives there.
 async fn set_embedding(pool: &PgPool, claim: Uuid, vec: &str) {
-    sqlx::query("UPDATE claims SET embedding = $2::vector WHERE id = $1")
-        .bind(claim)
-        .bind(vec)
-        .execute(pool)
-        .await
-        .expect("set claim embedding");
+    viewer_fixture::set_claim_embedding(pool, claim, vec).await;
 }
 
 /// A `claim_themes` row with a 1536d centroid, and the claims attached to it.

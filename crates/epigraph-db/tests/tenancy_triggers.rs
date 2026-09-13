@@ -9,21 +9,41 @@
 //!
 //! # What a green run here does and does not prove
 //!
-//! Every `#[sqlx::test]` connects as `epigraph`, which is `rolsuper = true` on
-//! this host. `epigraph_definer_bypass()` is `pg_has_role(current_user,
-//! 'epigraph_maintenance', 'MEMBER')`, and `pg_has_role` is true of a superuser
-//! for every role — so **arm (d)'s 42501 assertion can never fire in this
-//! suite**, whoever owns the function. A test asserting "propagation succeeds"
-//! is therefore NOT evidence that the production deploy will work.
+//! **CORRECTION, MEASURED — the paragraph that stood here said arm (d)'s 42501
+//! could never fire because CI connects as a superuser. That was a
+//! mis-diagnosis, and it had already been contradicted by the sentence on
+//! [`propagation_function_is_owned_by_the_maintenance_role`] two screens
+//! below.** `epigraph_propagate_tenancy` is `SECURITY DEFINER`, so inside its
+//! frame `current_user` is the function OWNER, not whoever connected.
+//! `epigraph_definer_bypass()` is `SECURITY INVOKER`, so called from inside
+//! that frame it evaluates `pg_has_role(<owner>, 'epigraph_maintenance',
+//! 'MEMBER')`. Measured on this host: with the session at
+//! `SET SESSION AUTHORIZATION epigraph_app`, a nested definer frame owned by
+//! `epigraph_maintenance` still reports `current_user = epigraph_maintenance`
+//! and `epigraph_definer_bypass() = true`.
 //!
-//! What *is* checkable, and what
-//! [`propagation_function_is_owned_by_the_maintenance_role`] checks, is the
-//! catalog: `pg_proc.proowner`. That is the fact the deploy depends on, it is
-//! independent of who runs the test, and it was measured to matter — re-owning
-//! the function without `GRANT EXECUTE ON FUNCTION epigraph_definer_bypass()
-//! TO epigraph_maintenance` produces `permission denied for function
-//! epigraph_definer_bypass` on the first batch, and re-owning it to a
-//! non-maintenance role makes the assertion return false.
+//! Two consequences, and they point in opposite directions from the old text:
+//!
+//! * Downgrading the CONNECTION — `SET ROLE`, `SET SESSION AUTHORIZATION`, a
+//!   dedicated non-superuser login — cannot reach arm (d) at all. The three
+//!   non-superuser roles are `NOLOGIN` (migration 060) and, more decisively,
+//!   the connecting role is simply not what the predicate reads.
+//! * The OWNER is the lever, and it is reachable from a test.
+//!   [`propagation_refuses_when_its_definer_frame_is_not_the_maintenance_role`]
+//!   re-owns the function to `epigraph_app` inside its own `#[sqlx::test]`
+//!   database and drives a real tenancy `UPDATE`, so the refusal now fires
+//!   behaviourally rather than being asserted only from the catalog.
+//!
+//! The catalog assertion in
+//! [`propagation_function_is_owned_by_the_maintenance_role`] STAYS and is still
+//! the primary instrument: it pins the fact the deploy depends on
+//! (`pg_proc.proowner`) without depending on any error path. It was measured to
+//! matter — re-owning the function without `GRANT EXECUTE ON FUNCTION
+//! epigraph_definer_bypass() TO epigraph_maintenance` produces `permission
+//! denied for function epigraph_definer_bypass` on the first batch, and
+//! re-owning it to a non-maintenance role makes the assertion return false.
+//! That "permission denied" is ALSO SQLSTATE 42501, which is why the
+//! behavioural arm discriminates on the message text as well as the code.
 
 mod viewer_fixture;
 
@@ -720,13 +740,20 @@ async fn a_non_tenancy_update_does_not_trigger_the_propagation_walk(pool: PgPool
 
 /// The SECURITY DEFINER bodies must be owned by `epigraph_maintenance`.
 ///
-/// # Why a catalog assertion rather than a behavioural one
+/// # Why a catalog assertion, and what it is now paired with
 ///
 /// `epigraph_definer_bypass()` keys on `current_user`, which inside a SECURITY
-/// DEFINER frame is the function OWNER. CI connects as a superuser, for whom
-/// `pg_has_role` is true of every role, so a behavioural test passes whatever
-/// the owner is. `pg_proc.proowner` is the fact the deploy actually depends on
-/// and the only one that discriminates here.
+/// DEFINER frame is the function OWNER — so `pg_proc.proowner` is the fact the
+/// deploy actually depends on, and reading it is independent of every error
+/// path, every role grant and every trigger firing condition. That is why this
+/// stays the primary instrument.
+///
+/// It is now PAIRED with
+/// [`propagation_refuses_when_its_definer_frame_is_not_the_maintenance_role`],
+/// which re-owns the function inside its own per-test database and shows the
+/// refusal actually raises. A catalog read alone cannot tell you the RAISE is
+/// still wired; the behavioural arm alone cannot tell you production's owner is
+/// right. Neither replaces the other.
 ///
 /// Measured consequence of getting it wrong: with the owner set but without
 /// `GRANT EXECUTE ON FUNCTION epigraph_definer_bypass() TO
@@ -791,9 +818,10 @@ async fn propagation_function_is_owned_by_the_maintenance_role(pool: PgPool) {
             owner, "epigraph_maintenance",
             "{f} must be owned by epigraph_maintenance. Owned by '{owner}', its \
              SECURITY DEFINER frame runs as that role instead, so \
-             epigraph_definer_bypass() is false in production and every \
-             propagation raises 42501 — while this suite stays green because CI \
-             connects as a superuser."
+             epigraph_definer_bypass() is false and every propagation raises \
+             42501. That is not hypothetical: \
+             propagation_refuses_when_its_definer_frame_is_not_the_maintenance_role \
+             reproduces exactly this state on purpose."
         );
     }
 
@@ -813,6 +841,128 @@ async fn propagation_function_is_owned_by_the_maintenance_role(pool: PgPool) {
          Migration 067 revoked it FROM PUBLIC, so re-owning the trigger bodies \
          without re-granting it makes every propagation fail with 42501's \
          cousin: permission denied for function."
+    );
+}
+
+/// Arm (d)'s refusal FIRES when the definer frame is not the maintenance role.
+///
+/// # What was wrong with the previous account of this
+///
+/// This suite recorded for four PRs that the 42501 refusal "can never fire,
+/// whoever owns the function", because CI connects as a superuser and
+/// `pg_has_role` is true of a superuser for every role. That reasoning applies
+/// to a `SECURITY INVOKER` body. `epigraph_propagate_tenancy` is `SECURITY
+/// DEFINER` (migration 070), so `current_user` inside it is the OWNER and the
+/// connecting role never appears in the predicate at all. The recorded
+/// conclusion was therefore both wrong and load-bearing: it is why no
+/// behavioural arm was ever written.
+///
+/// Measured on this host before writing this test: with the session at
+/// `SET SESSION AUTHORIZATION epigraph_app`, a nested `SECURITY DEFINER` frame
+/// owned by `epigraph_maintenance` reports `current_user = epigraph_maintenance`
+/// and `epigraph_definer_bypass() = true`. Downgrading the connection cannot
+/// reach the arm; re-owning the function is the only lever, and it needs no
+/// migration, no deploy-time grant and no second CI container — `#[sqlx::test]`
+/// gives this arm a private database, so the re-own is local to it and the
+/// catalog assertion above, which runs against its own database, cannot see it.
+///
+/// # Why both directions are asserted here
+///
+/// A refusal test that only shows "the UPDATE failed" proves nothing: the
+/// trigger stack in front of arm (d) has several other RAISEs, and
+/// `permission denied for function epigraph_definer_bypass` — the failure mode
+/// of re-owning without re-granting — is ALSO SQLSTATE 42501. So this asserts
+/// the code AND the message, and it first asserts the same UPDATE SUCCEEDS
+/// under the shipped owner, so a green run cannot come from a statement that
+/// was broken for an unrelated reason.
+///
+/// The UPDATE narrows (`public` → `group`) rather than widening, because
+/// `epigraph_claims_block_widening` refuses the declassifying direction outright
+/// and would mask arm (d) entirely. It also changes tenancy for real: migration
+/// 070's firing gate returns before the assertion when the new
+/// `(owner_group_id, visibility)` is not distinct from the old, so a no-op
+/// UPDATE would pass this test without arm (d) ever being evaluated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn propagation_refuses_when_its_definer_frame_is_not_the_maintenance_role(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "owner").await;
+
+    // Two public claims: one for the positive direction, one for the refusal.
+    // Separate rows so the first UPDATE's committed effect cannot make the
+    // second one a no-op that the firing gate short-circuits.
+    let ok_claim = insert_undeclared_claim(&pool, agent, "reaches arm (d) as shipped").await;
+    let refused_claim = insert_undeclared_claim(&pool, agent, "reaches arm (d) re-owned").await;
+    let ok_evidence = insert_evidence(&pool, ok_claim, "ev ok").await;
+    let refused_evidence = insert_evidence(&pool, refused_claim, "ev refused").await;
+
+    // POSITIVE DIRECTION, under the shipped owner.
+    sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'group' WHERE id = $2")
+        .bind(group)
+        .bind(ok_claim)
+        .execute(&pool)
+        .await
+        .expect("privatizing a claim must succeed while epigraph_maintenance owns the function");
+    let (ev_group, ev_vis) = tenancy_of(&pool, "evidence", ok_evidence).await;
+    assert_eq!(
+        (ev_group, ev_vis.as_str()),
+        (group, "group"),
+        "the positive direction must actually propagate, or the refusal below \
+         is being compared against a path that never worked"
+    );
+
+    // Now make the frame a non-member. `epigraph_app` is the role production
+    // connects as, and it is NOT a member of epigraph_maintenance — which is
+    // precisely the deploy mistake the catalog assertion above exists to catch.
+    sqlx::query("ALTER FUNCTION public.epigraph_propagate_tenancy() OWNER TO epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("re-own the propagation function");
+
+    let err =
+        sqlx::query("UPDATE claims SET owner_group_id = $1, visibility = 'group' WHERE id = $2")
+            .bind(group)
+            .bind(refused_claim)
+            .execute(&pool)
+            .await
+            .expect_err(
+                "arm (d) must REFUSE once its definer frame is not a member of \
+             epigraph_maintenance. A success here means the assertion is no \
+             longer wired and every deploy-owner regression is invisible.",
+            );
+
+    let db_err = err.as_database_error().expect("a database error");
+    assert_eq!(
+        db_err.code().as_deref(),
+        Some("42501"),
+        "arm (d) raises USING ERRCODE = '42501'; got {db_err:?}"
+    );
+    assert!(
+        db_err
+            .message()
+            .contains("propagation requires a maintenance-role"),
+        "the refusal must be arm (d)'s own RAISE, not another 42501 on the way \
+         to it — `permission denied for function epigraph_definer_bypass` \
+         carries the same SQLSTATE and would mean the arm was never evaluated. \
+         Got: {}",
+        db_err.message()
+    );
+
+    // EFFECT, not just the status: the refusal aborted the whole statement, so
+    // neither the claim nor its derived row moved.
+    let (claim_group, claim_vis) = tenancy_of(&pool, "claims", refused_claim).await;
+    assert_eq!(
+        claim_vis, "public",
+        "the refused UPDATE must leave the claim's visibility untouched"
+    );
+    assert_ne!(
+        claim_group, group,
+        "the refused UPDATE must leave the claim's owner_group_id untouched"
+    );
+    let (ev_group, ev_vis) = tenancy_of(&pool, "evidence", refused_evidence).await;
+    assert_eq!(
+        (ev_group, ev_vis.as_str()),
+        (claim_group, claim_vis.as_str()),
+        "the derived row must still agree with its claim — a partial \
+         propagation would be worse than a refusal"
     );
 }
 
