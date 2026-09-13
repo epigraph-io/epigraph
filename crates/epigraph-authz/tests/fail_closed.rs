@@ -22,21 +22,27 @@
 //! # Why the fixture is local rather than a sixth `viewer_fixture.rs`
 //!
 //! `crates/{api,cli,db,engine,mcp}/tests/viewer_fixture.rs` were five
-//! byte-identical copies. **They are no longer**: PR-26 added
-//! `scoped_pool_with_mode`, `downgraded_pool`, `seed_edge` and
-//! `seed_edge_owned_by` to the **api** and **db** copies only, so the five now
-//! split into two groups — api+db carrying those four helpers, cli+engine+mcp
-//! not. Corrected here rather than left standing, because no test hashes or
-//! compares the copies (grepped), so this prose was the only record of the
-//! invariant and a stale claim would send the next author to a copy that does
-//! not have what they read about. Do not copy an arbitrary one of the five and
-//! expect `downgraded_pool`.
+//! hand-maintained copies that had already drifted into two groups. **That is
+//! no longer the shape.** There is now ONE body —
+//! `crates/epigraph-db/tests/viewer_fixture.rs` — and the other four paths are
+//! `#[path]` shims onto it, so every crate sees the same helpers and
+//! `downgraded_pool` is reachable from all five.
+//! `crates/epigraph-db/tests/viewer_fixture_single_source.rs` is the ratchet
+//! that keeps it that way; read the canonical file, not an arbitrary path.
 //!
-//! A sixth would still be more drift surface for the one helper this file needs
-//! and does not have: **`seed_agent_with_group` hardcodes `role = 'admin'`**,
-//! so it cannot produce the principal this test exists to examine.
-//! [`seed_agent_in_group`] below takes the role as a parameter, which is the
-//! whole difference.
+//! The earlier revision of this paragraph described the two-group split and
+//! warned against expecting `downgraded_pool` from an arbitrary copy. Both
+//! statements are spent, and they are corrected here rather than left standing
+//! for the reason they were written down in the first place: nothing hashes or
+//! compares fixture prose, so a stale claim sends the next author to a file
+//! that does not hold what they read about.
+//!
+//! A sixth copy would still be more drift surface for the one helper this file
+//! needs and the canonical fixture does not have:
+//! **`seed_agent_with_group` hardcodes `role = 'admin'`**, so it cannot produce
+//! the principal this test exists to examine. [`seed_agent_in_group`] below
+//! takes the role as a parameter, which is the whole difference — and it is
+//! why this fixture stays local rather than moving into the canonical file.
 
 use epigraph_authz::{GroupPolicyGate, GRANT_GROUP_WRITER};
 use epigraph_db::visibility::Viewer;

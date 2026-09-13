@@ -1,11 +1,41 @@
 //! Shared `Viewer` construction for integration tests.
 //!
-//! Included, not linked:
+//! # THIS FILE IS THE ONLY COPY. Do not add a second one.
+//!
+//! Included, not linked. Inside `epigraph-db`, that is the plain form:
 //!
 //! ```ignore
 //! #[path = "viewer_fixture.rs"]
 //! mod fixture;
 //! ```
+//!
+//! Four other crates' test trees held a hand-maintained copy of this file:
+//! `epigraph-api` a byte-identical 544-line twin, and `epigraph-cli`,
+//! `epigraph-engine` and `epigraph-mcp` a byte-identical 321-line variant of it
+//! between them. Measured with `diff`, the 321-line variant CHANGED exactly two
+//! lines of the twin — one doc line and `scoped_pool`'s body — and simply LACKED
+//! the other 223 (`2` changed + `223` added = 544). So it was a strict
+//! behavioural subset, not a tailored fork, and one canonical text serves all
+//! five. Each of those four paths is now a three-line re-export shim
+//! that `#[path]`-includes THIS file, so `mod viewer_fixture;` still resolves
+//! crate-locally at all ~145 declaration sites and there is one text to change.
+//!
+//! Why that shape rather than the alternatives: a shared test-support crate is a
+//! new workspace member, and the last one added to this workspace took
+//! `~/.cargo-target` from 48G to 64G. A bare `include!` cannot carry this file's
+//! `//!` docs or its `#![allow(dead_code)]`, because inner attributes may not
+//! arrive by macro expansion. Rewriting all 145 declarations to `#[path]` the
+//! canonical file directly would work but is 145 edits to remove 4 files.
+//!
+//! `epigraph-db` is the canonical home because it is the crate that defines
+//! `Viewer`, `ScopedPool` and `SessionGucMode`, and every other crate here
+//! depends on it — so the fixture cannot acquire a dependency the consumers
+//! lack.
+//!
+//! `viewer_fixture_single_source.rs` is the ratchet: it fails if a second full
+//! copy reappears anywhere in the workspace tree. Not `crates/*/tests/` — that
+//! narrower root was rejected in the ratchet's own doc, because it misses
+//! `tests/engine-integration`.
 //!
 //! # Why this file exists
 //!
@@ -128,7 +158,18 @@ pub async fn scoped_pool_with_mode(pool: &PgPool, mode: SessionGucMode) -> Scope
 /// Seeding, and `Viewer::resolve`, must still run on the ORIGINAL superuser
 /// pool: `Viewer::resolve` reads `group_memberships`, and on a downgraded
 /// unstamped session it resolves to an EMPTY group set — which would make every
-/// assertion in the file pass for the wrong reason.
+/// assertion keyed on that viewer pass for the wrong reason.
+///
+/// **That warning is now load-bearing in five crates, not two.** Until the
+/// fixture was collapsed onto one body this helper existed only in the
+/// `epigraph-api` and `epigraph-db` copies, and the pairing hazard was contained
+/// by convention in `epigraph-db/tests/privatization_authz.rs` and
+/// `privatization_plan_policies.rs`, whose own headers spell it out.
+/// `epigraph-cli`, `epigraph-engine` and `epigraph-mcp` can now reach it too,
+/// with no such header. Nothing detects the wrong pairing —
+/// `viewer_fixture_single_source.rs` ratchets against a second COPY, not against
+/// a misuse — so a `resolve` on this pool is a silent, permanently green
+/// "a stranger cannot read this". Resolve first, downgrade second.
 pub async fn downgraded_pool(pool: &PgPool, role: &str) -> PgPool {
     use sqlx::Executor;
     let url = database_url_for(pool).await;
@@ -261,6 +302,34 @@ pub async fn seed_public_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uui
 /// A `visibility = 'group'` claim owned by `group`.
 pub async fn seed_group_claim(pool: &PgPool, agent: Uuid, group: Uuid, content: &str) -> Uuid {
     seed_claim(pool, agent, content, "group", group).await
+}
+
+/// Give a seeded claim an `embedding`, so vector-ranked and vector-aggregating
+/// reads can see it. `vec` is pgvector literal text, e.g. `"[0,1,...]"`.
+///
+/// `seed_public_claim` / `seed_group_claim` write no embedding, and the reads
+/// that AGGREGATE embeddings — `ClaimThemeRepository::set_centroid_from_claims`
+/// is the one this was added for — are invisible without it: with no embedded
+/// claim in the corpus the aggregate is empty for every viewer, so an isolation
+/// assertion over it passes for the wrong reason.
+///
+/// This lived as a file-local copy in
+/// `epigraph-api/tests/search_voids_methods_scoped_read.rs`, whose own comment
+/// gave the reason: the fixture was duplicated by hand across crates and adding
+/// a helper meant adding it twice. That is no longer true — this file is the
+/// only copy — so the helper lives here and that file delegates to it.
+///
+/// Writes `claims.embedding`, the 1536-d column every read in this workspace
+/// ranks on. `embedding_3072` is a separate column and is deliberately not
+/// touched: a helper that wrote both would make a test pass on whichever one
+/// the read did not use.
+pub async fn set_claim_embedding(pool: &PgPool, claim: Uuid, vec: &str) {
+    sqlx::query("UPDATE claims SET embedding = $2::vector WHERE id = $1")
+        .bind(claim)
+        .bind(vec)
+        .execute(pool)
+        .await
+        .expect("set claim embedding");
 }
 
 /// A `reasoning_traces` row for `claim`, wired up as that claim's `trace_id`.

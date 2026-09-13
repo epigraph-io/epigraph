@@ -98,7 +98,31 @@ pub async fn drop_unique_constraint(pool: &PgPool) {
 
 /// Add the (content_hash, agent_id) UNIQUE constraint, deduping any
 /// existing duplicate rows first. Postgres has no `ADD CONSTRAINT IF NOT
-/// EXISTS`, so the DO block swallows duplicate_object.
+/// EXISTS`, so the DO block swallows the already-present cases.
+///
+/// # `duplicate_table` is not optional, and it is not the same as
+/// `duplicate_object`
+///
+/// MEASURED when `claim_helper_tests.rs` moved to `#[sqlx::test]`:
+/// `helper_post_107_idempotent` failed with `42P07 relation
+/// "uq_claims_content_hash_agent" already exists`, which is `duplicate_table`
+/// — Postgres reports the collision against the constraint's backing INDEX, not
+/// against the constraint — while the handler named only `duplicate_object`
+/// (`42710`). On the old shared database this never fired, because an earlier
+/// arm had always just DROPPED the constraint. On a freshly-migrated database
+/// migration 013 has already created it, so the ADD raises 42P07 EVERY time and
+/// the swallow is the normal path rather than the fallback.
+/// `epigraph-db/tests/claim_repo_helpers.rs` hit and fixed this first; this is
+/// the same fix, and the divergence between the two copies is exactly the class
+/// that made it survive.
+///
+/// # Why the post-condition is asserted rather than trusted
+///
+/// Because the ADD now always raises and is always caught, a future edit that
+/// renamed the constraint, named the wrong columns or targeted the wrong table
+/// would be swallowed identically, and every post-107 arm would go on asserting
+/// `DuplicateKey` against whatever migration 013 happens to provide. Reading
+/// `pg_constraint` makes the fixture prove the precondition it claims.
 pub async fn add_unique_constraint(pool: &PgPool) {
     sqlx::query(
         "DELETE FROM claims a USING claims b
@@ -114,12 +138,25 @@ pub async fn add_unique_constraint(pool: &PgPool) {
         r#"DO $$ BEGIN
               ALTER TABLE claims ADD CONSTRAINT uq_claims_content_hash_agent
                   UNIQUE (content_hash, agent_id);
-           EXCEPTION WHEN duplicate_object THEN NULL;
+           EXCEPTION WHEN duplicate_object OR duplicate_table THEN NULL;
            END $$"#,
     )
     .execute(pool)
     .await
     .expect("add constraint");
+
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint
+         WHERE conname = 'uq_claims_content_hash_agent'
+           AND conrelid = 'claims'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("inspect pg_constraint");
+    assert_eq!(
+        present, 1,
+        "post-107 fixture requires uq_claims_content_hash_agent on `claims`"
+    );
 }
 
 pub async fn insert_test_agent(pool: &PgPool, agent_id: Uuid) {

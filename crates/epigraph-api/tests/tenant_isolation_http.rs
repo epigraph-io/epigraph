@@ -1713,3 +1713,185 @@ async fn list_candidates_http_renders_the_excerpt_of_a_superseded_claim() {
 
     let _ = shutdown.send(());
 }
+
+// ── The other two of PR-09's four handlers ─────────────────────────────────
+//
+// PR-09 changed four handlers and wrote HTTP cases for two of them
+// (`list_events` and `list_candidates`, above). The other two —
+// `routes/events.rs::graph_snapshot` and
+// `routes/cross_source.rs::get_cross_source_matches` — were RECORDED as covered
+// at the repo layer rather than asserted at the HTTP layer, and that recording
+// was made three separate times without ever being paid off. This is the
+// payment.
+//
+// Both are written against `#[sqlx::test]`'s per-test database rather than the
+// ambient `DATABASE_URL` used by the two older cases in this file, following
+// `graph_neighborhoods_test.rs`: `spawn_app` builds its own pool from a URL, so
+// each arm hands it `fixture::database_url_for(&pool)`. `graph_snapshot` in
+// particular is not safely writable on a shared corpus — it is keyed on a
+// global `graph_version` counter, not on a self-minted id, so on the ambient
+// database its result set is whatever every other binary has left in `events`.
+//
+// One consequence, recorded because it is a precedent and not a preference:
+// `#[sqlx::test]` drives the future on a CURRENT-THREAD runtime, so the axum
+// server and the reqwest client driving it are cooperatively scheduled on one
+// thread. Same trade `graph_neighborhoods_test.rs` documents at length.
+
+/// `GET /api/v1/graph/snapshot/:version` must not replay another group's claim
+/// ids to a stranger.
+///
+/// `graph_snapshot` replays the same `EventRepository::list` that
+/// `list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring_buffer`
+/// covers, which is why this was recorded rather than asserted. The reason that
+/// argument is not sufficient is the one this whole file's header records
+/// against an earlier revision of itself: what a repo-level or sibling-handler
+/// test pins is the FUNCTION, and what leaks is the CALL SITE. `graph_snapshot`
+/// re-filters the rows it gets back (`graph_version <= version`) and rebuilds
+/// every event into its own response struct, so it is a second, independent
+/// rendering of the same rows.
+///
+/// The payload shape is deliberately `claim_a_id` / `claim_b_id` and not
+/// `claim_id`: a suppression rule keyed on the `claim_id` key alone passes this
+/// row straight through, and the corpus must be able to tell those apart.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_snapshot_http_does_not_replay_a_private_claim_id_to_a_stranger(pool: PgPool) {
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "snapshot-http").await;
+    let (stranger_agent, _) = fixture::seed_agent_with_group(&pool, "snapshot-http-stranger").await;
+    let private =
+        fixture::seed_group_claim(&pool, owner_agent, group, "snapshot-http private content").await;
+    let public =
+        fixture::seed_public_claim(&pool, owner_agent, "snapshot-http public control").await;
+
+    let version: i64 = sqlx::query_scalar(
+        "INSERT INTO events (event_type, actor_id, payload, graph_version) \
+         VALUES ('snapshot-http.pair', NULL, \
+                 jsonb_build_object('claim_a_id', $1::text, 'claim_b_id', $2::text), \
+                 nextval('events_graph_version_seq')) \
+         RETURNING graph_version",
+    )
+    .bind(private)
+    .bind(public)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the snapshot event");
+
+    let url = fixture::database_url_for(&pool).await;
+    let owner_token = common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent);
+    let stranger_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    let snapshot = |token: String| async move {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/api/v1/graph/snapshot/{version}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("GET /api/v1/graph/snapshot/:version");
+        let status = resp.status();
+        let body = resp.text().await.expect("snapshot body");
+        assert!(
+            status.is_success(),
+            "GET /api/v1/graph/snapshot/{version} must succeed; got {status}: {body}"
+        );
+        body
+    };
+
+    let stranger_body = snapshot(stranger_token).await;
+    assert!(
+        !stranger_body.contains(&private.to_string()),
+        "the snapshot replayed another group's claim id to a stranger. An \
+         event payload names the claim, the relationship and the actor, so this \
+         is a structural leak even though no content is rendered. Body: \
+         {stranger_body}"
+    );
+
+    // Class P. A snapshot that returns nothing to anybody would pass the
+    // assertion above and be a fail-closed regression, and `graph_snapshot`
+    // has a second filter of its own (`graph_version <= version`) that could
+    // produce exactly that.
+    let owner_body = snapshot(owner_token).await;
+    assert!(
+        owner_body.contains(&private.to_string()) && owner_body.contains(&public.to_string()),
+        "the owner must receive its own event with both claim ids; a snapshot \
+         empty for everyone is not isolation. Body: {owner_body}"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `GET /api/v1/claims/:id/cross_source_matches` must answer for an invisible
+/// claim EXACTLY as it answers for one that does not exist.
+///
+/// This is plan §8.5 as a byte comparison rather than as a status-code check.
+/// A 404 whose body names a different entity, or spells the id differently, or
+/// differs in any other way from the nonexistent-claim 404, is still an
+/// existence oracle for every private claim id — the caller just has to read
+/// the body instead of the status line. So the two responses are compared
+/// against each other, not against `404`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cross_source_matches_http_answers_404_identically_for_invisible_and_absent(pool: PgPool) {
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "xsm-http").await;
+    let (stranger_agent, _) = fixture::seed_agent_with_group(&pool, "xsm-http-stranger").await;
+    let private =
+        fixture::seed_group_claim(&pool, owner_agent, group, "xsm-http private content").await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let owner_token = common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent);
+    let stranger_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    let matches = |id: Uuid, token: String| async move {
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/v1/claims/{id}/cross_source_matches"
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("GET /api/v1/claims/:id/cross_source_matches");
+        let status = resp.status();
+        let body = resp.text().await.expect("cross_source_matches body");
+        (status, body)
+    };
+
+    // Class P first: the owner really can read its own claim here, so a 404
+    // below is the tenancy probe and not a broken route.
+    let (owner_status, owner_body) = matches(private, owner_token).await;
+    assert!(
+        owner_status.is_success(),
+        "the owner must be able to read its own claim's cross-source matches; \
+         got {owner_status}: {owner_body}"
+    );
+
+    let absent = Uuid::new_v4();
+    let (absent_status, absent_body) = matches(absent, stranger_token.clone()).await;
+    let (invisible_status, invisible_body) = matches(private, stranger_token).await;
+
+    assert_eq!(
+        invisible_status.as_u16(),
+        404,
+        "a stranger must not receive another group's cross-source matches; got \
+         {invisible_status}: {invisible_body}"
+    );
+    // The bodies name their own id, so compare with the ids normalised out.
+    assert_eq!(
+        invisible_body.replace(&private.to_string(), "<id>"),
+        absent_body.replace(&absent.to_string(), "<id>"),
+        "the invisible-claim 404 must be byte-identical to the absent-claim \
+         404 once the id is normalised out. Any residual difference is an \
+         existence oracle: it lets a stranger distinguish \"this claim is \
+         private\" from \"this claim does not exist\" for any id it can guess."
+    );
+    assert_eq!(
+        absent_status, invisible_status,
+        "the two 404s must not differ in status either"
+    );
+    assert!(
+        !invisible_body.contains("xsm-http private content"),
+        "the refusal body leaked the private claim's content: {invisible_body}"
+    );
+
+    let _ = shutdown.send(());
+}
