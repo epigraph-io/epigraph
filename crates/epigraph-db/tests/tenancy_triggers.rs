@@ -785,6 +785,23 @@ async fn propagation_function_is_owned_by_the_maintenance_role(pool: PgPool) {
         // Migration 084 drops it with the table its trigger fired on, so an
         // entry here would assert the existence of a function the migrator has
         // just removed.
+        //
+        // Migration 089's stamping body. Listed here because the property this
+        // test asserts is exactly what 089 depends on and cannot assert for
+        // itself: 079 FORCEs row security on `harvester_fragments`, whose policy
+        // admits a write only through `epigraph_bypass()`,
+        // `epigraph_definer_bypass()`, or a writable-group match. A body owned by
+        // a NON-member of epigraph_maintenance reads `public.claims` under row
+        // security, so it stamps only the links the writing session could
+        // already see and stamps nothing, with no error, for the rest — measured
+        // out of band from a real non-bypassing application-role session, which
+        // this suite cannot open (`epigraph_bypass()` reads session_user, the
+        // superuser here; finding
+        // F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable). Unlike arm
+        // (d), 089 deliberately does NOT assert the bypass in its own body — it
+        // fires on ordinary application inserts, where a 42501 would be a write
+        // outage — so the catalog is the only place the requirement is checkable.
+        "epigraph_inherit_fragment_tenancy_stmt",
     ] {
         let owner: String = sqlx::query_scalar(
             "SELECT r.rolname FROM pg_proc p \
@@ -989,10 +1006,26 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
     // drops. Keeping the name in the IN-list while lowering the count would have
     // made the vacuity guard self-fulfilling — it would still be looking for a
     // trigger that cannot exist.
+    //
+    // 21 SINCE MIGRATION 089, AND THE REASON IS NOT THAT ARM (c)'s TABLE SET
+    // MOVED. It did not: arm (c) still covers exactly the 17 tier-A tables that
+    // carry a `claim_id`, and `harvester_fragments` still cannot be one of them.
+    // The 21st trigger is 089's
+    // `harvester_claim_provenance_fragment_inherit_tenancy`, a SECOND AFTER
+    // INSERT trigger on a table that already has arm (c)'s. It stamps a
+    // different row — the `harvester_fragments` row the provenance row points at
+    // — from the same claim, which is the one moment no arm of 070 could cover.
+    // It is named inside the `%_inherit_tenancy` pattern on purpose: a name
+    // outside it would be invisible to this assertion, to
+    // `locked_decisions.rs::d1_tenancy_stamping_triggers_are_armed`, to
+    // `tenancy_required.rs::a5_every_tenancy_trigger_is_enabled` and to
+    // `AppState::assert_tenancy_triggers_armed`, so a DISABLED stamping trigger
+    // would be indistinguishable from an armed one everywhere at once.
     assert_eq!(
-        armed, 20,
-        "expected 20 tenancy triggers (3 named + 17 claim-derived inheritors); \
-         found {armed}. A changed count means arm (c)'s table set moved."
+        armed, 21,
+        "expected 21 tenancy triggers (3 named + 17 claim-derived inheritors + \
+         migration 089's provenance→fragment inheritor); found {armed}. A changed \
+         count means arm (c)'s table set moved, or 089's trigger is gone."
     );
 }
 
@@ -1517,5 +1550,438 @@ async fn arm_d_co_owns_a_cross_group_edge_rather_than_picking_a_side(pool: PgPoo
     assert_ne!(
         vis, "public",
         "an edge between two group-private claims is never public"
+    );
+}
+
+// =============================================================================
+// Migration 089 — the provenance→fragment stamp.
+//
+// `harvester_fragments` carries tenancy columns but has NO `claim_id`: it
+// reaches a claim only through `harvester_claim_provenance`. So arm (c) cannot
+// cover it (nothing to key on) and arm (d) fires only when a claim's tenancy
+// CHANGES, which need never happen. A fragment written BEFORE the provenance
+// row linking it to its claim was therefore stamped by no trigger at all.
+// Migration 089 stamps it at the moment that link appears.
+//
+// # The fixtures are local to this file, deliberately
+//
+// `viewer_fixture.rs` is shared by ~19 test files across three crates. A
+// harvester seeder that exactly one file calls does not belong in it. The one
+// other harvester seeder in the tree is private to `seal_side_channels.rs` and
+// is welded to that file's seal fixture (it also seeds vectors, evidence,
+// challenges and experiment triples), so it is not reusable here either.
+//
+// Two schema constraints these helpers respect: `harvester_sources.content_hash`
+// is UNIQUE, so each source needs its own; and a fragment's own `content_hash`
+// is not, but is given a distinct value anyway so a failure names one row.
+// =============================================================================
+
+/// A `harvester_sources` row. Its `content_hash` is UNIQUE, so it is derived
+/// from a fresh UUID rather than a literal.
+async fn insert_harvester_source(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO harvester_sources (id, content_hash, modality) VALUES ($1, $2, 'text')",
+    )
+    .bind(id)
+    .bind(id.as_bytes().to_vec())
+    .execute(pool)
+    .await
+    .expect("seed harvester source");
+    id
+}
+
+/// A fragment that declares NEITHER tenancy column.
+///
+/// This is the shape the insert-order gap is actually about, and what it
+/// produces is measured rather than assumed: `harvester_fragments` is a
+/// migration-074 parentless ROOT armed by `epigraph_root_require_tenancy()`,
+/// whose seed arm COALESCEs an undeclared insert to `('public', <seed group>)`
+/// on a session that satisfies `pg_has_role(session_user, 'epigraph_seed',
+/// 'MEMBER')` — which the superuser harness role does. It is NOT world. A
+/// predicate matching only the world sentinel would leave every row written this
+/// way exactly where it found it, which is why 089 names both sentinels.
+async fn insert_undeclared_fragment(pool: &PgPool, source: Uuid, text: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO harvester_fragments (id, source_id, content_hash, content_text) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(id.as_bytes().to_vec())
+    .bind(text)
+    .execute(pool)
+    .await
+    .expect("seed undeclared harvester fragment");
+    id
+}
+
+/// A fragment that declares both columns explicitly.
+async fn insert_declared_fragment(
+    pool: &PgPool,
+    source: Uuid,
+    text: &str,
+    visibility: &str,
+    owner: Uuid,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO harvester_fragments \
+             (id, source_id, content_hash, content_text, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(id.as_bytes().to_vec())
+    .bind(text)
+    .bind(visibility)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("seed declared harvester fragment");
+    id
+}
+
+/// The provenance row that links a fragment to a claim — the write 089 fires on.
+///
+/// Its OWN tenancy is declared to match the claim, which is what
+/// `harvester_claim_provenance_inherit_tenancy` (arm (c)) would stamp anyway.
+/// 089's body never reads these columns; it joins `public.claims` directly. That
+/// is what makes the two triggers' firing order on this table irrelevant, and it
+/// is why this helper declaring them cannot mask a broken 089.
+async fn link_fragment_to_claim(
+    pool: &PgPool,
+    claim: Uuid,
+    fragment: Uuid,
+    visibility: &str,
+    owner: Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO harvester_claim_provenance \
+             (claim_id, fragment_id, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .bind(visibility)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("link fragment to claim");
+}
+
+/// THE FAILING ORDER: fragment first, its provenance row second.
+///
+/// Before migration 089 this is the gap. Measured at head on a throwaway
+/// database before the fix existed: the fragment is inserted, lands
+/// `('public', <seed group>)` on the seed arm, its provenance row for a
+/// group-private claim arrives, and the fragment is still `('public', seed)`.
+/// `harvester_fragments.content_text` is chunked source text — the same class of
+/// claim-derived plaintext migration 070's own comment calls out for `evidence`,
+/// where omitting the table "stamped evidence of a group-private claim as
+/// world/public".
+///
+/// This test is the mutation proof's target: run it against the pre-089 schema
+/// and it fails on this assertion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_fragment_written_before_its_provenance_row_still_inherits_its_claim(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "harvest-author").await;
+    let claim = fixture::seed_group_claim(&pool, agent, group, "private finding").await;
+    let source = insert_harvester_source(&pool).await;
+
+    // Order is the whole point: the fragment exists before anything links it.
+    let fragment = insert_undeclared_fragment(&pool, source, "chunk of private source").await;
+    let before = tenancy_of(&pool, "harvester_fragments", fragment).await;
+    assert_ne!(
+        before.0, group,
+        "premise check: nothing can have stamped the fragment yet — it has no \
+         claim_id and no provenance row. Got {before:?}"
+    );
+
+    link_fragment_to_claim(&pool, claim, fragment, "group", group).await;
+
+    let (owner, vis) = tenancy_of(&pool, "harvester_fragments", fragment).await;
+    assert_eq!(
+        (owner, vis.as_str()),
+        (group, "group"),
+        "the fragment must take its claim's tenancy once the provenance row \
+         linking them exists. It was {before:?} before the link. Without \
+         migration 089 nothing stamps it: arm (c) needs a claim_id this table \
+         does not have, and arm (d) fires only on a claims UPDATE that changes \
+         tenancy — which need never happen."
+    );
+}
+
+/// The same order, but with the fragment declaring `('public', <world>)`
+/// explicitly rather than taking the seed arm.
+///
+/// Both sentinel spellings reproduce the gap, and this is the one the PR-12
+/// backfill's predicate names. Kept as a separate case rather than folded into
+/// the one above because they exercise DIFFERENT halves of 089's target-side
+/// predicate: a fix matching only `world` passes here and fails the seed case,
+/// which is the live one on any database at migration-074 head.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_world_declared_fragment_also_inherits_when_its_provenance_row_arrives(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "harvest-author").await;
+    let claim = fixture::seed_group_claim(&pool, agent, group, "private finding").await;
+    let source = insert_harvester_source(&pool).await;
+    let world = fixture::world_group(&pool).await;
+
+    let fragment = insert_declared_fragment(&pool, source, "chunk", "public", world).await;
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await,
+        (world, "public".to_string()),
+        "premise check: the declaration must survive the insert"
+    );
+
+    link_fragment_to_claim(&pool, claim, fragment, "group", group).await;
+
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await,
+        (group, "group".to_string()),
+        "a world-owned fragment carries no tenancy — the world group is a shape \
+         constant with no members — so it is still unstamped and 089 must stamp it"
+    );
+}
+
+/// THE NO-WIDENING ASSERTION, AND THE MOST IMPORTANT TEST OF THIS BATCH.
+///
+/// A fragment already owned by a REAL group must not be re-stamped by a later
+/// provenance row naming a claim in a DIFFERENT group. That is a tenancy
+/// widening in the general case — the direction that leaks — and it is the exact
+/// failure a predicate "improved" by dropping the still-unstamped clause would
+/// produce. Fail-closed here means "stamp the unstamped, never re-stamp the
+/// stamped".
+///
+/// TWO DISTINCT GROUPS ARE LOAD-BEARING. `seal_side_channels.rs::
+/// a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it` already
+/// walks this path incidentally, but seeds both claims into the SAME group — so
+/// a re-stamp there is invisible and that test cannot stand in for this one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_already_owned_fragment_is_not_re_stamped_by_a_later_claim(pool: PgPool) {
+    let (agent_a, group_a) = fixture::seed_agent_with_group(&pool, "owner-a").await;
+    let (agent_b, group_b) = fixture::seed_agent_with_group(&pool, "owner-b").await;
+    assert_ne!(group_a, group_b, "the two groups must be distinct");
+
+    let claim_a = fixture::seed_group_claim(&pool, agent_a, group_a, "claim in A").await;
+    let claim_b = fixture::seed_group_claim(&pool, agent_b, group_b, "claim in B").await;
+    let source = insert_harvester_source(&pool).await;
+
+    let fragment = insert_declared_fragment(&pool, source, "chunk", "group", group_a).await;
+    link_fragment_to_claim(&pool, claim_a, fragment, "group", group_a).await;
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await,
+        (group_a, "group".to_string()),
+        "premise check: the fragment belongs to A before B's claim cites it"
+    );
+
+    // A second claim, owned by a different group, cites the same fragment.
+    // `harvester_claim_provenance` is keyed `(claim_id, fragment_id)`, so this
+    // is a legal second row and not an upsert.
+    link_fragment_to_claim(&pool, claim_b, fragment, "group", group_b).await;
+
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await,
+        (group_a, "group".to_string()),
+        "the fragment must STILL belong to group A. Re-stamping it to B would \
+         hand B's members content A owns, and would take it away from A — a \
+         widening in one direction and a silent loss in the other. 089's \
+         still-unstamped clause is what prevents it; a predicate without that \
+         clause passes every other test in this batch and fails only here."
+    );
+}
+
+/// The source-side half: a claim owned by the WORLD group donates nothing.
+///
+/// A claim owned by the world group is a shape constant, not an owner, and has
+/// no tenancy to donate. `c.owner_group_id <> <world>` is what skips it.
+///
+/// # ⚠ THE ASSERTION IS THE FULL TUPLE, AND THAT IS THE WHOLE POINT
+///
+/// An earlier version of this test asserted `visibility == "public"` alone, and
+/// it could not fail for the reason it names. The fixture's fragment is
+/// `insert_undeclared_fragment`, which lands `('public', <seed group>)` — not
+/// world — because migration 074's root arm COALESCEs an undeclared insert to the
+/// SEED sentinel on a session that is a member of `epigraph_seed`, which the
+/// superuser harness role is. `fixture::seed_public_claim` is
+/// `('public', <world>)`. So deleting `c.owner_group_id <> <world>` from
+/// migration 089 writes **world over seed** — the owner moves and the visibility
+/// does not — and a visibility-only assertion stays green. Capturing the tuple
+/// before the link and comparing the whole of it is what makes this test able to
+/// fail; the mutation was run to prove it does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_claim_leaves_its_fragment_public(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "harvest-author").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "a public finding").await;
+    let source = insert_harvester_source(&pool).await;
+    let world = fixture::world_group(&pool).await;
+
+    let fragment = insert_undeclared_fragment(&pool, source, "chunk of public source").await;
+    let before = tenancy_of(&pool, "harvester_fragments", fragment).await;
+    assert_ne!(
+        before.0, world,
+        "premise check: this test only discriminates the source-side clause if the fragment \
+         does NOT already carry the world sentinel, because that is the value the clause stops \
+         the trigger from writing. Got {before:?}"
+    );
+
+    link_fragment_to_claim(&pool, claim, fragment, "public", world).await;
+
+    let after = tenancy_of(&pool, "harvester_fragments", fragment).await;
+    assert_eq!(
+        after, before,
+        "a world-owned claim must leave the fragment EXACTLY as it found it, owner included. \
+         Both halves matter. Visibility: there is no group to make it private TO, and a \
+         'group'-visible row owned by a memberless group is unreadable by anybody including \
+         its author (062's *_group_needs_real_group CHECK says exactly this). Owner: without \
+         089's `c.owner_group_id <> <world>` clause the trigger writes the world sentinel over \
+         this fragment's seed sentinel — a write with no meaning that also leaves the \
+         IS DISTINCT FROM guard as the only thing stopping it churning on every harvest."
+    );
+    assert_eq!(
+        after.1, "public",
+        "and it is still public, stated separately so a future fixture change that makes \
+         `before` group-private cannot turn the equality above into a vacuous pass"
+    );
+}
+
+/// REGRESSION GUARD, AND A DELIBERATE SUBSTITUTION FOR AN UNSATISFIABLE ONE.
+///
+/// This batch's acceptance asked for "the reverse order still works —
+/// provenance row first, then the fragment". THAT ORDER DOES NOT EXIST AND
+/// NEVER DID. `harvester_claim_provenance_fragment_id_fkey` is NOT DEFERRABLE
+/// (`condeferrable = false`), so a provenance row naming a fragment that does
+/// not exist yet raises `23503` immediately, in any statement order and any
+/// transaction. Measured before this file was written; a test asserting the
+/// requirement literally would fail and invite weakening something real.
+///
+/// What the requirement was reaching for — "whatever stamped a fragment before
+/// must still stamp it" — is arm (d), and that is what this asserts: a
+/// `claims` UPDATE that changes tenancy must still propagate through provenance
+/// to the fragment, exactly as migration 070's `epigraph_propagate_tenancy` has
+/// always done. 089 adds an AFTER INSERT trigger on a different table and must
+/// not disturb it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claims_tenancy_update_still_propagates_to_the_fragment(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "harvest-author").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "public for now").await;
+    let source = insert_harvester_source(&pool).await;
+    let world = fixture::world_group(&pool).await;
+
+    let fragment = insert_undeclared_fragment(&pool, source, "chunk").await;
+    link_fragment_to_claim(&pool, claim, fragment, "public", world).await;
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await.1,
+        "public",
+        "premise check: a public claim leaves it public (089's source-side half)"
+    );
+
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $1 WHERE id = $2")
+        .bind(group)
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("privatize the claim");
+
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await,
+        (group, "group".to_string()),
+        "migration 070 arm (d) must still re-stamp the fragment through \
+         provenance when its claim is privatized. Note this arm has NO \
+         still-unstamped clause and is right not to: a claim's own tenancy \
+         change is authoritative over its derived rows, whereas 089 fires on a \
+         new LINK, where the fragment may already have an owner of its own."
+    );
+}
+
+/// Migration 089 is idempotent at the level its statements promise.
+///
+/// sqlx records no row for a failed migration, so a `lock_timeout` abort part
+/// way through the file must leave it re-runnable. Re-running the two statements
+/// that can collide — the `CREATE OR REPLACE FUNCTION` and the
+/// `DROP TRIGGER IF EXISTS` / `CREATE TRIGGER` pair — must be clean and must
+/// leave exactly one trigger, not two.
+///
+/// # The ACL tail asserts "089 CONTAINS a REVOKE", not "the re-run re-granted"
+///
+/// The distinction is measured, and an earlier version of this doc had it
+/// backwards (inherited from 086's prose, corrected in `schema_contract.rs` in
+/// the same change). On PostgreSQL 16.13, `CREATE OR REPLACE FUNCTION` of the
+/// same signature PRESERVES `proacl`, so the re-apply below cannot re-grant
+/// anything and contributes nothing to the tail either way. What the tail IS live
+/// for is the REVOKE's presence at all: a first creation leaves `proacl` NULL,
+/// which IS the implicit grant to PUBLIC, so deleting 089's `REVOKE` fails this
+/// assertion on any fresh database. That property is also pinned at head by
+/// `schema_contract.rs::migration_089_stamping_definer_is_revoked_from_public`;
+/// it is kept here so a re-run that somehow loses it is caught in the same test
+/// that proves the re-run is safe.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_089_is_safe_to_re_run(pool: PgPool) {
+    let count = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM pg_trigger \
+              WHERE tgname = 'harvester_claim_provenance_fragment_inherit_tenancy' \
+                AND NOT tgisinternal",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count 089's trigger")
+    };
+    assert_eq!(
+        count(pool.clone()).await,
+        1,
+        "089 installs exactly one trigger"
+    );
+
+    let sql = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/089_harvester_fragment_provenance_stamp.sql"
+    ))
+    .expect("read migration 089");
+    // `SET LOCAL` outside a transaction only WARNs, which is harmless here and
+    // is not what this test is about.
+    sqlx::raw_sql(&sql)
+        .execute(&pool)
+        .await
+        .expect("migration 089 must be re-runnable: sqlx records no row for a failed migration");
+
+    assert_eq!(
+        count(pool.clone()).await,
+        1,
+        "re-running 089 must leave ONE trigger. `DROP TRIGGER IF EXISTS` before \
+         `CREATE TRIGGER` is what makes that true; without it the re-run raises \
+         42710 and the recovery path is a manual DROP on a live database."
+    );
+
+    let public_can_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('public', \
+                'public.epigraph_inherit_fragment_tenancy_stmt()', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        !public_can_execute,
+        "PUBLIC can EXECUTE 089's stamping body. The live cause is a MISSING \
+         `REVOKE EXECUTE … FROM PUBLIC` in the migration, because a creation \
+         leaves proacl NULL and a NULL proacl IS the grant to PUBLIC. Note it is \
+         NOT the re-apply above: CREATE OR REPLACE preserves the ACL (measured on \
+         PostgreSQL 16.13), so do not go looking for a re-grant that cannot have \
+         happened."
+    );
+
+    // And the mechanism still works after the re-run, not merely the catalog.
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "post-rerun").await;
+    let claim = fixture::seed_group_claim(&pool, agent, group, "private").await;
+    let source = insert_harvester_source(&pool).await;
+    let fragment = insert_undeclared_fragment(&pool, source, "chunk").await;
+    link_fragment_to_claim(&pool, claim, fragment, "group", group).await;
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", fragment).await,
+        (group, "group".to_string()),
+        "the trigger must still stamp after the file is re-applied — a re-run \
+         that leaves a catalog entry but a dead mechanism is the failure this \
+         half catches"
     );
 }

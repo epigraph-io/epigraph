@@ -85,8 +85,40 @@ back. Migration 062 forbids that pairing outright with
 | A new claim from an authenticated principal | the principal's declared write target |
 | A claim-derived row (`evidence`, `triples`, …) | inherited from the parent claim by 070 arm (c), at insert |
 | A visibility change on a claim | propagated to 17 derived tables, `harvester_fragments` and `edges` by 070 arm (d), in the same transaction |
+| A `harvester_fragments` row whose provenance row arrives later | stamped from the cited claim by **089**, when the `harvester_claim_provenance` row linking them is inserted — but only if the fragment is still unstamped. See the note below the table. |
 | An edge | the **meet** of its two endpoints, 070 arm (b) |
-| A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `harvester_fragments`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. |
+| A row with no derivable owner (`frames`, `contexts`, `perspectives`, `communities`, `recall_events`) | **must be declared by the writer.** Before 074 these landed on `('public', world)`; after 074 there is no default to land on. See the next section. `harvester_fragments` is in this set too, with one qualification — see below. |
+
+**`harvester_fragments` is the one table in two rows of that table, and the
+order of the two writes decides which.** It has no `claim_id`, so it is a
+parentless root and its writer must declare tenancy (074) — but it does reach a
+claim, through `harvester_claim_provenance`. Until migration 089, a fragment
+written *before* that link existed was stamped by nothing: arm (c) has no column
+to key on, and arm (d) fires only when a claim's tenancy actually changes. 089
+closes that with an AFTER INSERT trigger on the provenance side.
+
+It stamps **only a still-unstamped fragment** — one owned by the world or seed
+group, the two sentinels 062's `*_group_needs_real_group` CHECK names as
+non-owners. A fragment already owned by a real group keeps that owner when a
+second claim cites it, because re-stamping it to the second claim's group would
+widen access to the first group's content.
+
+**089 does not relieve the writer of declaring, and is not a substitute for it.**
+Its target predicate matches only the two sentinel owners, and under 079's FORCE
+`harvester_fragments_tenancy`'s `WITH CHECK` admits a write naming a sentinel
+owner only through a bypass disjunct. So the rows 089 reaches are the ones written
+by a bypassing or `epigraph_seed`-member session — today's connection regime, and
+the `#[sqlx::test]` harness — plus everything already on disk. **Declare both
+columns at the fragment's own insert site.** 089 is a backstop for the rows that
+predate a declaration, not a default to lean on.
+
+One consequence worth knowing before you rely on it: a still-unstamped fragment
+cited by **both** a public claim and a group-private one becomes group-private the
+moment the private link is inserted, and so leaves the public claim's provenance.
+That is intended and fail-closed — it is the same stance
+`seal_side_channels.rs::a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it`
+already takes for the seal — and it is a second reason to declare a fragment's
+tenancy yourself rather than let a later link decide it.
 
 ## Declaring visibility on write
 
@@ -169,10 +201,24 @@ production statements, in `repos/community.rs`, `repos/context.rs`,
 `repos/frame.rs`, `repos/perspective.rs`, `repos/recall_event.rs` and
 `bin/dekg.rs`.
 
+**`harvester_fragments` is a partial exception since migration 089, and only
+partial.** It still has no `claim_id` and its writer must still declare — nothing
+about the `23502` changed. What 089 adds is a *second chance*: the fragment does
+reach a claim through `harvester_claim_provenance`, and when that link is
+inserted the fragment inherits the claim's tenancy, provided it is still
+unstamped. So route 2 exists for it one step removed, keyed on a later write
+rather than on its own — and only for rows a bypassing or `epigraph_seed`-member
+session wrote, because a sentinel owner is what the predicate matches and the
+policy does not admit an application-role write that names one. The other five
+have no such path and never will.
+
 ### What you must not do
 
 Do not add a `DEFAULT` back. Do not stamp the seed or world group from
-application code. Do not "fix" a `23502` by widening the row to `'public'` when
+application code — the prohibition binds application writers, and it is not
+contradicted by 070's and 089's stamping bodies, whose target-side predicates
+treat both sentinels as "no owner yet" and may therefore copy a sentinel owner
+from a claim. Do not "fix" a `23502` by widening the row to `'public'` when
 the caller meant `'group'` — a failed write is recoverable, a disclosure is not.
 
 ## Running the backfill

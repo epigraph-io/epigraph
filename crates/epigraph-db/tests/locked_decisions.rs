@@ -1620,14 +1620,40 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // set moved. The name is removed from the IN-list as well, so the query no
     // longer looks for a trigger that cannot exist; leaving it would have made
     // the count self-fulfilling.
+    //
+    // 21 SINCE MIGRATION 089, AND ARM (c)'s TABLE SET DID NOT MOVE.
+    //
+    // This assertion's message demands a decision rather than a silent edit, so
+    // here is the decision. Arm (c) still covers exactly the 17 tier-A tables
+    // carrying a `claim_id`; `harvester_fragments` has none and still cannot be
+    // one of them. What 089 adds is a SECOND AFTER INSERT trigger on
+    // `harvester_claim_provenance` — which already has arm (c)'s — stamping the
+    // `harvester_fragments` row that provenance row points at, from the same
+    // claim. That is the one write moment neither arm (c) (no `claim_id` to key
+    // on) nor arm (d) (fires only when a claim's tenancy CHANGES) could reach,
+    // and a fragment written before its provenance row was consequently stamped
+    // by nothing.
+    //
+    // It is a D1 change in the direction D1 wants: strictly fewer ways for a row
+    // to end up carrying no real owner, and it adds no way for one to become
+    // public. That last clause is MEASURED and it is narrower than it looks: 062's
+    // visibility CHECKs restrict claims and harvester_fragments alike to exactly
+    // {public, group}, and harvester_fragments_group_needs_real_group makes a
+    // sentinel-owned fragment necessarily public, so a stamp can only move a
+    // fragment public -> public or public -> group. It is NOT the wider claim that
+    // the stamp's effect is independent of who writes the provenance row; that is
+    // a separate question, recorded as finding F-089-F in
+    // docs/tenancy/progress.json with its location and owner.
     assert_eq!(
         rows.len(),
-        20,
-        "expected 20 tenancy triggers — 3 named (claims_require_tenancy, \
+        21,
+        "expected 21 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
-         *_inherit_tenancy per claim-derived tier-A table (17). Found {}: {rows:?}. \
-         A different count means migration 070 arm (c)'s table set moved, which \
-         is a D1 change and needs a decision, not a silent edit.",
+         *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
+         089's harvester_claim_provenance_fragment_inherit_tenancy. Found {}: \
+         {rows:?}. A different count means migration 070 arm (c)'s table set \
+         moved or 089's trigger is gone, which is a D1 change and needs a \
+         decision, not a silent edit.",
         rows.len()
     );
 

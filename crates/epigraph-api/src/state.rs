@@ -656,6 +656,22 @@ pub fn rls_verdict(p: &RlsPosture) -> Result<RlsVerdict, epigraph_db::DbError> {
 /// Required unconditionally by [`AppState::assert_tenancy_triggers_armed`],
 /// because every database from 070 onward has them — including one sitting at
 /// plan §9.2 step (i) with 074 not yet applied.
+///
+/// # ⚠ This list is 070's, not "every stamping trigger"
+///
+/// Migration 089's `harvester_claim_provenance_fragment_inherit_tenancy` is
+/// deliberately absent from both tiers, so a database at 089 whose stamping
+/// trigger has been DROPPED still boots. An unconditional entry would refuse
+/// every pre-089 database, which is the plan §9.2 step (i) failure this whole
+/// two-tier split exists to prevent, and the available marker (089's own
+/// function) would only add coverage for a manually dropped trigger — a state
+/// `tenancy_triggers.rs::every_tenancy_trigger_is_enabled` and
+/// `locked_decisions.rs::d1_tenancy_stamping_triggers_are_armed` already pin at
+/// 21 in CI. A *disabled* 089 trigger IS refused here without an entry, because
+/// the `disabled` half of that check is built from the `%\_inherit\_tenancy`
+/// LIKE-matched rows rather than from `required`. Only ABSENCE is uncovered, it
+/// reverts to the pre-089 status quo rather than failing open, and it is recorded
+/// as finding `F-089-G` in `docs/tenancy/progress.json`.
 #[cfg(feature = "db")]
 const TENANCY_TRIGGERS_070: &[(&str, &str)] = &[
     ("claims", "claims_require_tenancy"),

@@ -628,10 +628,29 @@ async fn backfill_agent_keyed(pool: &PgPool, table: &str, agent_col: &str) -> an
 ///
 /// This arm exists because arm (c) CANNOT cover this table (it has no
 /// `claim_id`) and arm (d) only fires on a claims *UPDATE*. A fragment inserted
-/// **before** its `harvester_claim_provenance` row is therefore never stamped
-/// by any trigger — an insert-order hole the plan does not mention. The
-/// backfill closes it for existing rows; new rows in that order remain a live
-/// gap, recorded in the PR body.
+/// **before** its `harvester_claim_provenance` row was therefore stamped by no
+/// trigger at all — an insert-order hole the plan does not mention.
+///
+/// # Migration 089 closed the forward half; this pass is for the backlog
+///
+/// Since migration 089 a fragment written in that order IS stamped, at the
+/// moment the `harvester_claim_provenance` row linking it to its claim is
+/// inserted (`harvester_claim_provenance_fragment_inherit_tenancy`). So the
+/// residual this pass exists for is rows that were already on disk when 089
+/// applied, not new writes.
+///
+/// # ⚠ The two predicates are NOT the same, and the difference is measured
+///
+/// This one binds `f.owner_group_id = $1` with [`WORLD`] alone; 089's target side
+/// matches BOTH sentinels, `(world, seed)`. 089 names the seed sentinel because
+/// migration 074 made this table a parentless root whose seed arm COALESCEs an
+/// undeclared insert to `('public', <seed group>)` on a session that is a member
+/// of `epigraph_seed`. A seed-owned fragment already on disk is therefore
+/// reachable by NEITHER instrument: 089 fires only on a new provenance insert,
+/// and this predicate skips it. [`residual`] has the same world-only binding, so
+/// `verify` does not count those rows either. No code change here: widening this
+/// predicate changes what the backfill does to existing rows, which is outside
+/// this batch. Recorded as finding `F-089-D` in `docs/tenancy/progress.json`.
 async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
     let n = sqlx::query(
         "UPDATE harvester_fragments f
@@ -835,9 +854,18 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 ///
 /// It is NOT added to `tenancy_triggers.rs::propagation_function_is_owned_by_the_maintenance_role`
 /// or to `schema_contract.rs::the_five_session_functions_exist`: the first is
-/// scoped by name to 070's propagation trigger bodies and the second to 067's
-/// five session functions, and widening either would make its own doc comment
-/// false.
+/// scoped to the tenancy STAMPING TRIGGER BODIES and the second to 067's five
+/// session functions, and widening either past its own scope would make its doc
+/// comment false.
+///
+/// The first scope is "070's five plus migration 089's
+/// `epigraph_inherit_fragment_tenancy_stmt`" — it was 070's five alone until
+/// 089, and the sentence above is restated here rather than left as written
+/// because 089 moved it. `epigraph_claim_tenancy_by_ids` still does not belong
+/// there: it is a READ helper backing a suppression control, not a body any
+/// trigger fires, so it would widen that test from "trigger bodies" to
+/// "definer bodies" and leave it asserting a different claim than its name and
+/// its own comment make.
 ///
 /// # ⚠ WHY THE 086 ENTRY IS DEFERRED AND THE OTHER SIX ARE NOT
 ///
@@ -898,9 +926,49 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// `epigraph_definer_bypass()` — so it FAILS SAFE but with more authority than
 /// intended, and nothing in `_sqlx_migrations` records the difference. This gate
 /// is the only instrument that reports it.
+///
+/// `epigraph_inherit_fragment_tenancy_stmt` (89) is deferred for the structural
+/// reason, not a judgement call: 089 is LATER than every migration week 11c
+/// applies, so at the moment this pre-flight runs the function legitimately does
+/// not exist. An entry in [`DEFINER_FUNCTIONS`] would therefore report `does not
+/// exist` and fail a correctly-sequenced deploy — turning the control that
+/// prevents an outage into the outage.
+///
+/// ## What this entry catches, scoped to what is reachable
+///
+/// 089's `ALTER FUNCTION ... OWNER TO` is inside a guarded `DO` block, so it can
+/// silently no-op. But the two failure states are reported by DIFFERENT branches
+/// of [`verify_definer_ownership`] and only one of them is this entry's:
+///
+/// * **Role absent** (the cluster the guard exists for — 060 could only
+///   `RAISE NOTICE`): reported by the role-existence branch, which returns before
+///   the per-function loop and says so. Not this entry.
+/// * **Owner present but not a MEMBER of `epigraph_maintenance`** — an operator
+///   re-own, a restore, a migration runner that is neither a superuser nor a
+///   member: this entry, via the `pg_has_role` predicate below.
+///
+/// A **superuser-owned** body passes, as 086's entry already records, and that is
+/// correct: it satisfies `epigraph_definer_bypass()` and bypasses row security
+/// outright, so nothing is degraded.
+///
+/// ## And what a non-member owner actually costs, measured
+///
+/// Not "the stamp is filtered away silently" — that was an earlier draft's claim
+/// and it is wrong. Measured out of band on a scratch database at head, from a
+/// genuine non-bypassing application-role session (`#[sqlx::test]` cannot ask:
+/// `session_user` is the superuser — see finding
+/// `F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable`): a non-member
+/// owner still stamps a link whose claim the writing session can already see,
+/// because `harvester_fragments_tenancy`'s WITH CHECK is satisfied by that
+/// session's own writable groups. What it loses is the link whose claim the
+/// session CANNOT see — the body's own read of `public.claims` is RLS-filtered,
+/// so the join matches nothing and zero rows are stamped with no error. The
+/// ownership is load-bearing for COVERAGE, which is why a catalog gate rather
+/// than a runtime one is the right instrument.
 const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_claim_tenancy_by_ids", 86),
     ("epigraph_is_instance_admin", 83),
+    ("epigraph_inherit_fragment_tenancy_stmt", 89),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1064,6 +1132,14 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
 }
 
 /// Count rows still owned by the world group on `table`.
+///
+/// **The world group ONLY, which is narrower than "carries no real owner".** 062
+/// names two sentinels and 074's seed arm produces the other one, so a
+/// seed-stamped row is not counted here and `verify`'s tier-A residual line reads
+/// zero over it. Left as-is deliberately: this is the gate's reporting predicate,
+/// changing it changes what `verify` prints for every tier-A table, and the census
+/// that would replace it is an operator decision rather than a fix. Recorded with
+/// [`backfill_harvester_fragments`]' matching asymmetry as finding `F-089-D`.
 async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {table} WHERE owner_group_id = $1"

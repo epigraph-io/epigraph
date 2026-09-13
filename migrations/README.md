@@ -70,7 +70,8 @@ Current reservation:
   | **086** | PR-24 | `epigraph_claim_tenancy_by_ids` `SECURITY DEFINER` read helper — **claimed 2026-09-06**, was headroom |
   | **087** | PR-18 (delivered as 18b) | SELECT + INSERT policies on `privatization_plans` and `privatization_plan_items` — **claimed 2026-09-08**, was headroom |
   | **088** | PR-18 (delivered as 18c) | UPDATE policies on `privatization_plans` and `privatization_plan_items` — **claimed 2026-09-08**, was headroom |
-  | **089–090** | — | remaining headroom |
+  | **089** | cleanup batch `tenancy/fix-harvester-fragment-stamp` (no plan section — all 22 are delivered) | `harvester_claim_provenance_fragment_inherit_tenancy` + `epigraph_inherit_fragment_tenancy_stmt`: an AFTER INSERT statement trigger that stamps a `harvester_fragments` row with its claim's tenancy when the provenance row linking them appears. Closes the one write moment migration 070 could not cover — `harvester_fragments` has no `claim_id`, so arm (c) cannot key on it, and arm (d) fires only when a claim's tenancy changes. Adds no table, so 070's `GRANT … ON ALL TABLES` note needs no re-issue. File: `089_harvester_fragment_provenance_stamp.sql`. **No undo runbook ships**, unlike 070/074/079/084: reversing this file is one `DROP TRIGGER IF EXISTS` plus one `DROP FUNCTION IF EXISTS` (both named in the file's own closing section), and the rows it stamped are deliberately NOT un-stamped — `docs/runbooks/070-undo.sql` takes the same stance, so an operator rolling back is left with a fail-closed residual rather than a hazard. Recorded here so the absence is a decision rather than an omission. **Claimed 2026-09-12**, was headroom. **Applied to a throwaway database only, NOT to any deployed database.** |
+  | **090** | — | remaining headroom |
 
   **The post-shift numbers, pinned.** THIS TABLE IS AUTHORITATIVE; plan §3.1's
   own columns are not, and neither is `docs/tenancy/FINAL-PLAN.md`. Derive
