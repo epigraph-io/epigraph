@@ -26,6 +26,21 @@ struct TraceWithAgentRow {
     agent_id: Uuid,
 }
 
+/// One reasoning trace as a provenance step: the identity, the **raw**
+/// `reasoning_type` string as stored, and the confidence.
+///
+/// `reasoning_type` is deliberately NOT parsed into [`Methodology`]. See
+/// [`ReasoningTraceRepository::provenance_step_by_id`] for why.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TraceProvenanceStep {
+    /// `reasoning_traces.id`.
+    pub id: Uuid,
+    /// `reasoning_traces.reasoning_type`, exactly as stored.
+    pub reasoning_type: String,
+    /// `reasoning_traces.confidence`.
+    pub confidence: f64,
+}
+
 /// Build ReasoningTrace from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -131,6 +146,50 @@ impl ReasoningTraceRepository {
             None, // signature not stored yet
             row.created_at,
         ))
+    }
+
+    /// The three columns a provenance step renders — `id`, the **raw**
+    /// `reasoning_type` string and `confidence` — read through a `Viewer`.
+    ///
+    /// # Why this is not [`Self::get_by_id`]
+    ///
+    /// `get_by_id` parses `reasoning_type` into [`Methodology`] via
+    /// [`Self::db_string_to_methodology`], and that mapping is deliberately
+    /// lossy in the direction this caller cannot absorb: `"statistical"` and
+    /// `"analogical"` both resolve to a different spelling on the way back out.
+    /// The provenance step label is a response field, so reusing `get_by_id`
+    /// would change a public API response as a side effect of adding a filter.
+    /// It also `INNER JOIN`s `claims` for an `agent_id` this caller does not
+    /// project, and returns `explanation`, which it must not.
+    ///
+    /// So: the same visibility mechanism, over the projection the caller
+    /// actually needs. One marker, one bind — `reasoning_traces` is the only
+    /// relation here. The caller has already read the owning claim through the
+    /// same viewer, so there is no second alias to mark.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn provenance_step_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: TraceId,
+    ) -> Result<Option<TraceProvenanceStep>, DbError> {
+        let uuid: Uuid = id.into();
+        let sql = viewer.splice(
+            r#"
+            SELECT rt.id, rt.reasoning_type, rt.confidence
+            FROM reasoning_traces rt
+            WHERE rt.id = $1
+              /* {VISIBILITY:rt} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, TraceProvenanceStep>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// Get a reasoning trace by ID

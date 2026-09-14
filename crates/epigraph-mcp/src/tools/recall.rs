@@ -223,6 +223,65 @@ pub struct RecallWithContextParams {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Why a recall audit row has no owner — and therefore must not be written.
+///
+/// **Every variant is a DROP, and that is the whole point of the type.** It has
+/// no shape meaning "write it instance-wide", so the widening is unreachable
+/// from a caller that handles the failure sloppily. The earlier spelling —
+/// `Result<Option<Uuid>, DbError>` — did have such a shape: `Ok(None)` selected
+/// `TenancyDecl::instance_wide()`, and a caller that reached it through an
+/// `.ok()` on a fallible identity lookup turned a transient failure into a
+/// world-readable row carrying the querying agent's raw query text. The `Err`
+/// arm failed closed and the `None` arm failed open; only the type can keep
+/// those from drifting apart again.
+///
+/// A retrieval that is not audited is recoverable from the request log; a
+/// disclosure is not.
+///
+/// Shared by both MCP recall surfaces so the rule has one spelling.
+#[derive(Debug)]
+pub(crate) enum AuditOwnerUnresolved {
+    /// The surface produced no principal at all. On the MCP transports this is
+    /// a bypass viewer, which `request_viewer` never returns — so it is a
+    /// defensive arm, and it drops rather than widening for the same reason the
+    /// lookup failure does.
+    NoPrincipal,
+    /// There IS a principal and its personal group could not be resolved.
+    Lookup(epigraph_db::DbError),
+}
+
+impl std::fmt::Display for AuditOwnerUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPrincipal => f.write_str("the call carried no principal"),
+            Self::Lookup(e) => write!(f, "the principal's personal group could not be read: {e}"),
+        }
+    }
+}
+
+/// The group that will own a recall audit row: **the request principal's**
+/// personal group.
+///
+/// `principal` is [`Viewer::principal`](epigraph_db::Viewer::principal), not
+/// `EpiGraphMcpFull::agent_id`, and the distinction is the security property.
+/// `agent_id` resolves the agent for the *signer's public key* — one agent per
+/// process — while `get_recall_events` filters with the viewer built from the
+/// *per-request* `AuthContext`. On stdio the two are the same value. On the
+/// HTTP transport they are not, and owning the row from the process identity
+/// would both misattribute it and suppress it from the agent that authored it.
+///
+/// # Errors
+/// [`AuditOwnerUnresolved`] — see that type: every variant means drop the row.
+pub(crate) async fn recall_audit_owner_group(
+    pool: &sqlx::PgPool,
+    principal: Option<Uuid>,
+) -> Result<Uuid, AuditOwnerUnresolved> {
+    let principal = principal.ok_or(AuditOwnerUnresolved::NoPrincipal)?;
+    epigraph_db::ClaimRepository::personal_group_of_pool(pool, principal)
+        .await
+        .map_err(AuditOwnerUnresolved::Lookup)
+}
+
 /// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
 ///
 /// Shared by the empty-result early return and the main path so the two
@@ -235,23 +294,43 @@ pub struct RecallWithContextParams {
 fn spawn_recall_audit(
     server: &EpiGraphMcpFull,
     event_id: Uuid,
-    agent_id: Option<Uuid>,
+    principal: Option<Uuid>,
     query: &str,
     pgvec: &str,
     params_json: serde_json::Value,
     returned_claim_ids: Vec<Uuid>,
 ) {
-    let event = epigraph_db::NewRecallEvent {
-        id: event_id,
-        agent_id,
-        tool: "recall_with_context".to_string(),
-        query_text: query.to_string(),
-        query_pgvector: Some(pgvec.to_string()),
-        params: params_json,
-        returned_claim_ids,
-    };
+    let query = query.to_string();
+    let pgvec = pgvec.to_string();
     let pool = server.pool.clone();
     tokio::spawn(async move {
+        // Resolved inside the spawn: everything this needs is an owned `Uuid`,
+        // so nothing here borrows the request, and the group lookup — a pool
+        // acquire, a SELECT, and on an agent's first recall a personal-group
+        // mint — stays off the response path. `058_recall_events.sql`'s own
+        // table comment is the contract: "never blocks a recall".
+        let owner_group_id = match recall_audit_owner_group(&pool, principal).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    reason = %e,
+                    "recall_with_context audit skipped rather than widened"
+                );
+                return;
+            }
+        };
+        let event = epigraph_db::NewRecallEvent {
+            id: event_id,
+            // The REQUEST principal, not the process identity. See
+            // `recall_audit_owner_group`.
+            agent_id: principal,
+            tool: "recall_with_context".to_string(),
+            query_text: query,
+            query_pgvector: Some(pgvec),
+            params: params_json,
+            returned_claim_ids,
+            owner_group_id: Some(owner_group_id),
+        };
         if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
             tracing::warn!(error = %e, "recall_with_context audit log failed; recall unaffected");
         }
@@ -752,7 +831,7 @@ async fn recall_with_context_post_embed(
         spawn_recall_audit(
             server,
             event_id,
-            server.agent_id().await.ok(),
+            viewer.principal(),
             &params.query,
             pgvec,
             // `since` is recorded on the EMPTY path too: "this window
@@ -1112,7 +1191,7 @@ async fn recall_with_context_post_embed(
     spawn_recall_audit(
         server,
         event_id,
-        server.agent_id().await.ok(),
+        viewer.principal(),
         &params.query,
         pgvec,
         serde_json::json!({
@@ -1948,5 +2027,83 @@ pub mod __test_only {
             lens,
         )
         .await
+    }
+}
+
+/// Unit tests for the recall audit owner helper.
+///
+/// **The module MUST be named `tests`.** `no_inline_sql_in_tools.rs`'s
+/// `the_cfg_test_boundary_is_the_last_item_in_every_file_that_has_one` splits
+/// production from test sites on the first test-cfg attribute in a file and
+/// refuses any other module name, because a differently-named module would make
+/// that split wrong for every site below it. That lint finds the boundary with
+/// a plain substring search, so this comment deliberately does NOT spell the
+/// attribute out — a mention inside a doc comment IS the first match.
+#[cfg(test)]
+mod tests {
+    use super::{recall_audit_owner_group, AuditOwnerUnresolved};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// The DROP arms, asserted directly rather than through a handler.
+    ///
+    /// A handler-level version of this — "poll for a second and assert no row
+    /// appeared" — would pass whenever the spawned write is merely slow, which
+    /// is the false-green shape this suite rejects elsewhere. At the helper the
+    /// answer is a value, not a race.
+    ///
+    /// Both arms exist because they used to be one: the earlier
+    /// `Result<Option<Uuid>, DbError>` spelling made "no principal" a
+    /// SUCCESS that selected the instance-wide declaration, so the two failure
+    /// modes disagreed about whether to publish the row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unresolvable_principal_is_an_error_not_a_widening(pool: PgPool) {
+        assert!(
+            matches!(
+                recall_audit_owner_group(&pool, None).await,
+                Err(AuditOwnerUnresolved::NoPrincipal)
+            ),
+            "no principal must be an error the caller has to handle, never an \
+             owner-less row"
+        );
+
+        // A uuid that is not an `agents` row: the group cannot be resolved and
+        // cannot be minted either.
+        assert!(
+            matches!(
+                recall_audit_owner_group(&pool, Some(Uuid::new_v4())).await,
+                Err(AuditOwnerUnresolved::Lookup(_))
+            ),
+            "a principal whose group cannot be resolved must take the same drop \
+             path as no principal at all"
+        );
+    }
+
+    /// The positive direction, on the same plant: a real agent resolves, and
+    /// resolves to the SAME group on the second call — `personal_group_of` is
+    /// mint-if-absent, and a helper that minted a fresh group per recall would
+    /// scatter one agent's history across groups instead of scoping it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_real_principal_resolves_to_one_stable_group(pool: PgPool) {
+        // Seeded through the repo layer, not an inline INSERT: `recall.rs` is
+        // registered in `no_inline_sql_in_tools.rs` at zero cfg(test) SQL
+        // sites, and a fixture is not a reason to move that number.
+        let pk: [u8; 32] = *Uuid::new_v4().as_bytes().repeat(2).first_chunk().unwrap();
+        let agent = epigraph_db::AgentRepository::create(
+            &pool,
+            &epigraph_core::Agent::new(pk, Some("audit-owner-fixture".to_string())),
+        )
+        .await
+        .expect("seed agent")
+        .id
+        .as_uuid();
+
+        let first = recall_audit_owner_group(&pool, Some(agent))
+            .await
+            .expect("a real principal resolves");
+        let second = recall_audit_owner_group(&pool, Some(agent))
+            .await
+            .expect("and resolves again");
+        assert_eq!(first, second, "one agent, one personal group, every call");
     }
 }

@@ -490,6 +490,116 @@ impl ClaimRepository {
         Self::default_decl_for_author(&mut conn, agent_id).await
     }
 
+    /// [`Self::personal_group_of`] for a caller holding a pool, and for a
+    /// caller that wants the GROUP rather than the `public` declaration
+    /// [`Self::default_decl_for_author_pool`] wraps it in.
+    ///
+    /// Exists because not every row an agent owns is a row anyone else should
+    /// read. `default_decl_for_author_pool` is the right answer for a claim —
+    /// the corpus is shared and the author's group is who a later privatization
+    /// acts on — and the wrong one for a private audit row, which wants the
+    /// same owner and `visibility = 'group'`. Returning the id keeps that
+    /// choice at the call site instead of hiding it in a helper's name.
+    ///
+    /// Read-first, mint-if-absent, with the security property that ordering
+    /// carries — see [`Self::personal_group_of`].
+    ///
+    /// # Errors
+    /// As [`Self::personal_group_of`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn personal_group_of_pool(pool: &PgPool, agent_id: Uuid) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::personal_group_of(&mut conn, agent_id).await
+    }
+
+    /// The grounded embedding neighborhood of a query vector, read through a
+    /// `Viewer`.
+    ///
+    /// "Grounded" is the caller's existing definition and is unchanged: a claim
+    /// counts only if some `paper` / `evidence` / `analysis` row asserts,
+    /// supports, concludes or provides evidence for it. Claim-to-claim
+    /// propagation alone is not grounded evidence.
+    ///
+    /// # Why this exists rather than an inline route read
+    ///
+    /// `routes/hypothesis.rs::create_hypothesis` ran this statement inline
+    /// against a pool, with no viewer, and returned aggregate statistics
+    /// derived from it — so the aggregates were functions of rows the caller
+    /// may not read. That is latent only while the corpus is entirely public,
+    /// and `routes/privatization.rs` makes private claims producible today.
+    /// `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` carried it as
+    /// `("hypothesis.rs", 1)`: the statement names `FROM claims` and projects
+    /// `embedding`, which is the tier-A content column set the register
+    /// matches, so it was counted debt rather than an unseen read. This moves
+    /// it to the repo layer, where CLAUDE.md says the SQL belongs, and retires
+    /// that register entry.
+    ///
+    /// # Both relations are marked
+    ///
+    /// `claims c` carries `/* {VISIBILITY:c} */` and the grounding subquery's
+    /// `edges e` carries `/* {EDGE_VISIBILITY:e} */`. Marking only the outer
+    /// relation would leave the *grounding decision* — and therefore
+    /// `neighbor_count` — a function of edges the viewer cannot see. Both
+    /// markers resolve to the SAME bind index, so the statement still binds
+    /// [`Viewer::group_bind`](crate::visibility::Viewer::group_bind) exactly
+    /// once. Migration 070 makes an edge inherit its endpoints' tenancy, so on
+    /// a public claim the edge predicate is satisfied by the leading `public`
+    /// disjunct and the result is unchanged; it becomes load-bearing exactly
+    /// when the endpoints are private.
+    ///
+    /// **The edge marker is defense in depth and is NOT what the acceptance
+    /// test proves**, which is stated rather than left for a reader to assume.
+    /// Because 070 makes the edge inherit, a private claim's grounding edge is
+    /// private too, and the edge predicate alone would exclude the neighbour
+    /// whatever the `claims` predicate did — a test built that way passes with
+    /// the `claims` filter removed. So
+    /// `hypothesis_ownership_from_principal.rs::hypothesis_voi_neighborhood_excludes_claims_the_caller_cannot_read`
+    /// forces the grounding edge public, leaving the `claims` predicate as the
+    /// only thing that can exclude the row.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn grounded_neighborhood<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_vector: &str,
+        exclude: Uuid,
+        min_similarity: f64,
+        limit: i64,
+    ) -> Result<Vec<GroundedNeighbor>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.belief, c.plausibility,
+                   1 - (c.embedding <=> $1::vector) AS similarity
+            FROM claims c
+            WHERE c.embedding IS NOT NULL
+              AND c.id != $2
+              AND 1 - (c.embedding <=> $1::vector) >= $3
+              AND EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.target_id = c.id
+                    AND e.target_type = 'claim'
+                    AND e.source_type IN ('paper', 'evidence', 'analysis')
+                    AND e.relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                    /* {EDGE_VISIBILITY:e} */
+              )
+              /* {VISIBILITY:c} */
+            ORDER BY similarity DESC
+            LIMIT $4
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_as::<_, GroundedNeighbor>(&sql)
+            .bind(query_vector)
+            .bind(exclude)
+            .bind(min_similarity)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
     ///
     /// **Legacy behavior:** dedups on `content_hash` alone (NOT on
@@ -6998,6 +7108,24 @@ impl ClaimRepository {
             already_existed: false,
         })
     }
+}
+
+/// One grounded neighbour of a query vector, as
+/// [`ClaimRepository::grounded_neighborhood`] returns it.
+///
+/// `belief`, `plausibility` and `similarity` are `Option` because the columns
+/// are nullable and the caller supplies its own defaults — the shape the route
+/// layer already had, preserved so the move changes no arithmetic.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GroundedNeighbor {
+    /// `claims.id`.
+    pub id: Uuid,
+    /// `claims.belief`.
+    pub belief: Option<f64>,
+    /// `claims.plausibility`.
+    pub plausibility: Option<f64>,
+    /// `1 - cosine_distance(embedding, query_vector)`.
+    pub similarity: Option<f64>,
 }
 
 /// One near-duplicate neighbour of a seed claim.

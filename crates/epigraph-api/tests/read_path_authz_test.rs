@@ -1341,3 +1341,149 @@ async fn graph_query_stranger_token_spoofed_owner_omits_the_private_node() {
         "owner token must see the full node label even with a spoofed body agent_id"
     );
 }
+
+// =============================================================================
+// claim_provenance: the TRACE step is read through the viewer too
+// =============================================================================
+
+/// Seed a reasoning trace on `claim` and return its id, WITHOUT pointing that
+/// claim at it.
+///
+/// `reasoning_traces` is one of migration 070's inheritors, so this row's
+/// `(visibility, owner_group_id)` is stamped from `claim`'s by arm (c) — which
+/// is how a trace comes to be group-private in the first place.
+async fn seed_trace_on(pool: &sqlx::PgPool, claim: Uuid, reasoning_type: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, confidence, explanation) \
+         VALUES ($1, $2, 0.9, 'seeded by read_path_authz_test') RETURNING id",
+    )
+    .bind(claim)
+    .bind(reasoning_type)
+    .fetch_one(pool)
+    .await
+    .expect("seed reasoning trace")
+}
+
+async fn point_claim_at_trace(pool: &sqlx::PgPool, claim: Uuid, trace: Uuid) {
+    sqlx::query("UPDATE claims SET trace_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(trace)
+        .execute(pool)
+        .await
+        .expect("point the claim at a trace");
+}
+
+/// Every `id` appearing anywhere in the provenance response, as strings.
+fn ids_in(body: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(m) => {
+                for (k, val) in m {
+                    if k == "id" {
+                        if let Some(s) = val.as_str() {
+                            out.push(s.to_string());
+                        }
+                    }
+                    walk(val, out);
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    walk(body, &mut out);
+    out
+}
+
+/// **`claims.trace_id` is a plain column: the trace a claim names need not be a
+/// trace that claim owns.** So "the caller could read the claim" does not imply
+/// "the caller may read the trace", and the trace read has to filter on its own.
+///
+/// THE PLANT IS DELIBERATELY NOT A PRIVATE CLAIM. `claim_provenance` reads the
+/// claim through the viewer first and 404s when it is absent, so a test that
+/// plants a private CLAIM passes before the fix as well — it would be measuring
+/// the claim read, which was already converted. The discriminating plant is a
+/// claim the caller CAN read whose trace belongs to another group.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_provenance_omits_a_trace_the_viewer_may_not_read() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+
+    // A group-private claim belonging to somebody else, and its trace — which
+    // inherits that claim's tenancy.
+    let other_owner = Uuid::new_v4();
+    let private_claim =
+        common::seed_claim_with_agent(&pool, "TRACE other-group claim body", other_owner).await;
+    common::seed_private_ownership(&pool, private_claim, other_owner).await;
+    let private_trace = seed_trace_on(&pool, private_claim, "statistical").await;
+
+    // A readable claim that names it.
+    let reader = Uuid::new_v4();
+    let readable = common::seed_claim_with_agent(&pool, "TRACE readable claim body", reader).await;
+    point_claim_at_trace(&pool, readable, private_trace).await;
+
+    let url = format!("http://{addr}/api/v1/claims/{readable}/provenance");
+    assert_anonymous_get_401(&url).await;
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(common::mint_token_with_agent(&["claims:read"], reader))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the claim itself is readable, so the route still answers"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    // Assert the EFFECT: the other group's trace contributes no step.
+    let ids = ids_in(&body);
+    assert!(
+        !ids.contains(&private_trace.to_string()),
+        "a reasoning trace owned by another group was returned as a provenance \
+         step: {body:?}"
+    );
+    let steps = serde_json::to_string(&body).unwrap();
+    assert!(
+        !steps.contains("\"trace\""),
+        "no trace-typed step may be emitted for a trace this viewer cannot read: {body:?}"
+    );
+}
+
+/// OTHER DIRECTION. A trace the viewer CAN read still produces its step, with
+/// the same label this route has always returned — the raw `reasoning_type`
+/// string and the confidence to two places.
+///
+/// Without this, a filter that suppressed every trace would pass the test above
+/// and silently empty the provenance of the whole corpus.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_provenance_still_returns_a_trace_the_viewer_may_read() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+
+    let reader = Uuid::new_v4();
+    let claim = common::seed_claim_with_agent(&pool, "TRACE public claim body", reader).await;
+    let trace = seed_trace_on(&pool, claim, "statistical").await;
+    point_claim_at_trace(&pool, claim, trace).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/claims/{claim}/provenance"))
+        .bearer_auth(common::mint_token_with_agent(&["claims:read"], reader))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert!(
+        ids_in(&body).contains(&trace.to_string()),
+        "a readable trace must still appear as a provenance step: {body:?}"
+    );
+    let rendered = serde_json::to_string(&body).unwrap();
+    assert!(
+        rendered.contains("statistical (0.90)"),
+        "the step label is the RAW reasoning_type and the confidence, unchanged \
+         by moving the read into the repo layer: {body:?}"
+    );
+}

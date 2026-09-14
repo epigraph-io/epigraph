@@ -591,34 +591,62 @@ async fn recall_post_embed(
             .filter(|r| r.result_type.is_none()) // claims only; workflows are a different id-space
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        // Resolved before the spawn: agent identity comes from the request's
-        // auth context, which does not outlive this call.
-        let agent_id = server.agent_id().await.ok();
-        let event = epigraph_db::NewRecallEvent {
-            id: event_id,
-            agent_id,
-            tool: "recall".to_string(),
-            query_text: params.query.clone(),
-            query_pgvector: pgvec_opt.clone(),
-            params: serde_json::json!({
-                "limit": limit,
-                "min_truth": min_truth,
-                "tags": tags,
-                "agent_filter": agent_filter,
-                "include_workflows": params.include_workflows,
-                "exclude_contested": params.exclude_contested,
-                // A retrieval whose temporal window cannot be reconstructed
-                // from its audit row is an unauditable retrieval: the same
-                // query with and without a window returns different sets, so
-                // the window is part of what was asked.
-                "since": params.since,
-            }),
-            returned_claim_ids,
-        };
+        // THE AUDIT ROW'S IDENTITY IS THE REQUEST PRINCIPAL, NOT THE PROCESS.
+        // This was `server.agent_id()`, which resolves the agent for the
+        // SIGNER'S PUBLIC KEY — one agent per process — while
+        // `get_recall_events` filters with the viewer built from the
+        // per-request `AuthContext`. On stdio the two are the same value and
+        // nothing moves. On the HTTP transport they are not, and owning the row
+        // from the process identity would misattribute it AND suppress it from
+        // the agent that authored it.
+        //
+        // Nothing here borrows the request, so everything the write needs is
+        // assembled as owned values and the group lookup happens INSIDE the
+        // spawn — `058_recall_events.sql`'s table comment is the contract
+        // ("never blocks a recall"), and resolving a personal group is a pool
+        // acquire plus a SELECT plus, on an agent's first recall, a mint.
+        let principal = viewer.principal();
+        let query_text = params.query.clone();
+        let query_pgvector = pgvec_opt.clone();
+        let params_json = serde_json::json!({
+            "limit": limit,
+            "min_truth": min_truth,
+            "tags": tags,
+            "agent_filter": agent_filter,
+            "include_workflows": params.include_workflows,
+            "exclude_contested": params.exclude_contested,
+            // A retrieval whose temporal window cannot be reconstructed from
+            // its audit row is an unauditable retrieval: the same query with
+            // and without a window returns different sets, so the window is
+            // part of what was asked.
+            "since": params.since,
+        });
         let pool = server.pool.clone();
         tokio::spawn(async move {
+            // Unresolvable ⇒ DROP, never widen. See `recall_audit_owner_group`.
+            let owner_group_id =
+                match super::recall::recall_audit_owner_group(&pool, principal).await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(reason = %e, "recall audit skipped rather than widened");
+                        return;
+                    }
+                };
+            let event = epigraph_db::NewRecallEvent {
+                id: event_id,
+                agent_id: principal,
+                tool: "recall".to_string(),
+                query_text,
+                query_pgvector,
+                params: params_json,
+                returned_claim_ids,
+                owner_group_id: Some(owner_group_id),
+            };
             if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
-                tracing::warn!(error = %e, "recall audit log failed; recall itself unaffected");
+                tracing::warn!(
+                    error = %e,
+                    "recall audit log failed; recall itself unaffected"
+                );
             }
         });
     }

@@ -32,9 +32,30 @@ pub struct CreateHypothesisRequest {
 /// POST /api/v1/hypothesis — Create a hypothesis claim with VOI assessment.
 #[cfg(feature = "db")]
 pub async fn create_hypothesis(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<CreateHypothesisRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // ONE EXTRACTOR, NOT TWO, AND IT IS THE VIEWER.
+    //
+    // The first revision of this change took `RequirePrincipal`, arguing that
+    // "the derivation needs a principal id, not a visibility predicate". That
+    // is inverted for this handler: step 4 below is a corpus-wide read whose
+    // aggregates go into the response, so it needs the predicate too — and
+    // `RequirePrincipal` would have guaranteed no lint ever noticed, because
+    // the registers key on which extractor a handler holds. `ViewerExtractor`
+    // supplies BOTH: `viewer.principal()` is the same uuid, and the viewer is
+    // spent on the neighborhood read rather than left unspent.
+    //
+    // Identical 401 posture either way — both extractors refuse a missing
+    // `AuthContext` and a token whose `agent_id` is `None`, in that order.
+    //
+    // `None` here is a bypass viewer, which `ViewerExtractor` never produces;
+    // it is refused rather than defaulted, because the alternative is deriving
+    // a row's owner from nothing.
+    let principal = viewer.principal().ok_or_else(|| ApiError::Unauthorized {
+        reason: "a hypothesis must be owned by a principal".into(),
+    })?;
     let search_radius = request.search_radius.unwrap_or(0.3);
 
     // 1. Embed the hypothesis
@@ -51,39 +72,29 @@ pub async fn create_hypothesis(
 
     // 2. Create claim with hypothesis labels and properties
     //
-    // Tenancy declaration (PR-16). This statement binds no parent, so migration
-    // 074 has nothing to inherit from and the write must name both columns.
+    // Tenancy declaration. This statement binds no parent, so migration 074 has
+    // nothing to inherit from and the write must name both columns.
     //
-    // CORRECTION TO THE PLAN. §4.6 says "explicit declaration from
-    // `AuthContext`". This handler takes no `AuthContext` -- it reads the
-    // author from `request.agent_id` -- and the owner it needs is the CLAIM'S
-    // AUTHOR, not the caller. Those are the same principal on every honest
-    // invocation, and where they differ the author is the right answer: the row
-    // records `agent_id` as its author, so owning it from anywhere else would
-    // make authorship and ownership disagree on the same row. Nothing is
-    // disclosed either way -- the row is `public` -- so this is a question of
-    // whose group a later privatization acts on, and the author's is the only
-    // defensible one. Threading an `AuthContext` in to check that the caller
-    // MAY author as `request.agent_id` is a real gap, and it is the write-side
-    // gate's, not this PR's.
+    // THE OWNER COMES FROM THE AUTHENTICATED PRINCIPAL, not from the body.
+    // `routes/claims.rs::create_claim` made this move already and this handler
+    // could not, for a stated reason that no longer holds: it had no principal
+    // at all. `ViewerExtractor` supplies one, so the divergence closes. The
+    // argument is the same one recorded there: `owner_group_id` decides whose
+    // group a later privatization acts on, and deriving it from an
+    // unauthenticated body field lets a caller place rows into a group it is
+    // not a member of.
     //
-    // DIVERGENCE FROM `routes/claims.rs::create_claim`, DELIBERATE and made in
-    // review. That handler derives the declaration from the AUTHENTICATED
-    // PRINCIPAL rather than from the body's author, because `ViewerExtractor`
-    // guarantees it has one and deriving `owner_group_id` from an
-    // un-authenticated body field would let a caller place rows into a group it
-    // is not a member of. This handler has neither a `ViewerExtractor` nor an
-    // `AuthContext` -- it is one of the fail-open surfaces the write-side gate
-    // owns -- so there is no principal here to derive from, and the author is
-    // the only identity in scope. Tracked as
+    // AUTHORSHIP IS A SEPARATE QUESTION AND IS STILL OPEN. `claims.agent_id`
+    // continues to come from the body; nothing here checks that the caller may
+    // author as it, and this handler deliberately does not invent that check --
+    // see `routes/claims.rs::create_claim`, which documents the same decoupling
+    // and the in-repo consumer that constrains any answer. Tracked as
     // `D-PR16-claim-authorship-is-not-a-credential` in
-    // `docs/tenancy/progress.json`.
+    // `docs/tenancy/progress.json`, with an owner.
     let content_hash = epigraph_crypto::ContentHasher::hash(request.statement.as_bytes());
-    let decl = epigraph_db::ClaimRepository::default_decl_for_author_pool(
-        &state.db_pool,
-        request.agent_id,
-    )
-    .await?;
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, principal)
+            .await?;
     let claim_id: (Uuid,) = sqlx::query_as(
         r#"
         INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties, embedding, visibility, owner_group_id)
@@ -132,29 +143,33 @@ pub async fn create_hypothesis(
     //    A grounded claim has at least one non-claim provenance chain
     //    (paper, evidence, or analysis source). Claim-to-claim propagation
     //    alone is not grounded evidence and is excluded from the neighborhood.
-    let neighbors: Vec<NeighborRow> = sqlx::query_as(
-        r#"
-        SELECT c.id, c.belief, c.plausibility,
-               1 - (c.embedding <=> $1::vector) AS similarity
-        FROM claims c
-        WHERE c.embedding IS NOT NULL
-          AND c.id != $2
-          AND 1 - (c.embedding <=> $1::vector) >= $3
-          AND EXISTS (
-              SELECT 1 FROM edges e
-              WHERE e.target_id = c.id
-                AND e.target_type = 'claim'
-                AND e.source_type IN ('paper', 'evidence', 'analysis')
-                AND e.relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
-          )
-        ORDER BY similarity DESC
-        LIMIT 50
-        "#,
+    //
+    //    READ THROUGH THE VIEWER. This was an inline, pool-level `SELECT ...
+    //    FROM claims c` in the route layer, and every number in the `voi`
+    //    object below — plus `neighborhood_size` — is an aggregate over its
+    //    rows. `statement` and `search_radius` are both caller-supplied, so an
+    //    unfiltered scan makes the response a function of claims the caller may
+    //    not read. Inert while the corpus is entirely public; not inert once
+    //    `routes/privatization.rs` has run, which it can today.
+    //
+    //    Moved to `ClaimRepository::grounded_neighborhood`, where CLAUDE.md
+    //    says the SQL belongs, and where BOTH relations are marked — see that
+    //    function for why the grounding subquery's `edges` needs the predicate
+    //    as much as `claims` does.
+    //
+    //    BEHAVIOUR: on a wholly public corpus the result set is byte-identical
+    //    (`visibility = 'public'` is the leading disjunct of both fragments).
+    //    Where private claims exist, a caller outside their groups now gets a
+    //    smaller neighborhood and therefore a different VOI score — which is
+    //    the intended effect, and is written up in `docs/deploy.md`.
+    let neighbors = epigraph_db::ClaimRepository::grounded_neighborhood(
+        &state.db_pool,
+        &viewer,
+        &format_embedding(&embedding),
+        claim_id.0,
+        search_radius,
+        50,
     )
-    .bind(format_embedding(&embedding))
-    .bind(claim_id.0)
-    .bind(search_radius)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to query neighborhood: {e}"),
@@ -480,17 +495,12 @@ fn format_embedding(embedding: &[f32]) -> String {
     )
 }
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct NeighborRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    belief: Option<f64>,
-    plausibility: Option<f64>,
-    similarity: Option<f64>,
-}
-
 // `ClaimRow` was deleted with the inline claim-content read in
 // `hypothesis_status`. Its replacement is
 // `ClaimRepository::content_and_properties`, whose row type lives in the repo
 // layer where the `/* {VISIBILITY:c} */` marker convention applies.
+//
+// `NeighborRow` went the same way, with the VOI neighborhood scan: its
+// replacement is `epigraph_db::GroundedNeighbor`. A row type in the route layer
+// is where an unfiltered read hides, so both are deliberately absent rather
+// than kept "in case".

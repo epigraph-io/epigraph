@@ -660,18 +660,12 @@ pub fn rls_verdict(p: &RlsPosture) -> Result<RlsVerdict, epigraph_db::DbError> {
 /// # ⚠ This list is 070's, not "every stamping trigger"
 ///
 /// Migration 089's `harvester_claim_provenance_fragment_inherit_tenancy` is
-/// deliberately absent from both tiers, so a database at 089 whose stamping
-/// trigger has been DROPPED still boots. An unconditional entry would refuse
-/// every pre-089 database, which is the plan §9.2 step (i) failure this whole
-/// two-tier split exists to prevent, and the available marker (089's own
-/// function) would only add coverage for a manually dropped trigger — a state
-/// `tenancy_triggers.rs::every_tenancy_trigger_is_enabled` and
-/// `locked_decisions.rs::d1_tenancy_stamping_triggers_are_armed` already pin at
-/// 21 in CI. A *disabled* 089 trigger IS refused here without an entry, because
-/// the `disabled` half of that check is built from the `%\_inherit\_tenancy`
-/// LIKE-matched rows rather than from `required`. Only ABSENCE is uncovered, it
-/// reverts to the pre-089 status quo rather than failing open, and it is recorded
-/// as finding `F-089-G` in `docs/tenancy/progress.json`.
+/// deliberately absent from THIS tier and from [`TENANCY_TRIGGERS_074`], and
+/// that is not an omission: an entry in either one would refuse a database that
+/// is legitimately behind. Here it would refuse every pre-089 database — the
+/// plan §9.2 step (i) failure this whole staged split exists to prevent — and in
+/// 074's tier it would refuse every database between 074 and 089. It lives in
+/// [`TENANCY_TRIGGERS_089`] instead, gated on its own migration's marker.
 #[cfg(feature = "db")]
 const TENANCY_TRIGGERS_070: &[(&str, &str)] = &[
     ("claims", "claims_require_tenancy"),
@@ -770,6 +764,52 @@ const TENANCY_TRIGGERS_074: &[(&str, &str)] = &[
     ("harvester_fragments", "harvester_fragments_require_tenancy"),
     ("recall_events", "recall_events_require_tenancy"),
 ];
+
+/// The tenancy trigger **migration 089** adds, as `(relation, trigger)`.
+///
+/// Transcribed from `migrations/089_harvester_fragment_provenance_stamp.sql`:
+/// the statement-level `AFTER INSERT` trigger that stamps a harvester fragment
+/// from the claim its provenance link names.
+///
+/// Required by [`AppState::assert_tenancy_triggers_armed`] **only when 089's
+/// own function `public.epigraph_inherit_fragment_tenancy_stmt` exists**, which
+/// is [`MIGRATION_089_MARKER`].
+///
+/// # Why a third tier rather than an entry in one of the other two
+///
+/// Both existing tiers would refuse a database that is legitimately behind:
+/// unconditionally, every pre-089 database (plan §9.2 step (i)); under 074's
+/// marker, every database between 074 and 089. The staging is the control, so
+/// each migration's triggers have to be gated on that migration's own marker.
+///
+/// # Why the FUNCTION is the marker and the trigger is not
+///
+/// A gate keyed on the trigger would be vacuous by construction: the state it
+/// exists to catch is the trigger's absence, and the marker would vanish with
+/// it. 089 installs a `CREATE OR REPLACE FUNCTION` as well as a
+/// `CREATE TRIGGER`, and dropping the trigger leaves the function behind — so
+/// "function present, trigger absent" is exactly the state that now refuses.
+/// Dropping both (a database that never ran 089, or one deliberately reverted
+/// by 089's own documented reversal) requires nothing and boots, which is what
+/// keeps the staging property intact.
+///
+/// # What this closes
+///
+/// Before this tier, a *disabled* 089 trigger was refused — the `disabled` half
+/// of the check is built from the `%\_inherit\_tenancy` LIKE-matched rows rather
+/// than from `required` — while a *dropped* one was not. That asymmetry was
+/// finding `F-089-G` in `docs/tenancy/progress.json`.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_089: &[(&str, &str)] = &[(
+    "harvester_claim_provenance",
+    "harvester_claim_provenance_fragment_inherit_tenancy",
+)];
+
+/// The marker that migration 089 has run: the function it installs alongside
+/// its trigger. See [`TENANCY_TRIGGERS_089`] for why it is the function and not
+/// the trigger.
+#[cfg(feature = "db")]
+const MIGRATION_089_MARKER: &str = "epigraph_inherit_fragment_tenancy_stmt";
 
 impl AppState {
     /// Create new application state with the given configuration (no database)
@@ -1202,6 +1242,10 @@ impl AppState {
     ///     (some roots armed, `claims_block_widening` created) is therefore
     ///     still caught, because that trigger is created in section 4, before
     ///     section 5 drops the defaults.
+    ///   * [`TENANCY_TRIGGERS_089`] is required only once
+    ///     [`MIGRATION_089_MARKER`] — 089's own function — is present. The
+    ///     marker is deliberately NOT the trigger: a gate keyed on the thing it
+    ///     checks for is vacuous.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -1239,9 +1283,17 @@ impl AppState {
               WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = ANY($1)",
         )
         .bind(
+            // EVERY tier's relations, including 089's. A relation missing from
+            // this bind list falls to `table_absent` and WARNS instead of
+            // refusing — so forgetting one here makes the tier that names it
+            // fail open, which is the defect this whole function exists to
+            // remove. (089's relation happens also to be in 070's list, so the
+            // chain below is currently redundant for it. It is spelled anyway:
+            // the next tier's relation will not be.)
             TENANCY_TRIGGERS_070
                 .iter()
                 .chain(TENANCY_TRIGGERS_074.iter())
+                .chain(TENANCY_TRIGGERS_089.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -1249,6 +1301,21 @@ impl AppState {
         .await?;
         let existing: std::collections::HashSet<&str> =
             existing_tables.iter().map(String::as_str).collect();
+
+        // 089 ran iff its function is installed. Keyed on the FUNCTION rather
+        // than on the trigger, because the state this tier exists to catch is
+        // the trigger's absence and a marker that disappears with its subject
+        // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
+        // the trigger actually lives in, and a hand-edited migrations table
+        // would otherwise decide a safety check.
+        let migration_089_applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p \
+                              JOIN pg_namespace n ON n.oid = p.pronamespace \
+                             WHERE n.nspname = 'public' AND p.proname = $1)",
+        )
+        .bind(MIGRATION_089_MARKER)
+        .fetch_one(&self.db_pool)
+        .await?;
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -1258,6 +1325,9 @@ impl AppState {
         let mut required: Vec<(&str, &str)> = TENANCY_TRIGGERS_070.to_vec();
         if migration_074_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_074);
+        }
+        if migration_089_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_089);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -1312,6 +1382,7 @@ impl AppState {
         tracing::info!(
             triggers = rows.len(),
             migration_074_applied,
+            migration_089_applied,
             "tenancy triggers armed"
         );
         Ok(())
