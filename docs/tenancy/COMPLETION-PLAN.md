@@ -318,6 +318,10 @@ items, for the same reason: they cannot be worked, only answered.
 
 ## §8 — Acceptance for this plan as a whole
 
+**Every criterion below is evaluated on `integration/tenancy`, not on `main`** (§6.3).
+Criterion 3 is the one exception, because it is about a running system rather than a branch,
+and it is reached only after the end-to-end gate.
+
 1. `HIGH_WATER` reaches its floor and the register documents what remains exempt and why.
 2. Step 11d has run, and a **non-bypass role** is demonstrably refused — not a superuser
    standing in for one.
