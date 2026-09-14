@@ -942,3 +942,105 @@ that is required, not an optimisation.
 
 074 is a **one-way door**. Its undo script is `docs/runbooks/074-undo.sql`; read
 it before applying 074 to anything you cannot rebuild.
+
+## `tenancy/fix-security-track` — four operator-visible behaviour changes
+
+Same convention as PR-03's §1a–§1d: **one section per change, each naming the
+affected credential and the remedy.** "BREAKING" without the affected credential
+is not actionable. No migration ships with this batch; every item below is a
+code-only change and takes effect the moment the binaries roll.
+
+### 1a. BREAKING — `POST /api/v1/hypothesis` now requires a token bound to a principal
+
+The handler took no authentication at all and read the claim's author from the
+request body. It now takes `ViewerExtractor`, which refuses a request in two
+cases, in this order:
+
+1. no `AuthContext` at all — already impossible on the protected router;
+2. **an `AuthContext` whose `agent_id` is `None`** — a token that authenticates
+   but carries no principal.
+
+**The affected credential:** an OAuth client registered *before* PR-02 began
+populating `oauth_clients.agent_id` mints exactly that token. Such a client
+previously got a `200` from this route and now gets a `401` with
+`token carries no agent_id`.
+
+**Remedy:** re-mint the client through `/oauth/token`. Every principal minted
+since PR-02 carries an `agents.id`. This is the same remedy §1 records for the
+router inversion; nothing new has to be provisioned.
+
+**How to find them before they find you:** the refusal emits
+`visibility.viewer.rejected{reason="no_agent_id", route, client_id}` as a
+structured tracing event. Grep the API logs for that target on
+`route=/api/v1/hypothesis` for one retention window *before* rolling, and re-mint
+whatever `client_id` appears.
+
+### 1b. `POST /api/v1/hypothesis` — ownership now comes from the token, not the body
+
+`claims.owner_group_id` for a hypothesis was derived from the body's `agent_id`.
+It is now derived from the authenticated principal, which is what
+`routes/claims.rs::create_claim` already does.
+
+**Who this moves:** a *delegating* caller — one that authenticates as A and posts
+`agent_id: B`. Its rows previously landed in B's personal group and now land in
+A's. `claims.agent_id` is unchanged and still comes from the body, so authorship
+and ownership can now disagree on the same row; that is deliberate and is the
+same split `create_claim` documents (`agent_id` records who said it,
+`owner_group_id` records who is accountable for the row).
+
+**Action:** none, unless an operator has been relying on delegated posts to place
+rows into a group the caller is not a member of — which is the behaviour this
+closes. Rows already written are not restamped.
+
+### 1c. `POST /api/v1/hypothesis` — the VOI score is now viewer-scoped
+
+The response's `voi.score`, `voi.neighbor_count`, `voi.avg_belief_gap` and
+`neighborhood_size` are aggregates over an embedding-neighborhood scan of
+`claims`. That scan is now filtered by the caller's viewer, and so is the
+`edges` subquery that decides which neighbours count as grounded.
+
+**On a wholly public corpus nothing changes** — `visibility = 'public'` is the
+leading disjunct of both predicates. Once `routes/privatization.rs` has produced
+private claims, a caller outside their groups gets a smaller neighborhood and
+therefore a **different VOI score for the same statement**. That is the intended
+effect; it is called out here because the number is cached onto the claim's
+`properties->>'voi_score'` and a dashboard comparing scores across callers will
+now see them diverge.
+
+### 1d. BREAKING — the MCP tool `get_recall_events` is now self-scoped
+
+`recall_events` rows are written with `visibility = 'group'` and owned by the
+querying principal's personal group, instead of `('public', world)`. The read
+predicate was always correct; the data is what made it vacuous.
+
+**Effect:** an agent reads its own recall history and no longer reads anyone
+else's. The tool's `agent_id` filter still works but is now effectively
+self-only, and **the instance-wide audit view is gone with no compensating
+path** — `tools/viewer.rs::request_viewer` has no admin or bypass arm, so there
+is no credential that restores a cross-agent view of this table. If an operator
+needs one, it has to be built; it does not exist today.
+
+**This is FORWARD-ONLY, and that is the part to plan around.** Every
+`recall_events` row written *before* this deploys still carries
+`visibility = 'public'`, from migration 062's column default and from
+`epigraph-tenancy-backfill`'s `recall_events` pass, and the read predicate's
+middle disjunct admits every one of them to every authenticated reader. No
+migration in this batch restamps them. Two consequences:
+
+* the narrowing applies to new rows only, so the historical audit log stays
+  instance-wide until it ages out;
+* `RecallEventRepository::prune_older_than` — `RECALL_EVENTS_RETENTION_DAYS`,
+  default 90 — is what retires those rows, so **confirm the retention prune is
+  actually scheduled and running** rather than assuming it.
+
+The one-off reconciliation (set `visibility = 'group'` where `agent_id IS NOT
+NULL` and `owner_group_id` already names that agent's personal group) is
+recorded as an outstanding operator decision in `docs/tenancy/progress.json`,
+in the same shape as `D-PR18-stale-cross-group-edges`' remediation. Do not
+improvise it against a live database without that entry's context.
+
+**One path still writes instance-wide, on purpose:** the `epigraph-engine`
+library recall has no principal at all, so there is no personal group to name
+and migration 062's `recall_events_group_needs_real_group` CHECK forbids
+substituting a sentinel. Rows from that path remain `('public', world)` and are
+identifiable by `agent_id IS NULL`.

@@ -1539,7 +1539,14 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
 /// evidence that this surface does — they are separate handlers.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
-    let viewer = viewerfx::public_viewer(&pool).await;
+    // A viewer for a REAL principal, not the nil one: the audit row is owned by
+    // the request principal's personal group, and a principal that is not an
+    // agent has none — so the write correctly drops rather than widening. See
+    // `recall_audit_wiring.rs::principal_viewer`.
+    let (audit_principal, _audit_group) = viewerfx::seed_agent_with_group(&pool, "rwc-audit").await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, audit_principal)
+        .await
+        .expect("resolve the request principal");
     use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
 
     let agent = diverse_fixture::seed_agent(&pool).await;

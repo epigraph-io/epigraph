@@ -1957,13 +1957,6 @@ struct ClaimProvRow {
 }
 #[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
-struct TraceProvRow {
-    id: Uuid,
-    methodology: String,
-    confidence: f64,
-}
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
 struct EvidenceProvRow {
     id: Uuid,
     source_url: Option<String>,
@@ -2249,19 +2242,33 @@ pub async fn claim_provenance(
 
     // 2. If claim has a trace, follow it
     if let Some(trace_id) = claim_row.trace_id {
-        let trace_row: Option<TraceProvRow> = sqlx::query_as(
-            "SELECT id, reasoning_type as methodology, confidence FROM reasoning_traces WHERE id = $1"
+        // READ THROUGH THE VIEWER, and not redundant with the claim check
+        // above for the same reason the evidence read below is not: `claims`
+        // and `reasoning_traces` carry their own tenancy, and `claims.trace_id`
+        // is a plain column — the trace a claim names need not be a trace that
+        // claim owns. This was an inline, viewer-less `SELECT` against a tier-A
+        // table in the route layer, which is also where CLAUDE.md says SQL may
+        // not live; both are fixed by the same move.
+        //
+        // The projection is the RAW `reasoning_type` string, so the step label
+        // is byte-identical to what this route returned before. See
+        // `ReasoningTraceRepository::provenance_step_by_id` for why
+        // `get_by_id` is the wrong reuse.
+        let trace_row = epigraph_db::ReasoningTraceRepository::provenance_step_by_id(
+            pool,
+            &viewer,
+            epigraph_core::TraceId::from_uuid(trace_id),
         )
-        .bind(trace_id)
-        .fetch_optional(pool)
         .await
-        .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?;
+        .map_err(|e| ApiError::InternalError {
+            message: format!("DB error: {e}"),
+        })?;
 
         if let Some(trace) = trace_row {
             let trace_step = ProvenanceStep {
                 id: trace.id,
                 entity_type: "trace".to_string(),
-                label: format!("{} ({:.2})", trace.methodology, trace.confidence),
+                label: format!("{} ({:.2})", trace.reasoning_type, trace.confidence),
             };
 
             // 3. Find evidence linked to this claim via edges

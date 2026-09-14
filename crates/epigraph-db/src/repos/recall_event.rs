@@ -68,6 +68,25 @@ pub struct NewRecallEvent {
     pub query_pgvector: Option<String>,
     pub params: serde_json::Value,
     pub returned_claim_ids: Vec<Uuid>,
+    /// The group that owns this audit row — the **querying principal's**
+    /// personal group, resolved ONCE by the caller rather than per event by
+    /// [`RecallEventRepository::log`], which sits on the tail of every recall.
+    ///
+    /// `None` means *there was no principal to resolve one from*, and is NOT a
+    /// caller's choice about visibility. It selects the instance-wide
+    /// declaration, so a caller that reaches it by collapsing a failure into
+    /// "no principal" publishes the row.
+    ///
+    /// **That invariant is enforced by a type, not by this comment.** The MCP
+    /// surfaces resolve through `tools::recall::recall_audit_owner_group`,
+    /// which returns `Result<Uuid, AuditOwnerUnresolved>` — no variant of that
+    /// error means "write it instance-wide", so an unresolvable identity drops
+    /// the row. The remaining `None` producer is the library path in
+    /// `epigraph-engine`, which has no principal at all and whose `agent_id` is
+    /// `None` for the same reason (`recall_events.agent_id` is nullable for
+    /// that caller on purpose). See [`RecallEventRepository::log`] for why that
+    /// one caller cannot be given a group instead.
+    pub owner_group_id: Option<Uuid>,
 }
 
 pub struct RecallEventRepository;
@@ -85,42 +104,44 @@ impl RecallEventRepository {
             .as_ref()
             .map(|v| ContentHasher::hash(v.as_bytes()).to_vec());
 
-        // ── Tenancy declaration (PR-16), AND A DELIBERATE NON-CHANGE ──
+        // ── Tenancy declaration ──
         //
         // `recall_events` has no parent and no inheritance arm, so migration
-        // 074 requires this write to name both columns. `instance_wide()`
-        // preserves EXACTLY the value the row carried under migration 062's
-        // DEFAULT: ('public', world). Nothing about who can read this table
-        // changes in PR-16.
+        // 074 requires this write to name both columns.
         //
-        // THAT IS NOT THE RIGHT LONG-TERM ANSWER, and it is recorded here
-        // rather than left to be discovered. `query_text` is the querying
-        // agent's raw search string, and plan §4.9's leak table rates
-        // "MCP get_recall_events -- others' raw search text" a BLOCKER. The
-        // correct declaration is `TenancyDecl::group(<the querying agent's
-        // personal group>)`, which would make each agent's recall history
-        // readable only by that agent.
+        // `query_text` is the querying agent's raw search string, so the row
+        // belongs to that agent and to nobody else: `group` over the agent's
+        // personal group, resolved once by the caller and threaded in on
+        // `NewRecallEvent` rather than looked up here, on the tail of every
+        // recall.
         //
-        // It is not made here, for two stated reasons rather than by omission:
-        //   1. It is a READ-path behaviour change -- cross-agent reads of
-        //      `get_recall_events` and `RecallEventRepository::list` start
-        //      returning fewer rows -- and PR-16's charter is "declare, do not
-        //      default". Changing the VALUE while changing the MECHANISM would
-        //      make a read regression indistinguishable from a 074 defect.
-        //   2. `log` is on the hot path of every `recall` / `recall_with_context`
-        //      call, and resolving a personal group per event is an extra round
-        //      trip per query. It wants the group threaded in on
-        //      `NewRecallEvent`, resolved once by the caller.
+        // THE VISIBILITY IS THE LOAD-BEARING HALF, not the owner. `list`'s
+        // predicate is `$bypass OR visibility = 'public' OR owner_group_id =
+        // ANY($groups)`, and a `'public'` row satisfies the middle disjunct
+        // whatever it is owned by -- which is why threading the group through
+        // while leaving `'public'` would still filter nothing. The one-shot
+        // backfill stamps these rows `('public', <the agent's personal
+        // group>)`, so the owner alone was already right and the predicate was
+        // still vacuous.
         //
-        // TRACKED, NOT JUST COMMENTED. A `grep -rn instance_wide` breadcrumb is
-        // not a commitment; every other residual in this series carries a `D-`
-        // id, and so does this one:
+        // THE AGENT-LESS CASE IS A MEASURED RESIDUAL, NOT A CHOICE. The library
+        // path in `epigraph-engine` has no principal at all -- its `agent_id`
+        // is `None` -- so there is no personal group to name, and the two
+        // memberless sentinel groups cannot stand in for one: migration 062's
+        // `recall_events_group_needs_real_group` CHECK forbids pairing `'group'`
+        // with either the world or the seed group, because a group-visible row
+        // owned by a memberless group is a black hole nobody, including its
+        // author, can read back. Refusing the write instead is also wrong: this
+        // function is best-effort by contract (see the module header) and
+        // `recall_event_test.rs::agentless_event_is_accepted` pins that an
+        // agent-less retrieval is still audited. So that ONE caller keeps the
+        // instance-wide declaration, and it is the whole of what remains open:
         // `D-PR16-recall-events-are-instance-wide` in
-        // `docs/tenancy/progress.json`, owned by the read-path PR. Closing it
-        // is a one-line change here plus a `NewRecallEvent` field, resolved
-        // once by each of the three callers (`mcp/tools/recall.rs`,
-        // `mcp/tools/memory.rs`, `engine/recall.rs`).
-        let decl = epigraph_core::TenancyDecl::instance_wide();
+        // `docs/tenancy/progress.json` records it, narrowed.
+        let decl = match event.owner_group_id {
+            Some(group) => epigraph_core::TenancyDecl::group(group),
+            None => epigraph_core::TenancyDecl::instance_wide(),
+        };
 
         let row = sqlx::query!(
             r#"

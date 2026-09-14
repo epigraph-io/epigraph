@@ -303,10 +303,18 @@
 //!   mixed trees: 466 was the pre-pilot figure.)
 //! * **The recon's headline 448 is not this scanner's 461, and neither is
 //!   wrong** — they are different needles. `state.db_pool` alone measures 445
-//!   here (447 before the pilot, which is the recon's ~448); adding the 9
-//!   `self.db_pool` sites inside `state.rs` and the lines carrying more than
-//!   one occurrence gives 461. This scanner's needle is the more complete one
-//!   and is the right key for the question it asks.
+//!   here (447 before the pilot, which is the recon's ~448); adding the
+//!   `self.db_pool` sites inside `state.rs` (the count [`EXEMPT`] records —
+//!   quoted here as 9 when this was written, and authoritative THERE, not
+//!   here) and the lines carrying more than one occurrence gives 461. This
+//!   scanner's needle is the more complete one and is the right key for the
+//!   question it asks.
+//!
+//!   **These four totals are a measurement of the tree ON THE DAY THIS LINT WAS
+//!   WRITTEN and are not re-derived on every change.** Conversions have landed
+//!   since; the assertions above measure the tree directly and are what a
+//!   reader should trust. The prose is kept for the *relationship* between the
+//!   needles, which does not go stale, not for the integers.
 //! * Whole-line comments are skipped by prefix, so a `.db_pool` appended after
 //!   code on the same line as a trailing comment is still counted (correctly),
 //!   while a commented-out call is not.
@@ -428,14 +436,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "state.rs",
-        9,
+        10,
         "Boot and observability, including the session-GUC probe itself. ENUMERATED rather than \
          waved at, because this is the one file where the needle is an indirection layer: a \
          `pub async fn` on AppState that reads self.db_pool is exempt-by-file no matter who calls \
          it, and a ViewerExtractor grep cannot detect the mixed case (AppState methods take &self; \
-         the Viewer lives in the calling handler). The nine sites are exactly \
-         load_entity_type_cache (1), assert_tenancy_triggers_armed (2), probe_rls_posture (3), \
-         rls_canary_visible (2) and warn_on_privileged_connection (1). VERIFIED BY CALL GRAPH, not \
+         the Viewer lives in the calling handler). The ten sites are exactly \
+         load_entity_type_cache (1), assert_tenancy_triggers_armed (3), probe_rls_posture (3), \
+         rls_canary_visible (2) and warn_on_privileged_connection (1). The third site in \
+         assert_tenancy_triggers_armed is migration 089's marker probe, added with \
+         TENANCY_TRIGGERS_089: it reads pg_proc, which carries no tenancy columns and no rows a \
+         Viewer could filter. VERIFIED BY CALL GRAPH, not \
          by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \
          routes/edges.rs. Scoping the probe to a Viewer would make it prove a property of that \

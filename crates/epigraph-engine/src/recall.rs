@@ -177,6 +177,11 @@ async fn log_recall_event(
         query_pgvector: pgvec.map(ToString::to_string),
         params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
         returned_claim_ids,
+        // No principal on this path — `agent_id` above is `None` for the same
+        // reason — so there is no personal group to own the row. See
+        // `RecallEventRepository::log` for why a memberless sentinel group
+        // cannot stand in and why the write is not refused instead.
+        owner_group_id: None,
     };
     if let Err(e) = epigraph_db::RecallEventRepository::log(pool, event).await {
         tracing::warn!(error = %e, "engine recall audit log failed; recall unaffected");

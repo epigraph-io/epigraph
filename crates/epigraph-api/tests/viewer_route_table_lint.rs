@@ -129,20 +129,37 @@ use std::path::{Path, PathBuf};
 ///
 /// Read "4 → 0" as **all four COUNTED statements**, which is the only thing
 /// this lint measures. `measure_inline_claim_content_reads` matches the
-/// `tier_a` *claim-content* column set and nothing else, so three inline reads
-/// survive in `edges.rs::claim_provenance` that it has never counted and still
-/// does not: two `SELECT target_id FROM edges …` projections (edge columns) and
-/// one `SELECT id, reasoning_type, confidence FROM reasoning_traces WHERE id =
-/// $1`. `reasoning_traces` IS a tier_a table (062 lists it; 070 carries it), and
-/// `ReasoningTraceRepository::get_by_id(pool, viewer, id)` is the filtered form —
-/// but it returns a parsed `Methodology` enum where the handler formats a raw
-/// `reasoning_type` string, so swapping it changes a response field and can turn
-/// an unrecognised value into a 500. That is a behaviour change, not a move, and
-/// PR-14 does not make it: the read is pre-existing, the deleted pass never
-/// covered it, and it is filed as `D-PR16-claim-provenance-trace-read-unfiltered`
-/// in `docs/tenancy/progress.json`. Stated here because a security ratchet whose
-/// prose over-claims its own measurement is how the previous revision of this
-/// file went wrong.
+/// `tier_a` *claim-content* column set and nothing else, so inline reads survive
+/// in `edges.rs::claim_provenance` that it has never counted and still does not:
+/// two `SELECT target_id FROM edges …` projections, which are edge columns and
+/// no content.
+///
+/// **A fourth statement in the same file, enumerated so this paragraph does not
+/// under-count its own subject.** `edges.rs::propagate_to_dependents` runs
+/// `SELECT DISTINCT rt.claim_id FROM reasoning_traces rt, jsonb_array_elements(…)`
+/// with a `Viewer` in scope and unspent. Measured rather than assumed: the ids
+/// reach no response — only a `tracing::info!` — and the write they feed is
+/// itself viewer-filtered, because `recompute_claim_belief` reads its BBAs
+/// through `MassFunctionRepository::get_for_claim_frame(pool, viewer, …)` and
+/// no-ops on a claim the viewer cannot see. So no cross-group mutation and no
+/// id disclosure. Recorded here rather than left in a review comment, because
+/// the next reader of this paragraph would otherwise re-open it.
+///
+/// **A third one used to be here and no longer is.** The inline
+/// `SELECT id, reasoning_type, confidence FROM reasoning_traces WHERE id = $1`
+/// became `ReasoningTraceRepository::provenance_step_by_id(pool, viewer, id)` —
+/// a repo-layer read carrying a `/* {VISIBILITY:rt} */` marker — closing
+/// `D-PR16-claim-provenance-trace-read-unfiltered`. **No number in this file
+/// moved when it did**, which is the point of this paragraph: the statement was
+/// never counted, so the register could not have shown its removal any more than
+/// it showed its presence. Not `get_by_id`, whose parsed `Methodology` return
+/// would have changed a response field; the new function projects the raw
+/// `reasoning_type` and the label is byte-identical.
+///
+/// Stated here because a security ratchet whose prose over-claims its own
+/// measurement is how the previous revision of this file went wrong — and
+/// "the register is unchanged" was never evidence about these statements in
+/// either direction.
 ///
 /// **`claims.rs` 3 → 3, but they are not what the register said they were.**
 /// The three counted statements are at `claims.rs` lines 2193, 2241 and 2668,
@@ -165,7 +182,9 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3)];
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
 ///
-/// Thirteen handler sites across eight files read `tier_a` claim content inline
+/// Twelve handler sites across seven files read `tier_a` claim content inline
+/// (thirteen across eight until `tenancy/fix-security-track` retired
+/// `hypothesis.rs`'s — see the comment on that removal below)
 /// in the route layer with no `Viewer` spliced into the statement. Before PR-14
 /// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
 /// become live disclosure the moment ownership is transcribed into the tenancy
@@ -184,7 +203,7 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3)];
 /// So this is a live-disclosure register, not a latent one, and the deadline it
 /// carries is **overdue since PR-12** rather than pending. PR-14 does not
 /// discharge it: the plan's *Files* line scopes this PR to deleting redaction,
-/// and converting thirteen handlers in eight unrelated files is a different
+/// and converting the remaining handlers in unrelated files is a different
 /// change with a different blast radius. The owner is recorded on
 /// `open_findings::F-inline-claim-content-reads` in
 /// `docs/tenancy/progress.json` (proposed: PR-16, which already owns the
@@ -208,7 +227,19 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // duplicates of SQL in `epigraph-mcp/src/tools/matching.rs`; there is now
     // one copy, in the repo layer, filtered.
     ("embeddings.rs", 1),
-    ("hypothesis.rs", 1),
+    // `hypothesis.rs` was 1 until `tenancy/fix-security-track` and is now 0, so
+    // it is gone from the register entirely. The site was
+    // `create_hypothesis`'s VOI neighborhood scan — `SELECT c.id, c.belief,
+    // c.plausibility, 1 - (c.embedding <=> $1::vector) ... FROM claims c`, which
+    // this lint DID count (it names `FROM claims` and projects `embedding`, a
+    // `CONTENT_COLUMNS` token). Every number in that handler's `voi` response
+    // object is an aggregate over its rows, so the response was a function of
+    // claims the caller may not read. It is now
+    // `ClaimRepository::grounded_neighborhood(pool, viewer, ..)`, which marks
+    // `claims` AND the grounding subquery's `edges`. The handler's extractor
+    // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
+    // taking the principal-only extractor is what would have kept this read out
+    // of every register permanently.
     ("policies.rs", 2),
     ("political.rs", 1),
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old

@@ -77,10 +77,10 @@ pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
     ClaimNeighbor, ClaimPairDistance, ClaimRepository, ConsolidateMode, ConsolidateResult,
-    DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, HybridHit, LabelQuery,
-    LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    EXPANSION_RELATIONSHIPS,
+    DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
+    HybridHit, LabelQuery, LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff,
+    PatchClaimInput, SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -135,7 +135,7 @@ pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use structural::{BeliefIntervalRow, StructuralRepository};
-pub use trace::ReasoningTraceRepository;
+pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
