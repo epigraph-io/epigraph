@@ -271,11 +271,37 @@ In `~/tenancy-pending-decisions.md`, filed as EpiGraph backlog claims labelled
   follows
 - **`F-089-F`** — the harvester trust model
 
-### 6.3 When to merge to `main`
-`integration/tenancy` is **188 commits ahead** and `main` is **0 ahead** — the divergence
-window is the smallest it will ever be, and it closes as §2 lands. Merging before 11d ships
-a large, inert, well-tested change; merging after ships an enforcement change. **Both are
-defensible and the choice is not implicit — make it deliberately.**
+### 6.3 When to merge to `main` — **DECIDED, 2026-09-14. Do not re-open.**
+
+**`integration/tenancy` remains the integration branch, and every item in this plan targets
+it. Nothing merges to `main` until end-to-end tests pass against `integration/tenancy`, and
+the promotion to production happens after that — not before.**
+
+So the answer to the question this section used to pose is **neither** of the two options it
+offered. It framed the choice as "merge to `main` before 11d or after 11d" and omitted the
+one the operator actually wanted: **merge after end-to-end validation on the integration
+branch**, which is a gate this plan had not accounted for at all.
+
+An earlier revision of this section described the divergence window as "the smallest it will
+ever be," which reads as an argument to merge early. That is a real property and it is not a
+reason. A merge to `main` is a promotion, and promotion waits on validation rather than on
+the convenience of the diff. **The window widening as §2 lands is expected and is not a
+cost worth pre-empting.**
+
+Consequences for everything else in this document:
+
+- Every workflow, shard and batch targets `integration/tenancy`. The merge watcher already
+  enforces this for `tenancy/*` branches and refuses to merge that branch to `main` by
+  design — that refusal is correct and stays.
+- §8's acceptance criteria are evaluated **on `integration/tenancy`**, not on `main`.
+- The deploy in §2.4 is gated on end-to-end validation in addition to 11d and
+  `D-PR14-transcription-is-a-deploy-prerequisite`.
+
+**Standing e2e gate, not yet specified.** This plan does not define what the end-to-end
+suite covers, and that is a gap worth naming rather than assuming: §1 establishes that the
+enforcement boundary is Rust rather than Postgres, so an e2e suite that exercises only the
+HTTP surface would validate the convention and not the boundary. Specifying it is its own
+piece of work and belongs to whoever owns the promotion.
 
 ---
 
@@ -291,6 +317,10 @@ items, for the same reason: they cannot be worked, only answered.
 ---
 
 ## §8 — Acceptance for this plan as a whole
+
+**Every criterion below is evaluated on `integration/tenancy`, not on `main`** (§6.3).
+Criterion 3 is the one exception, because it is about a running system rather than a branch,
+and it is reached only after the end-to-end gate.
 
 1. `HIGH_WATER` reaches its floor and the register documents what remains exempt and why.
 2. Step 11d has run, and a **non-bypass role** is demonstrably refused — not a superuser
