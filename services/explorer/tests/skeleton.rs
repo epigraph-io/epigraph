@@ -238,10 +238,7 @@ async fn every_area_route_is_mounted() {
     let bff = [
         format!("/explorer/bff/claim/{CLAIM}"),
         "/explorer/bff/search?q=x".to_string(),
-        format!("/explorer/bff/graph/ego/{CLAIM}"),
-        "/explorer/bff/themes".to_string(),
-        "/explorer/bff/communities".to_string(),
-        format!("/explorer/bff/neighborhood/{CLAIM}"),
+        // Graph-area BFF routes are built: tests/graph.rs covers them.
     ];
     for uri in &bff {
         let res = app.get_as(uri, &sid).await;
