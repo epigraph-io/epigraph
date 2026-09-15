@@ -12,7 +12,8 @@ use crate::state::AppState;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum RefreshError {
-    /// Refresh is not implemented/configured (no client id, or stubbed).
+    /// Refresh is not configured. The refresh grant needs no client id
+    /// upstream, so [`oauth::refresh_grant`] does not return this today.
     #[error("token refresh unavailable")]
     Unavailable,
     /// The session is gone (logged out, expired, or never existed).
