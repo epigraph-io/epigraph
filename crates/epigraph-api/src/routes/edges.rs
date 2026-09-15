@@ -2212,8 +2212,11 @@ pub async fn claim_provenance(
     let access = check_content_access(pool, claim_id, requester).await;
     let claim_label = if access == ContentAccess::Redacted {
         "[REDACTED]".to_string()
-    } else if claim_row.content.len() > 60 {
-        format!("{}...", &claim_row.content[..57])
+    } else if claim_row.content.chars().count() > 60 {
+        // Count and cut in chars: a byte slice panics when a multi-byte
+        // character straddles the cut. Same rule as `load_subgraph` labels.
+        let truncated: String = claim_row.content.chars().take(57).collect();
+        format!("{truncated}...")
     } else {
         claim_row.content.clone()
     };
