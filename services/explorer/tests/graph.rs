@@ -1,6 +1,7 @@
-//! Graph area: `/bff/graph/ego/:id`, `/bff/themes`, `/bff/communities` and
-//! `/bff/neighborhood/:id`, against a wiremock upstream shaped like plan
-//! §2.2 and `graph-entity-endpoints.md` §1-3 (text/plain errors included).
+//! Graph area: `/bff/graph/ego/:id`, `/bff/themes`, `/bff/communities`,
+//! `/bff/neighborhood/:id` and the graph assets, against a wiremock upstream
+//! shaped like plan §2.2 and `graph-entity-endpoints.md` §1-3 (text/plain
+//! errors included).
 
 mod common;
 
@@ -479,4 +480,46 @@ async fn neighborhood_bff_404_is_json() {
         .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     assert_eq!(res.json()["error"], "not_found");
+}
+
+// ---- static assets ----------------------------------------------------------------
+
+#[tokio::test]
+async fn graph_assets_are_served_with_their_content_types() {
+    let app = spawn().await;
+    for (name, ct) in [
+        ("graph.js", "text/javascript; charset=utf-8"),
+        ("graph.css", "text/css; charset=utf-8"),
+    ] {
+        let res = app.get(&format!("/explorer/static/{name}")).await;
+        assert_eq!(res.status, StatusCode::OK, "{name}");
+        assert_eq!(res.header("content-type"), Some(ct), "{name}");
+        assert_eq!(res.header("x-content-type-options"), Some("nosniff"));
+        assert!(!res.body.is_empty());
+    }
+}
+
+/// Pins graph.js's safety rules (no eval, no HTML parsing of data) so a
+/// later edit cannot quietly break them; the browser behaviour itself is
+/// exercised by hand.
+#[test]
+fn graph_js_never_parses_strings_as_code_or_html() {
+    let js = include_str!("../static/graph.js");
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "new Function",
+        "setAttribute('style'",
+        ".style.",
+    ] {
+        assert!(!js.contains(banned), "graph.js must not use {banned}");
+    }
+    assert!(js.contains("'use strict'"));
+    assert!(
+        js.contains("function localPath("),
+        "URLs from data are checked"
+    );
 }
