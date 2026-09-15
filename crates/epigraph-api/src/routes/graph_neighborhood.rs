@@ -1,13 +1,16 @@
 //! /api/v1/graph/neighborhoods/:id/expand — compound + atomic modes.
 //!
-//! Compound mode (this file): nodes are compound claims (those with
+//! Compound mode (the default): nodes are compound claims (those with
 //! decomposes_to children inside the neighborhood) plus standalone claims
 //! (no decomposes_to in either direction). Edges are induced from atom-level
 //! relationships (mass-weighted by `forward_strength`) plus direct
 //! compound-compound edges that exist outside the decomposition hierarchy.
 //!
-//! Atomic mode is implemented in Task 8 — for now `atomic_response` returns
-//! an empty placeholder.
+//! Atomic mode (`?mode=atomic`) returns the neighborhood's member claims
+//! themselves, the epistemic edges between them (`decomposes_to` excluded,
+//! positive `forward_strength` only), and the compound groups those atoms
+//! belong to. Neither mode applies `budget` yet, so both report
+//! `truncated: false`.
 
 use axum::{
     extract::{Path, Query, State},
