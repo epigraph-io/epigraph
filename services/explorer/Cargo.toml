@@ -15,6 +15,10 @@ description = "Server-rendered web UI and BFF for the EpiGraph knowledge graph"
 name = "epigraph_explorer"
 path = "src/lib.rs"
 
+[[bin]]
+name = "epigraph-explorer"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 askama = "0.16"

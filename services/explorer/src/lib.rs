@@ -2,15 +2,17 @@
 //! graph, and the BFF its client-side JS talks to.
 //!
 //! The contract is `docs/superpowers/plans/2026-09-15-epigraph-explorer-impl-plan.md`.
-//! Everything lives in the library so integration tests can build the same
-//! router the binary serves.
+//! `main.rs` is config → state → router → serve; everything else is here so
+//! integration tests can build the same router.
 
 pub mod app;
 pub mod assets;
 pub mod auth;
+pub mod bff;
 pub mod config;
 pub mod error;
 pub mod links;
+pub mod pages;
 pub mod security;
 pub mod state;
 pub mod ttl;

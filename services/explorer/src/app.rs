@@ -12,7 +12,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::error::{self, AppError};
 use crate::state::AppState;
-use crate::{assets, auth, security};
+use crate::{assets, auth, bff, pages, security};
 
 /// Forms and redeem bodies are tiny; nothing legitimate comes near this.
 pub const MAX_REQUEST_BODY: usize = 64 * 1024;
@@ -37,6 +37,11 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .route("/health", get(health))
         .route("/static/{*path}", get(assets::serve))
         .merge(auth::routes())
+        .merge(pages::core::routes())
+        .merge(pages::entities::routes())
+        .merge(pages::graph::routes())
+        .merge(bff::core::routes())
+        .merge(bff::graph::routes())
         .merge(extra);
 
     let base = state.config.base_path.clone();
