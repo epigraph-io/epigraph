@@ -1,20 +1,23 @@
 //! `/`, `/search`, `/claim/:id` (plan §3.4). OWNED BY THE CORE AREA.
 //!
-//! The claim composition lives in submodules so `/bff/claim/:id`
-//! (`crate::bff::core`) serves exactly what the page renders.
+//! The claim composition and the search runner live in submodules so
+//! `/bff/claim/:id` and `/bff/search` (`crate::bff::core`) serve exactly
+//! what the pages render.
 
 pub mod claim_view;
 pub mod relationships;
+pub mod search_view;
 pub mod vocab;
 
 use askama::Template;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use axum::routing::get;
 use axum::Router;
 use uuid::Uuid;
 
 use self::claim_view::{compose, og_for_claim, og_generic, ClaimView, EdgeEvidenceRow, Og};
+use self::search_view::{Mode, RawSearchQuery, SearchOutcome, SearchParams};
 use self::vocab::fmt_prob;
 use crate::auth::{Caller, PageCtx, SignedIn};
 use crate::error::AppError;
@@ -39,9 +42,31 @@ async fn landing(user: SignedIn) -> Result<Html<String>, AppError> {
     stub_page(user.ctx, "EpiGraph Explorer", "core")
 }
 
-// STUB: semantic / label / evidence search.
-async fn search(user: SignedIn) -> Result<Html<String>, AppError> {
-    stub_page(user.ctx, "Search", "core")
+// ---- /search ---------------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "core/search.html")]
+struct SearchPage {
+    ctx: PageCtx,
+    outcome: SearchOutcome,
+    modes: [Mode; 3],
+}
+
+async fn search(
+    State(state): State<AppState>,
+    user: SignedIn,
+    Query(raw): Query<RawSearchQuery>,
+) -> Result<Html<String>, AppError> {
+    let params = SearchParams::from_raw(&raw);
+    let api = user.api(&state);
+    let outcome = search_view::run(&api, &state.links, &params).await?;
+    let mut ctx = user.ctx;
+    ctx.search_query = params.q.clone();
+    render(&SearchPage {
+        ctx,
+        outcome,
+        modes: Mode::ALL,
+    })
 }
 
 // ---- /claim/:id --------------------------------------------------------------------

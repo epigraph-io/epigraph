@@ -1,6 +1,7 @@
-//! Core area against a wiremock upstream: the composed claim page (grouped
-//! outlinks, evidence, redaction short-circuit, degraded sections, OG),
-//! anonymous unfurls, and the `/bff/claim` ETag. Upstream JSON is shaped exactly like the mapping
+//! Core area against a wiremock upstream: search in all three modes, the
+//! composed claim page (grouped outlinks, evidence,
+//! redaction short-circuit, degraded sections, OG), anonymous unfurls, and
+//! the `/bff/claim` ETag. Upstream JSON is shaped exactly like the mapping
 //! reports (`claims-endpoints.md`, `search-overview-endpoints.md`, plan
 //! §2.2–§2.4), including omitted optional fields.
 
@@ -13,7 +14,7 @@ use axum::Router;
 use common::{spawn, spawn_with, TestApp};
 use epigraph_explorer::config::{ENV_PUBLIC_UNFURL, ENV_UPSTREAM_TIMEOUT_MS};
 use serde_json::{json, Value};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 const CLAIM: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
@@ -267,6 +268,10 @@ async fn core_routes_are_mounted_and_built() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
 
+    let res = app.get_as("/explorer/search?q=x", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("Search failed."), "{}", res.body);
+
     let res = app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     assert!(res.body.contains("We could not find that claim."));
@@ -276,6 +281,10 @@ async fn core_routes_are_mounted_and_built() {
         .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     assert_eq!(res.json()["error"], "not_found");
+
+    let res = app.get_as("/explorer/bff/search?q=x", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.json()["results"]["status"], "unavailable");
 }
 
 // ---- /claim/:id -----------------------------------------------------------------------
@@ -821,4 +830,251 @@ async fn bff_claim_requires_sign_in() {
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
     assert_eq!(res.json()["error"], "unauthorized");
     assert!(upstream_paths(&app).await.is_empty());
+}
+
+// ---- /search ---------------------------------------------------------------------------------
+
+fn semantic_hit(id: &str, statement: &str, similarity: f64) -> Value {
+    json!({
+        "claim_id": id, "statement": statement, "similarity": similarity,
+        "epistemic": {"belief": 0.6, "plausibility": 0.9, "ignorance": 0.3, "truth_value": 0.8},
+        "agent_id": AGENT
+    })
+}
+
+#[tokio::test]
+async fn semantic_search_posts_the_query_and_links_results() {
+    let app = spawn().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/search/semantic"))
+        .and(header("authorization", "Bearer tok"))
+        .and(body_json(json!({"query": "water boils", "limit": 50})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                semantic_hit(CLAIM, CONTENT, 0.923),
+                semantic_hit(SUPPORTED, "[REDACTED]", 0.5)
+            ],
+            "total": 2, "query_time_ms": 12
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as("/explorer/search?q=water+boils&page=3", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let body = &res.body;
+    assert!(body.contains(&format!(
+        "<a href=\"/explorer/claim/{CLAIM}\">{CONTENT}</a>"
+    )));
+    assert!(body.contains("92% match"));
+    assert!(body.contains("truth 0.80"));
+    assert!(body.contains("belief [0.60, 0.90]"));
+    assert!(body.contains(&format!(
+        "<a href=\"/explorer/claim/{SUPPORTED}\" class=\"result__hidden\">Content hidden</a>"
+    )));
+    assert!(!body.contains("[REDACTED]"));
+    assert!(
+        body.contains("the EpiGraph API cannot page further"),
+        "unpaged mode says so"
+    );
+    assert!(!body.contains("rel=\"next\"") && !body.contains("rel=\"prev\""));
+    assert!(body.contains("value=\"water boils\""), "query prefilled");
+    assert!(body.contains("value=\"semantic\" checked"));
+}
+
+#[tokio::test]
+async fn label_search_pages_by_offset_while_pages_are_full() {
+    let app = spawn().await;
+    let hit = |i: usize| {
+        json!({
+            "id": format!("0000000{}-0000-4000-8000-{:012}", i % 10, i),
+            "content": format!("Labelled claim {i}"), "truth_value": 0.5, "agent_id": AGENT,
+            "created_at": "2026-01-02T03:04:05+00:00", "labels": ["a", "b"],
+            "is_current": i != 1, "supersedes": null
+        })
+    };
+    for (offset, n) in [("0", 20usize), ("20", 3)] {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/claims/by-labels"))
+            .and(query_param("labels", "a,b"))
+            .and(query_param("current_only", "true"))
+            .and(query_param("limit", "20"))
+            .and(query_param("offset", offset))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Value::Array((0..n).map(hit).collect())),
+            )
+            .expect(1)
+            .mount(&app.upstream)
+            .await;
+    }
+    let sid = app.sign_in("tok");
+
+    let res = app
+        .get_as("/explorer/search?q=a%2C+b&mode=label", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains("Labelled claim 19"));
+    assert!(res.body.contains("page 1"));
+    assert!(res
+        .body
+        .contains("href=\"/explorer/search?q=a%2C+b&#38;mode=label&#38;page=2\" rel=\"next\""));
+    assert!(!res.body.contains("rel=\"prev\""));
+    assert!(res
+        .body
+        .contains("<span class=\"result__superseded\">superseded</span>"));
+    assert!(res.body.contains("2026-01-02"));
+
+    let res = app
+        .get_as("/explorer/search?q=a%2C+b&mode=label&page=2", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("Labelled claim 2"));
+    assert!(res
+        .body
+        .contains("href=\"/explorer/search?q=a%2C+b&#38;mode=label&#38;page=1\" rel=\"prev\""));
+    assert!(
+        !res.body.contains("rel=\"next\""),
+        "a short page is the last"
+    );
+    assert!(!res.body.contains("cannot page further"));
+}
+
+#[tokio::test]
+async fn evidence_search_links_evidence_and_its_claim() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/search/evidence"))
+        .and(query_param("query", "boiling point"))
+        .and(query_param("limit", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [
+                {"evidence_id": EVIDENCE, "claim_id": CLAIM, "raw_content": "Table of boiling points",
+                 "evidence_type": "document", "similarity": 0.81},
+                {"evidence_id": "7f7f7f7f-0000-4000-8000-000000000017", "claim_id": SUPPORTED,
+                 "raw_content": null, "evidence_type": "testimony", "similarity": 0.4}
+            ],
+            "count": 2
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as("/explorer/search?q=boiling+point&mode=evidence", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains(&format!(
+        "<a href=\"/explorer/claim/{CLAIM}\">Table of boiling points</a>"
+    )));
+    assert!(res.body.contains(&format!(
+        "<a href=\"/explorer/evidence/{EVIDENCE}\">Evidence details</a>"
+    )));
+    assert!(res.body.contains("<span class=\"label\">Document</span>"));
+    assert!(res.body.contains("<span class=\"label\">Testimony</span>"));
+    assert!(res.body.contains("(no text)"));
+    assert!(res.body.contains("81% match"));
+}
+
+#[tokio::test]
+async fn search_empty_results_blank_queries_and_failures() {
+    let app = spawn().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/search/semantic"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"results": [], "total": 0, "query_time_ms": 1})),
+        )
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/search/evidence"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_json(json!({"error": "InternalError", "message": "sqlx: secret"})),
+        )
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    let res = app.get_as("/explorer/search?q=nothing+matches", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("No results for “nothing matches”."));
+
+    let res = app.get_as("/explorer/search?q=x&mode=evidence", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res
+        .body
+        .contains("Search failed. The EpiGraph API is unavailable right now."));
+    assert!(!res.body.contains("secret"));
+
+    // Nothing to search for: the form only, no upstream call.
+    for uri in [
+        "/explorer/search",
+        "/explorer/search?q=++&mode=label",
+        "/explorer/search?q=%2C+%2C&mode=label",
+    ] {
+        let res = app.get_as(uri, &sid).await;
+        assert_eq!(res.status, StatusCode::OK, "{uri}");
+        assert!(!res.body.contains("id=\"results-title\""), "{uri}");
+    }
+    let res = app.get_as("/explorer/search?q=%2C&mode=label", &sid).await;
+    assert!(res.body.contains("Enter one or more labels"));
+    let long = "q".repeat(1001);
+    let res = app
+        .get_as(&format!("/explorer/search?q={long}"), &sid)
+        .await;
+    assert!(res.body.contains("That search is too long."));
+
+    assert_eq!(
+        upstream_paths(&app).await.len(),
+        2,
+        "only the two real searches"
+    );
+}
+
+#[tokio::test]
+async fn bff_search_returns_the_normalised_outcome() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/claims/by-labels"))
+        .and(query_param("labels", "physics"))
+        .and(query_param("offset", "20"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": CLAIM, "content": CONTENT, "truth_value": 0.8, "agent_id": AGENT,
+            "created_at": "2026-01-02T03:04:05+00:00", "labels": ["physics"],
+            "is_current": true, "supersedes": null
+        }])))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as("/explorer/bff/search?q=physics&mode=label&page=2", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let v = res.json();
+    assert_eq!(v["mode"], "label");
+    assert_eq!(v["page"], 2);
+    assert_eq!(v["paging_supported"], true);
+    assert_eq!(v["results"]["status"], "ok");
+    assert_eq!(
+        v["results"]["data"][0]["claim_url"],
+        format!("/explorer/claim/{CLAIM}")
+    );
+    assert_eq!(v["results"]["data"][0]["text"], CONTENT);
+    assert_eq!(
+        v["prev_url"],
+        "/explorer/search?q=physics&mode=label&page=1"
+    );
+    assert_eq!(v["next_url"], Value::Null);
+
+    let res = app.get_as("/explorer/bff/search?q=+", &sid).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert_eq!(res.json()["error"], "bad_request");
+    let res = app.get("/explorer/bff/search?q=x").await;
+    assert_eq!(res.status, StatusCode::UNAUTHORIZED);
 }

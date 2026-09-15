@@ -1,11 +1,11 @@
 //! `/bff/claim/:id`, `/bff/search` (plan §3.4). OWNED BY THE CORE AREA.
 //!
-//! `/bff/claim/:id` serves exactly what the claim page renders (the
-//! composition lives in `crate::pages::core`), as JSON. Degraded sections
-//! serialize as `{"status":"unavailable","reason":…}`.
+//! Both serve exactly what the matching page renders (the composition lives
+//! in `crate::pages::core`), as JSON. Degraded sections serialize as
+//! `{"status":"unavailable","reason":…}`.
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -16,6 +16,7 @@ use crate::auth::SignedIn;
 use crate::error::AppError;
 use crate::pages::core::claim_view::compose;
 use crate::pages::core::parse_claim_id;
+use crate::pages::core::search_view::{self, RawSearchQuery, SearchOutcome, SearchParams};
 use crate::state::AppState;
 
 /// Composed per viewer, so never shared; revalidate every time (the ETag
@@ -94,9 +95,23 @@ pub fn if_none_match_hits(header_value: &str, etag: &str) -> bool {
         .any(|t| t == "*" || opaque(t) == ours)
 }
 
-// STUB: as `/search`.
-async fn search(_user: SignedIn) -> Result<Json<serde_json::Value>, AppError> {
-    Err(AppError::NotBuilt("/bff/search"))
+/// As `/search`, as JSON. An empty or invalid query is a 400 here (the page
+/// shows the form instead).
+async fn search(
+    State(state): State<AppState>,
+    user: SignedIn,
+    Query(raw): Query<RawSearchQuery>,
+) -> Result<Json<SearchOutcome>, AppError> {
+    let params = SearchParams::from_raw(&raw);
+    if params.q.is_empty() {
+        return Err(AppError::BadRequest("Enter a search query.".into()));
+    }
+    let api = user.api(&state);
+    let outcome = search_view::run(&api, &state.links, &params).await?;
+    if let Some(problem) = &outcome.problem {
+        return Err(AppError::BadRequest(problem.clone()));
+    }
+    Ok(Json(outcome))
 }
 
 #[cfg(test)]
