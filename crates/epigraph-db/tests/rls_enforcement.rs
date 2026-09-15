@@ -1378,12 +1378,55 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// | Site | Table | Pool | Disposition |
 /// |---|---|---|---|
 /// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (`bin/server.rs` builds `job_pool` from `maintenance_url`; both `PostgresJobQueue::new` sites take it) | `epigraph_bypass()` is true, guard intact |
-/// | `edge.rs::create_symmetric_if_absent` | `edges` | app | degrades to duplicate edge |
-/// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto, but `alternative_of` carries `edges_alternative_of_symmetric_uniq`, so a duplicate raises 23505 rather than landing |
-/// | `graph_view.rs` (2 sites) | `edges` | app | already-decomposed claims reappear as undecomposed |
+/// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
+/// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
+/// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
 /// | `graph_neighborhood.rs` (2 sites) | `edges` | app | ditto |
 ///
-/// **None is a read leak**; every one is a correctness degradation on writes or
+/// # CORRECTION: the general mechanism does not hold for the two `edges` WRITE guards
+///
+/// Measured on this tree rather than inherited. A guard subquery goes blind only
+/// if the writer can perform the insert but not the read, and on these two that
+/// combination is mostly unreachable:
+///
+/// * `edges_validate_refs` (`trigger_validate_edge_refs`) is BEFORE INSERT and
+///   SECURITY INVOKER, so it is RLS-filtered. A session that cannot see both
+///   endpoint rows gets `foreign_key_violation` — fail-CLOSED, not a silent
+///   duplicate.
+/// * When a session CAN see both endpoints, every branch of
+///   `epigraph_edges_tenancy`'s stamp derives the edge's owner and co-owner from
+///   those same endpoints, so a trigger-stamped edge between two visible claims
+///   is itself visible to that session under the co-ownership INTERSECTION.
+///
+/// Two cases survive, and migration 090 is what closes them: the guard is not
+/// atomic (two concurrent promote decisions both see an empty guard), and an
+/// edge can keep a group stamp after both of its endpoints become public,
+/// because 072 arm (d) carries a deliberate NO-WIDENING rule. In the second the
+/// writer sees the endpoints, not the edge. Neither is a read leak.
+///
+/// The row count for `graph_view.rs` is also corrected upward: three `NOT
+/// EXISTS` clauses across `neighborhood_compound_nodes` (2) and
+/// `compound_neighbors` (1), not two. The enumeration in this table is narrower
+/// than the set of app-pool guard subqueries that actually exist; that analysis
+/// is held outside this repository and the residual is owned by
+/// `D-PR17-read-guards-widen-under-rls`, which stays OPEN for the read sites —
+/// no unique constraint can repair a read that returns fewer rows.
+///
+/// **None is a read leak**, and migration 090 does not make one — but the
+/// condition that holds it true is now worth naming, because it is a property
+/// of the CALLERS rather than of the repair. A unique index enforces itself
+/// across policy boundaries by construction, so post-090
+/// `create_symmetric_if_absent` answers `false` ("already linked") about an edge
+/// the writing session cannot see. That boolean reaches no caller-visible
+/// response: all three production callers discard it —
+/// `routes/cross_source.rs`'s PROMOTE arm returns `{id, status}`,
+/// `tools/matching.rs` returns `row_to_out(updated)`, and
+/// `matching/policy.rs::write_edge` returns `Ok(())`. A future caller that wants
+/// to surface it (as the sibling `_returning` variant already surfaces
+/// `created`) has to confront that first. Recorded against
+/// `D-PR17-read-guards-widen-under-rls`.
+///
+/// Every site here is a correctness degradation on writes or
 /// counts, and every one is latent until step 11d repoints `DATABASE_URL` — the
 /// same precondition `D-PR17-request-path-never-stamps-session-gucs` already
 /// gates. Replacing the read-guards with real unique constraints is recorded as
@@ -1417,8 +1460,339 @@ fn guard_subquery_sites_are_enumerated() {
 }
 
 // ===========================================================================
+// Migration 090 — the symmetric-dedup guard, on a role a policy filters
+// ===========================================================================
+
+/// The properties every production caller of `create_symmetric_if_absent`
+/// stamps, and the marker migration 090's predicate is keyed on.
+fn matcher_props() -> serde_json::Value {
+    serde_json::json!({ "source": "cross_source_matcher" })
+}
+
+/// `EdgeRepository::create_symmetric_if_absent` must still answer "already
+/// linked" when the existing edge is not visible to the connection asking.
+///
+/// # Why this needs an app-role pool, and why the earlier shape of this finding did not reproduce
+///
+/// `D-PR17-read-guards-widen-under-rls` states the general mechanism: a
+/// `WHERE NOT EXISTS (SELECT 1 FROM t …)` guard over a protected `t` returns
+/// nothing to a non-bypass role, so the guard degrades into an unconditional
+/// insert. Measured on this tree, that does NOT hold for this site as stated,
+/// and the reason is recorded on `guard_subquery_sites_are_enumerated` above:
+/// `edges_validate_refs` is SECURITY INVOKER and refuses the insert outright
+/// when the writer cannot see both endpoints, and when it CAN see both
+/// endpoints `epigraph_edges_tenancy` derives the edge's ownership from those
+/// same endpoints, so the edge is visible too.
+///
+/// What survives is the case where an edge's ownership NO LONGER follows its
+/// endpoints'. Migration 072 arm (d) carries a deliberate NO-WIDENING rule, so
+/// an edge stamped `('group', G)` keeps that stamp when both of its endpoints
+/// are later widened to public. The writer then sees both claims and not the
+/// edge.
+///
+/// # How the fixture reaches that state, stated precisely
+///
+/// It PLANTS it: the edge is written the ordinary production way so
+/// `epigraph_edges_tenancy` stamps it, and then a direct `UPDATE claims` with
+/// `epigraph.allow_declassify` armed widens both endpoints. It is NOT produced
+/// by a production writer, and saying so would be false —
+/// `PrivatizationRepository::restore_claims_conn` is the only caller of that GUC
+/// in the tree, and `epigraph-jobs/src/privatization.rs` follows it with
+/// `recompute_boundary_meet_conn` in the same transaction precisely so no edge
+/// is committed disagreeing with its endpoints. What makes the planted state
+/// legitimate is not its provenance but the PREMISE assertion below: the state
+/// is reachable by any writer that widens claims without re-running the
+/// boundary meet, and the assertion proves the database really is in it. The
+/// nil `owner_group_id` written here is also not what `restore_claims_conn`
+/// writes (it restores `before_owner_group_id`); it is the value 074 requires
+/// beside `visibility = 'public'`.
+///
+/// # The properties
+///
+/// 1. **PREMISE** — the app-role session sees both claims and zero edges for the
+///    pair. Without it the test could pass for the trivial reason that nothing
+///    is filtered, and this whole file would be measuring the fixture.
+/// 2. **THE REPAIR** — the repo function returns `false` (already linked) and
+///    the owner-visible row count for the pair stays at **one**. On the tree
+///    before migration 090 this is `true` and **two**: the guard is blind, the
+///    insert lands, and the duplicate it creates is PUBLIC because the trigger
+///    re-derives tenancy from the two public endpoints.
+/// 3. **POSITIVE** — a legitimate first link over a fresh pair still inserts.
+///    Over-suppression is the silent failure here: an index that refused every
+///    caller would satisfy property 2 perfectly.
+/// 4. **THE INDEX IS NOT OVER-BROAD** — an ASYMMETRIC relationship still stores
+///    both directions for one pair. `(a,b)` and `(b,a)` are different facts for
+///    most of the edge vocabulary, and a constraint keyed only on the
+///    `LEAST`/`GREATEST` pair would forbid the second one. Under FORCE that
+///    refusal would be indistinguishable from the guard working, which is why
+///    this arm is not garnish.
+///
+/// `create_symmetric_if_absent_distinguishes_by_relationship` in
+/// `edge_repo_tests.rs` is the fifth property — two different symmetric
+/// relationships over one pair are two edges — and it is why `relationship` is
+/// in the index key rather than only in its predicate.
+///
+/// # Why the props carry the matcher marker
+///
+/// Migration 090 is keyed on `(pair + properties->>'source' =
+/// 'cross_source_matcher')`, the same identity `MatchCandidateRepo::retire`
+/// already uses to find the edges it may retract. All three production callers
+/// of `create_symmetric_if_absent` stamp it, so a fixture that omitted it would
+/// exercise a shape production never writes and would pass for the wrong
+/// reason. The narrowing is what keeps an operator-authored edge over the same
+/// pair legal — `cross_source_route_tests.rs::retire_leaves_non_matcher_edges_between_the_same_pair_alone`
+/// and `privatization_boundary.rs::the_omitted_edge_type_warning_names_only_what_was_left_untraversed`
+/// both depend on that and both pass UNMODIFIED.
+///
+/// # What migration 090's repair depends on that nothing pins
+///
+/// The index only bites for a row carrying `properties->>'source' =
+/// 'cross_source_matcher'`, and that marker comes from the CALLER's payload —
+/// `create_symmetric_if_absent` hardcodes both endpoint types but passes
+/// `properties` through verbatim. All three production callers stamp it today;
+/// a fourth that did not would take its rows out of the predicate silently.
+/// Recorded here rather than pinned, because pinning it means either stamping
+/// the marker inside the repo function or enumerating call sites in a lint, and
+/// both are behaviour changes outside this batch's scope.
+#[sqlx::test(migrations = "../../migrations")]
+async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer(pool: PgPool) {
+    use epigraph_db::EdgeRepository;
+    use sqlx::Executor;
+
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "m090-author").await;
+    let c1 = fixture::seed_group_claim(&pool, agent, group, "m090 claim one").await;
+    let c2 = fixture::seed_group_claim(&pool, agent, group, "m090 claim two").await;
+
+    // The edge is created the ordinary production way, so `epigraph_edges_tenancy`
+    // stamps it from the endpoints: both are in G, so the edge is ('group', G).
+    let created =
+        EdgeRepository::create_symmetric_if_absent(&pool, c1, c2, "CORROBORATES", matcher_props())
+            .await
+            .expect("seed the symmetric edge");
+    assert!(created, "the first link must insert");
+
+    // Declassify both endpoints through the admin surface. Arm (d) fires on the
+    // claims UPDATE and its no-widening guard leaves the EDGE at ('group', G).
+    // One connection, because `epigraph.allow_declassify` is session-scoped.
+    let mut admin = pool.acquire().await.expect("admin connection");
+    admin
+        .execute("SET epigraph.allow_declassify = 'yes'")
+        .await
+        .expect("arm the declassification GUC");
+    sqlx::query(
+        "UPDATE claims SET visibility = 'public', \
+         owner_group_id = '00000000-0000-0000-0000-000000000000'::uuid \
+         WHERE id = ANY($1)",
+    )
+    .bind(&[c1, c2][..])
+    .execute(&mut *admin)
+    .await
+    .expect("declassify both endpoints");
+    admin
+        .execute("SET epigraph.allow_declassify = 'no'")
+        .await
+        .expect("disarm the declassification GUC");
+    drop(admin);
+
+    let (edge_vis, edge_owner): (String, Uuid) = sqlx::query_as(
+        "SELECT visibility, owner_group_id FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'CORROBORATES'",
+    )
+    .bind(c1)
+    .bind(c2)
+    .fetch_one(&pool)
+    .await
+    .expect("read the edge back");
+    assert_eq!(
+        (edge_vis.as_str(), edge_owner),
+        ("group", group),
+        "PREMISE: 072 arm (d)'s no-widening rule must leave the edge group-owned \
+         after both endpoints go public. If this ever changes, the blind-guard \
+         state this test is built on is no longer reachable and the test must be \
+         re-derived rather than deleted."
+    );
+
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    let url = fixture::database_url_for(&pool).await;
+    let app_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET SESSION AUTHORIZATION epigraph_app")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("app-role pool");
+
+    // ---- (1) PREMISE: both endpoints visible, the edge between them is not.
+    let claims_seen: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1)")
+        .bind(&[c1, c2][..])
+        .fetch_one(&app_pool)
+        .await
+        .expect("count claims under the app role");
+    assert_eq!(
+        claims_seen, 2,
+        "PREMISE: both endpoints are public and must be visible to an unstamped \
+         app-role session, or the insert would be refused by edges_validate_refs \
+         and this test would be measuring that instead"
+    );
+    let edges_seen: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+           AND relationship = 'CORROBORATES'",
+    )
+    .bind(c1)
+    .bind(c2)
+    .fetch_one(&app_pool)
+    .await
+    .expect("count edges under the app role");
+    assert_eq!(
+        edges_seen, 0,
+        "PREMISE: the group-owned edge must be INVISIBLE to this session. Seeing \
+         it means the guard is not blind and property 2 below is vacuous."
+    );
+
+    // ---- (2) THE REPAIR. Reverse direction, through the production function.
+    let created_again = EdgeRepository::create_symmetric_if_absent(
+        &app_pool,
+        c2,
+        c1,
+        "CORROBORATES",
+        matcher_props(),
+    )
+    .await
+    .expect("the reverse-direction call must not error");
+    assert!(
+        !created_again,
+        "the repo function must report the pair as ALREADY LINKED. Reporting a \
+         fresh insert is the degradation migration 090 exists to close: the \
+         guard cannot see the edge, so the constraint has to supply the answer."
+    );
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+           AND relationship = 'CORROBORATES'",
+    )
+    .bind(c1)
+    .bind(c2)
+    .fetch_one(&pool)
+    .await
+    .expect("count edges on the owner connection");
+    assert_eq!(
+        total, 1,
+        "ASSERT THE EFFECT, not the return value: exactly one edge must exist for \
+         the pair on the OWNER connection, which sees everything. Two means the \
+         duplicate landed."
+    );
+
+    // ---- (3) POSITIVE: a legitimate first link over a fresh pair still inserts.
+    let c3 = fixture::seed_public_claim(&pool, agent, "m090 claim three").await;
+    let c4 = fixture::seed_public_claim(&pool, agent, "m090 claim four").await;
+    let fresh = EdgeRepository::create_symmetric_if_absent(
+        &app_pool,
+        c3,
+        c4,
+        "CORROBORATES",
+        matcher_props(),
+    )
+    .await
+    .expect("a legitimate first link must not error");
+    assert!(
+        fresh,
+        "the legitimate caller must still succeed. A constraint that refused \
+         every insert would satisfy every assertion above and produce a silent, \
+         permanent inability to link anything."
+    );
+
+    // ---- (4) THE INDEX IS NOT OVER-BROAD: an asymmetric relationship keeps both
+    // directions. `decomposes_to` is outside 090's predicate, and (a,b) vs (b,a)
+    // are different facts for it.
+    //
+    // ON `app_pool`, LIKE ARMS (1)-(3). An earlier revision of this arm ran on
+    // the owner connection, which proves only that the shipped predicate
+    // excludes `decomposes_to` — true by inspection. The whole premise of this
+    // test is that the app role is the filtered one, so the over-broad-refusal
+    // this arm guards against has to be measured there.
+    for (s, t) in [(c3, c4), (c4, c3)] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                relationship, properties) \
+             VALUES ($1, 'claim', $2, 'claim', 'decomposes_to', '{}'::jsonb)",
+        )
+        .bind(s)
+        .bind(t)
+        .execute(&app_pool)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "an ASYMMETRIC relationship must store both directions for one \
+                 pair; 090's predicate names only the symmetric set, and a \
+                 blanket index would forbid this. {s} -> {t}: {e}"
+            )
+        });
+    }
+    let asymmetric: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+           AND relationship = 'decomposes_to'",
+    )
+    .bind(c3)
+    .bind(c4)
+    .fetch_one(&pool)
+    .await
+    .expect("count asymmetric edges");
+    assert_eq!(
+        asymmetric, 2,
+        "both directions of an asymmetric edge survive"
+    );
+}
+
+// ===========================================================================
 // PR-24 — the existence probe, on a role a policy actually filters
 // ===========================================================================
+
+/// The positive premise for a GUC-INDEPENDENCE arm: prove the stamp landed on
+/// the connection the reads that follow will use.
+///
+/// Both `hidden_claim_ids_still_classifies_on_the_app_role_under_force` and
+/// `event_list_still_suppresses_on_the_app_role_under_force` finish by stamping
+/// `epigraph.group_ids` with the OWNING group and asserting that the answers do
+/// not change. That is a NULL-RESULT assertion: a `set_config` that silently did
+/// nothing satisfies it identically, and so would a pool that handed the stamp
+/// to one connection and the reads to another. Reading the value back turns the
+/// arm from "stamping changed nothing" into "stamping happened AND changed
+/// nothing", which is the property the tests claim to pin.
+///
+/// `max_connections(1)` on both app-role pools is what makes the read-back
+/// meaningful — with a larger pool this would be a coin flip rather than a
+/// premise. `current_setting(.., true)` is the missing-ok form: it returns NULL
+/// rather than raising when the GUC was never set, so a failure here reports the
+/// absent stamp instead of erroring out of the test body.
+///
+/// Recorded as `D-PR25-guc-independence-arm-has-no-positive-premise`, whose own
+/// note is that the two arms must be edited TOGETHER or the pair pins one
+/// property in two different shapes. Hence one helper called from both.
+async fn assert_stamp_landed(app_pool: &PgPool, group: Uuid) {
+    let landed: Option<String> =
+        sqlx::query_scalar("SELECT current_setting('epigraph.group_ids', true)")
+            .fetch_one(app_pool)
+            .await
+            .expect("read epigraph.group_ids back off the app-role connection");
+    let expected = group.to_string();
+    assert_eq!(
+        landed.as_deref(),
+        Some(expected.as_str()),
+        "PREMISE for the GUC-independence arm: the stamp must be OBSERVABLE on \
+         the connection the following reads use. Got {landed:?}, expected \
+         {expected:?}. Without this the arm asserts only that two reads agree \
+         with two earlier reads, which a set_config that did nothing satisfies \
+         exactly as well as one that worked."
+    );
+}
 
 /// `ClaimRepository::hidden_claim_ids` must still classify ids on an
 /// `epigraph_app` session with FORCE live.
@@ -1614,6 +1988,7 @@ async fn hidden_claim_ids_still_classifies_on_the_app_role_under_force(pool: PgP
         .execute(&app_pool)
         .await
         .expect("stamp epigraph.group_ids");
+    assert_stamp_landed(&app_pool, group).await;
 
     let stamped_member = ClaimRepository::hidden_claim_ids(&app_pool, &member, &ids)
         .await
@@ -1904,6 +2279,7 @@ async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
         .execute(&app_pool)
         .await
         .expect("stamp epigraph.group_ids");
+    assert_stamp_landed(&app_pool, group).await;
 
     let stamped_member = visible_ids(&app_pool, &member, member_agent).await;
     let stamped_stranger = visible_ids(&app_pool, &stranger, member_agent).await;

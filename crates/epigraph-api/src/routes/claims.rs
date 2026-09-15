@@ -1293,13 +1293,17 @@ pub async fn find_claims_needing_embeddings(
     // is also the exact privileged-viewer/ordinary-pool hybrid PR-15 deleted
     // from the CLI fleet, which is why the repo method takes an executor rather
     // than a `&PgPool`.
-    let (mut maint_conn, viewer) = state
+    let mut session = state
         .maintenance_viewer(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
         })?;
-    let claims = ClaimRepository::find_claims_needing_embeddings(&mut *maint_conn, &viewer, limit)
+    // `split` and not two separate accessors: the repo call needs the connection
+    // mutably and the viewer immutably at the same moment, which one `&mut`
+    // borrow of the session cannot otherwise express.
+    let (maint_conn, viewer) = session.split();
+    let claims = ClaimRepository::find_claims_needing_embeddings(&mut *maint_conn, viewer, limit)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),

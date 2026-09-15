@@ -190,12 +190,15 @@ pub async fn decide_match_candidate(
                 .await
                 .map_err(internal_error)?;
 
-            // Write the edge if it doesn't already exist (either
-            // direction). The unique-triple index was dropped in migrations
-            // 017/018, so this explicit existence check — now centralized in
-            // `EdgeRepository::create_symmetric_if_absent` — is the only guard
-            // against duplicates from repeated `decide` calls. The
-            // are_all_current guard above stays here at the call site.
+            // Write the edge if it doesn't already exist (either direction).
+            // The unique-triple index was dropped in migrations 017/018, and
+            // migration 090's `edges_symmetric_relationship_uniq` replaces it:
+            // the explicit existence check — now centralized in
+            // `EdgeRepository::create_symmetric_if_absent` — is the FAST PATH,
+            // and that index is what makes the answer true for a duplicate the
+            // check cannot see. The index is keyed on the
+            // `"source": "cross_source_matcher"` marker the props below stamp.
+            // The are_all_current guard above stays here at the call site.
             let props = serde_json::json!({
                 "candidate_id":     candidate_id,
                 "score":            row.score,

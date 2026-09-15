@@ -68,8 +68,8 @@ pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
     create_pool_with_options, maintenance_database_url, maintenance_verdict,
     probe_maintenance_privilege, resolve_maintenance_url, MaintenanceConn, MaintenanceDsnSource,
-    MaintenancePrivilege, MaintenanceVerdict, ScopedConn, ScopedPool, ScopedPoolOptions,
-    ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
+    MaintenancePrivilege, MaintenanceSession, MaintenanceVerdict, ScopedConn, ScopedPool,
+    ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, MAINTENANCE_DATABASE_URL,
 };
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,

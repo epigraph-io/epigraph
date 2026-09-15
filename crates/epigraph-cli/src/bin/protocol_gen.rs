@@ -43,12 +43,13 @@ async fn main() {
     let maint = epigraph_cli::MaintenancePool::connect("protocol_gen")
         .await
         .expect("maintenance pool");
-    let (_maint_conn, viewer) = maint
+    let session = maint
         .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
         .await
         .expect("maintenance viewer");
+    let viewer = session.viewer();
 
-    if let Err(e) = run(args, maint.pool().clone(), &viewer).await {
+    if let Err(e) = run(args, maint.pool().clone(), viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }

@@ -829,12 +829,12 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let (_maint_conn, viewer) = crate::maintenance::maintenance_viewer(
+        let session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::DedupSweep,
         )
         .await?;
-        let viewer = &viewer;
+        let viewer = session.viewer();
         self.reject_if_read_only()?;
         tools::dedup_sweep::sweep_semantic_duplicates(self, viewer, params).await
     }
@@ -1099,12 +1099,12 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<RecomputeBeliefsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let (_maint_conn, viewer) = crate::maintenance::maintenance_viewer(
+        let session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::BeliefRecomputation,
         )
         .await?;
-        let viewer = &viewer;
+        let viewer = session.viewer();
         self.reject_if_read_only()?;
         tools::cdst_maintenance::recompute_beliefs(self, viewer, params).await
     }
@@ -1611,12 +1611,12 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let (_maint_conn, viewer) = crate::maintenance::maintenance_viewer(
+        let session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::EmbeddingBackfill,
         )
         .await?;
-        let viewer = &viewer;
+        let viewer = session.viewer();
         self.reject_if_read_only()?;
         crate::tools::embeddings::backfill_embeddings(self, viewer, params).await
     }

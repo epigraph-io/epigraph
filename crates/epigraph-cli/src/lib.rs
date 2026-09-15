@@ -62,31 +62,32 @@ use std::sync::Arc;
 /// "maintenance connection issued" log line — describe work that never
 /// bypassed anything.
 ///
-/// # The lifetime — improved, and NOT yet a guarantee
+/// # The lifetime — the accidental shape is now a borrow error
 ///
 /// `maintenance_pool_and_viewer` dropped the `MaintenanceConn` inside the
 /// constructor, so the `Viewer` it handed back had no privileged connection
 /// behind it at all. Its own doc said so: *"The `Viewer` outlives it here; from
-/// PR-17 on it must not."* [`Self::viewer`] returns the connection to the
-/// caller instead, and every converted binary binds it for the whole run, so
-/// the bypass and the connection it is spent on stay together in practice.
+/// PR-17 on it must not."* PR-15 fixed that by returning the connection to the
+/// caller — but as a SECOND value, so the bypass and the connection it must be
+/// spent on stayed together by review rather than by the borrow checker.
 ///
-/// That is a real improvement and it is **not** the type-level coupling the
-/// obligation asked for, so this section does not claim to have discharged it.
-/// The returned `Viewer` is owned, and the `MaintenanceLease` it was minted
-/// from is a local that drops at return — a caller that drops `_maint_conn` and
-/// keeps the viewer still compiles. Holding both is a convention this crate's
-/// call sites follow, enforced by review rather than by the borrow checker.
-/// Making it structural (a guard owning both, yielding `&Viewer`) touches this
-/// type, `AppState::maintenance_viewer`, `epigraph_mcp::maintenance::maintenance_viewer`
-/// and every call site, and is recorded as a PR-17 obligation
-/// (`D-PR17-maintenance-lease-coupling-is-a-convention` in
-/// `docs/tenancy/progress.json`) rather than done half-way here. Call sites
-/// bind both:
+/// [`Self::viewer`] now returns one [`epigraph_db::MaintenanceSession`] owning
+/// both, which yields the viewer only as `&Viewer`. Dropping the session drops
+/// the viewer with it, and there is no accessor that moves the viewer out, so
+/// the accidental version of `D-PR17-maintenance-lease-coupling-is-a-convention`
+/// is now a borrow error rather than a review item. The mint is
+/// `ScopedPool::maintenance_session`, so `AppState::maintenance_viewer` and
+/// `epigraph_mcp::maintenance::maintenance_viewer` inherit the same shape rather
+/// than each re-deriving it.
+///
+/// It is not an absolute guarantee, and [`epigraph_db::MaintenanceSession`]'s
+/// own doc says why: `Viewer` is `Clone`, so a deliberate clone still produces
+/// an owned bypass. The residual is named on the obligation.
 ///
 /// ```ignore
 /// let maint = MaintenancePool::connect("epigraph-embed-backfill").await?;
-/// let (_maint_conn, viewer) = maint.viewer(SystemReason::EmbeddingBackfill).await?;
+/// let session = maint.viewer(SystemReason::EmbeddingBackfill).await?;
+/// let viewer = session.viewer();
 /// let pool = maint.pool();
 /// ```
 ///
@@ -183,31 +184,23 @@ impl MaintenancePool {
         self.source
     }
 
-    /// A bypass viewer and the maintenance connection it must be spent on.
+    /// A bypass viewer and the maintenance connection it must be spent on,
+    /// owned together as one [`epigraph_db::MaintenanceSession`].
     ///
-    /// Both must be held for as long as the viewer is used, and the caller is
-    /// what enforces that: the `Viewer` is owned, so dropping the connection
-    /// leaves it usable. See the type documentation for why the previous
-    /// template's dropping the connection early was worse, and why the
-    /// remaining coupling is a convention rather than a guarantee.
+    /// The session hands the viewer out only by reference, so a caller can no
+    /// longer drop the connection and keep the viewer — the shape that, from
+    /// plan §9.2 step 11d onward, silently returns zero rows instead of all of
+    /// them. That used to be a call-site convention
+    /// (`D-PR17-maintenance-lease-coupling-is-a-convention`) and is now the
+    /// borrow checker's job.
     ///
     /// # Errors
     /// `DbError::ConnectionFailed` if the connection cannot be acquired.
     pub async fn viewer(
         &self,
         reason: epigraph_db::visibility::SystemReason,
-    ) -> Result<
-        (
-            epigraph_db::MaintenanceConn<'_>,
-            epigraph_db::visibility::Viewer,
-        ),
-        epigraph_db::DbError,
-    > {
-        let (conn, lease) = self.scoped.unscoped_for_maintenance(reason).await?;
-        Ok((
-            conn,
-            epigraph_db::visibility::Viewer::system(&lease, reason),
-        ))
+    ) -> Result<epigraph_db::MaintenanceSession<'_>, epigraph_db::DbError> {
+        self.scoped.maintenance_session(reason).await
     }
 }
 

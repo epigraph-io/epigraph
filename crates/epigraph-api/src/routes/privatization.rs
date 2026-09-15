@@ -973,7 +973,7 @@ pub async fn create_plan(
     });
 
     // ---- THE MAINTENANCE CONNECTION. Authorization, selection, freeze. ----
-    let (mut maint, bypass) = state
+    let mut session = state
         .maintenance_viewer(SystemReason::PrivatizationSelection)
         .await
         .map_err(|e| {
@@ -987,11 +987,12 @@ pub async fn create_plan(
                 message: "Failed to acquire a maintenance connection".to_string(),
             }
         })?;
+    let (maint, bypass) = session.split();
 
     let actor = crate::middleware::instance_authz::require_instance_admin_for_group(
         auth,
         body.target_group_id,
-        &mut maint,
+        &mut *maint,
     )
     .await?;
 
@@ -1024,7 +1025,7 @@ pub async fn create_plan(
     // Seeds. Resolved on the maintenance connection under the bypass viewer,
     // for the same reason the closure is: a seed set narrowed to what the actor
     // can see is a plan that misses the rows it exists to find.
-    let seeds = resolve_seeds(&mut maint, &bypass, &body.seeds, node_cap).await?;
+    let seeds = resolve_seeds(&mut *maint, bypass, &body.seeds, node_cap).await?;
     if seeds.is_empty() {
         return Err(ApiError::BadRequest {
             message: "the selector resolved to no seeds; a privatization needs at least one"
@@ -1041,16 +1042,16 @@ pub async fn create_plan(
     };
 
     let selection =
-        PrivatizationRepository::select(&mut maint, &bypass, request, SELECTION_STATEMENT_TIMEOUT)
+        PrivatizationRepository::select(&mut *maint, bypass, request, SELECTION_STATEMENT_TIMEOUT)
             .await
             .map_err(selection_error)?;
 
     let authors_losing = selection
-        .authors_losing_own_claims(&mut maint, &bypass, body.target_group_id)
+        .authors_losing_own_claims(&mut *maint, bypass, body.target_group_id)
         .await?;
-    let boundary_counts = selection.boundary_edge_counts(&mut maint, &bypass).await?;
+    let boundary_counts = selection.boundary_edge_counts(&mut *maint, bypass).await?;
     let omitted = selection
-        .omitted_edge_types(&mut maint, &bypass, &edge_types)
+        .omitted_edge_types(&mut *maint, bypass, &edge_types)
         .await?;
 
     let digest = selection.digest();
@@ -1133,7 +1134,7 @@ pub async fn create_plan(
     // Acquired AFTER the freeze, and the maintenance connection is dropped
     // first: holding both while rendering is what makes it easy to render on
     // the wrong one.
-    drop(maint);
+    drop(session);
 
     let mut read = state.read_as(&viewer).await.map_err(scoped_read_error)?;
     let visible = selection
@@ -1536,7 +1537,8 @@ pub async fn approve_plan(
         });
     }
 
-    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut session = maintenance(&state).await?;
+    let (maint, _bypass) = session.split();
     let mut tx = sqlx::Connection::begin(&mut *maint)
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
@@ -1722,7 +1724,8 @@ pub async fn abort_plan(
         });
     }
 
-    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut session = maintenance(&state).await?;
+    let (maint, _bypass) = session.split();
     let mut tx = sqlx::Connection::begin(&mut *maint)
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
@@ -1844,11 +1847,12 @@ pub async fn revert_plan(
     // encrypted-subgraph feature, not to D4: a `restrict` plan whose frozen set
     // contains an already-encrypted claim sealed nothing, and refusing its
     // revert would defeat the full reversibility §6.5.4 leans on hardest.
-    let (mut maint, _bypass) = maintenance(&state).await?;
-    let sealed = PrivatizationRepository::sealed_item_count_conn(&mut maint, plan_id)
+    let mut session = maintenance(&state).await?;
+    let (maint, _bypass) = session.split();
+    let sealed = PrivatizationRepository::sealed_item_count_conn(&mut *maint, plan_id)
         .await
         .map_err(plan_write_error)?;
-    drop(maint);
+    drop(session);
     if sealed > 0 {
         return Err(ApiError::Conflict {
             reason: format!(
@@ -1933,9 +1937,10 @@ pub async fn get_audit(
     // information at all for this event type. `Option<bool>` already has a value
     // for "attempted, outcome not yet known".
     {
-        let (mut maint, _bypass) = maintenance(&state).await?;
+        let mut session = maintenance(&state).await?;
+        let (maint, _bypass) = session.split();
         SecurityEventRepository::log_conn(
-            &mut maint,
+            &mut *maint,
             &epigraph_db::repos::security_event::SecurityEventRow {
                 id: Uuid::new_v4(),
                 event_type: AUDIT_READ_EVENT_TYPE.to_string(),
@@ -2042,9 +2047,10 @@ pub async fn seal_manifest(
     refuse_unless_sealable(&plan)?;
 
     let limit = manifest_limit(params.limit)?;
-    let (mut maint, bypass) = maintenance(&state).await?;
+    let mut session = maintenance(&state).await?;
+    let (maint, bypass) = session.split();
 
-    let epoch = PrivatizationRepository::active_epoch_conn(&mut maint, plan.target_group_id)
+    let epoch = PrivatizationRepository::active_epoch_conn(&mut *maint, plan.target_group_id)
         .await?
         .ok_or_else(|| ApiError::Conflict {
             reason: "the target group has no active key epoch; rotate a key into it before \
@@ -2053,8 +2059,8 @@ pub async fn seal_manifest(
         })?;
 
     let items = PrivatizationRepository::seal_manifest_page_conn(
-        &mut maint,
-        &bypass,
+        &mut *maint,
+        bypass,
         plan_id,
         params.cursor,
         limit,
@@ -2075,8 +2081,7 @@ pub async fn seal_manifest(
     // smallest in the process — `load_plan_for_actor` makes the same commit for
     // the same reason. Two concurrent manifest requests each holding one and
     // blocking on a second is a deadlock the pool size makes reachable.
-    drop(bypass);
-    drop(maint);
+    drop(session);
 
     // DUAL-LOGGED, and BEFORE the body is returned. `security_events` is the
     // principal-keyed record that this agent was served plaintext;
@@ -2174,9 +2179,10 @@ pub async fn seal_commit(
         });
     }
 
-    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut session = maintenance(&state).await?;
+    let (maint, _bypass) = session.split();
 
-    let epoch = PrivatizationRepository::active_epoch_conn(&mut maint, plan.target_group_id)
+    let epoch = PrivatizationRepository::active_epoch_conn(&mut *maint, plan.target_group_id)
         .await?
         .ok_or_else(|| ApiError::Conflict {
             reason: "the target group has no active key epoch; rotate a key into it before \
@@ -2189,7 +2195,7 @@ pub async fn seal_commit(
     //    approved.
     let claim_ids: Vec<Uuid> = body.items.iter().map(|i| i.claim_id).collect();
     let frozen =
-        PrivatizationRepository::plan_contains_conn(&mut maint, plan_id, &claim_ids).await?;
+        PrivatizationRepository::plan_contains_conn(&mut *maint, plan_id, &claim_ids).await?;
     if frozen.len() != claim_ids.len() {
         return Err(ApiError::BadRequest {
             message: format!(
@@ -2203,7 +2209,7 @@ pub async fn seal_commit(
     // 2. The TCB shape, read from the DATABASE and not from the manifest this
     //    server served. That is the whole point of re-reading it: a version row
     //    inserted since would otherwise keep its plaintext.
-    let shape = PrivatizationRepository::seal_tcb_shape_conn(&mut maint, &claim_ids).await?;
+    let shape = PrivatizationRepository::seal_tcb_shape_conn(&mut *maint, &claim_ids).await?;
 
     // 3. The manifest digest, recomputed over that shape in the same order the
     //    manifest served it.
@@ -2395,9 +2401,10 @@ pub async fn unseal_manifest(
     }
 
     let limit = manifest_limit(params.limit)?;
-    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut session = maintenance(&state).await?;
+    let (maint, _bypass) = session.split();
     let items = PrivatizationRepository::unseal_manifest_page_conn(
-        &mut maint,
+        &mut *maint,
         plan_id,
         params.cursor,
         limit,
@@ -2414,7 +2421,7 @@ pub async fn unseal_manifest(
     let next_cursor = items.last().map(|i| i.claim_id);
     // See `seal_manifest`: the maintenance connection goes back to the pool
     // before the audit acquires its own.
-    drop(maint);
+    drop(session);
     log_manifest_read(
         &state,
         &plan,
@@ -2562,7 +2569,8 @@ pub async fn unseal_commit(
         });
     }
 
-    let (mut maint, _bypass) = maintenance(&state).await?;
+    let mut session = maintenance(&state).await?;
+    let (maint, _bypass) = session.split();
 
     // 1. Every claim_id is a FROZEN item of this plan. The mirror of
     //    `seal_commit` step 1, and for the same reason read in the other
@@ -2572,7 +2580,7 @@ pub async fn unseal_commit(
     //    deleting the ciphertext that was the only remaining copy.
     let claim_ids: Vec<Uuid> = body.items.iter().map(|i| i.claim_id).collect();
     let frozen =
-        PrivatizationRepository::plan_contains_conn(&mut maint, plan_id, &claim_ids).await?;
+        PrivatizationRepository::plan_contains_conn(&mut *maint, plan_id, &claim_ids).await?;
     if frozen.len() != claim_ids.len() {
         return Err(ApiError::BadRequest {
             message: format!(
@@ -2588,7 +2596,7 @@ pub async fn unseal_commit(
     //    this group and is a no-op below, which is what makes a re-delivered
     //    commit succeed rather than trip the cover check.
     let shape = PrivatizationRepository::unseal_tcb_shape_conn(
-        &mut maint,
+        &mut *maint,
         plan.target_group_id,
         &claim_ids,
     )
@@ -2920,7 +2928,8 @@ async fn log_manifest_read(
     use epigraph_db::repos::security_event::{SecurityEventRepository, SecurityEventRow};
 
     let correlation_id = new_correlation_id();
-    let (mut maint, _bypass) = maintenance(state).await?;
+    let mut session = maintenance(state).await?;
+    let (maint, _bypass) = session.split();
     let mut tx = sqlx::Connection::begin(&mut *maint)
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
@@ -2982,11 +2991,12 @@ async fn require_plan_authority(
     auth: &crate::middleware::bearer::AuthContext,
     target_group_id: Uuid,
 ) -> Result<Uuid, ApiError> {
-    let (mut maint, _bypass) = maintenance(state).await?;
+    let mut session = maintenance(state).await?;
+    let (maint, _bypass) = session.split();
     crate::middleware::instance_authz::require_instance_admin_for_group(
         auth,
         target_group_id,
-        &mut maint,
+        &mut *maint,
     )
     .await
 }
@@ -3003,15 +3013,7 @@ async fn require_plan_authority(
 /// `SystemReason::PrivatizationApply`, belongs to the JOB, which is where the
 /// rows actually move.
 #[cfg(feature = "db")]
-async fn maintenance(
-    state: &AppState,
-) -> Result<
-    (
-        epigraph_db::MaintenanceConn<'_>,
-        epigraph_db::visibility::Viewer,
-    ),
-    ApiError,
-> {
+async fn maintenance(state: &AppState) -> Result<epigraph_db::MaintenanceSession<'_>, ApiError> {
     use epigraph_db::visibility::SystemReason;
 
     state
@@ -3213,7 +3215,8 @@ async fn dispatch(
         }
     })?;
 
-    let (mut maint, _bypass) = maintenance(state).await?;
+    let mut session = maintenance(state).await?;
+    let (maint, _bypass) = session.split();
     let mut tx = sqlx::Connection::begin(&mut *maint)
         .await
         .map_err(|source| plan_write_error(epigraph_db::DbError::QueryFailed { source }))?;
