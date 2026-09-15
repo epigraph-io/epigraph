@@ -531,8 +531,13 @@ pub async fn claim_history(
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<VersionHistoryResponse>, ApiError> {
     // Walk the supersession chain using database queries
-    // First, walk backwards to find the root
+    // First, walk backwards to find the root. `mark_duplicate` writes
+    // `dup.supersedes = canonical` without a cycle check, so X↔Y (or X→X)
+    // loops exist; a cycle has no root, so the walk stops at the first
+    // revisited id and starts from the last new one.
     let mut root_id = claim_id;
+    let mut seen_backward: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    seen_backward.insert(claim_id);
     loop {
         let row: Option<(Option<Uuid>,)> =
             sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1")
@@ -550,7 +555,13 @@ pub async fn claim_history(
                     id: claim_id.to_string(),
                 });
             }
-            Some((Some(prev_id),)) => root_id = prev_id,
+            Some((Some(prev_id),)) => {
+                if !seen_backward.insert(prev_id) {
+                    tracing::warn!(%claim_id, %prev_id, "supersedes cycle in claim history");
+                    break;
+                }
+                root_id = prev_id;
+            }
             Some((None,)) => break,
         }
     }
@@ -560,8 +571,13 @@ pub async fn claim_history(
     let mut current_id = Some(root_id);
     let mut version_number: u32 = 1;
     let mut current_version: u32 = 1;
+    // Forward-walk guard for the same cycles: each version is listed once.
+    let mut listed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
     while let Some(id) = current_id {
+        if !listed.insert(id) {
+            break;
+        }
         let row: Option<(Uuid, String, f64, bool, DateTime<Utc>)> = sqlx::query_as(
             "SELECT id, content, truth_value, COALESCE(is_current, true), created_at FROM claims WHERE id = $1",
         )
