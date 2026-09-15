@@ -210,12 +210,12 @@ async fn signed_in_pages_redirect_anonymous_viewers_to_login() {
 async fn every_area_route_is_mounted() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
+    // Built areas leave this stub list; their mounting is pinned in their
+    // own test file (entities: `entity_routes_answer_with_and_without_the_base_path`).
     let pages = [
         "/explorer/".to_string(),
         "/explorer/search?q=x".to_string(),
         format!("/explorer/claim/{CLAIM}"),
-        format!("/explorer/claim/{CLAIM}/history"),
-        format!("/explorer/claim/{CLAIM}/provenance"),
         format!("/explorer/claim/{CLAIM}/graph"),
         format!("/explorer/agent/{CLAIM}"),
         format!("/explorer/frame/{CLAIM}"),
