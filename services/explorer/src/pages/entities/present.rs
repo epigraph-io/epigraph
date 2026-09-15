@@ -1,11 +1,11 @@
 //! Pure presentation for the entities pages: formatting, query parsing,
-//! duplicate detection in version histories, and the provenance-chain
-//! layout. No I/O.
+//! evidence-type normalisation, safe outbound links, duplicate detection in
+//! version histories, and the provenance-chain layout. No I/O.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use url::form_urlencoded;
+use url::{form_urlencoded, Url};
 use uuid::Uuid;
 
 use crate::links::Links;
@@ -14,6 +14,8 @@ use crate::upstream::{truncate_chars, ChainNode, ProvenanceChainResponse, REDACT
 
 /// What a redacted claim reads as on these pages.
 pub const HIDDEN_TEXT: &str = "Content hidden. You do not have access to this claim's text.";
+/// Highest `?page=` honoured; keeps upstream offsets small and finite.
+pub const MAX_PAGE: u32 = 10_000;
 /// `?max_depth=` on the provenance page when absent or unparseable
 /// (the MCP tool's default, plan §2.1).
 pub const DEFAULT_PROVENANCE_DEPTH: u32 = 4;
@@ -25,6 +27,19 @@ pub fn fmt_prob(v: Option<f64>) -> String {
     match v {
         Some(x) if x.is_finite() => format!("{x:.2}"),
         _ => "—".into(),
+    }
+}
+
+/// A fraction as a whole percentage; tiny non-zero shares read `<1%`.
+pub fn fmt_pct(v: f64) -> String {
+    if !v.is_finite() {
+        return "—".into();
+    }
+    let pct = v * 100.0;
+    if pct > 0.0 && pct < 0.5 {
+        "<1%".into()
+    } else {
+        format!("{pct:.0}%")
     }
 }
 
@@ -95,6 +110,13 @@ pub fn query_param(raw: Option<&str>, key: &str) -> Option<String> {
         .last()
 }
 
+/// `?page=` → `1..=MAX_PAGE`; anything unparseable is page 1.
+pub fn parse_page(raw: Option<&str>) -> u32 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|p| p.clamp(1, u64::from(MAX_PAGE)) as u32)
+        .unwrap_or(1)
+}
+
 /// `?max_depth=` → `lo..=hi`; anything unparseable is `default`. A wide
 /// integer is parsed first so `-3` and `300` clamp instead of failing.
 pub fn parse_depth(raw: Option<&str>, default: u32, (lo, hi): (u32, u32)) -> u32 {
@@ -102,6 +124,221 @@ pub fn parse_depth(raw: Option<&str>, default: u32, (lo, hi): (u32, u32)) -> u32
         Some(d) => d.clamp(i64::from(lo), i64::from(hi)) as u32,
         None => default.clamp(lo, hi),
     }
+}
+
+/// `value` if it is one of `allowed`, else the first allowed value.
+pub fn one_of(value: Option<&str>, allowed: &[&'static str]) -> &'static str {
+    value
+        .and_then(|v| allowed.iter().find(|a| a.eq_ignore_ascii_case(v.trim())))
+        .copied()
+        .unwrap_or(allowed[0])
+}
+
+// ---- evidence ----------------------------------------------------------------------
+
+/// A display evidence type. Upstream has three vocabularies for one row
+/// (`/claims/:id/evidence`, `/evidence/:id`, `/search/evidence`; plan §3.4),
+/// so every page shows this normalised label, plus the recorded value when
+/// it differs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvidenceKind {
+    pub label: String,
+    pub recorded_as: Option<String>,
+}
+
+pub fn evidence_kind(raw: Option<&str>) -> EvidenceKind {
+    let raw = raw.map(str::trim).unwrap_or("");
+    let key = raw.to_ascii_lowercase().replace(['-', ' '], "_");
+    let label = match key.as_str() {
+        "" | "unknown" | "none" | "null" | "unspecified" => "Unspecified",
+        "document" | "documentary" | "doc" => "Document",
+        "literature" | "paper" | "publication" | "reference" | "citation" | "article" => {
+            "Literature"
+        }
+        "figure" | "image" | "table" | "chart" => "Figure",
+        "observation" | "observational" | "empirical" | "measurement" | "experiment"
+        | "experimental" => "Observation",
+        "testimony" | "testimonial" => "Testimony",
+        "computation" | "computational" | "analytical" | "analysis" | "simulation" => "Analysis",
+        "statistical" | "statistics" => "Statistical",
+        "conversational" | "conversation" => "Conversation",
+        "consensus" => "Consensus",
+        _ => {
+            return EvidenceKind {
+                label: sentence_case(&truncate_chars(&key.replace('_', " "), 40)),
+                recorded_as: None,
+            }
+        }
+    };
+    EvidenceKind {
+        label: label.into(),
+        recorded_as: (!raw.is_empty() && !raw.eq_ignore_ascii_case(label))
+            .then(|| truncate_chars(raw, 40)),
+    }
+}
+
+fn sentence_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// An outbound link. `href` is `None` when the value is not a safe
+/// http(s) URL or DOI: the template then renders plain text, so a hostile
+/// `javascript:` value can never become a link.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtLink {
+    pub kind: &'static str,
+    pub href: Option<String>,
+    pub text: String,
+}
+
+/// A DOI in any of its usual spellings (`10.x/y`, `doi:10.x/y`,
+/// `https://doi.org/10.x/y`, `dx.doi.org`), normalised to `10.x/y`.
+pub fn doi_from(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let lower = s.to_ascii_lowercase();
+    let rest = [
+        "https://doi.org/",
+        "http://doi.org/",
+        "https://dx.doi.org/",
+        "http://dx.doi.org/",
+        "doi:",
+    ]
+    .iter()
+    .find(|p| lower.starts_with(*p))
+    .map_or(s, |p| s[p.len()..].trim_start());
+    let (prefix, suffix) = rest.split_once('/')?;
+    let valid = prefix.starts_with("10.")
+        && prefix.len() > 3
+        && prefix[3..].chars().all(|c| c.is_ascii_digit() || c == '.')
+        && !suffix.is_empty()
+        && !rest.chars().any(|c| c.is_whitespace() || c.is_control());
+    valid.then(|| rest.to_string())
+}
+
+/// `https://doi.org/<doi>` with the DOI percent-encoded as a path, so `#`,
+/// `?` and friends inside a DOI cannot change the link's meaning.
+pub fn doi_url(doi: &str) -> Option<String> {
+    let doi = doi_from(doi)?;
+    let mut u = Url::parse("https://doi.org/").ok()?;
+    u.set_path(&doi);
+    Some(u.into())
+}
+
+/// An absolute http(s) URL with a host, normalised; everything else `None`.
+pub fn web_url(raw: &str) -> Option<String> {
+    let u = Url::parse(raw.trim()).ok()?;
+    (matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty()))
+        .then(|| u.into())
+}
+
+/// Links for an evidence row's `source_url` and `doi`. A DOI in
+/// `source_url` becomes `https://doi.org/<doi>` (plan §3.4); a DOI given in
+/// both fields is shown once.
+pub fn source_links(source_url: Option<&str>, doi: Option<&str>) -> Vec<ExtLink> {
+    let mut out = Vec::new();
+    let mut shown_doi: Option<String> = None;
+    if let Some(s) = source_url.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(d) = doi_from(s) {
+            out.push(ExtLink {
+                kind: "DOI",
+                href: doi_url(&d),
+                text: format!("doi:{}", truncate_chars(&d, 120)),
+            });
+            shown_doi = Some(d.to_ascii_lowercase());
+        } else {
+            out.push(ExtLink {
+                kind: "Source",
+                href: web_url(s),
+                text: truncate_chars(s, 120),
+            });
+        }
+    }
+    if let Some(d) = doi.map(str::trim).filter(|d| !d.is_empty()) {
+        match doi_from(d) {
+            Some(n) if shown_doi.as_deref() == Some(n.to_ascii_lowercase().as_str()) => {}
+            Some(n) => out.push(ExtLink {
+                kind: "DOI",
+                href: doi_url(&n),
+                text: format!("doi:{}", truncate_chars(&n, 120)),
+            }),
+            None => out.push(ExtLink {
+                kind: "DOI",
+                href: None,
+                text: truncate_chars(d, 120),
+            }),
+        }
+    }
+    out
+}
+
+// ---- agents ------------------------------------------------------------------------
+
+/// `https://orcid.org/<id>` for a well-formed ORCID iD (bare or as a URL).
+pub fn orcid_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let id = ["https://orcid.org/", "http://orcid.org/"]
+        .iter()
+        .find_map(|p| s.strip_prefix(p))
+        .unwrap_or(s);
+    let groups: Vec<&str> = id.split('-').collect();
+    let valid = groups.len() == 4
+        && groups.iter().enumerate().all(|(i, g)| {
+            g.len() == 4
+                && g.chars().enumerate().all(|(j, c)| {
+                    c.is_ascii_digit() || (i == 3 && j == 3 && (c == 'X' || c == 'x'))
+                })
+        });
+    valid.then(|| format!("https://orcid.org/{}", id.to_ascii_uppercase()))
+}
+
+/// `https://ror.org/<id>` for a well-formed ROR id (bare or as a URL).
+pub fn ror_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    let id = ["https://ror.org/", "http://ror.org/"]
+        .iter()
+        .find_map(|p| s.strip_prefix(p))
+        .unwrap_or(s);
+    let valid = id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric());
+    valid.then(|| format!("https://ror.org/{}", id.to_ascii_lowercase()))
+}
+
+/// One row of a share table (`<meter>` value plus a percentage label).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShareRow {
+    pub label: String,
+    /// `0..=1`, three places, for `<meter value>`.
+    pub value: String,
+    pub pct: String,
+}
+
+/// Largest shares first, at most `cap` rows; `label` maps each key.
+pub fn share_rows(
+    map: &BTreeMap<String, f64>,
+    cap: usize,
+    label: impl Fn(&str) -> String,
+) -> Vec<ShareRow> {
+    let mut rows: Vec<(&String, f64)> = map
+        .iter()
+        .map(|(k, v)| (k, if v.is_finite() { *v } else { 0.0 }))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    rows.into_iter()
+        .take(cap)
+        .map(|(k, v)| ShareRow {
+            label: label(k),
+            value: format!("{:.3}", v.clamp(0.0, 1.0)),
+            pct: fmt_pct(v),
+        })
+        .collect()
+}
+
+/// `refuted` → `Refuted`, `meta_analysis` → `Meta analysis`.
+pub fn humanise_key(key: &str) -> String {
+    sentence_case(&truncate_chars(key.trim(), 60).replace('_', " "))
 }
 
 // ---- history -----------------------------------------------------------------------
@@ -350,6 +587,9 @@ mod tests {
         assert_eq!(fmt_prob(Some(0.456)), "0.46");
         assert_eq!(fmt_prob(None), "—");
         assert_eq!(fmt_prob(Some(f64::NAN)), "—");
+        assert_eq!(fmt_pct(0.421), "42%");
+        assert_eq!(fmt_pct(0.001), "<1%");
+        assert_eq!(fmt_pct(0.0), "0%");
         assert_eq!(
             fmt_time(Some("2026-01-02T03:04:05Z")),
             "2026-01-02 03:04 UTC"
@@ -385,10 +625,139 @@ mod tests {
             Some("3")
         );
         assert_eq!(query_param(None, "page"), None);
+        assert_eq!(parse_page(Some("0")), 1);
+        assert_eq!(parse_page(Some("abc")), 1);
+        assert_eq!(parse_page(Some("99999999999")), MAX_PAGE);
+        assert_eq!(parse_page(Some(" 7 ")), 7);
         assert_eq!(parse_depth(Some("300"), 4, (1, 8)), 8);
         assert_eq!(parse_depth(Some("-3"), 4, (1, 8)), 1);
         assert_eq!(parse_depth(Some("x"), 4, (1, 8)), 4);
         assert_eq!(parse_depth(None, 4, (1, 8)), 4);
+        assert_eq!(
+            one_of(Some("PLAUSIBILITY"), &["belief", "plausibility"]),
+            "plausibility"
+        );
+        assert_eq!(
+            one_of(Some("drop table"), &["belief", "plausibility"]),
+            "belief"
+        );
+    }
+
+    #[test]
+    fn evidence_types_normalise_across_vocabularies() {
+        for (raw, label) in [
+            ("empirical", "Observation"),
+            ("observation", "Observation"),
+            ("testimonial", "Testimony"),
+            ("testimony", "Testimony"),
+            ("analytical", "Analysis"),
+            ("computation", "Analysis"),
+            ("statistical", "Statistical"),
+            ("figure", "Figure"),
+            ("document", "Document"),
+            ("reference", "Literature"),
+            ("conversational", "Conversation"),
+            ("unknown", "Unspecified"),
+        ] {
+            assert_eq!(evidence_kind(Some(raw)).label, label, "{raw}");
+        }
+        assert_eq!(evidence_kind(Some("Document")).recorded_as, None);
+        assert_eq!(
+            evidence_kind(Some("empirical")).recorded_as.as_deref(),
+            Some("empirical")
+        );
+        assert_eq!(evidence_kind(None).label, "Unspecified");
+        assert_eq!(evidence_kind(None).recorded_as, None);
+        assert_eq!(evidence_kind(Some("meta_analysis")).label, "Meta analysis");
+    }
+
+    #[test]
+    fn dois_become_doi_org_links() {
+        assert_eq!(doi_from("10.1000/xyz").as_deref(), Some("10.1000/xyz"));
+        assert_eq!(doi_from("doi: 10.1000/xyz").as_deref(), Some("10.1000/xyz"));
+        assert_eq!(
+            doi_from("https://doi.org/10.1000/xyz").as_deref(),
+            Some("10.1000/xyz")
+        );
+        assert_eq!(
+            doi_from("DOI:10.1000/a(b)c").as_deref(),
+            Some("10.1000/a(b)c")
+        );
+        assert_eq!(doi_from("10.1000"), None);
+        assert_eq!(doi_from("11.1000/x"), None);
+        assert_eq!(doi_from("10.10 00/x"), None);
+        assert_eq!(doi_from("https://example.com/10.1/x"), None);
+        assert_eq!(
+            doi_url("10.1000/a#b?c").as_deref(),
+            Some("https://doi.org/10.1000/a%23b%3Fc")
+        );
+    }
+
+    #[test]
+    fn only_http_urls_become_links() {
+        assert_eq!(
+            web_url("https://api.example.com/paper.pdf").as_deref(),
+            Some("https://api.example.com/paper.pdf")
+        );
+        assert_eq!(web_url("javascript:alert(1)"), None);
+        assert_eq!(web_url("data:text/html,x"), None);
+        assert_eq!(web_url("/relative/path"), None);
+        assert_eq!(web_url("mailto:a@example.com"), None);
+
+        let l = source_links(Some("javascript:alert(1)"), None);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].href, None);
+        assert_eq!(l[0].text, "javascript:alert(1)");
+
+        // A DOI in source_url becomes a doi.org link; the same DOI in `doi` is not repeated.
+        let l = source_links(Some("10.1000/XYZ"), Some("https://doi.org/10.1000/xyz"));
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].href.as_deref(), Some("https://doi.org/10.1000/XYZ"));
+
+        let l = source_links(Some("https://api.example.com/a"), Some("10.1/b"));
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[1].href.as_deref(), Some("https://doi.org/10.1/b"));
+
+        let l = source_links(None, Some("not a doi"));
+        assert_eq!(l[0].href, None);
+        assert!(source_links(Some("  "), None).is_empty());
+    }
+
+    #[test]
+    fn orcid_and_ror() {
+        assert_eq!(
+            orcid_url("0000-0002-1825-009x").as_deref(),
+            Some("https://orcid.org/0000-0002-1825-009X")
+        );
+        assert_eq!(
+            orcid_url("https://orcid.org/0000-0002-1825-0097").as_deref(),
+            Some("https://orcid.org/0000-0002-1825-0097")
+        );
+        assert_eq!(orcid_url("0000-0002-1825"), None);
+        assert_eq!(orcid_url("javascript:alert(1)"), None);
+        assert_eq!(
+            ror_url("05dxps055").as_deref(),
+            Some("https://ror.org/05dxps055")
+        );
+        assert_eq!(
+            ror_url("https://ror.org/05dxps055").as_deref(),
+            Some("https://ror.org/05dxps055")
+        );
+        assert_eq!(ror_url("05dx/ps05"), None);
+    }
+
+    #[test]
+    fn share_rows_sort_and_cap() {
+        let m = BTreeMap::from([
+            ("a".to_string(), 0.2),
+            ("b".to_string(), 0.7),
+            ("c".to_string(), 0.1),
+        ]);
+        let rows = share_rows(&m, 2, humanise_key);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "B");
+        assert_eq!(rows[0].value, "0.700");
+        assert_eq!(rows[0].pct, "70%");
     }
 
     fn version(n: u32, current: bool, superseded_by: Option<Uuid>) -> ClaimVersion {
