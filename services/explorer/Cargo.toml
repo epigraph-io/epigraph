@@ -1,0 +1,51 @@
+[package]
+name = "epigraph-explorer"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Server-rendered web UI and BFF for the EpiGraph knowledge graph"
+
+# Standalone root: its own Cargo.lock and target/. It is deliberately NOT a
+# member of the kernel workspace, so nothing below may use `workspace = true`
+# (it cannot resolve from here — see crates/epigraph-harvester).
+[workspace]
+
+[lib]
+name = "epigraph_explorer"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+askama = "0.16"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+cookie = "0.18"
+futures = "0.3"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"
+
+# Copied by hand from the kernel's [workspace.lints]; `lints.workspace = true`
+# cannot resolve outside the workspace.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
