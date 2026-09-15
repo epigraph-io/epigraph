@@ -44,8 +44,8 @@
 //! If a future tool reaches for this to read *content* on a caller's behalf,
 //! that is the abuse, and the fix is `tools::viewer::request_viewer`.
 
-use epigraph_db::visibility::{SystemReason, Viewer};
-use epigraph_db::MaintenanceConn;
+use epigraph_db::visibility::SystemReason;
+use epigraph_db::MaintenanceSession;
 use rmcp::model::ErrorData as McpError;
 
 use crate::server::EpiGraphMcpFull;
@@ -76,12 +76,17 @@ use crate::server::EpiGraphMcpFull;
 /// makes it matter. Until then the failure mode is a clear error naming the
 /// missing constructor, which is the right thing for it to be.
 ///
-/// The `MaintenanceConn` must be held for as long as the viewer is used —
-/// dropping it returns the connection to the pool, and from PR-15 on the
-/// maintenance connection is the privileged one. Call sites bind it:
+/// Returns one [`MaintenanceSession`], which owns the connection and the viewer
+/// together and hands the viewer out only by reference — so a call site can no
+/// longer ACCIDENTALLY drop the connection and keep the bypass
+/// (`D-PR17-maintenance-lease-coupling-is-a-convention`; `Viewer` is `Clone`, so
+/// a deliberate clone is still possible and the residual is named on that
+/// entry). The mint is `ScopedPool::maintenance_session`, shared with the CLI
+/// and API wrappers.
 ///
 /// ```ignore
-/// let (_conn, viewer) = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
+/// let session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
+/// let viewer = session.viewer();
 /// ```
 ///
 /// # Errors
@@ -94,7 +99,7 @@ use crate::server::EpiGraphMcpFull;
 pub(crate) async fn maintenance_viewer(
     server: &EpiGraphMcpFull,
     reason: SystemReason,
-) -> Result<(MaintenanceConn<'_>, Viewer), McpError> {
+) -> Result<MaintenanceSession<'_>, McpError> {
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         McpError::internal_error(
             "this MCP server was not built from a ScopedPool, so no maintenance \
@@ -102,9 +107,8 @@ pub(crate) async fn maintenance_viewer(
             None,
         )
     })?;
-    let (conn, lease) = scoped
-        .unscoped_for_maintenance(reason)
+    scoped
+        .maintenance_session(reason)
         .await
-        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))?;
-    Ok((conn, Viewer::system(&lease, reason)))
+        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))
 }

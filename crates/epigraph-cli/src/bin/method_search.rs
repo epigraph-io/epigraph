@@ -66,11 +66,12 @@ async fn main() {
     let maint = epigraph_cli::MaintenancePool::connect("method_search")
         .await
         .expect("maintenance pool");
-    let (_maint_conn, viewer) = maint
+    let session = maint
         .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
         .await
         .expect("maintenance viewer");
-    let exit_code = match run(args, maint.pool().clone(), &viewer).await {
+    let viewer = session.viewer();
+    let exit_code = match run(args, maint.pool().clone(), viewer).await {
         Ok(all_filled) => {
             if all_filled {
                 0

@@ -148,10 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // whole run — the lease attests to THAT connection, and the pre-PR-15
     // template dropped it while the viewer lived on.
     let maint = epigraph_cli::MaintenancePool::connect("decompose_claims").await?;
-    let (_maint_conn, viewer) = maint
+    let session = maint
         .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
         .await?;
-    let viewer = &viewer;
+    let viewer = session.viewer();
     let pool = maint.pool();
 
     let claims = ClaimRepository::list_undecomposed(pool, viewer, cli.limit, 0).await?;

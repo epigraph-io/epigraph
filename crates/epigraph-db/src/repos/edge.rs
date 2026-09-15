@@ -238,10 +238,44 @@ impl EdgeRepository {
     ///
     /// Returns `true` when a new row was inserted, `false` on a dedup hit.
     ///
-    /// Single-statement `INSERT … SELECT … WHERE NOT EXISTS`; **not**
-    /// `ON CONFLICT` — migrations 017/018 dropped the unique triple index, so
-    /// there is no constraint to infer on. The matcher's `are_all_current`
-    /// guard stays at the MCP call site; this method is purely the write.
+    /// Single-statement `INSERT … SELECT … WHERE NOT EXISTS`, with
+    /// `ON CONFLICT DO NOTHING` behind it.
+    ///
+    /// # The guard is the fast path; migration 090 is what makes the answer true
+    ///
+    /// The `NOT EXISTS` read is not a lock. Two concurrent promote decisions
+    /// over the same pair both observe an empty guard and both insert, and
+    /// nothing in the schema used to stop the second one — the old note here
+    /// said there was "no constraint to infer on" because migrations 017/018
+    /// dropped the unique triple index. Migration 090 adds one:
+    /// `edges_symmetric_relationship_uniq`, over
+    /// `(LEAST(source,target), GREATEST(source,target), relationship)`, keyed on
+    /// the same `(pair + properties->>'source' = 'cross_source_matcher')`
+    /// identity `MatchCandidateRepo::retire` already uses and restricted to
+    /// in-force claim-claim rows. Its predicate is a strict SUBSET of what this
+    /// guard blocks, so it can only ever reject a row the guard would have
+    /// rejected too if it had seen it — and an operator-authored edge over the
+    /// same pair is untouched, which is what keeps this a dedup repair rather
+    /// than a change to what `POST /edges` may write.
+    ///
+    /// The second case it covers is why this is a FORCE precondition
+    /// (`D-PR17-read-guards-widen-under-rls`): 072 arm (d)'s no-widening rule
+    /// lets an edge keep a group stamp after both of its endpoints become
+    /// public, so a writer can see the endpoints and not the edge. The guard
+    /// then permits a second row for the pair; the index refuses it. Latent
+    /// until plan §9.2 step 11d, because until then the application connects as
+    /// a role no policy applies to.
+    ///
+    /// `DO NOTHING` is **bare**, with no arbiter inference: inference against a
+    /// partial expression index must imply the index predicate exactly, and a
+    /// mismatch is a runtime error out of this `sqlx::query` that no compile
+    /// step sees. Bare `DO NOTHING` also covers
+    /// `edges_alternative_of_symmetric_uniq` for free. It suppresses unique and
+    /// exclusion violations only — 074's tenancy RAISE and `edges_validate_refs`
+    /// still propagate, which is what keeps this write fail-closed.
+    ///
+    /// The matcher's `are_all_current` guard stays at the MCP call site; this
+    /// method is purely the write.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -262,7 +296,8 @@ impl EdgeRepository {
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
-             )",
+             )
+             ON CONFLICT DO NOTHING",
         )
         .bind(a)
         .bind(b)
@@ -282,11 +317,33 @@ impl EdgeRepository {
     /// `was_created = true` with the freshly-inserted id, or `false` with the
     /// id of the pre-existing symmetric edge. Purpose-built for the
     /// `link_alternative` MCP tool over `alternative_of` (migration 042's
-    /// `edges_alternative_of_symmetric_uniq`). Runtime `sqlx::query*` — no
-    /// `.sqlx/` prepared-cache entry.
+    /// `edges_alternative_of_symmetric_uniq`, narrowed to rows in force by 091).
+    /// Runtime `sqlx::query*` — no `.sqlx/` prepared-cache entry.
+    ///
+    /// Carries the same bare `ON CONFLICT DO NOTHING` as
+    /// [`Self::create_symmetric_if_absent`], and see that function for why the
+    /// constraint rather than the guard is what makes the answer true. The
+    /// arbiter here is migration 042's `edges_alternative_of_symmetric_uniq`
+    /// (narrowed by 091), not 090 — `alternative_of` is outside 090's predicate.
+    ///
+    /// WHAT THE `DO NOTHING` IS AND IS NOT PROVED TO DO. When the conflicting
+    /// row is visible to this connection the dedup-hit branch below reads it and
+    /// the concurrent-duplicate case resolves to `(existing_id, false)` instead
+    /// of a 23505 the caller maps to an internal error. When it is NOT visible,
+    /// one error is traded for another, not for an answer. There is no test over
+    /// this function or over its one caller, so both halves are asserted by
+    /// inspection; the change is conservative because every pre-change path is
+    /// unchanged.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns `DbError::QueryFailed` if the database query fails. On the
+    /// dedup-hit branch that includes the case where the conflicting edge is not
+    /// visible to this connection and there is no id to return. Note what does
+    /// the filtering and when: the probe below is annotated
+    /// `VISIBILITY-EXEMPT` and carries no `Viewer` splice, so it is unfiltered
+    /// on the role the application connects as TODAY and becomes filtered by the
+    /// database policy only from plan §9.2 step 11d, at which point that branch
+    /// yields `RowNotFound`. That is a loud failure rather than a wrong answer.
     #[instrument(skip(pool, properties))]
     pub async fn create_symmetric_if_absent_returning(
         pool: &PgPool,
@@ -305,6 +362,7 @@ impl EdgeRepository {
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
              )
+             ON CONFLICT DO NOTHING
              RETURNING id",
         )
         .bind(a)

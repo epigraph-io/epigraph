@@ -46,10 +46,11 @@
 //! this crate does not depend on `epigraph-cli`; inverting that layering to name
 //! a type would be a larger change than the guarantee is worth. What is taken
 //! instead is [`epigraph_db::ScopedPool`], which is nameable here and which is
-//! the type that mints a `MaintenanceLease` — and `Viewer::system` cannot be
+//! the type that mints a `MaintenanceLease` — and a bypass `Viewer` cannot be
 //! built without one. So the bypass viewer the drift rescan needs is reachable
-//! only through `ScopedPool::unscoped_for_maintenance`, by construction rather
-//! than by convention.
+//! only through `ScopedPool`, by construction rather than by convention; the
+//! rescan takes it as a whole [`epigraph_db::MaintenanceSession`], so the viewer
+//! and the privileged connection it must be spent on are one value.
 //!
 //! What that does NOT buy: `ScopedPool` does not prove the DSN behind it is
 //! privileged. `bin/server.rs` probes that once at boot with
@@ -1002,19 +1003,28 @@ async fn rescan_for_drift_inner(
     dispatched_by: Uuid,
     correlation_id: &str,
 ) -> Result<usize, epigraph_db::DbError> {
-    let (mut conn, lease) = pool
-        .unscoped_for_maintenance(reason(Direction::Apply))
-        .await?;
-    let bypass = epigraph_db::visibility::Viewer::system(&lease, reason(Direction::Apply));
+    // ONE VALUE, NOT TWO. This was the file's only site that paired a locally
+    // minted bypass `Viewer` with a separately-owned `MaintenanceConn` — the
+    // shape `D-PR17-maintenance-lease-coupling-is-a-convention` names. The other
+    // four `unscoped_for_maintenance` sites in this module mint no viewer at
+    // all, so after this conversion the claim on
+    // `ScopedPool::maintenance_session` — that the remaining callers of
+    // `unscoped_for_maintenance` have no coupling to preserve — is true of every
+    // one of them rather than of four out of five.
+    let mut session = pool.maintenance_session(reason(Direction::Apply)).await?;
 
-    let applied = PrivatizationRepository::applied_entity_ids_conn(&mut conn, plan.id).await?;
+    let applied = PrivatizationRepository::applied_entity_ids_conn(session.conn(), plan.id).await?;
     if applied.is_empty() {
         return Ok(0);
     }
 
+    // `split` rather than two accessors: `restatement_drift_conn` needs the
+    // connection mutably and the viewer immutably in one call.
+    let (conn, bypass) = session.split();
+
     let drift = match PrivatizationRepository::restatement_drift_conn(
-        &mut conn,
-        &bypass,
+        conn,
+        bypass,
         &applied,
         DRIFT_NODE_CAP,
     )
@@ -1069,7 +1079,7 @@ async fn rescan_for_drift_inner(
     }
     PrivatizationRepository::create_followup_drift_plan_conn(
         &mut tx,
-        &bypass,
+        bypass,
         plan,
         &drift,
         dispatched_by,

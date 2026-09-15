@@ -938,17 +938,23 @@ impl AppState {
     /// PR-06 converts) reach their bypass through here instead, where a reviewer
     /// looking for "who can bypass" will actually find it.
     ///
-    /// The returned `MaintenanceConn` must be held for as long as the viewer is
-    /// used, and from PR-15 on it must also be the thing the statements RUN on:
-    /// the maintenance connection is the privileged one, so a caller that holds
-    /// it and then queries `db_pool` gets a bypass viewer on an unprivileged
-    /// connection — an empty result and a 200. `routes/claims.rs::find_claims_needing_embeddings`
-    /// is the one call site and it passes `&mut *maint_conn`.
+    /// Returns one [`epigraph_db::MaintenanceSession`] owning the privileged
+    /// connection and the bypass viewer together: the viewer comes out only as
+    /// `&Viewer`, so a call site that drops the connection and goes on using the
+    /// viewer is now a borrow error rather than a review item. That is the
+    /// accidental half of `D-PR17-maintenance-lease-coupling-is-a-convention`;
+    /// the deliberate half is not closed, because `Viewer` is `Clone` — see
+    /// [`epigraph_db::MaintenanceSession`]. The mint is
+    /// `ScopedPool::maintenance_session`, shared with the CLI and MCP wrappers.
     ///
-    /// The coupling is NOT enforced by the type: the `Viewer` is owned and the
-    /// `MaintenanceLease` it was minted from drops at return, so dropping the
-    /// connection leaves a usable viewer behind. Making that structural is
-    /// `D-PR17-maintenance-lease-coupling-is-a-convention`.
+    /// The remaining discipline is one the type cannot express: from PR-15 on
+    /// the statements must also RUN on that connection. A caller that holds the
+    /// session and then queries `db_pool` gets a bypass viewer on an
+    /// unprivileged connection — an empty result and a 200.
+    /// `routes/claims.rs::find_claims_needing_embeddings` is the one call site
+    /// and it takes both halves from [`epigraph_db::MaintenanceSession::split`].
+    /// That residual is `D-PR17-hybrid-shape-lint`, which is a lint's job rather
+    /// than a lifetime's.
     ///
     /// # Errors
     /// `DbError::InvalidData` when this `AppState` was not built from a
@@ -958,13 +964,7 @@ impl AppState {
     pub async fn maintenance_viewer(
         &self,
         reason: epigraph_db::visibility::SystemReason,
-    ) -> Result<
-        (
-            epigraph_db::MaintenanceConn<'_>,
-            epigraph_db::visibility::Viewer,
-        ),
-        epigraph_db::DbError,
-    > {
+    ) -> Result<epigraph_db::MaintenanceSession<'_>, epigraph_db::DbError> {
         let scoped = self
             .scoped
             .as_ref()
@@ -973,9 +973,7 @@ impl AppState {
                          lease can be minted; use AppState::with_scoped_pool"
                     .to_string(),
             })?;
-        let (conn, lease) = scoped.unscoped_for_maintenance(reason).await?;
-        let viewer = epigraph_db::visibility::Viewer::system(&lease, reason);
-        Ok((conn, viewer))
+        scoped.maintenance_session(reason).await
     }
 
     /// A connection stamped with `viewer`'s tenancy context, in whichever form

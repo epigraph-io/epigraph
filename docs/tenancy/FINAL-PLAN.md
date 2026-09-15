@@ -3722,8 +3722,21 @@ The two surfaces RLS structurally cannot reach — an in-process bus is not SQL.
 
 *Files:* migrations 073/074/075; boot assertions in `AppState::with_db`; a 60-second canary health metric.
 *Depends on:* **PR-15** (maintenance DSNs) and PR-16.
-*Acceptance:* the process refuses to serve as a superuser or `BYPASSRLS` holder, refuses if `pg_class.relforcerowsecurity` is false on any protected table, refuses if the canary row is visible on the app connection, refuses if `current_user <> 'epigraph_app'`, refuses if the §0.5 session-GUC probe fails, and refuses if any tenancy trigger is not `tgenabled='O'`; the `group_memberships` policy does **not** recurse; **a token mint (`ensure_for_client` + `UPDATE oauth_clients SET agent_id`) succeeds under `FORCE` as `epigraph_app`** (the direct sec-F13 regression); **a `Scoped` viewer reads its own group-private rows at all 17 `claim.rs` read functions** (the sec-F1 regression); **the privatization apply job writes successfully on the maintenance pool** (the ops-F5 regression); a `recall_events` row with `agent_id IS NULL` is **not** visible to a session whose principal GUC is unset.
+*Acceptance:* the process refuses to serve as a superuser or `BYPASSRLS` holder, refuses if `pg_class.relforcerowsecurity` is false on any protected table, refuses if the canary row is visible on the app connection, **WARNS — does not refuse — if `current_user <> 'epigraph_app'`** (amended to what shipped; see the note below), refuses if the §0.5 session-GUC probe fails, and refuses if any tenancy trigger is not `tgenabled='O'`; the `group_memberships` policy does **not** recurse; **a token mint (`ensure_for_client` + `UPDATE oauth_clients SET agent_id`) succeeds under `FORCE` as `epigraph_app`** (the direct sec-F13 regression); **a `Scoped` viewer reads its own group-private rows at all 17 `claim.rs` read functions** (the sec-F1 regression); **the privatization apply job writes successfully on the maintenance pool** (the ops-F5 regression); a `recall_events` row with `agent_id IS NULL` is **not** visible to a session whose principal GUC is unset.
 *Tests:* `rls_enforcement.rs` (incl. the `pg_policy.polcmd` per-command coverage table), `no_unscoped_pool.rs`, `qual_guc_coherence.rs` under `FORCE`.
+
+> **Amendment (`D-PR17-current-user-refusal-left-as-a-warning`).** The clause above
+> originally read "refuses if `current_user <> 'epigraph_app'`". Five of the six listed
+> posture refusals ship armed; this one ships as a `WARN`, and that is a considered
+> deviation, not an omission. `epigraph_api::state::rls_verdict` carries the full
+> reasoning under *"THE ONE ACCEPTANCE ITEM THIS DELIBERATELY DOES NOT ARM"*: arming it
+> makes the marker its own trigger — CI, every developer host and production today would
+> refuse to boot the moment the code deploys — and it un-boots §9.2's documented
+> sub-minute rollback, because reverting `DATABASE_URL` is exactly what puts
+> `current_user` back to the owner role. The harm the check reaches for is measured
+> directly by the **canary** refusal, which is armed. This line is amended to state what
+> ships rather than arming the sixth; an acceptance line the code falsifies is the defect
+> either way, and the code here is the considered half.
 
 ---
 

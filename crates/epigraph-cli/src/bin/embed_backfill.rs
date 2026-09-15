@@ -63,12 +63,13 @@ async fn main() -> anyhow::Result<()> {
     let maint = epigraph_cli::MaintenancePool::connect_to(&cli.database_url, "embed_backfill")
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    let (_maint_conn, viewer) = maint
+    let session = maint
         .viewer(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
         .await
         .context("mint maintenance viewer")?;
+    let viewer = session.viewer();
 
-    run(cli, maint.pool(), &viewer).await
+    run(cli, maint.pool(), viewer).await
 }
 
 async fn run(

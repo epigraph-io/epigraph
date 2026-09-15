@@ -1057,6 +1057,44 @@ impl ScopedPool {
         Ok((MaintenanceConn(conn, PhantomData), MaintenanceLease::new()))
     }
 
+    /// The maintenance escape hatch as ONE value: the privileged connection and
+    /// the bypass [`Viewer`] that may only be spent on it, owned together.
+    ///
+    /// This is the constructor the three wrappers
+    /// (`epigraph_cli::MaintenancePool::viewer`,
+    /// `epigraph_api::AppState::maintenance_viewer`,
+    /// `epigraph_mcp::maintenance::maintenance_viewer`) now call, so all three
+    /// inherit the coupling instead of each re-deriving it from
+    /// [`Self::unscoped_for_maintenance`] and handing the caller two separable
+    /// values. See [`MaintenanceSession`] for what that buys and why it matters
+    /// only from plan §9.2 step 11d onward.
+    ///
+    /// [`Self::unscoped_for_maintenance`] stays, and stays public: a caller that
+    /// wants the unstamped connection WITHOUT minting a bypass viewer has no
+    /// coupling to preserve, and forcing a viewer on it would mint a bypass
+    /// nobody spends. The `SystemReason` is still recorded there, so the bypass
+    /// metric is unchanged.
+    ///
+    /// MEASURED, because an enumeration is a claim: after this batch every
+    /// remaining production caller of [`Self::unscoped_for_maintenance`] — the
+    /// privatization job's four sites — really does mint no viewer, and the one
+    /// that did (`privatization.rs::rescan_for_drift_inner`, which paired a
+    /// locally minted `Viewer::system` with a separately-owned connection) was
+    /// converted to this constructor in the same commit. `#[sqlx::test]`
+    /// fixtures are the other population and are not production.
+    ///
+    /// # Errors
+    /// Propagates [`Self::unscoped_for_maintenance`]: `DbError::ConnectionFailed`
+    /// if the connection cannot be acquired.
+    pub async fn maintenance_session(
+        &self,
+        r: SystemReason,
+    ) -> Result<MaintenanceSession<'_>, DbError> {
+        let (conn, lease) = self.unscoped_for_maintenance(r).await?;
+        let viewer = Viewer::system(&lease, r);
+        Ok(MaintenanceSession::new(conn, viewer))
+    }
+
     /// The plan §0.5 boot probe: prove session GUCs survive between statements
     /// on one pooled connection, and prove the release scrub clears them.
     ///
@@ -1345,6 +1383,124 @@ impl std::ops::Deref for MaintenanceConn<'_> {
 impl std::ops::DerefMut for MaintenanceConn<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+/// A privileged connection and the bypass [`Viewer`] that may only be spent on
+/// it, owned together so the pair cannot come apart.
+///
+/// # What this makes structural
+///
+/// Before this type the three maintenance constructors — `MaintenancePool::viewer`,
+/// `AppState::maintenance_viewer`, `epigraph_mcp::maintenance::maintenance_viewer`
+/// — each returned `(MaintenanceConn<'_>, Viewer)`, with the `Viewer` **owned**
+/// and the [`MaintenanceLease`] it was minted from a local that dropped at
+/// return. A caller that dropped the connection and kept the viewer still
+/// compiled, and every call site binding both for the whole run was doing so by
+/// review rather than by the borrow checker
+/// (`D-PR17-maintenance-lease-coupling-is-a-convention`).
+///
+/// That is the silent-zero-rows shape, and only from plan §9.2 step 11d onward:
+/// once RLS is FORCEd a bypass `Viewer` emits no SQL predicate but the database
+/// policy still filters, so spending one on an ordinary `epigraph_app`
+/// connection returns **zero** rows rather than all of them — a wrong answer
+/// with no error.
+///
+/// [`Self::viewer`] hands the viewer out only by reference, so the borrow
+/// checker now refuses a call site that keeps the viewer past the connection.
+/// There is no accessor that moves the `Viewer` out, and adding one would undo
+/// the whole point of the type.
+///
+/// # WHAT THIS DOES NOT MAKE STRUCTURAL, STATED RATHER THAN IMPLIED
+///
+/// [`Viewer`] is `Clone`. `session.viewer().clone()` therefore yields an OWNED
+/// bypass viewer that outlives the session and compiles — method resolution
+/// picks `Viewer::clone` at the `&Viewer` receiver, not the `&T: Clone` impl.
+/// So what this type removes is the ACCIDENTAL shape: the call site that binds
+/// the connection to `_conn`, lets it drop, and goes on using a viewer it
+/// happens to still own. A DELIBERATE clone is not prevented, and the residual
+/// is recorded on `D-PR17-maintenance-lease-coupling-is-a-convention` rather
+/// than papered over. Making it unreachable would mean `Viewer` losing `Clone`,
+/// which is a change to every holder of one across the workspace.
+///
+/// No production site clones a viewer out of a session today, and the shape a
+/// clone would be used for — spending the bypass on an application pool — is
+/// what `no_hybrid_bypass_spend.rs` is keyed on.
+///
+/// # Why [`Self::split`] exists rather than a `DerefMut` to the connection
+///
+/// The overwhelmingly common shape is `repo_fn(&mut *conn, &viewer, ..)`, which
+/// needs a mutable borrow of the connection and an immutable borrow of the
+/// viewer AT THE SAME TIME. Through a single `DerefMut` those are two borrows of
+/// the same value and the call does not compile. `split` takes one `&mut self`
+/// and returns disjoint field borrows, which is exactly what the call site
+/// needs and what a `DerefMut` cannot express.
+///
+/// # The guarantee, as a test
+///
+/// Keeping the viewer past the connection is now a BORROW ERROR, and these two
+/// doctests are the proof. The `compile_fail` one is pinned to `E0505` rather
+/// than to "does not compile", because a `compile_fail` block that fails for a
+/// typo proves nothing:
+///
+/// ```compile_fail,E0505
+/// # async fn f(scoped: &epigraph_db::ScopedPool) -> Result<(), epigraph_db::DbError> {
+/// use epigraph_db::visibility::SystemReason;
+/// let session = scoped.maintenance_session(SystemReason::EmbeddingBackfill).await?;
+/// let viewer = session.viewer();
+/// drop(session);                 // the privileged connection goes back to the pool
+/// let _ = viewer.bypass_bind();  // ... and the bypass is still usable. E0505.
+/// # Ok(()) }
+/// ```
+///
+/// The POSITIVE arm — the legitimate order still compiles, so the block above is
+/// failing on the thing it claims to and not on the fixture:
+///
+/// ```
+/// # async fn f(scoped: &epigraph_db::ScopedPool) -> Result<(), epigraph_db::DbError> {
+/// use epigraph_db::visibility::SystemReason;
+/// let session = scoped.maintenance_session(SystemReason::EmbeddingBackfill).await?;
+/// let viewer = session.viewer();
+/// let _ = viewer.bypass_bind();
+/// drop(session);
+/// # Ok(()) }
+/// ```
+pub struct MaintenanceSession<'a> {
+    conn: MaintenanceConn<'a>,
+    viewer: Viewer,
+}
+
+impl std::fmt::Debug for MaintenanceSession<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintenanceSession")
+            .field("viewer", &self.viewer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> MaintenanceSession<'a> {
+    /// Crate-private, like [`MaintenanceLease::new`]: the only mint is
+    /// [`ScopedPool::maintenance_session`], so there is no way to pair an
+    /// arbitrary connection with a bypass viewer from outside this crate.
+    pub(crate) fn new(conn: MaintenanceConn<'a>, viewer: Viewer) -> Self {
+        Self { conn, viewer }
+    }
+
+    /// The bypass viewer, BY REFERENCE. It cannot outlive this session.
+    #[must_use]
+    pub fn viewer(&self) -> &Viewer {
+        &self.viewer
+    }
+
+    /// The privileged connection, for a statement that needs no viewer.
+    pub fn conn(&mut self) -> &mut PgConnection {
+        &mut self.conn
+    }
+
+    /// Both halves at once, as disjoint borrows — the shape almost every repo
+    /// call needs. See the type doc for why this is not a `DerefMut`.
+    pub fn split(&mut self) -> (&mut PgConnection, &Viewer) {
+        (&mut self.conn.0, &self.viewer)
     }
 }
 
