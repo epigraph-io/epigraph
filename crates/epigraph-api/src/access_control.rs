@@ -4,7 +4,8 @@
 //! preserves the `crate::access_control::*` import path for the HTTP routes.
 #[cfg(feature = "db")]
 pub use epigraph_db::access_control::{
-    batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
+    batch_check_content_access, batch_content_access, check_content_access, ContentAccess,
+    COARSE_EDGE_TYPES,
 };
 
 /// Redact claim content: keep id, truth_value, belief, plausibility, pignistic_prob

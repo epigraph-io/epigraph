@@ -57,7 +57,8 @@ pub mod repos;
 
 // Re-export primary types
 pub use access_control::{
-    batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
+    batch_check_content_access, batch_content_access, check_content_access, ContentAccess,
+    COARSE_EDGE_TYPES,
 };
 pub use errors::DbError;
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
