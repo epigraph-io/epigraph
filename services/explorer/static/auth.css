@@ -1,0 +1,19 @@
+/* Sign-in pages (templates/auth/*). Builds on app.css custom properties.
+ */
+
+.auth-page {
+  max-width: var(--measure);
+  margin: var(--space-6) 0;
+}
+
+.auth-page h1 {
+  margin-top: 0;
+}
+
+.auth-page__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  align-items: center;
+  margin: var(--space-5) 0;
+}
