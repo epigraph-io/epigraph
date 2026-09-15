@@ -210,10 +210,11 @@ async fn signed_in_pages_redirect_anonymous_viewers_to_login() {
 async fn every_area_route_is_mounted() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
+    // Built core routes (`/claim/:id`, `/bff/claim/:id`) are pinned by
+    // tests/core.rs::core_routes_are_mounted_and_built.
     let pages = [
         "/explorer/".to_string(),
         "/explorer/search?q=x".to_string(),
-        format!("/explorer/claim/{CLAIM}"),
         format!("/explorer/claim/{CLAIM}/history"),
         format!("/explorer/claim/{CLAIM}/provenance"),
         format!("/explorer/claim/{CLAIM}/graph"),
@@ -236,7 +237,6 @@ async fn every_area_route_is_mounted() {
         assert_eq!(res.status, StatusCode::OK, "{uri}");
     }
     let bff = [
-        format!("/explorer/bff/claim/{CLAIM}"),
         "/explorer/bff/search?q=x".to_string(),
         format!("/explorer/bff/graph/ego/{CLAIM}"),
         "/explorer/bff/themes".to_string(),

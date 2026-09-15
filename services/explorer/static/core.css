@@ -1,0 +1,191 @@
+/* EpiGraph Explorer — core area: the claim page.
+ *
+ * Builds on app.css custom properties; no inline styles (CSP style-src
+ * 'self'). Layouts collapse to one column below ~48rem and hold at 400px.
+ */
+
+/* ---- claim page ---------------------------------------------------------- */
+
+.claim__header {
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.claim__kicker {
+  font-size: 0.875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  margin: 0 0 var(--space-3);
+}
+
+.claim__content {
+  margin: 0 0 var(--space-4);
+  padding: 0 0 0 var(--space-4);
+  border-left: 3px solid var(--accent);
+  white-space: pre-line;
+}
+
+.claim__nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  font-size: 0.95rem;
+}
+
+.claim-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(16rem, 22rem);
+  gap: var(--space-6);
+  align-items: start;
+}
+
+.claim-layout__aside {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-6);
+}
+
+.claim-panel .section__title {
+  margin-top: 0;
+}
+
+.claim-panel .meta dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.claim-meter {
+  width: 6rem;
+  max-width: 100%;
+  height: 0.6rem;
+}
+
+@media (max-width: 48rem) {
+  .claim-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .claim-layout__aside {
+    margin-top: 0;
+  }
+}
+
+/* Connections, grouped by relationship family. */
+.outlinks__family {
+  margin: var(--space-4) 0 var(--space-5);
+  padding-left: var(--space-4);
+  border-left: 3px solid var(--border);
+}
+
+.outlinks__family--support {
+  border-left-color: var(--support);
+}
+
+.outlinks__family--refute {
+  border-left-color: var(--refute);
+}
+
+.outlinks__family-title {
+  margin-top: 0;
+  font-size: 1rem;
+  color: var(--text-muted);
+}
+
+.outlinks__family--support .outlinks__family-title {
+  color: var(--support);
+}
+
+.outlinks__family--refute .outlinks__family-title {
+  color: var(--refute);
+}
+
+.outlinks__heading {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.outlinks__list > li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  align-items: baseline;
+  justify-content: space-between;
+  padding: var(--space-2) 0;
+}
+
+.outlinks__list a,
+.outlinks__plain {
+  flex: 1 1 16rem;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+
+.outlinks__hidden {
+  font-style: italic;
+}
+
+/* Evidence, challenges, provenance. */
+.evidence-item__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: baseline;
+  margin: 0 0 var(--space-1);
+}
+
+.evidence-item__text {
+  margin: 0 0 var(--space-1);
+  max-width: var(--measure);
+  overflow-wrap: break-word;
+  white-space: pre-line;
+}
+
+.challenge__state {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.challenge--accepted .challenge__state {
+  color: var(--refute);
+}
+
+.challenge--rejected .challenge__state {
+  color: var(--text-muted);
+}
+
+.provenance-path {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  padding: 0;
+  margin: 0 0 var(--space-2);
+}
+
+.provenance-path__step {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+
+.provenance-path__sep {
+  align-self: center;
+  color: var(--text-muted);
+}
+
+/* Anonymous claim page. */
+.signin-prompt h1 {
+  margin-top: 0;
+}
