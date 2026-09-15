@@ -48,6 +48,10 @@ pub enum ContentAccess {
 /// - Partition is `public`
 /// - Partition is `community` and requester has a perspective that is a member
 /// - Partition is `private` and requester is the owner
+///
+/// Fails closed: if the ownership or membership lookup errors (pool
+/// exhaustion, statement timeout, dropped connection) the node is
+/// `Redacted`, never `Full`.
 pub async fn check_content_access(
     pool: &PgPool,
     node_id: Uuid,
@@ -55,13 +59,22 @@ pub async fn check_content_access(
 ) -> ContentAccess {
     // 1. Look up ownership (partition_type, owner_id, encryption_key_id)
     // For community partitions, encryption_key_id stores the community UUID.
-    let ownership: Option<(String, Uuid, Option<String>)> = sqlx::query_as(
+    let ownership: Option<(String, Uuid, Option<String>)> = match sqlx::query_as(
         "SELECT partition_type, owner_id, encryption_key_id FROM ownership WHERE node_id = $1",
     )
     .bind(node_id)
     .fetch_optional(pool)
     .await
-    .unwrap_or(None);
+    {
+        Ok(row) => row,
+        // A failed lookup is NOT "no ownership row": reading it as one would
+        // serve a private node's content as public whenever the pool is
+        // exhausted.
+        Err(e) => {
+            tracing::warn!(%node_id, error = %e, "ownership lookup failed; redacting");
+            return ContentAccess::Redacted;
+        }
+    };
 
     let (partition, owner_id, encryption_key_id) = match ownership {
         Some(row) => row,
@@ -110,7 +123,7 @@ pub async fn check_content_access(
             .bind(agent_id)
             .fetch_one(pool)
             .await
-            .unwrap_or(false);
+            .unwrap_or(false); // lookup error → not a member → Redacted
 
             if is_member {
                 ContentAccess::Full
