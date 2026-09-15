@@ -1,7 +1,7 @@
-//! Sign-in, refresh and logout (plan §3.3) against a wiremock
-//! `/oauth/token` and `/oauth/revoke` shaped like oauth-auth.md §1.4, §3 and
-//! §6: form bodies in, `TokenResponse` or the non-RFC `{error, message,
-//! details}` body out; revoke takes JSON only.
+//! Sign-in, refresh, embed handoff and logout (plan §3.3) against a
+//! wiremock `/oauth/token` and `/oauth/revoke` shaped like oauth-auth.md
+//! §1.4, §3 and §6: form bodies in, `TokenResponse` or the non-RFC
+//! `{error, message, details}` body out; revoke takes JSON only.
 
 mod common;
 
@@ -165,6 +165,12 @@ async fn finish_login(app: &TestApp, started: &Started, query: &str) -> TestResp
         &[("cookie", &cookie)],
     )
     .await
+}
+
+fn attr<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let start = body.find(&needle)? + needle.len();
+    Some(&body[start..start + body[start..].find('"')?])
 }
 
 // ---- login ------------------------------------------------------------------------
@@ -598,6 +604,174 @@ async fn token_endpoint_errors_are_parsed_and_reported() {
     let res = finish_login(&app, &started, "&code=c0de").await;
     assert_eq!(res.status, StatusCode::BAD_GATEWAY);
     assert_eq!(app.state.sessions.len(), 0);
+}
+
+// ---- embed sign-in ----------------------------------------------------------------
+
+#[tokio::test]
+async fn iframe_navigation_gets_the_embed_sign_in_page() {
+    let app = app().await;
+    let res = app
+        .get_with(
+            &format!("/explorer/auth/login?return_to={CLAIM_PATH}"),
+            &[("sec-fetch-dest", "iframe")],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.header("cache-control"), Some("no-store"));
+    assert!(res.header("content-security-policy").is_some());
+    assert!(
+        app.state.auth_flow.pending.is_empty(),
+        "no login started yet"
+    );
+    assert!(set_cookie(&res, "epx_login").is_none());
+
+    let body = &res.body;
+    assert_eq!(attr(body, "data-return-to"), Some(CLAIM_PATH));
+    assert_eq!(attr(body, "data-redeem"), Some("/explorer/auth/redeem"));
+    let login = attr(body, "data-login").unwrap().replace("&#38;", "&");
+    assert_eq!(
+        login,
+        "/explorer/auth/login?mode=popup&return_to=%2Fexplorer%2Fclaim%2F0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10"
+    );
+    assert!(body.contains("/explorer/static/embed.js?v="), "{body}");
+    assert!(
+        body.contains(&format!("{ORIGIN}{CLAIM_PATH}")),
+        "new-tab link"
+    );
+    assert!(!body.contains("<script>"), "CSP: no inline script");
+    assert!(!body.contains("style="), "CSP: no inline style");
+
+    // The popup itself (mode=popup) is a normal top-level navigation.
+    let started = start_login(&app, "?mode=popup").await;
+    assert!(
+        app.state
+            .auth_flow
+            .pending
+            .get(&started.state)
+            .unwrap()
+            .popup
+    );
+}
+
+#[tokio::test]
+async fn popup_flow_hands_off_a_single_use_code() {
+    let app = app().await;
+    let started = start_login(&app, &format!("?mode=popup&return_to={CLAIM_PATH}")).await;
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &pending_verifier(&app, &started)),
+        ("redirect_uri", REDIRECT_URI),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("access-1", "refresh-1")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+
+    let res = finish_login(&app, &started, "&code=c0de").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.header("cache-control"), Some("no-store"));
+    assert!(
+        set_cookie(&res, "epx_session").is_none(),
+        "the popup's first-party jar is not the iframe's"
+    );
+    assert_eq!(attr(&res.body, "data-status"), Some("ok"));
+    assert!(res.body.contains("/explorer/static/embed.js?v="));
+    assert!(!res.body.contains("<script>"));
+    let code = attr(&res.body, "data-handoff")
+        .expect("handoff code")
+        .to_string();
+    assert_eq!(code.len(), 43);
+    assert!(!res.body.contains("access-1") && !res.body.contains("refresh-1"));
+
+    let redeem = |origin: Option<&'static str>, body: String| {
+        let app = &app;
+        async move {
+            let mut h = vec![("content-type", "application/x-www-form-urlencoded")];
+            if let Some(o) = origin {
+                h.push(("origin", o));
+            }
+            send_with(app, Method::POST, "/explorer/auth/redeem", &h, &body).await
+        }
+    };
+
+    // Cross-origin and Origin-less POSTs are refused before the code is read,
+    // so they do not burn it.
+    for origin in [None, Some("https://evil.example.net"), Some("null")] {
+        let res = redeem(origin, format!("code={code}")).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{origin:?}");
+    }
+
+    let res = redeem(Some(ORIGIN), format!("code={code}")).await;
+    assert_eq!(res.status, StatusCode::NO_CONTENT, "{}", res.body);
+    assert_eq!(res.header("cache-control"), Some("no-store"));
+    let (sid, line) = set_cookie(&res, "epx_session").expect("embed cookie");
+    for attr in [
+        "HttpOnly",
+        "SameSite=None",
+        "Secure",
+        "Partitioned",
+        "Path=/explorer",
+        "Max-Age=2592000",
+    ] {
+        assert!(line.contains(attr), "{attr} missing from {line}");
+    }
+    let sid = SessionId::parse(&sid).unwrap();
+    assert_eq!(
+        app.state.sessions.get(&sid).unwrap().access_token,
+        "access-1"
+    );
+
+    // Single use.
+    let res = redeem(Some(ORIGIN), format!("code={code}")).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(set_cookie(&res, "epx_session").is_none());
+
+    // Junk, missing and expired codes.
+    for body in [String::new(), "code=".into(), "code=nope".into()] {
+        let res = redeem(Some(ORIGIN), body.clone()).await;
+        assert_eq!(res.status, StatusCode::BAD_REQUEST, "{body:?}");
+    }
+    let stale = epigraph_explorer::auth::random_token(32);
+    app.state.auth_flow.handoffs.insert(
+        stale.clone(),
+        Handoff {
+            session_id: sid.clone(),
+        },
+        StdDuration::ZERO,
+    );
+    let res = redeem(Some(ORIGIN), format!("code={stale}")).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+
+    // A code whose session has since ended is worthless.
+    let orphan = epigraph_explorer::auth::random_token(32);
+    let gone = app.sign_in("x");
+    app.state.sessions.remove(&gone);
+    app.state.auth_flow.handoffs.insert(
+        orphan.clone(),
+        Handoff { session_id: gone },
+        StdDuration::from_secs(60),
+    );
+    let res = redeem(Some(ORIGIN), format!("code={orphan}")).await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn popup_failures_are_posted_back_not_rendered_as_pages() {
+    let app = app().await;
+    let started = start_login(&app, "?mode=popup").await;
+    let res = finish_login(&app, &started, "&error=access_denied").await;
+    assert_eq!(res.status, StatusCode::FORBIDDEN);
+    assert_eq!(attr(&res.body, "data-status"), Some("error"));
+    assert_eq!(
+        attr(&res.body, "data-message"),
+        Some("Sign-in was cancelled.")
+    );
+    assert!(attr(&res.body, "data-handoff").is_none());
+    assert!(res.body.contains("/explorer/static/embed.js?v="));
+    assert!(app.state.auth_flow.handoffs.is_empty());
 }
 
 // ---- refresh ----------------------------------------------------------------------

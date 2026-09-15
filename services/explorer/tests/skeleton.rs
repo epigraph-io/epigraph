@@ -229,10 +229,9 @@ async fn every_area_route_is_mounted() {
         assert_eq!(res.status, StatusCode::OK, "{uri}");
         assert!(res.body.contains("not built yet"), "{uri}");
     }
-    // Login, callback and logout are built (tests/auth.rs covers them). Here:
-    // mounted and no longer stubs. With no client id sign-in is disabled
-    // (503), an unknown `state` is refused (400), and a POST without an
-    // Origin is refused (403).
+    // Auth routes are built (tests/auth.rs covers them). Here: mounted and no
+    // longer stubs. With no client id sign-in is disabled (503), an unknown
+    // `state` is refused (400), and POSTs without an Origin are refused (403).
     let res = app.get_as("/explorer/auth/login", &sid).await;
     assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
     let res = app
@@ -240,10 +239,10 @@ async fn every_area_route_is_mounted() {
         .await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
     assert!(!res.body.contains("not built yet"));
-    let res = app.post_form("/explorer/auth/logout", "", Some(&sid)).await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN);
-    let res = app.post_form("/explorer/auth/redeem", "", Some(&sid)).await;
-    assert_eq!(res.status, StatusCode::OK);
+    for uri in ["/explorer/auth/logout", "/explorer/auth/redeem"] {
+        let res = app.post_form(uri, "", Some(&sid)).await;
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
+    }
     let bff = [
         format!("/explorer/bff/claim/{CLAIM}"),
         "/explorer/bff/search?q=x".to_string(),

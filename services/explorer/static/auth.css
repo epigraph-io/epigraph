@@ -1,5 +1,12 @@
-/* Sign-in pages (templates/auth/*). Builds on app.css custom properties.
+/* Sign-in pages: the embed sign-in page, the sign-in popup and sign-in
+ * failures (templates/auth/*). Builds on app.css custom properties.
  */
+
+/* app.css gives buttons display:inline-block, which beats the UA's
+ * [hidden] rule; embed.js reveals controls by clearing `hidden`. */
+.auth-page [hidden] {
+  display: none !important;
+}
 
 .auth-page {
   max-width: var(--measure);
@@ -16,4 +23,18 @@
   gap: var(--space-3);
   align-items: center;
   margin: var(--space-5) 0;
+}
+
+.auth-page__status {
+  margin: var(--space-4) 0;
+}
+
+.auth-page button[disabled] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+/* The popup is a small standalone window: no site header. */
+.auth-popup {
+  padding: var(--space-5) var(--space-4);
 }

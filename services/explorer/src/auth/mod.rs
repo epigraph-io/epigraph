@@ -7,16 +7,22 @@
 //!
 //! The flow, against the API's own OAuth AS (oauth-auth.md §8):
 //!
-//! - `GET /auth/login?return_to=` stores a pending login (PKCE verifier,
-//!   `return_to`) under a random `state`, binds it to this browser with the
-//!   `epx_login` cookie, and 303s to `{oauth_base}/oauth/authorize`.
+//! - `GET /auth/login?return_to=&mode=page|popup` stores a pending login
+//!   (PKCE verifier, `return_to`, mode) under a random `state`, binds it to
+//!   this browser with the `epx_login` cookie, and 303s to
+//!   `{oauth_base}/oauth/authorize`. A navigation inside an iframe
+//!   (`Sec-Fetch-Dest: iframe`, i.e. the Notion embed) gets a page with a
+//!   button that opens the popup instead, because the AS cannot be framed.
 //! - `GET /auth/callback` checks `state` and the binding, redeems the code at
-//!   once (upstream codes live 60 s), creates the session, sets the
-//!   first-party cookie and 303s to `return_to`.
+//!   once (upstream codes live 60 s), and creates the session. Page mode sets
+//!   the first-party cookie and 303s to `return_to`; popup mode renders a page
+//!   that hands a single-use code to the opening iframe (`static/embed.js`).
+//! - `POST /auth/redeem` (Origin-checked) swaps that code for the
+//!   `SameSite=None; Partitioned` cookie the iframe can hold.
 //! - `POST /auth/logout` (Origin-checked) revokes the refresh token upstream,
 //!   drops the session and clears both cookies.
-//! - `POST /auth/redeem` (embed sign-in) is still a stub.
 
+use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
@@ -27,7 +33,7 @@ use subtle::ConstantTimeEq;
 
 use crate::error::AppError;
 use crate::state::AppState;
-use crate::view::{render, stub_page};
+use crate::view::render;
 
 pub mod extract;
 pub mod flow;
@@ -42,7 +48,7 @@ pub use session::{
     read_session_cookie, session_cookie, Session, SessionId, SessionStore, SESSION_COOKIE,
 };
 
-use flow::{PendingLogin, MAX_PENDING_LOGINS, PENDING_LOGIN_TTL};
+use flow::{Handoff, PendingLogin, HANDOFF_TTL, MAX_PENDING_LOGINS, PENDING_LOGIN_TTL};
 
 /// `/auth/*`. Merged into the app router by `app::build_app`.
 pub fn routes() -> Router<AppState> {
@@ -55,7 +61,33 @@ pub fn routes() -> Router<AppState> {
 
 // ---- templates ----------------------------------------------------------------
 
-/// A sign-in that could not finish.
+/// Shown instead of the authorize redirect when the login navigation happens
+/// inside an iframe: the button (wired by `static/embed.js`) opens the popup.
+#[derive(askama::Template)]
+#[template(path = "auth/embed_signin.html")]
+struct EmbedSignInPage {
+    ctx: PageCtx,
+    popup_login_url: String,
+    redeem_url: String,
+    return_to: String,
+    /// The destination as an absolute URL, for the "open in a new tab" link.
+    open_url: String,
+}
+
+/// Rendered in the popup by `/auth/callback?mode=popup`. `status` is `ok`
+/// (with a handoff code) or `error`; `static/embed.js` posts either to the
+/// opener and closes the window.
+#[derive(askama::Template)]
+#[template(path = "auth/popup.html")]
+struct PopupPage {
+    ctx: PageCtx,
+    status: &'static str,
+    handoff: Option<String>,
+    title: &'static str,
+    message: String,
+}
+
+/// A page-mode sign-in that could not finish.
 #[derive(askama::Template)]
 #[template(path = "auth/failed.html")]
 struct FailedPage {
@@ -119,11 +151,21 @@ fn require_same_origin(state: &AppState, headers: &HeaderMap) -> Result<(), AppE
     }
 }
 
+/// Whether the browser says this navigation is loading an iframe (Fetch
+/// Metadata; sent by current Chromium, Firefox and Safari).
+fn is_iframe_navigation(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|d| d.eq_ignore_ascii_case("iframe") || d.eq_ignore_ascii_case("frame"))
+}
+
 // ---- GET /auth/login ----------------------------------------------------------
 
 #[derive(Deserialize)]
 struct LoginQuery {
     return_to: Option<String>,
+    mode: Option<String>,
 }
 
 async fn login(
@@ -137,6 +179,21 @@ async fn login(
         ));
     };
     let return_to = flow::safe_return_to(&state.links, q.return_to.as_deref());
+    let popup = q.mode.as_deref() == Some("popup");
+
+    if !popup && is_iframe_navigation(&headers) {
+        // The page stands in for `return_to`: its header links and og:url
+        // point there, not back at this login URL.
+        let ctx = page_ctx(&state, &headers, return_to.clone());
+        let page = EmbedSignInPage {
+            popup_login_url: state.links.login_popup(Some(&return_to)),
+            redeem_url: state.links.redeem(),
+            open_url: state.links.absolute(&return_to),
+            return_to,
+            ctx,
+        };
+        return Ok(html(StatusCode::OK, render(&page)?));
+    }
 
     let pending = &state.auth_flow.pending;
     if pending.len() >= MAX_PENDING_LOGINS && {
@@ -165,7 +222,7 @@ async fn login(
         PendingLogin {
             pkce_verifier,
             return_to,
-            popup: false,
+            popup,
             binding: binding.clone(),
             created_at: std::time::Instant::now(),
         },
@@ -268,9 +325,29 @@ async fn callback(
             .sessions
             .create(tokens.access_token, tokens.refresh_token, tokens.expires_at);
     tracing::info!(
+        popup = pending.popup,
         took_ms = pending.created_at.elapsed().as_millis() as u64,
         "signed in"
     );
+
+    if pending.popup {
+        let code = random_token(32);
+        state.auth_flow.handoffs.insert(
+            code.clone(),
+            Handoff {
+                session_id: session_id.clone(),
+            },
+            HANDOFF_TTL,
+        );
+        let page = PopupPage {
+            ctx: page_ctx(&state, &headers, pending.return_to.clone()),
+            status: "ok",
+            handoff: Some(code),
+            title: "Signed in",
+            message: "You are signed in. This window closes by itself.".into(),
+        };
+        return Ok(html(StatusCode::OK, render(&page)?));
+    }
 
     // A fresh id on every sign-in (no fixation); the browser's previous
     // session, if any, is replaced rather than left in the store.
@@ -283,7 +360,8 @@ async fn callback(
     )
 }
 
-/// Report a callback failure as a page with a "Sign in again" link.
+/// Report a callback failure: to the opener in popup mode (the popup page
+/// posts an error message), else as a page with a "Sign in again" link.
 fn failed(
     state: &AppState,
     headers: &HeaderMap,
@@ -298,6 +376,16 @@ fn failed(
     };
     let return_to = pending.map_or_else(|| state.links.home(), |p| p.return_to.clone());
     let ctx = page_ctx(state, headers, return_to.clone());
+    if pending.is_some_and(|p| p.popup) {
+        let page = PopupPage {
+            ctx,
+            status: "error",
+            handoff: None,
+            title,
+            message,
+        };
+        return Ok(html(status, render(&page)?));
+    }
     let page = FailedPage {
         retry_url: state.links.login(Some(&return_to)),
         ctx,
@@ -310,9 +398,34 @@ fn failed(
 
 // ---- POST /auth/redeem --------------------------------------------------------
 
-// STUB: redeem a single-use handoff code, set the partitioned cookie.
-async fn redeem(caller: Caller) -> Result<Html<String>, AppError> {
-    stub_page(caller.ctx, "Sign in", "auth")
+async fn redeem(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppError> {
+    require_same_origin(&state, &headers)?;
+
+    let code = url::form_urlencoded::parse(&body)
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned());
+    let handoff = code
+        .filter(|c| flow::is_token_shaped(c))
+        .and_then(|c| state.auth_flow.handoffs.take(&c))
+        .filter(|h| state.sessions.get(&h.session_id).is_some());
+    let Some(handoff) = handoff else {
+        return Err(AppError::BadRequest(
+            "This sign-in code has expired or was already used. Sign in again.".into(),
+        ));
+    };
+
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, NO_STORE);
+    h.append(
+        header::SET_COOKIE,
+        embed_session_cookie(&state.config, &handoff.session_id),
+    );
+    Ok(resp)
 }
 
 // ---- POST /auth/logout --------------------------------------------------------
