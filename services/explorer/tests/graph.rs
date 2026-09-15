@@ -1,5 +1,6 @@
 //! Graph area: `/bff/graph/ego/:id`, `/bff/themes`, `/bff/communities`,
-//! `/bff/neighborhood/:id` and the graph assets, against a wiremock upstream
+//! `/bff/neighborhood/:id`, and the `/claim/:id/graph`, `/theme/:id`,
+//! `/community/:id`, `/neighborhood/:id` pages, against a wiremock upstream
 //! shaped like plan §2.2 and `graph-entity-endpoints.md` §1-3 (text/plain
 //! errors included).
 
@@ -480,6 +481,511 @@ async fn neighborhood_bff_404_is_json() {
         .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
     assert_eq!(res.json()["error"], "not_found");
+}
+
+// ---- /theme/:id -------------------------------------------------------------------
+
+#[tokio::test]
+async fn theme_synthetic_entry_renders_view_expired() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "theme_id": THEME, "truncated": false,
+            "neighborhoods": [{"id": THEME, "label": "synthetic", "size": 0,
+                               "mean_betp": null, "dominant_frame_id": null}],
+            "neighborhood_edges": []
+        })))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/theme/{THEME}?claim={CLAIM}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("View expired — clustering has re-run"));
+    assert!(res
+        .body
+        .contains(&format!("href=\"/explorer/claim/{CLAIM}\"")));
+    assert!(
+        !res.body
+            .contains(&format!("/explorer/neighborhood/{THEME}")),
+        "the synthetic id is the theme id; linking it would 404"
+    );
+}
+
+#[tokio::test]
+async fn theme_404_renders_view_expired() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .respond_with(text_plain(404, "theme not found"))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("/explorer/theme/{THEME}"), &sid).await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.header("content-type").unwrap().starts_with("text/html"));
+    assert!(res.body.contains("View expired — clustering has re-run"));
+    assert!(
+        res.body.contains("href=\"/explorer/\""),
+        "inside the layout"
+    );
+    assert!(
+        !res.body.contains("theme not found"),
+        "upstream text is not shown"
+    );
+}
+
+#[tokio::test]
+async fn theme_renders_neighbourhoods_weighted_edges_and_share() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .and(query_param("budget", "150"))
+        .and(header("authorization", "Bearer tok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "theme_id": THEME, "truncated": false,
+            "neighborhoods": [
+                {"id": NBH, "label": FRAME, "size": 12, "mean_betp": 0.756,
+                 "dominant_frame_id": FRAME},
+                {"id": NBH2, "label": "neighborhood-2", "size": 3}
+            ],
+            "neighborhood_edges": [{"a": NBH, "b": NBH2, "weight": 0.25}]
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(
+            &format!("/explorer/theme/{THEME}?budget=9999&claim={CLAIM}"),
+            &sid,
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let b = &res.body;
+    assert!(b.contains("not a permalink"));
+    assert!(b.contains(&format!(
+        "data-share-url=\"https://explorer.example.com/explorer/claim/{CLAIM}\""
+    )));
+    assert!(b.contains(&format!(
+        "href=\"/explorer/neighborhood/{NBH}?claim={CLAIM}\""
+    )));
+    assert!(b.contains("Frame 6f9a5a4e"), "frame-UUID labels are named");
+    assert!(b.contains("neighborhood-2"));
+    assert!(b.contains("0.76"), "mean belief to two places");
+    assert!(b.contains("0.25"), "edge weight");
+    assert!(b.contains(&format!("href=\"/explorer/frame/{FRAME}\"")));
+    assert!(!b.contains("View expired"));
+    app.upstream.verify().await;
+}
+
+#[tokio::test]
+async fn theme_without_a_known_claim_has_no_share_button() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .and(query_param("budget", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "theme_id": THEME,
+            "neighborhoods": [{"id": NBH, "label": "neighborhood-1", "size": 2}]
+        })))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    // A malformed ?claim= is ignored rather than failing the page.
+    let res = app
+        .get_as(&format!("/explorer/theme/{THEME}?claim=nope"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains("not a permalink"));
+    assert!(!res.body.contains("data-share-url"));
+    assert!(res
+        .body
+        .contains(&format!("href=\"/explorer/neighborhood/{NBH}\"")));
+}
+
+#[tokio::test]
+async fn theme_upstream_failure_is_the_error_page() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .respond_with(text_plain(500, "error returned from database"))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("/explorer/theme/{THEME}"), &sid).await;
+    assert_eq!(res.status, StatusCode::BAD_GATEWAY);
+    assert!(res.body.contains("EpiGraph is unavailable"));
+    assert!(!res.body.contains("database"));
+}
+
+// ---- /community/:id ---------------------------------------------------------------
+
+#[tokio::test]
+async fn community_clamps_budget_and_hides_redacted_labels() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/communities/{CLUSTER}/expand")))
+        .and(query_param("budget", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cluster_id": CLUSTER, "truncated": true, "total_size": 900,
+            "nodes": [
+                {"id": CLAIM, "label": "Visible claim text", "entity_type": "claim",
+                 "pignistic_prob": 0.42, "frame_id": null, "cluster_id": CLUSTER,
+                 "conflict_k": null},
+                {"id": SECRET, "label": "[REDACTED]", "entity_type": "claim",
+                 "pignistic_prob": 0.9, "frame_id": FRAME, "cluster_id": CLUSTER,
+                 "conflict_k": null}
+            ],
+            "edges": [{"source": SECRET, "target": CLAIM, "relationship": "SUPPORTS"}],
+            "filtered_edge_count": 5
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/community/{CLUSTER}?budget=-4"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let b = &res.body;
+    assert!(b.contains("Visible claim text"));
+    assert!(b.contains("belief 0.42"));
+    assert!(b.contains("Hidden claim"));
+    assert!(!b.contains("[REDACTED]"));
+    assert!(
+        !b.contains("0.90"),
+        "a hidden claim's numbers are not shown"
+    );
+    assert!(b.contains("2 of 900"));
+    assert!(b.contains("SUPPORTS"));
+    assert!(b.contains("graph-row--support"));
+    assert!(b.contains("5 connections of other kinds"));
+    assert!(b.contains("not a permalink"));
+    app.upstream.verify().await;
+}
+
+#[tokio::test]
+async fn community_404_renders_view_expired() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/communities/{CLUSTER}/expand")))
+        .and(query_param("budget", "100"))
+        .respond_with(text_plain(404, "cluster not in latest run"))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/community/{CLUSTER}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.contains("View expired — clustering has re-run"));
+}
+
+// ---- /neighborhood/:id ------------------------------------------------------------
+
+#[tokio::test]
+async fn neighborhood_page_toggles_modes_and_seeds_the_canvas() {
+    let app = spawn().await;
+    mount_neighborhood(&app, "atomic", atomic_json(), 1).await;
+    mount_neighborhood(&app, "compound", compound_json(), 1).await;
+    let sid = app.sign_in("tok");
+
+    let res = app
+        .get_as(
+            &format!("/explorer/neighborhood/{NBH}?mode=atomic&claim={CLAIM}"),
+            &sid,
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let b = &res.body;
+    assert!(b.contains(&format!(
+        "data-graph-source=\"/explorer/bff/neighborhood/{NBH}?mode=atomic\""
+    )));
+    assert!(b.contains(&format!(
+        "href=\"/explorer/neighborhood/{NBH}?mode=atomic&#38;claim={CLAIM}\" aria-current=\"page\""
+    )));
+    assert!(b.contains(&format!(
+        "href=\"/explorer/neighborhood/{NBH}?mode=compound&#38;claim={CLAIM}\">"
+    )));
+    assert!(
+        b.contains("Parent claim"),
+        "compound groups listed in atomic mode"
+    );
+    assert!(b.contains("An atom"));
+
+    let res = app
+        .get_as(&format!("/explorer/neighborhood/{NBH}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains(&format!(
+        "data-graph-source=\"/explorer/bff/neighborhood/{NBH}?mode=compound\""
+    )));
+    assert!(res.body.contains("Compound claim"));
+    assert!(res.body.contains("decomposes_to"));
+    app.upstream.verify().await;
+}
+
+#[tokio::test]
+async fn neighborhood_404_renders_view_expired() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/neighborhoods/{NBH}/expand")))
+        .respond_with(text_plain(404, "neighborhood not found in latest run"))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/neighborhood/{NBH}?claim={CLAIM}"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.contains("View expired — clustering has re-run"));
+    assert!(res
+        .body
+        .contains(&format!("href=\"/explorer/claim/{CLAIM}\"")));
+    assert!(
+        !res.body.contains("data-graph-source"),
+        "no canvas for a dead id"
+    );
+}
+
+// ---- /claim/:id/graph -------------------------------------------------------------
+
+async fn mount_placement(app: &TestApp) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/placement")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "claim_id": CLAIM, "theme_id": THEME,
+            "cluster_run_id": "8a9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10",
+            "cluster_id": CLUSTER, "neighborhood_id": null,
+            "run_completed_at": "2026-09-01T12:00:00Z"
+        })))
+        .mount(&app.upstream)
+        .await;
+}
+
+#[tokio::test]
+async fn claim_graph_page_escapes_data_and_uses_no_inline_script() {
+    let app = spawn().await;
+    mount_ego(&app, "40", ego_json(HOSTILE)).await;
+    mount_placement(&app).await;
+    let sid = app.sign_in("tok");
+
+    let res = app
+        .get_as(&format!("/explorer/claim/{CLAIM}/graph"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let b = &res.body;
+    assert!(b.contains(&format!(
+        "data-graph-source=\"/explorer/bff/graph/ego/{CLAIM}\""
+    )));
+    assert!(b.contains(&format!("data-graph-center=\"{CLAIM}\"")));
+    assert!(b.contains("data-node-cap=\"150\""));
+    assert!(b.contains("/explorer/static/graph.js?v="));
+    assert!(b.contains("/explorer/static/graph.css?v="));
+    assert!(!b.contains("<script>alert"), "claim text is escaped");
+    assert!(b.contains("&#34;&#62;&#60;script&#62;alert(1)&#60;/script&#62;"));
+    for tag in b.split("<script").skip(1) {
+        let open = tag.split('>').next().unwrap();
+        assert!(
+            open.contains(" src=\""),
+            "every script is external: <script{open}>"
+        );
+    }
+    assert!(!b.contains("style="), "CSP forbids inline styles");
+    assert!(!b.contains("[REDACTED]"));
+
+    // The <noscript> list: every edge, relationship and direction.
+    assert!(b.contains("<noscript>"));
+    assert!(b.contains("SUPPORTS →"));
+    assert!(b.contains("← contradicts"));
+    assert!(b.contains(&format!("href=\"/explorer/agent/{AGENT}\"")));
+    assert!(b.contains("Hidden claim"));
+    assert!(b.contains("212 connections"), "degree-cap notice");
+
+    // Placement links carry the claim so their share buttons work.
+    assert!(b.contains(&format!("href=\"/explorer/theme/{THEME}?claim={CLAIM}\"")));
+    assert!(b.contains(&format!(
+        "href=\"/explorer/community/{CLUSTER}?claim={CLAIM}\""
+    )));
+    assert!(
+        !b.contains("Its neighbourhood"),
+        "null neighborhood_id → no link"
+    );
+}
+
+#[tokio::test]
+async fn claim_graph_max_degree_is_clamped_into_the_canvas_source() {
+    let app = spawn().await;
+    mount_ego(&app, "80", ego_json("c")).await;
+    mount_placement(&app).await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(
+            &format!("/explorer/claim/{CLAIM}/graph?max_degree=999"),
+            &sid,
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains(&format!(
+        "data-graph-source=\"/explorer/bff/graph/ego/{CLAIM}?max_degree=80\""
+    )));
+}
+
+#[tokio::test]
+async fn claim_graph_redacted_centre_shows_no_text() {
+    let app = spawn().await;
+    mount_ego(
+        &app,
+        "40",
+        json!({
+            "center": {"id": CLAIM, "entity_type": "claim", "label": "[REDACTED]",
+                       "content": "[REDACTED]", "labels": ["secret-label"], "redacted": true},
+            "nodes": [], "edges": [], "total_edges": 0, "truncated": false
+        }),
+    )
+    .await;
+    mount_placement(&app).await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/claim/{CLAIM}/graph"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains("<title>Hidden claim · Graph"));
+    assert!(res.body.contains("You do not have access to this claim"));
+    assert!(!res.body.contains("[REDACTED]"));
+    assert!(!res.body.contains("secret-label"));
+}
+
+#[tokio::test]
+async fn claim_graph_404_and_degraded_placement() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/ego")))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "NotFound", "message": "Claim not found"
+        })))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/claim/{CLAIM}/graph"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.contains("We could not find that claim."));
+
+    // Ego works, placement fails: the page renders with that section degraded.
+    let app = spawn().await;
+    mount_ego(&app, "40", ego_json("c")).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/placement")))
+        .respond_with(text_plain(500, "boom"))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/claim/{CLAIM}/graph"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains("class=\"section-unavailable\""));
+    assert!(res.body.contains("data-graph-source"));
+}
+
+#[tokio::test]
+async fn graph_pages_redirect_anonymous_viewers() {
+    let app = spawn().await;
+    let res = app
+        .get(&format!("/explorer/theme/{THEME}?claim={CLAIM}"))
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        res.location().unwrap(),
+        format!("/explorer/auth/login?return_to=%2Fexplorer%2Ftheme%2F{THEME}%3Fclaim%3D{CLAIM}")
+    );
+}
+
+#[tokio::test]
+async fn every_graph_route_is_built_at_both_mounts() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/ego")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ego_json("c")))
+        .mount(&app.upstream)
+        .await;
+    mount_placement(&app).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "theme_id": THEME, "neighborhoods": [{"id": NBH, "label": "n", "size": 1}]
+        })))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/communities/{CLUSTER}/expand")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "cluster_id": CLUSTER, "total_size": 0
+        })))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/neighborhoods/{NBH}/expand")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(compound_json()))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"themes": []})))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/communities/overview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "run_id": null, "generated_at": null, "degraded": false,
+            "status": "no_clusters_computed", "supernodes": [], "cluster_edges": []
+        })))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    for base in ["/explorer", ""] {
+        for route in [
+            format!("/claim/{CLAIM}/graph"),
+            format!("/theme/{THEME}"),
+            format!("/community/{CLUSTER}"),
+            format!("/neighborhood/{NBH}?mode=compound"),
+        ] {
+            let uri = format!("{base}{route}");
+            let res = app.get_as(&uri, &sid).await;
+            assert_eq!(res.status, StatusCode::OK, "{uri}: {}", res.body);
+            assert!(res.header("content-type").unwrap().starts_with("text/html"));
+            assert!(!res.body.contains("not built yet"), "{uri}");
+            assert!(
+                res.body.contains("href=\"/explorer/\""),
+                "{uri}: base-path links"
+            );
+        }
+        for route in [
+            format!("/bff/graph/ego/{CLAIM}"),
+            "/bff/themes".to_string(),
+            "/bff/communities".to_string(),
+            format!("/bff/neighborhood/{NBH}"),
+        ] {
+            let uri = format!("{base}{route}");
+            let res = app.get_as(&uri, &sid).await;
+            assert_eq!(res.status, StatusCode::OK, "{uri}: {}", res.body);
+            assert!(res
+                .header("content-type")
+                .unwrap()
+                .starts_with("application/json"));
+        }
+    }
+    // Links are base-path aware even when the proxy stripped the prefix.
+    let res = app.get_as("/bff/themes", &sid).await;
+    assert_eq!(res.json()["themes"], json!([]));
+    let res = app.get_as("/bff/communities", &sid).await;
+    assert_eq!(res.json()["status"], "no_clusters_computed");
 }
 
 // ---- static assets ----------------------------------------------------------------

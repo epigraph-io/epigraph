@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+
+{% block title %}Neighbourhood · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("graph.css") }}">
+<script src="{{ ctx.static_url("graph.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<h1 class="graph-title">Neighbourhood</h1>
+<p class="small muted mono">{{ neighborhood_id }}</p>
+{%- if expired %}
+{% include "graph/_expired.html" %}
+{%- else %}
+{% include "graph/_not_permalink.html" %}
+
+<nav class="graph-modes" aria-label="Neighbourhood view">
+  <a class="graph-mode" href="{{ compound_href }}"{% if !atomic %} aria-current="page"{% endif %}>Compound claims</a>
+  <a class="graph-mode" href="{{ atomic_href }}"{% if atomic %} aria-current="page"{% endif %}>Atomic claims</a>
+</nav>
+<p class="small muted">{% if atomic %}Each node is one atomic claim in this neighbourhood.{% else %}Each node is a compound claim built from atoms in this neighbourhood; size shows how many atoms it has.{% endif %}</p>
+{%- if hidden_nodes > 0 %}
+<p class="notice notice--warn small">This neighbourhood is large: {{ hidden_nodes }} more claims are not shown.</p>
+{%- endif %}
+
+{% include "graph/_canvas.html" %}
+
+<section class="section" aria-labelledby="claims-title">
+  <h2 id="claims-title" class="section__title">Claims <span class="small muted">{{ nodes.len() }}</span></h2>
+  {%- if nodes.is_empty() %}
+  <p class="muted">No claims to show.</p>
+  {%- else %}
+  <ul class="link-list graph-list">
+    {%- for c in nodes %}
+    <li class="graph-row">
+      <a href="{{ c.href }}"{% if c.redacted %} class="muted"{% endif %}>{{ c.label }}</a>
+      <span class="small muted num">belief {{ c.betp }}</span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+</section>
+
+{%- if atomic %}
+<section class="section" aria-labelledby="groups-title">
+  <h2 id="groups-title" class="section__title">Compound claims <span class="small muted">{{ groups.len() }}</span></h2>
+  {%- if groups.is_empty() %}
+  <p class="muted">These atoms belong to no compound claim.</p>
+  {%- else %}
+  <ul class="link-list graph-list">
+    {%- for g in groups %}
+    <li class="graph-row">
+      <a href="{{ g.href }}"{% if g.redacted %} class="muted"{% endif %}>{{ g.label }}</a>
+      <span class="small muted num">{{ g.member_count }} atoms here</span>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+</section>
+{%- endif %}
+
+<section class="section" aria-labelledby="edges-title">
+  <h2 id="edges-title" class="section__title">Connections <span class="small muted">{{ edges.len() }}</span></h2>
+  {%- if edges.is_empty() %}
+  <p class="muted">No connections among these claims.</p>
+  {%- else %}
+  {% include "graph/_edge_table.html" %}
+  {%- endif %}
+</section>
+{%- endif %}
+{% endblock %}

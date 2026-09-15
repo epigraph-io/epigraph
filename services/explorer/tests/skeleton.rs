@@ -216,13 +216,10 @@ async fn every_area_route_is_mounted() {
         format!("/explorer/claim/{CLAIM}"),
         format!("/explorer/claim/{CLAIM}/history"),
         format!("/explorer/claim/{CLAIM}/provenance"),
-        format!("/explorer/claim/{CLAIM}/graph"),
         format!("/explorer/agent/{CLAIM}"),
         format!("/explorer/frame/{CLAIM}"),
         format!("/explorer/evidence/{CLAIM}"),
-        format!("/explorer/theme/{CLAIM}"),
-        format!("/explorer/community/{CLAIM}"),
-        format!("/explorer/neighborhood/{CLAIM}?mode=compound"),
+        // Graph-area pages are built: tests/graph.rs covers them.
         "/explorer/auth/login".to_string(),
         "/explorer/auth/callback?code=x&state=y".to_string(),
     ];
