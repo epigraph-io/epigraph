@@ -9,6 +9,10 @@ pub mod relationships;
 pub mod search_view;
 pub mod vocab;
 
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
 use askama::Template;
 use axum::extract::{Path, Query, State};
 use axum::response::Html;
@@ -18,12 +22,18 @@ use uuid::Uuid;
 
 use self::claim_view::{compose, og_for_claim, og_generic, ClaimView, EdgeEvidenceRow, Og};
 use self::search_view::{Mode, RawSearchQuery, SearchOutcome, SearchParams};
-use self::vocab::fmt_prob;
+use self::vocab::{fmt_count, fmt_datetime, fmt_prob};
 use crate::auth::{Caller, PageCtx, SignedIn};
 use crate::error::AppError;
 use crate::state::AppState;
-use crate::upstream::Degraded;
-use crate::view::{render, stub_page};
+use crate::upstream::core::{CommunitiesOverview, ThemesOverview};
+use crate::upstream::{degrade, Degraded, StatsResponse, UpstreamError};
+use crate::view::render;
+
+/// Items shown per landing overview list (upstream sends every one).
+pub const OVERVIEW_ITEMS: usize = 12;
+/// How long landing data is cached per viewer (plan §3.4: 60 s overviews).
+pub const LANDING_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -37,9 +47,165 @@ pub fn parse_claim_id(raw: &str) -> Result<Uuid, AppError> {
     Uuid::parse_str(raw.trim()).map_err(|_| AppError::NotFound("claim".into()))
 }
 
-// STUB: `/api/v1/stats` + theme/community overviews.
-async fn landing(user: SignedIn) -> Result<Html<String>, AppError> {
-    stub_page(user.ctx, "EpiGraph Explorer", "core")
+// ---- / -------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct StatRow {
+    pub label: &'static str,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StatsView {
+    pub rows: Vec<StatRow>,
+    pub computed: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverviewItem {
+    pub href: String,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverviewList {
+    pub items: Vec<OverviewItem>,
+    /// Entries upstream returned (only the first [`OVERVIEW_ITEMS`] show).
+    pub total: usize,
+    /// Run status worth telling the reader ("no clustering yet", …).
+    pub note: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "core/landing.html")]
+struct LandingPage {
+    ctx: PageCtx,
+    stats: Degraded<StatsView>,
+    themes: Degraded<OverviewList>,
+    communities: Degraded<OverviewList>,
+    modes: [Mode; 3],
+}
+
+async fn landing(State(state): State<AppState>, user: SignedIn) -> Result<Html<String>, AppError> {
+    let api = user.api(&state);
+    let who = user.auth.cache_key();
+    let (stats, themes, communities) = tokio::join!(
+        cached(&state, format!("core:landing:stats:{who}"), api.stats()),
+        cached(
+            &state,
+            format!("core:landing:themes:{who}"),
+            api.landing_themes()
+        ),
+        cached(
+            &state,
+            format!("core:landing:communities:{who}"),
+            api.landing_communities()
+        ),
+    );
+    let links = &state.links;
+    render(&LandingPage {
+        ctx: user.ctx,
+        stats: degrade(stats)?.map(|s| stats_view(&s)),
+        themes: degrade(themes)?.map(|t| themes_list(&t, links)),
+        communities: degrade(communities)?.map(|c| communities_list(&c, links)),
+        modes: Mode::ALL,
+    })
+}
+
+/// Per-viewer TTL cache in front of an upstream call. Only successes are
+/// cached; the key must carry `RequestAuth::cache_key` (redaction differs
+/// per viewer). `call` is not polled on a hit.
+async fn cached<T, F>(state: &AppState, key: String, call: F) -> Result<Arc<T>, UpstreamError>
+where
+    T: Send + Sync + 'static,
+    F: Future<Output = Result<T, UpstreamError>>,
+{
+    if let Some(hit) = state.cache.get::<T>(&key) {
+        return Ok(hit);
+    }
+    let value = Arc::new(call.await?);
+    state
+        .cache
+        .insert(key, Arc::clone(&value), LANDING_CACHE_TTL);
+    Ok(value)
+}
+
+fn stats_view(s: &StatsResponse) -> StatsView {
+    let row = |label, n| StatRow {
+        label,
+        value: fmt_count(n),
+    };
+    StatsView {
+        rows: vec![
+            row("Claims", s.claims),
+            row("Edges", s.edges),
+            row("Evidence", s.evidence),
+            row("Embeddings", s.embeddings),
+            row("Agents", s.agents),
+            row("Frames", s.frames),
+            row("Workflows", s.workflows),
+        ],
+        computed: s.computed_at.as_ref().map(fmt_datetime),
+    }
+}
+
+fn themes_list(t: &ThemesOverview, links: &crate::links::Links) -> OverviewList {
+    // Upstream already orders by claim_count DESC, label ASC.
+    OverviewList {
+        items: t
+            .themes
+            .iter()
+            .take(OVERVIEW_ITEMS)
+            .map(|th| OverviewItem {
+                href: links.theme(th.id),
+                label: nonempty_label(&th.label, "Untitled theme"),
+                detail: format!("{} claims", fmt_count(th.claim_count)),
+            })
+            .collect(),
+        total: t.themes.len(),
+        note: None,
+    }
+}
+
+fn communities_list(c: &CommunitiesOverview, links: &crate::links::Links) -> OverviewList {
+    let mut nodes: Vec<_> = c.supernodes.iter().collect();
+    nodes.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.label.cmp(&b.label)));
+    let note = if c.status.as_deref() == Some("no_clusters_computed") {
+        Some("No clustering run has been computed yet.".to_string())
+    } else if c.degraded {
+        Some("The latest clustering run is marked degraded.".to_string())
+    } else {
+        None
+    };
+    OverviewList {
+        items: nodes
+            .into_iter()
+            .take(OVERVIEW_ITEMS)
+            .map(|n| {
+                let mut detail = format!("{} claims", fmt_count(n.size));
+                if n.mean_betp.is_some() {
+                    detail.push_str(&format!(" · mean BetP {}", fmt_prob(n.mean_betp)));
+                }
+                OverviewItem {
+                    href: links.community(n.cluster_id),
+                    label: nonempty_label(&n.label, "Unnamed community"),
+                    detail,
+                }
+            })
+            .collect(),
+        total: c.supernodes.len(),
+        note,
+    }
+}
+
+fn nonempty_label(label: &str, fallback: &str) -> String {
+    let l = vocab::one_line(label);
+    if l.is_empty() {
+        fallback.to_string()
+    } else {
+        crate::upstream::truncate_chars(&l, 80)
+    }
 }
 
 // ---- /search ---------------------------------------------------------------------

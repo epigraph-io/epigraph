@@ -157,7 +157,7 @@ async fn landing_page_mounts_at_base_path_with_and_without_slash() {
     for uri in ["/explorer", "/explorer/", "/explorer/?utm=x", "/"] {
         let res = app.get_as(uri, &sid).await;
         assert_eq!(res.status, StatusCode::OK, "{uri}");
-        assert!(res.body.contains("not built yet"), "{uri}");
+        assert!(res.body.contains("id=\"landing-title\""), "{uri}");
         assert!(
             res.body.contains("action=\"/explorer/auth/logout\""),
             "{uri}"
@@ -210,10 +210,9 @@ async fn signed_in_pages_redirect_anonymous_viewers_to_login() {
 async fn every_area_route_is_mounted() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
-    // Built core routes (`/search`, `/claim/:id`, `/bff/claim/:id`,
+    // Built core routes (`/`, `/search`, `/claim/:id`, `/bff/claim/:id`,
     // `/bff/search`) are pinned by tests/core.rs::core_routes_are_mounted_and_built.
     let pages = [
-        "/explorer/".to_string(),
         format!("/explorer/claim/{CLAIM}/history"),
         format!("/explorer/claim/{CLAIM}/provenance"),
         format!("/explorer/claim/{CLAIM}/graph"),

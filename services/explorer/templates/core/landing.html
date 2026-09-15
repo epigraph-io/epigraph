@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<section class="landing-hero" aria-labelledby="landing-title">
+  <h1 id="landing-title">{{ ctx.product_name() }}</h1>
+  <p class="lead">Read claims in the EpiGraph knowledge graph, with the evidence behind them and the claims they support or contradict.</p>
+  <form class="search-panel" method="get" action="{{ ctx.search_url() }}" role="search" aria-label="Search the knowledge graph">
+    <div class="search-panel__row">
+      <label class="visually-hidden" for="landing-q">Search for</label>
+      <input id="landing-q" type="search" name="q" placeholder="Search claims, labels or evidence" autocomplete="off">
+      <label class="visually-hidden" for="landing-mode">Search by</label>
+      <select id="landing-mode" name="mode">
+        {%- for m in modes %}
+        <option value="{{ m.as_str() }}">{{ m.title() }}</option>
+        {%- endfor %}
+      </select>
+      <button type="submit">Search</button>
+    </div>
+  </form>
+</section>
+
+<section class="section" aria-labelledby="stats-title">
+  <h2 id="stats-title" class="section__title">The graph today</h2>
+  {%- match stats %}
+  {%- when Degraded::Available { data } %}
+  <dl class="stats">
+    {%- for s in data.rows %}
+    <div class="stats__item"><dt>{{ s.label }}</dt><dd class="num">{{ s.value }}</dd></div>
+    {%- endfor %}
+  </dl>
+  {%- if let Some(c) = data.computed %}
+  <p class="small muted">Counted {{ c }}.</p>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+
+<div class="landing-overviews">
+  <section class="section" aria-labelledby="themes-title">
+    <h2 id="themes-title" class="section__title">Themes</h2>
+    {%- match themes %}
+    {%- when Degraded::Available { data } %}
+    {%- if data.items.is_empty() %}
+    <p class="muted">No themes have been computed yet.</p>
+    {%- else %}
+    <ul class="link-list overview-list">
+      {%- for t in data.items %}
+      <li><a href="{{ t.href }}">{{ t.label }}</a> <span class="muted small">{{ t.detail }}</span></li>
+      {%- endfor %}
+    </ul>
+    {%- if data.total > data.items.len() %}
+    <p class="small muted">The {{ data.items.len() }} largest of {{ data.total }} themes.</p>
+    {%- endif %}
+    {%- endif %}
+    {%- when Degraded::Unavailable { reason } %}
+    <p class="section-unavailable">{{ reason }}</p>
+    {%- endmatch %}
+  </section>
+
+  <section class="section" aria-labelledby="communities-title">
+    <h2 id="communities-title" class="section__title">Communities</h2>
+    {%- match communities %}
+    {%- when Degraded::Available { data } %}
+    {%- if let Some(n) = data.note %}
+    <p class="small muted">{{ n }}</p>
+    {%- endif %}
+    {%- if !data.items.is_empty() %}
+    <ul class="link-list overview-list">
+      {%- for c in data.items %}
+      <li><a href="{{ c.href }}">{{ c.label }}</a> <span class="muted small">{{ c.detail }}</span></li>
+      {%- endfor %}
+    </ul>
+    {%- if data.total > data.items.len() %}
+    <p class="small muted">The {{ data.items.len() }} largest of {{ data.total }} communities.</p>
+    {%- endif %}
+    {%- elif data.note.is_none() %}
+    <p class="muted">The latest clustering run has no communities.</p>
+    {%- endif %}
+    {%- when Degraded::Unavailable { reason } %}
+    <p class="section-unavailable">{{ reason }}</p>
+    {%- endmatch %}
+  </section>
+</div>
+<p class="small muted">Themes and communities are rebuilt whenever clustering re-runs, so links to them are not permanent. Link to claims when sharing.</p>
+{% endblock %}

@@ -1,5 +1,5 @@
-//! Core area against a wiremock upstream: search in all three modes, the
-//! composed claim page (grouped outlinks, evidence,
+//! Core area against a wiremock upstream: the landing page, search in all
+//! three modes, the composed claim page (grouped outlinks, evidence,
 //! redaction short-circuit, degraded sections, OG), anonymous unfurls, and
 //! the `/bff/claim` ETag. Upstream JSON is shaped exactly like the mapping
 //! reports (`claims-endpoints.md`, `search-overview-endpoints.md`, plan
@@ -12,7 +12,9 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::Router;
 use common::{spawn, spawn_with, TestApp};
-use epigraph_explorer::config::{ENV_PUBLIC_UNFURL, ENV_UPSTREAM_TIMEOUT_MS};
+use epigraph_explorer::config::{
+    ENV_DEV_BEARER, ENV_PUBLIC_BASE_URL, ENV_PUBLIC_UNFURL, ENV_UPSTREAM_TIMEOUT_MS,
+};
 use serde_json::{json, Value};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -267,6 +269,11 @@ async fn core_routes_are_mounted_and_built() {
     // No upstream mocks: wiremock answers 404 to everything.
     let app = spawn().await;
     let sid = app.sign_in("tok");
+
+    let res = app.get_as("/explorer/", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("id=\"landing-title\""));
+    assert!(!res.body.contains("not built yet"));
 
     let res = app.get_as("/explorer/search?q=x", &sid).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -1077,4 +1084,140 @@ async fn bff_search_returns_the_normalised_outcome() {
     assert_eq!(res.json()["error"], "bad_request");
     let res = app.get("/explorer/bff/search?q=x").await;
     assert_eq!(res.status, StatusCode::UNAUTHORIZED);
+}
+
+// ---- / -----------------------------------------------------------------------------------
+
+fn stats_json() -> Value {
+    json!({"claims": 343000, "edges": 1200000, "evidence": 5000, "embeddings": 340000,
+           "agents": 42, "frames": 7, "workflows": 3, "computed_at": "2026-09-15T00:00:00Z"})
+}
+
+fn themes_json() -> Value {
+    json!({"themes": [
+        {"id": THEME, "label": "Thermodynamics", "claim_count": 40},
+        {"id": "9b9b9b9b-0000-4000-8000-000000000019", "label": "Optics", "claim_count": 12}
+    ]})
+}
+
+fn communities_json() -> Value {
+    json!({
+        "run_id": "cccccccc-0000-4000-8000-00000000000c",
+        "generated_at": "2026-09-01T12:00:00Z",
+        "degraded": false,
+        "supernodes": [
+            {"cluster_id": "aaaaaaaa-0000-4000-8000-000000000001", "label": "cluster-1", "size": 5,
+             "mean_betp": null, "dominant_type": null, "dominant_frame_id": null},
+            {"cluster_id": CLUSTER, "label": "cluster-2", "size": 30, "mean_betp": 0.61,
+             "dominant_type": "factual", "dominant_frame_id": null}
+        ],
+        "cluster_edges": [{"a": CLUSTER, "b": "aaaaaaaa-0000-4000-8000-000000000001", "weight": 3}]
+    })
+}
+
+#[tokio::test]
+async fn landing_shows_stats_themes_and_communities() {
+    let app = spawn().await;
+    mount_get(&app, "/api/v1/stats", 200, stats_json(), 1).await;
+    mount_get(&app, "/api/v1/graph/themes/overview", 200, themes_json(), 1).await;
+    mount_get(
+        &app,
+        "/api/v1/graph/communities/overview",
+        200,
+        communities_json(),
+        1,
+    )
+    .await;
+    let sid = app.sign_in("tok");
+
+    let res = app.get_as("/explorer/", &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let body = &res.body;
+    assert!(body.contains("<dt>Claims</dt><dd class=\"num\">343,000</dd>"));
+    assert!(body.contains("<dt>Edges</dt><dd class=\"num\">1,200,000</dd>"));
+    assert!(body.contains(&format!("<a href=\"/explorer/theme/{THEME}\">Thermodynamics</a> <span class=\"muted small\">40 claims</span>")));
+    let big = body
+        .find(&format!(
+            "<a href=\"/explorer/community/{CLUSTER}\">cluster-2</a>"
+        ))
+        .expect("largest community");
+    let small = body.find("cluster-1</a>").expect("smaller community");
+    assert!(big < small, "communities sorted by size");
+    assert!(body.contains("30 claims · mean BetP 0.61"));
+    assert!(body.contains("action=\"/explorer/search\""));
+    assert!(body.contains("<option value=\"evidence\">"));
+
+    // Cached per viewer for 60 s: a second view makes no upstream calls
+    // (each mock expects exactly one hit).
+    let res = app.get_as("/explorer/", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(upstream_paths(&app).await.len(), 3);
+}
+
+#[tokio::test]
+async fn landing_degrades_each_overview_independently() {
+    // Dev bearer (localhost): a 401 on the protected overview is a plain
+    // Unauthorized, so the section degrades instead of ending a session.
+    let app = spawn_with(
+        &[
+            (ENV_PUBLIC_BASE_URL, "http://localhost:8096/explorer"),
+            (ENV_DEV_BEARER, "dev-token"),
+        ],
+        Router::new(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(stats_json()))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .and(header("authorization", "Bearer dev-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": "Unauthorized", "message": "Invalid token: ExpiredSignature"
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/communities/overview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "run_id": null, "generated_at": null, "degraded": false,
+            "status": "no_clusters_computed", "supernodes": [], "cluster_edges": []
+        })))
+        .mount(&app.upstream)
+        .await;
+
+    let res = app.get("/explorer/").await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains("343,000"), "stats still render");
+    assert!(res
+        .body
+        .contains("<p class=\"section-unavailable\">Sign in to see this.</p>"));
+    assert!(res
+        .body
+        .contains("No clustering run has been computed yet."));
+
+    // A session whose protected overview fails with a 5xx degrades too.
+    let app = spawn().await;
+    mount_get(&app, "/api/v1/stats", 200, stats_json(), 1).await;
+    mount_get(&app, "/api/v1/graph/themes/overview", 200, themes_json(), 1).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/communities/overview"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .insert_header("content-type", "text/plain")
+                .set_body_string("error returned from database: secret"),
+        )
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as("/explorer/", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.body.contains("Thermodynamics"));
+    assert!(res.body.contains(
+        "<p class=\"section-unavailable\">The EpiGraph API is unavailable right now.</p>"
+    ));
+    assert!(!res.body.contains("secret"));
 }

@@ -1,10 +1,10 @@
-/* EpiGraph Explorer — core area: search and the claim page.
+/* EpiGraph Explorer — core area: landing, search, claim page.
  *
  * Builds on app.css custom properties; no inline styles (CSP style-src
  * 'self'). Layouts collapse to one column below ~48rem and hold at 400px.
  */
 
-/* ---- search panel ----------------------------------------------- */
+/* ---- search panel (landing + search page) -------------------------------- */
 
 .search-panel {
   margin: 0 0 var(--space-5);
@@ -50,6 +50,65 @@
 
 .search-panel__hint {
   margin: var(--space-2) 0 0;
+}
+
+/* ---- landing ------------------------------------------------------------- */
+
+.landing-hero {
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.landing-hero .lead {
+  max-width: var(--measure);
+  color: var(--text-muted);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  gap: var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+
+.stats__item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3) var(--space-4);
+}
+
+.stats__item dt {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.stats__item dd {
+  margin: 0;
+  font-size: 1.35rem;
+  font-weight: 650;
+}
+
+.landing-overviews {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 0 var(--space-6);
+}
+
+.landing-overviews > .section {
+  margin-block: var(--space-4);
+}
+
+.overview-list > li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+  padding: var(--space-2) 0;
+}
+
+.overview-list a {
+  overflow-wrap: anywhere;
 }
 
 /* ---- search results ------------------------------------------------------ */
