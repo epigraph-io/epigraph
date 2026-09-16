@@ -164,8 +164,47 @@ pub struct AppState {
     ///
     /// The consequence is deliberate: a process that never built a `ScopedPool`
     /// cannot mint a [`epigraph_db::visibility::MaintenanceLease`], and
-    /// therefore cannot construct a bypass `Viewer` at all. Fixtures and unit
-    /// tests get `None` and a clear error rather than a silent bypass.
+    /// therefore cannot construct a bypass `Viewer` at all. Such a process gets
+    /// `None` and a clear error rather than a silent bypass.
+    ///
+    /// # WHICH TEST FIXTURES ARE STILL SUCH A PROCESS — AND WHICH IS NOT
+    ///
+    /// Until conversion shard 4 that sentence read "fixtures and unit tests",
+    /// full stop. It no longer does, and the change is recorded here rather
+    /// than left to be discovered. [`crate::build_app_for_tests`] — which
+    /// `epigraph-api/tests/common`'s `spawn_app` uses, and through it roughly
+    /// sixty integration binaries — now builds through
+    /// [`Self::with_scoped_pool`], because a handler converted onto
+    /// [`Self::read_as`] REFUSES on a `None` and would otherwise answer 500 for
+    /// a reason unrelated to the route.
+    ///
+    /// So the bypass mint IS reachable from `spawn_app` today, and the three
+    /// route-layer consumers of it — `routes/privatization.rs::create_plan`,
+    /// `routes/privatization.rs::maintenance` and the embedding-backfill site
+    /// in `routes/claims.rs` — can now execute their bypass path there instead
+    /// of erroring. MEASURED, because the size of that blast radius is the
+    /// whole question: **no** `epigraph-api` integration binary reaches any of
+    /// the three over HTTP. `privatization_routes.rs` is the only binary that
+    /// names them and it invokes the handlers DIRECTLY, on its own `split_state`
+    /// fixture, for a reason its module doc gives. The reachability is
+    /// therefore latent rather than exercised, and it is not a production
+    /// change at all: `bin/server.rs` has built through `with_scoped_pool`
+    /// since PR-17.
+    ///
+    /// The residual a future author should know: `spawn_app` attaches no
+    /// maintenance pool, so `ScopedPool::maintenance_inner()` falls back to the
+    /// application pool — the fallback `unscoped_for_maintenance`'s own doc
+    /// calls unsound. A test written against that path would be measuring the
+    /// fallback, not the lease.
+    ///
+    /// Unit tests and every other non-`spawn_app` constructor are unchanged:
+    /// [`Self::with_db`] still leaves this `None`, which is what the
+    /// direct-invocation proofs in `epigraph-api/tests/` rely on — they set
+    /// `state.scoped` by hand precisely so the two arms are DIFFERENT pools.
+    /// `tests/common/mod.rs::spawn_app_with_mock_embedding` was moved onto
+    /// `with_scoped_pool` in the same change, because its doc claims to mirror
+    /// `build_app_for_tests` and a silent divergence there would surface as a
+    /// 500 in whichever shard next converts a route reachable through it.
     #[cfg(feature = "db")]
     pub scoped: Option<epigraph_db::ScopedPool>,
     /// API configuration
@@ -539,17 +578,31 @@ pub enum RlsVerdict {
 /// `crates/epigraph-api/src/bin/server.rs`'s boot sequence, alongside
 /// `assert_tenancy_triggers_armed` and `warn_on_privileged_connection`.
 /// `epigraph_api::build_app_for_tests` — which `epigraph-api/tests/common`'s
-/// `spawn_app` uses, and through it roughly sixty integration binaries — builds
-/// its pool with `PgPoolOptions::connect` and calls `AppState::with_db`
-/// directly, reaching none of them.
+/// `spawn_app` uses, and through it roughly sixty integration binaries —
+/// reaches none of them.
+///
+/// **THE RE-CHECK THIS PARAGRAPH ASKED FOR HAS BEEN RUN.** It used to say the
+/// fixture "builds its pool with `PgPoolOptions::connect` and calls
+/// `AppState::with_db` directly", and then instructed a future author to
+/// re-check if a refactor ever made it run the boot sequence. Conversion shard
+/// 4 made exactly that refactor: the fixture now builds through
+/// `epigraph_db::ScopedPool::connect_with_options` and
+/// [`AppState::with_scoped_pool`]. The CONCLUSION survives, for a different
+/// reason than the one originally written — `with_scoped_pool` delegates to
+/// [`AppState::with_db`] and runs no boot assertion, so the fixture still calls
+/// none of `assert_rls_posture`, [`assert_tenancy_triggers_armed`] or
+/// [`warn_on_privileged_connection`]. The staging argument holds; the mechanism
+/// sentence it rested on does not, and is corrected here rather than left to
+/// mislead the next reader who consults this doc to answer "does the test
+/// fixture arm the RLS posture checks?".
 ///
 /// That is why arming these refusals does not turn the test suite red, and it
 /// is also why arming them is MORE dangerous rather than less: no gate in the
 /// four-command CI sequence exercises this function's refusal branches. They are
 /// covered instead by the pure unit tests over [`rls_verdict`] below, which is
 /// the same split `epigraph_db::maintenance_verdict` uses and for the same
-/// reason. If a future refactor makes `build_app_for_tests` run the boot
-/// sequence, re-check the staging argument before assuming it still holds.
+/// reason. If a future refactor makes `build_app_for_tests` actually invoke the
+/// boot sequence, re-check the staging argument before assuming it still holds.
 ///
 /// # THE ONE ACCEPTANCE ITEM THIS DELIBERATELY DOES NOT ARM
 ///
