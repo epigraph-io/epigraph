@@ -385,6 +385,42 @@ fn config_validation_is_enforced() {
     ));
 }
 
+/// Startup as `main.rs` runs it: config → state → router. A base path that
+/// shadows a top-level route must stop at the *config* step with an
+/// `Invalid` (which `main` turns into exit 2, the code the systemd unit's
+/// `RestartPreventExitStatus=2` looks for), never reach `build_app` and
+/// panic there (exit 101, indistinguishable from a crash, so systemd
+/// restart-loops on a config typo).
+#[test]
+fn a_base_path_that_shadows_a_route_fails_config_not_the_router_build() {
+    let start = |base: &str| {
+        let base = base.to_string();
+        let lookup = move |k: &str| (k == ENV_PUBLIC_BASE_URL).then(|| base.clone());
+        let config = Config::from_lookup(lookup)?;
+        let state = AppState::new(config).expect("state builds");
+        let _router = epigraph_explorer::app::build_app(state);
+        Ok::<(), ConfigError>(())
+    };
+
+    for shadowing in [
+        "https://explorer.example.com/search",
+        "https://explorer.example.com/auth",
+    ] {
+        assert!(
+            matches!(
+                start(shadowing).unwrap_err(),
+                ConfigError::Invalid {
+                    var: ENV_PUBLIC_BASE_URL,
+                    ..
+                }
+            ),
+            "{shadowing} must be refused by config validation"
+        );
+    }
+    start("https://explorer.example.com/explorer").expect("an ordinary base path still starts");
+    start("http://localhost:8096").expect("the root base path still starts");
+}
+
 #[tokio::test]
 async fn dev_bearer_signs_in_anonymous_requests_on_localhost() {
     let app = spawn_with(
@@ -656,7 +692,10 @@ async fn the_queue_wait_and_the_request_share_one_deadline() {
     let start = Instant::now();
     let (quick, queued) = tokio::join!(api.stats(), api.claim(claim_id()));
     let elapsed = start.elapsed();
-    assert!(quick.is_ok(), "the holder of the permit succeeds: {quick:?}");
+    assert!(
+        quick.is_ok(),
+        "the holder of the permit succeeds: {quick:?}"
+    );
     assert_eq!(
         queued.unwrap_err(),
         UpstreamError::Timeout,
@@ -737,7 +776,10 @@ async fn unreachable_refresh_keeps_the_session_and_degrades() {
         err.user_message(),
         "The EpiGraph API is unavailable right now."
     );
-    assert!(degrade::<()>(Err(err)).is_ok(), "a section can degrade on it");
+    assert!(
+        degrade::<()>(Err(err)).is_ok(),
+        "a section can degrade on it"
+    );
     assert!(
         app.state.sessions.get(&sid).is_some(),
         "the session survives an upstream that could not be reached"
