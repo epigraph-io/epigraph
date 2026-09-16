@@ -1221,3 +1221,58 @@ fn every_node_stays_visible_against_the_stage_in_both_themes() {
         );
     }
 }
+
+/// `load` used to write "Loading neighbours…" / "Added N nodes." into the side
+/// panel whatever node was selected when the fetch landed, so selecting
+/// another node mid-fetch showed it a status about the first one.
+#[test]
+fn expansion_status_is_addressed_to_the_node_that_asked_for_it() {
+    let js = include_str!("../static/graph.js");
+
+    let setter = block(js, "setPanelStatus(anchor, text) {");
+    assert!(
+        setter.contains("this.selected !== anchor"),
+        "setPanelStatus must drop messages for a node that is no longer selected: {setter}"
+    );
+
+    // Every panel-status message goes through that guard. `select` clears the
+    // element through its own alias when the selection really did change.
+    assert_eq!(
+        js.matches("panel.status.textContent").count(),
+        1,
+        "only setPanelStatus may write the panel status"
+    );
+    assert!(
+        !js.contains("forPanel"),
+        "the unguarded panel branch of setStatus is gone"
+    );
+
+    let load = block(js, "async load(url, anchor) {");
+    assert!(
+        !load.contains("status.textContent"),
+        "load must not touch a status element directly: {load}"
+    );
+    assert_eq!(
+        load.matches("this.setPanelStatus(anchor,").count(),
+        2,
+        "load's progress and outcome messages are anchored"
+    );
+    assert_eq!(
+        load.matches("this.reportLoadError(anchor,").count(),
+        2,
+        "load's two failure paths are anchored"
+    );
+
+    let report = block(js, "reportLoadError(anchor, message) {");
+    assert!(
+        report.contains("this.setPanelStatus(anchor, message)"),
+        "an expansion's failure goes through the guard too: {report}"
+    );
+
+    let expand = block(js, "async expand(n) {");
+    assert_eq!(
+        expand.matches("this.setPanelStatus(n,").count(),
+        2,
+        "expand's own refusals are anchored to the node they are about"
+    );
+}

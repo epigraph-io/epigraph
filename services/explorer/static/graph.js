@@ -440,11 +440,27 @@
 
     // ---- data ----------------------------------------------------------------
 
-    setStatus(text, isError, forPanel) {
-      const el = forPanel ? this.panel.status : this.statusEl;
+    /** The canvas-wide status under the toolbar. */
+    setStatus(text, isError) {
+      const el = this.statusEl;
       if (!el) return;
       el.textContent = text;
-      if (!forPanel) el.classList.toggle('graph__status--error', Boolean(isError));
+      el.classList.toggle('graph__status--error', Boolean(isError));
+    }
+
+    /** A status about one node, which the panel only shows while that node is
+     * the selected one: an expansion's fetch outlives the click that started
+     * it, so a message that lands after the user picked another node would
+     * describe a node the panel is no longer showing. */
+    setPanelStatus(anchor, text) {
+      if (!this.panel.status || this.selected !== anchor) return;
+      this.panel.status.textContent = text;
+    }
+
+    /** A load failure: the panel for an expansion, the toolbar otherwise. */
+    reportLoadError(anchor, message) {
+      if (anchor) this.setPanelStatus(anchor, message);
+      else this.setStatus(message, true);
     }
 
     addFallbackLink() {
@@ -458,13 +474,13 @@
 
     /** Fetch a canvas payload and merge it. Resolves true on success. */
     async load(url, anchor) {
-      const forPanel = Boolean(anchor);
-      this.setStatus(forPanel ? 'Loading neighbours…' : 'Loading the graph…', false, forPanel);
+      if (anchor) this.setPanelStatus(anchor, 'Loading neighbours…');
+      else this.setStatus('Loading the graph…', false);
       let res;
       try {
         res = await fetch(url, { credentials: 'same-origin', headers: { Accept: 'application/json' } });
       } catch (err) {
-        this.setStatus('Could not reach the Explorer. Check your connection and try again.', true, forPanel);
+        this.reportLoadError(anchor, 'Could not reach the Explorer. Check your connection and try again.');
         return false;
       }
       let body = null;
@@ -477,15 +493,15 @@
         let message = 'The graph could not be loaded.';
         if (res.status === 401) message = 'Your session has ended. Reload the page to sign in again.';
         else if (body && typeof body.message === 'string' && body.message) message = body.message;
-        this.setStatus(message, true, forPanel);
+        this.reportLoadError(anchor, message);
         return false;
       }
       const added = this.merge(body, anchor);
-      if (forPanel) {
-        this.setStatus(added === 0 ? 'No new neighbours to add.' : 'Added ' + added + (added === 1 ? ' node.' : ' nodes.'), false, true);
+      if (anchor) {
+        this.setPanelStatus(anchor, added === 0 ? 'No new neighbours to add.' : 'Added ' + added + (added === 1 ? ' node.' : ' nodes.'));
       }
       const e = this.edges.size;
-      this.setStatus(this.nodes.size + (this.nodes.size === 1 ? ' node, ' : ' nodes, ') + e + (e === 1 ? ' connection.' : ' connections.'), false, false);
+      this.setStatus(this.nodes.size + (this.nodes.size === 1 ? ' node, ' : ' nodes, ') + e + (e === 1 ? ' connection.' : ' connections.'), false);
       return true;
     }
 
@@ -870,13 +886,13 @@
       if (!n || n.expanded || n.expanding) return;
       const url = localPath(n.d.expand_href);
       if (!url) {
-        if (this.selected === n) this.setStatus('This node cannot be expanded.', false, true);
+        this.setPanelStatus(n, 'This node cannot be expanded.');
         return;
       }
       if (this.nodes.size >= this.cap) {
         this.leftOut += 1;
         this.updateCapNotice();
-        if (this.selected === n) this.setStatus('The graph already shows its maximum of ' + this.cap + ' nodes.', false, true);
+        this.setPanelStatus(n, 'The graph already shows its maximum of ' + this.cap + ' nodes.');
         return;
       }
       n.expanding = true;
