@@ -38,12 +38,14 @@ uses a service token of its own.
      │                     • in-memory sessions (access + refresh token)
      │                     • one global upstream semaphore, per-call timeout
      │                             │  Authorization: Bearer <viewer's token>
+     │                             │  /oauth/token, /oauth/revoke (no bearer)
      │                             │  EPIGRAPH_API_URL (loopback)
      │                             ▼
-     │   /oauth/*          epigraph-api  :8080   (systemd: epigraph-api.service)
+     │   /oauth/authorize  epigraph-api  :8080   (systemd: epigraph-api.service)
      └─────────────────────▶   /api/v1/*  ── reads, with redaction per viewer
         (top-level              /oauth/*   ── authorization server
-         navigation)                 │
+         navigation, to                   │
+         EPIGRAPH_OAUTH_BASE_URL)         │
                                      ▼
                               Google OIDC (email allowlist)
 ```
@@ -99,7 +101,7 @@ code **2**.
 | `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL including the base path, e.g. `https://explorer.example.com/explorer`. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
-| `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server. Browsers are sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer also calls this origin server to server for `/oauth/token` and `/oauth/revoke`, so the Explorer host must be able to reach it. |
+| `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
 | `EPIGRAPH_EXPLORER_CLIENT_ID` | unset | The `client_id` of the pre-registered OAuth client (see Operator setup). If it is unset, sign-in is disabled and a warning is logged at startup. Whitespace is rejected. |
 | `EPIGRAPH_EXPLORER_PUBLIC_UNFURL` | `false` | If `true`, an anonymous `/claim/{id}` renders OpenGraph text from an anonymous upstream read, unless that read is redacted. Otherwise it shows a generic card. Accepts `true/false/1/0/yes/no/on/off`. |
 | `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` | `https://www.notion.so https://*.notion.so https://*.notion.site` | The CSP `frame-ancestors` source list, space-separated. `;`, `,`, control characters and non-ASCII are rejected. Setting it **explicitly empty** means `'none'` (no framing at all). |
@@ -268,10 +270,12 @@ The API's authorization server signs people in **only through Google**, and
 ### 3. The consent page
 
 After Google, the API shows its own consent page, and the user must press
-**Allow** on every sign-in (consent is not stored). Until the kernel fix in
-plan §2.7 is deployed, that page is hard-coded to read "Authorize Claude" /
-"Claude wants to access EpiGraph as …". Tell users to expect it. The fix makes
-the page name the requesting client (from `client_name` above).
+**Allow** on every sign-in (consent is not stored). The page names the
+requesting client from `oauth_clients.client_name` (plan §2.7, landed in
+`fix(oauth): name the requesting client on the consent page`), so whatever you
+put in `client_name` above is what your users read there. Older API builds
+hard-code "Authorize Claude"; if that is what the page says, the API is behind
+this tree.
 
 ### 4. Keep `/oauth/*` browser-reachable
 
