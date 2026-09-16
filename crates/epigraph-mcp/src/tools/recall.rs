@@ -65,6 +65,11 @@ pub struct RecallWithContextParams {
     pub paper_doi_filter: Option<String>,
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
+    /// Max epistemic-edge neighbours returned **per relationship** per hit
+    /// (supports / refutes / contradicts / specializes / elaborates / cites).
+    /// Default 4. Per-relationship rather than per-hit so a claim with many
+    /// `supports` edges cannot crowd out its single `refutes`.
+    pub epistemic_limit: Option<u32>,
     pub neighbor_paragraphs_limit: Option<u32>,
     /// When `true`, run the diverse retrieval pipeline before structural
     /// enrichment: pull candidates from the most-similar themes and use
@@ -310,7 +315,10 @@ pub struct CorroboratesEdge {
 
 /// Epistemic relationship types carried through structural context assembly
 /// (in addition to the corroborates edges handled separately above).
-#[allow(dead_code)]
+///
+/// Deliberately excludes `decomposes_to` and `continues_argument`: those are
+/// document-skeleton structure, already carried by their own context fields,
+/// and counting them here would double-report the skeleton as argument.
 const EPISTEMIC_EDGE_RELATIONSHIPS: &[&str] = &[
     "supports",
     "refutes",
@@ -378,6 +386,7 @@ pub async fn recall_with_context(
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
     let corroborates_limit = params.corroborates_limit.unwrap_or(4);
+    let epistemic_limit = params.epistemic_limit.unwrap_or(4);
     let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
 
     // Stage 1: pick centroid_dim (request hint OR auto-detect via population threshold).
@@ -435,6 +444,7 @@ pub async fn recall_with_context(
         min_truth,
         siblings_limit,
         corroborates_limit,
+        epistemic_limit,
         neighbor_paragraphs_limit,
         lens,
     )
@@ -569,6 +579,7 @@ async fn recall_with_context_post_embed(
     min_truth: f64,
     siblings_limit: u32,
     corroborates_limit: u32,
+    epistemic_limit: u32,
     neighbor_paragraphs_limit: u32,
     lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
@@ -827,6 +838,7 @@ async fn recall_with_context_post_embed(
         &paragraph_ids,
         siblings_limit,
         corroborates_limit,
+        epistemic_limit,
     )
     .await
     .map_err(|e| internal_error(format!("batch fetch: {e}")))?;
@@ -1104,6 +1116,7 @@ pub async fn fetch_batched_context(
     paragraph_ids: &[Uuid],
     siblings_limit: u32,
     corroborates_limit: u32,
+    epistemic_limit: u32,
 ) -> Result<BatchedContext, sqlx::Error> {
     let mut paragraph_meta: std::collections::HashMap<Uuid, ParagraphCore> = Default::default();
     let mut paper_meta: std::collections::HashMap<Uuid, PaperMeta> = Default::default();
@@ -1120,9 +1133,11 @@ pub async fn fetch_batched_context(
         Default::default();
     let mut corroborates_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
         Default::default();
-    let epistemic_edges_by_paragraph: std::collections::HashMap<Uuid, Vec<EpistemicEdgeNeighbor>> =
-        Default::default();
-    let epistemic_edges_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
+    let mut epistemic_edges_by_paragraph: std::collections::HashMap<
+        Uuid,
+        Vec<EpistemicEdgeNeighbor>,
+    > = Default::default();
+    let mut epistemic_edges_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
         Default::default();
     let mut continues_argument_by_paragraph: std::collections::HashMap<Uuid, Vec<Uuid>> =
         Default::default();
@@ -1382,6 +1397,82 @@ pub async fn fetch_batched_context(
                     content: r.content,
                     similarity: r.strength,
                     paper_doi: r.paper_doi,
+                });
+        }
+    }
+
+    // 7b. Epistemic-edge neighbours — bidirectional, per-relationship capped.
+    //
+    // Direction is part of the payload because it carries the meaning: an
+    // incoming `refutes` means "is refuted by", which is the opposite claim
+    // about credibility from an outgoing one.
+    {
+        let relationships: Vec<String> = EPISTEMIC_EDGE_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let rows = sqlx::query!(
+            r#"
+            WITH neighbors AS (
+                SELECT e.source_id AS paragraph_id, e.target_id AS neighbor_id,
+                       e.relationship, 'outgoing' AS direction
+                FROM edges e
+                WHERE e.source_id = ANY($1) AND e.relationship = ANY($3)
+                UNION ALL
+                SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
+                       e.relationship, 'incoming' AS direction
+                FROM edges e
+                WHERE e.target_id = ANY($1) AND e.relationship = ANY($3)
+            ),
+            joined AS (
+                SELECT n.paragraph_id, n.neighbor_id, n.relationship, n.direction,
+                       c.content, c.truth_value
+                FROM neighbors n
+                JOIN claims c ON c.id = n.neighbor_id
+            ),
+            ranked AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY paragraph_id, relationship
+                        ORDER BY truth_value DESC, neighbor_id
+                    ) AS rn,
+                    COUNT(*) OVER (PARTITION BY paragraph_id) AS total
+                FROM joined
+            )
+            SELECT
+                paragraph_id AS "paragraph_id!",
+                neighbor_id AS "neighbor_id!",
+                content AS "content!",
+                relationship AS "relationship!",
+                direction AS "direction!",
+                truth_value AS "truth_value!",
+                total AS "total!"
+            FROM ranked
+            WHERE rn <= $2
+            "#,
+            paragraph_ids,
+            i64::from(epistemic_limit),
+            &relationships
+        )
+        .fetch_all(pool)
+        .await?;
+        for r in rows {
+            epistemic_edges_total_by_paragraph
+                .entry(r.paragraph_id)
+                .or_insert_with(|| r.total.max(0) as usize);
+            epistemic_edges_by_paragraph
+                .entry(r.paragraph_id)
+                .or_default()
+                .push(EpistemicEdgeNeighbor {
+                    claim_id: r.neighbor_id,
+                    content: r.content,
+                    relationship: r.relationship,
+                    direction: if r.direction == "incoming" {
+                        EdgeDirection::Incoming
+                    } else {
+                        EdgeDirection::Outgoing
+                    },
+                    truth_value: r.truth_value,
                 });
         }
     }
@@ -1757,6 +1848,7 @@ pub mod __test_only {
         let min_truth = params.min_truth.unwrap_or(0.3);
         let siblings_limit = params.siblings_limit.unwrap_or(8);
         let corroborates_limit = params.corroborates_limit.unwrap_or(4);
+        let epistemic_limit = params.epistemic_limit.unwrap_or(4);
         let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
         // Mirror the real entry: resolve + existence-check the lens up front so
         // integration tests exercise the same validation path.
@@ -1777,6 +1869,7 @@ pub mod __test_only {
             min_truth,
             siblings_limit,
             corroborates_limit,
+            epistemic_limit,
             neighbor_paragraphs_limit,
             lens,
         )
