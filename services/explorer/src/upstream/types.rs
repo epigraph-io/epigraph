@@ -370,6 +370,91 @@ mod tests {
         assert_eq!(c.cycles.len(), 1);
     }
 
+    /// Cross-lane contract pin for the four routes the kernel lane added for
+    /// this service. The payloads below are what the kernel's own serde
+    /// structs emit, field for field:
+    ///
+    /// - `crates/epigraph-api/src/routes/ego.rs:52-93` — `EgoNode`'s five
+    ///   claim-only fields carry `skip_serializing_if = "Option::is_none"`, so
+    ///   a non-claim neighbour arrives as four keys and nothing else; `label`
+    ///   and `redacted` are always present. `labels` is `Option<Vec<String>>`
+    ///   upstream and `Vec<String>` here, which is only safe because the skip
+    ///   means it is *omitted* rather than `null`.
+    /// - `crates/epigraph-api/src/routes/placement.rs:29-40` — the one route
+    ///   that deliberately serialises nulls: "no neighbourhood" has to be
+    ///   distinguishable from "field not read".
+    /// - `crates/epigraph-api/src/routes/stats.rs:18-31` — all eight fields
+    ///   always present.
+    /// - `crates/epigraph-api/src/routes/provenance_chain.rs:54-84` —
+    ///   `ChainNode.truth_value`/`is_current` are bare `f64`/`bool` upstream
+    ///   and `Option` here (widening, safe); `depth` is `i32` upstream and
+    ///   `u32` here, which holds because the BFS seeds at 0 and only
+    ///   increments (`repos/provenance_chain.rs:143,151`).
+    #[test]
+    fn kernel_routes_serialize_into_these_dtos() {
+        // ego: a redacted centre, an unhydratable neighbour (every optional
+        // key omitted), and the `direction` values the kernel emits.
+        let e: EgoResponse = serde_json::from_value(json!({
+            "center": {"id": "00000000-0000-0000-0000-000000000001",
+                       "entity_type": "claim", "label": "[REDACTED]",
+                       "redacted": true, "content": "[REDACTED]"},
+            "nodes": [{"id": "00000000-0000-0000-0000-000000000002",
+                       "entity_type": "workflow", "label": "workflow",
+                       "redacted": false}],
+            "edges": [{"id": "00000000-0000-0000-0000-00000000000a",
+                       "source_id": "00000000-0000-0000-0000-000000000001",
+                       "target_id": "00000000-0000-0000-0000-000000000002",
+                       "source_type": "claim", "target_type": "workflow",
+                       "relationship": "derived_from", "direction": "out"}],
+            "total_edges": 1, "truncated": false
+        }))
+        .unwrap();
+        assert!(e.center.redacted && e.center.content.as_deref() == Some(REDACTED));
+        assert!(e.nodes[0].labels.is_empty(), "omitted labels read as empty");
+        assert!(e.nodes[0].truth_value.is_none() && e.nodes[0].is_current.is_none());
+        assert_eq!(e.edges[0].direction, EdgeDirection::Out);
+        assert_eq!(e.edges[0].neighbour_id(), e.nodes[0].id);
+
+        // placement: the redacted / unclustered answer is explicit nulls.
+        let p: PlacementResponse = serde_json::from_value(json!({
+            "claim_id": "00000000-0000-0000-0000-000000000001",
+            "theme_id": null, "cluster_run_id": null, "cluster_id": null,
+            "neighborhood_id": null, "run_completed_at": null
+        }))
+        .unwrap();
+        assert!(p.theme_id.is_none() && p.cluster_run_id.is_none());
+
+        // stats: every field, and `computed_at` as chrono renders it.
+        let s: StatsResponse = serde_json::from_value(json!({
+            "claims": 1, "edges": 2, "evidence": 3, "embeddings": 4,
+            "agents": 5, "frames": 6, "workflows": 7,
+            "computed_at": "2026-09-16T12:00:00.123456789Z"
+        }))
+        .unwrap();
+        assert_eq!((s.claims, s.workflows), (1, 7));
+        assert!(s.computed_at.is_some());
+
+        // provenance-chain: bare (non-Option) upstream scalars, and a cycle.
+        let c: ProvenanceChainResponse = serde_json::from_value(json!({
+            "root": "00000000-0000-0000-0000-000000000001",
+            "nodes": [{"id": "00000000-0000-0000-0000-000000000001",
+                       "content": "[REDACTED]", "truth_value": 0.0,
+                       "labels": [], "is_current": false, "depth": 3,
+                       "redacted": true}],
+            "edges": [{"source": "00000000-0000-0000-0000-000000000001",
+                       "target": "00000000-0000-0000-0000-000000000002",
+                       "relationship": "derived_from"}],
+            "truncated": true,
+            "cycles": [["00000000-0000-0000-0000-000000000001",
+                        "00000000-0000-0000-0000-000000000002"]]
+        }))
+        .unwrap();
+        assert_eq!(c.nodes[0].depth, 3);
+        assert_eq!(c.nodes[0].is_current, Some(false));
+        assert!(c.nodes[0].redacted && c.truncated);
+        assert_eq!(c.cycles[0].len(), 2);
+    }
+
     #[test]
     fn api_error_body() {
         let e: ApiErrorBody = serde_json::from_value(json!({
