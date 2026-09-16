@@ -173,6 +173,7 @@ pub async fn callback_endpoint(
 ) -> Result<Response, ApiError> {
     use crate::oauth::providers::provision_external_user_client;
     use epigraph_db::repos::authorize_session::AuthorizeSessionRepository;
+    use epigraph_db::repos::oauth_client::OAuthClientRepository;
 
     // 1. Read-only lookup (NO delete): we still need the verifier + request to transition.
     let session = AuthorizeSessionRepository::find_by_state(&state.db_pool, &q.state)
@@ -183,6 +184,21 @@ pub async fn callback_endpoint(
         .ok_or(ApiError::BadRequest {
             message: "unknown or expired authorize session".into(),
         })?;
+
+    // 1b. The client this flow is for — the consent page must name it, not a
+    // hard-coded product. It was active at /oauth/authorize; if it has been
+    // suspended or revoked since, refuse here, BEFORE the Google exchange and
+    // before provisioning a user, rather than ask for consent to a client whose
+    // code could never be redeemed (get_by_client_id filters status='active').
+    let requesting_client =
+        OAuthClientRepository::get_by_client_id(&state.db_pool, &session.client_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+            .ok_or(ApiError::BadRequest {
+                message: "invalid_client".into(),
+            })?;
 
     // 2. Exchange the Google code -> id_token -> validated identity (reuse the provider flow).
     let provider = state
@@ -251,9 +267,12 @@ pub async fn callback_endpoint(
         message: "authorize session expired".into(),
     })?;
 
-    // 6. Render consent keyed by the nonce. email + scopes are server-derived, not from a form.
+    // 6. Render consent keyed by the nonce. The client name, email and scopes are all
+    // server-derived (the registered client row, the Google identity, the session), not
+    // from a form.
     Ok(Html(render_consent_page(
         &consent_nonce,
+        &requesting_client.client_name,
         &user.client_name,
         &grantable,
     ))
@@ -261,22 +280,28 @@ pub async fn callback_endpoint(
 }
 
 /// Pure HTML render. `ticket` is the consent-session nonce the POST handler will consume.
-fn render_consent_page(ticket: &str, email: &str, scopes: &[String]) -> String {
+/// `client_name` is the REQUESTING client's registered name (`oauth_clients.client_name`
+/// of the `client_id` that started the flow) — every EpiGraph deployment has more than
+/// one client, so the page names the one asking; `email` is the signed-in user's
+/// per-user client name. Both are attacker-influenced (registration is dynamic), so both
+/// go through `html_escape`.
+fn render_consent_page(ticket: &str, client_name: &str, email: &str, scopes: &[String]) -> String {
     let scope_items: String = scopes
         .iter()
         .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
         .collect();
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
-<title>Authorize Claude</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
-<h1>Authorize Claude</h1>
-<p>Claude wants to access EpiGraph as <strong>{email}</strong> with:</p>
+<title>Authorize {client_name}</title></head><body style="font-family:sans-serif;max-width:32rem;margin:4rem auto">
+<h1>Authorize {client_name}</h1>
+<p><strong>{client_name}</strong> wants to access EpiGraph as <strong>{email}</strong> with:</p>
 <ul>{scope_items}</ul>
 <form method="post" action="/oauth/authorize/consent">
   <input type="hidden" name="ticket" value="{ticket}">
   <button name="decision" value="allow">Allow</button>
   <button name="decision" value="deny">Deny</button>
 </form></body></html>"#,
+        client_name = html_escape(client_name),
         email = html_escape(email),
         ticket = html_escape(ticket),
         scope_items = scope_items
@@ -386,4 +411,34 @@ pub async fn authorize_endpoint(
     Err(ApiError::ServiceUnavailable {
         service: "database required for OAuth2".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page names the requesting client instead of a hard-coded product,
+    /// and escapes it: `client_name` comes from dynamic registration.
+    #[test]
+    fn consent_page_names_and_escapes_the_requesting_client() {
+        let html = render_consent_page(
+            "tick&et",
+            "Explorer <b>beta</b>",
+            "reader@example.com",
+            &["claims:read".to_string()],
+        );
+        assert!(
+            html.contains("<title>Authorize Explorer &lt;b&gt;beta&lt;/b&gt;</title>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<h1>Authorize Explorer &lt;b&gt;beta&lt;/b&gt;</h1>"),
+            "{html}"
+        );
+        assert!(!html.contains("<b>beta</b>"), "{html}");
+        assert!(!html.contains("Claude"), "{html}");
+        assert!(html.contains("reader@example.com"), "{html}");
+        assert!(html.contains(r#"value="tick&amp;et""#), "{html}");
+        assert!(html.contains("<li><code>claims:read</code></li>"), "{html}");
+    }
 }
