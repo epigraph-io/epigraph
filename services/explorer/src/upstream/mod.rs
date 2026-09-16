@@ -1,9 +1,11 @@
 //! Typed client for epigraph-api.
 //!
 //! Every call goes through one global semaphore (`UPSTREAM_CONCURRENCY`, well
-//! under the API's 10-connection pool) with a per-call timeout, forwards the
-//! caller's own bearer (never a service token) or calls anonymously, and maps
-//! every failure into [`UpstreamError`].
+//! under the API's 10-connection pool) under a single per-call deadline
+//! (`EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` from the moment the call starts,
+//! covering the queue wait *and* the request), forwards the caller's own
+//! bearer (never a service token) or calls anonymously, and maps every
+//! failure into [`UpstreamError`].
 //!
 //! 401 policy (plan §3.3): upstream answers a present-but-stale bearer with
 //! 401 even on public routes. With a session, the client calls
@@ -89,8 +91,8 @@ pub enum UpstreamError {
     /// 5xx.
     #[error("upstream error ({status}): {message}")]
     Server { status: u16, message: String },
-    /// The per-call timeout elapsed, waiting for a semaphore slot or for
-    /// the response.
+    /// The per-call deadline elapsed: waiting for a semaphore slot, waiting
+    /// for the response, or the two together.
     #[error("upstream timed out")]
     Timeout,
     /// Connection refused/reset/dropped (a handler panic upstream drops the
@@ -299,7 +301,13 @@ impl<'a> Api<'a> {
         Q: Serialize + ?Sized,
     {
         let up = &self.state.upstream;
-        let _permit = tokio::time::timeout(up.timeout, up.semaphore.acquire())
+        // One budget for the whole exchange, not one per stage: queueing for a
+        // permit and waiting for the response used to be two independent
+        // timeouts, so a contended call could take 2 × the configured timeout
+        // (and a page composing N sub-calls stacked that up). Everything below
+        // shares this deadline.
+        let deadline = tokio::time::Instant::now() + up.timeout;
+        let _permit = tokio::time::timeout_at(deadline, up.semaphore.acquire())
             .await
             .map_err(|_| {
                 tracing::warn!(%path, "upstream semaphore wait timed out");
@@ -307,11 +315,19 @@ impl<'a> Api<'a> {
             })?
             .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?;
 
+        // Whatever the queue left us. Zero is the same timeout the caller
+        // already handles; reqwest would not treat `Duration::ZERO` that way.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(%path, "upstream budget spent waiting for a semaphore slot");
+            return Err(UpstreamError::Timeout);
+        }
+
         let url = format!("{}{}", up.base, path);
         let mut req = up
             .http
             .request(method.clone(), &url)
-            .timeout(up.timeout)
+            .timeout(remaining)
             .header(ACCEPT, "application/json");
         if let Some(q) = query {
             req = req.query(q);

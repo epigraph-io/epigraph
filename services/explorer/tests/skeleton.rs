@@ -614,6 +614,63 @@ async fn upstream_calls_share_one_semaphore() {
     assert_eq!(app.state.upstream.available_permits(), 1);
 }
 
+/// The semaphore wait and the request share ONE budget.
+///
+/// `concurrency = 1`, timeout 500 ms. The first call holds the only permit
+/// for 300 ms and succeeds; the second therefore queues 300 ms and then talks
+/// to an upstream that never answers. Its deadline is 500 ms from when *it*
+/// started, so it must give up ~200 ms after it gets the permit — not start a
+/// fresh 500 ms clock and take 800 ms overall.
+#[tokio::test]
+async fn the_queue_wait_and_the_request_share_one_deadline() {
+    let app = spawn_with(
+        &[
+            (ENV_UPSTREAM_CONCURRENCY, "1"),
+            (ENV_UPSTREAM_TIMEOUT_MS, "500"),
+        ],
+        Router::new(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"claims": 1}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(claim_json())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&app.upstream)
+        .await;
+    let api = app
+        .state
+        .api(&epigraph_explorer::auth::RequestAuth::Anonymous);
+
+    let start = Instant::now();
+    let (quick, queued) = tokio::join!(api.stats(), api.claim(claim_id()));
+    let elapsed = start.elapsed();
+    assert!(quick.is_ok(), "the holder of the permit succeeds: {quick:?}");
+    assert_eq!(
+        queued.unwrap_err(),
+        UpstreamError::Timeout,
+        "the queued call must still time out"
+    );
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "the queued call took {elapsed:?} overall: it waited ~300 ms for the \
+         permit and then started a fresh timeout instead of spending what was \
+         left of its own 500 ms budget"
+    );
+    assert_eq!(app.state.upstream.available_permits(), 1);
+}
+
 // ---- 401 policy ---------------------------------------------------------------
 
 #[tokio::test]
