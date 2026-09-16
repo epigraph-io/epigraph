@@ -101,6 +101,8 @@ pub mod revoke_signature;
 pub mod search;
 pub mod spans;
 pub mod staging;
+#[cfg(feature = "db")]
+pub mod stats;
 pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
@@ -582,6 +584,7 @@ pub fn create_router(state: AppState) -> Router {
             get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
+        .route("/api/v1/stats", get(stats::corpus_stats))
         .route(
             "/api/v1/clusters/boundary-claims",
             get(crud::get_boundary_claims),
