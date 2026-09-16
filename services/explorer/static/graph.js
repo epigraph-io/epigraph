@@ -28,6 +28,18 @@
   const FAMILIES = ['support', 'refute', 'structural'];
   const HUES = [212, 152, 272, 28, 334, 96, 190, 248, 4, 56];
 
+  // The belief ramp, as HSL percentages at p = 0 (no belief) and p = 1. Both
+  // ends are floored away from the stage the node sits on (--surface: #ffffff
+  // light, #1c1f23 dark): a ramp that runs all the way to the stage's own
+  // lightness makes low-belief nodes invisible rather than pale. The stroke in
+  // graph.css carries the rest of the contrast; tests/graph.rs recomputes the
+  // WCAG ratios from these numbers, and .graph__ramp's gradient mirrors them.
+  const RAMP_SATURATION = [35, 70];
+  const RAMP_LIGHTNESS_LIGHT = [72, 38];
+  const RAMP_LIGHTNESS_DARK = [36, 76];
+  // Redacted, or no belief at all: a neutral grey, never paler than the ramp.
+  const NEUTRAL_LIGHTNESS = [70, 44]; // light theme, dark theme
+
   // Layout (world units are CSS px at zoom 1).
   const LINK_DISTANCE = 90;
   const LINK_STRENGTH = 0.06;
@@ -104,6 +116,11 @@
     return HUES[h % HUES.length];
   }
 
+  /** Interpolate one of the ramps above at t in [0, 1]. */
+  function rampAt(range, t) {
+    return Math.round(range[0] + (range[1] - range[0]) * t);
+  }
+
   /** Sequential ramp on pignistic_prob, else truth_value; neutral grey when
    * the node is redacted or has neither. Hue from frame_id, else type. */
   function nodeFill(d, dark) {
@@ -112,11 +129,11 @@
       p = num(d.pignistic_prob);
       if (p === null) p = num(d.truth_value);
     }
-    if (p === null) return dark ? 'hsl(210, 6%, 44%)' : 'hsl(210, 6%, 76%)';
+    if (p === null) return 'hsl(210, 6%, ' + NEUTRAL_LIGHTNESS[dark ? 1 : 0] + '%)';
     const t = Math.min(1, Math.max(0, p));
     const hue = hueFor(String(d.frame_id || d.entity_type || 'claim').toLowerCase());
-    const sat = Math.round(35 + 35 * t);
-    const light = Math.round(dark ? 26 + 46 * t : 90 - 52 * t);
+    const sat = rampAt(RAMP_SATURATION, t);
+    const light = rampAt(dark ? RAMP_LIGHTNESS_DARK : RAMP_LIGHTNESS_LIGHT, t);
     return 'hsl(' + hue + ', ' + sat + '%, ' + light + '%)';
   }
 
@@ -423,11 +440,27 @@
 
     // ---- data ----------------------------------------------------------------
 
-    setStatus(text, isError, forPanel) {
-      const el = forPanel ? this.panel.status : this.statusEl;
+    /** The canvas-wide status under the toolbar. */
+    setStatus(text, isError) {
+      const el = this.statusEl;
       if (!el) return;
       el.textContent = text;
-      if (!forPanel) el.classList.toggle('graph__status--error', Boolean(isError));
+      el.classList.toggle('graph__status--error', Boolean(isError));
+    }
+
+    /** A status about one node, which the panel only shows while that node is
+     * the selected one: an expansion's fetch outlives the click that started
+     * it, so a message that lands after the user picked another node would
+     * describe a node the panel is no longer showing. */
+    setPanelStatus(anchor, text) {
+      if (!this.panel.status || this.selected !== anchor) return;
+      this.panel.status.textContent = text;
+    }
+
+    /** A load failure: the panel for an expansion, the toolbar otherwise. */
+    reportLoadError(anchor, message) {
+      if (anchor) this.setPanelStatus(anchor, message);
+      else this.setStatus(message, true);
     }
 
     addFallbackLink() {
@@ -441,13 +474,13 @@
 
     /** Fetch a canvas payload and merge it. Resolves true on success. */
     async load(url, anchor) {
-      const forPanel = Boolean(anchor);
-      this.setStatus(forPanel ? 'Loading neighbours…' : 'Loading the graph…', false, forPanel);
+      if (anchor) this.setPanelStatus(anchor, 'Loading neighbours…');
+      else this.setStatus('Loading the graph…', false);
       let res;
       try {
         res = await fetch(url, { credentials: 'same-origin', headers: { Accept: 'application/json' } });
       } catch (err) {
-        this.setStatus('Could not reach the Explorer. Check your connection and try again.', true, forPanel);
+        this.reportLoadError(anchor, 'Could not reach the Explorer. Check your connection and try again.');
         return false;
       }
       let body = null;
@@ -460,15 +493,15 @@
         let message = 'The graph could not be loaded.';
         if (res.status === 401) message = 'Your session has ended. Reload the page to sign in again.';
         else if (body && typeof body.message === 'string' && body.message) message = body.message;
-        this.setStatus(message, true, forPanel);
+        this.reportLoadError(anchor, message);
         return false;
       }
       const added = this.merge(body, anchor);
-      if (forPanel) {
-        this.setStatus(added === 0 ? 'No new neighbours to add.' : 'Added ' + added + (added === 1 ? ' node.' : ' nodes.'), false, true);
+      if (anchor) {
+        this.setPanelStatus(anchor, added === 0 ? 'No new neighbours to add.' : 'Added ' + added + (added === 1 ? ' node.' : ' nodes.'));
       }
       const e = this.edges.size;
-      this.setStatus(this.nodes.size + (this.nodes.size === 1 ? ' node, ' : ' nodes, ') + e + (e === 1 ? ' connection.' : ' connections.'), false, false);
+      this.setStatus(this.nodes.size + (this.nodes.size === 1 ? ' node, ' : ' nodes, ') + e + (e === 1 ? ' connection.' : ' connections.'), false);
       return true;
     }
 
@@ -853,13 +886,14 @@
       if (!n || n.expanded || n.expanding) return;
       const url = localPath(n.d.expand_href);
       if (!url) {
-        if (this.selected === n) this.setStatus('This node cannot be expanded.', false, true);
+        this.setPanelStatus(n, 'This node cannot be expanded.');
         return;
       }
       if (this.nodes.size >= this.cap) {
-        this.leftOut += 1;
-        this.updateCapNotice();
-        if (this.selected === n) this.setStatus('The graph already shows its maximum of ' + this.cap + ' nodes.', false, true);
+        // No fetch happens here, so no neighbour was dropped: the cap notice
+        // only ever counts nodes a payload really carried past the cap (see
+        // merge). The status below is the whole story.
+        this.setPanelStatus(n, 'The graph already shows its maximum of ' + this.cap + ' nodes.');
         return;
       }
       n.expanding = true;

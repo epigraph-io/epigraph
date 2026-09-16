@@ -184,7 +184,8 @@
   height: 0.7rem;
   border-radius: 999px;
   border: 1px solid var(--border);
-  background: linear-gradient(90deg, hsl(212, 35%, 90%), hsl(212, 70%, 38%));
+  /* Mirrors RAMP_* in graph.js; tests/graph.rs keeps the two in step. */
+  background: linear-gradient(90deg, hsl(212, 35%, 72%), hsl(212, 70%, 38%));
 }
 
 .graph__help {
@@ -203,7 +204,7 @@
 
 @media (prefers-color-scheme: dark) {
   .graph__ramp {
-    background: linear-gradient(90deg, hsl(212, 35%, 26%), hsl(212, 70%, 72%));
+    background: linear-gradient(90deg, hsl(212, 35%, 36%), hsl(212, 70%, 76%));
   }
 }
 
@@ -262,8 +263,11 @@
   outline: none;
 }
 
+/* Every node keeps an outline that clears 3:1 against the stage, whatever the
+ * belief ramp does to its fill; --surface here would be the stage's own colour,
+ * which erases a pale node instead of separating it. */
 .gnode circle {
-  stroke: var(--surface);
+  stroke: var(--text-muted);
   stroke-width: 1.5;
 }
 
