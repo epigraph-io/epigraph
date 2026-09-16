@@ -241,8 +241,17 @@ pub async fn overview(
     }))
 }
 
+/// Expand one cluster of the latest run into its claim nodes.
+///
+/// Node `label` is `claims.content`, so it carries the same partition
+/// restrictions `GET /claims/:id` enforces: labels the requester may not read
+/// become `"[REDACTED]"` (§2.6). This route is on the protected router, so the
+/// bearer is required and `auth_ctx` is always present; it stays `Option` to
+/// match every other redacting handler and to fail closed (requester `None` ⇒
+/// public content only) if the layering ever changes.
 pub async fn expand(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(cluster_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<ExpandResponse>, (axum::http::StatusCode, String)> {
@@ -278,7 +287,7 @@ pub async fn expand(
             .map(|s| (*s).to_string())
             .collect(),
     };
-    let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
+    let mut nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         "WITH degree AS (
             SELECT m.claim_id, COUNT(e.*) AS deg
             FROM claim_cluster_membership m
@@ -310,6 +319,18 @@ pub async fn expand(
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
     let (edges, filtered_edge_count) =
         fetch_subgraph_edges(pool, &node_ids, allowlist.as_deref()).await?;
+
+    // Every node here is a claim (the SELECT hard-codes `entity_type`), so the
+    // whole node set goes through one ownership lookup.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
+    )
+    .await;
 
     Ok(Json(ExpandResponse {
         cluster_id,

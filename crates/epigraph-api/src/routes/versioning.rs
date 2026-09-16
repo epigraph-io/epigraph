@@ -528,6 +528,7 @@ pub async fn mark_duplicate(
 #[cfg(feature = "db")]
 pub async fn claim_history(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<VersionHistoryResponse>, ApiError> {
     // Walk the supersession chain using database queries
@@ -619,6 +620,19 @@ pub async fn claim_history(
             break;
         }
     }
+
+    // SECURITY (§2.6): each version is a distinct claim with its own
+    // ownership row — a superseded version can be public while its successor
+    // is private, or the reverse — so the batch check covers the whole chain.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    crate::access_control::redact_claim_fields(
+        &state.db_pool,
+        requester,
+        versions.iter_mut().map(|v| (v.claim_id, &mut v.content)),
+    )
+    .await;
 
     let total_versions = versions.len();
 

@@ -1679,6 +1679,7 @@ pub struct ClaimByLabelsResponse {
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(q): Query<ClaimsByLabelsQuery>,
 ) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
     let labels: Vec<String> = q
@@ -1723,20 +1724,33 @@ pub async fn list_by_labels(
         message: e.to_string(),
     })?;
 
-    Ok(Json(
-        rows.into_iter()
-            .map(|(c, claim_labels)| ClaimByLabelsResponse {
-                id: c.id.as_uuid(),
-                content: c.content,
-                truth_value: c.truth_value.value(),
-                agent_id: c.agent_id.as_uuid(),
-                created_at: c.created_at.to_rfc3339(),
-                labels: claim_labels,
-                is_current: c.is_current,
-                supersedes: c.supersedes.map(|s| s.as_uuid()),
-            })
-            .collect(),
-    ))
+    let mut items: Vec<ClaimByLabelsResponse> = rows
+        .into_iter()
+        .map(|(c, claim_labels)| ClaimByLabelsResponse {
+            id: c.id.as_uuid(),
+            content: c.content,
+            truth_value: c.truth_value.value(),
+            agent_id: c.agent_id.as_uuid(),
+            created_at: c.created_at.to_rfc3339(),
+            labels: claim_labels,
+            is_current: c.is_current,
+            supersedes: c.supersedes.map(|s| s.as_uuid()),
+        })
+        .collect();
+
+    // SECURITY (§2.6): same redaction `get_claim` applies, one batch lookup
+    // for the page. Requester is the authenticated agent_id (else client_id).
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    crate::access_control::redact_claim_fields(
+        &state.db_pool,
+        requester,
+        items.iter_mut().map(|it| (it.id, &mut it.content)),
+    )
+    .await;
+
+    Ok(Json(items))
 }
 
 /// Stub for non-db builds — returns an empty list.

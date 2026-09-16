@@ -126,8 +126,17 @@ pub struct CompoundGroup {
     pub member_atom_ids: Vec<Uuid>,
 }
 
+/// Expand one neighborhood of the latest run.
+///
+/// Every `label` in either mode is `claims.content`, so both response shapes
+/// carry the same partition restrictions `GET /claims/:id` enforces: labels
+/// the requester may not read become `"[REDACTED]"` (§2.6). This route is on
+/// the protected router, so the bearer is required and `auth_ctx` is always
+/// present; it stays `Option` to match every other redacting handler and to
+/// fail closed if the layering ever changes.
 pub async fn expand(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(neighborhood_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<NeighborhoodExpandResponse>, (axum::http::StatusCode, String)> {
@@ -157,12 +166,16 @@ pub async fn expand(
         ));
     }
 
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+
     match params.mode.as_str() {
         "atomic" => Ok(Json(NeighborhoodExpandResponse::Atomic(
-            atomic_response(pool, neighborhood_id, params.budget).await?,
+            atomic_response(pool, neighborhood_id, params.budget, requester).await?,
         ))),
         _ => Ok(Json(NeighborhoodExpandResponse::Compound(
-            compound_response(pool, neighborhood_id, params.budget).await?,
+            compound_response(pool, neighborhood_id, params.budget, requester).await?,
         ))),
     }
 }
@@ -171,8 +184,9 @@ async fn compound_response(
     pool: &PgPool,
     neighborhood_id: Uuid,
     _budget: i64,
+    requester: Option<Uuid>,
 ) -> Result<CompoundResponse, (axum::http::StatusCode, String)> {
-    let nodes: Vec<CompoundNode> = sqlx::query_as::<_, (Uuid, String, String, i32, Option<f64>, Option<Uuid>)>(
+    let mut nodes: Vec<CompoundNode> = sqlx::query_as::<_, (Uuid, String, String, i32, Option<f64>, Option<Uuid>)>(
         r#"
         WITH atoms AS (
             SELECT m.claim_id
@@ -353,6 +367,15 @@ async fn compound_response(
     })
     .collect();
 
+    // `label` is `COALESCE(c.content, c.id::text)` for both compound and
+    // standalone nodes; one ownership lookup covers the whole node set.
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
+    )
+    .await;
+
     Ok(CompoundResponse {
         neighborhood_id,
         truncated: false,
@@ -367,8 +390,9 @@ async fn atomic_response(
     pool: &PgPool,
     neighborhood_id: Uuid,
     _budget: i64,
+    requester: Option<Uuid>,
 ) -> Result<AtomicResponse, (axum::http::StatusCode, String)> {
-    let nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
+    let mut nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
         r#"
         SELECT c.id,
                COALESCE(c.content, c.id::text) AS label,
@@ -404,7 +428,7 @@ async fn atomic_response(
     .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
     .collect();
 
-    let compound_groups: Vec<CompoundGroup> = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>)>(
+    let mut compound_groups: Vec<CompoundGroup> = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>)>(
         r#"
         SELECT e.source_id AS compound_id,
                COALESCE(c.content, c.id::text) AS label,
@@ -427,6 +451,20 @@ async fn atomic_response(
         member_atom_ids,
     })
     .collect();
+
+    // Atom labels and compound-group labels are both `claims.content`, and a
+    // group's parent compound is generally not among `nodes`, so both sets go
+    // into the same single lookup.
+    let redact_targets: Vec<(Uuid, &mut String)> = nodes
+        .iter_mut()
+        .map(|n| (n.id, &mut n.label))
+        .chain(
+            compound_groups
+                .iter_mut()
+                .map(|g| (g.compound_id, &mut g.label)),
+        )
+        .collect();
+    crate::access_control::redact_claim_fields(pool, requester, redact_targets).await;
 
     Ok(AtomicResponse {
         neighborhood_id,
