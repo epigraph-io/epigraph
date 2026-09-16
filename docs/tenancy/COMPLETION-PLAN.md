@@ -24,9 +24,9 @@ Residual work is recorded in three places that overlap in exactly one significan
 |---|---|---|
 | `open_findings` | 54 | 42 actionable, 12 `ACCEPTED` and deliberately carried |
 | `deferred_obligations` | 48 | **45 not stated as discharged**; 3 carry no `status` field at all |
-| `no_unscoped_pool.rs` ratchet | 372 sites / 46 files | the conversion tail |
+| `no_unscoped_pool.rs` ratchet | 355 sites / 44 files | the conversion tail |
 
-**This table is a POINT-IN-TIME SNAPSHOT, measured 2026-09-16 at the close of conversion shard 4.**
+**This table is a POINT-IN-TIME SNAPSHOT, measured 2026-09-16 at the close of conversion shard 5.**
 Every shard so far has had to re-sweep it, and a stale row here has already been raised as a
 finding twice. Treat the registers themselves as authoritative: `open_findings` /
 `deferred_obligations` in `docs/tenancy/progress.json`, and `HIGH_WATER` / `HIGH_WATER_FILES`
@@ -84,9 +84,13 @@ Strictly ordered. Each stage gates the next.
 
 ### 2.1 — Drain the conversion tail
 
-**372 sites across 46 files**, per the ratchet's own measurement — it strips comments and
-excludes a separately-reviewed exempt set, so a naive `grep` (448 across 59) overcounts.
-Quote the ratchet, not the grep.
+**355 sites across 44 files**, per the ratchet's own measurement — it strips comments and
+excludes a separately-reviewed exempt set, so a naive `grep` overcounts.
+Quote the ratchet, not the grep. (It read 372 across 46 at the close of conversion shard 4;
+shard 5 converted 17 more and emptied two files, which is where 355/44 comes from. The
+parenthesised naive-grep figure this line used to carry was NOT re-derived by shard 5 and has
+been dropped rather than restated stale.) A smaller number is not a discharged decision:
+§9.2 step 11d stays blocked until this reaches zero.
 
 Distribution is heavily skewed, which is what makes sharding cheap:
 
@@ -94,13 +98,19 @@ Distribution is heavily skewed, which is what makes sharding cheap:
 |---|---|
 | `routes/crud.rs` | 40 |
 | `routes/workflows.rs` | 40 |
-| `routes/claims.rs` | 26 |
+| `routes/claims.rs` | 25 |
 | `routes/experiment_loop.rs` | 20 |
-| remaining 42 files | ~265 |
+| remaining 40 files | 230 |
+
+Re-measured by conversion shard 5 by reimplementing `measure()` over the tree: 40 + 40 + 25 +
+20 + 230 = **355 across 44 files**, which is the ratchet's own number. Two corrections to the
+row this table used to carry. `routes/claims.rs` is **25, not 26** — the machine-checked
+`UNCONVERTED` entry reads 25 both before and after this shard, so the 26 was already stale and
+is not something shard 5 changed. And the roll-up row is now exact rather than a `~` estimate.
 
 **Shape: one shard per file, ratchet steps down each time.** This is the pattern PR-23
-through PR-29 already established and proved; do not invent a new one. Three shards clear
-27% of the tail.
+through PR-29 already established and proved; do not invent a new one. The three largest files
+are 105 of the 355 remaining sites — 30% of the tail in three shards.
 
 **Per-shard acceptance:**
 - `HIGH_WATER` and `HIGH_WATER_FILES` decrease, never increase, and the new numbers are
@@ -120,10 +130,17 @@ Each of these is latent today and bites the moment 11d runs.
 A `WHERE NOT EXISTS (SELECT 1 FROM t …)` over a protected `t` returns nothing to a
 non-bypass role, so a dedup guard silently degrades into an unconditional insert. Already
 enumerated and pinned by `rls_enforcement.rs::guard_subquery_sites_are_enumerated`. App-pool
-sites: `edge.rs::create_symmetric_if_absent`, `::create_symmetric_if_absent_returning`, two
-sites each in `graph_view.rs` and `routes/graph_neighborhood.rs`, all over `edges`.
+sites: `edge.rs::create_symmetric_if_absent`, `::create_symmetric_if_absent_returning`,
+**three** sites in `graph_view.rs` and two in `routes/graph_neighborhood.rs`, all over `edges`.
 **None is a read leak**; each is a correctness degradation — duplicate edges, or
 already-decomposed claims reappearing as undecomposed.
+Two reconciliations with that test, which is the authority here and had already corrected this
+line. (1) `graph_view.rs` is **three** `NOT EXISTS` clauses across two functions, not two —
+the test recorded that upward correction and this sentence had not been re-swept. (2) The two
+`routes/graph_neighborhood.rs` sites are no longer plain app-pool: conversion shard 5 moved
+`compound_response`, the only function that reaches them, onto a viewer-stamped `read_as`
+connection, so they are the one STAMPED row in that table. The SQL is unchanged and the
+disposition is unchanged; only the session moved.
 **The fix is real unique constraints, not policy changes.** Claims a migration number.
 
 **2.2.2 `D-PR16-seed-grant-to-the-harness-role`.** The *Files* line item "`epigraph_seed`
