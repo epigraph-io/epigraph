@@ -120,7 +120,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let progress_every = cli.progress_every;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            match recompute_one_claim_all_frames(&pool, claim_id).await {
+            match recompute_one_claim_cached_belief(&pool, claim_id).await {
                 Ok(written) => {
                     if written > 0 {
                         claims_with_work.fetch_add(1, Ordering::Relaxed);
@@ -169,32 +169,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// deterministic last-writer for the cached `claims.{belief, pl, betp, ...}`
 /// scalars so that two runs against the same population converge.
 ///
-/// Returns the number of (claim, frame) pairs that produced a recompute.
-async fn recompute_one_claim_all_frames(
+/// Returns 1 if the claim's cached scalars were rewritten, 0 otherwise.
+async fn recompute_one_claim_cached_belief(
     pool: &sqlx::PgPool,
     claim_id: Uuid,
 ) -> Result<usize, String> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT DISTINCT mf.frame_id, f.name \
-           FROM mass_functions mf \
-           JOIN frames f ON f.id = mf.frame_id \
-          WHERE mf.claim_id = $1 \
-          ORDER BY f.name",
-    )
-    .bind(claim_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("list frames for claim: {e}"))?;
-    let mut written = 0usize;
-    for (frame_id, _frame_name) in rows {
-        let did =
-            epigraph_engine::edge_factor::recompute_claim_belief_on_frame(pool, claim_id, frame_id)
-                .await?;
-        if did {
-            written += 1;
-        }
-    }
-    Ok(written)
+    // Backlog 696d3a1c: `claims.{belief, plausibility, mass_on_empty,
+    // pignistic_prob, mass_on_missing}` is ONE shared cache, not per-frame state.
+    // This used to enumerate every frame the claim had BBAs on and recompute each,
+    // which wrote that cache once per frame and let the alphabetically last one
+    // win — reliably clobbering the edge-derived `binary_truth` belief, since
+    // `binary_truth` sorts first. `recompute_claim_cached_belief` picks the single
+    // owning frame instead.
+    Ok(usize::from(
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, claim_id).await?,
+    ))
 }
 
 fn read_claim_ids(cli: &Cli) -> Result<Vec<Uuid>, Box<dyn std::error::Error>> {

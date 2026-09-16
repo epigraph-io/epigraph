@@ -917,6 +917,50 @@ async fn recompute_combined_belief(
     Ok(())
 }
 
+/// Recompute a claim's cached DS scalars, letting exactly ONE frame own them.
+///
+/// Backlog 696d3a1c. `recompute_claim_belief_on_frame` persists nothing per-frame —
+/// it writes only the five SHARED `claims.{belief, plausibility, mass_on_empty,
+/// pignistic_prob, mass_on_missing}` columns plus `claims.classification`. Callers
+/// that looped over every frame a claim has BBAs on therefore wrote that one cache
+/// repeatedly, and the last frame processed won.
+///
+/// `list_frames_for_claim` orders `BY f.name`, and the canonical `binary_truth`
+/// frame sorts FIRST (b < c < f < p < t). So the edge-derived belief that
+/// `auto_wire_ds_for_edge` writes there was reliably clobbered by any
+/// `claim_validity`, `paper_validity_*` or `textbook_veracity_*` frame the claim
+/// also carried — usually one holding the pre-edge intrinsic assessment. That is
+/// what silently reverted every `contradicts`/`refutes` edge written since the
+/// previous recompute, and it reported `errors: []` while doing it.
+///
+/// The cache is a single scalar summary, so it needs a single owner.
+/// `binary_truth` is that owner: it is the frame the edge-wiring path writes and
+/// the one unframed `get_belief` is documented to serve.
+///
+/// When the claim has no `binary_truth` BBA there is no canonical opinion to
+/// preserve, so the previous last-frame-wins behaviour is kept rather than leaving
+/// the cache unwritten — this function never makes a claim's cache emptier than it
+/// was.
+///
+/// Returns whether the cache was written.
+pub async fn recompute_claim_cached_belief(pool: &PgPool, claim_id: Uuid) -> Result<bool, String> {
+    let frames = MassFunctionRepository::list_frames_for_claim(pool, claim_id)
+        .await
+        .map_err(|e| format!("list_frames_for_claim: {e}"))?;
+    let Some((last_frame, _)) = frames.last().cloned() else {
+        return Ok(false);
+    };
+
+    let canonical = ensure_binary_frame(pool).await?;
+    let owner = if frames.iter().any(|(id, _)| *id == canonical) {
+        canonical
+    } else {
+        last_frame
+    };
+
+    recompute_claim_belief_on_frame(pool, claim_id, owner).await
+}
+
 /// Get-or-create the canonical `binary_truth` frame.
 pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
     if let Some(row) = FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
