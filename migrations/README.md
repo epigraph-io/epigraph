@@ -73,10 +73,13 @@ Current reservation:
   | **089** | cleanup batch `tenancy/fix-harvester-fragment-stamp` (no plan section — all 22 are delivered) | `harvester_claim_provenance_fragment_inherit_tenancy` + `epigraph_inherit_fragment_tenancy_stmt`: an AFTER INSERT statement trigger that stamps a `harvester_fragments` row with its claim's tenancy when the provenance row linking them appears. Closes the one write moment migration 070 could not cover — `harvester_fragments` has no `claim_id`, so arm (c) cannot key on it, and arm (d) fires only when a claim's tenancy changes. Adds no table, so 070's `GRANT … ON ALL TABLES` note needs no re-issue. File: `089_harvester_fragment_provenance_stamp.sql`. **No undo runbook ships**, unlike 070/074/079/084: reversing this file is one `DROP TRIGGER IF EXISTS` plus one `DROP FUNCTION IF EXISTS` (both named in the file's own closing section), and the rows it stamped are deliberately NOT un-stamped — `docs/runbooks/070-undo.sql` takes the same stance, so an operator rolling back is left with a fail-closed residual rather than a hazard. Recorded here so the absence is a decision rather than an omission. **Claimed 2026-09-12**, was headroom. **Applied to a throwaway database only, NOT to any deployed database.** |
   | **090** | FORCE-precondition batch `tenancy/fix-force-preconditions` (no plan section — all 22 are delivered) | `edges_symmetric_relationship_uniq`: a partial UNIQUE index over `(LEAST(source_id,target_id), GREATEST(source_id,target_id), relationship)` for the two symmetric claim-claim relationships `EdgeRepository::create_symmetric_if_absent` writes (`CORROBORATES`, `contradicts`), keyed on the same `(pair + properties->>'source' = 'cross_source_matcher')` identity `MatchCandidateRepo::retire` already uses and restricted to in-force claim-claim rows, so an operator-authored edge over the same pair is unaffected — a broader predicate was written first and rejected when two existing tests caught it changing what `POST /edges` may write. `alternative_of` is deliberately excluded — migration 042's `edges_alternative_of_symmetric_uniq`, narrowed by 091, already covers it. Backs a read guard that is not atomic and that cannot see an edge whose ownership no longer follows its endpoints' (072 arm (d)'s no-widening rule); `D-PR17-read-guards-widen-under-rls`. File: `090_edges_symmetric_relationship_uniq.sql`. **No undo runbook ships**: reversing this file is one `DROP INDEX IF EXISTS edges_symmetric_relationship_uniq`, named in the file itself, and it creates no rows to un-create. **The file carries a DEPLOY PRECONDITION** — `CREATE UNIQUE INDEX` fails on pre-existing in-force duplicates, and the census query is in its header; measured zero on the throwaway, unknown on production, which is at migration 59. **Claimed 2026-09-15**, was headroom — this exhausts the reserved 060–090 range. **Applied to a throwaway database only, NOT to any deployed database.** |
 
-  **060–090 is now fully allocated.** There is no headroom left inside the
-  reserved range. A tenancy migration that needs a number after this one is a
-  version-space decision for the operator, not a choice a PR may make: `092` and
-  later are the *public non-tenancy* sequence and `epigraph-internal` shares it.
+  **060–090 is now fully allocated.** There is no headroom left inside this
+  range. It is NOT the end of the tenancy series: the operator authorized a
+  SECOND contiguous tenancy block, `092–099`, on 2026-09-15 — see its own entry
+  below. Until that decision it was true, and is recorded here as history, that
+  "a tenancy migration that needs a number after this one is a version-space
+  decision for the operator, not a choice a PR may make". The decision was made;
+  the rule that produced it stands for `100` and beyond.
 
   **The post-shift numbers, pinned.** THIS TABLE IS AUTHORITATIVE; plan §3.1's
   own columns are not, and neither is `docs/tenancy/FINAL-PLAN.md`. Derive
@@ -185,13 +188,31 @@ Current reservation:
 - **091**: public `alternative_of_uniq_ignores_retracted` (PR #411) — the first
   allocation outside the reserved range. It was written as `060` and merged to
   `main` before this table existed there; see "Why 091 and not 060" below.
-- **092+**: public next
+- **092–099**: RESERVED — public multi-user tenancy series, CONTINUED.
+  `epigraph-internal` MUST NOT allocate in this range. `091` is NOT in it (see
+  the entry above and "Why 091 and not 060"), which is why the block starts at
+  `092` and is not contiguous with `060–090`.
 
-Next public migration **outside the reserved tenancy range** must be `092` or
-later; numbers inside 060–090 are allocated by §3.1 of the tenancy plan and are
-claimed one PR at a time on `feat/multi-user-tenancy`. Picking a colliding
-version (checksum mismatch on a `_sqlx_migrations` row that's already applied)
-will panic the api binary on restart.
+  Authorized by the operator on **2026-09-15**, when `060–090` was exhausted and
+  `D-PR17-creator-arm-outlives-membership` still needed a migration. Recorded
+  here on the same terms as `060–090`, in the same commit as the first file that
+  claims from it. The working record is `~/tenancy-pending-decisions.md`, outside
+  this repository.
+
+  | Version(s) | PR | What |
+  |---|---|---|
+  | **092** | obligation batch `tenancy/fix-force-tail-and-registers` (no plan section — all 22 are delivered) | `epigraph_group_roster_admits_principal` + a narrowed `epigraph_is_group_creator` + an `ALTER POLICY` on `groups_tenancy`: bounds migration 077's group-creation bootstrap arm to the group's roster, so it ends where the creator's own membership ends instead of never. Closes `D-PR17-creator-arm-outlives-membership` (COMPLETION-PLAN §2.2.5). The arm is carried by THREE policies in TWO spellings — an inline column comparison on `groups`, the shared `epigraph_is_group_creator()` helper on `group_memberships` and `group_key_epochs` — and both are narrowed, because a single-site fix is incomplete by construction. `ALTER POLICY`, not DROP + CREATE, so `pg_policy.polcmd` keeps `*` and no command coverage can be lost; pinned by `locked_decisions.rs::d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster`. The new definer body's OWNER is a correctness control rather than hygiene — see the file's section 5 — and is pinned in CI by `schema_contract.rs::migration_092_roster_definer_is_revoked_from_public` and at deploy by `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (plan §9.2 step 11c). File: `092_group_creator_arm_roster_bound.sql`. **No undo runbook ships**, on the same ground as 089 and 090: reversing it is one `CREATE OR REPLACE FUNCTION public.epigraph_is_group_creator(uuid)` back to 077's body, one `ALTER POLICY groups_tenancy ON public.groups USING (…)` back to 077's text and one `DROP FUNCTION IF EXISTS public.epigraph_group_roster_admits_principal(uuid)` — the roster predicate is NEW in 092 and has no 077 body to be replaced back to, so it is dropped rather than replaced — all three named in the file's own closing section, and it creates no rows to un-create. **No deploy precondition**: it adds no constraint and no index, so there is no pre-existing state it can fail on. **Claimed 2026-09-16.** **Applied to a throwaway database only, NOT to any deployed database.** |
+  | **093–099** | — | headroom |
+
+- **100+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `100` or
+later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
+numbers inside 092–099 are allocated by the obligation batches that follow it.
+Both are claimed one at a time, and a claim is recorded in the tables above **in
+the same commit as the file**. Picking a colliding version (checksum mismatch on
+a `_sqlx_migrations` row that's already applied) will panic the api binary on
+restart.
 
 ## `-- no-transaction` migrations
 
@@ -336,6 +357,16 @@ prod rows matching internal migration descriptions : 0
 Verify both before assuming it still holds. If a database is ever found that
 ran internal *and* is targeted by public migrations, `060`–`112` is a minefield
 there and public must allocate above `112` for that database.
+
+**The 092–099 tenancy block sits inside internal's 060–112, and that is a known
+consequence of the reservation, not an oversight.** It rests on exactly the
+measurement above and on nothing else. **The measurement was NOT re-run when 092
+was claimed on 2026-09-16** — this batch is confined to a throwaway database and
+has no read of any deployed cluster — so the two numbers quoted in the block
+above are still the 2026-09-02 ones. Re-run them before the first deploy that
+carries a migration in this block; if a database is found that ran internal, the
+whole `092`–`099` reservation is void for that database and the rule in the
+paragraph above applies instead.
 
 Note also that `crates/epigraph-api/src/lib.rs` sets
 `migrator.set_ignore_missing(true)`, so a *gap* is tolerated but a *checksum

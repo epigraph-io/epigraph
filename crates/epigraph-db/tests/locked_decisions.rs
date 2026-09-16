@@ -596,6 +596,53 @@
 //!   060-090 range must set `security_invoker`") stands, is restated in README,
 //!   and is still ratcheted on the two view exemptions by
 //!   `tenancy_coverage.rs::the_two_view_exemptions_are_security_invoker`.
+//!
+//! ## Status at migration 092
+//!
+//! **092 CHANGES AN RLS POLICY, so this file is touched deliberately.** §0.2's
+//! rejection trigger fires on *"a PR that changes an RLS policy … and does not
+//! touch this file"*, and the discharge here is an assertion rather than a
+//! sentence — see
+//! [`d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster`].
+//!
+//! 092 bounds migration 077's group-creation bootstrap arm to the group's
+//! roster, closing `D-PR17-creator-arm-outlives-membership`. The arm is carried
+//! by three policies — `groups_tenancy`, `group_memberships_tenancy` and
+//! `group_key_epochs_tenancy` — in two different spellings, an inline column
+//! comparison on `groups` and the shared `epigraph_is_group_creator()` helper on
+//! the other two, so a single-site fix is incomplete by construction and would
+//! still pass a proof written against whichever spelling it chose.
+//!
+//! * **D4 — the policies stay FORCEd and keep full command coverage.** 092
+//!   amends `groups_tenancy` with `ALTER POLICY` rather than DROP + CREATE, so
+//!   `pg_policy.polcmd` stays `*` (`FOR ALL`) and the grantee list is preserved
+//!   by construction; the other two policies are not re-issued at all, only the
+//!   function their arms call. No table is added to or removed from the FORCEd
+//!   set, so `FORCE_PROTECTED_SET`, `CONTROL_TABLES`, `PRIVATIZATION_TABLES`,
+//!   `rls_enforcement.rs::PROTECTED` and `DELIBERATELY_UNCOVERED` need no edit
+//!   and get none.
+//! * **D1 — no tenancy column.** `groups`, `group_memberships` and
+//!   `group_key_epochs` carry neither `visibility` nor `owner_group_id`; they are
+//!   not in 062's `tier_a` set, and 092 adds no column anywhere.
+//! * **D3 — no `Viewer` shape, constructor or `SystemReason` is added**, and no
+//!   route is added, moved or removed. 092 is SQL only; the Rust half of this
+//!   batch is tests and the ledger.
+//! * **The arm is still session-keyed in the shape
+//!   `rls_enforcement.rs::no_policy_arm_is_session_independent` requires.** That
+//!   test splits each policy expression on the literal `" OR "` and demands every
+//!   fragment name a session helper. The narrowing is written INSIDE the existing
+//!   disjunct as an `AND`, not as a new top-level `OR`, so the fragment still
+//!   reads `created_by_agent_id = ( SELECT epigraph_principal_id() …) AND …` —
+//!   measured against `pg_get_expr`, not assumed. A narrowing spelled as a
+//!   sibling disjunct would have been reported as an unconditional grant, which
+//!   misdescribes the change and sends a reviewer the wrong way. The roster
+//!   helper is ALSO added to that test's `SESSION_HELPERS` list, so recognition
+//!   rests on the helper's own session binding rather than on the adjacent
+//!   `epigraph_principal_id()` happening to be the substring the match finds —
+//!   the incidental shape the list's own 083 entry criticises.
+//! * **No `ROW_ONLY_BY_DESIGN` entry goes stale.** None of the four needles
+//!   (`true`, `key_kind`, `privatization_apply`, `agent_id IS NULL`) matches an
+//!   arm 092 rewrites, and that register is exact in both directions.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -2268,5 +2315,140 @@ fn d4_migration_086_installs_no_policy() {
         "086 must keep the guarded OWNER TO, the GRANT EXECUTE and the pinned search_path. \
          The owner is what makes epigraph_definer_bypass() true inside the frame — it is the \
          MECHANISM, not hardening — and without the grant the app role gets 42501."
+    );
+}
+
+// ===========================================================================
+// D4 — migration 092's narrowing of the group-creation bootstrap arm
+// ===========================================================================
+
+/// **D4, locked.** The bootstrap arm is bounded by the roster in BOTH of its
+/// spellings, and the three policies that carry it still cover every command.
+///
+/// This is the catalog half of 092. The behavioural half lives in
+/// `rls_enforcement.rs::the_creator_arm_ends_with_the_creators_own_membership`
+/// and its positive sibling; a catalog check proves the predicate is INSTALLED,
+/// never that it FILTERS, which is why both exist (see this file's header and
+/// `rls_enforcement.rs`'s "three classes").
+///
+/// Read from `pg_get_expr` and `pg_proc.prosrc` rather than from the migration
+/// text: 092 is one of ~1000 `#[sqlx::test(migrations = "../../migrations")]`
+/// replays, and what matters is the predicate the database ENDED UP WITH after
+/// 077 and 092 both ran — a later migration that reverted either spelling would
+/// leave the migration text saying the right thing and the catalog saying the
+/// wrong one.
+///
+/// **WHAT THIS TEST DELIBERATELY DOES NOT PIN: `proowner` and `proacl`.** It
+/// greps `prosrc` for a predicate name, which survives any ownership change — so
+/// it cannot see the one degradation that reverts 092 silently, a roster
+/// predicate whose definer frame is not admitted by `epigraph_definer_bypass()`
+/// and whose `NOT EXISTS` therefore admits every group. That pin is
+/// `schema_contract.rs::migration_092_roster_definer_is_revoked_from_public`, on
+/// the template 086 and 089 each established, and the deploy-time half is
+/// `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Named here because a
+/// reader who finds only this test would reasonably conclude 092 is fully
+/// ratcheted by it.
+///
+/// **The `polcmd` assertion is not decoration.** `groups_tenancy` is a single
+/// `FOR ALL` policy, so a narrowing written as DROP POLICY + CREATE POLICY that
+/// forgot `FOR ALL` would silently drop INSERT/UPDATE/DELETE coverage while the
+/// USING clause still read correctly. 092 uses `ALTER POLICY`, which cannot lose
+/// it; this pins the outcome so a future re-issue cannot.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster(pool: PgPool) {
+    const ROSTER_PREDICATE: &str = "epigraph_group_roster_admits_principal";
+
+    // Spelling one: the inline column comparison on `groups`.
+    let (polcmd, using): (String, String) = sqlx::query_as(
+        "SELECT p.polcmd::text, pg_get_expr(p.polqual, p.polrelid) \
+           FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+          WHERE c.relname = 'groups' AND p.polname = 'groups_tenancy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("groups_tenancy must exist — 077 creates it and 092 amends it");
+
+    assert_eq!(
+        polcmd, "*",
+        "groups_tenancy must still be FOR ALL. A re-issue that lost it would leave \
+         INSERT/UPDATE/DELETE uncovered while the USING clause still read correctly, and \
+         `rls_enforcement.rs::every_protected_relation_covers_every_command_or_records_why` \
+         would then need a DELIBERATELY_UNCOVERED row that nobody wrote."
+    );
+    let creator_arm = using
+        .split(" OR ")
+        .find(|a| a.contains("created_by_agent_id"))
+        .unwrap_or_else(|| {
+            panic!(
+                "groups_tenancy's USING clause no longer has a created_by_agent_id arm at all. \
+                 Deleting it is NOT the fix: measured on 16.13, `INSERT … RETURNING` consults \
+                 the USING clause, and `GroupRepository::create_with_admin` writes exactly \
+                 that — group creation would be a total outage. USING was:\n{using}"
+            )
+        });
+    assert!(
+        creator_arm.contains(ROSTER_PREDICATE),
+        "groups_tenancy's bootstrap arm is not bounded by the roster. \
+         `groups.created_by_agent_id` is never rewritten, so an unbounded arm has no end and \
+         outlives the creator's own membership — `D-PR17-creator-arm-outlives-membership`, \
+         closed by migration 092. Arm was:\n{creator_arm}"
+    );
+    assert!(
+        creator_arm.contains("epigraph_principal_id"),
+        "the arm must still name a session helper in the SAME \" OR \"-delimited fragment, or \
+         `rls_enforcement.rs::no_policy_arm_is_session_independent` reports it as an \
+         unconditional grant. Write the bound as an AND inside the existing disjunct, never as \
+         a sibling one. Arm was:\n{creator_arm}"
+    );
+
+    // Spelling two: the shared helper, which is what `group_memberships_tenancy`
+    // and `group_key_epochs_tenancy` call. Narrowing only the policy above would
+    // leave both of those exactly as 077 wrote them.
+    let body: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_is_group_creator'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("epigraph_is_group_creator must exist");
+    assert!(
+        body.contains(ROSTER_PREDICATE),
+        "epigraph_is_group_creator is not bounded by the roster. It is the arm's OTHER \
+         spelling: `group_memberships_tenancy` and `group_key_epochs_tenancy` reach the same \
+         permission through it, in USING and in WITH CHECK, so a fix applied only to \
+         groups_tenancy covers one of three tables and still passes a proof written against \
+         that one. Body was:\n{body}"
+    );
+
+    // Vacuity guard, in both directions: the helper the two assertions above key
+    // on must exist, be session-bound, and read `group_memberships` rather than
+    // `groups` — reading `groups` is what makes it unusable in `groups_tenancy`'s
+    // USING clause, because a STABLE function cannot see the row an
+    // `INSERT … RETURNING` is inserting.
+    let roster: (String, bool, String) = sqlx::query_as(
+        "SELECT p.prosrc, p.prosecdef, p.provolatile::text \
+           FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = $1",
+    )
+    .bind(ROSTER_PREDICATE)
+    .fetch_one(&pool)
+    .await
+    .expect("the roster predicate must exist, or both assertions above are vacuous");
+    assert!(
+        roster.1 && roster.2 == "s",
+        "{ROSTER_PREDICATE} must be STABLE SECURITY DEFINER: it reads group_memberships, which \
+         is itself under RLS, and an invoker-rights body would make groups_tenancy depend on \
+         group_memberships_tenancy, which calls back into groups. VOLATILE would say it writes."
+    );
+    assert!(
+        roster.0.contains("group_memberships") && !roster.0.contains("FROM public.groups"),
+        "{ROSTER_PREDICATE} must read group_memberships and NOT groups. The asymmetry is the \
+         whole reason it is safe in a clause where epigraph_is_group_creator is not."
+    );
+    assert!(
+        roster.0.contains("epigraph_principal_id"),
+        "{ROSTER_PREDICATE} must bind its subject to the calling principal. Parameterised by \
+         group and unbound to the session, it would admit any group with an empty roster to \
+         anybody."
     );
 }
