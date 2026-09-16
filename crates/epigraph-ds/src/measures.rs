@@ -69,7 +69,7 @@ pub fn belief(m: &MassFunction, target: &FocalElement) -> f64 {
         })
         .map(|(_, &mass)| mass)
         .sum();
-    normalize_unit_interval(raw)
+    normalize_unit_interval(conflict_renormalized(m, raw))
 }
 
 /// Plausibility: sum of masses of all positive focal elements intersecting target
@@ -94,7 +94,7 @@ pub fn plausibility(m: &MassFunction, target: &FocalElement) -> f64 {
         })
         .map(|(_, &mass)| mass)
         .sum();
-    normalize_unit_interval(raw)
+    normalize_unit_interval(conflict_renormalized(m, raw))
 }
 
 /// Belief interval [Bel(A), Pl(A)]
@@ -115,8 +115,11 @@ pub fn ignorance(m: &MassFunction, target: &FocalElement) -> f64 {
 
 /// Pignistic probability for a singleton hypothesis
 ///
-/// BetP(x) = sum [m(A) / |A|] for all positive A containing x, A non-empty
-/// normalized by `1 / (1 - m_conflict)`
+/// BetP(x) = sum [m(A) / |A|] for all positive A containing x, A non-empty,
+/// normalized by `1 / (1 - m(empty))` — the SAME factor `belief` and
+/// `plausibility` apply, so BetP is guaranteed to lie within [Bel, Pl].
+/// Open-world (complement) mass is excluded from the numerator but is NOT
+/// normalized away.
 ///
 /// Complement elements do not contribute to `BetP` directly.
 #[must_use]
@@ -140,7 +143,21 @@ pub fn pignistic_probability(m: &MassFunction, hypothesis_idx: usize) -> f64 {
         return 0.0;
     }
 
-    let normalizer = 1.0 / (1.0 - non_classical_mass);
+    // Renormalize by conflict ONLY — the same factor `belief` and `plausibility`
+    // apply (backlog 0183a294). This previously divided by
+    // `1/(1 - non_classical_mass)`, folding in complement (open-world) mass,
+    // while Bel/Pl divided by nothing. Three measures on two denominators put
+    // BetP outside [Bel, Pl] by exactly that discrepancy.
+    //
+    // Two halves, decided separately:
+    //  * Open-world mass is NOT divided out — `m(Ω, complement)` means "the truth
+    //    may lie outside this frame", and renormalising it away reasserts a closed
+    //    world. Dropping this half fixes the open-world case.
+    //  * Conflict mass IS divided out, now uniformly across all three measures.
+    //    Subtracting it instead (the simpler edit) breaks reliability
+    //    monotonicity: sharper sources conflict more, so raising
+    //    `source_reliability` 0.9 -> 0.99 LOWERED combined BetP, caught by
+    //    epigraph-engine's per_frame_locality_factor_override_applied.
 
     let sum: f64 = m
         .masses()
@@ -160,7 +177,29 @@ pub fn pignistic_probability(m: &MassFunction, hypothesis_idx: usize) -> f64 {
     // non-finite result when the normalizer blows up. `normalize_unit_interval`
     // (not `clamp`) strips the IEEE 754 -0.0 sign that would otherwise be stored
     // verbatim in the divergence cache.
-    normalize_unit_interval(sum * normalizer)
+    normalize_unit_interval(conflict_renormalized(m, sum))
+}
+
+/// Divide out genuine conflict mass `m(∅)` — and ONLY that.
+///
+/// Backlog 0183a294. Bel, Pl and BetP must share one denominator or BetP escapes
+/// [Bel, Pl]. The factor is `1/(1 - m(∅))`: the Smets TBM convention, and the one
+/// `crates/epigraph-engine`'s reliability-monotonicity invariant depends on —
+/// sharper (more reliable) sources conflict more, so leaving `m(∅)` subtracted
+/// rather than divided out makes raising `source_reliability` LOWER belief.
+///
+/// Open-world mass `m(Ω, complement)` is deliberately NOT divided out: it encodes
+/// "the truth may lie outside this frame", and renormalising it away silently
+/// reasserts a closed world. `scripts/lib/scifact_conformal.py`, against which the
+/// 0.948-F1 conformal quantiles were fit, likewise excludes open-world mass
+/// without renormalising — and carries no conflict key at all, so it licenses
+/// dropping the open-world half only.
+fn conflict_renormalized(m: &MassFunction, raw: f64) -> f64 {
+    let m_conflict = m.mass_of_conflict();
+    if (1.0 - m_conflict).abs() < 1e-9 {
+        return 0.0;
+    }
+    raw / (1.0 - m_conflict)
 }
 
 /// Commonality function: total mass of all positive supersets of target
@@ -564,6 +603,13 @@ mod tests {
         // BetP(0) = (0.5/1 + 0.2/2) / 0.7 = 0.6 / 0.7 ~ 0.857
         assert!((betp0 + betp1 - 1.0).abs() < 1e-10);
         assert!(betp0 > betp1);
+
+        // Backlog 0183a294: conflict is still normalized away, but now by the same
+        // factor Bel/Pl use, so Pl({0}) is 0.7/0.7 = 1.0 and BetP 0.857 sits INSIDE
+        // [Bel, Pl] instead of above it. This bound assertion is what was missing.
+        let target = FocalElement::positive(BTreeSet::from([0]));
+        assert!(betp0 >= belief(&m, &target) - 1e-10);
+        assert!(betp0 <= plausibility(&m, &target) + 1e-10);
     }
 
     // ======== Tolerance boundary tests ========
