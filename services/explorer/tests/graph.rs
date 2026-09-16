@@ -1029,3 +1029,195 @@ fn graph_js_never_parses_strings_as_code_or_html() {
         "URLs from data are checked"
     );
 }
+
+// ---- canvas palette and status routing -------------------------------------
+//
+// There is no JS runtime in this tree, so these read the shipped assets: the
+// palette test recomputes the WCAG contrast arithmetic a browser would apply
+// to the `hsl()` fills graph.js writes, and the two status tests pin the
+// structure that makes the guards unskippable.
+
+/// The numbers in a `const NAME = [1, 2];` declaration.
+fn js_numbers(js: &str, name: &str) -> Vec<f64> {
+    let needle = format!("const {name} = [");
+    let start = js
+        .find(&needle)
+        .unwrap_or_else(|| panic!("graph.js declares {name}"))
+        + needle.len();
+    let end = start + js[start..].find(']').expect("a closed array");
+    js[start..end]
+        .split(',')
+        .map(|p| p.trim().parse::<f64>().expect("a plain number"))
+        .collect()
+}
+
+/// The body of the `{ … }` block opened by `header` (which must end in `{`).
+fn block<'a>(src: &'a str, header: &str) -> &'a str {
+    let start = src
+        .find(header)
+        .unwrap_or_else(|| panic!("{header} is present"))
+        + header.len();
+    let mut depth = 1usize;
+    for (i, c) in src[start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &src[start..start + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("{header} is never closed");
+}
+
+/// A `--token: value;` from app.css, in the light or the dark theme.
+fn css_token(css: &str, name: &str, dark: bool) -> String {
+    let split = css
+        .find("@media (prefers-color-scheme: dark)")
+        .expect("app.css has a dark block");
+    let region = if dark { &css[split..] } else { &css[..split] };
+    let needle = format!("{name}:");
+    let start = region
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{name} is defined"))
+        + needle.len();
+    let end = start + region[start..].find(';').expect("a closed declaration");
+    region[start..end].trim().to_string()
+}
+
+fn srgb_from_hex(hex: &str) -> [f64; 3] {
+    let h = hex.trim_start_matches('#');
+    assert_eq!(h.len(), 6, "{hex} is #rrggbb");
+    [0usize, 2, 4]
+        .map(|i| f64::from(u8::from_str_radix(&h[i..i + 2], 16).expect("hex digits")) / 255.0)
+}
+
+/// CSS `hsl(h, s%, l%)` → sRGB in 0..=1 (CSS Color 4 §7.1).
+fn srgb_from_hsl(hue: f64, sat_pct: f64, light_pct: f64) -> [f64; 3] {
+    let (s, l) = (sat_pct / 100.0, light_pct / 100.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = hue / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u8 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    [r + m, g + m, b + m]
+}
+
+/// WCAG 2.1 relative luminance of an sRGB colour.
+fn luminance(rgb: [f64; 3]) -> f64 {
+    let lin = |c: f64| {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+}
+
+/// WCAG 2.1 contrast ratio, `(lighter + 0.05) / (darker + 0.05)`.
+fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// The belief ramp used to run to 90% lightness on a `--surface: #ffffff`
+/// stage while `.gnode circle` stroked with `--surface` itself, so a
+/// low-belief node was a white disc outlined in white: 1.18:1 for the palest
+/// hue. Recomputes every extreme from the constants the assets ship.
+#[test]
+fn every_node_stays_visible_against_the_stage_in_both_themes() {
+    let js = include_str!("../static/graph.js");
+    let css = include_str!("../static/graph.css");
+    let tokens = include_str!("../static/app.css");
+
+    let hues = js_numbers(js, "HUES");
+    let sat = js_numbers(js, "RAMP_SATURATION");
+    let neutral = js_numbers(js, "NEUTRAL_LIGHTNESS");
+    assert_eq!(sat.len(), 2, "the saturation ramp has two ends");
+    assert_eq!(neutral.len(), 2, "one neutral grey per theme");
+
+    // The outline is what actually clears 3:1 for every node, whatever the
+    // ramp does to the fill; --surface would be the stage's own colour.
+    let circle = block(css, ".gnode circle {");
+    assert!(
+        circle.contains("stroke: var(--text-muted)"),
+        ".gnode circle must stroke with a colour that contrasts with the stage, got: {circle}"
+    );
+
+    for (i, dark) in [false, true].into_iter().enumerate() {
+        let theme = if dark { "dark" } else { "light" };
+        let ramp = js_numbers(
+            js,
+            if dark {
+                "RAMP_LIGHTNESS_DARK"
+            } else {
+                "RAMP_LIGHTNESS_LIGHT"
+            },
+        );
+        assert_eq!(ramp.len(), 2, "the {theme} ramp has two ends");
+        let stage = srgb_from_hex(&css_token(tokens, "--surface", dark));
+        let stroke = srgb_from_hex(&css_token(tokens, "--text-muted", dark));
+
+        let outline = contrast(stroke, stage);
+        assert!(
+            outline >= 3.0,
+            "the node outline is {outline:.2}:1 against the {theme} stage, want >= 3"
+        );
+
+        // Still a belief scale: the ends stay far apart in lightness.
+        assert!(
+            (ramp[0] - ramp[1]).abs() >= 30.0,
+            "the {theme} ramp spans only {} lightness points",
+            (ramp[0] - ramp[1]).abs()
+        );
+
+        for &hue in &hues {
+            let pale = srgb_from_hsl(hue, sat[0], ramp[0]);
+            let ratio = contrast(pale, stage);
+            assert!(
+                ratio >= 1.5,
+                "a no-belief node hsl({hue}, {}%, {}%) is {ratio:.2}:1 against the {theme} stage",
+                sat[0],
+                ramp[0]
+            );
+            let strong = srgb_from_hsl(hue, sat[1], ramp[1]);
+            let scale = contrast(strong, pale);
+            assert!(
+                scale >= 1.6,
+                "hue {hue}: high and low belief are only {scale:.2}:1 apart in {theme}"
+            );
+        }
+
+        let grey = srgb_from_hsl(210.0, 6.0, neutral[i]);
+        let ratio = contrast(grey, stage);
+        assert!(
+            ratio >= 1.5,
+            "a redacted node is {ratio:.2}:1 against the {theme} stage"
+        );
+        assert!(
+            (neutral[i] - ramp[0]).abs() <= 10.0,
+            "the {theme} neutral grey drifted away from the ramp's low end"
+        );
+
+        // The legend swatch claims to show this ramp; keep it honest.
+        let gradient = format!(
+            "hsl(212, {}%, {}%), hsl(212, {}%, {}%)",
+            sat[0] as i64, ramp[0] as i64, sat[1] as i64, ramp[1] as i64
+        );
+        assert!(
+            css.contains(&gradient),
+            ".graph__ramp must paint the {theme} ramp: {gradient}"
+        );
+    }
+}

@@ -28,6 +28,18 @@
   const FAMILIES = ['support', 'refute', 'structural'];
   const HUES = [212, 152, 272, 28, 334, 96, 190, 248, 4, 56];
 
+  // The belief ramp, as HSL percentages at p = 0 (no belief) and p = 1. Both
+  // ends are floored away from the stage the node sits on (--surface: #ffffff
+  // light, #1c1f23 dark): a ramp that runs all the way to the stage's own
+  // lightness makes low-belief nodes invisible rather than pale. The stroke in
+  // graph.css carries the rest of the contrast; tests/graph.rs recomputes the
+  // WCAG ratios from these numbers, and .graph__ramp's gradient mirrors them.
+  const RAMP_SATURATION = [35, 70];
+  const RAMP_LIGHTNESS_LIGHT = [72, 38];
+  const RAMP_LIGHTNESS_DARK = [36, 76];
+  // Redacted, or no belief at all: a neutral grey, never paler than the ramp.
+  const NEUTRAL_LIGHTNESS = [70, 44]; // light theme, dark theme
+
   // Layout (world units are CSS px at zoom 1).
   const LINK_DISTANCE = 90;
   const LINK_STRENGTH = 0.06;
@@ -104,6 +116,11 @@
     return HUES[h % HUES.length];
   }
 
+  /** Interpolate one of the ramps above at t in [0, 1]. */
+  function rampAt(range, t) {
+    return Math.round(range[0] + (range[1] - range[0]) * t);
+  }
+
   /** Sequential ramp on pignistic_prob, else truth_value; neutral grey when
    * the node is redacted or has neither. Hue from frame_id, else type. */
   function nodeFill(d, dark) {
@@ -112,11 +129,11 @@
       p = num(d.pignistic_prob);
       if (p === null) p = num(d.truth_value);
     }
-    if (p === null) return dark ? 'hsl(210, 6%, 44%)' : 'hsl(210, 6%, 76%)';
+    if (p === null) return 'hsl(210, 6%, ' + NEUTRAL_LIGHTNESS[dark ? 1 : 0] + '%)';
     const t = Math.min(1, Math.max(0, p));
     const hue = hueFor(String(d.frame_id || d.entity_type || 'claim').toLowerCase());
-    const sat = Math.round(35 + 35 * t);
-    const light = Math.round(dark ? 26 + 46 * t : 90 - 52 * t);
+    const sat = rampAt(RAMP_SATURATION, t);
+    const light = rampAt(dark ? RAMP_LIGHTNESS_DARK : RAMP_LIGHTNESS_LIGHT, t);
     return 'hsl(' + hue + ', ' + sat + '%, ' + light + '%)';
   }
 
