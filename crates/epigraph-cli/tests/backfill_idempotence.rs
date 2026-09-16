@@ -1207,3 +1207,92 @@ async fn verify_covers_the_089_stamping_definer_once_its_migration_is_applied(po
          about it; stderr:\n{stderr}"
     );
 }
+
+/// The migration-092 addition to the definer-ownership pre-flight is LIVE, not a
+/// list edit nobody exercises.
+///
+/// # Why this entry matters more than the three beside it
+///
+/// `epigraph_group_roster_admits_principal` is in
+/// `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` for the structural reason
+/// 083/086/089 are: plan §9.2 runs this pre-flight at step 11c, and 092 is later
+/// than every migration 11c applies, so an unconditional entry would report
+/// `does not exist` and block a correctly sequenced deploy.
+///
+/// The other three entries guard bodies that ask `EXISTS`. An RLS-filtered read
+/// answers "no", so they fail toward refusing — a lost write, a degraded read
+/// control, a coverage gap. This body's first disjunct asks `NOT EXISTS`, so a
+/// filtered read answers **yes** and the predicate ADMITS. A body owned by a
+/// role that is not a member of `epigraph_maintenance` therefore does not
+/// degrade migration 092's narrowing; it reverts it to migration 077's unbounded
+/// arm with no error and no catalog symptom. This gate is the only instrument
+/// that reports that on a real cluster, which is why the entry needs a test
+/// rather than a list edit.
+///
+/// A presence-gated entry is exactly the shape that can be right in the runbook
+/// and vacuous in CI: if the gate never opened, `verify` would stay green for a
+/// reason unrelated to this function's ownership. `#[sqlx::test(migrations =
+/// "../../migrations")]` applies 092, so the gate is open here; the CLOSED
+/// branch is covered generically by the two 086 tests above, which pin
+/// `applicable_definer_functions`' skip behaviour itself.
+///
+/// As with 089's entry, what is asserted is the gate's exit code and message,
+/// not a behavioural difference: `epigraph_bypass()` reads `session_user`, which
+/// in every `#[sqlx::test]` is the superuser, so the re-own below changes the
+/// CATALOG and not this suite's observable behaviour — the pre-existing finding
+/// `F-PR12-ci-runs-as-superuser-so-the-42501-arm-is-untestable`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    seed_undeclared_claim(&pool, agent, "ordinary").await;
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
+
+    // PREMISE: the gate is OPEN on this database. Without this every assertion
+    // below would pass for the wrong reason — a skipped entry.
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_group_roster_admits_principal')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read pg_proc");
+    assert!(
+        present,
+        "092's roster predicate must exist for this test to mean anything — the entry under \
+         test is skipped when it does not"
+    );
+
+    // Install an owner that is NOT a member of epigraph_maintenance: an operator
+    // re-own, a restore, or a migration runner that is neither a superuser nor a
+    // member, which is the state 092's guarded `DO` block can silently leave.
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_group_roster_admits_principal(uuid) OWNER TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-own 092's roster predicate to the app role");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must refuse a deploy whose 092 roster predicate is owned by a role that is not \
+         a member of epigraph_maintenance. Such a body reads group_memberships under row \
+         security, and because its first disjunct is a NOT EXISTS an incomplete read makes it \
+         ADMIT rather than refuse — migration 092's narrowing silently becomes migration 077's \
+         unbounded arm again, with no runtime signal; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("epigraph_group_roster_admits_principal")
+            && stderr.contains("epigraph_maintenance"),
+        "and it must NAME the function and the required owner, or an operator cannot act on it; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(
+            "skipping the ownership check for public.epigraph_group_roster_admits_principal"
+        ),
+        "the gate must be OPEN here; if verify skipped the entry, this test is asserting nothing \
+         about it; stderr:\n{stderr}"
+    );
+}
