@@ -17,7 +17,6 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
-use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::auth::{PageCtx, SignedIn};
@@ -26,7 +25,7 @@ use crate::bff::graph::{
     CanvasNode, GroupItem, LABEL_CHARS, VISIBLE_NODE_CAP,
 };
 use crate::error::{not_found_as, AppError};
-use crate::links::Links;
+use crate::links::{with_centre_claim as with_claim, Links};
 use crate::state::AppState;
 use crate::upstream::graph::{clamp_expand_budget, NeighborhoodMode};
 use crate::upstream::{degrade, Degraded, PlacementResponse, UpstreamError};
@@ -74,21 +73,6 @@ impl ViewParams {
 /// A malformed path id reads as "not found", not a generic 400.
 fn parse_id(raw: &str, what: &'static str) -> Result<Uuid, AppError> {
     Uuid::parse_str(raw.trim()).map_err(|_| AppError::NotFound(what.into()))
-}
-
-/// `href` plus `?claim=<id>` when the centre claim is known, so the share
-/// button survives navigation between non-permalink views.
-fn with_claim(href: String, claim: Option<Uuid>) -> String {
-    match claim {
-        Some(c) => {
-            let sep = if href.contains('?') { '&' } else { '?' };
-            let qs = form_urlencoded::Serializer::new(String::new())
-                .append_pair("claim", &c.to_string())
-                .finish();
-            format!("{href}{sep}{qs}")
-        }
-        None => href,
-    }
 }
 
 /// The share target of a non-permalink view: the centre claim.

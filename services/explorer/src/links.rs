@@ -262,6 +262,25 @@ impl Links {
     }
 }
 
+/// Tag a theme / community / neighbourhood URL with the claim the viewer
+/// arrived from.
+///
+/// None of those three views is a permalink — every clustering run mints new
+/// ids — so the page cannot recover its centre from the path. `?claim=<uuid>`
+/// carries it, and the graph pages read it to render the share button (which
+/// copies the *claim's* URL, the only durable one) and to highlight the
+/// centre. Every builder of those links must go through here; a link without
+/// it silently drops the share button.
+pub fn with_centre_claim(href: String, claim: Option<Uuid>) -> String {
+    match claim {
+        Some(c) => {
+            let sep = if href.contains('?') { '&' } else { '?' };
+            format!("{href}{sep}{}", query(&[("claim", &c.to_string())]))
+        }
+        None => href,
+    }
+}
+
 fn query(pairs: &[(&str, &str)]) -> String {
     let mut qs = form_urlencoded::Serializer::new(String::new());
     for (k, v) in pairs {

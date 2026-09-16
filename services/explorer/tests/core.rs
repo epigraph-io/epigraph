@@ -400,13 +400,18 @@ async fn claim_page_renders_evidence_challenges_provenance_and_placement() {
     assert!(body.contains("<span class=\"num\">0.80</span>"));
     assert!(body.contains("<dt>Plausibility</dt><dd class=\"num\">0.90</dd>"));
 
-    // Placement links, flagged as not permalinks.
-    assert!(body.contains(&format!("<a href=\"/explorer/theme/{THEME}\">Theme</a>")));
+    // Placement links, flagged as not permalinks. Each carries `?claim=` so
+    // the theme / community / neighbourhood view it opens can render its share
+    // button, whose target is this claim's URL — the only durable one of the
+    // four (`links::with_centre_claim`).
     assert!(body.contains(&format!(
-        "<a href=\"/explorer/community/{CLUSTER}\">Community</a>"
+        "<a href=\"/explorer/theme/{THEME}?claim={CLAIM}\">Theme</a>"
     )));
     assert!(body.contains(&format!(
-        "<a href=\"/explorer/neighborhood/{NEIGHBORHOOD}\">Neighborhood</a>"
+        "<a href=\"/explorer/community/{CLUSTER}?claim={CLAIM}\">Community</a>"
+    )));
+    assert!(body.contains(&format!(
+        "<a href=\"/explorer/neighborhood/{NEIGHBORHOOD}?claim={CLAIM}\">Neighborhood</a>"
     )));
     assert!(body.contains("not permalinks"));
     assert!(body.contains(&format!("<a href=\"/explorer/agent/{AGENT}\">Agent</a>")));
@@ -425,6 +430,58 @@ async fn claim_page_renders_evidence_challenges_provenance_and_placement() {
     assert!(body.contains(&format!(
         "<meta name=\"twitter:title\" content=\"{CONTENT}\">"
     )));
+}
+
+/// Cross-area: follow the claim page's own theme link into the graph area and
+/// land on a view that can still be shared.
+///
+/// The two areas were built in separate worktrees and each was right alone —
+/// the graph pages read `?claim=` and the claim page emitted placement links —
+/// but the claim page emitted them bare, so every theme, community and
+/// neighbourhood view reached from a claim silently lost its share button.
+/// Nothing either area tested could see that, because neither test followed a
+/// link the other area had produced. This one does.
+#[tokio::test]
+async fn placement_links_from_the_claim_page_open_a_shareable_view() {
+    let app = spawn().await;
+    mount_claim_page(&app, 1).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/graph/themes/{THEME}/expand")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "theme_id": THEME, "truncated": false,
+            "neighborhoods": [{"id": NEIGHBORHOOD, "label": "n-1", "size": 4}],
+            "neighborhood_edges": []
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+
+    let claim_page = app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await;
+    assert_eq!(claim_page.status, StatusCode::OK);
+
+    // Take the href the page actually rendered, not one rebuilt here.
+    let marker = "<li><a href=\"";
+    let start = claim_page
+        .body
+        .find(&format!("{marker}/explorer/theme/"))
+        .expect("theme link on the claim page")
+        + marker.len();
+    let href: String = claim_page.body[start..]
+        .split('"')
+        .next()
+        .expect("quoted href")
+        .to_string();
+
+    let theme_page = app.get_as(&href, &sid).await;
+    assert_eq!(theme_page.status, StatusCode::OK, "{}", theme_page.body);
+    assert!(
+        theme_page.body.contains(&format!(
+            "data-share-url=\"https://explorer.example.com/explorer/claim/{CLAIM}\""
+        )),
+        "the theme view reached from {href} must know its centre claim"
+    );
+    app.upstream.verify().await;
 }
 
 #[tokio::test]

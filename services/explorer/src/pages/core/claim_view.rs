@@ -16,7 +16,7 @@ use super::vocab::{
     SourceLink,
 };
 use crate::error::{not_found_as, AppError};
-use crate::links::Links;
+use crate::links::{with_centre_claim, Links};
 use crate::upstream::core::{ChallengeList, ClaimEvidence, ClaimProvenance, EvidenceEdgeList};
 use crate::upstream::{
     degrade, truncate_chars, Api, BeliefResponse, ClaimResponse, Degraded, PlacementResponse,
@@ -230,7 +230,7 @@ pub async fn compose(api: &Api<'_>, links: &Links, id: Uuid) -> Result<ClaimView
         contradicting: degrade(contradicting)?.map(|v| edge_evidence_rows(v, links)),
         challenges: degrade(challenges)?.map(|v| challenge_rows(v, links)),
         provenance: degrade(provenance)?.map(|v| provenance_rows(v, links)),
-        placement: degrade(placement)?.map(|p| placement_view(p, links)),
+        placement: degrade(placement)?.map(|p| placement_view(p, links, id)),
     })
 }
 
@@ -326,11 +326,15 @@ fn provenance_rows(p: ClaimProvenance, links: &Links) -> Vec<ProvenanceRow> {
         .collect()
 }
 
-fn placement_view(p: PlacementResponse, links: &Links) -> PlacementView {
+/// `claim` is the page's own claim: the three placement views are not
+/// permalinks, so each link carries it as `?claim=` (see
+/// [`with_centre_claim`]) or the view it opens loses its share button.
+fn placement_view(p: PlacementResponse, links: &Links, claim: Uuid) -> PlacementView {
+    let tag = |href: String| with_centre_claim(href, Some(claim));
     PlacementView {
-        theme_href: p.theme_id.map(|i| links.theme(i)),
-        community_href: p.cluster_id.map(|i| links.community(i)),
-        neighborhood_href: p.neighborhood_id.map(|i| links.neighborhood(i, None)),
+        theme_href: p.theme_id.map(|i| tag(links.theme(i))),
+        community_href: p.cluster_id.map(|i| tag(links.community(i))),
+        neighborhood_href: p.neighborhood_id.map(|i| tag(links.neighborhood(i, None))),
         run_completed: p.run_completed_at.as_ref().map(fmt_datetime),
     }
 }
