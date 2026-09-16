@@ -210,21 +210,29 @@ async fn signed_in_pages_redirect_anonymous_viewers_to_login() {
 async fn every_area_route_is_mounted() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
-    // Built areas leave this stub list; their mounting is pinned in their own
-    // test file (core `/`, `/search`, `/claim/:id`, `/bff/claim/:id`,
-    // `/bff/search`: `core_routes_are_mounted_and_built`; entities `history`,
-    // `provenance`, `/agent`, `/frame`, `/evidence`:
-    // `entity_routes_answer_with_and_without_the_base_path`).
+    // Every plan §3.4 page route, whatever it answers, must answer from real
+    // area code. Upstream is unmocked here, so the status is whatever that
+    // area's degradation policy produces; only "is it still the skeleton?" is
+    // asserted. Per-route behaviour is pinned in tests/core.rs, tests/entities.rs,
+    // tests/graph.rs and tests/auth.rs.
     let pages = [
+        "/explorer/".to_string(),
+        "/explorer/search?q=x".to_string(),
+        format!("/explorer/claim/{CLAIM}"),
+        format!("/explorer/claim/{CLAIM}/history"),
+        format!("/explorer/claim/{CLAIM}/provenance"),
         format!("/explorer/claim/{CLAIM}/graph"),
+        format!("/explorer/agent/{CLAIM}"),
+        format!("/explorer/frame/{CLAIM}"),
+        format!("/explorer/evidence/{CLAIM}"),
         format!("/explorer/theme/{CLAIM}"),
         format!("/explorer/community/{CLAIM}"),
         format!("/explorer/neighborhood/{CLAIM}?mode=compound"),
     ];
     for uri in &pages {
         let res = app.get_as(uri, &sid).await;
-        assert_eq!(res.status, StatusCode::OK, "{uri}");
-        assert!(res.body.contains("not built yet"), "{uri}");
+        assert_ne!(res.status, StatusCode::NOT_FOUND, "not mounted: {uri}");
+        assert!(!res.body.contains("not built yet"), "still a stub: {uri}");
     }
     // Auth routes are built (tests/auth.rs covers them). Here: mounted and no
     // longer stubs. With no client id sign-in is disabled (503), an unknown
@@ -240,7 +248,11 @@ async fn every_area_route_is_mounted() {
         let res = app.post_form(uri, "", Some(&sid)).await;
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
     }
+    // Same for every §3.4 BFF route: mounted, and no longer the 501 `not_built`
+    // placeholder the skeleton shipped.
     let bff = [
+        format!("/explorer/bff/claim/{CLAIM}"),
+        "/explorer/bff/search?q=x".to_string(),
         format!("/explorer/bff/graph/ego/{CLAIM}"),
         "/explorer/bff/themes".to_string(),
         "/explorer/bff/communities".to_string(),
@@ -248,8 +260,13 @@ async fn every_area_route_is_mounted() {
     ];
     for uri in &bff {
         let res = app.get_as(uri, &sid).await;
-        assert_eq!(res.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
-        assert_eq!(res.json()["error"], "not_built", "{uri}");
+        assert_ne!(res.status, StatusCode::NOT_FOUND, "not mounted: {uri}");
+        assert_ne!(
+            res.status,
+            StatusCode::NOT_IMPLEMENTED,
+            "still a stub: {uri}"
+        );
+        assert_ne!(res.json()["error"], "not_built", "still a stub: {uri}");
     }
 }
 
