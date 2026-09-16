@@ -133,14 +133,23 @@ pub async fn expand(
 ) -> Result<Json<NeighborhoodExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
-    let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM graph_neighborhoods WHERE id = $1 \
-         AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)",
-    )
-    .bind(neighborhood_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The same lookup `graph::expand` and `GET /claims/:id/placement` use; a
+    // missing run leaves `exists` None and answers the same 404 the inlined
+    // subquery did.
+    let latest = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let exists: Option<(Uuid,)> = match &latest {
+        Some(run) => {
+            sqlx::query_as("SELECT id FROM graph_neighborhoods WHERE id = $1 AND run_id = $2")
+                .bind(neighborhood_id)
+                .bind(run.run_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(internal)?
+        }
+        None => None,
+    };
     if exists.is_none() {
         return Err((
             StatusCode::NOT_FOUND,

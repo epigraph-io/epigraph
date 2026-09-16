@@ -86,6 +86,8 @@ pub mod ownership;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
+pub mod placement;
+#[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
 #[cfg(feature = "db")]
@@ -628,6 +630,10 @@ pub fn create_router(state: AppState) -> Router {
             get(provenance_chain::claim_provenance_chain),
         )
         .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
+        .route(
+            "/api/v1/claims/:id/placement",
+            get(placement::claim_placement),
+        )
         .route(
             "/api/v1/claims/:id/supporting-evidence",
             get(edges::supporting_evidence),

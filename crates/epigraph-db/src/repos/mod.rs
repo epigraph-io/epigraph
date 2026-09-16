@@ -15,6 +15,7 @@ pub mod claim;
 pub mod claim_encryption;
 pub mod claim_theme;
 pub mod claim_version;
+pub mod cluster_run;
 pub mod community;
 pub mod context;
 pub mod counterfactual;
@@ -79,6 +80,7 @@ pub use claim_theme::{
     DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
+pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
 pub use community::CommunityRepository;
 pub use context::ContextRepository;
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};

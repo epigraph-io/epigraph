@@ -191,16 +191,18 @@ pub async fn overview(
     Query(_params): Query<OverviewParams>,
 ) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
     let pool: &PgPool = &state.db_pool;
-    let latest: Option<(Uuid, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
-        "SELECT run_id, completed_at, degraded
-         FROM graph_cluster_runs
-         ORDER BY completed_at DESC
-         LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(internal)?;
-    let Some((run_id, generated_at, degraded)) = latest else {
+    // Shared with `expand`, `graph_neighborhood::expand` and
+    // `GET /claims/:id/placement`, so an id one of them hands out is an id the
+    // others still recognise.
+    let latest = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let Some(epigraph_db::ClusterRunRow {
+        run_id,
+        completed_at: generated_at,
+        degraded,
+    }) = latest
+    else {
         return Ok(Json(OverviewResponse {
             run_id: None,
             generated_at: None,
@@ -246,14 +248,13 @@ pub async fn expand(
 ) -> Result<Json<ExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let Some(run) = latest_run else {
         return Err((StatusCode::NOT_FOUND, "no completed run".into()));
     };
+    let run_id = run.run_id;
     let cluster_exists: Option<(i64,)> =
         sqlx::query_as("SELECT size::bigint FROM graph_clusters WHERE id = $1 AND run_id = $2")
             .bind(cluster_id)
@@ -516,7 +517,7 @@ fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
     }
 }
 
-fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
+fn internal<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
