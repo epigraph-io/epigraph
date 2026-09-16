@@ -16,6 +16,34 @@ use crate::{assets, auth, bff, pages, security};
 
 /// Forms and redeem bodies are tiny; nothing legitimate comes near this.
 pub const MAX_REQUEST_BODY: usize = 64 * 1024;
+/// First path segment of every route [`build_app_with`] mounts at the root.
+///
+/// The app is mounted twice — nested under the base path *and* at the root —
+/// so a base path whose first segment is one of these makes `nest` and
+/// `merge` claim the same path and axum panics while building the router
+/// ("Overlapping method route"). [`crate::config::Config::from_lookup`]
+/// refuses such a base path so the process exits 2 with a clear message
+/// instead, which is what the systemd unit's `RestartPreventExitStatus=2`
+/// needs to stop restart-looping on a config typo.
+///
+/// KEEP IN SYNC with the `.route(..)` / `.merge(..)` calls below and in
+/// `auth::routes`, `pages::{core,entities,graph}::routes` and
+/// `bff::{core,graph}::routes`. Adding a top-level route whose first segment
+/// is new means adding it here too.
+pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
+    "agent",
+    "auth",
+    "bff",
+    "claim",
+    "community",
+    "evidence",
+    "frame",
+    "health",
+    "neighborhood",
+    "search",
+    "static",
+    "theme",
+];
 /// Sessions older than the upstream refresh-token lifetime are dead.
 pub const SESSION_MAX_AGE: chrono::Duration = chrono::Duration::days(30);
 
@@ -101,6 +129,50 @@ async fn fallback() -> AppError {
     AppError::NotFound("page".into())
 }
 
+/// The first path segment of every route the app router claims at the root.
+///
+/// Test-only: `Router` cannot be enumerated, so this walks the same route
+/// tables `build_app_with` merges. It is what keeps
+/// [`RESERVED_BASE_PATH_SEGMENTS`] honest.
+#[cfg(test)]
+fn top_level_segments() -> Vec<String> {
+    // Every `.route(path, _)` literal mounted at the root, in one place.
+    const ROUTE_PATHS: &[&str] = &[
+        "/",
+        "/health",
+        "/static/{*path}",
+        "/auth/login",
+        "/auth/callback",
+        "/auth/logout",
+        "/auth/redeem",
+        "/search",
+        "/claim/{id}",
+        "/claim/{id}/history",
+        "/claim/{id}/provenance",
+        "/claim/{id}/graph",
+        "/agent/{id}",
+        "/frame/{id}",
+        "/evidence/{id}",
+        "/theme/{id}",
+        "/community/{id}",
+        "/neighborhood/{id}",
+        "/bff/claim/{id}",
+        "/bff/search",
+        "/bff/graph/ego/{id}",
+        "/bff/themes",
+        "/bff/communities",
+        "/bff/neighborhood/{id}",
+    ];
+    let mut segments: Vec<String> = ROUTE_PATHS
+        .iter()
+        .filter_map(|p| p.split('/').nth(1).filter(|s| !s.is_empty()))
+        .map(str::to_string)
+        .collect();
+    segments.sort();
+    segments.dedup();
+    segments
+}
+
 /// Purge expired sessions, pending logins, handoff codes and cache entries
 /// once a minute.
 pub fn spawn_housekeeping(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -116,4 +188,27 @@ pub fn spawn_housekeeping(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `RESERVED_BASE_PATH_SEGMENTS` is what stops a colliding base path from
+    /// panicking the router build, so it must list exactly the segments the
+    /// root-mounted routes claim — no more (which would refuse a usable base
+    /// path) and no fewer (which would let the panic back in).
+    #[test]
+    fn reserved_segments_match_the_routers_top_level() {
+        let mut reserved: Vec<String> = RESERVED_BASE_PATH_SEGMENTS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        reserved.sort();
+        assert_eq!(
+            reserved,
+            top_level_segments(),
+            "RESERVED_BASE_PATH_SEGMENTS has drifted from the app's routes"
+        );
+    }
 }

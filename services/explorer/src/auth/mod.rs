@@ -195,18 +195,23 @@ async fn login(
         return Ok(html(StatusCode::OK, render(&page)?));
     }
 
+    // The cap bounds memory; it must never bound *sign-in*. Anyone can start
+    // a pending login without a session, so refusing at the cap let one
+    // flooder lock every user out of `/auth/login` — and every page but
+    // `/claim/:id` sends a signed-out viewer here. Evict instead: purge what
+    // has expired, then drop the entries nearest their deadline until there
+    // is room for this one. The map still holds at most MAX_PENDING_LOGINS.
     let pending = &state.auth_flow.pending;
-    if pending.len() >= MAX_PENDING_LOGINS && {
+    if pending.len() >= MAX_PENDING_LOGINS {
         pending.purge_expired();
-        pending.len() >= MAX_PENDING_LOGINS
-    } {
-        tracing::warn!(
-            held = pending.len(),
-            "pending-login cap reached; refusing new sign-ins"
-        );
-        return Err(AppError::Degraded(
-            "Too many sign-ins are in progress. Try again in a few minutes.".into(),
-        ));
+        let evicted = pending.evict_oldest_beyond(MAX_PENDING_LOGINS - 1);
+        if evicted > 0 {
+            tracing::warn!(
+                evicted,
+                held = pending.len(),
+                "pending-login cap reached; evicted the oldest in-flight sign-ins"
+            );
+        }
     }
 
     // Reuse this browser's binding if it has one, so two tabs signing in at

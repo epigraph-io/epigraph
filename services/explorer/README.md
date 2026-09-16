@@ -98,7 +98,7 @@ code **2**.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL including the base path, e.g. `https://explorer.example.com/explorer`. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. |
+| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL including the base path, e.g. `https://explorer.example.com/explorer`. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`agent`, `auth`, `bff`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
 | `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
@@ -355,12 +355,21 @@ Then sign in through the browser and open a claim.
   privileges of its own. It never sends a token it knows is stale, because
   the API returns 401 for a present-but-invalid bearer even on public routes.
   It refreshes a token 60 s before expiry. After an upstream 401 it refreshes
-  and retries once, and a second failure ends the session. Refresh runs one
+  and retries once, and a second 401 ends the session. Refresh runs one
   at a time per session, and the rotated refresh token is stored every time.
-- **Redaction short-circuit.** Several upstream read routes do not yet redact
-  what `GET /claims/{id}` redacts (plan §2.6). If `GET /claims/{id}` returns
-  the content `"[REDACTED]"`, the Explorer skips every other content-bearing
-  call for that page, and the text never reaches OpenGraph tags.
+  A refresh that *fails* ends the session only when upstream refused it
+  (`invalid_grant`, a revoked token, no such session). A refresh that could
+  not reach `/oauth/token` at all — a restart, a timeout, a 5xx — keeps the
+  session and reports the ordinary "API unavailable" failure, so an API
+  restart does not sign every user out.
+- **Redaction short-circuit.** The kernel's §2.6 sweep made every read route
+  the Explorer renders from apply what `GET /claims/{id}` applies — claim
+  text the requester may not read comes back as `"[REDACTED]"` from
+  `/claims/{id}/history`, `/agents/{id}/claims`, `/frames/{id}/claims`,
+  `/claims/by-labels`, `/search/semantic` and both graph `expand` routes. The
+  Explorer keeps its own short-circuit on top: if `GET /claims/{id}` returns
+  `"[REDACTED]"`, it skips every other content-bearing call for that page, so
+  the text never reaches OpenGraph tags and the calls are never made.
 - **Sign-in** uses the authorization-code flow with mandatory PKCE S256
   against the API's own authorization server, with `scope=claims:read`. The
   code lives 60 s upstream and is redeemed immediately. No token ever appears

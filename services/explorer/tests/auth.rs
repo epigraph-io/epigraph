@@ -267,7 +267,7 @@ async fn sign_in_is_disabled_without_a_client_id() {
 }
 
 #[tokio::test]
-async fn pending_logins_are_capped() {
+async fn pending_logins_are_capped_by_eviction_not_refusal() {
     let app = app().await;
     let entry = |ttl| {
         for i in 0..MAX_PENDING_LOGINS {
@@ -291,15 +291,38 @@ async fn pending_logins_are_capped() {
     assert_eq!(res.status, StatusCode::SEE_OTHER);
     assert_eq!(app.state.auth_flow.pending.len(), 1);
 
-    // Live ones are not: the next login is refused rather than stored.
+    // A map full of *live* entries must not lock anyone out: the cap evicts
+    // the oldest in-flight attempts and this sign-in still starts.
     entry(StdDuration::from_secs(600));
     let res = app.get("/explorer/auth/login").await;
-    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        res.status,
+        StatusCode::SEE_OTHER,
+        "a full pending map must not refuse sign-in: {}",
+        res.body
+    );
+    let authorize = Url::parse(res.location().expect("Location")).unwrap();
+    let oauth_state = authorize
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .expect("state in the authorize URL");
+    assert!(
+        app.state.auth_flow.pending.get(&oauth_state).is_some(),
+        "the new pending login was stored"
+    );
     assert_eq!(
         app.state.auth_flow.pending.len(),
-        MAX_PENDING_LOGINS + 1,
-        "nothing new was stored"
+        MAX_PENDING_LOGINS,
+        "memory stays bounded: one old entry was evicted to make room"
     );
+
+    // And it keeps working under a sustained flood.
+    for _ in 0..5 {
+        let res = app.get("/explorer/auth/login").await;
+        assert_eq!(res.status, StatusCode::SEE_OTHER);
+        assert!(app.state.auth_flow.pending.len() <= MAX_PENDING_LOGINS);
+    }
 }
 
 #[tokio::test]

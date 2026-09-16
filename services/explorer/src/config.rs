@@ -142,6 +142,7 @@ impl Config {
         }
         let base_path = normalize_base_path(public_base_url.path())
             .map_err(|reason| invalid(ENV_PUBLIC_BASE_URL, reason))?;
+        reject_reserved_base_path(&base_path)?;
         let public_origin = public_base_url.origin().ascii_serialization();
 
         let oauth_base_url = match get(ENV_OAUTH_BASE_URL) {
@@ -275,6 +276,32 @@ fn normalize_base_path(path: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Refuse a base path whose first segment is also a top-level route name.
+///
+/// `app::build_app_with` mounts the routes nested under the base path *and*
+/// at the root, so `/search` as a base path makes both claim `GET /search`
+/// and axum panics while building the router. A panic exits 101, which the
+/// systemd unit's `RestartPreventExitStatus=2` cannot distinguish from a
+/// crash, so it restart-loops on what is really a config typo. Catching it
+/// here turns it into an ordinary `ConfigError::Invalid` → exit 2 with a
+/// message naming the offending segment.
+fn reject_reserved_base_path(base_path: &str) -> Result<(), ConfigError> {
+    let Some(first) = base_path.split('/').nth(1) else {
+        return Ok(()); // root base path: nothing to collide with
+    };
+    if crate::app::RESERVED_BASE_PATH_SEGMENTS.contains(&first) {
+        return Err(invalid(
+            ENV_PUBLIC_BASE_URL,
+            format!(
+                "base path may not start with {first:?}: it is one of the Explorer's own \
+                 top-level routes ({}). Pick another prefix, e.g. /explorer",
+                crate::app::RESERVED_BASE_PATH_SEGMENTS.join(", ")
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_bool(var: &'static str, raw: Option<String>, default: bool) -> Result<bool, ConfigError> {
     match raw.as_deref().map(str::to_ascii_lowercase).as_deref() {
         None => Ok(default),
@@ -397,6 +424,40 @@ mod tests {
                 ),
                 "{bad} gave {err:?}"
             );
+        }
+    }
+
+    /// A base path that collides with a top-level route used to panic inside
+    /// `build_app` (exit 101), which `RestartPreventExitStatus=2` cannot tell
+    /// from a crash. It must be a config error instead.
+    #[test]
+    fn base_path_may_not_shadow_a_top_level_route() {
+        for seg in crate::app::RESERVED_BASE_PATH_SEGMENTS {
+            let url = format!("https://explorer.example.com/{seg}");
+            let err = match cfg(&[(ENV_PUBLIC_BASE_URL, &url)]) {
+                Err(e) => e,
+                Ok(_) => panic!("{url} must be refused, not accepted"),
+            };
+            match &err {
+                ConfigError::Invalid { var, reason } => {
+                    assert_eq!(*var, ENV_PUBLIC_BASE_URL);
+                    assert!(reason.contains(seg), "{reason}");
+                }
+                other => panic!("{url} gave {other:?}"),
+            }
+            // Only the FIRST segment can collide.
+            let nested = format!("https://explorer.example.com/explorer/{seg}");
+            assert_eq!(
+                cfg(&[(ENV_PUBLIC_BASE_URL, &nested)]).unwrap().base_path,
+                format!("/explorer/{seg}")
+            );
+        }
+        // The ordinary prefixes still work.
+        for ok in [
+            "https://explorer.example.com/explorer",
+            "http://localhost:8096",
+        ] {
+            assert!(cfg(&[(ENV_PUBLIC_BASE_URL, ok)]).is_ok(), "{ok}");
         }
     }
 

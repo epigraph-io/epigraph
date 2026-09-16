@@ -247,10 +247,14 @@ pub struct Outlinks {
     pub families: Vec<FamilyGroup>,
     /// Edges upstream returned (after its degree cap).
     pub shown_edges: usize,
-    /// Edges before the cap.
+    /// `/ego`'s `total_edges`: edges before the degree cap, already net of
+    /// anything dropped for redaction, so it never counts neighbours this
+    /// viewer may not see.
     pub total_edges: u64,
+    /// `/ego`'s `truncated`: the degree cap cut edges. Never inferred from
+    /// the counts — see [`group_outlinks`].
     pub truncated: bool,
-    /// The graph view, which can page through the rest.
+    /// The graph view of the same neighbourhood.
     pub graph_url: String,
 }
 
@@ -338,12 +342,19 @@ pub fn group_outlinks(ego: &EgoResponse, links: &Links) -> Outlinks {
         }
     }
 
-    let shown_edges = ego.edges.len();
+    // Truncation is upstream's to declare. Inferring it from
+    // `total_edges > edges.len()` also fired when the missing edges were
+    // dropped by *redaction*, which put a dead "explore the rest" link on the
+    // page (the graph view reads the same `/ego` route) and told the viewer
+    // exactly how many neighbours are hidden from them. `/ego`'s `total_edges`
+    // is redaction-aware and its `truncated` means degree-cap truncation, so
+    // both are taken as given; the `.max(shown_edges)` fixup that papered over
+    // the mismatch goes with them.
     Outlinks {
         families,
-        shown_edges,
-        total_edges: ego.total_edges.max(shown_edges as u64),
-        truncated: ego.truncated || ego.total_edges > shown_edges as u64,
+        shown_edges: ego.edges.len(),
+        total_edges: ego.total_edges,
+        truncated: ego.truncated,
         graph_url: links.claim_graph(center),
     }
 }
@@ -518,5 +529,40 @@ mod tests {
         assert!(hidden.redacted);
         assert_eq!(hidden.text, "Content hidden");
         assert!(!o.truncated);
+    }
+
+    /// `/ego` subtracts redaction-dropped edges from `total_edges` and sets
+    /// `truncated` only for its degree cap. A response where the two simply
+    /// disagree (fewer edges than `total_edges`, `truncated: false`) must not
+    /// raise the truncation notice: that link is dead — the graph view reads
+    /// the same `/ego` — and the count would disclose how many neighbours the
+    /// viewer may not see.
+    #[test]
+    fn a_short_edge_list_alone_is_not_truncation() {
+        let ego = EgoResponse {
+            center: node(1, "claim", "centre"),
+            nodes: vec![node(2, "claim", "two")],
+            edges: vec![edge(1, 2, "supports", "out")],
+            total_edges: 9,
+            truncated: false,
+        };
+        let o = group_outlinks(&ego, &links());
+        assert!(
+            !o.truncated,
+            "truncation is upstream's to declare, never inferred from the counts"
+        );
+        assert_eq!(o.shown_edges, 1);
+        assert_eq!(
+            o.total_edges, 9,
+            "upstream's total is reported verbatim, not raised to the shown count"
+        );
+
+        // And the cap flag alone is enough, even when the counts agree.
+        let ego = EgoResponse {
+            truncated: true,
+            total_edges: 1,
+            ..ego
+        };
+        assert!(group_outlinks(&ego, &links()).truncated);
     }
 }

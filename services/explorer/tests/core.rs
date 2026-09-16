@@ -354,11 +354,54 @@ async fn claim_page_groups_outlinks_by_family_and_direction() {
     assert!(!body.contains(&format!("/paper/{PAPER}")));
     assert!(body.contains("claim · superseded"));
 
-    // Truncation notice with the graph link.
-    assert!(body.contains("Showing 7 of 57 connections."));
+    // Truncation notice with the graph link. The fixture sets upstream's
+    // `truncated: true`, so this is the degree cap talking.
+    assert!(
+        body.contains("This claim has 57 connections; the connection limit cut the list to 7."),
+        "{body}"
+    );
     assert!(body.contains(&format!(
         "<a href=\"/explorer/claim/{CLAIM}/graph\">Open the graph view</a>"
     )));
+}
+
+/// Fewer edges than `total_edges` is not, on its own, truncation: `/ego`
+/// subtracts redaction-dropped edges from `total_edges` and reserves
+/// `truncated` for its degree cap. Raising the notice anyway offered a dead
+/// link (the graph view reads the same `/ego`) and published a count of the
+/// neighbours the viewer may not see.
+#[tokio::test]
+async fn short_edge_list_without_upstream_truncation_shows_no_notice() {
+    let app = spawn().await;
+    mount_get(
+        &app,
+        &claim_path(""),
+        200,
+        claim_json(CONTENT, &["physics"]),
+        1,
+    )
+    .await;
+    // Upstream's own `truncated` is false while `total_edges` (57) exceeds
+    // the seven edges it returned — the shape a redacted neighbourhood has.
+    // Every other sub-call is unmounted and degrades, which the page allows.
+    let mut ego = ego_json();
+    ego["truncated"] = json!(false);
+    mount_get(&app, &claim_path("/ego"), 200, ego, 1).await;
+
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(
+        !res.body.contains("connection limit cut the list"),
+        "no truncation notice when upstream did not truncate"
+    );
+    assert!(
+        !res.body.contains("57 connections"),
+        "and no count of what is missing: {}",
+        res.body
+    );
+    // The connections that did come back are still rendered.
+    assert!(res.body.contains("Supports →"));
 }
 
 #[tokio::test]

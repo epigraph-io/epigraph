@@ -385,6 +385,42 @@ fn config_validation_is_enforced() {
     ));
 }
 
+/// Startup as `main.rs` runs it: config → state → router. A base path that
+/// shadows a top-level route must stop at the *config* step with an
+/// `Invalid` (which `main` turns into exit 2, the code the systemd unit's
+/// `RestartPreventExitStatus=2` looks for), never reach `build_app` and
+/// panic there (exit 101, indistinguishable from a crash, so systemd
+/// restart-loops on a config typo).
+#[test]
+fn a_base_path_that_shadows_a_route_fails_config_not_the_router_build() {
+    let start = |base: &str| {
+        let base = base.to_string();
+        let lookup = move |k: &str| (k == ENV_PUBLIC_BASE_URL).then(|| base.clone());
+        let config = Config::from_lookup(lookup)?;
+        let state = AppState::new(config).expect("state builds");
+        let _router = epigraph_explorer::app::build_app(state);
+        Ok::<(), ConfigError>(())
+    };
+
+    for shadowing in [
+        "https://explorer.example.com/search",
+        "https://explorer.example.com/auth",
+    ] {
+        assert!(
+            matches!(
+                start(shadowing).unwrap_err(),
+                ConfigError::Invalid {
+                    var: ENV_PUBLIC_BASE_URL,
+                    ..
+                }
+            ),
+            "{shadowing} must be refused by config validation"
+        );
+    }
+    start("https://explorer.example.com/explorer").expect("an ordinary base path still starts");
+    start("http://localhost:8096").expect("the root base path still starts");
+}
+
 #[tokio::test]
 async fn dev_bearer_signs_in_anonymous_requests_on_localhost() {
     let app = spawn_with(
@@ -614,6 +650,66 @@ async fn upstream_calls_share_one_semaphore() {
     assert_eq!(app.state.upstream.available_permits(), 1);
 }
 
+/// The semaphore wait and the request share ONE budget.
+///
+/// `concurrency = 1`, timeout 500 ms. The first call holds the only permit
+/// for 300 ms and succeeds; the second therefore queues 300 ms and then talks
+/// to an upstream that never answers. Its deadline is 500 ms from when *it*
+/// started, so it must give up ~200 ms after it gets the permit — not start a
+/// fresh 500 ms clock and take 800 ms overall.
+#[tokio::test]
+async fn the_queue_wait_and_the_request_share_one_deadline() {
+    let app = spawn_with(
+        &[
+            (ENV_UPSTREAM_CONCURRENCY, "1"),
+            (ENV_UPSTREAM_TIMEOUT_MS, "500"),
+        ],
+        Router::new(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/stats"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"claims": 1}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(claim_json())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&app.upstream)
+        .await;
+    let api = app
+        .state
+        .api(&epigraph_explorer::auth::RequestAuth::Anonymous);
+
+    let start = Instant::now();
+    let (quick, queued) = tokio::join!(api.stats(), api.claim(claim_id()));
+    let elapsed = start.elapsed();
+    assert!(
+        quick.is_ok(),
+        "the holder of the permit succeeds: {quick:?}"
+    );
+    assert_eq!(
+        queued.unwrap_err(),
+        UpstreamError::Timeout,
+        "the queued call must still time out"
+    );
+    assert!(
+        elapsed < Duration::from_millis(700),
+        "the queued call took {elapsed:?} overall: it waited ~300 ms for the \
+         permit and then started a fresh timeout instead of spending what was \
+         left of its own 500 ms budget"
+    );
+    assert_eq!(app.state.upstream.available_permits(), 1);
+}
+
 // ---- 401 policy ---------------------------------------------------------------
 
 #[tokio::test]
@@ -653,6 +749,65 @@ async fn failed_refresh_ends_the_session() {
         UpstreamError::SessionExpired
     );
     assert!(app.state.sessions.get(&sid).is_none(), "session dropped");
+}
+
+/// A refresh that could not *reach* `/oauth/token` is transient: the API
+/// restarting must not sign every user out, so the session survives and the
+/// call reports the ordinary "API unavailable" failure a section degrades on.
+#[tokio::test]
+async fn unreachable_refresh_keeps_the_session_and_degrades() {
+    let app = spawn().await;
+    mount_claim_for_token(&app, "stale", 401, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream restarting"))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+
+    let sid = app.sign_in("stale");
+    let api = app.state.api(&app.session_auth(&sid, "stale"));
+    let err = api.claim(claim_id()).await.unwrap_err();
+    assert!(
+        matches!(err, UpstreamError::Transport(_)),
+        "a transient refresh failure must not read as SessionExpired: {err:?}"
+    );
+    assert_eq!(
+        err.user_message(),
+        "The EpiGraph API is unavailable right now."
+    );
+    assert!(
+        degrade::<()>(Err(err)).is_ok(),
+        "a section can degrade on it"
+    );
+    assert!(
+        app.state.sessions.get(&sid).is_some(),
+        "the session survives an upstream that could not be reached"
+    );
+}
+
+/// Same split on the proactive path: an expired token whose refresh could not
+/// reach upstream keeps the session (with its stale token) instead of
+/// resolving to anonymous.
+#[tokio::test]
+async fn unreachable_proactive_refresh_keeps_the_session() {
+    let app = spawn().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+        .mount(&app.upstream)
+        .await;
+
+    let sid = app.sign_in_expiring("stale", chrono::Duration::seconds(-5));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        TestApp::cookie(&sid).parse().unwrap(),
+    );
+    let auth = epigraph_explorer::auth::resolve_auth(&app.state, &headers).await;
+    assert_eq!(auth.session_id(), Some(&sid), "session kept: {auth:?}");
+    assert_eq!(auth.bearer(), Some("stale"), "stale token carried forward");
+    assert!(app.state.sessions.get(&sid).is_some());
 }
 
 #[tokio::test]

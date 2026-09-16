@@ -1,15 +1,26 @@
 //! Typed client for epigraph-api.
 //!
 //! Every call goes through one global semaphore (`UPSTREAM_CONCURRENCY`, well
-//! under the API's 10-connection pool) with a per-call timeout, forwards the
-//! caller's own bearer (never a service token) or calls anonymously, and maps
-//! every failure into [`UpstreamError`].
+//! under the API's 10-connection pool) under a single per-call deadline
+//! (`EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` from the moment the call starts,
+//! covering the queue wait *and* the request), forwards the caller's own
+//! bearer (never a service token) or calls anonymously, and maps every
+//! failure into [`UpstreamError`].
 //!
 //! 401 policy (plan §3.3): upstream answers a present-but-stale bearer with
 //! 401 even on public routes. With a session, the client calls
 //! [`crate::auth::refresh_session`] once, retries once with the new token, and
-//! on a second 401 (or a failed refresh) drops the session and returns
+//! on a second 401 drops the session and returns
 //! [`UpstreamError::SessionExpired`].
+//!
+//! A *failed* refresh is split by cause. [`crate::auth::RefreshError::Rejected`]
+//! and `NoSession` mean upstream refused the credential, so the session ends
+//! the same way. `Upstream`/`Unavailable` mean `/oauth/token` could not be
+//! reached — an API restart, a timeout, a 5xx — which says nothing about the
+//! refresh token; the session is kept and the call returns
+//! [`UpstreamError::Transport`], the ordinary transient failure a degraded
+//! section already renders. There is still exactly one refresh attempt per
+//! request, so a flapping upstream cannot loop.
 //!
 //! Area agents add typed methods as `impl Api<'_>` blocks in their own
 //! `upstream/{core,entities,graph}.rs`, built on [`Api::get`],
@@ -80,8 +91,8 @@ pub enum UpstreamError {
     /// 5xx.
     #[error("upstream error ({status}): {message}")]
     Server { status: u16, message: String },
-    /// The per-call timeout elapsed, waiting for a semaphore slot or for
-    /// the response.
+    /// The per-call deadline elapsed: waiting for a semaphore slot, waiting
+    /// for the response, or the two together.
     #[error("upstream timed out")]
     Timeout,
     /// Connection refused/reset/dropped (a handler panic upstream drops the
@@ -248,10 +259,21 @@ impl<'a> Api<'a> {
         let stale = token.unwrap_or_default();
         let fresh = match auth::refresh_session(self.state, id, &stale).await {
             Ok(t) => t,
-            Err(e) => {
-                tracing::info!(error = %e, %path, "upstream 401 and refresh failed; ending session");
+            // Upstream said no (invalid_grant, revoked, no such session):
+            // the credential is dead, so the session is too.
+            Err(e @ (auth::RefreshError::Rejected(_) | auth::RefreshError::NoSession)) => {
+                tracing::info!(error = %e, %path, "upstream 401 and refresh rejected; ending session");
                 self.state.sessions.remove(id);
                 return Err(UpstreamError::SessionExpired);
+            }
+            // We could not *reach* `/oauth/token` (transport, timeout, 5xx).
+            // That says nothing about the refresh token, so keep the session
+            // and report a transient upstream failure: an API restart must
+            // not sign every user out. `degrade` renders this as an
+            // unavailable section, and the next request refreshes again.
+            Err(e) => {
+                tracing::warn!(error = %e, %path, "upstream 401 but the refresh could not reach upstream; keeping the session");
+                return Err(UpstreamError::Transport(e.to_string()));
             }
         };
         *self.token.lock().unwrap_or_else(|p| p.into_inner()) = Some(fresh.clone());
@@ -279,7 +301,13 @@ impl<'a> Api<'a> {
         Q: Serialize + ?Sized,
     {
         let up = &self.state.upstream;
-        let _permit = tokio::time::timeout(up.timeout, up.semaphore.acquire())
+        // One budget for the whole exchange, not one per stage: queueing for a
+        // permit and waiting for the response used to be two independent
+        // timeouts, so a contended call could take 2 × the configured timeout
+        // (and a page composing N sub-calls stacked that up). Everything below
+        // shares this deadline.
+        let deadline = tokio::time::Instant::now() + up.timeout;
+        let _permit = tokio::time::timeout_at(deadline, up.semaphore.acquire())
             .await
             .map_err(|_| {
                 tracing::warn!(%path, "upstream semaphore wait timed out");
@@ -287,11 +315,19 @@ impl<'a> Api<'a> {
             })?
             .map_err(|_| UpstreamError::Transport("upstream client shut down".into()))?;
 
+        // Whatever the queue left us. Zero is the same timeout the caller
+        // already handles; reqwest would not treat `Duration::ZERO` that way.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(%path, "upstream budget spent waiting for a semaphore slot");
+            return Err(UpstreamError::Timeout);
+        }
+
         let url = format!("{}{}", up.base, path);
         let mut req = up
             .http
             .request(method.clone(), &url)
-            .timeout(up.timeout)
+            .timeout(remaining)
             .header(ACCEPT, "application/json");
         if let Some(q) = query {
             req = req.query(q);

@@ -173,8 +173,10 @@ async fn history(
     let id = parse_id(&raw, "claim")?;
     let api = user.api(&state);
     let claim = api.claim(id).await.map_err(not_found_as("claim"))?;
-    // `/history` does not redact upstream (until the §2.6 sweep): a claim
-    // hidden from this viewer gets no content-bearing sub-call (plan §3.4).
+    // Since the §2.6 sweep `/history` redacts per version upstream
+    // (`versioning::claim_history`), so this is belt and braces rather than
+    // the only guard: a claim hidden from this viewer still gets no
+    // content-bearing sub-call at all (plan §3.4), which also saves the call.
     let history = if claim.is_redacted() {
         Degraded::unavailable(
             "This claim's content is hidden from you, so its version history is not shown.",

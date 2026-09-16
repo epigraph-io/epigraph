@@ -15,8 +15,12 @@
 //! - Neighbourhood expand is `#[serde(untagged)]` upstream with no mode
 //!   field; [`NeighborhoodExpand`] tells the two shapes apart by the array
 //!   only each one carries (`compound_groups` / `induced_edges`).
-//! - Labels are raw claim content (unredacted until the kernel's §2.6 sweep,
-//!   which substitutes [`super::REDACTED`]) and are never truncated upstream.
+//! - Labels are raw claim content, never truncated upstream, and — since the
+//!   §2.6 sweep — redacted per viewer: `graph::expand` (community) and
+//!   `graph_neighborhood::expand` (both response modes) substitute
+//!   [`super::REDACTED`] for labels the requester may not read. The one
+//!   exception is `graph/themes/:id/expand`, whose `NeighborhoodOut.label` is
+//!   a frame UUID or `"neighborhood-N"`, never claim content.
 //! - `budget` has no upper cap upstream; the BFF clamps it
 //!   ([`clamp_expand_budget`]).
 
@@ -132,7 +136,8 @@ pub struct CommunityExpand {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ExpandNode {
     pub id: Uuid,
-    /// Full claim content (not truncated; not redacted before §2.6).
+    /// Full claim content, not truncated; [`super::REDACTED`] when the
+    /// requester may not read it (`graph::expand`, §2.6 sweep).
     #[serde(default)]
     pub label: String,
     /// Always `"claim"` today.

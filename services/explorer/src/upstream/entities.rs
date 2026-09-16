@@ -51,8 +51,10 @@ pub struct VersionHistoryResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ClaimVersion {
     pub claim_id: Uuid,
-    /// Unredacted upstream until the §2.6 sweep lands; may be `[REDACTED]`
-    /// after it.
+    /// `[REDACTED]` for a version this viewer may not read: since the §2.6
+    /// sweep `versioning::claim_history` runs the whole chain through
+    /// `access_control::redact_claim_fields`, per version (each one is a
+    /// distinct claim with its own ownership row).
     #[serde(default)]
     pub content: String,
     #[serde(default)]
@@ -112,7 +114,10 @@ pub struct AgentClaimsPage {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AttributedClaim {
     pub id: Uuid,
-    /// Unredacted upstream until the §2.6 sweep lands.
+    /// `[REDACTED]` for a claim this viewer may not read: since the §2.6
+    /// sweep `agents::agent_claims` redacts the page through
+    /// `access_control::redact_claim_fields` (attribution to a readable agent
+    /// says nothing about who may read the claim).
     #[serde(default)]
     pub content: String,
     #[serde(default)]

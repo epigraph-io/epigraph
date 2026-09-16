@@ -100,6 +100,32 @@ impl<K: Eq + Hash, V: Clone> TtlMap<K, V> {
     }
 }
 
+impl<K: Eq + Hash + Clone, V: Clone> TtlMap<K, V> {
+    /// Shrink the map to at most `max` entries by dropping the ones whose
+    /// deadlines are nearest; returns how many were dropped.
+    ///
+    /// This is the bound for maps anyone can fill (pending logins): refusing
+    /// a new entry when the map is full turns a flood into a denial of
+    /// service for every user, so the cap evicts instead. Entries share one
+    /// TTL there, so "nearest deadline" is "inserted longest ago" — a flood
+    /// mostly evicts its own earlier entries, and an evicted sign-in fails
+    /// the way an expired one does (the browser can retry).
+    pub fn evict_oldest_beyond(&self, max: usize) -> usize {
+        let mut map = self.lock();
+        let excess = map.len().saturating_sub(max);
+        if excess == 0 {
+            return 0;
+        }
+        let mut by_deadline: Vec<(Instant, K)> =
+            map.iter().map(|(k, (d, _))| (*d, k.clone())).collect();
+        by_deadline.sort_unstable_by_key(|(d, _)| *d);
+        for (_, key) in by_deadline.into_iter().take(excess) {
+            map.remove(&key);
+        }
+        excess
+    }
+}
+
 type AnyArc = Arc<dyn Any + Send + Sync>;
 
 /// A typed-on-read TTL cache keyed by string.
@@ -168,6 +194,26 @@ mod tests {
 
         m.insert("late".into(), 8, Duration::ZERO);
         assert_eq!(m.take(&"late".into()), None);
+    }
+
+    #[test]
+    fn eviction_drops_the_nearest_deadlines_first() {
+        let m: TtlMap<String, u32> = TtlMap::new();
+        for (i, secs) in [30u64, 10, 20, 40].into_iter().enumerate() {
+            m.insert(format!("k{i}"), i as u32, Duration::from_secs(secs));
+        }
+        assert_eq!(m.evict_oldest_beyond(4), 0, "already within the cap");
+        assert_eq!(m.evict_oldest_beyond(2), 2);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&"k1".to_string()), None, "10 s deadline went first");
+        assert_eq!(m.get(&"k2".to_string()), None, "then the 20 s one");
+        assert_eq!(m.get(&"k0".to_string()), Some(0));
+        assert_eq!(m.get(&"k3".to_string()), Some(3));
+
+        // Evicting to zero empties the map rather than panicking.
+        assert_eq!(m.evict_oldest_beyond(0), 2);
+        assert!(m.is_empty());
+        assert_eq!(m.evict_oldest_beyond(0), 0);
     }
 
     #[test]

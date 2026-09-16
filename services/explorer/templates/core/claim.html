@@ -44,7 +44,7 @@
         <p class="muted">This claim has no connections yet.</p>
         {%- else %}
         {%- if data.truncated %}
-        <p class="notice notice--warn small">Showing {{ data.shown_edges }} of {{ data.total_edges }} connections. <a href="{{ data.graph_url }}">Open the graph view</a> to explore the rest.</p>
+        <p class="notice notice--warn small">This claim has {{ data.total_edges }} connections; the connection limit cut the list to {{ data.shown_edges }}. <a href="{{ data.graph_url }}">Open the graph view</a> to explore them visually.</p>
         {%- endif %}
         {%- for fam in data.families %}
         <section class="outlinks__family outlinks__family--{{ fam.slug() }}" aria-label="{{ fam.title }}">

@@ -283,6 +283,88 @@ async fn history_lists_versions_marking_current_superseded_and_duplicates() {
     app.upstream.verify().await;
 }
 
+/// Post-§2.6-sweep shape: the requested claim is readable but an *older*
+/// version is not, because each version is a distinct claim with its own
+/// ownership row and `versioning::claim_history` redacts them one by one.
+/// The hidden version must read as hidden, never as the literal marker.
+#[tokio::test]
+async fn history_renders_a_per_version_redaction_as_hidden_text() {
+    let app = spawn().await;
+    get_ok(
+        &app,
+        &format!("/api/v1/claims/{CLAIM}"),
+        claim_json("Water boils at 100 °C at sea level."),
+    )
+    .await;
+    get_ok(
+        &app,
+        &format!("/api/v1/claims/{CLAIM}/history"),
+        json!({
+            "claim_id": CLAIM,
+            "versions": [
+                {"claim_id": V1, "content": "[REDACTED]", "truth_value": null,
+                 "version": 1, "is_current": false, "created_at": "2025-12-01T00:00:00Z",
+                 "superseded_by": CLAIM},
+                {"claim_id": CLAIM, "content": "Water boils at 100 °C at sea level.",
+                 "truth_value": 0.8, "version": 2, "is_current": true,
+                 "created_at": "2026-01-02T03:04:05Z", "superseded_by": null}
+            ],
+            "total_versions": 2, "current_version": 2
+        }),
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/claim/{CLAIM}/history"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(
+        !res.body.contains("[REDACTED]"),
+        "the marker is never shown verbatim: {}",
+        res.body
+    );
+    assert!(res.body.contains("Content hidden"), "{}", res.body);
+    assert!(res.body.contains("claim-text--redacted"), "{}", res.body);
+    // The readable version is unaffected.
+    assert!(res.body.contains("Water boils at 100 °C at sea level."));
+}
+
+/// The same for `/agents/:id/claims`: attribution to an agent this viewer can
+/// see says nothing about who may read the claim, so `agents::agent_claims`
+/// redacts the page and the Explorer must render that as hidden.
+#[tokio::test]
+async fn agent_attributed_claims_render_redacted_rows_as_hidden_text() {
+    let app = spawn().await;
+    get_ok(&app, &format!("/api/v1/agents/{AGENT}"), agent_json(AGENT)).await;
+    get_ok(
+        &app,
+        &format!("/api/v1/agents/{AGENT}/claims"),
+        json!({
+            "agent_id": AGENT,
+            "items": [
+                {"id": CLAIM, "content": "[REDACTED]", "truth_value": null,
+                 "agent_id": AGENT, "created_at": "2026-01-02T03:04:05Z",
+                 "attribution": {}},
+                {"id": V1, "content": "Water boils at 99 °C.", "truth_value": 0.3,
+                 "agent_id": AGENT, "created_at": "2025-12-01T00:00:00Z",
+                 "attribution": {}}
+            ],
+            "total": 2, "limit": 20, "offset": 0
+        }),
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(
+        !res.body.contains("[REDACTED]"),
+        "the marker is never shown verbatim: {}",
+        res.body
+    );
+    assert!(res.body.contains("Content hidden"), "{}", res.body);
+    assert!(res.body.contains("Water boils at 99 °C."));
+}
+
 #[tokio::test]
 async fn history_escapes_hostile_content() {
     let app = spawn().await;
