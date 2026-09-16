@@ -168,10 +168,18 @@ async fn read_as_refuses_a_bypass_viewer(pool: PgPool) {
 //
 // The handler is invoked directly rather than over HTTP: it is an ordinary
 // async fn, and calling it here exercises the converted body without standing
-// up bearer auth. `spawn_app` builds state through a NON-scoped constructor, so
-// no HTTP fixture in this crate could reach a stamped read today — closing that
-// is the natural first task of the conversion shards, and is called out in the
-// PR body rather than half-done here.
+// up bearer auth.
+//
+// UPDATED BY CONVERSION SHARD 4, which did the thing this paragraph called out.
+// It used to read "`spawn_app` builds state through a NON-scoped constructor,
+// so no HTTP fixture in this crate could reach a stamped read today — closing
+// that is the natural first task of the conversion shards". `spawn_app` now
+// builds through `AppState::with_scoped_pool` and an HTTP fixture DOES reach a
+// stamped read. Direct invocation is still what this file needs, for the
+// separate reason that `with_scoped_pool` makes `db_pool` and `scoped.inner()`
+// the same pool, so an HTTP fixture cannot distinguish a converted site from an
+// unconverted one. That narrower gap is still open; see
+// `lineage_scoped_read.rs`'s module doc for its current statement.
 
 use axum::extract::{Json as JsonBody, State};
 use epigraph_api::middleware::bearer::ViewerExtractor;

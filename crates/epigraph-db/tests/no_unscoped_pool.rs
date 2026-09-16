@@ -15,9 +15,10 @@
 //! # Why it is SEEDED rather than asserted at zero
 //!
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
-//! lint would fail on day one"*. It would — there are 391 unconverted sites as
-//! of this commit, and a lint that fails on day one is a lint someone deletes
-//! in week two.
+//! lint would fail on day one"*. It would — there were 391 unconverted sites
+//! when this file landed, and a lint that fails on day one is a lint someone
+//! deletes in week two. (372 today; the assertions below measure the tree and
+//! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
 //! per-file site count, so the lint **passes today** and can only shrink. Each
@@ -54,7 +55,7 @@
 //!   against, and the write-side predicate is 16b's, not this PR's. Measured on
 //!   this tree with a same-line name needle (create / insert / update / delete
 //!   / upsert / supersede / revoke / mark_ / record_ / append): **30** of the
-//!   391 sites below are visibly write-shaped, led by
+//!   372 sites below are visibly write-shaped, led by
 //!   `routes/experiment_loop.rs` (5), `routes/tasks.rs` (4) and
 //!   `routes/crud.rs`, `routes/claims.rs`, `routes/workflows.rs`,
 //!   `routes/webhooks.rs` (3 each). That is a LOWER bound — the needle only
@@ -100,15 +101,27 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 391 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 372 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
-//!      second shard's five, and PR-29 — the first MULTI-FILE shard — the third
+//!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
 //!      shard's eleven, across `routes/search.rs`, `routes/voids.rs` and
-//!      `routes/methods.rs`. None discharged the gate — 391 is not 0 — and
-//!      neither PR-25 nor PR-26 nor PR-28 nor PR-29 may be read as unblocking
-//!      step 11d. A SMALLER number is not a discharged decision: 25 of the 416
-//!      sites the series began with are converted, and 391 are not.
+//!      `routes/methods.rs`, and shard 4 nineteen more across
+//!      `routes/belief.rs` (14) and `routes/computation.rs` (5). None
+//!      discharged the gate — 372 is not 0 — and no shard in the series may be
+//!      read as unblocking step 11d. A SMALLER number is not a discharged
+//!      decision: 44 of the 416 sites the series began with are converted, and
+//!      372 are not.
+//!
+//!      **Shard 4 is also the first shard to end with rows it did not empty,
+//!      and that is the honest outcome rather than a shortfall.** It was sized
+//!      from a read/write classification that put all 40 of its sites in three
+//!      files at "read"; re-measured from the tree, 7 of the 40 write and 9 more
+//!      are in handlers that hold no `Viewer` at all. So `routes/belief.rs`
+//!      keeps 3 and `routes/computation.rs` 10, `routes/papers.rs` is unchanged
+//!      at 8, and [`HIGH_WATER_FILES`] does not move. A shard lowers its rows to
+//!      what it converted; it does not delete a row it did not empty, and it
+//!      does not convert a site to make a planning figure land.
 //!
 //!   And independently of both, the conversion is unargued: each file takes a
 //!   raw `&PgPool` as a *parameter* (from `state.db_pool` and from the
@@ -469,13 +482,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 391;
+const HIGH_WATER: usize = 372;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
+///
+/// Shard 4 converted 19 sites and did NOT move this: none of its three files
+/// reached zero, so no key was deleted. A shard whose site count falls without
+/// this moving is the ordinary case, not a sign it forgot to lower something.
 const HIGH_WATER_FILES: usize = 46;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 391 sites across 46 files as of this commit. Lower an entry when a shard
+/// 372 sites across 46 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -484,7 +501,16 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/agents.rs", 15),
     ("routes/assess.rs", 1),
     ("routes/audit.rs", 1),
-    ("routes/belief.rs", 17),
+    // 17 before this PR. Shard 4 converted the FOURTEEN read-only handlers onto
+    // `AppState::read_as`. The row SURVIVES at 3 rather than being deleted, and
+    // the remainder is a class rather than a leftover: `create_frame`,
+    // `submit_evidence` and `refine_frame` each WRITE through their alias. Every
+    // site in this file is one handler-level `let pool = &state.db_pool;`, so
+    // those three cannot be split off the reads beside them without splitting
+    // the handler, and `read_as` is documented read-only — see that file's
+    // module doc for why routing a write through it compiles and then discards
+    // the write. Their owner is `ScopedPool::begin_as` plus 16b's write gate.
+    ("routes/belief.rs", 3),
     ("routes/challenge.rs", 3),
     ("routes/claims.rs", 25),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
@@ -493,7 +519,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // so a `0` row could never be satisfied.
     ("routes/clusters.rs", 1),
     ("routes/community.rs", 5),
-    ("routes/computation.rs", 15),
+    // 15 before this PR. Shard 4 converted the five sites belonging to its four
+    // read-only handlers (`sheaf_consistency`, `sheaf_cohomology`,
+    // `sheaf_reconcile`, `belief_at_time`). Unlike `routes/belief.rs` the sites
+    // here are PER-STATEMENT, so a partially-converted handler is expressible;
+    // the shard declined to produce one. Of the ten that remain, seven are
+    // `propagate_beliefs`, which writes through two of them, and three are
+    // `compose_subgraphs`. Both are named in that file's module doc.
+    ("routes/computation.rs", 10),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),
@@ -522,6 +555,16 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 3, moved both onto `AppState::read_as`. It is one of THREE rows that shard
     // deleted — see `routes/search.rs` and `routes/voids.rs` below — which is
     // what makes it the first multi-file shard in the series.
+    //
+    // `routes/papers.rs` is UNCHANGED at 8, deliberately. Shard 4 was sized to
+    // include this file and then measured it: two of the eight sites write,
+    // neither handler holds a `Viewer`, and adding one to both `#[cfg]` arms is
+    // a callable behaviour change. A schema measurement taken in the same pass
+    // is registered as `F-SHARD4-A3` and is not restated here; its operational
+    // conclusion is that converting the remaining six would move this counter
+    // and change no row the endpoint returns. That file's module doc carries
+    // the reasoning. This row is the series' example of a file that is COUNTED
+    // and not convertible.
     ("routes/papers.rs", 8),
     ("routes/perspective.rs", 5),
     ("routes/policies.rs", 9),

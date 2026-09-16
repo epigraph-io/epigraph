@@ -3,14 +3,26 @@
 //!
 //! # What this file measures, and what it explicitly does not
 //!
-//! The handlers are called DIRECTLY, not over HTTP. `spawn_app` builds
-//! `AppState` through `AppState::with_db`, which leaves `scoped` as `None`, and
-//! both `AppState::read_as` and `AppState::maintenance_viewer` REFUSE rather
-//! than falling back to the raw pool — so every one of these handlers would
-//! return 500 through that fixture. `split_state` below is the same shape three
-//! conversion shards already use for the same reason; the HTTP-level
-//! (bearer-auth) fixture gap is recorded in `docs/tenancy/progress.json` with an
-//! owner and this file does not close it.
+//! The handlers are called DIRECTLY, not over HTTP, and the reason CHANGED
+//! under this file in conversion shard 4. It used to be that `spawn_app` built
+//! `AppState` through `AppState::with_db`, leaving `scoped` as `None`, so every
+//! handler here would have returned 500 through that fixture. That is no longer
+//! true: `build_app_for_tests` now goes through `AppState::with_scoped_pool`,
+//! and `AppState::maintenance_viewer` would succeed on it. The reason to keep
+//! invoking directly is the one that survives — `with_scoped_pool` sets
+//! `db_pool = scoped.inner().clone()`, so on `spawn_app` the two arms are the
+//! SAME pool and nothing about the split is observable, whereas `split_state`
+//! below gives `db_pool` a genuinely filtered pool. It is the same shape three
+//! conversion shards already use. The HTTP-level (bearer-auth, FILTERED-pool)
+//! fixture gap is recorded in `docs/tenancy/progress.json` with an owner and
+//! this file does not close it.
+//!
+//! One consequence of that change worth stating where a reader of THESE
+//! handlers will see it: `spawn_app` can now mint a maintenance lease, so the
+//! bypass path in `create_plan` and `maintenance` is reachable from an HTTP
+//! fixture. Measured at the time of the change, no `epigraph-api` integration
+//! binary reaches either over HTTP — this file is the only one that names them
+//! and it does not use `spawn_app`. See `AppState::scoped`'s own doc.
 //!
 //! **The plan tables' RLS policy is NOT under test here.** `split_state`'s
 //! `scoped` arm connects as the `#[sqlx::test]` superuser, which is

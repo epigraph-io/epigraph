@@ -22,14 +22,21 @@ Residual work is recorded in three places that overlap in exactly one significan
 
 | register | count | note |
 |---|---|---|
-| `open_findings` | 47 | 35 actionable, 12 `ACCEPTED` and deliberately carried |
+| `open_findings` | 54 | 42 actionable, 12 `ACCEPTED` and deliberately carried |
 | `deferred_obligations` | 48 | **45 not stated as discharged**; 3 carry no `status` field at all |
-| `no_unscoped_pool.rs` ratchet | 391 sites / 46 files | the conversion tail |
+| `no_unscoped_pool.rs` ratchet | 372 sites / 46 files | the conversion tail |
+
+**This table is a POINT-IN-TIME SNAPSHOT, measured 2026-09-16 at the close of conversion shard 4.**
+Every shard so far has had to re-sweep it, and a stale row here has already been raised as a
+finding twice. Treat the registers themselves as authoritative: `open_findings` /
+`deferred_obligations` in `docs/tenancy/progress.json`, and `HIGH_WATER` / `HIGH_WATER_FILES`
+in `crates/epigraph-db/tests/no_unscoped_pool.rs`, which are machine-checked and these numbers
+are not.
 
 **The `F-` and `D-` id spaces are disjoint — zero overlap, verified by set intersection.**
 They are two registers, not one counted twice.
 
-**The one real duplication:** `D-PR17-request-path-never-stamps-session-gucs` *is* the 391
+**The one real duplication:** `D-PR17-request-path-never-stamps-session-gucs` *is* the ratchet's
 sites. Its own text says "411 `state.db_pool` line hits across ~50 files under routes/".
 It is scheduled once, in §2.1, and nowhere else.
 
@@ -77,7 +84,7 @@ Strictly ordered. Each stage gates the next.
 
 ### 2.1 — Drain the conversion tail
 
-**391 sites across 46 files**, per the ratchet's own measurement — it strips comments and
+**372 sites across 46 files**, per the ratchet's own measurement — it strips comments and
 excludes a separately-reviewed exempt set, so a naive `grep` (448 across 59) overcounts.
 Quote the ratchet, not the grep.
 
@@ -169,8 +176,8 @@ exists and is honest about what it cannot restore. Read it before, not during.
 
 ## §3 — Parallel track A: security items that must not wait
 
-**These are live on today's corpus and independent of 11d.** Scheduling them behind 391
-conversions would be the wrong order.
+**These are live on today's corpus and independent of 11d.** Scheduling them behind the
+remaining conversions would be the wrong order.
 
 **3.1 `D-PR19-webhook-secret-at-rest`** — `webhook_subscriptions.secret` stores the
 HMAC-SHA256 signing secret **in plaintext**. Anyone who can read that table can forge

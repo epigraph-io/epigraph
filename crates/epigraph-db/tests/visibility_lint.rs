@@ -1006,7 +1006,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// functions whose PARAMETER LIST mentions `Viewer`. A connection-taking
 /// function that simply omits the `Viewer` parameter is therefore invisible to
 /// it — and PR-23 made `*_conn` siblings the standard conversion shape for the
-/// 391 sites `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this
+/// sites `epigraph-db/tests/no_unscoped_pool.rs` registers. Without this
 /// rule, a sibling written without a viewer would pass BOTH controls: this file
 /// would not inspect it, and the ratchet would count its call site as converted
 /// because the `.db_pool` access is gone. The two together would certify

@@ -44,12 +44,22 @@
 //! `epigraph-db/tests/lineage_scoped_read_policy.rs`, on both `SessionGucMode`
 //! arms. Neither file is sufficient alone.
 //!
-//! There is also still no HTTP-level fixture: `spawn_app` builds `AppState`
-//! through a non-scoped constructor, so the handler is called directly. That
-//! gap is recorded in `docs/tenancy/progress.json`'s `prs.next` with an owner,
-//! re-specified from "an HTTP fixture that builds AppState through
-//! with_scoped_pool" (which would have been cosmetic — see above) to "give the
-//! api test fixture a filtered pool".
+//! The handler is called directly rather than over HTTP, and what remains owed
+//! at the HTTP level is NARROWER than this paragraph said before conversion
+//! shard 4. **Corrected by that shard, which falsified the premise:** `spawn_app`
+//! no longer builds `AppState` through a non-scoped constructor —
+//! `build_app_for_tests` goes through `AppState::with_scoped_pool`, so an HTTP
+//! fixture CAN reach a stamped read today and a converted route no longer 500s
+//! there. What it still cannot do is tell a converted site from an unconverted
+//! one: `with_scoped_pool` sets `db_pool = scoped.inner().clone()`, so both arms
+//! are the SAME pool and a mutation proof built on it reports a false pass.
+//! The owed thing is therefore a FILTERED pool for the fixture's `db_pool`,
+//! which is exactly how `docs/tenancy/progress.json`'s `prs.next` re-specified
+//! it — "give the api test fixture a filtered pool", re-specified away from "an
+//! HTTP fixture that builds AppState through with_scoped_pool" precisely
+//! because that half would have been cosmetic. It is still open. The instrument
+//! that can see the difference remains `viewer_fixture::downgraded_pool`, used
+//! by this file and by `belief_computation_scoped_read.rs`.
 //!
 //! Finally: `crates/epigraph-api/tests/integration/lineage_integration_tests.rs`
 //! shares this endpoint's NAME and covers none of it — it declares its own DTOs

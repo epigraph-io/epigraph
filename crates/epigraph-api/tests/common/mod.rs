@@ -33,6 +33,26 @@ pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) 
 ///
 /// Use this for tests of routes like `POST /api/v1/embeddings/neighborhood-density`
 /// whose handler returns 500 when no embedding service is configured.
+///
+/// # "Mirrors" is load-bearing, and conversion shard 4 nearly broke it
+///
+/// That sentence was a plain fact while both fixtures built `PgPoolOptions` +
+/// `AppState::with_db`. Shard 4 moved `build_app_for_tests` onto
+/// `ScopedPool::connect_with_options` + `AppState::with_scoped_pool`, because a
+/// handler converted onto `AppState::read_as` REFUSES when `AppState.scoped` is
+/// `None` rather than falling back to the raw pool. Left alone, this helper
+/// would have kept `scoped` at `None` and the two fixtures would have differed
+/// on the one property that decides whether a converted route answers at all —
+/// with this doc still asserting they do not.
+///
+/// Nothing was failing: its three consumers reach hypothesis, cluster and
+/// embedding routes, none of which any shard has converted. That is what makes
+/// it a trap rather than a bug — the next shard to convert a route reachable
+/// from here would have got a 500 whose cause is three files away, which is the
+/// failure the ledger already records verbatim against PR-29's
+/// `call_diverse_search`. So the construction is mirrored instead, pinned to
+/// the same `SessionGucMode::Session` and the same 4 connections, and the
+/// sentence above is true again rather than merely old.
 #[allow(
     dead_code,
     reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
@@ -43,15 +63,21 @@ pub async fn spawn_app_with_mock_embedding(
     use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
     use std::sync::Arc;
 
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(database_url)
-        .await
-        .expect("db connect");
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        database_url,
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("db connect");
     let provider = MockProvider::new(EmbeddingConfig::openai(1536));
     let svc: Arc<dyn EmbeddingService> = Arc::new(provider);
-    let state = epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default())
-        .with_embedding_service(svc);
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default())
+            .with_embedding_service(svc);
     let app = epigraph_api::routes::create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

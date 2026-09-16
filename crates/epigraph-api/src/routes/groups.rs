@@ -634,7 +634,12 @@ pub async fn get_group(
 /// regression the ratchet exists to stop. Note the asymmetry this creates and
 /// does not resolve: rotation is stamped, while the other four group routes
 /// (including the removal that sets `reseal_required_at`) still run unstamped,
-/// as all 391 unconverted sites do.
+/// as the sites `no_unscoped_pool.rs` still registers as unconverted do. That
+/// clause carried a literal count and the word "all" until conversion shard 4,
+/// which made both wrong — the count moved, and the conversion shards have
+/// since stamped read handlers in other files. Deliberately non-numeric now:
+/// every shard in this series has had to re-sweep a hard-coded copy of that
+/// figure, and the register is the thing to read.
 ///
 /// # The refusals, and why each is a refusal rather than a best effort
 ///
