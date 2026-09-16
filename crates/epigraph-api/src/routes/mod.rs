@@ -88,6 +88,8 @@ pub mod policies;
 pub mod political;
 #[cfg(feature = "db")]
 pub mod provenance;
+#[cfg(feature = "db")]
+pub mod provenance_chain;
 pub mod rag;
 pub mod reasoning;
 pub mod revoke_signature;
@@ -618,6 +620,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/provenance",
             get(edges::claim_provenance),
+        )
+        .route(
+            "/api/v1/claims/:id/provenance-chain",
+            get(provenance_chain::claim_provenance_chain),
         )
         .route(
             "/api/v1/claims/:id/supporting-evidence",
