@@ -12,6 +12,12 @@
 //! `claim_id` plus a relationship name already says more than a redacted node
 //! should. A redacted *centre* answers with the centre alone.
 //!
+//! `total_edges` is redaction-aware: `EgoRepository` counts the degree in the
+//! database, and this route subtracts the edges it then dropped for redaction
+//! before serialising. `truncated` stays cap-only, so the pair says "the cap
+//! cut the list, and this is how much of it you are allowed to know about"
+//! rather than handing a stranger the exact size of the part they cannot see.
+//!
 //! All SQL lives in `epigraph_db::EgoRepository`.
 
 use std::collections::{HashMap, HashSet};
@@ -86,10 +92,15 @@ pub struct EgoResponse {
     pub center: EgoNode,
     pub nodes: Vec<EgoNode>,
     pub edges: Vec<EgoEdge>,
-    /// Every depth-1 edge matching the relationship filter, before the degree
-    /// cap. This is the claim's degree, not the size of `edges`.
+    /// Every depth-1 edge matching the relationship filter that this requester
+    /// may see, before the degree cap: the database count minus the edges
+    /// redaction dropped. Not the size of `edges` — that is additionally cut
+    /// by the cap — and deliberately not the raw degree, which would disclose
+    /// the number of hidden neighbours.
     pub total_edges: i64,
-    /// `true` when the degree cap cut the edge set.
+    /// `true` when the degree cap cut the edge set — never when redaction did.
+    /// A client may therefore read this as "there is more to see", which is
+    /// what the Explorer's "connection limit cut the list" notice does.
     pub truncated: bool,
 }
 
@@ -283,13 +294,26 @@ pub async fn claim_ego(
         }
     }
 
+    let before_redaction = edges.len();
     edges.retain(|e| !hidden.contains(&e.source_id) && !hidden.contains(&e.target_id));
+    let dropped_for_redaction = (before_redaction - edges.len()) as i64;
+
+    // The repo counts the degree in the database, before redaction. Serialising
+    // that raw would tell the viewer exactly how many neighbours they may not
+    // see — the metadata leak this handler already refuses to make for a
+    // redacted *centre*. Subtracting what redaction dropped makes the two
+    // consistent: with no cap in play the count is exactly `edges.len()`, and
+    // `truncated` is left alone so it still means the degree cap and only the
+    // degree cap. `saturating_sub` cannot fire (dropped ≤ kept ≤ total) and is
+    // there so a future counting change degrades to 0 rather than a negative
+    // degree.
+    let total_edges = fetched.total_edges.saturating_sub(dropped_for_redaction);
 
     Ok(Json(EgoResponse {
         center: to_node(center_entity, false),
         nodes,
         edges,
-        total_edges: fetched.total_edges,
+        total_edges,
         truncated: fetched.truncated,
     }))
 }

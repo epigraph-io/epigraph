@@ -42,6 +42,12 @@ pub struct EgoEdges {
     /// Every matching depth-1 edge, before the degree cap. Counted in the
     /// database, so it is unaffected by the cap and by any redaction the
     /// caller applies afterwards.
+    ///
+    /// That last part is why a caller that redacts must NOT serialise this
+    /// number as-is: it is the claim's true degree, and next to a redacted
+    /// edge list it states exactly how many neighbours the viewer may not see.
+    /// `routes/ego.rs` subtracts what it dropped before putting it on the
+    /// wire; a new caller has to do the same.
     pub total_edges: i64,
     /// `true` when the degree cap cut the set — NOT when redaction did.
     pub truncated: bool,

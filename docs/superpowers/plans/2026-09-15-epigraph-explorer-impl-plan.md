@@ -100,6 +100,18 @@ canvas both read this. Query: `max_degree` (default 40, clamp `1..=200`),
 - Redaction via the batch access check (§2.5). Mirrors `claim_neighborhood`:
   edges touching a redacted *neighbour* claim are dropped; a redacted *centre*
   returns the centre with `redacted: true` and no edges.
+- `total_edges` is **redaction-aware**: the repository counts the degree in the
+  database, and the route subtracts the edges it then dropped for redaction
+  before serialising. Reporting the raw degree beside a redacted edge list
+  would state exactly how many neighbours the viewer may not see — the same
+  metadata the redacted-centre case already withholds. With the cap not in
+  play the number is therefore exactly `edges.len()`.
+- `truncated` means the **degree cap** cut the list, and only that; redaction
+  never sets it. So the pair is readable as "there is more to see, and this is
+  how much of it you are allowed to know about", which is what the Explorer's
+  "connection limit cut the list" notice relies on (it renders `total_edges`
+  verbatim and trusts `truncated` alone — see
+  `services/explorer/src/pages/core/relationships.rs::group_outlinks`).
 - **404** when the centre claim does not exist.
 
 ```json

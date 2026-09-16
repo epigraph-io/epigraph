@@ -518,3 +518,110 @@ async fn long_labels_are_cut_on_a_char_boundary(pool: PgPool) {
         "`content` is never truncated; only `label` is"
     );
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn total_edges_excludes_the_edges_redaction_dropped(pool: PgPool) {
+    // Two private neighbours and one public one. Serialising the database
+    // degree would tell an anonymous caller that exactly two neighbours are
+    // being withheld — the metadata this route already refuses to publish for
+    // a redacted centre.
+    let owner = Uuid::new_v4();
+    let center = common::seed_claim(&pool, "public centre").await;
+    let public_neighbour = common::seed_claim(&pool, "public neighbour").await;
+    let secret_a = common::seed_claim_with_agent(&pool, "classified A", owner).await;
+    let secret_b = common::seed_claim_with_agent(&pool, "classified B", owner).await;
+    common::insert_edge(
+        &pool,
+        center,
+        public_neighbour,
+        "claim",
+        "claim",
+        "supports",
+    )
+    .await;
+    common::insert_edge(&pool, center, secret_a, "claim", "claim", "supports").await;
+    common::insert_edge(&pool, secret_b, center, "claim", "claim", "supports").await;
+    common::seed_private_ownership(&pool, secret_a, owner).await;
+    common::seed_private_ownership(&pool, secret_b, owner).await;
+    let app = router(pool);
+
+    let path = format!("/api/v1/claims/{center}/ego");
+
+    // Anonymous: one visible edge, and `total_edges` says one — not three.
+    let (status, body) = get(&app, &path, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
+    assert_eq!(
+        body["total_edges"], 1,
+        "`total_edges` must not count the edges redaction dropped, got {body}"
+    );
+    assert_eq!(
+        body["truncated"],
+        Value::Bool(false),
+        "redaction is not cap-truncation, got {body}"
+    );
+
+    // The owner sees the whole degree, so this cannot pass by always reporting
+    // `edges.len()` of a shrunken set.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 3);
+    assert_eq!(body["total_edges"], 3);
+    assert_eq!(body["truncated"], Value::Bool(false));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_degree_cap_and_redaction_subtract_independently(pool: PgPool) {
+    // Four public neighbours and one private one, capped at 2. `truncated`
+    // must stay true (the cap really did cut the list) while `total_edges`
+    // drops to the four edges this caller is allowed to know about.
+    let owner = Uuid::new_v4();
+    let center = common::seed_claim(&pool, "public centre").await;
+    for i in 0..4 {
+        let n = common::seed_claim(&pool, &format!("public neighbour {i}")).await;
+        common::insert_edge(&pool, center, n, "claim", "claim", "supports").await;
+    }
+    let secret = common::seed_claim_with_agent(&pool, "classified", owner).await;
+    common::insert_edge(&pool, secret, center, "claim", "claim", "supports").await;
+    common::seed_private_ownership(&pool, secret, owner).await;
+    let app = router(pool);
+
+    // max_degree=2 with 4 outbound and 1 inbound: the balanced split takes one
+    // from each side, so the single inbound edge taken IS the private one and
+    // redaction then drops it.
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego?max_degree=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["edges"].as_array().expect("edges").len(),
+        1,
+        "one of the two capped edges was the private one, got {body}"
+    );
+    assert_eq!(
+        body["truncated"],
+        Value::Bool(true),
+        "the cap did cut the list, so `truncated` stays true, got {body}"
+    );
+    assert_eq!(
+        body["total_edges"], 4,
+        "five edges exist but only four are this caller's to count, got {body}"
+    );
+
+    // The owner: same cap, nothing redacted, full degree reported.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego?max_degree=2"),
+        Some(&owner_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
+    assert_eq!(body["truncated"], Value::Bool(true));
+    assert_eq!(body["total_edges"], 5);
+}
