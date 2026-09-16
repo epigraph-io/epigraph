@@ -27,6 +27,28 @@
 # EPIGRAPH_API_URL). The explorer's own sign-in routes are /explorer/auth/*,
 # which are distinct from the API's /oauth/*.
 #
+# RATE LIMITING /explorer/auth/login. Every anonymous GET of that path
+# stores a pending login in the explorer's process-local map (10-minute TTL,
+# 10 000 entries). The explorer keeps the map bounded by evicting its oldest
+# entries rather than refusing, so a flood can no longer lock anyone out of
+# sign-in — but it can still evict other people's in-flight attempts, which
+# makes them retry. An edge rate limit on that one path removes even that.
+# Caddy has no rate limiter in the standard build; with the
+# `caddy-ratelimit` module built in, add inside the handle_path block:
+#
+#   @login path /auth/login
+#   rate_limit @login {
+#       zone explorer_login {
+#           key    {remote_host}
+#           events 30
+#           window 1m
+#       }
+#   }
+#
+# (`handle_path` has already stripped `/explorer`, so the matcher is
+# `/auth/login`.) Do not rate-limit `/auth/callback`: one slow sign-in behind
+# a shared NAT would then fail at the last step.
+#
 # HEADERS. The explorer sets its own Content-Security-Policy, including
 # `frame-ancestors` (the Notion embed depends on it), X-Content-Type-Options
 # and Referrer-Policy. Do not add X-Frame-Options or a second CSP for this
