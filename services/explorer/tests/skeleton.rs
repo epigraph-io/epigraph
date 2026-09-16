@@ -223,17 +223,25 @@ async fn every_area_route_is_mounted() {
         format!("/explorer/theme/{CLAIM}"),
         format!("/explorer/community/{CLAIM}"),
         format!("/explorer/neighborhood/{CLAIM}?mode=compound"),
-        "/explorer/auth/login".to_string(),
-        "/explorer/auth/callback?code=x&state=y".to_string(),
     ];
     for uri in &pages {
         let res = app.get_as(uri, &sid).await;
         assert_eq!(res.status, StatusCode::OK, "{uri}");
         assert!(res.body.contains("not built yet"), "{uri}");
     }
+    // Auth routes are built (tests/auth.rs covers them). Here: mounted and no
+    // longer stubs. With no client id sign-in is disabled (503), an unknown
+    // `state` is refused (400), and POSTs without an Origin are refused (403).
+    let res = app.get_as("/explorer/auth/login", &sid).await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE);
+    let res = app
+        .get_as("/explorer/auth/callback?code=x&state=y", &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    assert!(!res.body.contains("not built yet"));
     for uri in ["/explorer/auth/logout", "/explorer/auth/redeem"] {
         let res = app.post_form(uri, "", Some(&sid)).await;
-        assert_eq!(res.status, StatusCode::OK, "{uri}");
+        assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
     }
     let bff = [
         format!("/explorer/bff/claim/{CLAIM}"),
@@ -605,7 +613,7 @@ async fn failed_refresh_ends_the_session() {
     mount_claim_for_token(&app, "stale", 401, 1).await;
 
     // Stored token == failing token → the hook must call the refresh grant,
-    // which the skeleton stubs as unavailable.
+    // which fails here: no `/oauth/token` mock, so upstream answers 404.
     let sid = app.sign_in("stale");
     let api = app.state.api(&app.session_auth(&sid, "stale"));
     assert_eq!(
@@ -686,7 +694,7 @@ async fn session_expiry_mid_page_redirects_to_login_and_clears_the_cookie() {
 #[tokio::test]
 async fn expired_token_without_refresh_reads_as_signed_out() {
     let app = spawn().await;
-    // Token already expired; the stubbed refresh cannot renew it.
+    // Token already expired; refresh cannot renew it (no `/oauth/token` mock).
     let sid = app.sign_in_expiring("tok", chrono::Duration::seconds(-5));
     let res = app.get_as("/explorer/search", &sid).await;
     assert_eq!(res.status, StatusCode::SEE_OTHER);
