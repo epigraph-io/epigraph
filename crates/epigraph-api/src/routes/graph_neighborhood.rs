@@ -14,7 +14,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::middleware::bearer::ViewerExtractor;
@@ -137,13 +136,33 @@ pub async fn expand(
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<NeighborhoodExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
+    // Conversion shard 5. ONE viewer-stamped connection for the whole response.
+    //
+    // The existence probe immediately below reads `graph_neighborhoods` and
+    // `graph_cluster_runs`; measured at migration head 92 NEITHER carries row
+    // level security (`pg_class.relrowsecurity` is false on both, and no policy
+    // exists on either), so stamping this statement narrows nothing and this
+    // probe is NOT made viewer-filtered by the change. What the stamp is for is
+    // the node projections in `atomic_response` / `compound_response`, which
+    // read `claims`, `edges` and `claim_neighborhood_membership`.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "expand",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to acquire a scoped connection".to_string(),
+        )
+    })?;
     let exists: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM graph_neighborhoods WHERE id = $1 \
          AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)",
     )
     .bind(neighborhood_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *read)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if exists.is_none() {
@@ -155,22 +174,27 @@ pub async fn expand(
 
     match params.mode.as_str() {
         "atomic" => Ok(Json(NeighborhoodExpandResponse::Atomic(
-            atomic_response(pool, &viewer, neighborhood_id, params.budget).await?,
+            atomic_response(&mut read, &viewer, neighborhood_id, params.budget).await?,
         ))),
         _ => Ok(Json(NeighborhoodExpandResponse::Compound(
-            compound_response(pool, &viewer, neighborhood_id, params.budget).await?,
+            compound_response(&mut read, &viewer, neighborhood_id, params.budget).await?,
         ))),
     }
 }
 
+/// Conversion shard 5 took this from `pool: &PgPool` to a borrowed connection so
+/// that its four statements run on the caller's ONE viewer-stamped connection
+/// rather than on four arbitrary raw-pool checkouts. `&mut PgConnection` rather
+/// than a by-value `E: PgExecutor`, because a by-value executor is MOVED by its
+/// first use and this body has four; `&mut *conn` is reborrowed per call.
 async fn compound_response(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::Viewer,
     neighborhood_id: Uuid,
     _budget: i64,
 ) -> Result<CompoundResponse, (axum::http::StatusCode, String)> {
     let nodes: Vec<CompoundNode> = epigraph_db::GraphViewRepository::neighborhood_compound_nodes(
-        pool,
+        &mut *conn,
         viewer,
         neighborhood_id,
     )
@@ -215,7 +239,7 @@ async fn compound_response(
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
@@ -257,7 +281,7 @@ async fn compound_response(
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool).await
+    .fetch_all(&mut *conn).await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
     .map(|(source, target, relationship)| DirectEdge { source, target, relationship })
@@ -315,7 +339,7 @@ async fn compound_response(
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
@@ -365,25 +389,30 @@ async fn compound_response(
     })
 }
 
+/// Conversion shard 5 took this from `pool: &PgPool` to a borrowed connection,
+/// for the reason given on [`compound_response`].
 async fn atomic_response(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::Viewer,
     neighborhood_id: Uuid,
     _budget: i64,
 ) -> Result<AtomicResponse, (axum::http::StatusCode, String)> {
-    let nodes: Vec<AtomicNode> =
-        epigraph_db::GraphViewRepository::neighborhood_atomic_nodes(pool, viewer, neighborhood_id)
-            .await
-            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .into_iter()
-            .map(|r| AtomicNode {
-                id: r.id,
-                label: r.label,
-                compound_id: r.compound_id,
-                pignistic_prob: r.pignistic_prob,
-                frame_id: r.frame_id,
-            })
-            .collect();
+    let nodes: Vec<AtomicNode> = epigraph_db::GraphViewRepository::neighborhood_atomic_nodes(
+        &mut *conn,
+        viewer,
+        neighborhood_id,
+    )
+    .await
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .into_iter()
+    .map(|r| AtomicNode {
+        id: r.id,
+        label: r.label,
+        compound_id: r.compound_id,
+        pignistic_prob: r.pignistic_prob,
+        frame_id: r.frame_id,
+    })
+    .collect();
 
     let edges: Vec<AtomicEdge> = sqlx::query_as::<_, (Uuid, Uuid, String)>(
         r#"
@@ -396,7 +425,7 @@ async fn atomic_response(
           AND ft.forward_strength > 0
         "#,
     )
-    .bind(neighborhood_id).fetch_all(pool).await
+    .bind(neighborhood_id).fetch_all(&mut *conn).await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
     .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
@@ -404,7 +433,7 @@ async fn atomic_response(
 
     let compound_groups: Vec<CompoundGroup> =
         epigraph_db::GraphViewRepository::neighborhood_compound_groups(
-            pool,
+            &mut *conn,
             viewer,
             neighborhood_id,
         )
@@ -514,15 +543,30 @@ pub async fn claim_compound_neighborhood(
     Query(params): Query<CompoundNeighborhoodParams>,
 ) -> Result<Json<CompoundNeighborhoodResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
+    // Conversion shard 5: one viewer-stamped connection across all four
+    // statements, so the centre's visibility check and the neighbour
+    // aggregation describe the same corpus.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_compound_neighborhood",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to acquire a scoped connection".to_string(),
+        )
+    })?;
     let budget = params.budget.clamp(1, 200);
 
     // Fetch center claim content + verify the VIEWER can see it. A claim the
     // viewer cannot read is reported as absent, identically to one that does
     // not exist.
-    let center = epigraph_db::GraphViewRepository::compound_center_content(pool, &viewer, claim_id)
-        .await
-        .map_err(internal)?;
+    let center =
+        epigraph_db::GraphViewRepository::compound_center_content(&mut *read, &viewer, claim_id)
+            .await
+            .map_err(internal)?;
     let Some(center_content) = center else {
         return Err((StatusCode::NOT_FOUND, "claim not found".into()));
     };
@@ -532,7 +576,7 @@ pub async fn claim_compound_neighborhood(
     // compound (or themselves if standalone). The center claim's projection
     // is filtered out so we don't return self-loops.
     let rows = epigraph_db::GraphViewRepository::compound_neighbors(
-        pool,
+        &mut *read,
         &viewer,
         claim_id,
         budget + 1, // +1 so we can detect truncation
@@ -549,7 +593,7 @@ pub async fn claim_compound_neighborhood(
         "SELECT COUNT(*)::bigint FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
     )
     .bind(claim_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *read)
     .await
     .map_err(internal)?
         > 0;
@@ -557,7 +601,7 @@ pub async fn claim_compound_neighborhood(
         "SELECT COUNT(*)::bigint FROM edges WHERE target_id = $1 AND relationship = 'decomposes_to'",
     )
     .bind(claim_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *read)
     .await
     .map_err(internal)?
         > 0;

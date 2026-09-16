@@ -205,10 +205,50 @@ impl AgentRepository {
 
     /// Get an agent by ID
     ///
+    /// # Tenancy: takes an executor, and deliberately takes no `Viewer`
+    ///
+    /// Widened from `&PgPool` to `E: PgExecutor` by conversion shard 5 so that
+    /// the five `routes/political.rs` handlers which call it alongside a
+    /// viewer-spliced `PoliticalRepository` read can run BOTH statements on one
+    /// viewer-stamped connection. The SQL, its binds and the projected row shape
+    /// are unchanged; nothing else about this function was re-derived.
+    ///
+    /// **MOTIVATION IS NOT REACH, and the reach is wider than the motivation.**
+    /// Those five handlers are why the signature moved; they are not the whole
+    /// caller set. Ten other PRODUCTION call sites, across six files — four in
+    /// `routes/agents.rs`, two in `routes/crud.rs`, and one each in
+    /// `routes/claims.rs`, `routes/submit.rs`, `routes/webhooks.rs` (inside
+    /// `agent_principal_exists`, a file under a standing do-not-convert hold)
+    /// and `epigraph-engine/src/export/prov.rs` — were NOT touched and continue
+    /// to pass a `&PgPool`, which still satisfies `E: PgExecutor<'e>`. So no
+    /// caller changed behaviour and none needed editing; the count is stated
+    /// because this doc is the tree's explanation of why the signature moved,
+    /// and a motivation read as an inventory understates what the widening
+    /// reaches.
+    ///
+    /// It has no `Viewer` because there is nothing on `agents` for one to
+    /// narrow, and that is a deliberate schema decision rather than an
+    /// oversight. `migrations/077_rls_policies.sql` §9 creates
+    /// `agents_identity ON public.agents FOR SELECT TO PUBLIC USING (true)` and
+    /// states the reason in the migration itself: `agents.id` / `display_name` /
+    /// `public_key` "must render authorship on public claims, so the ROW is
+    /// universally readable and PostgreSQL has no column-level RLS to narrow
+    /// it." That migration names THIS function explicitly among the ones which
+    /// "take no `Viewer` and return the full row". The compensating projection —
+    /// `profile_visibility` gating `properties`, `orcid` and `ror_id` — lives in
+    /// exactly one function, [`Self::get_public_profile`], and the residual is
+    /// already on record as `D-PR17-agent-projection-enforced-at-one-call-site`.
+    /// Stamping the session GUCs on this read changes no row either way; the
+    /// value of the widening is entirely in the SIBLING statement it lets share
+    /// the connection.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: AgentId) -> Result<Option<Agent>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: AgentId,
+    ) -> Result<Option<Agent>, DbError> {
         let uuid: Uuid = id.into();
 
         let row = sqlx::query!(
@@ -219,7 +259,7 @@ impl AgentRepository {
             "#,
             uuid
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {

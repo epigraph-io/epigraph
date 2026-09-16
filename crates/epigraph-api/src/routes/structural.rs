@@ -7,6 +7,24 @@
 //! - `GET /api/v1/structural-features/:owner_id` — statistical features for
 //!   owner's subgraph, restricted to the caller's visible set.
 //!
+//! # Tenancy: this file's single raw-pool site is converted
+//!
+//! Conversion shard 5. `get_structural_features` held one
+//! `let pool = &state.db_pool;` alias that fanned into NINE sequential
+//! `StructuralRepository` round-trips; all nine now run on ONE viewer-stamped
+//! connection from [`AppState::read_as`], which is what makes the nine
+//! aggregates describe a single corpus rather than nine samples taken a
+//! connection apart. The file leaves `no_unscoped_pool.rs::UNCONVERTED`
+//! entirely.
+//!
+//! One consequence that no row-count assertion will show: the handler now holds
+//! a pooled connection for the whole nine-statement sequence rather than
+//! borrowing one per statement. That is a real change in connection-hold under
+//! load — the largest in this series so far — and the same shape
+//! `F-PR26-lineage-holds-one-connection-for-n-round-trips` already records.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+//!
 //! The plan's PR-08 evidence line says this route is registered *"inside the
 //! `public` Router (`mod.rs:671`)"* and must be moved. It is already on
 //! `protected`, in BOTH `create_router` variants (`routes/mod.rs`, the
@@ -330,15 +348,40 @@ pub async fn get_structural_features(
 ) -> Result<Json<StructuralFeaturesResponse>, ApiError> {
     use epigraph_db::StructuralRepository;
 
-    let pool = &state.db_pool;
     let apply_noise = noise_engages(params.epsilon);
     if !apply_noise {
         crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
     }
 
+    // Conversion shard 5: ONE viewer-stamped connection, threaded through all
+    // nine repo round-trips below. That is what makes this response internally
+    // consistent -- nine aggregates over the corpus THIS reader can see, rather
+    // than nine samples taken a connection apart.
+    //
+    // ORDERING, STATED WITH ITS CONDITION. The `claims:admin` check above runs
+    // before this acquire ONLY on the branch where `noise_engages(params.epsilon)`
+    // is false -- the exact-count path. On the noised path there is no scope
+    // check at all, so every authenticated caller reaches here and holds one
+    // pooled connection across all nine round-trips below. An earlier revision
+    // of this comment stated the ordering unconditionally, which was true of one
+    // branch and read as true of both. The connection-hold consequence itself is
+    // recorded in this module's doc and on
+    // `F-PR26-lineage-holds-one-connection-for-n-round-trips`.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_structural_features",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // 1. Node counts by type
     let node_type_counts: Vec<NodeTypeCount> =
-        StructuralRepository::node_counts(pool, &viewer, owner_id)
+        StructuralRepository::node_counts(&mut *read, &viewer, owner_id)
             .await?
             .into_iter()
             .map(|(node_type, count)| NodeTypeCount { node_type, count })
@@ -346,7 +389,7 @@ pub async fn get_structural_features(
 
     // 2. Edge counts by coarse relationship type
     let edge_type_counts: Vec<EdgeTypeCount> =
-        StructuralRepository::edge_counts(pool, &viewer, owner_id)
+        StructuralRepository::edge_counts(&mut *read, &viewer, owner_id)
             .await?
             .into_iter()
             .map(|(relationship, count)| EdgeTypeCount {
@@ -356,20 +399,21 @@ pub async fn get_structural_features(
             .collect();
 
     // 3. Degree distribution
-    let degree_rows = StructuralRepository::degrees(pool, &viewer, owner_id).await?;
+    let degree_rows = StructuralRepository::degrees(&mut *read, &viewer, owner_id).await?;
     let degrees: Vec<f64> = degree_rows.iter().map(|(d,)| *d as f64).collect();
     let degree_stats = compute_degree_stats(&degrees);
 
     // 4. Belief interval widths
-    let belief_rows = StructuralRepository::belief_intervals(pool, &viewer, owner_id).await?;
+    let belief_rows = StructuralRepository::belief_intervals(&mut *read, &viewer, owner_id).await?;
     let belief_stats = compute_belief_stats(&belief_rows);
 
     // 5. Frame coverage
-    let frame_coverage = StructuralRepository::frame_coverage(pool, &viewer, owner_id).await?;
+    let frame_coverage =
+        StructuralRepository::frame_coverage(&mut *read, &viewer, owner_id).await?;
 
     // 6. Temporal activity (last 30 days, 7-day bins)
     let temporal_bins: Vec<TemporalBin> =
-        StructuralRepository::temporal_bins(pool, &viewer, owner_id)
+        StructuralRepository::temporal_bins(&mut *read, &viewer, owner_id)
             .await?
             .into_iter()
             .map(|(bin_label, count)| TemporalBin { bin_label, count })
@@ -377,16 +421,16 @@ pub async fn get_structural_features(
 
     // 7. Local clustering coefficients
     let clustering_rows =
-        StructuralRepository::clustering_coefficients(pool, &viewer, owner_id).await?;
+        StructuralRepository::clustering_coefficients(&mut *read, &viewer, owner_id).await?;
     let clustering_stats = compute_clustering_stats(&clustering_rows);
 
     // 8. Community membership count
     let community_count =
-        StructuralRepository::community_membership_count(pool, &viewer, owner_id).await?;
+        StructuralRepository::community_membership_count(&mut *read, &viewer, owner_id).await?;
 
     // 9. Conflict coefficient distribution
     let conflict_rows =
-        StructuralRepository::conflict_coefficients(pool, &viewer, owner_id).await?;
+        StructuralRepository::conflict_coefficients(&mut *read, &viewer, owner_id).await?;
     let conflict_stats = compute_conflict_stats(&conflict_rows);
 
     // Every count-shaped field is noised in ONE place, after the response is

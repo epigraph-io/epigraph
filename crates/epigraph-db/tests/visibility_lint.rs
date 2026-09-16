@@ -1170,6 +1170,34 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `ClaimThemeRepository::claims_in_themes_at_dim_since`, which DOES take a `&Viewer` and \
          splices it. PR-29 widened the executor only; the SQL is unchanged.",
     ),
+    (
+        "agent.rs",
+        "get_by_id",
+        "Reads `agents` by primary key; the statement's FROM is `agents` alone and it joins \
+         nothing. THIS ENTRY'S ARGUMENT DIFFERS FROM THE TWO ABOVE AND IS STATED AS IT ACTUALLY \
+         IS: `methods` and `claim_themes` carry no RLS at all, whereas `agents` DOES \
+         (`relrowsecurity` is true) -- its SELECT policy simply does not narrow anything. \
+         `migrations/077_rls_policies.sql` section 9 creates `agents_identity ON public.agents \
+         FOR SELECT TO PUBLIC USING (true)` and gives the reason in the migration: \
+         `agents.id`/`display_name`/`public_key` `must render authorship on public claims, so \
+         the ROW is universally readable and PostgreSQL has no column-level RLS to narrow it`. \
+         That migration names `AgentRepository::get_by_id` EXPLICITLY among the functions which \
+         `take no Viewer and return the full row`, and points at the compensating projection -- \
+         `profile_visibility` gating `properties`/`orcid`/`ror_id` -- implemented in exactly one \
+         function, `agent.rs::get_public_profile`. The residual that leaves is already on record \
+         as `D-PR17-agent-projection-enforced-at-one-call-site`; this entry does not discharge \
+         it and does not re-derive it. SCOPE: conversion shard 5 widened the executor ONLY, so \
+         that the five `routes/political.rs` handlers calling this beside a viewer-spliced \
+         `PoliticalRepository` read can run both statements on ONE stamped connection. The SQL, \
+         its binds and the projected row shape are unchanged and were not re-derived here. \
+         REACH IS WIDER THAN MOTIVATION: those five are why the signature moved, not the whole \
+         caller set. Ten other production call sites across six files -- `routes/agents.rs` (4), \
+         `routes/crud.rs` (2), and one each in `routes/claims.rs`, `routes/submit.rs`, \
+         `routes/webhooks.rs::agent_principal_exists` and \
+         `epigraph-engine/src/export/prov.rs` -- were not touched and still pass `&PgPool`, \
+         which satisfies `E: PgExecutor<'e>`. Stated here for the same reason the SQL/executor \
+         split above is stated: so a reader does not mistake the motivation for the inventory.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
