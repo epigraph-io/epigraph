@@ -786,3 +786,82 @@ async fn neighborhoods_expand_redacts_labels_in_both_modes() {
         PRIVATE_BODY
     );
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/claims/:id/compound_neighborhood
+//
+// The sweep's blind spot: this route is on the PUBLIC router, so the
+// non-owner half of the triple is a genuinely anonymous caller — and every
+// `label` it emits, the centre's included, is raw `claims.content`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_compound_neighborhood_redacts_labels_for_non_owner_only() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let owner = Uuid::new_v4();
+
+    // A private centre with no `decomposes_to` children, so it is its own
+    // atom, reached through `supports` (forward_strength 0.7 > 0, which is
+    // what `epistemic_edges` requires).
+    let center = seed_claim_full(&pool, PRIVATE_BODY, owner, None, None, &[]).await;
+    common::seed_private_ownership(&pool, center, owner).await;
+    let private_neighbour = seed_claim_full(&pool, PRIVATE_BODY, owner, None, None, &[]).await;
+    common::seed_private_ownership(&pool, private_neighbour, owner).await;
+    let public_neighbour = seed_claim_full(&pool, PUBLIC_BODY, owner, None, None, &[]).await;
+    for neighbour in [private_neighbour, public_neighbour] {
+        common::insert_edge(&pool, center, neighbour, "claim", "claim", "supports").await;
+    }
+
+    let url = format!("http://{addr}/api/v1/claims/{center}/compound_neighborhood");
+    let label_of = |body: &Value, id: Uuid| field_for(body, "nodes", "id", id, "label");
+
+    // Anonymous: both private labels redacted, the public one untouched.
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let anon: Value = resp.json().await.unwrap();
+    assert_eq!(
+        label_of(&anon, private_neighbour),
+        "[REDACTED]",
+        "an anonymous caller must not read private claim text through a \
+         compound-neighbourhood node label"
+    );
+    assert_eq!(
+        label_of(&anon, center),
+        "[REDACTED]",
+        "the centre's label is `claims.content` too and is redacted the same way"
+    );
+    assert_eq!(
+        label_of(&anon, public_neighbour),
+        PUBLIC_BODY,
+        "public claim text must survive the sweep"
+    );
+
+    // A stranger's token buys nothing: the check is on the authenticated agent.
+    let stranger = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let other: Value = client()
+        .get(&url)
+        .bearer_auth(&stranger)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(label_of(&other, private_neighbour), "[REDACTED]");
+    assert_eq!(label_of(&other, center), "[REDACTED]");
+
+    // Owner token: the real text, so this cannot pass by redacting everything.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let owned: Value = client()
+        .get(&url)
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(label_of(&owned, private_neighbour), PRIVATE_BODY);
+    assert_eq!(label_of(&owned, center), PRIVATE_BODY);
+    assert_eq!(label_of(&owned, public_neighbour), PUBLIC_BODY);
+}

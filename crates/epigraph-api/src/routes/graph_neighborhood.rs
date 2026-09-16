@@ -525,14 +525,30 @@ pub struct CompoundNeighborEdge {
     pub total_strength: f64,
 }
 
+/// Project one claim's 1-hop neighbourhood onto the compound layer.
+///
+/// Every `label` here — the centre's and every neighbour's — is `claims.content`,
+/// so this response carries the same partition restrictions `GET /claims/:id`
+/// enforces: labels the requester may not read become `"[REDACTED]"` (§2.6).
+/// Unlike the other two expand routes this one is on the **public** router, so
+/// `auth_ctx` is genuinely absent for an anonymous caller and the requester is
+/// then `None` — public content only, which is the fail-closed default.
 pub async fn claim_compound_neighborhood(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<CompoundNeighborhoodParams>,
 ) -> Result<Json<CompoundNeighborhoodResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
     let budget = params.budget.clamp(1, 200);
+
+    // SECURITY: requester from the validated bearer only; the `get_claim`
+    // convention (`agent_id`, falling back to `client_id`), shared by every
+    // handler in the §2.6 sweep.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // Fetch center claim content + verify it exists.
     let center: Option<(String,)> = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
@@ -673,6 +689,15 @@ pub async fn claim_compound_neighborhood(
             pignistic_prob: None,
         },
     );
+
+    // Centre and neighbours alike are `claims.content`; one ownership lookup
+    // covers the whole node set, matching the cost of the other swept routes.
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
+    )
+    .await;
 
     Ok(Json(CompoundNeighborhoodResponse {
         center_id: claim_id,
