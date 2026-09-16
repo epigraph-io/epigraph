@@ -951,6 +951,30 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// correct: it satisfies `epigraph_definer_bypass()` and bypasses row security
 /// outright, so nothing is degraded.
 ///
+/// # ⚠ `epigraph_group_roster_admits_principal` (92) — THE FOURTH DIRECTION
+///
+/// Deferred for the same structural reason as 083/086/089: 092 is later than
+/// every migration step 11c applies, so an unconditional entry would report
+/// `does not exist` and fail a correctly sequenced deploy.
+///
+/// **Its failure direction is the one none of the other entries has, and it is
+/// why this entry is not optional.** 070's five lose a WRITE, 071's lost a LEAK,
+/// 086's degrades a READ CONTROL, 089's loses COVERAGE — all of them fail
+/// closed-ish, because their bodies ask `EXISTS` and an RLS-filtered read
+/// answers "no". This body's first disjunct asks `NOT EXISTS (any roster row for
+/// this group)`, so an RLS-filtered read answers **yes** and the predicate
+/// ADMITS. An app-owned or runner-owned body therefore does not degrade the
+/// narrowing migration 092 installs — it SILENTLY REVERTS it to migration 077's
+/// unbounded arm, with no error, no catalog symptom and a green test suite.
+///
+/// The predicate this gate applies —
+/// `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')` — is exactly the
+/// condition `epigraph_definer_bypass()` itself tests, so this entry checks the
+/// thing the correctness of 092 rests on rather than a proxy for it. The CI half
+/// is `schema_contract.rs::migration_092_roster_definer_is_revoked_from_public`,
+/// which pins `proowner` by string equality; this half is what an operator gets
+/// on a cluster whose catalog CI never sees.
+///
 /// ## And what a non-member owner actually costs, measured
 ///
 /// Not "the stamp is filtered away silently" — that was an earlier draft's claim
@@ -969,6 +993,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_claim_tenancy_by_ids", 86),
     ("epigraph_is_instance_admin", 83),
     ("epigraph_inherit_fragment_tenancy_stmt", 89),
+    ("epigraph_group_roster_admits_principal", 92),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

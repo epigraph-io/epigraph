@@ -912,6 +912,317 @@ async fn a_principal_can_create_a_group_and_enrol_itself_but_not_impersonate(poo
     );
 }
 
+/// Migration 092: the whole three-statement bootstrap still succeeds, including
+/// the `RETURNING` and the epoch-0 insert the test above omits.
+///
+/// This is the OVER-SUPPRESSION guard for 092, and it is a distinct test from
+/// [`a_principal_can_create_a_group_and_enrol_itself_but_not_impersonate`]
+/// because that one issues plain `INSERT`s and therefore exercises `WITH CHECK`
+/// only. `GroupRepository::create_with_admin` writes
+/// `INSERT INTO groups … RETURNING id`, and MEASURED on PostgreSQL 16.13 an
+/// `INSERT … RETURNING` is refused when the USING clause rejects the new row —
+/// so the `groups` USING arm is load-bearing for group creation and a narrowing
+/// that got it wrong would take group creation down entirely. 077's frozen
+/// header attributes the USING arm to `community.rs`'s `ON CONFLICT` instead;
+/// an UNTARGETED `ON CONFLICT DO NOTHING`, which is what `community.rs` writes
+/// on `groups`, does not consult the SELECT side at all. 092's header carries
+/// the correction, which is the only place it can live.
+///
+/// All three statements run on ONE connection with the GUCs an app connection
+/// has at group-creation time: no groups, no writable groups, a principal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_three_statement_bootstrap_still_succeeds_under_the_roster_bound_arm(pool: PgPool) {
+    let (agent, _g) = fixture::seed_agent_with_group(&pool, "bootstrap").await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    let (returned, epoch, enrolled) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            set_gucs(&mut conn, "", "", &agent.to_string()).await;
+            let returned: Result<Uuid, _> = sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('boot', 'did:probe:' || gen_random_uuid()::text, $1, 'team', $2) \
+             RETURNING id",
+        )
+        .bind(vec![7u8; 32])
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await;
+            let Ok(new_group) = returned else {
+                return (conn, (returned, None, None));
+            };
+            let epoch = sqlx::query(
+                "INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status) \
+             VALUES ($1, 0, NULL, 'active')",
+            )
+            .bind(new_group)
+            .execute(&mut *conn)
+            .await;
+            let enrolled = sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'admin')",
+        )
+        .bind(new_group)
+        .bind(agent)
+        .execute(&mut *conn)
+        .await;
+            (conn, (returned, Some(epoch), Some(enrolled)))
+        })
+        .await;
+
+    returned.expect(
+        "`INSERT INTO groups … RETURNING id` is `GroupRepository::create_with_admin`'s first \
+         statement and it consults the USING clause. A refusal here is a total outage on group \
+         creation — the roster conjunct must be TRUE while the group has no roster.",
+    );
+    epoch
+        .expect("epoch-0 was not reached")
+        .expect("the epoch-0 insert runs in the same transaction, before the creator is a member");
+    enrolled
+        .expect("enrolment was not reached")
+        .expect("the creator's own first admin membership is the third statement");
+}
+
+/// **Migration 092, the positive direction.** A creator who is STILL a live
+/// member reads the group it created, its roster and its key epochs — with no
+/// group GUCs at all, so the reads are carried by the bootstrap arm alone.
+///
+/// Over-suppression is silent and permanent (plan §0.5, §8.4 P1): a narrowing
+/// that refused every creator would satisfy any negative test. The GUCs are
+/// deliberately `("", "", agent)` rather than the group's id, so
+/// `epigraph_session_groups()` is empty and this test cannot pass through the
+/// membership disjunct by accident.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_live_creator_still_reads_the_group_its_roster_and_its_epochs(pool: PgPool) {
+    let f = creator_arm_fixture(&pool, "live-creator").await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    let seen = read_as_creator(&pool, &f).await;
+
+    assert_eq!(
+        seen,
+        (1, 1, 1),
+        "a creator who is still a live member must keep the identity row, the OTHER member's \
+         roster row and the key epoch. Got (groups, other-member rows, epochs) = {seen:?}. If \
+         this is (0, 0, 0) the 092 narrowing over-suppresses and group administration is \
+         broken for everybody, which no negative test would report."
+    );
+}
+
+/// **Migration 092, the negative direction.** The bootstrap arm ends where the
+/// creator's own membership ends.
+///
+/// `groups.created_by_agent_id` is never rewritten, so before 092 the arm had no
+/// end: the three policies that carry it — on the identity row, the roster and
+/// the key epochs — kept admitting a creator whose membership in the group was
+/// over. Recorded as `D-PR17-creator-arm-outlives-membership`.
+///
+/// **The calibration is the third assertion.** The creator still reads its OWN
+/// membership row afterwards, through `group_memberships_tenancy`'s
+/// `agent_id = epigraph_principal_id()` disjunct, which 092 does not touch. If
+/// that read were also empty the instrument would be reporting "RLS refuses
+/// everything" rather than "this arm stopped", and the first two assertions
+/// would prove nothing.
+///
+/// **The fourth assertion is the WRITE direction**, and it is a different kind
+/// of evidence from the three reads. `epigraph_is_group_creator` gates four
+/// clauses — USING *and* WITH CHECK on both `group_memberships_tenancy` and
+/// `group_key_epochs_tenancy` — and a USING clause FILTERS silently while a
+/// WITH CHECK clause RAISES. The reads above can only ever observe the filter,
+/// so a future re-issue that narrowed the read side and left the write side as
+/// 077 wrote it would keep them green. The enrolment pair below (admitted
+/// before, refused after, same fixture, same connection shape) is what pins the
+/// gate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_creator_arm_ends_with_the_creators_own_membership(pool: PgPool) {
+    let f = creator_arm_fixture(&pool, "ex-creator").await;
+    let (newcomer_before, _) = fixture::seed_agent_with_group(&pool, "ex-creator-before").await;
+    let (newcomer_after, _) = fixture::seed_agent_with_group(&pool, "ex-creator-after").await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    // Calibration: the arm admits while the membership is live. Same connection
+    // shape as the assertion below, so a policy that filtered everything would
+    // fail HERE first.
+    assert_eq!(
+        read_as_creator(&pool, &f).await,
+        (1, 1, 1),
+        "the fixture must be visible BEFORE the revocation, or the negative below is vacuous"
+    );
+    enrol_as_creator(&pool, &f, newcomer_before).await.expect(
+        "CALIBRATION for the write direction: while the creator's own membership is live the \
+         enrolment is admitted. A refusal here would make the WITH CHECK assertion below \
+         vacuous — it would be reporting that this connection may never write at all.",
+    );
+
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(f.group)
+    .bind(f.creator)
+    .execute(&pool)
+    .await
+    .expect("revoke the creator's own membership");
+
+    let seen = read_as_creator(&pool, &f).await;
+    assert_eq!(
+        seen,
+        (0, 0, 0),
+        "after the creator's own membership ends, the bootstrap arm must no longer admit the \
+         group's identity row, the rest of its roster or its key epochs. Got (groups, \
+         other-member rows, epochs) = {seen:?}."
+    );
+
+    let own: i64 = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", &f.creator.to_string()).await;
+        let n = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(f.group)
+        .bind(f.creator)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("own membership count");
+        (conn, n)
+    })
+    .await;
+    assert_eq!(
+        own, 1,
+        "CALIBRATION: the principal still reads its OWN membership row through \
+         `group_memberships_tenancy`'s agent_id disjunct, which 092 does not touch. Zero here \
+         means the connection sees nothing at all and the assertions above are vacuous."
+    );
+
+    let refused = enrol_as_creator(&pool, &f, newcomer_after).await;
+    let code = refused
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .and_then(|e| e.code())
+        .map(|c| c.to_string());
+    assert_eq!(
+        code.as_deref(),
+        Some("42501"),
+        "THE WRITE DIRECTION. After the creator's own membership ends, enrolling a further \
+         member must be REFUSED BY THE POLICY, not silently filtered and not failing for some \
+         unrelated reason — 42501 is the row-level-security refusal, and asserting it rather \
+         than `is_err()` is what keeps a constraint violation or a privilege slip from standing \
+         in for the control. `group_memberships_tenancy`'s WITH CHECK offers this statement \
+         `epigraph_is_group_admin` (false — the admin row is revoked) or \
+         `epigraph_is_group_creator` (false under 092), so the row has no clause left to \
+         satisfy. This is the half the three read assertions above cannot see. Got: {refused:?}"
+    );
+}
+
+/// The creator enrolling a further member: `group_memberships_tenancy`'s WITH
+/// CHECK, on the same connection shape [`read_as_creator`] uses.
+///
+/// A plain `INSERT` with no `RETURNING` and no `ON CONFLICT` on purpose —
+/// measured on PostgreSQL 16.13, those two forms also consult the USING clause,
+/// which would make a refusal here ambiguous between the read side and the write
+/// side. This statement can only be refused by WITH CHECK.
+async fn enrol_as_creator(
+    pool: &PgPool,
+    f: &CreatorArmFixture,
+    newcomer: Uuid,
+) -> Result<(), sqlx::Error> {
+    let (group, creator) = (f.group, f.creator);
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", &creator.to_string()).await;
+        let r = sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'writer')",
+        )
+        .bind(group)
+        .bind(newcomer)
+        .execute(&mut *conn)
+        .await;
+        (conn, r.map(|_| ()))
+    })
+    .await
+}
+
+/// A creator, a second live member, a key epoch — the state the creator arm
+/// spans across all three policies it appears in.
+struct CreatorArmFixture {
+    creator: Uuid,
+    group: Uuid,
+    other: Uuid,
+}
+
+async fn creator_arm_fixture(pool: &PgPool, label: &str) -> CreatorArmFixture {
+    let (creator, _) = fixture::seed_agent_with_group(pool, &format!("{label}-creator")).await;
+    let (other, _) = fixture::seed_agent_with_group(pool, &format!("{label}-other")).await;
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'did:probe:' || gen_random_uuid()::text, $2, 'team', $3) RETURNING id",
+    )
+    .bind(label)
+    .bind(vec![9u8; 32])
+    .bind(creator)
+    .fetch_one(pool)
+    .await
+    .expect("seed the created group");
+    for (agent, role) in [(creator, "admin"), (other, "writer")] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, $3)",
+        )
+        .bind(group)
+        .bind(agent)
+        .bind(role)
+        .execute(pool)
+        .await
+        .expect("seed membership");
+    }
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status) \
+         VALUES ($1, 0, NULL, 'active')",
+    )
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed epoch 0");
+    CreatorArmFixture {
+        creator,
+        group,
+        other,
+    }
+}
+
+/// `(groups, other-member roster rows, key epochs)` visible to the creator on an
+/// `epigraph_app` connection stamped with a principal and NO group ids.
+///
+/// The roster count deliberately excludes the creator's own row: that row is
+/// admitted by a different disjunct, so counting it would make the probe
+/// insensitive to the arm under test.
+async fn read_as_creator(pool: &PgPool, f: &CreatorArmFixture) -> (i64, i64, i64) {
+    let (group, creator, other) = (f.group, f.creator, f.other);
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", &creator.to_string()).await;
+        let g = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM groups WHERE id = $1")
+            .bind(group)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("group count");
+        let m = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(group)
+        .bind(other)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("roster count");
+        let e = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM group_key_epochs WHERE group_id = $1",
+        )
+        .bind(group)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("epoch count");
+        (conn, (g, m, e))
+    })
+    .await
+}
+
 // ===========================================================================
 // The unstamped-negative class, and the predicate-shape ratchet
 //
@@ -962,6 +1273,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
         // repair — a `ROW_ONLY_BY_DESIGN` entry — would genuinely weaken this
         // ratchet by excusing an arm rather than recognising a helper.
         "epigraph_is_instance_admin",
+        // 092's roster predicate, on the same ground as the two entries above:
+        // its body binds its subject to `epigraph_principal_id()`, which
+        // `locked_decisions.rs::d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster`
+        // asserts, so an arm naming it IS session-derived however the argument is
+        // spelled. Today 092's arm passes only via the ADJACENT
+        // `created_by_agent_id = (SELECT public.epigraph_principal_id())` in the
+        // same fragment — the incidental shape the 083 comment above criticises.
+        // Listing the helper is what lets a future arm spell the bound without
+        // that neighbour and still be recognised instead of false-flagged.
+        "epigraph_group_roster_admits_principal",
     ];
     // ARMS — not policies — that are row-only BY DESIGN, each with the reason.
     //

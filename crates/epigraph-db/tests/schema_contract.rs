@@ -1051,3 +1051,114 @@ async fn migration_089_stamping_definer_is_revoked_from_public(pool: PgPool) {
          when a later migration re-creates the body and forgets to repeat the REVOKE."
     );
 }
+
+/// Migration 092's roster predicate keeps its OWNER, its explicit ACL and its
+/// revocation from `PUBLIC`.
+///
+/// # The owner assertion is a CORRECTNESS control here, not hygiene
+///
+/// On 086's and 089's bodies the owner protects COVERAGE: those bodies ask
+/// `EXISTS`, so an RLS-filtered read answers "no" and they fail toward doing
+/// less. `epigraph_group_roster_admits_principal`'s first disjunct asks
+/// `NOT EXISTS (any roster row for this group)`, so an incomplete read answers
+/// **yes** and the predicate ADMITS. Its read of `group_memberships` is complete
+/// only inside a definer frame that `epigraph_definer_bypass()` admits, and that
+/// function tests membership of `epigraph_maintenance` against `current_user`,
+/// i.e. against this function's owner. Lose the owner and migration 092's
+/// narrowing silently becomes migration 077's unbounded arm — no error, and
+/// `locked_decisions.rs::d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster`
+/// still passes, because it greps `prosrc` for a predicate name that survives
+/// any ownership change.
+///
+/// # Why a per-function test rather than a sweep
+///
+/// Unchanged from `migration_089_stamping_definer_is_revoked_from_public`: there
+/// is no generic sweep in this workspace asserting "every `prosecdef` function
+/// in `public` is revoked from `PUBLIC`", so a body with no bespoke pin is
+/// caught by nothing at all. 092's `ALTER FUNCTION … OWNER TO` sits inside a
+/// `pg_roles` guard that silently no-ops when 060 could only `RAISE NOTICE`, and
+/// `CREATE OR REPLACE` preserves `proacl` while `DROP FUNCTION` + `CREATE`
+/// restores the default — which IS the implicit `EXECUTE` to `PUBLIC`.
+///
+/// Pinned by string equality here, where
+/// `tenancy_backfill.rs::verify_definer_ownership` uses `pg_has_role`, for the
+/// same reason 089's pin is: this test pins what migration 092 INSTALLS, the
+/// deploy gate tolerates what a valid deploy can produce (a member role, or a
+/// superuser).
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
+    let meta: Option<(bool, String)> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname \
+           FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+           JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE n.nspname = 'public' \
+            AND p.proname = 'epigraph_group_roster_admits_principal'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner) =
+        meta.expect("public.epigraph_group_roster_admits_principal must exist (migration 092)");
+    assert!(
+        secdef,
+        "epigraph_group_roster_admits_principal must stay SECURITY DEFINER. 077 FORCEs row \
+         security on group_memberships, so an INVOKER body reads only the roster rows the \
+         calling session could already see — and because the predicate's bootstrap disjunct is \
+         a NOT EXISTS, seeing nothing means ADMITTING rather than refusing."
+    );
+    assert_eq!(
+        owner, "epigraph_maintenance",
+        "it must be owned by epigraph_maintenance, whose membership is what \
+         epigraph_definer_bypass() tests against current_user inside the definer frame. Owned \
+         by a role that is not a member, the frame's read of group_memberships is policy \
+         filtered, the NOT EXISTS disjunct becomes true for every group, and migration 092's \
+         narrowing reverts to migration 077's unbounded creator arm with no error. The owner is \
+         the MECHANISM here, not hardening."
+    );
+
+    let public_can_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('public', \
+                'public.epigraph_group_roster_admits_principal(uuid)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        !public_can_execute,
+        "epigraph_group_roster_admits_principal is EXECUTE-able by PUBLIC. It answers, with the \
+         maintenance role's authority and past group_memberships' FORCEd policy, a question \
+         about one principal's standing in one group. 092's `REVOKE EXECUTE … FROM PUBLIC` is \
+         what keeps that off a surface every role can reach directly — required because a FIRST \
+         creation leaves proacl NULL, which IS the implicit PUBLIC grant."
+    );
+
+    let acl: Option<String> = sqlx::query_scalar(
+        "SELECT proacl::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_group_roster_admits_principal'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("proacl lookup");
+    assert!(
+        acl.is_some(),
+        "epigraph_group_roster_admits_principal must carry an EXPLICIT ACL — a NULL proacl is \
+         the DEFAULT grant, which includes EXECUTE to PUBLIC. This is the assertion that fails \
+         when a later migration re-creates the body and forgets to repeat the REVOKE."
+    );
+
+    let app_can_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('epigraph_app', \
+                'public.epigraph_group_roster_admits_principal(uuid)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("app has_function_privilege lookup");
+    assert!(
+        app_can_execute,
+        "epigraph_app must keep EXECUTE. RLS predicates are evaluated with the QUERYING role's \
+         privileges, so without this grant every access to `groups`, `group_memberships` and \
+         `group_key_epochs` on an app connection is a 42501 rather than a filtered read — the \
+         REVOKE above without the matching GRANT is a total outage, not a narrowing."
+    );
+}
