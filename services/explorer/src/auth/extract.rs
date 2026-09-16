@@ -17,6 +17,7 @@ use axum::http::HeaderMap;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use super::refresh::RefreshError;
 use super::session::{read_session_cookie, SessionId};
 use crate::error::AppError;
 use crate::links::Links;
@@ -148,9 +149,13 @@ impl PageCtx {
 }
 
 /// Resolve the viewer from the `epx_session` cookie, refreshing the access
-/// token when it is within [`PROACTIVE_REFRESH_WINDOW`] of expiry. A session
-/// whose token has expired and cannot be refreshed is dropped. Falls back to
-/// the dev bearer, then to anonymous.
+/// token when it is within [`PROACTIVE_REFRESH_WINDOW`] of expiry.
+///
+/// A session is dropped only when upstream *refuses* the refresh
+/// ([`RefreshError::Rejected`], `NoSession`). If `/oauth/token` could not be
+/// reached at all, the session is kept with its existing token — a restart of
+/// the API is transient and must not sign every user out. Falls back to the
+/// dev bearer, then to anonymous.
 pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth {
     if let Some(id) = read_session_cookie(headers) {
         if let Some(session) = state.sessions.get(&id) {
@@ -170,9 +175,23 @@ pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth 
                         access_token: session.access_token,
                     };
                 }
-                Err(e) => {
-                    tracing::info!(error = %e, "session token expired and refresh failed; ending session");
+                // The token has expired and the refresh was *refused*: the
+                // credential is dead, so end the session.
+                Err(e @ (RefreshError::Rejected(_) | RefreshError::NoSession)) => {
+                    tracing::info!(error = %e, "session token expired and refresh was rejected; ending session");
                     state.sessions.remove(&id);
+                }
+                // The refresh could not reach `/oauth/token` (transport,
+                // timeout, 5xx). An API restart must not sign everyone out,
+                // so keep the session and carry the stale token: upstream
+                // answers 401, `Api::send` refreshes once more, and if that
+                // is refused *then* the session ends.
+                Err(e) => {
+                    tracing::warn!(error = %e, "proactive refresh could not reach upstream; keeping the session with its stale token");
+                    return RequestAuth::Session {
+                        id,
+                        access_token: session.access_token,
+                    };
                 }
             }
         }

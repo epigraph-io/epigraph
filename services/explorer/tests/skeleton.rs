@@ -655,6 +655,62 @@ async fn failed_refresh_ends_the_session() {
     assert!(app.state.sessions.get(&sid).is_none(), "session dropped");
 }
 
+/// A refresh that could not *reach* `/oauth/token` is transient: the API
+/// restarting must not sign every user out, so the session survives and the
+/// call reports the ordinary "API unavailable" failure a section degrades on.
+#[tokio::test]
+async fn unreachable_refresh_keeps_the_session_and_degrades() {
+    let app = spawn().await;
+    mount_claim_for_token(&app, "stale", 401, 1).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream restarting"))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+
+    let sid = app.sign_in("stale");
+    let api = app.state.api(&app.session_auth(&sid, "stale"));
+    let err = api.claim(claim_id()).await.unwrap_err();
+    assert!(
+        matches!(err, UpstreamError::Transport(_)),
+        "a transient refresh failure must not read as SessionExpired: {err:?}"
+    );
+    assert_eq!(
+        err.user_message(),
+        "The EpiGraph API is unavailable right now."
+    );
+    assert!(degrade::<()>(Err(err)).is_ok(), "a section can degrade on it");
+    assert!(
+        app.state.sessions.get(&sid).is_some(),
+        "the session survives an upstream that could not be reached"
+    );
+}
+
+/// Same split on the proactive path: an expired token whose refresh could not
+/// reach upstream keeps the session (with its stale token) instead of
+/// resolving to anonymous.
+#[tokio::test]
+async fn unreachable_proactive_refresh_keeps_the_session() {
+    let app = spawn().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("bad gateway"))
+        .mount(&app.upstream)
+        .await;
+
+    let sid = app.sign_in_expiring("stale", chrono::Duration::seconds(-5));
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        TestApp::cookie(&sid).parse().unwrap(),
+    );
+    let auth = epigraph_explorer::auth::resolve_auth(&app.state, &headers).await;
+    assert_eq!(auth.session_id(), Some(&sid), "session kept: {auth:?}");
+    assert_eq!(auth.bearer(), Some("stale"), "stale token carried forward");
+    assert!(app.state.sessions.get(&sid).is_some());
+}
+
 #[tokio::test]
 async fn second_401_after_refresh_ends_the_session() {
     let app = spawn().await;

@@ -355,8 +355,13 @@ Then sign in through the browser and open a claim.
   privileges of its own. It never sends a token it knows is stale, because
   the API returns 401 for a present-but-invalid bearer even on public routes.
   It refreshes a token 60 s before expiry. After an upstream 401 it refreshes
-  and retries once, and a second failure ends the session. Refresh runs one
+  and retries once, and a second 401 ends the session. Refresh runs one
   at a time per session, and the rotated refresh token is stored every time.
+  A refresh that *fails* ends the session only when upstream refused it
+  (`invalid_grant`, a revoked token, no such session). A refresh that could
+  not reach `/oauth/token` at all — a restart, a timeout, a 5xx — keeps the
+  session and reports the ordinary "API unavailable" failure, so an API
+  restart does not sign every user out.
 - **Redaction short-circuit.** Several upstream read routes do not yet redact
   what `GET /claims/{id}` redacts (plan §2.6). If `GET /claims/{id}` returns
   the content `"[REDACTED]"`, the Explorer skips every other content-bearing
