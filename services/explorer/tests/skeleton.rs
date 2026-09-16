@@ -210,11 +210,16 @@ async fn signed_in_pages_redirect_anonymous_viewers_to_login() {
 async fn every_area_route_is_mounted() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
-    // Every plan §3.4 page route, whatever it answers, must answer from real
-    // area code. Upstream is unmocked here, so the status is whatever that
-    // area's degradation policy produces; only "is it still the skeleton?" is
-    // asserted. Per-route behaviour is pinned in tests/core.rs, tests/entities.rs,
-    // tests/graph.rs and tests/auth.rs.
+    // Every plan §3.4 route must be answered by real area code. Upstream is
+    // unmocked, so the status is whatever that area's own error policy
+    // produces; what is asserted is that the answer came from the area and not
+    // from the router fallback or the skeleton stub. An unmounted path renders
+    // `AppError::NotFound("page")` (error.rs `from_status`), so "that page" in
+    // the body is the fallback's fingerprint — an area's own 404 names the
+    // entity it looked for ("that claim", "that agent", …). Per-route
+    // behaviour is pinned in tests/core.rs, tests/entities.rs, tests/graph.rs
+    // and tests/auth.rs.
+    const FALLBACK: &str = "could not find that page";
     let pages = [
         "/explorer/".to_string(),
         "/explorer/search?q=x".to_string(),
@@ -231,7 +236,7 @@ async fn every_area_route_is_mounted() {
     ];
     for uri in &pages {
         let res = app.get_as(uri, &sid).await;
-        assert_ne!(res.status, StatusCode::NOT_FOUND, "not mounted: {uri}");
+        assert!(!res.body.contains(FALLBACK), "not mounted: {uri}");
         assert!(!res.body.contains("not built yet"), "still a stub: {uri}");
     }
     // Auth routes are built (tests/auth.rs covers them). Here: mounted and no
@@ -249,7 +254,20 @@ async fn every_area_route_is_mounted() {
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
     }
     // Same for every §3.4 BFF route: mounted, and no longer the 501 `not_built`
-    // placeholder the skeleton shipped.
+    // placeholder the skeleton shipped. The two overviews are the exception to
+    // the unmocked-upstream rule: their handlers propagate an upstream 404 as
+    // `NotFound("page")`, which is indistinguishable from the router fallback,
+    // so they get an empty-but-valid upstream answer here.
+    for p in [
+        "/api/v1/graph/themes/overview",
+        "/api/v1/graph/communities/overview",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&app.upstream)
+            .await;
+    }
     let bff = [
         format!("/explorer/bff/claim/{CLAIM}"),
         "/explorer/bff/search?q=x".to_string(),
@@ -260,7 +278,7 @@ async fn every_area_route_is_mounted() {
     ];
     for uri in &bff {
         let res = app.get_as(uri, &sid).await;
-        assert_ne!(res.status, StatusCode::NOT_FOUND, "not mounted: {uri}");
+        assert!(!res.body.contains(FALLBACK), "not mounted: {uri}");
         assert_ne!(
             res.status,
             StatusCode::NOT_IMPLEMENTED,
