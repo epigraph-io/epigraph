@@ -53,9 +53,6 @@ pub enum AppError {
     /// 503: the page as a whole cannot be served right now.
     #[error("degraded: {0}")]
     Degraded(String),
-    /// 501 from `/bff/*` stubs that an area has not built yet.
-    #[error("not built yet: {0}")]
-    NotBuilt(&'static str),
     /// Internal error (500). The detail is logged, never shown.
     #[error("internal error: {0}")]
     Internal(String),
@@ -101,7 +98,6 @@ impl AppError {
             AppError::Upstream(UpstreamError::Timeout) => StatusCode::GATEWAY_TIMEOUT,
             AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Degraded(_) => StatusCode::SERVICE_UNAVAILABLE,
-            AppError::NotBuilt(_) => StatusCode::NOT_IMPLEMENTED,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -117,7 +113,6 @@ impl AppError {
             AppError::Upstream(UpstreamError::Timeout) => "upstream_timeout",
             AppError::Upstream(_) => "upstream_unavailable",
             AppError::Degraded(_) => "degraded",
-            AppError::NotBuilt(_) => "not_built",
             AppError::Internal(_) => "internal",
         }
     }
@@ -132,7 +127,6 @@ impl AppError {
             AppError::Forbidden(_) => "No access",
             AppError::Upstream(_) => "EpiGraph is unavailable",
             AppError::Degraded(_) => "Temporarily unavailable",
-            AppError::NotBuilt(_) => "Not built yet",
             AppError::Internal(_) => "Something went wrong",
         }
     }
@@ -145,7 +139,6 @@ impl AppError {
             AppError::Unauthorized => "Sign in to continue.".into(),
             AppError::SessionExpired => "Your session has expired. Sign in again.".into(),
             AppError::Upstream(e) => e.user_message().into(),
-            AppError::NotBuilt(what) => format!("{what} is not built yet."),
             AppError::Internal(_) => "An unexpected error occurred.".into(),
         }
     }

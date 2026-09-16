@@ -253,8 +253,10 @@ async fn every_area_route_is_mounted() {
         let res = app.post_form(uri, "", Some(&sid)).await;
         assert_eq!(res.status, StatusCode::FORBIDDEN, "{uri}");
     }
-    // Same for every §3.4 BFF route: mounted, and no longer the 501 `not_built`
-    // placeholder the skeleton shipped. The two overviews are the exception to
+    // Same for every §3.4 BFF route. The 501 `not_built` checks outlive the
+    // scaffolding they were written against (`AppError::NotBuilt` is gone) and
+    // stay as a guard against any route answering 501. The two overviews are
+    // the exception to
     // the unmocked-upstream rule: their handlers propagate an upstream 404 as
     // `NotFound("page")`, which is indistinguishable from the router fallback,
     // so they get an empty-but-valid upstream answer here.

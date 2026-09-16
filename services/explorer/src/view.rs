@@ -27,24 +27,6 @@ pub struct ErrorPage {
     pub message: String,
 }
 
-/// `templates/stub.html` — placeholder for routes an area has not built.
-#[derive(Template)]
-#[template(path = "stub.html")]
-pub struct StubPage {
-    pub ctx: PageCtx,
-    pub title: String,
-    pub area: &'static str,
-}
-
-/// Render the "not built yet" page for `area` (`core`, `entities`, …).
-pub fn stub_page(ctx: PageCtx, title: &str, area: &'static str) -> Result<Html<String>, AppError> {
-    render(&StubPage {
-        ctx,
-        title: title.to_string(),
-        area,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,10 +43,11 @@ mod tests {
 
     #[test]
     fn base_layout_is_base_path_aware_and_escaped() {
-        let html = StubPage {
+        let html = ErrorPage {
             ctx: ctx(false),
+            status: 404,
             title: "<script>alert(1)</script>".into(),
-            area: "core",
+            message: "m".into(),
         }
         .render()
         .unwrap();
@@ -87,10 +70,11 @@ mod tests {
 
     #[test]
     fn signed_in_layout_has_sign_out_form() {
-        let html = StubPage {
+        let html = ErrorPage {
             ctx: ctx(true),
+            status: 404,
             title: "t".into(),
-            area: "core",
+            message: "m".into(),
         }
         .render()
         .unwrap();
