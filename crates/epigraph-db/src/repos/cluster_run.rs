@@ -3,18 +3,24 @@
 //! Every graph `expand` route resolves the run the same way — newest
 //! `graph_cluster_runs.completed_at` — and answers 404 for anything that is
 //! not in *that* run. The lookup used to be copy-pasted into
-//! `routes/graph.rs` (twice) and `routes/graph_neighborhood.rs`, one of them
-//! as a subquery. It lives here now so `GET /claims/:id/placement` cannot
-//! drift from the routes whose ids it hands out: a `cluster_id` or
-//! `neighborhood_id` from `claim_placement` is one `expand` accepts at that
-//! moment, and both go stale together when the next run lands.
+//! `routes/graph.rs` (three times: `overview`, `expand` and `themes_expand`)
+//! and `routes/graph_neighborhood.rs`, one of them as a subquery. It lives
+//! here now so `GET /claims/:id/placement` cannot drift from the routes whose
+//! ids it hands out: a `cluster_id` or `neighborhood_id` from
+//! `claim_placement` is one `expand` accepts at that moment, and both go stale
+//! together when the next run lands.
+//!
+//! `themes_expand` was the last holdout — it kept its own inlined
+//! `ORDER BY completed_at DESC LIMIT 1` after the other three were converted,
+//! which made this paragraph false and left the route free to diverge from
+//! the `neighborhood_id`s `claim_placement` promises it will accept.
 //!
 //! Note what the lookup does NOT do: it does not filter on
 //! `graph_cluster_runs.algo` (migration 028). A `louvain_bridge` run from
 //! `POST /api/v1/clusters/build-from-bridges` therefore becomes "latest" and
 //! has no neighborhoods. That is pre-existing behaviour, preserved
 //! deliberately so this function and the expand routes agree; filtering is a
-//! separate decision for all four call sites at once.
+//! separate decision for all five call sites at once.
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;

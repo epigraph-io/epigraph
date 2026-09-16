@@ -474,14 +474,17 @@ pub async fn themes_expand(
         return Err((StatusCode::NOT_FOUND, "theme not found".into()));
     }
 
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    // The same lookup `overview`, `expand`, `graph_neighborhood::expand` and
+    // `GET /claims/:id/placement` use. Inlining it here let this route drift
+    // from the one that hands out the `neighborhood_id`s it is expected to
+    // accept; a missing run still answers the synthesized pre-run response.
+    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let Some(run) = latest_run else {
         return Ok(Json(synthesize_pre_run_response(theme_id)));
     };
+    let run_id = run.run_id;
 
     let budget = params.budget.max(1);
     let neighborhoods: Vec<NeighborhoodOut> = sqlx::query_as::<_, NeighborhoodOut>(
