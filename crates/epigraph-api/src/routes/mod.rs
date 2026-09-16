@@ -42,6 +42,8 @@ pub mod conventions;
 pub mod cross_source;
 pub mod crud;
 pub mod edges;
+#[cfg(feature = "db")]
+pub mod ego;
 pub mod embeddings;
 #[cfg(feature = "db")]
 pub mod entities;
@@ -625,6 +627,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/claims/:id/provenance-chain",
             get(provenance_chain::claim_provenance_chain),
         )
+        .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
         .route(
             "/api/v1/claims/:id/supporting-evidence",
             get(edges::supporting_evidence),
