@@ -210,15 +210,13 @@ async fn signed_in_pages_redirect_anonymous_viewers_to_login() {
 async fn every_area_route_is_mounted() {
     let app = spawn().await;
     let sid = app.sign_in("tok");
-    // Built core routes (`/`, `/search`, `/claim/:id`, `/bff/claim/:id`,
-    // `/bff/search`) are pinned by tests/core.rs::core_routes_are_mounted_and_built.
+    // Built areas leave this stub list; their mounting is pinned in their own
+    // test file (core `/`, `/search`, `/claim/:id`, `/bff/claim/:id`,
+    // `/bff/search`: `core_routes_are_mounted_and_built`; entities `history`,
+    // `provenance`, `/agent`, `/frame`, `/evidence`:
+    // `entity_routes_answer_with_and_without_the_base_path`).
     let pages = [
-        format!("/explorer/claim/{CLAIM}/history"),
-        format!("/explorer/claim/{CLAIM}/provenance"),
         format!("/explorer/claim/{CLAIM}/graph"),
-        format!("/explorer/agent/{CLAIM}"),
-        format!("/explorer/frame/{CLAIM}"),
-        format!("/explorer/evidence/{CLAIM}"),
         format!("/explorer/theme/{CLAIM}"),
         format!("/explorer/community/{CLAIM}"),
         format!("/explorer/neighborhood/{CLAIM}?mode=compound"),

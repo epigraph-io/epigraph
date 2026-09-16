@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}Provenance · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("entities.css") }}">
+{%- endblock %}
+
+{% block content %}
+<nav class="entity-tabs" aria-label="About this claim">
+  <a href="{{ claim_url }}">Claim</a>
+  <a href="{{ history_url }}">Version history</a>
+  <a href="{{ ctx.current_path }}" aria-current="page">Provenance</a>
+</nav>
+
+<header class="entity-head">
+  <p class="entity-kind">Provenance</p>
+  <h1 class="claim-text{% if heading.redacted %} claim-text--redacted{% endif %}">{{ heading.text }}</h1>
+  <p class="muted">The claims this one derives from, following supports,
+  corroborates, elaborates and decomposes_to back to their sources, and
+  supersedes back to older versions.</p>
+</header>
+
+<form class="depth-form" method="get" action="{{ self_url }}">
+  <label for="max-depth">Walk back up to</label>
+  <select id="max-depth" name="max_depth">
+    {%- for (d, selected) in depth_options %}
+    <option value="{{ d }}"{% if *selected %} selected{% endif %}>{{ d }} step{% if *d != 1 %}s{% endif %}</option>
+    {%- endfor %}
+  </select>
+  <button type="submit" class="button-quiet">Show</button>
+</form>
+
+{%- if truncated %}
+<div class="notice notice--warn chain-note" role="note">
+  <p>The walk stopped at depth {{ depth }}. Claims at that depth may have more
+  ancestors that are not shown here.</p>
+  {%- if let Some((next, url)) = deeper_url %}
+  <p><a href="{{ url }}">Walk back up to {{ next }} steps</a></p>
+  {%- else %}
+  <p class="small">This is the deepest walk the Explorer offers.</p>
+  {%- endif %}
+</div>
+{%- endif %}
+
+{%- if layout.ancestor_count == 0 %}
+<p class="notice chain-note">No claims were found that this claim derives from.</p>
+{%- else %}
+<p class="muted">{{ layout.ancestor_count }} ancestor{% if layout.ancestor_count != 1 %}s{% endif %} within {{ depth }} step{% if depth != 1 %}s{% endif %}.</p>
+{%- endif %}
+
+<ol class="chain">
+  {%- for level in layout.levels %}
+  <li class="chain-level" aria-labelledby="depth-{{ level.depth }}">
+    <h2 id="depth-{{ level.depth }}" class="chain-level__title">{{ level.title }}</h2>
+    <ul class="chain-nodes">
+      {%- for n in level.nodes %}
+      <li class="chain-node card{% if n.superseded %} chain-node--superseded{% endif %}">
+        <div class="chain-node__badges">
+          {%- if n.superseded %}
+          <span class="badge badge--superseded">Superseded</span>
+          {%- endif %}
+          {%- if n.text.redacted %}
+          <span class="badge badge--hidden">Hidden</span>
+          {%- endif %}
+          {%- if n.in_cycle %}
+          <span class="badge badge--cycle">In a cycle</span>
+          {%- endif %}
+        </div>
+        <p class="chain-node__text{% if n.text.redacted %} claim-text--redacted{% endif %}"><a href="{{ n.url }}">{{ n.text.text }}</a></p>
+        {%- if !n.links.is_empty() %}
+        <ul class="chain-links">
+          {%- for l in n.links %}
+          <li><span class="rel">{{ l.phrase }}</span> <a href="{{ l.other.url }}"{% if l.other.redacted %} class="claim-text--redacted"{% endif %}>{{ l.other.label }}</a></li>
+          {%- endfor %}
+        </ul>
+        {%- endif %}
+        <p class="small muted">Truth value <span class="num">{{ n.truth }}</span>
+          {%- if !n.labels.is_empty() %} · {% for label in n.labels %}<span class="label">{{ label }}</span>{% if !loop.last %} {% endif %}{% endfor %}{% endif %}</p>
+      </li>
+      {%- endfor %}
+    </ul>
+  </li>
+  {%- endfor %}
+</ol>
+
+{%- if !layout.cycles.is_empty() %}
+<section class="section" aria-labelledby="cycles-title">
+  <h2 id="cycles-title" class="section__title">Cycles</h2>
+  <p class="muted">These claims derive from each other in a loop, so the depth
+  order above is only approximate for them.</p>
+  <ul class="link-list">
+    {%- for cycle in layout.cycles %}
+    <li class="cycle">
+      {%- for r in cycle %}
+      <a href="{{ r.url }}"{% if r.redacted %} class="claim-text--redacted"{% endif %}>{{ r.label }}</a>{% if !loop.last %} <span class="rel" aria-label="linked to">→</span> {% endif %}
+      {%- endfor %}
+    </li>
+    {%- endfor %}
+  </ul>
+</section>
+{%- endif %}
+{% endblock %}
