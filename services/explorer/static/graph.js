@@ -890,8 +890,9 @@
         return;
       }
       if (this.nodes.size >= this.cap) {
-        this.leftOut += 1;
-        this.updateCapNotice();
+        // No fetch happens here, so no neighbour was dropped: the cap notice
+        // only ever counts nodes a payload really carried past the cap (see
+        // merge). The status below is the whole story.
         this.setPanelStatus(n, 'The graph already shows its maximum of ' + this.cap + ' nodes.');
         return;
       }

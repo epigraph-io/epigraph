@@ -1276,3 +1276,37 @@ fn expansion_status_is_addressed_to_the_node_that_asked_for_it() {
         "expand's own refusals are anchored to the node they are about"
     );
 }
+
+/// Expanding a node while the canvas already sits at the node cap fetches
+/// nothing and drops nothing, but used to add 1 to the "left out" count, so
+/// the notice reported neighbours that were never seen.
+#[test]
+fn hitting_the_node_cap_does_not_invent_a_left_out_count() {
+    let js = include_str!("../static/graph.js");
+
+    let expand = block(js, "async expand(n) {");
+    assert!(
+        expand.contains("this.nodes.size >= this.cap"),
+        "expand still refuses once the canvas is full"
+    );
+    assert!(
+        expand.contains("maximum of "),
+        "…and still says so in the panel"
+    );
+    assert!(
+        !expand.contains("leftOut") && !expand.contains("updateCapNotice"),
+        "expand must not touch the cap notice's count: {expand}"
+    );
+
+    // The count only ever comes from nodes a payload really carried past the
+    // cap, which is the one place that can count them.
+    let merge = block(js, "merge(data, anchor) {");
+    assert!(
+        merge.contains("leftOut += 1"),
+        "merge counts the real drops"
+    );
+    assert!(
+        merge.contains("this.leftOut += leftOut"),
+        "…and is what feeds the notice"
+    );
+}
