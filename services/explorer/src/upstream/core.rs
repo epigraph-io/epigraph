@@ -168,8 +168,11 @@ pub struct SemanticSearchResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct SemanticHit {
     pub claim_id: Uuid,
-    /// `claims.content`; `"[REDACTED]"` once the kernel redaction sweep
-    /// (plan §2.6) lands.
+    /// `claims.content`, or [`super::REDACTED`] for a hit this viewer may not
+    /// read: since the §2.6 sweep `search::semantic_search` redacts both the
+    /// hits and their `graph_neighbors[].statement` through
+    /// `access_control::redact_claim_fields`. The route takes an optional
+    /// bearer, so an anonymous caller sees only public claims' text.
     #[serde(default)]
     pub statement: String,
     #[serde(default)]

@@ -362,10 +362,14 @@ Then sign in through the browser and open a claim.
   not reach `/oauth/token` at all — a restart, a timeout, a 5xx — keeps the
   session and reports the ordinary "API unavailable" failure, so an API
   restart does not sign every user out.
-- **Redaction short-circuit.** Several upstream read routes do not yet redact
-  what `GET /claims/{id}` redacts (plan §2.6). If `GET /claims/{id}` returns
-  the content `"[REDACTED]"`, the Explorer skips every other content-bearing
-  call for that page, and the text never reaches OpenGraph tags.
+- **Redaction short-circuit.** The kernel's §2.6 sweep made every read route
+  the Explorer renders from apply what `GET /claims/{id}` applies — claim
+  text the requester may not read comes back as `"[REDACTED]"` from
+  `/claims/{id}/history`, `/agents/{id}/claims`, `/frames/{id}/claims`,
+  `/claims/by-labels`, `/search/semantic` and both graph `expand` routes. The
+  Explorer keeps its own short-circuit on top: if `GET /claims/{id}` returns
+  `"[REDACTED]"`, it skips every other content-bearing call for that page, so
+  the text never reaches OpenGraph tags and the calls are never made.
 - **Sign-in** uses the authorization-code flow with mandatory PKCE S256
   against the API's own authorization server, with `scope=claims:read`. The
   code lives 60 s upstream and is redeemed immediately. No token ever appears
