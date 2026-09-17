@@ -4485,10 +4485,33 @@ impl ClaimRepository {
         Ok(row.and_then(|(c,)| c))
     }
 
-    /// Store an embedding vector on a claim.
+    /// Store an embedding vector on a claim that is not sealed.
     ///
     /// The embedding string must be a valid pgvector literal (e.g., "[0.1,0.2,...]").
     /// Follows the same pattern as `EvidenceRepository::store_embedding`.
+    ///
+    /// # Why the seal predicate is in THIS statement
+    ///
+    /// This is the shared write every embedding producer goes through — the MCP
+    /// submit/memorize/ingest paths, the backfill tool, `embed_backfill`, and
+    /// `PUT /api/v1/claims/:id`, whose caller supplies the vector itself. The
+    /// enumerators those callers select from already exclude sealed rows, so
+    /// the predicate is a no-op for every one of them; the by-id caller has no
+    /// enumerator at all, and for it the predicate is the only thing standing
+    /// between a caller who still holds plaintext and a plaintext-derived
+    /// vector on a row whose whole point is that no such derivative survives.
+    /// CLAUDE.md's audit calls that a confidentiality violation rather than an
+    /// embedding gap, which is why the refusal is in the statement every caller
+    /// shares rather than in one caller's control flow.
+    ///
+    /// Keyed on `claim_encryption`, NEVER on `visibility`: a group-private
+    /// claim is ordinary plaintext and must still be embedded.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated; `false` for both "no such claim" and "the
+    /// claim is sealed", which this statement deliberately does not
+    /// distinguish. Callers treat a `false` as "nothing to store".
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.

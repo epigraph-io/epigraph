@@ -1150,6 +1150,75 @@ async fn a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it(pool:
     assert_eq!(ciphertext_rows, 0);
 }
 
+/// The SHARED embedding write refuses a sealed claim, and still writes an
+/// unsealed one.
+///
+/// # Why this is asserted on `store_embedding` and not only on its by-id sibling
+///
+/// `store_embedding_if_unsealed` is the statement the restore job uses, and it
+/// carried the seal predicate from the start. It is not the only statement that
+/// can put a vector on a claim: `store_embedding` is the write every other
+/// producer in the workspace shares — the MCP submit/memorize/ingest paths, the
+/// backfill tool, the backfill binary, and the by-id route whose caller supplies
+/// the vector itself. Their ENUMERATORS exclude sealed rows, so for them the
+/// predicate changes nothing; the by-id caller has no enumerator, and a claim id
+/// is not a capability to compute a vector over ciphertext.
+///
+/// The positive arm is not decoration. A predicate that refused everything is
+/// the silent failure mode here — every negative assertion would still pass, and
+/// the corpus would simply stop being embedded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_shared_embedding_write_refuses_a_sealed_claim(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let plain = seed_sealable_claim(&pool, &world, "ordinary, embeddable").await;
+    let sealed = seed_sealable_claim(&pool, &world, "confidential, not embeddable").await;
+
+    let payload = seal_payload(&pool, sealed).await;
+    commit_seal(&pool, &world, &[payload]).await;
+
+    // The seal nulls the column, so "still NULL" below is measured against a
+    // known starting point rather than against a column nobody ever wrote.
+    let cleared: Option<bool> =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+            .bind(sealed)
+            .fetch_one(&pool)
+            .await
+            .expect("read the sealed claim's vector column");
+    assert_eq!(cleared, Some(true), "the seal must have nulled the vector");
+
+    let vector = vector_literal(1536, 0.125);
+
+    let wrote = epigraph_db::ClaimRepository::store_embedding(&pool, plain, &vector)
+        .await
+        .expect("store a vector on an unsealed claim");
+    assert!(
+        wrote,
+        "the unsealed claim must still be embeddable; a statement that refuses \
+         everything passes every negative assertion in this test"
+    );
+
+    let refused = epigraph_db::ClaimRepository::store_embedding(&pool, sealed, &vector)
+        .await
+        .expect("the refusal is a zero-row UPDATE, not an error");
+    assert!(
+        !refused,
+        "the shared embedding write must report no row for a sealed claim"
+    );
+
+    let after: Option<bool> =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+            .bind(sealed)
+            .fetch_one(&pool)
+            .await
+            .expect("re-read the sealed claim's vector column");
+    assert_eq!(
+        after,
+        Some(true),
+        "a sealed claim carrying a vector is the audit's page-the-on-call \
+         condition, not a degraded restoration"
+    );
+}
+
 /// The restore write applies the READ's population rules, `is_current` included.
 ///
 /// The pair exists because the read and the write are separated by a provider
