@@ -1150,6 +1150,64 @@ async fn a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it(pool:
     assert_eq!(ciphertext_rows, 0);
 }
 
+/// The restore write applies the READ's population rules, `is_current` included.
+///
+/// The pair exists because the read and the write are separated by a provider
+/// round trip. `claim_text_for_embedding` declines a superseded claim; if the
+/// write did not, a supersede landing inside that window would put the vector
+/// back on the row the supersede had just nulled — `stale_present` in CLAUDE.md's
+/// audit, with nothing downstream to clean it up.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let current = seed_sealable_claim(&pool, &world, "still the current revision").await;
+    let stale = seed_sealable_claim(&pool, &world, "superseded mid-flight").await;
+
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+    let vector = vector_literal(1536, 0.375);
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let wrote = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        &mut conn, &bypass, current, &vector,
+    )
+    .await
+    .expect("store a vector on a current claim");
+    assert!(
+        wrote,
+        "a current, unsealed claim must still be embeddable by the restore write"
+    );
+
+    // What `ClaimRepository::supersede` does to the loser, reduced to the one
+    // column this write consults.
+    sqlx::query("UPDATE claims SET is_current = false, embedding = NULL WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("supersede the claim out from under the in-flight job");
+
+    let refused = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        &mut conn, &bypass, stale, &vector,
+    )
+    .await
+    .expect("the refusal is a zero-row UPDATE, not an error");
+    assert!(
+        !refused,
+        "the restore write must report no row for a superseded claim"
+    );
+
+    let after: Option<bool> =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+            .bind(stale)
+            .fetch_one(&pool)
+            .await
+            .expect("re-read the superseded claim's vector column");
+    assert_eq!(
+        after,
+        Some(true),
+        "every claim with is_current = false should have embedding = NULL"
+    );
+}
+
 #[test]
 fn the_fixture_seeds_exactly_the_tables_the_seal_deletes() {
     assert_eq!(

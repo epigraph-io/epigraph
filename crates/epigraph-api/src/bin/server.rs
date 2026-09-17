@@ -11,7 +11,7 @@
 // consequence of 086.
 use epigraph_api::metrics::Metrics;
 use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryConfig};
-use epigraph_api::{create_router, ApiConfig, AppState};
+use epigraph_api::{create_router, embedding_restore::EmbeddingProviderKind, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
     cluster_graph::ClusterGraphHandler,
@@ -19,7 +19,7 @@ use epigraph_jobs::{
         PrivatizationApplyHandler, PrivatizationResealHandler, PrivatizationRevertHandler,
     },
     theme_cluster_rebuild::ThemeClusterRebuildHandler,
-    JobQueue, JobRunner, PostgresJobQueue,
+    ConfigurableEmbeddingHandler, JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
 #[cfg(feature = "db")]
@@ -41,7 +41,17 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// - `OPENAI_API_KEY`: OpenAI API key (primary — text embeddings)
 /// - `JINA_API_KEY`: Jina AI API key (multimodal figure embeddings only)
 /// - `EMBEDDING_DIMENSION`: Vector dimension (default: 1536)
-fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::EmbeddingService> {
+///
+/// Returns the service together with [`EmbeddingProviderKind`], because the
+/// fallthrough is silent and one caller — the `embedding_generation` job
+/// registration below — must NOT accept it. A mock or Jina vector is fine to
+/// rank a single query with and not fine to persist into `claims.embedding`,
+/// and the trait object carries no provider identity with which to tell them
+/// apart afterwards.
+fn create_embedding_service() -> (
+    std::sync::Arc<dyn epigraph_embeddings::EmbeddingService>,
+    EmbeddingProviderKind,
+) {
     let dimension: usize = std::env::var("EMBEDDING_DIMENSION")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -54,7 +64,7 @@ fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::Embeddi
             match epigraph_embeddings::OpenAiProvider::new(config, api_key) {
                 Ok(provider) => {
                     tracing::info!(dim = dimension, "Embedding service: OpenAI (text-only)");
-                    return std::sync::Arc::new(provider);
+                    return (std::sync::Arc::new(provider), EmbeddingProviderKind::OpenAi);
                 }
                 Err(e) => {
                     tracing::warn!("OpenAI provider init failed: {e}, trying Jina fallback");
@@ -75,7 +85,7 @@ fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::Embeddi
                         "Embedding service: Jina v4 (multimodal) — \
                          text queries may not match OpenAI-embedded claims"
                     );
-                    return std::sync::Arc::new(provider);
+                    return (std::sync::Arc::new(provider), EmbeddingProviderKind::Jina);
                 }
                 Err(e) => {
                     tracing::warn!("Jina provider init failed: {e}, falling back to mock");
@@ -91,7 +101,7 @@ fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::Embeddi
         dim = dimension,
         "Embedding service: Mock (development only)"
     );
-    std::sync::Arc::new(provider)
+    (std::sync::Arc::new(provider), EmbeddingProviderKind::Mock)
 }
 
 #[tokio::main]
@@ -264,7 +274,15 @@ async fn main() {
     );
 
     // Create embedding service for semantic search
-    let embedding_service = create_embedding_service();
+    let (embedding_service, embedding_provider) = create_embedding_service();
+    // Cloned BEFORE `embedding_service` is moved into `AppState` below. The
+    // job runner is constructed after that move, and the handler needs the same
+    // provider the query path uses — not a second one built from the same env.
+    #[cfg(feature = "db")]
+    let embedder_for_jobs = Arc::clone(&embedding_service);
+    // The kind is consumed only by the job registration, which is db-only.
+    #[cfg(not(feature = "db"))]
+    let _ = embedding_provider;
 
     // Create application state — connect to PostgreSQL when db feature is enabled
     #[cfg(feature = "db")]
@@ -632,6 +650,46 @@ async fn main() {
         runner.register_handler(Arc::new(PrivatizationResealHandler::new(Arc::clone(
             &job_scoped,
         ))));
+
+        // `embedding_generation`, which `unseal-commit` enqueues once per
+        // restored claim. It was the job type the comment above was written
+        // about and did not cover: `ConfigurableEmbeddingHandler` and its
+        // `EmbeddingJobService` trait have both existed for some time, but
+        // nothing in the workspace implemented the trait, so the handler was
+        // unconstructible and the enqueued row was a marker rather than a
+        // restoration.
+        //
+        // REGISTERED CONDITIONALLY, and the condition is the point. The
+        // provider chain above falls through to a mock without failing, which
+        // is correct for a query path and destructive for a write path: an
+        // unconditional registration would drain the backlog on the first boot
+        // after deploy and fill the live ANN column with vectors from whatever
+        // provider happened to be configured. `EmbeddingProviderKind` carries
+        // that decision out of `create_embedding_service`, which is the only
+        // place that knows the answer.
+        //
+        // Declining is the safe direction and leaves the position exactly as it
+        // was: `epigraph-cli reembed` remains the recovery path, and the
+        // CLAUDE.md audit's 24 h unseal window keeps explaining the gap.
+        if embedding_provider.may_restore_claim_embeddings() {
+            runner.register_handler(Arc::new(ConfigurableEmbeddingHandler::new(Arc::new(
+                epigraph_api::embedding_restore::ClaimEmbeddingJobService::new(
+                    Arc::clone(&job_scoped),
+                    embedder_for_jobs,
+                ),
+            ))));
+            tracing::info!(
+                provider = embedding_provider.as_str(),
+                "embedding_generation handler registered; unsealed claims regain claims.embedding"
+            );
+        } else {
+            tracing::warn!(
+                provider = embedding_provider.as_str(),
+                "embedding_generation NOT registered: this provider must not write \
+                 claims.embedding. Unsealed claims keep NULL vectors until \
+                 `epigraph-cli reembed` runs"
+            );
+        }
 
         tokio::spawn(async move {
             runner.start().await;

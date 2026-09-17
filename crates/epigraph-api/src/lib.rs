@@ -1,3 +1,4 @@
+pub mod embedding_restore;
 pub mod errors;
 pub mod extractors;
 pub mod metrics;

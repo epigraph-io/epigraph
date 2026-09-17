@@ -4396,6 +4396,70 @@ impl ClaimRepository {
         Ok(rows)
     }
 
+    /// The text one claim should be embedded from, or `None` if it should not
+    /// be embedded at all.
+    ///
+    /// The by-id counterpart to
+    /// [`find_claims_needing_embeddings`](Self::find_claims_needing_embeddings),
+    /// for the restoration a privatization unseal enqueues: that path knows the
+    /// claim id and must not enumerate the corpus, but it has to apply the SAME
+    /// population rules, or the two paths disagree about which rows carry a
+    /// vector.
+    ///
+    /// # Why the encryption check is here and not at the caller
+    ///
+    /// **This is the load-bearing predicate.** A privatization seal nulls the
+    /// vector columns and replaces `content` with a stub; the plaintext lives
+    /// only in `claim_encryption`, which the server cannot read. Embedding a
+    /// sealed row would therefore either fail on the stub or — worse, if a
+    /// caller had plaintext in hand — write a plaintext-derived vector onto a
+    /// row whose whole point is that no such derivative exists. CLAUDE.md's
+    /// audit calls a sealed claim carrying a vector a confidentiality
+    /// violation rather than an embedding gap, so the refusal belongs in the
+    /// statement every caller shares, not in one caller's control flow. The
+    /// same predicate is in all three statements that can put a vector on a
+    /// claim — this read, [`store_embedding`](Self::store_embedding) and
+    /// [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed) —
+    /// rather than in the one path that happened to be written last.
+    ///
+    /// Keyed on `claim_encryption`, NEVER on `visibility`: a group-private
+    /// claim is ordinary plaintext and must still be embedded.
+    ///
+    /// # The viewer IS spent
+    ///
+    /// The job runner holds a bypass, for which the predicate renders empty —
+    /// but the parameter is real rather than decorative: any caller that is not
+    /// a maintenance path is filtered, so this cannot become a by-id content
+    /// read that ignores tenancy.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_text_for_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT content FROM claims \
+              WHERE id = $1 \
+                AND COALESCE(is_current, true) = true \
+                AND NOT ('telemetry' = ANY(labels)) \
+                AND (properties->>'event') IS NULL \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
+                ) \
+                /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<(String,)> = q.fetch_optional(executor).await?;
+        Ok(row.map(|(content,)| content))
+    }
+
     /// Read a claim's cached CDST classification label (`supported` |
     /// `contradicted` | `not_enough_info`), or `None` if unclassified or the
     /// claim does not exist. Written by `recompute_combined_belief` via
@@ -4434,12 +4498,101 @@ impl ClaimRepository {
         id: Uuid,
         embedding_pgvector: &str,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-            .bind(embedding_pgvector)
+        let result = sqlx::query(
+            "UPDATE claims SET embedding = $1::vector \
+              WHERE id = $2 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
+                )",
+        )
+        .bind(embedding_pgvector)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Store an embedding vector on a claim **only while that claim is not
+    /// sealed**, and only on a row the viewer may write.
+    ///
+    /// The counterpart to
+    /// [`claim_text_for_embedding`](Self::claim_text_for_embedding), and the
+    /// reason the pair exists rather than a single read followed by
+    /// [`store_embedding`](Self::store_embedding): the read and the write are
+    /// separated by a network round trip to an embedding provider, and a claim
+    /// can be sealed inside that window. Both halves of the pair therefore
+    /// apply the same population rules — `claim_encryption`, `is_current`.
+    ///
+    /// The `NOT EXISTS` is on `claim_encryption`, not on `visibility` — a
+    /// group-private claim is ordinary plaintext and must still be embedded.
+    ///
+    /// # Why the row is locked first, rather than trusting one statement's `WHERE`
+    ///
+    /// A single `UPDATE` whose `WHERE` re-checks `claim_encryption` is NOT
+    /// enough, and an earlier revision of this comment claimed it was. Under
+    /// `READ COMMITTED` an `UPDATE` that blocks on a row another transaction is
+    /// updating re-evaluates its qualification after that transaction commits,
+    /// but it does so against its ORIGINAL snapshot for every OTHER table — and
+    /// `claim_encryption` is another table. A seal committing inside that wait
+    /// would therefore go unseen and the vector would be written anyway.
+    ///
+    /// Taking the row lock in a SEPARATE statement first fixes that: the
+    /// `UPDATE` then takes a fresh statement snapshot AFTER the lock is
+    /// granted, and that snapshot does include the committed seal. It must be a
+    /// separate statement — folding the lock into a CTE of the same statement
+    /// changes nothing, because all parts of one statement share a snapshot.
+    /// The reverse interleaving is safe without any of this: if this
+    /// transaction takes the lock first, the seal's own `UPDATE` blocks behind
+    /// it and nulls the vector when it proceeds.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated. `false` covers four cases deliberately
+    /// indistinguishable to the caller: no such claim, a claim sealed since the
+    /// text was read, a claim superseded since the text was read, and a claim
+    /// the viewer may not write. A caller that needs to tell "sealed" from
+    /// "absent" would need a second read, and the answer it got would already
+    /// be stale.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, embedding_pgvector))]
+    pub async fn store_embedding_if_unsealed(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        embedding_pgvector: &str,
+    ) -> Result<bool, DbError> {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+
+        // The lock, as its own statement. See the section above: this is what
+        // makes the `NOT EXISTS` below read a snapshot that contains a seal
+        // which committed while this job was calling the provider.
+        sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .execute(pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c SET embedding = $2::vector \
+              WHERE c.id = $1 \
+                AND COALESCE(c.is_current, true) = true \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = c.id \
+                ) \
+                /* {WRITABLE:c} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(embedding_pgvector);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$3` to fill and binding unconditionally would
+        // over-supply the maintenance path by one parameter.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let result = q.execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
