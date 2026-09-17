@@ -2146,7 +2146,19 @@ pub async fn seal_manifest(
             i.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
         )
     }));
-    let next_cursor = items.last().map(|i| i.claim_id);
+    // A SHORT PAGE ENDS THE WALK. Handing back a cursor after a page that did
+    // not fill the limit costs the client one more round trip whose only
+    // possible answer is an empty page — and on THIS route that is not free:
+    // every manifest read is dual-logged, so the walk writes a `security_events`
+    // row and a `privatization_audit` row recording that plaintext was served,
+    // for a request that served none. `list_plans` in this file already
+    // compares the row count against the limit; the two manifests now agree
+    // with it.
+    let next_cursor = if i64::try_from(items.len()).unwrap_or(i64::MAX) == limit {
+        items.last().map(|i| i.claim_id)
+    } else {
+        None
+    };
 
     // RETURNED BEFORE THE AUDIT ACQUIRES ITS OWN. `log_manifest_read` takes a
     // maintenance connection, and the maintenance pool is deliberately the
@@ -2490,7 +2502,13 @@ pub async fn unseal_manifest(
             i.evidence.iter().map(|e| e.id).collect::<Vec<_>>(),
         )
     }));
-    let next_cursor = items.last().map(|i| i.claim_id);
+    // Short page ends the walk; see `seal_manifest` for why an extra empty page
+    // is not free on this route.
+    let next_cursor = if i64::try_from(items.len()).unwrap_or(i64::MAX) == limit {
+        items.last().map(|i| i.claim_id)
+    } else {
+        None
+    };
     // See `seal_manifest`: the maintenance connection goes back to the pool
     // before the audit acquires its own.
     drop(session);
