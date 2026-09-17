@@ -749,26 +749,17 @@ async fn main() {
     // webhooks; refusing to boot because a delivery cache could not be filled
     // would convert a degraded feature into an outage. It fails in the closed
     // direction anyway: an empty store delivers nothing.
+    //
+    // The mapping itself lives in `epigraph_api::state::hydrate_webhook_store`
+    // rather than here, so it is reachable from a test. A block inside `main`
+    // can be reviewed but not executed, which is what
+    // `D-PR-bin-server-boot-hydration-test` recorded.
     #[cfg(feature = "db")]
     {
-        match epigraph_db::WebhookSubscriptionRepository::list_active(&state.db_pool).await {
-            Ok(rows) => {
-                let mut store = state.webhook_store.write().await;
-                for row in &rows {
-                    store.insert(
-                        row.id,
-                        epigraph_api::state::WebhookSubscription {
-                            id: row.id,
-                            url: row.url.clone(),
-                            event_types: row.event_types.clone(),
-                            created_at: row.created_at,
-                            active: row.active,
-                            secret: row.secret.clone(),
-                            agent_id: Some(row.agent_id),
-                        },
-                    );
-                }
-                tracing::info!(count = rows.len(), "webhook subscriptions hydrated");
+        match epigraph_api::state::hydrate_webhook_store(&state.db_pool, &state.webhook_store).await
+        {
+            Ok(count) => {
+                tracing::info!(count, "webhook subscriptions hydrated");
             }
             Err(e) => {
                 tracing::error!(

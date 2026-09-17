@@ -119,11 +119,106 @@ pub struct WebhookSubscription {
 /// Thread-safe in-memory webhook subscription store.
 ///
 /// A per-process cache of `public.webhook_subscriptions` (migration 085), not
-/// the system of record. `bin/server.rs` hydrates it at boot via
-/// `WebhookSubscriptionRepository::list_active`; `register_webhook` and
-/// `delete_webhook` write through to the table before touching it, so a process
-/// restart no longer silently unsubscribes everyone.
+/// the system of record. `hydrate_webhook_store` (below) holds the row-to-cache
+/// mapping and `bin/server.rs::main` calls it once at boot — named here rather
+/// than naming the repository function directly, because the mapping is where
+/// the fields the fan-out reads are decided and that is what a reader following
+/// this sentence wants. `register_webhook` and `delete_webhook` write through to
+/// the table before touching it, so a process restart no longer silently
+/// unsubscribes everyone.
 pub type WebhookStore = Arc<RwLock<HashMap<Uuid, WebhookSubscription>>>;
+
+/// Fill a process's [`WebhookStore`] from the durable table, at boot.
+///
+/// # Why this is a function and not eight lines inside `bin/server.rs::main`
+///
+/// It was those eight lines until now, and that is exactly why
+/// `D-PR-webhook-dispatcher-behavioural-test`'s sibling obligation
+/// (`D-PR-bin-server-boot-hydration-test`) could be raised: the whole durability
+/// half of migration 085 rests on this mapping, and a block inside `main` can be
+/// read and reviewed but never executed by a test. Extracting it changes no
+/// behaviour — `main` calls it under the `#[cfg(feature = "db")]` the block
+/// already carried — and makes the mapping reachable from
+/// `tests/webhook_boot_hydration.rs`.
+///
+/// # Boot only, and that is now enforced rather than asserted
+///
+/// The extraction has a cost that a doc heading alone does not pay for. Inside
+/// `main` this mapping was structurally unreachable from request-serving code;
+/// as a `pub fn` on `epigraph_api::state` it is reachable from any handler, and
+/// it is an authority-free corpus-wide read — every principal's subscriptions,
+/// no `&Viewer`, by construction (see below). No `.db_pool` counter sees it,
+/// because the pool arrives as a parameter. So
+/// `epigraph-api/tests/no_bypass_in_handlers.rs` carries a needle for it: a call
+/// from `epigraph-api/src/routes` or `epigraph-mcp/src/tools` fails that lint.
+/// Nothing in either root calls it today; the needle exists so that the boot-only
+/// constraint survives the next author who needs "just this one map".
+///
+/// # The mapping is the load-bearing part
+///
+/// `agent_id: Some(row.agent_id)` in particular. `list_webhooks`, `get_webhook`
+/// and `deliver_event` all compare `agent_id == Some(principal)`, so a hydrated
+/// subscription that lost its principal on the way into the cache is not a
+/// cosmetic defect: it is invisible to its owner and undeliverable, while the
+/// row on disk looks healthy. The column is `NOT NULL` in migration 085, so the
+/// `Option` is a wire-format concession and never an absent principal here.
+///
+/// # It MERGES. It is not a reconciler, and calling it twice does not make it one
+///
+/// The loop below takes the write guard and inserts; it never clears and never
+/// removes. So the contract is *fill a store*, not *make the store equal the
+/// table*: a second call yields the UNION of what the store already held and
+/// what `list_active` returned this time, not the table's current set. That is
+/// the right shape for the one call site there is — an empty store at boot —
+/// and it is the reason the returned `usize` is the number of rows `list_active`
+/// returned rather than the size of the store afterwards.
+///
+/// This is stated because the obvious next use is not boot. Anything that wants
+/// the store to track the table over time needs a mechanism that can also drop
+/// an entry, which this function deliberately does not have; the conditions on
+/// that are recorded under `D-PR-webhook-store-invalidation` in
+/// `docs/tenancy/progress.json` and are not restated here.
+/// `tests/webhook_boot_hydration.rs::hydration_merges_into_the_store_and_never_evicts`
+/// pins the merge behaviour, so turning this into a reconciling function forces
+/// that assertion to change in the same commit.
+///
+/// # No `&Viewer`, deliberately
+///
+/// See `epigraph_db::repos::webhook`'s module doc. This is a corpus-wide boot
+/// enumerator; hydrating "as some viewer" would drop every other principal's
+/// subscriptions, and the symptom — webhooks that stop firing after a deploy —
+/// is indistinguishable from an idle corpus. Tenancy for webhooks is applied to
+/// the EVENT against the subscriber's viewer, one level up, in `deliver_event`.
+///
+/// # Errors
+/// Propagates [`epigraph_db::DbError`] from
+/// [`epigraph_db::WebhookSubscriptionRepository::list_active`]. The caller
+/// decides what a failure means; `bin/server.rs` logs it and boots anyway,
+/// because an empty store delivers nothing and a degraded feature is not an
+/// outage.
+#[cfg(feature = "db")]
+pub async fn hydrate_webhook_store(
+    pool: &sqlx::PgPool,
+    store: &WebhookStore,
+) -> Result<usize, epigraph_db::DbError> {
+    let rows = epigraph_db::WebhookSubscriptionRepository::list_active(pool).await?;
+    let mut guard = store.write().await;
+    for row in &rows {
+        guard.insert(
+            row.id,
+            WebhookSubscription {
+                id: row.id,
+                url: row.url.clone(),
+                event_types: row.event_types.clone(),
+                created_at: row.created_at,
+                active: row.active,
+                secret: row.secret.clone(),
+                agent_id: Some(row.agent_id),
+            },
+        );
+    }
+    Ok(rows.len())
+}
 
 /// Thread-safe embedding service type alias
 ///
