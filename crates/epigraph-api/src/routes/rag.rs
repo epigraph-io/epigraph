@@ -15,6 +15,29 @@
 //! ```text
 //! GET /api/v1/query/rag?query=climate+change+effects&limit=5&min_truth=0.8&domain=factual
 //! ```
+//!
+//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
+//!
+//! Conversion shard 6. `rag_context` and `search_evidence` each run their single
+//! read on a viewer-stamped connection from [`AppState::read_as`].
+//! `ClaimRepository::rag_hybrid_context` and
+//! `EvidenceRepository::search_by_embedding` already spliced the viewer; what
+//! changed is which connection carries the session GUCs the `claims` and
+//! `evidence` policies read.
+//!
+//! **Both acquire the connection AFTER `generate_query_embedding`, deliberately.**
+//! That call leaves the process, and each handler issues exactly one statement,
+//! so there is no coherence to preserve across the wait and no reason to hold one
+//! of the request pool's ten connections while a third party answers.
+//!
+//! `generate_claim_embedding` and `generate_evidence_embedding` are NOT
+//! converted: both WRITE, and [`AppState::read_as`] is read-only — a write routed
+//! through a `ScopedRead` type-checks and is then rolled back on drop under
+//! `SessionGucMode::Transaction`. They remain counted, and
+//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
+//! `("rag.rs", 2)` for them, unchanged by this shard.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -347,8 +370,27 @@ pub async fn rag_context(
         // `ClaimRepository::rag_hybrid_context`; see that function for the
         // scoring formula and for why an unfiltered version of this read was
         // the single highest-value exfiltration primitive in the API.
+        //
+        // THE CONNECTION IS TAKEN HERE, NOT AT THE HANDLER HEAD, and the
+        // ordering is load-bearing rather than stylistic. `generate_query_embedding`
+        // above is an outbound call to the embedding provider; acquiring first
+        // would hold one of the request pool's ten connections
+        // (`ScopedPoolOptions::default`) across a network round trip to a third
+        // party. This handler runs exactly ONE statement, so there is nothing to
+        // keep coherent across the wait and no reason to pay for it.
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "rag_context",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
         let rows = epigraph_db::ClaimRepository::rag_hybrid_context(
-            &state.db_pool,
+            &mut *read,
             &viewer,
             &embedding_str,
             min_truth,
@@ -594,8 +636,23 @@ pub async fn search_evidence(
     let (query_embedding, _is_real) = generate_query_embedding(&state, query).await;
     let embedding_str = format_embedding_for_pgvector(&query_embedding);
 
+    // Acquired AFTER `generate_query_embedding`, for the reason `rag_context`
+    // states above: that call leaves the process, this handler runs exactly one
+    // statement, and a connection held across the wait buys nothing.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "search_evidence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = epigraph_db::EvidenceRepository::search_by_embedding(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         &embedding_str,
         limit,

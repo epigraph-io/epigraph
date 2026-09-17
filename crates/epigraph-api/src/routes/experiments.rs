@@ -7,6 +7,29 @@
 //! - `GET  /api/v1/methods/search`           - Search methods by embedding similarity
 //! - `GET  /api/v1/methods/:id/gaps`         - Method gap analysis for a hypothesis
 //! - `POST /api/v1/experiments/design`        - Design an experiment protocol
+//!
+//! # Tenancy: 3 of this file's 11 raw-pool sites are converted
+//!
+//! Conversion shard 6. `method_gap_analysis` is the only wholly-convertible
+//! handler here, and all three of its sites now run on one viewer-stamped
+//! connection from [`AppState::read_as`], reborrowed per statement inside its
+//! two nested loops. Holding one connection for a whole handler makes the work
+//! done on it a function of the request's input, so that input is bounded above
+//! the acquire — see [`MAX_REQUIRED_CAPABILITIES`].
+//!
+//! Of those three, TWO narrow — `MethodRepository::{get_evidence_strength,
+//! get_source_papers}` reach `claims` and `edges` and splice the viewer — and
+//! ONE does not: `get_methods_for_capability` reads `methods` JOINed to
+//! `method_capabilities`, neither of which carries RLS at migration head 92.
+//!
+//! NOT converted, blocker named per handler:
+//! * `hypothesize`, `add_method`, `design_experiment` — WRITE, so
+//!   [`AppState::read_as`] is the wrong instrument; owner is
+//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//! * `find_methods` — the HANDLER: it holds no `Viewer`, so there is nothing to
+//!   stamp a connection with.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 #[cfg(feature = "db")]
 use axum::{
@@ -65,6 +88,20 @@ pub struct MethodGapQuery {
     pub required_capabilities: Option<Vec<String>>,
     pub max_paper_age_years: Option<i32>,
 }
+
+/// Upper bound on `MethodGapQuery::required_capabilities`.
+///
+/// `method_gap_analysis` holds one pooled connection for the duration of its
+/// analysis (conversion shard 6), and the statements it issues on that
+/// connection scale with this list. An unbounded caller-supplied list and a
+/// held connection are a bad pair, so the list is bounded above the acquire —
+/// the same control `rag.rs::rag_context` applies to `limit` with `MAX_LIMIT`.
+///
+/// 32 rather than a smaller number: a gap analysis is a planning call over a
+/// hypothesis's capability set, and the largest such set anywhere in this
+/// workspace's fixtures or docs is single-digit, so 32 leaves an order of
+/// magnitude of headroom over any real use while still being a bound.
+pub const MAX_REQUIRED_CAPABILITIES: usize = 32;
 
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
@@ -404,6 +441,24 @@ pub async fn method_gap_analysis(
 
     let capabilities = params.required_capabilities.clone().unwrap_or_default();
 
+    // Bounded before the connection is acquired, deliberately in that order.
+    // This handler now holds one pooled connection for the duration of its
+    // analysis (see the acquire below), and the work it does on that connection
+    // is a function of this list's length. An input-shaped bound above the
+    // acquire is the same control `rag.rs::rag_context` applies to `limit` with
+    // `MAX_LIMIT`, and it is applied here for the same reason. Rejected
+    // alternative: truncating silently — a caller who asks for more than the
+    // bound gets a wrong answer rather than an error, and a gap analysis that
+    // quietly drops capabilities reports them as covered.
+    if capabilities.len() > MAX_REQUIRED_CAPABILITIES {
+        return Err(ApiError::ValidationError {
+            field: "required_capabilities".to_string(),
+            reason: format!(
+                "At most {MAX_REQUIRED_CAPABILITIES} capabilities may be analysed in one request"
+            ),
+        });
+    }
+
     if capabilities.is_empty() {
         return Ok(Json(serde_json::json!({
             "hypothesis_id": params.hypothesis_id,
@@ -422,11 +477,52 @@ pub async fn method_gap_analysis(
     let mut gaps = 0;
     let mut stale = 0;
 
+    // ONE stamped connection for the whole analysis, reborrowed per statement.
+    //
+    // `&mut *read` rather than `&*read`: a by-value `E: PgExecutor` is MOVED by
+    // its first use, and the loops below issue O(capabilities x methods)
+    // statements. Reborrowing is what lets them all run on this connection.
+    //
+    // CONNECTION-HOLD PROFILE, recorded because the conversion changes it: this
+    // handler now holds one pooled connection for the duration of its analysis,
+    // where before each statement checked one out and returned it. The
+    // work done on that connection scales with the request's input, so the input
+    // is bounded above, before the acquire. That bound is the FIX; it is stated
+    // here as mechanism and its characteristics are not analysed in this
+    // repository. Shard 5 recorded a related item for
+    // `structural.rs::get_structural_features`, which differs in that its round
+    // trips are a fixed number. Nothing here changes what any caller can read.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "method_gap_analysis",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     for cap in &capabilities {
-        let methods =
-            epigraph_db::MethodRepository::get_methods_for_capability(&state.db_pool, cap)
-                .await
-                .unwrap_or_default();
+        // `methods` and `method_capabilities` both carry no RLS at migration
+        // head 92, so this site shares the connection and narrows nothing —
+        // see `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+        //
+        // PROPAGATED, not swallowed, and that is a consequence of the
+        // conversion. All three statements in these loops now share ONE
+        // connection; under `SessionGucMode::Transaction` a `ScopedRead` is a
+        // `sqlx::Transaction` with no per-statement savepoint, so the first
+        // error aborts it and every later statement is rejected with `25P02`.
+        // An `.unwrap_or_default()` inside the loop would turn that into a 200
+        // in which every REMAINING capability reports as a gap — a wrong answer
+        // that looks like a finding. Before the conversion each statement had
+        // its own checkout and a failure was isolated to it.
+        let methods = epigraph_db::MethodRepository::get_methods_for_capability(&mut *read, cap)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("{e}"),
+            })?;
 
         if methods.is_empty() {
             gaps += 1;
@@ -442,21 +538,44 @@ pub async fn method_gap_analysis(
         let mut cap_flags: Vec<String> = Vec::new();
 
         for m in &methods {
+            // Both of these DO narrow: they reach `claims` and `edges` and carry
+            // the `{VISIBILITY:c}` / `{EDGE_VISIBILITY:e}` markers. Both
+            // propagate rather than default, for the reason given at the
+            // capability read above — they are on the same shared connection.
+            //
+            // `get_evidence_strength` returns `Result<MethodEvidenceStrength>`
+            // and not an `Option`, so the previous `.ok()` had exactly one
+            // effect: it rendered a database error as the same value a method
+            // with no evidence produces, and the response then reported
+            // `evidence_strength: 0.0`.
+            //
+            // Checked in the repo body rather than inferred from the signature,
+            // because a `fetch_one` there WOULD make `RowNotFound` a legitimate
+            // empty result and this `?` would turn an ordinary cross-tenant miss
+            // into a 500 for the whole analysis: `get_evidence_strength` ends in
+            // `fetch_optional` and `map_or`s `None` onto a zero-valued
+            // `MethodEvidenceStrength`, so the no-evidence case is already
+            // `Ok`. `RowNotFound` cannot reach here and only a real database
+            // error can. That distinction matters in THIS handler in
+            // particular, because the loop above is driven by an UNSPLICED read
+            // and therefore iterates methods whose evidence the viewer may not
+            // be able to see.
             let evidence = epigraph_db::MethodRepository::get_evidence_strength(
-                &state.db_pool,
+                &mut *read,
                 &viewer,
                 m.method_id,
             )
             .await
-            .ok();
+            .map_err(|e| ApiError::InternalError {
+                message: format!("{e}"),
+            })?;
 
-            let papers = epigraph_db::MethodRepository::get_source_papers(
-                &state.db_pool,
-                &viewer,
-                m.method_id,
-            )
-            .await
-            .unwrap_or_default();
+            let papers =
+                epigraph_db::MethodRepository::get_source_papers(&mut *read, &viewer, m.method_id)
+                    .await
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("{e}"),
+                    })?;
 
             let newest_year = papers.iter().filter_map(|p| p.pub_year).max();
             let is_stale = newest_year.is_some_and(|y| current_year - y > max_age);
@@ -476,7 +595,7 @@ pub async fn method_gap_analysis(
             method_infos.push(serde_json::json!({
                 "method_id": m.method_id,
                 "name": m.name,
-                "evidence_strength": evidence.as_ref().map(|e| e.avg_belief).unwrap_or(0.0),
+                "evidence_strength": evidence.avg_belief,
                 "newest_source_year": newest_year,
                 "source_count": papers.len(),
                 "status": status,

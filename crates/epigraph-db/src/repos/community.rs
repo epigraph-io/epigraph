@@ -578,6 +578,20 @@ impl CommunityRepository {
 
     /// Get all member perspectives for a community
     ///
+    /// # The projection must match `PerspectiveRow` field for field
+    ///
+    /// `PerspectiveRow` is a `#[derive(FromRow)]` struct with TEN fields and
+    /// this list projected nine, omitting `properties`. `fetch_all` therefore
+    /// failed at decode with `no column found for name: properties` for every
+    /// community that HAS a member — a hard 500 on
+    /// `GET /api/v1/communities/:id`, not a subtle degradation. It was
+    /// invisible because this function has exactly one caller and that endpoint
+    /// had no test anywhere in the workspace; conversion shard 6 wrote the first
+    /// one and it failed on its first run. Restoring the column discloses
+    /// nothing new: the row is already viewer-filtered by the spliced predicate
+    /// below, and `routes/community.rs::get_community` maps only
+    /// `id`/`name`/`owner_agent_id` into its response.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -589,7 +603,8 @@ impl CommunityRepository {
         let sql = viewer.splice(
             r#"
             SELECT p.id, p.name, p.description, p.owner_agent_id, p.perspective_type,
-                   p.frame_ids, p.extraction_method, p.confidence_calibration, p.created_at
+                   p.frame_ids, p.extraction_method, p.confidence_calibration,
+                   p.properties, p.created_at
             FROM perspectives p
             JOIN community_members cm ON cm.perspective_id = p.id
             WHERE cm.community_id = $1

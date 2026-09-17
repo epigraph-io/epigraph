@@ -1,3 +1,38 @@
+//! Agent endpoints.
+//!
+//! # Tenancy: 5 of this file's 15 raw-pool sites are converted
+//!
+//! Conversion shard 6. `get_agent_reputation` (2 sites) and `agent_claims`
+//! (3 sites) each serve their whole request on one viewer-stamped connection
+//! from [`AppState::read_as`].
+//!
+//! **Only 3 of those 5 sites change what a caller can see, and the split is
+//! stated rather than averaged.** The `AgentRepository::get_by_id` site in each
+//! handler narrows nothing: `agents` carries RLS, but migration 077 section 9
+//! creates `agents_identity FOR SELECT TO PUBLIC USING (true)` on it and says
+//! why. The `ClaimRepository::get_by_agent` and the two
+//! `EdgeRepository::*_claims_attributed_to` sites read `claims` and `edges`,
+//! both FORCEd and both viewer-spliced, and those are the reads the stamp bears
+//! on. An earlier classification filed this whole file as convertible-and-inert;
+//! that is right about `get_agent`/`list_agents` and wrong about these five.
+//!
+//! NOT converted, with the blocker named per handler:
+//! * `create_agent`, `update_agent` — WRITE. [`AppState::read_as`] is read-only,
+//!   and a write routed through a `ScopedRead` type-checks and is then rolled
+//!   back on drop under `SessionGucMode::Transaction`. Owner is
+//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//! * `get_agent`, `list_agents` — the HANDLER, not the site: neither takes a
+//!   `Viewer`, so there is nothing for `read_as` to stamp a connection with.
+//!   The residual is already on record as `F-TAILRLS-P1` in
+//!   `docs/tenancy/progress.json` and is owned by that entry, not by this shard,
+//!   which neither widens nor narrows it.
+//!
+//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES`,
+//! `AUTH_OPTIONAL_PROVENANCE_SITES` and `AUTH_OPTIONAL_WRITE_SITES` rows for
+//! this file all sit in the write handlers above and are unchanged.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -373,16 +408,37 @@ pub async fn get_agent_reputation(
 ) -> Result<Json<AgentReputationResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
 
-    // 1. Look up the agent (404 if not found)
-    let agent = AgentRepository::get_by_id(&state.db_pool, agent_id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_agent_reputation",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    // 1. Look up the agent (404 if not found).
+    //
+    // Stamping this statement narrows NOTHING and is not claimed to: migration
+    // 077 section 9 gives `agents` the policy `agents_identity FOR SELECT TO
+    // PUBLIC USING (true)`. It shares the connection so that the reputation this
+    // handler returns is computed under ONE tenancy stamp rather than two
+    // checkouts'. That is the property the shared connection delivers; it is NOT
+    // a shared snapshot, because a `ScopedRead` is a bare connection under
+    // `SessionGucMode::Session` and READ COMMITTED under `Transaction`.
+    let agent = AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
 
-    // 2. Fetch all claims by this agent
-    let claims = ClaimRepository::get_by_agent(&state.db_pool, &viewer, agent_id).await?;
+    // 2. Fetch all claims by this agent. THIS is the read the stamp bears on:
+    // `claims` is FORCEd and `get_by_agent` splices the viewer.
+    let claims = ClaimRepository::get_by_agent(&mut *read, &viewer, agent_id).await?;
 
     // 3. Convert claims into ClaimOutcome structs
     let now = chrono::Utc::now();
@@ -507,8 +563,22 @@ pub async fn agent_claims(
 ) -> Result<Json<PaginatedResponse<AttributedClaimResponse>>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
 
-    // Verify agent exists
-    AgentRepository::get_by_id(&state.db_pool, agent_id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "agent_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    // Verify agent exists. As in `get_agent_reputation`, `agents_identity`
+    // does not narrow, so this site shares the connection for coherence with
+    // the two `edges`/`claims` reads below rather than for suppression.
+    AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
@@ -520,19 +590,18 @@ pub async fn agent_claims(
     let offset = params.offset.max(0);
     let min_truth = params.min_truth.clamp(0.0, 1.0);
 
-    // Query claims via ATTRIBUTED_TO edges
-    let rows = EdgeRepository::get_claims_attributed_to(
-        &state.db_pool,
-        &viewer,
-        id,
-        min_truth,
-        limit,
-        offset,
-    )
-    .await?;
+    // Query claims via ATTRIBUTED_TO edges.
+    //
+    // The page and its total now come off the SAME connection, which is what
+    // makes `total` describe the set `rows` was drawn from. On two checkouts
+    // they could disagree — and a total larger than the viewer's visible set is
+    // itself a cardinality disclosure.
+    let rows =
+        EdgeRepository::get_claims_attributed_to(&mut *read, &viewer, id, min_truth, limit, offset)
+            .await?;
 
     let total =
-        EdgeRepository::count_claims_attributed_to(&state.db_pool, &viewer, id, min_truth).await?;
+        EdgeRepository::count_claims_attributed_to(&mut *read, &viewer, id, min_truth).await?;
 
     let items: Vec<AttributedClaimResponse> = rows
         .into_iter()

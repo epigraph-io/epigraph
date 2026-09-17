@@ -13,6 +13,57 @@
 //! inversion; they are removed rather than corrected because "protected" is
 //! now the module-wide default and an exception would be the thing worth
 //! annotating.
+//!
+//! # Tenancy: 7 of this file's 17 raw-pool sites are converted
+//!
+//! Conversion shard 6. `list_edges`, `claim_neighborhood`, `graph_edges`,
+//! `graph_full`, `get_evidence`, `claim_provenance` and `evidence_by_relationship`
+//! each serve their whole request on one viewer-stamped connection from
+//! [`AppState::read_as`]. Every repo function they reach already spliced the
+//! viewer; what changed is which connection carries the session GUCs the
+//! `edges`, `claims`, `evidence` and `reasoning_traces` policies read.
+//!
+//! **Seven, not the six the shard was sized for.** `evidence_by_relationship` was
+//! filed unconvertible on the ground that it is an unrouted private helper, and
+//! that is true of the symbol and false of the reachability: it is called from
+//! exactly two production sites, `supporting_evidence` and
+//! `contradicting_evidence`, both routed GETs, and it already receives their
+//! `&Viewer` as an explicit parameter — which is the same two values `read_as`
+//! needs. It converts in place, with no signature change.
+//!
+//! The other two private helpers named alongside it, `is_valid_entity_type` and
+//! `entity_exists`, are genuinely blocked and the blocker is the HANDLER: their
+//! only production caller is `create_edge`, a POST, and neither receives a
+//! `Viewer` from anywhere.
+//!
+//! Two route-layer helpers changed shape so their bodies could run on the
+//! caller's connection rather than reaching for a pool of their own:
+//! `graph_query_utils::load_subgraph` grew a `load_subgraph_conn` primitive
+//! (the `&PgPool` spelling stays, so `routes/graph_query.rs` and
+//! `tests/tenant_isolation_http.rs` compile unedited and `graph_query.rs`
+//! remains counted unconverted), and the nested `build_evidence_chains` here
+//! takes `&mut PgConnection`. Both take a connection whose stamping they cannot
+//! verify, and both say so.
+//!
+//! NOT converted (10 sites), blocker named per handler:
+//! * `create_edge`, `create_hierarchical_edge`, `patch_edge`, `relate_claims`,
+//!   `delete_edge` — WRITE. [`AppState::read_as`] is read-only and a write
+//!   routed through a `ScopedRead` is rolled back on drop under
+//!   `SessionGucMode::Transaction` while still type-checking; the owner is
+//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//! * `is_valid_entity_type`, `entity_exists` — reached only from `create_edge`,
+//!   as above.
+//!
+//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES` and
+//! `AUTH_OPTIONAL_PROVENANCE_SITES` rows for this file all sit in those write
+//! handlers and are unchanged.
+//!
+//! `claim_provenance` carries an open finding, `F-SEC14-A`. Converting its
+//! executor does NOT discharge it — that entry's remedy is a different change to
+//! a different layer — and it stays open. Nothing further about it is recorded
+//! here; see `docs/tenancy/progress.json`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -1476,14 +1527,24 @@ pub async fn list_edges(
     State(state): State<AppState>,
     Query(params): Query<EdgeQueryParams>,
 ) -> Result<Json<Vec<EdgeResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_edges",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // AND-compose every non-null filter at the SQL layer so drainer
     // GET-then-POST guards work. Replaces the legacy first-non-null
     // cascade. Per #65: source_type defaults to None (not "claim") so
     // callers querying non-claim sources don't get silently filtered.
     let rows = EdgeRepository::list_filtered(
-        pool,
+        &mut *read,
         &viewer,
         params.source_id,
         params.target_id,
@@ -1529,7 +1590,26 @@ pub async fn claim_neighborhood(
     Path(claim_id): Path<Uuid>,
     Query(params): Query<NeighborhoodParams>,
 ) -> Result<Json<NeighborhoodResponse>, ApiError> {
-    let pool = &state.db_pool;
+    // One stamped connection for the whole traversal, reborrowed per hop. The
+    // frontier expansion below issues O(frontier) statements, so a by-value
+    // executor would be moved on the first one; and a neighborhood assembled
+    // from N checkouts is assembled under N independent tenancy stamps, so a hop
+    // could be filtered against a different `epigraph.group_ids` than the hop
+    // that reached it. One connection makes that one stamp. It does NOT make the
+    // traversal a single snapshot — `ScopedRead` is a bare connection under
+    // `SessionGucMode::Session` and READ COMMITTED under `Transaction` — and no
+    // claim here rests on one.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_neighborhood",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     let max_depth = params.depth.unwrap_or(2).min(3); // Cap at 3 hops
 
@@ -1538,8 +1618,8 @@ pub async fn claim_neighborhood(
     let mut visited_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     visited_ids.insert(claim_id);
 
-    let outgoing = EdgeRepository::get_by_source(pool, &viewer, claim_id, "claim").await?;
-    let incoming = EdgeRepository::get_by_target(pool, &viewer, claim_id, "claim").await?;
+    let outgoing = EdgeRepository::get_by_source(&mut *read, &viewer, claim_id, "claim").await?;
+    let incoming = EdgeRepository::get_by_target(&mut *read, &viewer, claim_id, "claim").await?;
 
     // Collect 1-hop neighbor IDs
     let mut frontier: Vec<Uuid> = Vec::new();
@@ -1560,8 +1640,8 @@ pub async fn claim_neighborhood(
     for _hop in 1..max_depth {
         let mut next_frontier = Vec::new();
         for &node_id in &frontier {
-            let out = EdgeRepository::get_by_source(pool, &viewer, node_id, "claim").await?;
-            let inc = EdgeRepository::get_by_target(pool, &viewer, node_id, "claim").await?;
+            let out = EdgeRepository::get_by_source(&mut *read, &viewer, node_id, "claim").await?;
+            let inc = EdgeRepository::get_by_target(&mut *read, &viewer, node_id, "claim").await?;
 
             for edge in out.iter().chain(inc.iter()) {
                 let neighbor_id = if edge.source_id == node_id {
@@ -1688,9 +1768,19 @@ pub async fn graph_edges(
     State(state): State<AppState>,
     Query(_params): Query<GraphAccessParams>,
 ) -> Result<Json<GraphEdgesResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "graph_edges",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    let rows = EdgeRepository::list_all(pool, &viewer, 5000).await?;
+    let rows = EdgeRepository::list_all(&mut *read, &viewer, 5000).await?;
 
     // Filter to claim-to-claim edges. `list_all` is spliced with `&viewer`, so
     // the endpoint-visibility half of this loop is now the database's job.
@@ -1815,10 +1905,31 @@ pub async fn graph_full(
     State(state): State<AppState>,
     Query(_params): Query<GraphAccessParams>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
-    let pool = &state.db_pool;
+    // The edge scan and the five node/edge projections inside `load_subgraph_conn`
+    // all run on this one stamped connection. That matters more here than
+    // anywhere else in the shard: `load_subgraph_conn` narrows its final edge
+    // fetch to the ids that SURVIVED its node projections, and that
+    // node-set-to-edge-set consistency argument only holds if both halves saw
+    // the same GROUP SET. Not the same snapshot: a `ScopedRead` is a bare
+    // connection under `SessionGucMode::Session` and a READ COMMITTED transaction
+    // under `Transaction`, so a concurrent writer can still move either half.
+    // What the shared connection guarantees is that both halves were filtered
+    // against one `epigraph.group_ids` / `principal_id` stamp, which is the half
+    // of the argument that is a tenancy property.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "graph_full",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // 1. Fetch all edges (capped)
-    let edge_rows = EdgeRepository::list_all(pool, &viewer, 2000).await?;
+    let edge_rows = EdgeRepository::list_all(&mut *read, &viewer, 2000).await?;
 
     // 2. Collect unique entity IDs by type
     let mut claim_ids = std::collections::HashSet::new();
@@ -1886,9 +1997,14 @@ pub async fn graph_full(
         }));
     }
 
-    // No label-blanking pass: `load_subgraph` is spliced with `&viewer`, so an
-    // unreadable claim is not among `resp.nodes` to be relabelled.
-    let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
+    // No label-blanking pass: `load_subgraph_conn` is spliced with `&viewer`, so
+    // an unreadable claim is not among `resp.nodes` to be relabelled.
+    //
+    // The `_conn` spelling, not the `&PgPool` wrapper: the wrapper acquires off
+    // `AppState.db_pool` and would put these five statements back on an
+    // unstamped connection. `graph_query.rs`'s two call sites still use the
+    // wrapper and are still counted unconverted.
+    let resp = super::graph_query_utils::load_subgraph_conn(&mut read, &viewer, node_ids).await?;
     Ok(resp)
 }
 
@@ -1973,7 +2089,17 @@ pub async fn get_evidence(
     Query(_params): Query<EvidenceAccessParams>,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<EvidenceDetailResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_evidence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Was an inline, viewer-less `SELECT … FROM evidence WHERE id = $1` whose
     // only control was a post-fetch `check_content_access` on the linked claim,
@@ -1981,7 +2107,7 @@ pub async fn get_evidence(
     // pass, so the read itself must filter: a row this viewer cannot see is
     // `None`, which is the SAME value a missing row produces, and both render
     // as the identical 404 below (§8.5).
-    let row = epigraph_db::EvidenceRepository::detail_by_id(pool, &viewer, evidence_id)
+    let row = epigraph_db::EvidenceRepository::detail_by_id(&mut *read, &viewer, evidence_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("DB error: {e}"),
@@ -1998,7 +2124,7 @@ pub async fn get_evidence(
         "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'claim' LIMIT 1"
     )
     .bind(evidence_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *read)
     .await
     .ok()
     .flatten();
@@ -2007,7 +2133,7 @@ pub async fn get_evidence(
         "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'agent' LIMIT 1"
     )
     .bind(evidence_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *read)
     .await
     .ok()
     .flatten();
@@ -2119,7 +2245,17 @@ pub async fn claim_provenance(
     Query(_params): Query<EvidenceAccessParams>,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
 ) -> Result<Json<ProvenanceResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_provenance",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // 1. Fetch the claim THROUGH the viewer.
     //
@@ -2129,7 +2265,7 @@ pub async fn claim_provenance(
     // filters instead: a claim this viewer cannot read is `None` — the same
     // value a nonexistent id produces — and both render the identical 404.
     let claim = epigraph_db::ClaimRepository::get_by_id(
-        pool,
+        &mut *read,
         &viewer,
         epigraph_core::ClaimId::from_uuid(claim_id),
     )
@@ -2172,8 +2308,13 @@ pub async fn claim_provenance(
     // this chain starts from" does not imply "the caller may read every piece
     // of evidence the chain passes through". The projected `properties` carries
     // a free-form `caption`, which is content.
+    //
+    // `&mut sqlx::PgConnection` and not a by-value `E: PgExecutor`: the loop
+    // below issues one statement per evidence id, and a by-value executor is
+    // moved by the first of them. The connection is the caller's, and the
+    // caller is responsible for its stamping — nothing here can check that.
     async fn build_evidence_chains(
-        pool: &epigraph_db::PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &epigraph_db::visibility::Viewer,
         claim_step: &ProvenanceStep,
         trace_step: Option<&ProvenanceStep>,
@@ -2182,7 +2323,7 @@ pub async fn claim_provenance(
         let mut chains = Vec::new();
         for target_id in evidence_target_ids {
             let ev: Option<EvidenceProvRow> =
-                epigraph_db::EvidenceRepository::detail_by_id(pool, viewer, target_id)
+                epigraph_db::EvidenceRepository::detail_by_id(&mut *conn, viewer, target_id)
                     .await
                     .map_err(|e| ApiError::InternalError {
                         message: format!("DB error: {e}"),
@@ -2255,7 +2396,7 @@ pub async fn claim_provenance(
         // `ReasoningTraceRepository::provenance_step_by_id` for why
         // `get_by_id` is the wrong reuse.
         let trace_row = epigraph_db::ReasoningTraceRepository::provenance_step_by_id(
-            pool,
+            &mut *read,
             &viewer,
             epigraph_core::TraceId::from_uuid(trace_id),
         )
@@ -2276,7 +2417,7 @@ pub async fn claim_provenance(
                 "SELECT target_id FROM edges WHERE source_id = $1 AND source_type = 'claim' AND target_type = 'evidence'"
             )
             .bind(claim_id)
-            .fetch_all(pool)
+            .fetch_all(&mut *read)
             .await
             .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?;
 
@@ -2291,7 +2432,7 @@ pub async fn claim_provenance(
                     evidence_edges.into_iter().map(|e| e.target_id).collect();
                 chains.extend(
                     build_evidence_chains(
-                        pool,
+                        &mut read,
                         &viewer,
                         &claim_step,
                         Some(&trace_step),
@@ -2309,12 +2450,14 @@ pub async fn claim_provenance(
             "SELECT target_id FROM edges WHERE source_id = $1 AND source_type = 'claim' AND target_type = 'evidence'"
         )
         .bind(claim_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?;
 
         let target_ids: Vec<Uuid> = evidence_edges.into_iter().map(|e| e.target_id).collect();
-        chains.extend(build_evidence_chains(pool, &viewer, &claim_step, None, target_ids).await?);
+        chains.extend(
+            build_evidence_chains(&mut read, &viewer, &claim_step, None, target_ids).await?,
+        );
     }
 
     Ok(Json(ProvenanceResponse { claim_id, chains }))
@@ -2394,7 +2537,17 @@ async fn evidence_by_relationship(
     relationship: &str,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Json<ClaimEvidenceListResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "evidence_by_relationship",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // The gate used to be `check_content_access(pool, claim_id, agent_id)`,
     // early-returning an empty list on `Redacted`, with the evidence query
@@ -2409,7 +2562,7 @@ async fn evidence_by_relationship(
     // the repo statement filters BOTH the edge and the evidence row, so even a
     // caller who reaches the query cannot pull `raw_content` it may not read.
     let rows = epigraph_db::EvidenceRepository::by_relationship_for_claim(
-        pool,
+        &mut *read,
         viewer,
         claim_id,
         relationship,
@@ -2725,12 +2878,87 @@ mod db_tests {
 
     // ── Test scaffolding ──
 
+    /// Rebuild a connection URL for the database `pool` is connected to.
+    ///
+    /// `#[sqlx::test]` hands each arm a randomly-named private database but no
+    /// URL, and [`test_state`] needs one to build its `ScopedPool`. Same move as
+    /// `tests/viewer_fixture.rs::database_url_for` and
+    /// `routes/search.rs::db_integration_tests::database_url_for`; duplicated
+    /// because this is an in-crate `#[cfg(test)]` module and cannot reach the
+    /// integration-test fixture.
+    ///
+    /// Without it the arms would seed the private database and the handler would
+    /// read the SHARED one — a silent vacuous pass.
+    async fn database_url_for(pool: &PgPool) -> String {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .expect("current_database()");
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        // Strip the query string before touching the path, or `?sslmode=require`
+        // would be mistaken for part of the database name.
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        }
+    }
+
     /// Build state AND prime the entity_types registry cache. `with_db` is
     /// sync and cannot load the cache, so every test path that reaches
     /// create_edge (whose sync validity gate reads the cache) MUST await this
     /// — an empty cache 400s all edge writes at validation.
+    ///
+    /// # Why this builds a `ScopedPool` rather than calling `AppState::with_db`
+    ///
+    /// Conversion shard 6 moved `list_edges` onto `AppState::read_as`, and
+    /// `read_as` HARD-REFUSES a state whose `scoped` is `None` — that refusal is
+    /// the fail-closed behaviour the conversion exists to establish, not an
+    /// inconvenience to route around. `AppState::with_db` leaves `scoped: None`,
+    /// so `list_edges_combines_source_target_relationship_filters` would have
+    /// started returning 500 against the converted handler.
+    ///
+    /// The other tests here drive POST/PATCH handlers that this shard did not
+    /// convert, and for them this is a no-op change of posture:
+    /// `with_scoped_pool` sets `db_pool = scoped.inner().clone()`, the same pool
+    /// they had before.
+    ///
+    /// # THIS MODULE'S `list_edges` ARM IS NOT A CONVERSION CONTROL, and the
+    /// repair is what made it one no longer
+    ///
+    /// Because `with_scoped_pool` sets `db_pool = scoped.inner().clone()`, the
+    /// converted and the unconverted spellings here read the SAME pool, so
+    /// reverting `list_edges` to `&state.db_pool` changes not one observable row
+    /// in `list_edges_combines_source_target_relationship_filters`. That arm
+    /// asserts functional filtering and nothing about tenancy; it did not
+    /// observe the conversion before this repair either, but the repair is what
+    /// makes the sameness structural rather than incidental, so it is recorded
+    /// here rather than left to be rediscovered.
+    ///
+    /// `crates/epigraph-api/tests/shard6_routes_scoped_read.rs::split_state` is
+    /// the instrument that DOES observe it — it deliberately gives `db_pool` a
+    /// separate downgraded pool — and is the only control on this handler's
+    /// conversion.
+    ///
+    /// `DATABASE_URL` is read again rather than taken from `state.db_pool` on
+    /// purpose: `no_unscoped_pool.rs`'s scanner does not cut `#[cfg(test)]` and
+    /// its `SCAN_ROOT` is `crates/epigraph-api/src`, so a `state.db_pool` written
+    /// in this helper would count as an unconverted site and silently re-raise
+    /// the row this shard just lowered.
     async fn test_state(pool: PgPool) -> AppState {
-        let state = AppState::with_db(pool, ApiConfig::default());
+        let url = database_url_for(&pool).await;
+        let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+            .await
+            .expect("connect a scoped pool");
+        let state = AppState::with_scoped_pool(scoped, ApiConfig::default());
         state
             .load_entity_type_cache()
             .await

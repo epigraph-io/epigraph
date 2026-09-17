@@ -1191,12 +1191,55 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `PoliticalRepository` read can run both statements on ONE stamped connection. The SQL, \
          its binds and the projected row shape are unchanged and were not re-derived here. \
          REACH IS WIDER THAN MOTIVATION: those five are why the signature moved, not the whole \
-         caller set. Ten other production call sites across six files -- `routes/agents.rs` (4), \
-         `routes/crud.rs` (2), and one each in `routes/claims.rs`, `routes/submit.rs`, \
+         caller set. EIGHT other production call sites across six files -- `routes/agents.rs` \
+         (2), `routes/crud.rs` (2), and one each in `routes/claims.rs`, `routes/submit.rs`, \
          `routes/webhooks.rs::agent_principal_exists` and \
          `epigraph-engine/src/export/prov.rs` -- were not touched and still pass `&PgPool`, \
-         which satisfies `E: PgExecutor<'e>`. Stated here for the same reason the SQL/executor \
-         split above is stated: so a reader does not mistake the motivation for the inventory.",
+         which satisfies `E: PgExecutor<'e>`. That count was TEN with `routes/agents.rs` at four \
+         when shard 5 wrote this entry; conversion shard 6 moved two of those four \
+         (`get_agent_reputation` and `agent_claims`) onto a stamped connection, and the number \
+         is re-measured here rather than left to read as still current. Stated for the same \
+         reason the SQL/executor split above is stated: so a reader does not mistake the \
+         motivation for the inventory.",
+    ),
+    (
+        "experiment.rs",
+        "get_for_hypothesis",
+        "Reads `experiments` by `hypothesis_id`, and the statement's FROM is `experiments` alone \
+         -- it joins nothing. `experiments` is one of the relations migration 062's `tier_a` \
+         roots do NOT reach: measured at migration head 92 it carries neither a `visibility` nor \
+         an `owner_group_id` column, and row-level security is off on it \
+         (`pg_class.relrowsecurity` and `relforcerowsecurity` both false, against `claims` which \
+         is true/true). So this site has no column to attach a predicate to and no policy for a \
+         session GUC to select, and a `&Viewer` here would be a parameter the statement could \
+         not spend. THE VISIBLE ROW SET IS UNCHANGED BY THE CONVERSION, which is the honest \
+         statement: its caller `routes/hypothesis.rs::hypothesis_status` reads this beside four \
+         tenancy-carrying reads, and the reason it now shares their connection is that the \
+         handler's answer should be assembled under ONE tenancy stamp, not that this read was \
+         leaking. SCOPE: \
+         conversion shard 6 widened the executor only. The SQL, its single bind and the \
+         projected row shape are unchanged and were not re-derived here. REACH IS WIDER THAN \
+         MOTIVATION: five other production call sites -- the `method_search`, `experiment`, \
+         `protocol_gen` and `hypothesis` binaries in `epigraph-cli`, and \
+         `epigraph-api/src/routes/experiment_loop.rs` -- still pass `&PgPool`, which satisfies \
+         `E: PgExecutor<'e>`, and none was edited.",
+    ),
+    (
+        "method.rs",
+        "get_methods_for_capability",
+        "Reads `methods` JOINed to `method_capabilities`, and BOTH relations in that FROM are \
+         global reference data with no tenancy: measured at migration head 92 neither carries a \
+         `visibility` or an `owner_group_id` column, and row-level security is off on both \
+         (`relrowsecurity` and `relforcerowsecurity` false on each). That is the same argument \
+         `method.rs::get` above makes for the same table, EXTENDED TO THE JOIN PARTNER rather \
+         than inherited from the file name -- a one-table claim would not have covered the \
+         second relation, and a join to a FORCEd table would have made this site filterable \
+         after all. SCOPE: conversion shard 6 widened the executor only, so that \
+         `routes/experiments.rs::method_gap_analysis` can interleave this with the two \
+         viewer-spliced `MethodRepository` reads it issues per method on ONE stamped connection. \
+         The SQL, its bind and the projected row shape are unchanged. It has exactly one caller, \
+         that handler, so reach and motivation coincide here -- unlike the `agent.rs` entry \
+         above, where they do not.",
     ),
 ];
 

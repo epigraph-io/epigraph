@@ -390,8 +390,19 @@ impl MethodRepository {
     }
 
     /// Find methods that enable a specific capability (pattern match).
-    pub async fn get_methods_for_capability(
-        pool: &PgPool,
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so `routes/experiments.rs::method_gap_analysis`
+    /// can run it on the same viewer-stamped connection as the two
+    /// tenancy-carrying reads it interleaves with. Conversion shard 6 widened the
+    /// executor ONLY; the SQL, its bind and the projected row shape are unchanged.
+    ///
+    /// It takes no `Viewer` because neither relation in its FROM has anything for
+    /// one to filter — see this function's row in
+    /// `epigraph-db/tests/visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    pub async fn get_methods_for_capability<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         capability_pattern: &str,
     ) -> Result<Vec<MethodForCapability>, sqlx::Error> {
         let like = format!("%{capability_pattern}%");
@@ -404,7 +415,7 @@ impl MethodRepository {
              ORDER BY mc.evidence_count DESC",
         )
         .bind(&like)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
