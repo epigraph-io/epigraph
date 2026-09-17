@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (330 today; the assertions below measure the tree and
+//! deletes in week two. (303 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 330 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 303 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -115,11 +115,26 @@
 //!      and `routes/structural.rs` (1), and shard 6 twenty-five more across
 //!      `routes/edges.rs` (7), `routes/hypothesis.rs` (6), `routes/agents.rs`
 //!      (5), `routes/experiments.rs` (3), `routes/community.rs` (2) and
-//!      `routes/rag.rs` (2). None
-//!      discharged the gate — 330 is not 0 — and no shard in the series may be
+//!      `routes/rag.rs` (2), and shard 7 — the LAST read shard — twenty-seven
+//!      more across `routes/workflows.rs` (10), `routes/entities.rs` (5),
+//!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
+//!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
+//!      `routes/challenge.rs`. None
+//!      discharged the gate — 303 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 86 of the 416 sites the series began with are converted, and
-//!      330 are not.
+//!      decision: 113 of the 416 sites the series began with are converted, and
+//!      303 are not.
+//!
+//!      **What remains is NOT read-shard work, and that is the closing
+//!      measurement of the read programme rather than a to-do list.** Shard 7
+//!      exhausted the sites PR #460 classified `A` that any shard may take: of
+//!      the 26 it was sized for, 24 landed, 2 were declined at SITE level (an
+//!      authorization read in `routes/claims.rs`, argued at the site), and 3
+//!      more landed that the classification filed `C` on a rule that does not
+//!      match reachability. The residue is ~39 category `B`, behind an open
+//!      operator decision, and ~265 category `C`, every one blocked by its
+//!      HANDLER — overwhelmingly because the handler WRITES, which
+//!      `AppState::read_as` is documented not to serve.
 //!
 //!      **Shard 4 is also the first shard to end with rows it did not empty,
 //!      and that is the honest outcome rather than a shortfall.** It was sized
@@ -302,6 +317,20 @@
 //!   `#[cfg(test)]` seeder — which is exactly the follow-up lint named at the
 //!   end of this bullet, and is where the count belongs. Shard 5 corrected
 //!   only what it falsified.
+//!
+//!   **Conversion shard 7 struck a second name for the same reason, and no
+//!   integer moves here either.** `routes/graph.rs::fetch_subgraph_edges` took
+//!   a `&PgPool` PARAMETER and now takes a `&mut PgConnection`, because its
+//!   only caller — `routes/graph.rs::expand`, verified as the only one
+//!   workspace-wide — is converted. It left the list below because its
+//!   SIGNATURE changed, not because the needle learned to see a parameter, and
+//!   shard 7 likewise replaces no number it did not measure. Note what did NOT
+//!   happen: it was changed IN PLACE rather than split into a `_conn` primitive
+//!   with a `&PgPool` wrapper, which is what shard 6 had to do for
+//!   `graph_query_utils::load_subgraph`. A wrapper here would have had zero
+//!   call sites, and the `_conn` shape would have added a route-layer
+//!   connection primitive that `visibility_lint.rs`'s two connection rules
+//!   cannot see, because their scan root is `crates/epigraph-db/src/repos`.
 //!   Enumerated so no shard author mistakes this table for complete —
 //!   `middleware/group_authz.rs::require_group_admin`,
 //!   `middleware/provenance.rs::record_provenance`,
@@ -310,7 +339,6 @@
 //!   `routes/computation.rs::extract_neighborhood`,
 //!   `routes/edges.rs::{trigger_edge_ds_recomputation, propagate_to_dependents,
 //!   recompute_claim_belief}`, `routes/events.rs::retain_visible_events`,
-//!   `routes/graph.rs::fetch_subgraph_edges`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
 //!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
@@ -525,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 330;
+const HIGH_WATER: usize = 303;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -543,11 +571,19 @@ const HIGH_WATER: usize = 330;
 /// Its 25 sites came off `HIGH_WATER` alone, 355 -> 330 — again read off
 /// `the_scanner_is_not_vacuous`'s own failure on the converted tree, not derived
 /// by subtracting the count the shard believed it had converted.
+///
+/// Conversion shard 7 did not move it either, for the same reason: its eight
+/// files all retain sites, the smallest residual being `routes/challenge.rs` at
+/// 2. Its 27 sites came off `HIGH_WATER` alone, 330 -> 303, and BOTH integers
+/// were read off `measure()`'s own failure output with these two constants
+/// temporarily set to 1 — never by subtracting the count the shard believed it
+/// had converted, which is the method every shard since 5 has used and the one
+/// that catches a miscount.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 330 sites across 44 files as of this commit. Lower an entry when a shard
+/// 303 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -566,8 +602,24 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // module doc for why routing a write through it compiles and then discards
     // the write. Their owner is `ScopedPool::begin_as` plus 16b's write gate.
     ("routes/belief.rs", 3),
-    ("routes/challenge.rs", 3),
-    ("routes/claims.rs", 25),
+    // 3 before conversion shard 7, which moved `list_challenges` onto
+    // `AppState::read_as`. The two that remain are `submit_challenge`, which
+    // WRITES and holds no `Viewer` at all; its owner is
+    // `D-PR16-claim-authorship-is-not-a-credential`, an open operator decision.
+    ("routes/challenge.rs", 2),
+    // 25 before conversion shard 7, which moved `get_claim`, `list_claims`,
+    // `list_claim_evidence` and `list_by_labels` onto
+    // `AppState::read_as`. FOUR, not six: `get_claim` and `list_claims` each
+    // hold a SECOND site that is declined at SITE level rather than handler
+    // level — a `GroupMembershipRepository::is_member` authorization gate that
+    // completes before any content read begins. The argument is written at the
+    // site in that file, and it is the first decline in this series whose
+    // blocker is the site and not the handler. The remaining NINETEEN sit in
+    // write handlers — `create_claim` (9), `update_claim` (6), `patch_claim`
+    // (2), `update_labels` (2) — which with those two gates is 21, the row
+    // below. (An earlier draft of this comment said "seventeen" and did not
+    // close the arithmetic against the row it annotates.)
+    ("routes/claims.rs", 21),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -594,7 +646,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `ScopedPool::begin_as` plus `Viewer::splice_write`, and
     // `ContextRepository::create` takes no `Viewer` at all.
     ("routes/context.rs", 1),
-    ("routes/conventions.rs", 4),
+    // 4 before conversion shard 7, which moved `list_skills` onto
+    // `AppState::read_as` through the same `WorkflowRepository::list` widening
+    // that serves `routes/workflows.rs::list_workflows` — one signature change
+    // for two converted sites in two files. The three that remain
+    // (`learn_convention`, `forget_convention`, `share_skill`) all WRITE.
+    ("routes/conventions.rs", 3),
     // UNCHANGED at 7, and that is a measurement rather than an omission.
     // Conversion shard 5 was sized to include this file (4 of its 7 sites were
     // classified as convertible reads) and then measured it site by site. Three
@@ -612,15 +669,40 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // took when `routes/computation.rs` offered the same choice. Whole handlers
     // or nothing.
     ("routes/cross_source.rs", 7),
-    ("routes/crud.rs", 40),
+    // 40 before conversion shard 7, which moved the four read-only
+    // `ClaimThemeRepository` handlers (`get_boundary_claims`,
+    // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto
+    // `AppState::read_as`. Every one of the thirty-six that remain sits in a
+    // WRITE handler; this is the densest write-blocked file in the series.
+    ("routes/crud.rs", 36),
     ("routes/edges.rs", 10),
     ("routes/embeddings.rs", 2),
-    ("routes/entities.rs", 8),
+    // 8 before conversion shard 7, and the largest single-file drop in that
+    // shard. `entity_neighborhood` (2 sites) is category A. `query_triples`
+    // (3 sites) is NOT: PR #460 filed it C because its classification computes
+    // `write verb OR no Viewer OR unrouted` from the HANDLER, and the verb is a
+    // property of the route table rather than of the statement. Measured here:
+    // it is a POST that holds a `ViewerExtractor`, runs three SELECTs, opens no
+    // transaction and writes nothing — the same "true of the rule, false of the
+    // reachability" shape shard 6 found in `edges.rs::evidence_by_relationship`.
+    // The three that remain are `create_entity`, `batch_create_mentions` and
+    // `batch_create_triples`, all writes.
+    ("routes/entities.rs", 3),
     ("routes/events.rs", 6),
     ("routes/experiment_loop.rs", 20),
     ("routes/experiments.rs", 8),
     ("routes/gaps.rs", 5),
-    ("routes/graph.rs", 4),
+    // 4 before conversion shard 7, which moved `expand` onto
+    // `AppState::read_as`. ONE register site spending its alias on FOUR
+    // statements: two inline run/cluster-metadata probes, the viewer-spliced
+    // `GraphViewRepository::expand_cluster_nodes`, and the private helper
+    // `fetch_subgraph_edges`, whose signature changed to `&mut PgConnection` in
+    // place — it has exactly one caller workspace-wide, so no pool-shaped
+    // wrapper was created and this file leaves the `&PgPool`-PARAMETER blind
+    // spot enumerated in the Known limits above. The three that remain
+    // (`overview`, `themes_overview`, `themes_expand`) are routed GETs that hold
+    // NO `Viewer`; their owner is `D-PR16-theme-cluster-viewer-scope`.
+    ("routes/graph.rs", 3),
     // `routes/graph_neighborhood.rs` was 2 and is GONE, not zeroed: conversion
     // shard 5 moved `expand` and `claim_compound_neighborhood` onto
     // `AppState::read_as`. It is one of TWO rows that shard deleted; see
@@ -699,14 +781,29 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/submit.rs", 4),
     ("routes/tasks.rs", 15),
     ("routes/timeline.rs", 2),
-    ("routes/versioning.rs", 9),
+    // 9 before conversion shard 7, which moved `claim_history` onto
+    // `AppState::read_as`. Of the eight that remain, six are `supersede_claim`
+    // and two `mark_duplicate` — both write. One of the six is additionally
+    // blocked at SITE level: `let pool = state.db_pool.clone()` is moved into a
+    // detached `tokio::spawn`, which a `ScopedRead<'_>` borrowed from
+    // `AppState` cannot outlive.
+    ("routes/versioning.rs", 8),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is
     // owned by the principal that registered it, so these three are ordinary
     // authenticated CRUD, not a pre-auth receiver.
     ("routes/webhooks.rs", 3),
-    ("routes/workflows.rs", 40),
+    // 40 before conversion shard 7, which moved `search_workflows` (6 sites),
+    // `find_workflow_hierarchical` (3) and `list_workflows` (1) onto
+    // `AppState::read_as` — the densest conversion in that shard. Of the thirty
+    // that remain, twenty-eight sit in WRITE handlers (`store_workflow`,
+    // `report_outcome`, `deprecate_workflow`, `report_hierarchical_outcome`,
+    // `ingest_workflow`, `record_behavioral_execution`, `evolve_step`,
+    // `add_step`, `delete_step`) and two in `get_workflow`, a routed GET that
+    // holds no `Viewer` at all — the same no-Viewer class shard 6 declined in
+    // `routes/agents.rs`.
+    ("routes/workflows.rs", 30),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is
