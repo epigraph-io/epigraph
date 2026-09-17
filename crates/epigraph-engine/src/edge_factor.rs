@@ -933,9 +933,32 @@ async fn recompute_combined_belief(
 /// what silently reverted every `contradicts`/`refutes` edge written since the
 /// previous recompute, and it reported `errors: []` while doing it.
 ///
-/// The cache is a single scalar summary, so it needs a single owner.
-/// `binary_truth` is that owner: it is the frame the edge-wiring path writes and
-/// the one unframed `get_belief` is documented to serve.
+/// ## What this function is, and what it is NOT
+///
+/// It is NOT an assertion that a claim has one frame. Multi-frame claims are
+/// intended and already first-class: `claim_frames` is keyed
+/// `PRIMARY KEY (claim_id, frame_id)`, and the same claim legitimately carries
+/// different beliefs in different contexts.
+///
+/// The actual defect is narrower and lives in the schema: `claims` holds SIX
+/// belief columns — `belief`, `plausibility`, `mass_on_empty`, `pignistic_prob`,
+/// `mass_on_missing`, `open_world_mass` — and NO frame reference. So a
+/// denormalized single-valued cache is being asked to summarize N frames. The
+/// clobber was the symptom of that, not of multi-frame itself.
+///
+/// This function does not resolve the modeling error. It makes the cache
+/// deterministic and non-destructive by designating ONE frame as the summarized
+/// one, so the cached scalars stop silently reverting edge-derived belief.
+///
+/// **Per-frame belief is not lost and never was.** It is recomputed on demand from
+/// `mass_functions` by the framed `get_belief` path, which is correct today. The
+/// cache is a performance artifact for the unframed read; the framed read is the
+/// source of truth for any specific context.
+///
+/// `binary_truth` is the designated summary frame because it is what the
+/// edge-wiring path writes and what unframed `get_belief` serves. The claim row
+/// records which frame the cache summarizes in `belief_frame_id`, so the number is
+/// self-describing rather than an anonymous one-of-N.
 ///
 /// When the claim has no `binary_truth` BBA there is no canonical opinion to
 /// preserve, so the previous last-frame-wins behaviour is kept rather than leaving
