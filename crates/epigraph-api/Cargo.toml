@@ -116,6 +116,13 @@ toml = "0.8"  # provider config TOML parsing in tests
 # Hand-rolling those bytes would test this file's idea of the wire format
 # instead of the one the CLI writes.
 epigraph-privacy = { workspace = true }
+# `tests/webhook_suppression_log.rs` only. The webhook fan-out's suppression
+# decisions are observable ONLY as a tracing event, so asserting that the
+# `webhook.delivery.suppressed` target fires needs a capturing subscriber.
+# `no-env-filter` is required: without it the filter is scoped to the CRATE THE
+# TEST TARGET IS IN, and events emitted from `src/` are never captured. Same
+# version and same feature as `epigraph-mcp`, which set this precedent.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 
 [[test]]
 name = "boot_secret_gate_test"
