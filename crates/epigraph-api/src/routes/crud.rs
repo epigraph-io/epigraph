@@ -7,6 +7,29 @@
 //! - `POST /api/v1/clusters` — Upsert cluster assignment
 //! - `POST /api/v1/frames/:id/assign-claim` — Assign claim to frame
 //! - `POST /api/v1/edges-staging/promote` — Promote approved staged edges
+//!
+//! # Tenancy: 4 of this file's 40 raw-pool sites are converted
+//!
+//! Conversion shard 7. The four read-only `ClaimThemeRepository` handlers —
+//! `get_boundary_claims`, `get_split_candidates`, `get_distant_claims` and
+//! `get_theme_embeddings` — each run their single read on a viewer-stamped
+//! connection from [`AppState::read_as`].
+//!
+//! **What that suppression is and is not, stated rather than implied.** Each of
+//! those four statements joins `claim_themes` to `claims`, and the viewer
+//! predicate is over `claims`. `claim_themes` is derived clustering output that
+//! carries no tenancy columns and no RLS at migration head 92, so the filtering
+//! these handlers gain is over the CLAIMS in a theme, never over the themes
+//! themselves. Stamping the connection does not change that and is not claimed
+//! to.
+//!
+//! The other 36 sites all sit in WRITE handlers — the densest write-blocked file
+//! in the series. [`AppState::read_as`] is documented read-only and a write
+//! routed through a `ScopedRead` is rolled back on drop under
+//! `SessionGucMode::Transaction` while still type-checking; their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -955,8 +978,20 @@ pub async fn get_boundary_claims(
     let min_cd = params.min_centroid_distance.unwrap_or(0.45);
     let limit = params.limit.unwrap_or(500).min(500);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_boundary_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows =
-        ClaimThemeRepository::find_boundary_claims(&state.db_pool, &viewer, min_br, min_cd, limit)
+        ClaimThemeRepository::find_boundary_claims(&mut *read, &viewer, min_br, min_cd, limit)
             .await?;
 
     let results: Vec<serde_json::Value> = rows
@@ -1497,8 +1532,20 @@ pub async fn get_split_candidates(
 
     use epigraph_db::ClaimThemeRepository;
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_split_candidates",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = ClaimThemeRepository::find_split_candidates(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         params.variance_threshold.unwrap_or(0.35),
         params.min_claims.unwrap_or(500),
@@ -1557,8 +1604,20 @@ pub async fn get_distant_claims(
 
     use epigraph_db::ClaimThemeRepository;
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_distant_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = ClaimThemeRepository::find_distant_claims(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         params.distance_threshold.unwrap_or(0.45),
         params.min_cluster_size.unwrap_or(20),
@@ -1651,8 +1710,20 @@ pub async fn get_theme_embeddings(
     use epigraph_db::ClaimThemeRepository;
 
     let limit = params.limit.unwrap_or(5000).min(5000);
-    let rows = ClaimThemeRepository::get_theme_embeddings(&state.db_pool, &viewer, theme_id, limit)
-        .await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_theme_embeddings",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let rows =
+        ClaimThemeRepository::get_theme_embeddings(&mut *read, &viewer, theme_id, limit).await?;
 
     // Parse pgvector text "[0.1,0.2,...]" into vectors for the projection.
     // These never leave this function: only the 2-D result is serialised.

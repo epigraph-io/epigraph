@@ -5,8 +5,35 @@
 //! - `DELETE /api/v1/conventions/:id` — forget a convention (add counter-evidence)
 //! - `POST /api/v1/skills/share` — share a workflow to global scope
 //!
-//! Public (GET):
+//! Authenticated (GET):
 //! - `GET /api/v1/skills` — list workflow skills
+//!
+//! (This header said "Public (GET)" and was stale. `list_skills` carries a
+//! `ViewerExtractor`, which 401s an unauthenticated caller, so the endpoint has
+//! not been public for some time. `forget_convention` and `share_skill` carry
+//! one too; `learn_convention` does not, and gates instead on an `AuthContext`
+//! plus a `claims:admin` scope check — authenticated either way. No handler's
+//! posture was changed by conversion shard 7: no `ViewerExtractor` was added or
+//! removed anywhere in `src/routes/` and no routed handler signature changed.
+//! The header was describing a contract the code had already left behind.)
+//!
+//! # Tenancy: 1 of this file's 4 raw-pool sites is converted
+//!
+//! Conversion shard 7. `list_skills` reads through a viewer-stamped connection
+//! from [`AppState::read_as`]. It shares `WorkflowRepository::list` with
+//! `routes/workflows.rs::list_workflows`, so ONE repository signature widening
+//! serves two converted sites in two files; that statement already carried
+//! `/* {VISIBILITY:c} */` over `claims`.
+//!
+//! The other 3 sites — `learn_convention`, `forget_convention`, `share_skill` —
+//! all WRITE. [`AppState::read_as`] is documented read-only and a write routed
+//! through a `ScopedRead` is rolled back on drop under
+//! `SessionGucMode::Transaction` while still type-checking. Their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`, and
+//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
+//! `("conventions.rs", 2)` for two of them, unchanged by this shard.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -360,10 +387,20 @@ pub async fn list_skills(
     State(state): State<AppState>,
     Query(params): Query<ListSkillsQuery>,
 ) -> Result<Json<Vec<SkillResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_skills",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     let rows = epigraph_db::WorkflowRepository::list(
-        pool,
+        &mut *read,
         &viewer,
         params.min_truth,
         params.category.as_deref(),

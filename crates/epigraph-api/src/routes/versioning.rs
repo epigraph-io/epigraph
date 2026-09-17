@@ -7,6 +7,27 @@
 //! mutating a claim in-place (which would break cryptographic integrity), a new
 //! claim is created that explicitly supersedes the old one. This preserves the
 //! full epistemic history: every version of a belief is recorded and traceable.
+//!
+//! # Tenancy: 1 of this file's 9 raw-pool sites is converted
+//!
+//! Conversion shard 7. `claim_history` runs
+//! `ClaimRepository::version_history` on a viewer-stamped connection from
+//! [`AppState::read_as`]; the statement already spliced the viewer, and what
+//! changed is which connection carries the session GUCs the `claims` policy
+//! reads.
+//!
+//! The other 8 sites WRITE — six in `supersede_claim`, two in `mark_duplicate`.
+//! One of the six is blocked a second time at SITE level:
+//! `let pool = state.db_pool.clone()` is moved into a detached `tokio::spawn`,
+//! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
+//! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! `supersede_claim` additionally carries an open entry whose owner is the
+//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
+//! This shard does not touch it and it stays open. Nothing further about it is
+//! recorded here — see `docs/tenancy/progress.json`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
     extract::{Path, State},
@@ -545,7 +566,19 @@ pub async fn claim_history(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<VersionHistoryResponse>, ApiError> {
-    let hits = epigraph_db::ClaimRepository::version_history(&state.db_pool, &viewer, claim_id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_history",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let hits = epigraph_db::ClaimRepository::version_history(&mut *read, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("DB error: {e}"),

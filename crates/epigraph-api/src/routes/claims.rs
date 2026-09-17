@@ -1,3 +1,77 @@
+//! Claim CRUD and query handlers.
+//!
+//! # Tenancy: 4 of this file's 25 raw-pool sites are converted
+//!
+//! Conversion shard 7. `get_claim`, `list_claims`, `list_claim_evidence` and
+//! `list_by_labels` each read through a viewer-stamped connection from
+//! [`AppState::read_as`]. For `get_claim` and `list_claims` that connection
+//! REPLACES an explicit read-only `db_pool.begin()`, and the rollback-on-drop
+//! the old site comments documented as load-bearing for GUC hygiene still holds
+//! — under `SessionGucMode::Transaction` a `ScopedRead` IS a transaction rolled
+//! back on drop, and under `Session` the settings are removed by the pool's
+//! `after_release` scrub. The comments are rewritten at the sites rather than
+//! deleted, so neither becomes a false claim.
+//!
+//! **FOUR converted sites, not six, and the two declines are SITE-level rather
+//! than HANDLER-level — the first of that kind in this series.** `get_claim` and
+//! `list_claims` each open with a
+//! `GroupMembershipRepository::is_member` AUTHORIZATION gate that runs to
+//! completion and returns 403 before any content read begins. Threading the
+//! stamped connection into it would require widening a concrete `&PgPool`
+//! signature and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER` row that
+//! no truthful wording fits, because `group_memberships` DOES carry a narrowing
+//! RLS policy; and the alternative — splicing a `Viewer` into a membership
+//! EXISTENCE check — would make an authorization answer a function of
+//! visibility. The full argument, including a hazard a reviewer will look for
+//! and which is NOT present, is written at the site.
+//!
+//! **THE SITE-LEVEL DECLINE HAS AN EXPIRY, AND IT IS NAMED RATHER THAN LEFT
+//! FOR A LATER READER TO REDISCOVER.** `is_member` still reads
+//! `group_memberships` through `state.db_pool` while every content statement
+//! moved to `read_as`. Migration 077's `group_memberships_tenancy` USING clause
+//! admits a row only via a bypass, a session-group match, a principal match or
+//! the group-creator predicate — none of which an UNSTAMPED session can satisfy
+//! if its role is subject to RLS. So the gate is correct today because
+//! `AppState.db_pool` runs as an RLS-exempt role, which is precisely the
+//! property this programme exists to remove. Downgrading `db_pool` turns the
+//! gate into a blanket 403 for legitimate group members — fail-closed, not a
+//! leak, but the decline must be revisited at that point rather than inherited.
+//!
+//! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
+//! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and
+//! `routes/crud.rs` state that rule; three statements in this file do not follow
+//! it. `get_claim`'s inline label read and `list_claims`' batched label read
+//! both keep `.unwrap_or_default()`, and `list_claims`' per-item encryption
+//! lookup keeps `if let Ok(Some(enc))`. The rule was applied only where this
+//! shard changed the statement anyway; these three ALREADY shared a connection
+//! via the `db_pool.begin()` transaction the conversion replaced, so nothing
+//! about their sharing changed, they cover a non-tenancy-bearing projection
+//! (labels, encryption metadata) rather than the rows the viewer predicate
+//! selects, and the direction of failure is safe — a swallowed error drops a
+//! field from the response and can never add a row. One consequence is worth
+//! writing down: `claim_encryption` DOES carry a narrowing policy at head 92, so
+//! at step 11d that `if let Ok(Some(enc))` becomes the branch that absorbs a
+//! policy denial and answers 200 with the field simply missing, indistinguishable
+//! from an unencrypted claim. Changing it is not this batch's.
+//!
+//! The other 19 sites sit in WRITE handlers — `create_claim` (9),
+//! `update_claim` (6), `patch_claim` (2), `update_labels` (2), which with the
+//! two site-level gates above accounts for all 21 the register carries.
+//! [`AppState::read_as`] is documented
+//! read-only and a write routed through a `ScopedRead` is rolled back on drop
+//! under `SessionGucMode::Transaction` while still type-checking; their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! `viewer_route_table_lint.rs::TEST_ONLY_INLINE_READS` still carries
+//! `("claims.rs", 3)` and `ROUTE_LAYER_WRITES` `("claims.rs", 4)`; no inline
+//! statement was relocated by this shard. Two open entries brush this file and
+//! are neither discharged nor worsened by an executor swap —
+//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`) and
+//! `F-get-by-id-conn-duplicates-get-by-id`. Analysis held outside this
+//! repository.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -149,10 +223,17 @@ pub struct PaginationParams {
     /// Optional search string to match against claim content
     #[serde(default)]
     pub search: Option<String>,
-    /// Optional requester agent ID for partition-aware content filtering
+    /// Accepted for wire compatibility and DELIBERATELY IGNORED — `list_claims`
+    /// never reads it. Identical in kind to [`GetClaimQuery::agent_id`]: the
+    /// requester's identity comes from the bearer token, never from a query
+    /// parameter.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
-    /// Group ID for RLS context
+    /// A membership ASSERTION `list_claims` verifies, not a visibility grant
+    /// and not an RLS context. The session GUCs migration 077's policies read
+    /// are stamped from the token-derived viewer, not from this field; supplying
+    /// it can only 403 a request that would otherwise have succeeded. See
+    /// [`GetClaimQuery::group_id`].
     #[serde(default)]
     pub group_id: Option<Uuid>,
 }
@@ -899,13 +980,27 @@ pub async fn create_claim(
     Ok(Json(response))
 }
 
-/// Query parameters for get_claim (optional agent_id for partition filtering)
+/// Query parameters for `get_claim`.
+///
+/// NEITHER FIELD WIDENS WHAT THE CALLER MAY SEE. Both are named for a
+/// post-fetch filtering pass that no longer exists; the doc is corrected here
+/// rather than the fields removed, because removing them is a wire-contract
+/// change with its own acceptance.
 #[derive(Deserialize, Debug, Default)]
 pub struct GetClaimQuery {
-    /// Optional requester agent ID for partition-aware content filtering
+    /// Accepted for wire compatibility and DELIBERATELY IGNORED — the handler
+    /// never reads it. The requester's identity comes from the bearer token
+    /// (see the `SECURITY:` comment in `get_claim`), so a query parameter can
+    /// neither select nor widen a principal.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
-    /// Group ID for RLS context — enables visibility of fully_private claims
+    /// A membership ASSERTION the handler verifies, not a visibility grant.
+    /// When present, `get_claim` checks that the authenticated principal
+    /// belongs to this group and returns 403 otherwise; it grants no additional
+    /// visibility, because the viewer's group set is resolved from the token by
+    /// `Viewer::resolve` and never from this parameter. Its only reachable
+    /// effect is to narrow — supplying it can 403 a request that would
+    /// otherwise have succeeded.
     #[serde(default)]
     pub group_id: Option<Uuid>,
 }
@@ -915,8 +1010,12 @@ pub struct GetClaimQuery {
 /// GET /claims/:id
 ///
 /// Returns the claim if found, or 404 if not found.
-/// If the claim is in a `private` or `community` partition and the requester
-/// does not have access, the content field is redacted.
+///
+/// THERE IS NO CONTENT-REDACTION PASS. Filtering happens inside
+/// `ClaimRepository::get_by_id_conn`'s spliced viewer predicate, so a claim the
+/// caller may not read is 404 — never a 200 whose `content` has been blanked.
+/// (The post-fetch pass this doc used to describe was deleted with
+/// `access_control` in PR-14; see the comment at the end of the handler body.)
 #[cfg(feature = "db")]
 pub async fn get_claim(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -953,29 +1052,69 @@ pub async fn get_claim(
         }
     }
 
-    // A transaction, not a pooled connection: no group context is set on it
-    // today, and any future set_config must be scoped to one so it cannot
-    // leak to the next borrower of the connection. What constrains this read
-    // is the Viewer threaded into the repository call below, not RLS; kernel
-    // RLS arrives with migrations 073-075.
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
+    // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL, AND THE DECLINE IS
+    // SITE-LEVEL RATHER THAN HANDLER-LEVEL.
+    //
+    // Conversion shard 7's rule is that a handler converts as a whole, because
+    // splitting one READ across two connections defeats the point. This is not
+    // that: `is_member` is an AUTHORIZATION gate that runs to completion and
+    // returns 403 before any content read begins, and the three content reads
+    // below — which ARE all on one connection with each other — are the only
+    // ones the response is built from. Nothing that answers the request is
+    // split.
+    //
+    // `GroupMembershipRepository::is_member` takes a concrete `&PgPool`, so
+    // threading the stamped connection into it would mean widening it to
+    // `E: PgExecutor` and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`
+    // row. Every existing row in that register argues one of two things: the
+    // relation carries no RLS, or it carries RLS whose SELECT policy does not
+    // narrow. `group_memberships` is neither — migration 077 gives it a
+    // narrowing SELECT policy — so no truthful row exists in the register's
+    // current form, and the alternative (splicing a `Viewer` into a membership
+    // EXISTENCE check) would make an authorization answer a function of
+    // visibility. Both repairs are worse than leaving the gate where it is.
+    //
+    // A hazard a reviewer will look for and which is NOT present: the
+    // `.or(Some(ctx.client_id))` fallback above cannot diverge from the
+    // principal `read_as` stamps, because `middleware/bearer.rs`'s
+    // `ViewerExtractor` — which this handler carries — rejects with 401 when
+    // `auth.agent_id` is `None`, so that arm is unreachable on this route.
 
-    // Query claim on the same transaction (RLS arrives with migrations 073-075)
-    let claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
+    // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
+    // three statements below still share one connection, and now that
+    // connection also carries the session GUCs migration 077's `claims` and
+    // `claim_encryption` policies read, so the policy and the in-query `$V`
+    // predicate describe the same group set instead of disagreeing.
+    //
+    // THE GUC-HYGIENE PROPERTY THE OLD COMMENT CLAIMED STILL HOLDS, BY A
+    // DIFFERENT MECHANISM, AND THE COMMENT IS REWRITTEN RATHER THAN DELETED SO
+    // IT DOES NOT BECOME A FALSE CLAIM. `ScopedRead` is a transaction under
+    // `SessionGucMode::Transaction` (rolled back on drop, exactly as before) and
+    // a pooled connection under `Session`, where the settings are removed by the
+    // pool's `after_release` scrub, installed at pool construction. Neither arm
+    // can leak a setting to the next borrower. No `commit()` is needed on
+    // either: this is a read.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_claim",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let claim = ClaimRepository::get_by_id_conn(&mut read, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),
             id: id.to_string(),
         })?;
 
-    // Encryption metadata query also within transaction
-    let encryption = ClaimEncryptionRepository::get_by_claim_id_conn(&mut tx, id)
+    // Encryption metadata, on the same stamped connection
+    let encryption = ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query claim encryption: {e}"),
@@ -984,13 +1123,11 @@ pub async fn get_claim(
     // Fetch labels from DB (not part of Claim domain model)
     let labels: Vec<String> = sqlx::query_scalar("SELECT unnest(labels) FROM claims WHERE id = $1")
         .bind(id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *read)
         .await
         .unwrap_or_default();
 
-    // Transaction auto-rolls-back on drop (read-only, no commit needed)
-    // This is intentional: dropping resets set_config local settings, preventing pool leak
-    drop(tx);
+    drop(read);
 
     let mut response: ClaimResponse = claim.into();
     response.labels = labels;
@@ -1084,29 +1221,48 @@ pub async fn list_claims(
         }
     }
 
-    // A transaction, not a pooled connection: no group context is set on it
-    // today, and any future set_config must be scoped to one so it cannot
-    // leak to the next borrower of the connection. What constrains this read
-    // is the Viewer threaded into the repository call below, not RLS; kernel
-    // RLS arrives with migrations 073-075.
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
+    // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL — the SITE-level decline
+    // documented at length on `get_claim`, which runs the identical gate. The
+    // short form: `is_member` is an authorization check that completes before
+    // any content read starts, so nothing is split across two connections;
+    // widening it to take the stamped connection would require an
+    // `EXECUTOR_WITHOUT_VIEWER` row no truthful wording fits, because
+    // `group_memberships` DOES carry a narrowing RLS policy; and splicing a
+    // `Viewer` into a membership existence check would make an authorization
+    // answer a function of visibility.
 
-    // Fetch on the same transaction (RLS arrives with migrations 073-075)
+    // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
+    // statements below still share one connection, and that connection now
+    // carries the session GUCs migration 077's policies read, so the policy and
+    // the in-query `$V` predicate describe the same group set. The
+    // rollback-on-drop the previous comment relied on for GUC hygiene still
+    // holds and is restated on `get_claim`; it is not deleted silently.
+    //
+    // THE LIST AND THE COUNT SHARING ONE CONNECTION IS NOW LOAD-BEARING FOR
+    // MORE THAN STYLE: they are two separate statements feeding one paginated
+    // answer, and a `total` computed under a different tenancy stamp from
+    // `items` would produce a page count the page itself contradicts.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let claims = ClaimRepository::list_conn(
-        &mut tx,
+        &mut read,
         &viewer,
         pagination.limit,
         pagination.offset,
         params.search.as_deref(),
     )
     .await?;
-    let total = ClaimRepository::count_conn(&mut tx, &viewer, params.search.as_deref()).await?;
+    let total = ClaimRepository::count_conn(&mut read, &viewer, params.search.as_deref()).await?;
 
     let mut items: Vec<ClaimResponse> = claims.into_iter().map(Into::into).collect();
 
@@ -1117,7 +1273,7 @@ pub async fn list_claims(
             "SELECT id, unnest(labels) FROM claims WHERE id = ANY($1) AND labels != '{}'",
         )
         .bind(&claim_ids)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *read)
         .await
         .unwrap_or_default();
 
@@ -1130,11 +1286,12 @@ pub async fn list_claims(
         }
     }
 
-    // Fetch encryption metadata INSIDE the transaction (RLS context still active)
+    // Fetch encryption metadata on the SAME stamped connection, so the tenancy
+    // context that selected `items` is still the one in force.
     if !items.is_empty() {
         for item in &mut items {
             if let Ok(Some(enc)) =
-                ClaimEncryptionRepository::get_by_claim_id_conn(&mut tx, item.id).await
+                ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, item.id).await
             {
                 item.privacy_tier = Some(enc.privacy_tier);
                 item.encrypted_content =
@@ -1145,8 +1302,7 @@ pub async fn list_claims(
         }
     }
 
-    // Transaction auto-rolls-back on drop (read-only, no commit needed)
-    drop(tx);
+    drop(read);
 
     // No redaction pass: `ClaimRepository::list_conn` was already spliced with
     // `&viewer`, so a row the caller may not read is not in `items` at all.
@@ -1203,9 +1359,20 @@ pub async fn list_claim_evidence(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<EvidenceResponse>>, ApiError> {
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claim_evidence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let evidence_list =
-        EvidenceRepository::get_by_claim(&state.db_pool, &viewer, ClaimId::from_uuid(claim_id))
-            .await?;
+        EvidenceRepository::get_by_claim(&mut *read, &viewer, ClaimId::from_uuid(claim_id)).await?;
 
     let responses: Vec<EvidenceResponse> = evidence_list
         .into_iter()
@@ -1847,8 +2014,13 @@ pub struct ClaimByLabelsResponse {
 ///
 /// Mirrors the MCP `query_claims_by_label` tool over plain HTTP so the
 /// backlog cleanup + reconciler Python scripts can read without direct DB
-/// access. Public (no auth) — these are read-only queries over public claim
-/// metadata, same as `GET /api/v1/claims` and `GET /api/v1/claims/by-belief`.
+/// access.
+///
+/// NOT public, despite what this doc said until conversion shard 7 corrected
+/// it: the handler carries a `ViewerExtractor`, which 401s an unauthenticated
+/// caller, and as of this shard the read runs on a viewer-stamped connection,
+/// so the rows returned are the caller's own visible set rather than "public
+/// claim metadata". The scripts named above authenticate.
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -1883,8 +2055,20 @@ pub async fn list_by_labels(
         .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_by_labels",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = ClaimRepository::list_by_labels(
-        &state.db_pool,
+        &mut *read,
         &viewer,
         epigraph_db::LabelQuery {
             labels: &labels,
