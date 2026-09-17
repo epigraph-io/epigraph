@@ -118,9 +118,15 @@ impl EntityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn find_by_name_and_type(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so `routes/entities.rs::query_triples` can run
+    /// both of its name resolutions on the same stamped connection as the
+    /// viewer-spliced `TripleRepository::query` that follows them. It takes NO
+    /// `&Viewer`; the reason is recorded in
+    /// `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    #[instrument(skip(executor))]
+    pub async fn find_by_name_and_type<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         canonical_name: &str,
         type_top: &str,
     ) -> Result<Option<EntityRow>, DbError> {
@@ -136,7 +142,7 @@ impl EntityRepository {
             canonical_name,
             type_top
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .map(|r| EntityRow {
             id: r.id,
@@ -158,8 +164,17 @@ impl EntityRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<EntityRow>, DbError> {
+    ///
+    /// Generic over the executor so `routes/entities.rs::entity_neighborhood`
+    /// can resolve the canonical entity on the same stamped connection as the
+    /// viewer-spliced `TripleRepository::entity_neighborhood` that follows it.
+    /// It takes NO `&Viewer`; the reason is recorded in
+    /// `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    #[instrument(skip(executor))]
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<EntityRow>, DbError> {
         let row = sqlx::query!(
             r#"
             SELECT id, canonical_name, type_top, type_sub, properties, is_canonical,
@@ -169,7 +184,7 @@ impl EntityRepository {
             "#,
             id
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?
         .map(|r| EntityRow {
             id: r.id,

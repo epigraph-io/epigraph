@@ -1241,6 +1241,99 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          that handler, so reach and motivation coincide here -- unlike the `agent.rs` entry \
          above, where they do not.",
     ),
+    (
+        "workflow.rs",
+        "search_hierarchical_by_text",
+        "Reads the `workflows` table by ILIKE over `canonical_name`/`goal`, and the statement's \
+         FROM is `workflows` alone -- it joins nothing. `workflows` is the HIERARCHICAL root \
+         table, which is a different relation from the `claims` rows labelled `workflow` that \
+         `WorkflowRepository::list`/`find_by_embedding` read and DO splice a viewer into; the \
+         distinction is why this entry exists beside functions in the same file that need none. \
+         Measured at migration head 92 it carries neither a `visibility` nor an `owner_group_id` \
+         column, and row-level security is off on it (`pg_class.relrowsecurity` and \
+         `relforcerowsecurity` both false, against `claims` which is true/true). So this site has \
+         no column to attach a predicate to and no policy for a session GUC to select, and a \
+         `&Viewer` here would be a parameter the statement could not spend. THE VISIBLE ROW SET \
+         IS UNCHANGED BY THE CONVERSION: its caller \
+         `routes/workflows.rs::find_workflow_hierarchical` reads this beside \
+         `resolve_steps_to_heads_batched`, which is viewer-spliced over `edges` and `claims`, and \
+         the reason it now shares that connection is that the handler's answer should be \
+         assembled under ONE tenancy stamp, not that this read was leaking. SCOPE: conversion \
+         shard 7 widened the executor only. The SQL, its three binds and the projected row shape \
+         are unchanged and were not re-derived here. REACH IS WIDER THAN MOTIVATION: one other \
+         production call site -- `epigraph-mcp/src/tools/workflow_hierarchical.rs` -- still \
+         passes `&PgPool`, which satisfies `E: PgExecutor<'e>`, and was not edited.",
+    ),
+    (
+        "workflow.rs",
+        "find_hierarchical_by_embedding",
+        "Cosine-similarity search over `workflows.goal_embedding`; the statement's FROM is \
+         `workflows` alone (cross-joined to a one-row `q` CTE holding the query vector) and it \
+         joins no other relation. Same relation and same measured posture as \
+         `search_hierarchical_by_text` above -- at migration head 92 `workflows` carries neither \
+         a `visibility` nor an `owner_group_id` column and has row-level security off \
+         (`relrowsecurity` and `relforcerowsecurity` both false) -- but the argument is RESTATED \
+         rather than inherited from the file name, because these are two different statements and \
+         a shared file proves nothing about either. This is the embedding-ranked sibling of the \
+         ILIKE path and falls back to it, so the two must agree about what they may return. \
+         SCOPE: conversion shard 7 widened the executor only; the SQL, its four binds and the \
+         projected row shape are unchanged. REACH IS WIDER THAN MOTIVATION: one other production \
+         call site -- `epigraph-mcp/src/tools/workflow_hierarchical.rs` -- still passes \
+         `&PgPool` and was not edited.",
+    ),
+    (
+        "behavioral_execution.rs",
+        "rolling_success_rate",
+        "Aggregates `AVG(success::int)` over the newest `window` rows of `behavioral_executions` \
+         for one workflow. The statement's FROM is `behavioral_executions` alone, and what it \
+         projects is a single `float8` SCALAR -- there is no row to withhold and no content \
+         column in the result at all. Measured at migration head 92 the relation carries neither \
+         a `visibility` nor an `owner_group_id` column, and row-level security is off on it \
+         (`relrowsecurity` and `relforcerowsecurity` both false). THE SCOPE LIMIT, STATED: what \
+         this relation's posture leaves open is the `F-aggregate-existence-oracles` class, filed \
+         against other handlers with an owner that is not this shard, and widening an executor \
+         neither creates nor closes it. SCOPE: conversion shard 7 widened the \
+         executor only so that `routes/workflows.rs::search_workflows` can run this beside the \
+         viewer-spliced `find_by_embedding`/`find_by_text`/`find_lineage_root` reads on ONE \
+         stamped connection. The SQL, its two binds and the scalar result type are unchanged. \
+         REACH IS WIDER THAN MOTIVATION: one other production call site -- \
+         `epigraph-mcp/src/tools/workflows.rs` -- still passes `&PgPool` and was not edited.",
+    ),
+    (
+        "entity.rs",
+        "get",
+        "Reads `entities` by primary key; the statement's FROM is `entities` alone and it joins \
+         nothing. `entities` is the RDF entity dictionary -- canonical names and type tags, with \
+         the tenancy-bearing assertions held one level out in `triples`. Measured at migration \
+         head 92 it carries neither a `visibility` nor an `owner_group_id` column, and row-level \
+         security is off on it (`relrowsecurity` and `relforcerowsecurity` both false), against \
+         `triples` in the very next statement of the same handler, which is true/true with a \
+         narrowing policy AND is viewer-spliced. So this site has no column to attach a predicate \
+         to and no policy for a session GUC to select. SCOPE: conversion shard 7 widened the \
+         executor only, so that `routes/entities.rs::entity_neighborhood` can resolve the \
+         canonical entity and read its triples under ONE tenancy stamp. The SQL, its single bind \
+         and the projected row shape are unchanged and were not re-derived here. REACH IS WIDER \
+         THAN MOTIVATION: one other production call site -- `epigraph-mcp/src/tools/rdf.rs` -- \
+         still passes `&PgPool`, which satisfies `E: PgExecutor<'e>`, and was not edited.",
+    ),
+    (
+        "entity.rs",
+        "find_by_name_and_type",
+        "Resolves a caller-supplied `(canonical_name, type_top)` pair to an entity id, \
+         case-insensitively and restricted to `is_canonical = true`. Same relation and same \
+         measured posture as `entity.rs::get` above -- at migration head 92 `entities` carries \
+         neither a `visibility` nor an `owner_group_id` column and has row-level security off \
+         (`relrowsecurity` and `relforcerowsecurity` both false) -- restated rather than \
+         inherited, because this is a NAME-KEYED resolution rather than a primary-key fetch and \
+         the two are not the same statement. Its caller \
+         `routes/entities.rs::query_triples` returns an EMPTY list rather than an error when the \
+         name does not resolve, which is documented on that handler, and the assertions it then \
+         reads are viewer-spliced over `triples`, which IS rls/force with a narrowing policy at \
+         head 92. SCOPE: conversion \
+         shard 7 widened the executor only. The SQL, its two binds and the projected row shape \
+         are unchanged. REACH IS WIDER THAN MOTIVATION: three other production call sites, all \
+         in `epigraph-mcp/src/tools/rdf.rs`, still pass `&PgPool` and were not edited.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has

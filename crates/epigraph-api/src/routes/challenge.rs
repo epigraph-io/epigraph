@@ -5,6 +5,21 @@
 //!
 //! Challenges allow agents to dispute existing claims with counter-evidence.
 //! This is a core epistemic mechanism: truth must be contestable to be trustworthy.
+//!
+//! # Tenancy: 1 of this file's 3 raw-pool sites is converted
+//!
+//! Conversion shard 7. `list_challenges` reads
+//! `ChallengeRepository::list_for_claim` — which already carried
+//! `/* {VISIBILITY:challenges} */` — on a viewer-stamped connection from
+//! [`AppState::read_as`]. `challenges` is RLS and FORCE with a narrowing policy
+//! at migration head 92, so this is one of the sites where the stamp and the
+//! in-query predicate must agree about the same group set.
+//!
+//! The other 2 sites are `submit_challenge`, which WRITES and holds no `Viewer`.
+//! Its owner is `D-PR16-claim-authorship-is-not-a-credential`, an open operator
+//! decision.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
     extract::{Path, State},
@@ -301,12 +316,23 @@ pub async fn list_challenges(
 ) -> Result<Json<ListChallengesResponse>, ApiError> {
     #[cfg(feature = "db")]
     let challenge_responses = {
-        let rows =
-            epigraph_db::ChallengeRepository::list_for_claim(&state.db_pool, &viewer, claim_id)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to list challenges: {e}"),
-                })?;
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "list_challenges",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+
+        let rows = epigraph_db::ChallengeRepository::list_for_claim(&mut *read, &viewer, claim_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to list challenges: {e}"),
+            })?;
         rows.into_iter()
             .map(|r| ChallengeResponse {
                 id: r.id,
