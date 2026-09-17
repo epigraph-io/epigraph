@@ -313,8 +313,17 @@ impl WorkflowRepository {
     }
 
     /// List workflow claims filtered by truth threshold and optional category label.
-    pub async fn list(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so `routes/workflows.rs::list_workflows` and
+    /// `routes/conventions.rs::list_skills` can each run it on the stamped
+    /// connection [`crate::ScopedPool::read_as`] hands their handler. The two
+    /// `fetch_all` calls below sit in MUTUALLY EXCLUSIVE branches, so a
+    /// by-value `E` is consumed at most once and the bound does not have to be
+    /// `&mut PgConnection`. The statement, its binds and its row shape are
+    /// unchanged by the widening; it already took a `&Viewer` and already
+    /// carried `/* {VISIBILITY:c} */`.
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         min_truth: f64,
         category: Option<&str>,
@@ -340,7 +349,7 @@ impl WorkflowRepository {
             if let Some(g) = viewer.group_bind() {
                 q = q.bind(g);
             }
-            q.fetch_all(pool).await
+            q.fetch_all(executor).await
         } else {
             let sql = viewer.splice(
                 "SELECT c.id, c.content, c.truth_value, c.labels, c.properties \
@@ -359,7 +368,7 @@ impl WorkflowRepository {
             if let Some(g) = viewer.group_bind() {
                 q = q.bind(g);
             }
-            q.fetch_all(pool).await
+            q.fetch_all(executor).await
         }
     }
 
@@ -592,8 +601,18 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `DbError` if either database query fails.
+    ///
+    /// # Why `&mut PgConnection` and not `E: PgExecutor`
+    ///
+    /// The two round-trips below are SEQUENTIAL, not exclusive branches: the
+    /// second is built from the first's rows. A by-value `E: PgExecutor<'e>` is
+    /// consumed by the first `fetch_all`, so that bound does not compile here —
+    /// and reborrowing a connection is what lets both statements run under the
+    /// ONE tenancy stamp `routes/workflows.rs::find_workflow_hierarchical`
+    /// acquires. It already took a `&Viewer` and already spliced it into both
+    /// statements; the SQL, the binds and the row shapes are unchanged.
     pub async fn resolve_steps_to_heads_batched(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         workflow_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<ResolvedStep>>, DbError> {
@@ -629,7 +648,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             sq = sq.bind(g);
         }
-        let seed_rows: Vec<StepSeedRow> = sq.fetch_all(pool).await.map_err(DbError::from)?;
+        let seed_rows: Vec<StepSeedRow> = sq.fetch_all(&mut *conn).await.map_err(DbError::from)?;
 
         // Initialise the result map with an empty Vec for every requested workflow
         // so callers get a deterministic entry even for step-less workflows.
@@ -709,7 +728,7 @@ impl WorkflowRepository {
             if let Some(g) = viewer.group_bind() {
                 hq = hq.bind(g);
             }
-            let head_rows: Vec<HeadRow> = hq.fetch_all(pool).await.map_err(DbError::from)?;
+            let head_rows: Vec<HeadRow> = hq.fetch_all(&mut *conn).await.map_err(DbError::from)?;
 
             for row in head_rows {
                 heads_by_lineage
@@ -768,8 +787,12 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn search_hierarchical_by_text(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so `find_workflow_hierarchical` can run it on
+    /// the stamped connection it acquires. It takes NO `&Viewer`; the reason is
+    /// recorded in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    pub async fn search_hierarchical_by_text<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         query: &str,
         limit: i64,
         min_truth: f64,
@@ -800,7 +823,7 @@ impl WorkflowRepository {
             .bind(&pattern)
             .bind(min_truth)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await
     }
 
@@ -819,8 +842,12 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn find_hierarchical_by_embedding(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor for the same reason as
+    /// [`Self::search_hierarchical_by_text`], and viewer-less for the same
+    /// reason, recorded in the same register.
+    pub async fn find_hierarchical_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         query_embedding: &[f32],
         similarity_threshold: f64,
         min_truth: f64,
@@ -868,7 +895,7 @@ impl WorkflowRepository {
             .bind(similarity_threshold)
             .bind(min_truth)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await
     }
 

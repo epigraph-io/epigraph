@@ -157,9 +157,14 @@ impl BehavioralExecutionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn rolling_success_rate(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so `routes/workflows.rs::search_workflows` can
+    /// run it on the stamped connection it already holds for
+    /// `find_by_embedding`/`find_by_text`. It takes NO `&Viewer`; the reason is
+    /// recorded in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    #[instrument(skip(executor))]
+    pub async fn rolling_success_rate<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         workflow_id: Uuid,
         window: i64,
     ) -> Result<f64, DbError> {
@@ -178,7 +183,7 @@ impl BehavioralExecutionRepository {
         )
         .bind(workflow_id)
         .bind(window)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(rate.unwrap_or(0.0))
