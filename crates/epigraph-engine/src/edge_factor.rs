@@ -899,11 +899,14 @@ async fn recompute_combined_belief(
     MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        preview.belief,
-        preview.plausibility,
-        preview.conflict_k,
-        Some(preview.pignistic_prob),
-        preview.missing_mass,
+        epigraph_db::CachedBelief {
+            belief: preview.belief,
+            plausibility: preview.plausibility,
+            mass_on_empty: preview.conflict_k,
+            pignistic_prob: Some(preview.pignistic_prob),
+            mass_on_missing: preview.missing_mass,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;

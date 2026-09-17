@@ -370,4 +370,25 @@ async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool:
          silently reverts every contradicts/refutes edge written since the last \
          recompute."
     );
+
+    // The cache must also SAY which frame it summarizes. `claims` carries six
+    // belief columns and, before migration 092, no frame reference — so the number
+    // looked authoritative while silently describing one of N contexts. Multi-frame
+    // claims are intended (claim_frames is PK (claim_id, frame_id)), which is
+    // exactly why the cache has to be self-describing.
+    let cached_frame: Option<Uuid> =
+        sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("belief_frame_id");
+    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
+        .await
+        .expect("ensure_binary_frame");
+    assert_eq!(
+        cached_frame,
+        Some(binary),
+        "claims.belief_frame_id must name the frame the cached scalars summarize, \
+         so a reader can tell which context the number describes"
+    );
 }
