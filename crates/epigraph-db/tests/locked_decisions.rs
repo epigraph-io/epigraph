@@ -463,11 +463,22 @@
 //!   only thing standing behind three read surfaces instead of two. PR-25 adds
 //!   no new entry there — the function is already registered, and the *same*
 //!   function is what backs both probes — but the stake it carries is larger.
-//!   **That constant's own doc still names only `hidden_claim_ids`**, because
-//!   editing any `epigraph-cli` file would make the `genai` feature gate owed by
-//!   a diff that otherwise touches no crate it gates; the drift is recorded as a
-//!   deferred obligation in `docs/tenancy/progress.json` rather than left to be
-//!   rediscovered, and THIS block is the current statement of the stake.
+//!   **AMENDED by `tenancy/fix-coverage-hygiene` (2026-09-17); the three
+//!   sentences that stood here are now false and are corrected rather than left
+//!   to be read as current.** They said that the constant's own doc still named
+//!   only `hidden_claim_ids`, that editing any `epigraph-cli` file would make
+//!   the `genai` feature gate owed, and that THIS block was the current
+//!   statement of the stake. All three have been superseded: that batch updated
+//!   the constant's doc at both of its sites — the `DEFERRED_DEFINER_FUNCTIONS`
+//!   preamble and `verify_definer_ownership`'s 086 bullet — so the wider stake
+//!   is now stated where an operator reads it; the `genai` reason was
+//!   re-measured and did not survive, because the `epigraph-tenancy-backfill`
+//!   `[[bin]]` carries `required-features = ["db"]` and `db` IS default, so that
+//!   file is already inside the standard gate and gates no `genai` target; and
+//!   the deferred obligation `D-PR25-deferred-definer-doc-understates-its-stake`
+//!   is dispositioned CLOSED in `docs/tenancy/progress.json` on that basis. This
+//!   block is kept as the PR-25-era record of how the residual widened, not as
+//!   the live statement of the stake.
 //!   `schema_contract.rs::migration_086_read_definer_is_revoked_from_public` is
 //!   likewise untouched and likewise load-bearing for more surfaces.
 //! * **D1 — a missing `EXECUTE` grant is still fail-CLOSED here, but the
