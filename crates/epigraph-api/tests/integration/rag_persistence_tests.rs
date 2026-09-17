@@ -31,6 +31,15 @@ use serde::Deserialize;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// The canonical viewer fixture, reached through `tests/viewer_fixture.rs`'s
+/// shim. Only `database_url_for` is used: `#[sqlx::test]` hands each arm a
+/// randomly-named private database and no URL, and `ScopedPool::connect` needs
+/// one. Taking it from the ambient `DATABASE_URL` alone would point the router
+/// at the SHARED database while the seeds went to the private one — a silent
+/// vacuous pass.
+#[path = "../viewer_fixture.rs"]
+mod viewer_fixture;
+
 // =============================================================================
 // RESPONSE TYPES
 // =============================================================================
@@ -132,8 +141,29 @@ fn rag_bearer_token() -> String {
     token
 }
 
-/// Create a router configured for testing with DB pool
-fn create_test_router(pool: PgPool) -> Router {
+/// Create a router configured for testing with DB pool.
+///
+/// # Why this builds a `ScopedPool`, and why it is now `async`
+///
+/// Conversion shard 6 moved `rag_context` onto `AppState::read_as`, which
+/// HARD-REFUSES a state whose `scoped` is `None` — that refusal is the
+/// fail-closed behaviour of the conversion, not an inconvenience to route
+/// around. `AppState::with_db_and_signature_state` leaves `scoped: None`, so
+/// every one of the five arms in this file would have started asserting
+/// `StatusCode::OK` against a 500.
+///
+/// The repair is plumbing, not a weakened assertion: `with_scoped_pool` sets
+/// `db_pool = scoped.inner().clone()`, so these tests keep exactly the
+/// connection posture and the row visibility they had. `signature_state` is a
+/// public field and is assigned after construction because no constructor takes
+/// both a `ScopedPool` and a signature state.
+///
+/// These tests are about RAG query SEMANTICS — similarity ordering, `min_truth`,
+/// `limit`, the domain filter — not about tenancy, and they are not being asked
+/// to become a tenancy instrument here. `#[sqlx::test]` connects as `epigraph`,
+/// which is superuser and `BYPASSRLS`, so nothing in this binary can observe
+/// suppression either way.
+async fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
         require_packet_signatures: false,
         max_request_size: 1024 * 1024,
@@ -141,7 +171,12 @@ fn create_test_router(pool: PgPool) -> Router {
         ..ApiConfig::default()
     };
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
-    let state = AppState::with_db_and_signature_state(pool, config, signature_state);
+    let url = viewer_fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+        .await
+        .expect("connect a scoped pool");
+    let mut state = AppState::with_scoped_pool(scoped, config);
+    state.signature_state = signature_state;
     create_router(state)
 }
 
@@ -276,7 +311,7 @@ async fn test_rag_returns_claims_sorted_by_similarity(pool: PgPool) {
     )
     .await;
 
-    let router = create_test_router(pool.clone());
+    let router = create_test_router(pool.clone()).await;
 
     // Act: Query for climate-related claims
     let (status, body) = rag_query(
@@ -381,7 +416,7 @@ async fn test_rag_min_truth_filters_low_truth_claims(pool: PgPool) {
     )
     .await;
 
-    let router = create_test_router(pool.clone());
+    let router = create_test_router(pool.clone()).await;
 
     // Act: Query with strict truth threshold
     let (status, body) = rag_query(&router, "water properties boiling", "min_truth=0.8").await;
@@ -424,7 +459,7 @@ async fn test_rag_min_truth_filters_low_truth_claims(pool: PgPool) {
 /// - Results array is empty
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_rag_empty_results_when_no_embeddings(pool: PgPool) {
-    let router = create_test_router(pool.clone());
+    let router = create_test_router(pool.clone()).await;
 
     // Act: Query an empty database
     let (status, body) = rag_query(&router, "nonexistent topic with no claims", "").await;
@@ -481,7 +516,7 @@ async fn test_rag_domain_filter(pool: PgPool) {
     )
     .await;
 
-    let router = create_test_router(pool.clone());
+    let router = create_test_router(pool.clone()).await;
 
     // Act: Query with domain=factual
     let (status, body) = rag_query(
@@ -536,7 +571,7 @@ async fn test_rag_limit_parameter(pool: PgPool) {
         .await;
     }
 
-    let router = create_test_router(pool.clone());
+    let router = create_test_router(pool.clone()).await;
 
     // Act: Query with limit=2
     let (status, body) = rag_query(

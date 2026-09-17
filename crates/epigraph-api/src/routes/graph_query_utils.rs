@@ -10,7 +10,40 @@ struct AgentGraphRow {
     display_name: Option<String>,
 }
 
-/// Build a subgraph response for an arbitrary node id set.
+/// Build a subgraph response for an arbitrary node id set — the `&PgPool`
+/// spelling of [`load_subgraph_conn`], which carries the substantive
+/// documentation.
+///
+/// Kept so the two `routes/graph_query.rs` call sites and
+/// `tests/tenant_isolation_http.rs` compile unedited.
+///
+/// It checks a connection out and delegates to [`load_subgraph_conn`]. Every
+/// statement therefore still runs on ONE connection — which it did before too,
+/// only implicitly and only if the pool happened to hand out the same one.
+///
+/// # This wrapper does NOT stamp, and callers of it are not converted
+///
+/// The connection it acquires comes from `AppState.db_pool`, so under FORCE it
+/// carries no session GUCs. `routes/graph_query.rs` reaching this is still an
+/// unconverted site and `no_unscoped_pool.rs` still counts it as one. The split
+/// exists so conversion shard 6 could move `routes/edges.rs::graph_full` onto a
+/// stamped connection WITHOUT dragging `graph_query.rs` — a file outside that
+/// shard — along with it. Making this wrapper the only spelling and having it
+/// look stamped is exactly the fail-open the series exists to remove.
+#[cfg(feature = "db")]
+pub async fn load_subgraph(
+    pool: &epigraph_db::PgPool,
+    viewer: &epigraph_db::Viewer,
+    node_ids: Vec<Uuid>,
+) -> Result<Json<FullGraphResponse>, ApiError> {
+    let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: format!("Acquire connection: {e}"),
+    })?;
+    load_subgraph_conn(&mut conn, viewer, node_ids).await
+}
+
+/// Build a subgraph response for an arbitrary node id set: five statements on
+/// ONE caller-supplied connection.
 ///
 /// # Viewer
 ///
@@ -46,9 +79,26 @@ struct AgentGraphRow {
 /// comment on `subgraph_edges` claiming the caller narrowed the set. It did
 /// not. `subgraph_edges` requires BOTH endpoints to be in the set, so an edge
 /// survives exactly when both of its endpoints did.
+///
+/// # THE CALLER OWNS THE STAMPING, AND THIS FUNCTION CANNOT VERIFY IT
+///
+/// Taking a `&mut PgConnection` does NOT mean the connection is viewer-stamped.
+/// `routes/edges.rs::graph_full` passes one from `AppState::read_as` and it is;
+/// [`load_subgraph`] passes one straight off `AppState.db_pool` and it is not.
+/// Nothing here can tell the two apart, and no lint reaches this file —
+/// `visibility_lint.rs` scans `crates/epigraph-db/src/repos/` only. Stated
+/// outright because "takes a connection, therefore stamped" is precisely the
+/// inference a later reader would otherwise make, and it would be wrong half the
+/// time at this function's own call sites.
+///
+/// What IS guaranteed here is the in-query half: every projection below either
+/// splices `viewer` or says why it does not.
+///
+/// `&mut PgConnection` rather than a by-value `E: PgExecutor` because a by-value
+/// executor is moved by its first use and this body has five.
 #[cfg(feature = "db")]
-pub async fn load_subgraph(
-    pool: &epigraph_db::PgPool,
+pub async fn load_subgraph_conn(
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::Viewer,
     node_ids: Vec<Uuid>,
 ) -> Result<Json<FullGraphResponse>, ApiError> {
@@ -58,11 +108,12 @@ pub async fn load_subgraph(
     let mut nodes: Vec<FullGraphNode> = Vec::new();
 
     // 2. Fetch claims (viewer-filtered)
-    let claim_rows = epigraph_db::GraphViewRepository::subgraph_claims(pool, viewer, &node_ids)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Fetch claims: {e}"),
-        })?;
+    let claim_rows =
+        epigraph_db::GraphViewRepository::subgraph_claims(&mut *conn, viewer, &node_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Fetch claims: {e}"),
+            })?;
 
     for row in claim_rows {
         let label = if row.content.chars().count() > 60 {
@@ -91,7 +142,7 @@ pub async fn load_subgraph(
     let agent_rows: Vec<AgentGraphRow> =
         sqlx::query_as("SELECT id, display_name FROM agents WHERE id = ANY($1)")
             .bind(&node_ids)
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Fetch agents: {e}"),
@@ -120,7 +171,7 @@ pub async fn load_subgraph(
 
     // 4. Fetch evidence (viewer-filtered)
     let evidence_rows =
-        epigraph_db::GraphViewRepository::subgraph_evidence(pool, viewer, &node_ids)
+        epigraph_db::GraphViewRepository::subgraph_evidence(&mut *conn, viewer, &node_ids)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Fetch evidence: {e}"),
@@ -167,11 +218,12 @@ pub async fn load_subgraph(
     }
 
     // 5. Fetch reasoning traces (viewer-filtered — `reasoning_traces` is tier_a)
-    let trace_rows = epigraph_db::GraphViewRepository::subgraph_traces(pool, viewer, &node_ids)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Fetch traces: {e}"),
-        })?;
+    let trace_rows =
+        epigraph_db::GraphViewRepository::subgraph_traces(&mut *conn, viewer, &node_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Fetch traces: {e}"),
+            })?;
 
     for row in trace_rows {
         let label = format!("{} ({:.2})", row.methodology, row.confidence);
@@ -194,11 +246,12 @@ pub async fn load_subgraph(
     // 6. Fetch edges LAST, narrowed to the ids that survived the node
     //    projections above — so the response cannot name a node it withheld.
     let surviving_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let edge_rows = epigraph_db::GraphViewRepository::subgraph_edges(pool, viewer, &surviving_ids)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Fetch subgraph edges: {e}"),
-        })?;
+    let edge_rows =
+        epigraph_db::GraphViewRepository::subgraph_edges(&mut *conn, viewer, &surviving_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Fetch subgraph edges: {e}"),
+            })?;
 
     // 7. Build edges
     let edges: Vec<FullGraphEdge> = edge_rows

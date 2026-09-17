@@ -1404,9 +1404,19 @@ async fn load_subgraph_never_returns_an_edge_naming_a_withheld_node(pool: PgPool
 /// criterion's own lint says it exists to catch. `hypothesis.rs` contained zero
 /// `check_content_access` calls, so the register's then-stated compensating
 /// control did not exist here either — and PR-14 has since deleted that
-/// function outright, so it exists nowhere. See
-/// `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`, which still
-/// carries `hypothesis.rs`.
+/// function outright, so it exists nowhere.
+///
+/// THE PREVIOUS SENTENCE HERE WAS FALSE AND IS CORRECTED RATHER THAN DROPPED.
+/// It read "See `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`, which
+/// still carries `hypothesis.rs`." Re-measured by conversion shard 6: that
+/// register carries `clusters.rs`, `conflicts.rs`, `embeddings.rs`,
+/// `policies.rs`, `political.rs`, `search.rs` and `workflows.rs`, and its own
+/// comment records that `hypothesis.rs` went 1 -> 0 under
+/// `tenancy/fix-security-track` and was removed entirely. So NO shard-6 file has
+/// a row in it — which is worth stating, because "do not lower
+/// `UNCOMPENSATED_INLINE_READS`" is a standing hold on this series and here it is
+/// satisfied vacuously rather than by restraint. A stale cross-reference to a
+/// register is the kind of claim a later reader re-derives instead of checking.
 ///
 /// This is HTTP-level rather than repo-level for the same reason as the two
 /// guards above: the defect lived in the handler, not in a repo function, so a

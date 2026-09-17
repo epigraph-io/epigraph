@@ -3,6 +3,30 @@
 //! - POST /api/v1/hypothesis — Create hypothesis claim with VOI
 //! - GET  /api/v1/hypothesis/:id/status — Belief, evidence chains, promotion readiness
 //! - POST /api/v1/hypothesis/:id/promote — Promote to research_validity
+//!
+//! # Tenancy: 6 of this file's 17 raw-pool sites are converted
+//!
+//! Conversion shard 6. `hypothesis_status` is the only wholly-convertible
+//! handler here and it is the shard's densest: all six of its sites — two
+//! viewer-spliced repo reads, one viewer-less repo read, one viewer-spliced
+//! count and two inline `sqlx` statements — now run on one viewer-stamped
+//! connection from [`AppState::read_as`]. A promotion verdict assembled from six
+//! separate checkouts is a verdict assembled under six independent tenancy
+//! stamps; this makes it one stamp. It does not make it one snapshot — see the
+//! comment at the acquire.
+//!
+//! **One of those six WIDENS what the caller sees rather than narrowing it**, and
+//! the handler comments say which and why rather than letting the diff read as
+//! uniformly restrictive. The `frames` lookup is the site; the same shape is
+//! already on record as `F-SHARD4-A5`.
+//!
+//! NOT converted: `create_hypothesis` and `promote_hypothesis` (11 sites) both
+//! WRITE, so [`AppState::read_as`] — which is read-only, and whose `ScopedRead`
+//! is rolled back on drop under `SessionGucMode::Transaction` — is the wrong
+//! instrument. `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
+//! `("hypothesis.rs", 2)` for them, unchanged by this shard.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 #[cfg(feature = "db")]
 use axum::{
@@ -238,8 +262,20 @@ pub async fn hypothesis_status(
     // no viewer — while the handler held one and spent it only on two scalar
     // reads below. A viewer-invisible claim now 404s here instead of having its
     // content, belief and properties returned.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "hypothesis_status",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let (claim_content, claim_properties) =
-        epigraph_db::ClaimRepository::content_and_properties(&state.db_pool, &viewer, id)
+        epigraph_db::ClaimRepository::content_and_properties(&mut *read, &viewer, id)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to fetch hypothesis: {e}"),
@@ -249,31 +285,38 @@ pub async fn hypothesis_status(
                 id: id.to_string(),
             })?;
 
-    // Get experiments
-    let experiments = epigraph_db::ExperimentRepository::get_for_hypothesis(&state.db_pool, id)
+    // Get experiments. `experiments` carries no RLS and this read takes no
+    // viewer; it shares the connection so the whole status is assembled under
+    // one tenancy stamp rather than six.
+    let experiments = epigraph_db::ExperimentRepository::get_for_hypothesis(&mut *read, id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("{e}"),
         })?;
 
-    // Get mass functions in hypothesis_assessment frame
+    // Get mass functions in hypothesis_assessment frame.
+    //
+    // THIS SITE WIDENS RATHER THAN NARROWS, and saying so is the point of the
+    // comment. `frames` is FORCEd. On an unstamped connection the session
+    // carries no group GUCs, so this lookup could only ever see a PUBLIC frame:
+    // if `hypothesis_assessment` is not public the handler silently degraded to
+    // `frame_id = None` and reported `bel_supported`/`bel_unsupported` as 0.0 —
+    // to its own owner, with a 200. Stamping admits the viewer's own groups, so
+    // the frame resolves for a caller entitled to it. No leak was closed here;
+    // a fail-closed degradation was. Same shape as `F-SHARD4-A5`.
     let frame_id: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_optional(&state.db_pool)
+            .fetch_optional(&mut *read)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("{e}"),
             })?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
-        let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
-            &state.db_pool,
-            &viewer,
-            id,
-            fid,
-        )
-        .await
-        .unwrap_or_default();
+        let mass_rows =
+            epigraph_db::MassFunctionRepository::get_for_claim_frame(&mut *read, &viewer, id, fid)
+                .await
+                .unwrap_or_default();
 
         // Use the most recent mass function's masses for belief
         if let Some(latest) = mass_rows.last() {
@@ -296,15 +339,28 @@ pub async fn hypothesis_status(
     };
 
     // Count completed experiments with analysis
-    let completed_with_analysis = epigraph_db::ExperimentRepository::count_completed_with_analysis(
-        &state.db_pool,
-        &viewer,
-        id,
-    )
-    .await
-    .unwrap_or(0);
+    let completed_with_analysis =
+        epigraph_db::ExperimentRepository::count_completed_with_analysis(&mut *read, &viewer, id)
+            .await
+            .unwrap_or(0);
 
-    // Check scope: find analyses that provide_evidence to this hypothesis with scope_limitations
+    // Check scope: find analyses that provide_evidence to this hypothesis with
+    // scope_limitations.
+    //
+    // NO `{VISIBILITY}` MARKER AND NONE TO ADD, stated here in the shape the two
+    // `EXECUTOR_WITHOUT_VIEWER` rows this shard wrote use, so a later reader does
+    // not have to re-derive it. Measured on the throwaway at migration head 92:
+    // `analyses` reports `relrowsecurity` and `relforcerowsecurity` both false,
+    // carries zero rows in `pg_policies`, and has neither a `visibility` nor an
+    // `owner_group_id` column — so there is no column to attach a predicate to
+    // and no policy for a session GUC to select. Stamping this statement
+    // therefore narrows nothing; it shares the connection so the verdict is
+    // assembled under one tenancy stamp. Its JOIN partner `edges` IS FORCEd and
+    // does carry the stamp. The residual — that this is an unspliced read over a
+    // relation with no tenancy of its own — is not new, not created here, and is
+    // registered in `docs/tenancy/progress.json` as `F-SHARD6-A1` with its
+    // location and owner; nothing about its reachability is recorded in this
+    // repository.
     let has_scope: (bool,) = sqlx::query_as(
         r#"
         SELECT EXISTS (
@@ -320,7 +376,7 @@ pub async fn hypothesis_status(
         "#,
     )
     .bind(id)
-    .fetch_one(&state.db_pool)
+    .fetch_one(&mut *read)
     .await
     .unwrap_or((false,));
 

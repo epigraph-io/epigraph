@@ -31,6 +31,29 @@
 //! `CommunityRepository::create`'s creator argument. Populating a community with
 //! *other* perspectives is admin-only. Stated here because a reader comparing the
 //! two scopes above will otherwise read the difference as an accident.
+//!
+//! # Tenancy: 2 of this file's 5 raw-pool sites are converted
+//!
+//! Conversion shard 6. `list_communities` and `get_community` each read through
+//! one viewer-stamped connection from [`AppState::read_as`]; `CommunityRepository`
+//! already spliced the viewer into `list`, `get_by_id` and `get_members`, so what
+//! changed is which connection carries the session GUCs migration 077's
+//! `communities_tenancy` policy reads.
+//!
+//! `get_community` is the reason this file is not "counter-only", and the pairing
+//! is worth naming rather than simplifying: `communities` carries RLS and filters,
+//! while `community_members` — the join `get_members` traverses — carries none at
+//! migration head 92. The suppression `get_community` gains comes from the
+//! `communities` row and from the `perspectives` rows `get_members` projects,
+//! both FORCEd; the membership join itself narrows nothing and is not claimed to.
+//!
+//! `create_community`, `add_member` and `remove_member` are NOT converted: all
+//! three WRITE, [`AppState::read_as`] is documented read-only, and a write routed
+//! through a `ScopedRead` is rolled back on drop under
+//! `SessionGucMode::Transaction` while still type-checking. Their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -221,9 +244,20 @@ pub async fn list_communities(
     State(state): State<AppState>,
     Query(params): Query<ListCommunitiesQuery>,
 ) -> Result<Json<Vec<CommunityResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_communities",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
     let rows =
-        epigraph_db::CommunityRepository::list(pool, &viewer, params.limit, params.offset).await?;
+        epigraph_db::CommunityRepository::list(&mut *read, &viewer, params.limit, params.offset)
+            .await?;
 
     Ok(Json(rows.into_iter().map(community_to_response).collect()))
 }
@@ -237,16 +271,26 @@ pub async fn get_community(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CommunityDetailResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_community",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    let row = epigraph_db::CommunityRepository::get_by_id(pool, &viewer, id)
+    let row = epigraph_db::CommunityRepository::get_by_id(&mut *read, &viewer, id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "community".to_string(),
             id: id.to_string(),
         })?;
 
-    let members = epigraph_db::CommunityRepository::get_members(pool, &viewer, id).await?;
+    let members = epigraph_db::CommunityRepository::get_members(&mut *read, &viewer, id).await?;
 
     let member_entries: Vec<CommunityMemberEntry> = members
         .into_iter()

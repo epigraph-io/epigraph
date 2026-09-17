@@ -7,6 +7,28 @@
 //! - `GET  /api/v1/methods/search`           - Search methods by embedding similarity
 //! - `GET  /api/v1/methods/:id/gaps`         - Method gap analysis for a hypothesis
 //! - `POST /api/v1/experiments/design`        - Design an experiment protocol
+//!
+//! # Tenancy: 3 of this file's 11 raw-pool sites are converted
+//!
+//! Conversion shard 6. `method_gap_analysis` is the only wholly-convertible
+//! handler here, and all three of its sites now run on one viewer-stamped
+//! connection from [`AppState::read_as`], reborrowed per statement inside its
+//! two nested loops. See the comment at the acquire for the connection-hold
+//! profile that creates.
+//!
+//! Of those three, TWO narrow — `MethodRepository::{get_evidence_strength,
+//! get_source_papers}` reach `claims` and `edges` and splice the viewer — and
+//! ONE does not: `get_methods_for_capability` reads `methods` JOINed to
+//! `method_capabilities`, neither of which carries RLS at migration head 92.
+//!
+//! NOT converted, blocker named per handler:
+//! * `hypothesize`, `add_method`, `design_experiment` — WRITE, so
+//!   [`AppState::read_as`] is the wrong instrument; owner is
+//!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//! * `find_methods` — the HANDLER: it holds no `Viewer`, so there is nothing to
+//!   stamp a connection with.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 #[cfg(feature = "db")]
 use axum::{
@@ -422,11 +444,36 @@ pub async fn method_gap_analysis(
     let mut gaps = 0;
     let mut stale = 0;
 
+    // ONE stamped connection for the whole analysis, reborrowed per statement.
+    //
+    // `&mut *read` rather than `&*read`: a by-value `E: PgExecutor` is MOVED by
+    // its first use, and the loops below issue O(capabilities x methods)
+    // statements. Reborrowing is what lets them all run on this connection.
+    //
+    // CONNECTION-HOLD PROFILE, recorded because the conversion changes it: this
+    // handler now holds one pooled connection for the duration of its analysis,
+    // where before each statement checked one out and returned it. Shard 5
+    // recorded a related item for `structural.rs::get_structural_features`.
+    // Nothing here changes what any caller can read.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "method_gap_analysis",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     for cap in &capabilities {
-        let methods =
-            epigraph_db::MethodRepository::get_methods_for_capability(&state.db_pool, cap)
-                .await
-                .unwrap_or_default();
+        // `methods` and `method_capabilities` both carry no RLS at migration
+        // head 92, so this site shares the connection and narrows nothing —
+        // see `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+        let methods = epigraph_db::MethodRepository::get_methods_for_capability(&mut *read, cap)
+            .await
+            .unwrap_or_default();
 
         if methods.is_empty() {
             gaps += 1;
@@ -442,21 +489,20 @@ pub async fn method_gap_analysis(
         let mut cap_flags: Vec<String> = Vec::new();
 
         for m in &methods {
+            // Both of these DO narrow: they reach `claims` and `edges` and carry
+            // the `{VISIBILITY:c}` / `{EDGE_VISIBILITY:e}` markers.
             let evidence = epigraph_db::MethodRepository::get_evidence_strength(
-                &state.db_pool,
+                &mut *read,
                 &viewer,
                 m.method_id,
             )
             .await
             .ok();
 
-            let papers = epigraph_db::MethodRepository::get_source_papers(
-                &state.db_pool,
-                &viewer,
-                m.method_id,
-            )
-            .await
-            .unwrap_or_default();
+            let papers =
+                epigraph_db::MethodRepository::get_source_papers(&mut *read, &viewer, m.method_id)
+                    .await
+                    .unwrap_or_default();
 
             let newest_year = papers.iter().filter_map(|p| p.pub_year).max();
             let is_stale = newest_year.is_some_and(|y| current_year - y > max_age);
