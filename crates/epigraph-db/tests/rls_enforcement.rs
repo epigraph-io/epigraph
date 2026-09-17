@@ -1702,7 +1702,17 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
 /// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
-/// | `graph_neighborhood.rs` (2 sites) | `edges` | app | ditto |
+/// | `graph_neighborhood.rs` (2 sites) | `edges` | app, **viewer-stamped since conversion shard 5** | ditto |
+///
+/// The `graph_neighborhood.rs` row is the only STAMPED one in this table, and
+/// the annotation is load-bearing because the `Pool` column is the proxy this
+/// analysis uses for whether a guard's session carries the tenancy GUCs. Both
+/// of its sites are the two `NOT EXISTS` clauses in `compound_response`'s
+/// `neighborhood_standalones` CTE, reached only through that one function,
+/// whose executor conversion shard 5 changed from `&PgPool` to a borrowed
+/// connection taken from `AppState::read_as`. Nothing about the SQL moved and
+/// the disposition is unchanged; what moved is the session it runs on. The
+/// other rows are unstamped as before.
 ///
 /// # CORRECTION: the general mechanism does not hold for the two `edges` WRITE guards
 ///

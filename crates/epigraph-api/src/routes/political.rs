@@ -15,6 +15,42 @@
 //! - `POST /api/v1/coalitions`                         — Item 7: Create coalition
 //! - `GET  /api/v1/counter-narrative-gaps`             — Item 11: Gap scanner stub
 //! - `GET  /api/v1/mirror-narratives`                  — Item 12: Mirror detection stub
+//!
+//! # Tenancy: 7 of this file's 12 raw-pool sites are converted, and 5 are not
+//!
+//! This section sits AFTER the endpoint list on purpose. An earlier revision
+//! spliced it between two bullets, which left six routes rendering as though
+//! they were part of the tenancy discussion; keep the inventory contiguous.
+//!
+//! Conversion shard 5 against `D-PR17-read-guards-widen-under-rls`
+//! (`epigraph-db/tests/no_unscoped_pool.rs`). The seven read-only handlers that
+//! hold a `ViewerExtractor` — `epistemic_profile`, `compare_agents`,
+//! `position_timeline`, `claim_genealogy`, `originated_claims`,
+//! `inflation_index` and `claim_techniques` — now take ONE viewer-stamped
+//! connection through [`AppState::read_as`] and thread it through every
+//! statement in the body.
+//!
+//! **The five that remain hold no `Viewer` at all**, which is why they are
+//! counted and not convertible. `list_techniques` and `list_coalitions` read
+//! global reference data; `create_technique` and `create_coalition` WRITE, and
+//! `read_as` is documented read-only (`ScopedRead::commit` is not called by
+//! `Drop`, so under `SessionGucMode::Transaction` a write routed through it is
+//! rolled back while still type-checking). `inflation_leaderboard` is the fifth
+//! — it is the site `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`
+//! records as `("political.rs", 1)`, so it must not be relocated to lower that
+//! register. Converting it is a repo-signature change rather than an executor
+//! swap: a handler does not own its SQL and cannot carry a marker. It stays
+//! where it is, its owner is that register, and the analysis of what it leaves
+//! open is held outside this repository.
+//!
+//! Two further limits, stated so the conversion is not over-read. `compare_agents`
+//! acquires ONCE above its loop rather than per iteration; the raw-pool alias it
+//! replaced was rebound inside the loop body. And `claim_genealogy`'s inline
+//! `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)` had its EXECUTOR changed
+//! and nothing else: it is still viewer-less in the statement, and that shape
+//! remains open under `F-aggregate-existence-oracles`, which owns it.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -298,10 +334,20 @@ pub async fn epistemic_profile(
     Query(_params): Query<EpistemicProfileParams>,
 ) -> Result<Json<EpistemicProfileResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "epistemic_profile",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Verify agent exists
-    let agent = AgentRepository::get_by_id(pool, agent_id)
+    let agent = AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
@@ -309,7 +355,7 @@ pub async fn epistemic_profile(
         })?;
 
     // Fetch claims
-    let claims = PoliticalRepository::get_agent_profile_claims(pool, &viewer, id).await?;
+    let claims = PoliticalRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
     let claim_count = claims.len();
 
     if claim_count == 0 {
@@ -354,7 +400,8 @@ pub async fn epistemic_profile(
         .collect();
 
     // Evidence distribution
-    let ev_rows = PoliticalRepository::get_agent_evidence_distribution(pool, &viewer, id).await?;
+    let ev_rows =
+        PoliticalRepository::get_agent_evidence_distribution(&mut *read, &viewer, id).await?;
     let ev_total: i64 = ev_rows.iter().map(|r| r.count).sum();
     let evidence_distribution: HashMap<String, f64> = if ev_total > 0 {
         ev_rows
@@ -427,16 +474,36 @@ pub async fn compare_agents(
     }
 
     let mut profiles = Vec::with_capacity(ids.len());
+
+    // Conversion shard 5. The acquire is HOISTED above the loop deliberately.
+    // The raw-pool alias it replaces was rebound INSIDE the loop body, so a
+    // mechanical per-site swap would have called `read_as` once per iteration --
+    // up to ten separately-stamped checkouts against one bounded pool, which is
+    // the shape `no_unscoped_pool.rs`'s own module doc names as the wrong
+    // answer. Hoisted, the whole comparison is one connection and every agent in
+    // it is measured against the same corpus, which is the property a
+    // comparison endpoint needs to be meaningful at all.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "compare_agents",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     for id in ids {
         let agent_id = AgentId::from_uuid(id);
-        let pool = &state.db_pool;
 
-        let agent = match AgentRepository::get_by_id(pool, agent_id).await? {
+        let agent = match AgentRepository::get_by_id(&mut *read, agent_id).await? {
             Some(a) => a,
             None => continue, // Skip missing agents
         };
 
-        let claims = PoliticalRepository::get_agent_profile_claims(pool, &viewer, id).await?;
+        let claims = PoliticalRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
         let claim_count = claims.len();
 
         let (mean_truth, refutation_rate) = if claim_count > 0 {
@@ -480,10 +547,20 @@ pub async fn position_timeline(
     Query(params): Query<PositionTimelineParams>,
 ) -> Result<Json<PositionTimelineResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "position_timeline",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Verify agent exists
-    AgentRepository::get_by_id(pool, agent_id)
+    AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
@@ -502,7 +579,8 @@ pub async fn position_timeline(
         .map(|d| d.with_timezone(&chrono::Utc));
 
     let claims =
-        PoliticalRepository::get_agent_position_timeline(pool, &viewer, id, since, until).await?;
+        PoliticalRepository::get_agent_position_timeline(&mut *read, &viewer, id, since, until)
+            .await?;
 
     // Build timeline entries
     let mut timeline: Vec<TimelineEntry> = claims
@@ -568,13 +646,39 @@ pub async fn claim_genealogy(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<GenealogyResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_genealogy",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    // Verify claim exists
+    // Verify claim exists. Conversion shard 5 stamped this statement's
+    // connection; it did NOT add a visibility predicate, and does not claim to
+    // have. A handler does not own its SQL and cannot carry a marker -- the
+    // statement would have to move into `src/repos/` first, which is a
+    // repo-signature change rather than an executor swap. The existence-oracle
+    // shape of this probe and of its siblings remains open under
+    // `F-aggregate-existence-oracles`, which owns it.
+    //
+    // THE UNCHANGED RESULT IS CONDITIONAL, UNLIKE `graph_neighborhood.rs::expand`'s.
+    // That sibling earned a PERMANENT conclusion by measuring `relrowsecurity =
+    // false` on the relations it probes, so stamping there can never narrow
+    // anything. `claims` is the opposite case: it carries FORCE row-level
+    // security, and what holds today is only that the application still connects
+    // as the owning superuser. When that stops (§9.2 step 11d), this probe's
+    // verdict is EXPECTED to change for a claim the viewer cannot see, turning
+    // today's 200-with-an-empty-tree into a 404. Measured vs reasoned, kept
+    // apart deliberately: the executor change is measured, the durability is not.
     let claim_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
             .bind(claim_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *read)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("DB check failed: {e}"),
@@ -586,7 +690,7 @@ pub async fn claim_genealogy(
         });
     }
 
-    let steps = PoliticalRepository::get_claim_genealogy(pool, &viewer, claim_id).await?;
+    let steps = PoliticalRepository::get_claim_genealogy(&mut *read, &viewer, claim_id).await?;
 
     // Find origin (ORIGINATED_BY) and amplifiers (AMPLIFIED_BY)
     let origin = steps
@@ -670,9 +774,19 @@ pub async fn originated_claims(
     Query(params): Query<OriginatedClaimsParams>,
 ) -> Result<Json<Vec<OriginatedClaimResponse>>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "originated_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    AgentRepository::get_by_id(pool, agent_id)
+    AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
@@ -683,7 +797,7 @@ pub async fn originated_claims(
     let min_amp = params.amplified_by_min.max(0);
 
     let rows = PoliticalRepository::get_originated_claims_with_amplification(
-        pool, &viewer, id, min_amp, limit,
+        &mut *read, &viewer, id, min_amp, limit,
     )
     .await?;
 
@@ -713,16 +827,26 @@ pub async fn inflation_index(
     Query(_params): Query<InflationIndexParams>,
 ) -> Result<Json<InflationIndexResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "inflation_index",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    AgentRepository::get_by_id(pool, agent_id)
+    AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
 
-    let rows = PoliticalRepository::get_agent_inflation_claims(pool, &viewer, id).await?;
+    let rows = PoliticalRepository::get_agent_inflation_claims(&mut *read, &viewer, id).await?;
 
     let sample_claims: Vec<InflationClaimEntry> = rows
         .iter()
@@ -886,9 +1010,19 @@ pub async fn claim_techniques(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<ClaimTechniqueResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_techniques",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    let rows = PoliticalRepository::get_claim_techniques(pool, &viewer, claim_id).await?;
+    let rows = PoliticalRepository::get_claim_techniques(&mut *read, &viewer, claim_id).await?;
 
     let items: Vec<ClaimTechniqueResponse> = rows
         .into_iter()
