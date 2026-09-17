@@ -471,9 +471,21 @@ pub async fn method_gap_analysis(
         // `methods` and `method_capabilities` both carry no RLS at migration
         // head 92, so this site shares the connection and narrows nothing —
         // see `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+        //
+        // PROPAGATED, not swallowed, and that is a consequence of the
+        // conversion. All three statements in these loops now share ONE
+        // connection; under `SessionGucMode::Transaction` a `ScopedRead` is a
+        // `sqlx::Transaction` with no per-statement savepoint, so the first
+        // error aborts it and every later statement is rejected with `25P02`.
+        // An `.unwrap_or_default()` inside the loop would turn that into a 200
+        // in which every REMAINING capability reports as a gap — a wrong answer
+        // that looks like a finding. Before the conversion each statement had
+        // its own checkout and a failure was isolated to it.
         let methods = epigraph_db::MethodRepository::get_methods_for_capability(&mut *read, cap)
             .await
-            .unwrap_or_default();
+            .map_err(|e| ApiError::InternalError {
+                message: format!("{e}"),
+            })?;
 
         if methods.is_empty() {
             gaps += 1;
@@ -490,19 +502,43 @@ pub async fn method_gap_analysis(
 
         for m in &methods {
             // Both of these DO narrow: they reach `claims` and `edges` and carry
-            // the `{VISIBILITY:c}` / `{EDGE_VISIBILITY:e}` markers.
+            // the `{VISIBILITY:c}` / `{EDGE_VISIBILITY:e}` markers. Both
+            // propagate rather than default, for the reason given at the
+            // capability read above — they are on the same shared connection.
+            //
+            // `get_evidence_strength` returns `Result<MethodEvidenceStrength>`
+            // and not an `Option`, so the previous `.ok()` had exactly one
+            // effect: it rendered a database error as the same value a method
+            // with no evidence produces, and the response then reported
+            // `evidence_strength: 0.0`.
+            //
+            // Checked in the repo body rather than inferred from the signature,
+            // because a `fetch_one` there WOULD make `RowNotFound` a legitimate
+            // empty result and this `?` would turn an ordinary cross-tenant miss
+            // into a 500 for the whole analysis: `get_evidence_strength` ends in
+            // `fetch_optional` and `map_or`s `None` onto a zero-valued
+            // `MethodEvidenceStrength`, so the no-evidence case is already
+            // `Ok`. `RowNotFound` cannot reach here and only a real database
+            // error can. That distinction matters in THIS handler in
+            // particular, because the loop above is driven by an UNSPLICED read
+            // and therefore iterates methods whose evidence the viewer may not
+            // be able to see.
             let evidence = epigraph_db::MethodRepository::get_evidence_strength(
                 &mut *read,
                 &viewer,
                 m.method_id,
             )
             .await
-            .ok();
+            .map_err(|e| ApiError::InternalError {
+                message: format!("{e}"),
+            })?;
 
             let papers =
                 epigraph_db::MethodRepository::get_source_papers(&mut *read, &viewer, m.method_id)
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| ApiError::InternalError {
+                        message: format!("{e}"),
+                    })?;
 
             let newest_year = papers.iter().filter_map(|p| p.pub_year).max();
             let is_stale = newest_year.is_some_and(|y| current_year - y > max_age);
@@ -522,7 +558,7 @@ pub async fn method_gap_analysis(
             method_infos.push(serde_json::json!({
                 "method_id": m.method_id,
                 "name": m.name,
-                "evidence_strength": evidence.as_ref().map(|e| e.avg_belief).unwrap_or(0.0),
+                "evidence_strength": evidence.avg_belief,
                 "newest_source_year": newest_year,
                 "source_count": papers.len(),
                 "status": status,

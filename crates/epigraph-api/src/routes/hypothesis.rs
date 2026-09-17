@@ -313,10 +313,16 @@ pub async fn hypothesis_status(
             })?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
+        // Propagated for the same reason as the two reads below: this is the
+        // first of the four statements that now share one connection, so under
+        // `SessionGucMode::Transaction` a swallow here is what would abort the
+        // transaction and make all three later defaults fire silently.
         let mass_rows =
             epigraph_db::MassFunctionRepository::get_for_claim_frame(&mut *read, &viewer, id, fid)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("{e}"),
+                })?;
 
         // Use the most recent mass function's masses for belief
         if let Some(latest) = mass_rows.last() {
@@ -338,11 +344,25 @@ pub async fn hypothesis_status(
         (0.0, 0.0)
     };
 
-    // Count completed experiments with analysis
+    // Count completed experiments with analysis.
+    //
+    // PROPAGATED, not swallowed, and the change is a consequence of the
+    // conversion rather than a tidy-up. This statement and the two below now
+    // share ONE connection. Under `SessionGucMode::Transaction` a `ScopedRead`
+    // is a `sqlx::Transaction` with no per-statement savepoint, so the first
+    // error aborts it and Postgres rejects every later command with `25P02` —
+    // and an `.unwrap_or(0)` here would turn that into a 200 reporting zero
+    // completed experiments and, two statements on, no scope limitation. Both
+    // feed `evaluate_promotion`, so the handler would render a confident
+    // verdict out of three defaults. Before the conversion each statement had
+    // its own checkout and a failure was isolated to it; sharing a connection
+    // is what makes the swallow unsafe, so the swallow goes.
     let completed_with_analysis =
         epigraph_db::ExperimentRepository::count_completed_with_analysis(&mut *read, &viewer, id)
             .await
-            .unwrap_or(0);
+            .map_err(|e| ApiError::InternalError {
+                message: format!("{e}"),
+            })?;
 
     // Check scope: find analyses that provide_evidence to this hypothesis with
     // scope_limitations.
@@ -378,7 +398,9 @@ pub async fn hypothesis_status(
     .bind(id)
     .fetch_one(&mut *read)
     .await
-    .unwrap_or((false,));
+    .map_err(|e| ApiError::InternalError {
+        message: format!("{e}"),
+    })?;
 
     let promotion_input = epigraph_engine::PromotionInput {
         bel_supported,
