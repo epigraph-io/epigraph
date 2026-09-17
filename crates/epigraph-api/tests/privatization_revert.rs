@@ -15,7 +15,12 @@
 //! genuinely sealed and then unsealed CAN be reverted — was unexercisable,
 //! because nothing in the product wrote a seal. **PR-21 changed that**: the
 //! manifest ceremony is in `privatization_seal.rs`, which drives a real seal and
-//! a real unseal through the routes. What this file still measures is the
+//! a real unseal through the routes. The positive arm IS now asserted, there:
+//! `a_sealed_plan_becomes_revertible_once_its_items_are_unsealed` seals a plan,
+//! unseals every item through the key ceremony, and requires the revert to
+//! succeed. A reader arriving here to check whether clause 10 is discharged
+//! should read that test; this file is the other half. What this file still
+//! measures is the
 //! refusal's CONDITION — the same request accepted once the encryption row is
 //! gone — against a stub ciphertext, which keeps the revert assertions
 //! independent of the key ceremony's own correctness.

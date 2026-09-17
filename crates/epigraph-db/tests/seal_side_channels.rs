@@ -880,6 +880,199 @@ async fn unseal_restores_the_row_and_the_generated_tsvector(pool: PgPool) {
     assert!(!embedding_present);
 }
 
+/// A second keyed `team` group, admin'd by the same author, old enough to be a
+/// seal target.
+///
+/// [`seed_world`] builds exactly one, which is why the cross-group predicate
+/// below had no fixture to run in. This is the sibling seed, not a rewrite of
+/// the original.
+async fn seed_sibling_group(pool: &PgPool, world: &World) -> Uuid {
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, status, \
+                             created_by_agent_id, created_at) \
+         VALUES ('sibling seal target', 'did:epigraph:team:' || gen_random_uuid()::text, \
+                 $2, 'team', 'active', $1, now() - interval '48 hours') \
+         RETURNING id",
+    )
+    .bind(world.author)
+    .bind(vec![0x22u8; 32])
+    .fetch_one(pool)
+    .await
+    .expect("seed the sibling team group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(group)
+    .bind(world.author)
+    .execute(pool)
+    .await
+    .expect("seed the sibling group's admin membership");
+    sqlx::query("INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, $2, 'active')")
+        .bind(group)
+        .bind(EPOCH)
+        .execute(pool)
+        .await
+        .expect("seed the sibling group's active key epoch");
+    group
+}
+
+/// `D-PR21-cross-group-ciphertext-untested` — an unseal cannot reach a claim
+/// whose ciphertext is bound to a DIFFERENT group's key.
+///
+/// # The property
+///
+/// `unseal_claims_conn` is scoped by two predicates. The plan-membership one is
+/// asserted at the route layer. This is the other: the row must carry a
+/// `claim_encryption` row bound to the group the unseal is being performed for.
+/// It shipped without a test, so a later refactor could have deleted it with
+/// every test still green.
+///
+/// # Why the stakes are not the usual read-side stakes
+///
+/// An unseal writes CALLER-SUPPLIED plaintext and then drops the ciphertext.
+/// The server holds no key, so it cannot tell the plaintext a commit supplies
+/// from any other string — the binding is the only thing that decides whose key
+/// the row belongs to, and once the ciphertext is dropped there is nothing left
+/// to check it against.
+///
+/// # Measured at the repository, and why
+///
+/// The state occurs in production through overlapping plans: a seal-commit's
+/// `ON CONFLICT (claim_id) DO NOTHING` leaves an earlier group's binding in
+/// place, so a second group's plan can hold an item whose ciphertext is still
+/// the first group's. The predicate itself is one statement, and asserting it
+/// where it lives keeps the assertion about the predicate rather than about the
+/// plan machinery that reaches it.
+///
+/// # WHAT IS PROVEN HERE, STATED NARROWLY
+///
+/// The predicate FILTERS: the foreign-bound row is not in the returned set, and
+/// its content, version and ciphertext are left exactly as they were. That is a
+/// property of this statement, and it is the property the assertions below
+/// measure. It is not the same statement as an end-to-end refusal — what a
+/// route built on top of this reports to its caller is the route's own
+/// question, and it is tracked separately under `D-PR21-unseal-commit-shape`
+/// (owner: privatization route layer; analysis held outside this repository).
+/// This test is deliberately not evidence about that.
+///
+/// # Both directions, over one row
+///
+/// The refusal is asserted first and the SAME row is then unsealed by its own
+/// group. A predicate that refused everything — the silent failure mode for a
+/// scoping control — would pass the first half alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unseal_cannot_reach_a_claim_bound_to_another_groups_key(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let sibling = seed_sibling_group(&pool, &world).await;
+    let plaintext = "a finding bound to one group's key and no other";
+    let claim = seed_sealable_claim(&pool, &world, plaintext).await;
+    let payload = seal_payload(&pool, claim).await;
+    commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+
+    let stub = format!("[sealed:x{}]", claim.simple());
+    let item = |content: &str| UnsealCommitItem {
+        claim_id: claim,
+        content: content.to_string(),
+        content_hash: blake3::hash(content.as_bytes()).as_bytes().to_vec(),
+        labels: vec!["restored".to_string()],
+        properties: serde_json::json!({ "back": true }),
+        versions: payload
+            .versions
+            .iter()
+            .map(|v| UnsealCommitVersion {
+                id: v.id,
+                content: content.to_string(),
+            })
+            .collect(),
+        evidence: payload
+            .evidence
+            .iter()
+            .map(|e| UnsealCommitEvidence {
+                id: e.id,
+                raw_content: Some(content.to_string()),
+                properties: serde_json::json!({ "source": content }),
+            })
+            .collect(),
+    };
+
+    let (scoped, _viewer) = viewer_fixture::bypass(&pool).await;
+    let (mut conn, _lease) = scoped
+        .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::PrivatizationApply)
+        .await
+        .expect("maintenance connection");
+
+    // The sibling group asks to unseal a row it does not hold the binding for,
+    // supplying plaintext the server cannot check.
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .expect("begin the cross-group unseal");
+    let restored =
+        PrivatizationRepository::unseal_claims_conn(&mut tx, sibling, &[item("substituted")])
+            .await
+            .expect("the statement runs; it is the row set that must be empty");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        restored,
+        Vec::<Uuid>::new(),
+        "an unseal performed for one group must restore NOTHING bound to another group's key"
+    );
+
+    let (content, ciphertext_rows): (String, i64) = sqlx::query_as(
+        "SELECT c.content, \
+                (SELECT count(*) FROM claim_encryption ce WHERE ce.claim_id = c.id) \
+           FROM claims c WHERE c.id = $1",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("read the claim");
+    assert_eq!(
+        content, stub,
+        "the refused unseal must leave the sealed stub in place, not the supplied plaintext"
+    );
+    assert_eq!(
+        ciphertext_rows, 1,
+        "the ciphertext is the only remaining copy of that plaintext; a refused unseal must not \
+         drop it"
+    );
+    let version_content: String =
+        sqlx::query_scalar("SELECT content FROM claim_versions WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the version");
+    assert_eq!(
+        version_content, stub,
+        "the refusal must cover the version rows too; restoring them would leak the plaintext \
+         the head row refused"
+    );
+
+    // The positive direction, on the same row: its OWN group can unseal it.
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .expect("begin the owning group's unseal");
+    let restored =
+        PrivatizationRepository::unseal_claims_conn(&mut tx, world.group, &[item(plaintext)])
+            .await
+            .expect("unseal");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        restored,
+        vec![claim],
+        "the group that holds the binding must still be able to unseal; a predicate that \
+         refused everyone would pass the assertions above"
+    );
+    drop(conn);
+
+    let content: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("read the restored claim");
+    assert_eq!(content, plaintext);
+}
+
 /// A commit that omits a version or an evidence row is REFUSED, not applied to
 /// the rest.
 ///
@@ -1148,6 +1341,133 @@ async fn a_shared_source_fragment_is_blanked_for_every_claim_that_cites_it(pool:
     .expect("read the out-of-plan claim");
     assert_eq!(content, sharer_text);
     assert_eq!(ciphertext_rows, 0);
+}
+
+/// The SHARED embedding write refuses a sealed claim, and still writes an
+/// unsealed one.
+///
+/// # Why this is asserted on `store_embedding` and not only on its by-id sibling
+///
+/// `store_embedding_if_unsealed` is the statement the restore job uses, and it
+/// carried the seal predicate from the start. It is not the only statement that
+/// can put a vector on a claim: `store_embedding` is the write every other
+/// producer in the workspace shares — the MCP submit/memorize/ingest paths, the
+/// backfill tool, the backfill binary, and the by-id route whose caller supplies
+/// the vector itself. Their ENUMERATORS exclude sealed rows, so for them the
+/// predicate changes nothing; the by-id caller has no enumerator, and a claim id
+/// is not a capability to compute a vector over ciphertext.
+///
+/// The positive arm is not decoration. A predicate that refused everything is
+/// the silent failure mode here — every negative assertion would still pass, and
+/// the corpus would simply stop being embedded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_shared_embedding_write_refuses_a_sealed_claim(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let plain = seed_sealable_claim(&pool, &world, "ordinary, embeddable").await;
+    let sealed = seed_sealable_claim(&pool, &world, "confidential, not embeddable").await;
+
+    let payload = seal_payload(&pool, sealed).await;
+    commit_seal(&pool, &world, &[payload]).await;
+
+    // The seal nulls the column, so "still NULL" below is measured against a
+    // known starting point rather than against a column nobody ever wrote.
+    let cleared: Option<bool> =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+            .bind(sealed)
+            .fetch_one(&pool)
+            .await
+            .expect("read the sealed claim's vector column");
+    assert_eq!(cleared, Some(true), "the seal must have nulled the vector");
+
+    let vector = vector_literal(1536, 0.125);
+
+    let wrote = epigraph_db::ClaimRepository::store_embedding(&pool, plain, &vector)
+        .await
+        .expect("store a vector on an unsealed claim");
+    assert!(
+        wrote,
+        "the unsealed claim must still be embeddable; a statement that refuses \
+         everything passes every negative assertion in this test"
+    );
+
+    let refused = epigraph_db::ClaimRepository::store_embedding(&pool, sealed, &vector)
+        .await
+        .expect("the refusal is a zero-row UPDATE, not an error");
+    assert!(
+        !refused,
+        "the shared embedding write must report no row for a sealed claim"
+    );
+
+    let after: Option<bool> =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+            .bind(sealed)
+            .fetch_one(&pool)
+            .await
+            .expect("re-read the sealed claim's vector column");
+    assert_eq!(
+        after,
+        Some(true),
+        "a sealed claim carrying a vector is the audit's page-the-on-call \
+         condition, not a degraded restoration"
+    );
+}
+
+/// The restore write applies the READ's population rules, `is_current` included.
+///
+/// The pair exists because the read and the write are separated by a provider
+/// round trip. `claim_text_for_embedding` declines a superseded claim; if the
+/// write did not, a supersede landing inside that window would put the vector
+/// back on the row the supersede had just nulled — `stale_present` in CLAUDE.md's
+/// audit, with nothing downstream to clean it up.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let current = seed_sealable_claim(&pool, &world, "still the current revision").await;
+    let stale = seed_sealable_claim(&pool, &world, "superseded mid-flight").await;
+
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+    let vector = vector_literal(1536, 0.375);
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let wrote = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        &mut conn, &bypass, current, &vector,
+    )
+    .await
+    .expect("store a vector on a current claim");
+    assert!(
+        wrote,
+        "a current, unsealed claim must still be embeddable by the restore write"
+    );
+
+    // What `ClaimRepository::supersede` does to the loser, reduced to the one
+    // column this write consults.
+    sqlx::query("UPDATE claims SET is_current = false, embedding = NULL WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("supersede the claim out from under the in-flight job");
+
+    let refused = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+        &mut conn, &bypass, stale, &vector,
+    )
+    .await
+    .expect("the refusal is a zero-row UPDATE, not an error");
+    assert!(
+        !refused,
+        "the restore write must report no row for a superseded claim"
+    );
+
+    let after: Option<bool> =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM claims WHERE id = $1")
+            .bind(stale)
+            .fetch_one(&pool)
+            .await
+            .expect("re-read the superseded claim's vector column");
+    assert_eq!(
+        after,
+        Some(true),
+        "every claim with is_current = false should have embedding = NULL"
+    );
 }
 
 #[test]

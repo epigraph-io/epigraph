@@ -149,13 +149,28 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- purpose, and keying on visibility would hide every group-private row.
          AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)
          -- Nor is an unseal in flight. BOUNDED, deliberately: `unseal-commit`
-         -- enqueues one embedding_generation job per restored claim, and the
-         -- shipped job runner registers no embedding handler to drain that
-         -- queue (`bin/server.rs`). Without the 24h bound this clause
-         -- would hide an unsealed claim from `live_missing` forever, which is
-         -- the failure mode the audit exists to catch. Keep the bound until a
-         -- handler is registered; a non-zero count of jobs older than it is
-         -- itself the signal that one is needed.
+         -- enqueues one embedding_generation job per restored claim.
+         --
+         -- THE BOUND STAYS AT 24h, AND IT IS NOW A DEPLOYMENT QUESTION RATHER
+         -- THAN A MISSING-CODE ONE. `bin/server.rs` does register a handler for
+         -- that job type, but CONDITIONALLY: only the provider that OWNS this
+         -- column may write it. That is stricter than "not a mock" -- a real
+         -- provider embedding into a different vector space is refused too, and
+         -- refused deliberately, because one ANN column holding two spaces
+         -- degrades recall with no error. So an instance on the development
+         -- fallback embedder AND an instance on any other real provider both
+         -- register nothing, and their queues still never drain. Removing the
+         -- bound would therefore hide an unsealed claim from `live_missing`
+         -- forever on exactly the instances that most need to see it. A
+         -- non-zero count of jobs older than the bound now means "this
+         -- instance's embedding provider is not the one that owns this
+         -- column", which is a deployment signal rather than a missing-handler
+         -- one; the boot log's own warning says which provider was selected,
+         -- and `epigraph-cli reembed` remains the recovery path in that case.
+         --
+         -- Restoration is HALF: the job writes `embedding`, which is the column
+         -- this clause reads. `embedding_3072` is nulled by the same seal and
+         -- is NOT restored by it -- `epigraph-cli reembed` writes that one.
          --
          -- THE PAYLOAD PATH IS `#>> '{EmbeddingGeneration,claim_id}'`, NOT
          -- `->>'claim_id'`. `EpiGraphJob` is an externally tagged serde enum, so

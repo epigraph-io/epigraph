@@ -697,6 +697,29 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "shared_fragment_count_conn",
+        "READ of `harvester_claim_provenance` joined to `privatization_plan_items`, returning a \
+         COUNT of FRAGMENT IDS and enumerating none of them — no claim id, no fragment id and no \
+         text crosses the boundary. It is the magnitude behind the seal preview's unconditional \
+         `unrecoverable` sentence, which already tells the operator that a shared fragment is \
+         blanked for the claims outside the plan too. Maintenance connection, and that is the \
+         point of the entry: the claims that make a fragment SHARED are by definition outside \
+         this plan, so they are exactly the rows the actor may have no right to see. A filtered \
+         count would report zero sharing to an operator whose seal shares plenty, understating \
+         the very loss the sentence exists to disclose. What the actor is told is one integer \
+         keyed on the EXISTENCE of rows outside the plan — which is a different shape from \
+         `sealed_item_count_conn`, and is stated rather than borrowed: that one counts rows \
+         INSIDE the plan. The argument for this entry is its own. The caller has already \
+         passed `require_instance_admin_for_group` for the target group, and the preview it \
+         feeds already returns several bypass-derived aggregates over the same unfiltered \
+         closure (`authors_losing_own_claims`, `boundary_edge_counts`, `not_visible_to_actor`), \
+         so one more integer grants no capability the route did not already grant. Note the \
+         limit plainly: a plan built one claim at a time makes this count a per-fragment \
+         existence signal, which is the reason the entry needs the admin gate above it rather \
+         than the analogy.",
+    ),
+    (
+        "privatization.rs",
         "item_state_counts_conn",
         "READ of `privatization_plan_items`, GROUPed to `state -> count`. Serves `GET /plans/:id`'s \
          live-progress block, so it MUST be given the actor's STAMPED app connection: 087's policy \

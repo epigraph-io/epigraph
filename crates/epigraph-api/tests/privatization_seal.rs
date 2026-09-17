@@ -226,6 +226,20 @@ async fn fetch_seal_manifest(
     world: &fx::World,
     plan: Uuid,
 ) -> Result<routes::SealManifest, ApiError> {
+    fetch_seal_manifest_page(pool, world, plan, None, None).await
+}
+
+/// One page of a plan's seal manifest, at an explicit cursor and limit.
+///
+/// The un-paged helper above delegates here, so the paging test and the six
+/// single-page tests drive the SAME call rather than two arrangements of it.
+async fn fetch_seal_manifest_page(
+    pool: &PgPool,
+    world: &fx::World,
+    plan: Uuid,
+    cursor: Option<Uuid>,
+    limit: Option<i64>,
+) -> Result<routes::SealManifest, ApiError> {
     let state = fx::split_state(pool).await;
     routes::seal_manifest(
         epigraph_api::middleware::bearer::ViewerExtractor(
@@ -236,10 +250,7 @@ async fn fetch_seal_manifest(
         axum::extract::State(state),
         Some(axum::Extension(fx::auth_for(world.actor))),
         axum::extract::Path(plan),
-        axum::extract::Query(routes::ManifestQuery {
-            cursor: None,
-            limit: None,
-        }),
+        axum::extract::Query(routes::ManifestQuery { cursor, limit }),
     )
     .await
     .map(|json| json.0)
@@ -680,6 +691,17 @@ async fn fetch_unseal_manifest(
     world: &fx::World,
     plan: Uuid,
 ) -> routes::UnsealManifest {
+    fetch_unseal_manifest_page(pool, world, plan, None, None).await
+}
+
+/// One page of a plan's unseal manifest, at an explicit cursor and limit.
+async fn fetch_unseal_manifest_page(
+    pool: &PgPool,
+    world: &fx::World,
+    plan: Uuid,
+    cursor: Option<Uuid>,
+    limit: Option<i64>,
+) -> routes::UnsealManifest {
     let state = fx::split_state(pool).await;
     routes::unseal_manifest(
         epigraph_api::middleware::bearer::ViewerExtractor(
@@ -690,10 +712,7 @@ async fn fetch_unseal_manifest(
         axum::extract::State(state),
         Some(axum::Extension(fx::auth_for(world.actor))),
         axum::extract::Path(plan),
-        axum::extract::Query(routes::ManifestQuery {
-            cursor: None,
-            limit: None,
-        }),
+        axum::extract::Query(routes::ManifestQuery { cursor, limit }),
     )
     .await
     .expect("unseal manifest")
@@ -902,6 +921,741 @@ async fn an_unseal_commit_that_omits_a_sealed_row_is_refused(pool: PgPool) {
         .await
         .expect("read the claim");
     assert_eq!(content, format!("[sealed:x{}]", claim.simple()));
+}
+
+/// Unseal a whole plan through the routes, and assert it restored everything.
+async fn unseal_through_routes(pool: &PgPool, world: &fx::World, plan: Uuid, expect: usize) {
+    let manifest = fetch_unseal_manifest(pool, world, plan).await;
+    assert_eq!(manifest.items.len(), expect);
+    let items = manifest.items.iter().map(unseal_entry).collect();
+    let resp = post_unseal_commit(pool, world, plan, routes::UnsealCommitRequest { items })
+        .await
+        .expect("unseal commit");
+    assert_eq!(resp.committed, expect);
+}
+
+/// The digest a dispatch route wants echoed back, as the route spells it.
+async fn echoed_digest(pool: &PgPool, plan: Uuid) -> String {
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT plan_digest FROM privatization_plans WHERE id = $1")
+            .bind(plan)
+            .fetch_one(pool)
+            .await
+            .expect("read the plan's stored digest");
+    format!("b3:{}", hex::encode(stored))
+}
+
+/// Ask the revert route to un-apply a plan.
+async fn post_revert(
+    pool: &PgPool,
+    world: &fx::World,
+    plan: Uuid,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let state = fx::split_state(pool).await;
+    let digest = echoed_digest(pool, plan).await;
+    routes::revert_plan(
+        epigraph_api::middleware::bearer::ViewerExtractor(
+            epigraph_db::visibility::Viewer::resolve(pool, world.actor)
+                .await
+                .expect("resolve"),
+        ),
+        axum::extract::State(state),
+        Some(axum::Extension(fx::auth_for(world.actor))),
+        axum::extract::Path(plan),
+        axum::Json(routes::RevertRequest {
+            plan_digest: digest,
+        }),
+    )
+    .await
+    .map(|(status, _)| status)
+}
+
+/// FINAL-PLAN acceptance clause 10, POSITIVE arm — a seal plan becomes
+/// revertible once its items are unsealed, and the revert actually runs.
+///
+/// # Why it lives here and not in `privatization_revert.rs`
+///
+/// That file measures the refusal's CONDITION against a stub ciphertext, which
+/// keeps its assertions independent of the key ceremony. Clause 10's positive
+/// arm is the opposite requirement: it is only meaningful over ciphertext the
+/// PRODUCT wrote and the product removed, because the thing it must prove is
+/// that `seal-commit`'s row and `unseal-commit`'s deletion are the same row the
+/// revert route counts. The drivers for both are in this file.
+///
+/// # Both arms, in one run, against one plan
+///
+/// The 409 is asserted first on the SAME plan that is then unsealed and
+/// reverted. Two separate plans would leave open the possibility that the
+/// refusal and the acceptance differ for some reason other than the seal — a
+/// revert that always 409'd and a revert that always 202'd would each pass one
+/// half of a two-plan version of this test.
+///
+/// # The effect, not the status
+///
+/// A `202` only says the dispatch was accepted. The revert handler is run and
+/// the claim's tenancy is read afterwards, because clause 10 is a claim about
+/// the corpus ending up back where it started, not about a status code.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_plan_becomes_revertible_once_its_items_are_unsealed(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let plaintext = "a result that is sealed, unsealed and then un-privatized";
+    let claim = seed_subject(&pool, &world, plaintext).await;
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+
+    seal_through_routes(&pool, &world, plan, 1).await;
+
+    // The negative arm, over ciphertext this ceremony actually wrote.
+    let err = post_revert(&pool, &world, plan)
+        .await
+        .expect_err("a plan whose item is sealed must not be revertible");
+    assert!(
+        matches!(&err, ApiError::Conflict { reason } if reason.contains('1')),
+        "expected a 409 carrying the still-sealed count, got {err:?}"
+    );
+    assert_eq!(
+        fx::plan_state(&pool, plan).await,
+        "applied",
+        "a refused revert must not move the plan"
+    );
+
+    unseal_through_routes(&pool, &world, plan, 1).await;
+    let sealed_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claim_encryption WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("count ciphertext rows");
+    assert_eq!(
+        sealed_rows, 0,
+        "CALIBRATION: the unseal must remove the row the 409 counts, or the acceptance below \
+         measures nothing about the seal"
+    );
+
+    // The positive arm.
+    let status = post_revert(&pool, &world, plan)
+        .await
+        .expect("a fully unsealed seal plan must be revertible");
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    assert_eq!(fx::plan_state(&pool, plan).await, "reverting");
+
+    // And it completes: the claim goes back to the tenancy the apply moved it
+    // out of, carrying the plaintext the unseal restored.
+    let scoped = fx::scoped(&pool).await;
+    // The correlation id the ROUTE minted, not one this test invents: §6.5.5's
+    // sixth re-validation condition compares the job's correlation id against
+    // the dispatch event, so a fabricated one would make the handler refuse.
+    let correlation = sqlx::query_scalar::<_, String>(
+        "SELECT correlation_id FROM security_events \
+          WHERE event_type = $1 AND details->>'plan_id' = $2::text \
+            AND correlation_id IS NOT NULL \
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(epigraph_jobs::privatization::DISPATCH_EVENT_TYPE)
+    .bind(plan)
+    .fetch_one(&pool)
+    .await
+    .expect("the revert dispatch wrote a correlated security event");
+    fx::run_revert(
+        &scoped,
+        &fx::revert_job(plan, world.actor, &correlation),
+        50,
+    )
+    .await
+    .expect("run the revert");
+
+    assert_eq!(
+        fx::plan_state(&pool, plan).await,
+        "reverted",
+        "the revert handler must carry the plan to its terminal state"
+    );
+    let (visibility, content): (String, String) =
+        sqlx::query_as("SELECT visibility, content FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the reverted claim");
+    assert_eq!(
+        (visibility.as_str(), content.as_str()),
+        ("public", plaintext),
+        "clause 10 asks for the corpus back where it started: public, with its plaintext"
+    );
+}
+
+/// Give `claim` a harvester source fragment, and return the fragment id.
+///
+/// The fragment inherits the claim's own tenancy, so the rows are consistent
+/// whatever visibility the claim is at when this is called.
+async fn seed_fragment(pool: &PgPool, claim: Uuid, text: &str) -> Uuid {
+    let source: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality, status) \
+         VALUES ($1, 'text', 'completed') RETURNING id",
+    )
+    // Per-call nonces: `harvester_sources.content_hash` is UNIQUE and one claim
+    // may cite more than one source, so a hash derived from the claim id alone
+    // makes the second seed a 23505.
+    .bind(Uuid::new_v4().as_bytes().to_vec())
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester source");
+    let fragment: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
+                                          context_window, status, visibility, owner_group_id) \
+         SELECT $1, $2, $3, $3, 'completed', c.visibility, c.owner_group_id \
+           FROM claims c WHERE c.id = $4 RETURNING id",
+    )
+    .bind(source)
+    .bind(Uuid::new_v4().as_bytes().to_vec())
+    .bind(text)
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester fragment");
+    cite_fragment(pool, claim, fragment).await;
+    fragment
+}
+
+/// Link an existing fragment to a second claim, which is what makes it SHARED.
+async fn cite_fragment(pool: &PgPool, claim: Uuid, fragment: Uuid) {
+    sqlx::query(
+        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id, visibility, \
+                                                 owner_group_id) \
+         SELECT $1, $2, c.visibility, c.owner_group_id FROM claims c WHERE c.id = $1",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .execute(pool)
+    .await
+    .expect("seed harvester provenance");
+}
+
+/// `D-PR21-shared-fragment-count` — the seal preview reports the MAGNITUDE of
+/// the shared-fragment loss it already describes.
+///
+/// # What was there, and what was missing
+///
+/// `SEAL_UNRECOVERABLE` states the property unconditionally: a fragment is one
+/// row, so blanking it takes the source text from every claim that cites it,
+/// including claims outside the plan. The behaviour is deliberate and is
+/// asserted in `epigraph-db/tests/seal_side_channels.rs`. What the operator
+/// could not see is how much of it there is — a plan that blanks one shared
+/// fragment and one that blanks four hundred read identically.
+///
+/// # Two plans, and the second is what makes the first mean anything
+///
+/// A count of shared fragments is only informative if it can be zero. The
+/// unshared plan is asserted first for exactly that reason: a field hard-wired
+/// to the plan's fragment count, or to any non-zero constant, would satisfy the
+/// shared case on its own.
+///
+/// # `restrict` gets `None`, not `0`
+///
+/// A restrict plan blanks no fragments at all, so a zero there would read as
+/// "measured, and there is no sharing" rather than "this question does not
+/// arise". The distinction matters because the count exists to qualify a
+/// sentence that a restrict preview does not carry.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seal_preview_counts_the_source_fragments_it_would_blank_for_outsiders(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+
+    // A plan whose fragment nobody else cites.
+    let lonely = seed_subject(&pool, &world, "a claim whose source nobody else cites").await;
+    seed_fragment(&pool, lonely, "a source only one claim cites").await;
+    assert_eq!(
+        seal_preview(&pool, &world, &[lonely])
+            .await
+            .counts
+            .shared_source_fragments,
+        Some(0),
+        "a plan whose fragments are cited by nobody outside it shares nothing; a non-zero here \
+         would mean the count is measuring the plan's own citations"
+    );
+
+    // A plan whose fragment IS cited from outside.
+    let sealed = seed_subject(&pool, &world, "a claim whose source is cited twice").await;
+    let outsider = seed_subject(&pool, &world, "a claim this plan does not touch").await;
+    let shared = seed_fragment(&pool, sealed, "a source two claims cite").await;
+    cite_fragment(&pool, outsider, shared).await;
+    seed_fragment(&pool, sealed, "a second source, cited once").await;
+
+    let preview = seal_preview(&pool, &world, &[sealed]).await;
+    assert_eq!(
+        preview.counts.total, 1,
+        "CALIBRATION: the outsider must be OUTSIDE the frozen set, or the count below is asked \
+         about a plan that contains both claims and there is nothing outside it to share with"
+    );
+    assert_eq!(
+        preview.counts.shared_source_fragments,
+        Some(1),
+        "one of this plan's two fragments is cited from outside it; the count is of FRAGMENTS \
+         that lose their text for outsiders, not of the plan's fragments and not of the outside \
+         claims affected"
+    );
+    assert!(
+        preview.side_effects.unrecoverable.is_some(),
+        "the count qualifies the unconditional sentence; it does not replace it"
+    );
+
+    // A restrict plan blanks no fragment, so the question does not arise.
+    let restrict = restrict_preview(&pool, &world, &[sealed]).await;
+    assert_eq!(
+        restrict.counts.shared_source_fragments, None,
+        "a restrict preview must report absence, not zero: zero would read as 'measured, and \
+         there is no sharing'"
+    );
+    assert!(restrict.side_effects.unrecoverable.is_none());
+}
+
+/// Create a plan through the ROUTE and return its preview, without applying it.
+///
+/// The preview is the consent surface, so the assertions above read the field
+/// out of the route's own response. A helper that re-issued the repository's
+/// query would assert a copy of the statement against itself and would pass
+/// even if nothing ever reached the operator.
+async fn seal_preview(pool: &PgPool, world: &fx::World, seeds: &[Uuid]) -> routes::PlanPreview {
+    let state = fx::split_state(pool).await;
+    let (_status, preview) = routes::create_plan(
+        epigraph_api::middleware::bearer::ViewerExtractor(
+            epigraph_db::visibility::Viewer::resolve(pool, world.actor)
+                .await
+                .expect("resolve the actor's viewer"),
+        ),
+        axum::extract::State(state),
+        Some(axum::Extension(fx::auth_for(world.actor))),
+        axum::Json(routes::CreatePlanRequest {
+            mode: Some("seal".to_string()),
+            target_group_id: world.target_group,
+            seeds: routes::PlanSeeds {
+                ids: Some(routes::SeedIds {
+                    claims: seeds.to_vec(),
+                }),
+                predicate: None,
+                saved_query: None,
+            },
+            closure: None,
+            on_conflict: None,
+            pad_to: Some(i32::try_from(PAD_TO).unwrap()),
+        }),
+    )
+    .await
+    .expect("create a seal plan");
+    preview.0
+}
+
+/// A `restrict` plan's preview, for the `None` arm.
+async fn restrict_preview(pool: &PgPool, world: &fx::World, seeds: &[Uuid]) -> routes::PlanPreview {
+    let state = fx::split_state(pool).await;
+    let (_status, preview) = routes::create_plan(
+        epigraph_api::middleware::bearer::ViewerExtractor(
+            epigraph_db::visibility::Viewer::resolve(pool, world.actor)
+                .await
+                .expect("resolve the actor's viewer"),
+        ),
+        axum::extract::State(state),
+        Some(axum::Extension(fx::auth_for(world.actor))),
+        axum::Json(routes::CreatePlanRequest {
+            mode: None,
+            target_group_id: world.target_group,
+            seeds: routes::PlanSeeds {
+                ids: Some(routes::SeedIds {
+                    claims: seeds.to_vec(),
+                }),
+                predicate: None,
+                saved_query: None,
+            },
+            closure: None,
+            on_conflict: None,
+            pad_to: None,
+        }),
+    )
+    .await
+    .expect("create a restrict plan");
+    preview.0
+}
+
+/// How many times a manifest read was audited for this plan.
+async fn manifest_reads(pool: &PgPool, plan: Uuid, action: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM privatization_audit WHERE plan_id = $1 AND action = $2",
+    )
+    .bind(plan)
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .expect("count audited manifest reads")
+}
+
+/// `D-PR21-manifest-paging-untested` — both manifests page, and a short final
+/// page ENDS the walk.
+///
+/// # What was untested
+///
+/// Every manifest call in this file passed `cursor: None, limit: None`, and
+/// `manifest_limit` turns `None` into the 500 ceiling, so every test was a
+/// single page. Neither route's `next_cursor` nor the CLI's loop over it had
+/// ever been exercised.
+///
+/// # A measurement that corrects the recorded hazard
+///
+/// The obligation predicted "a cursor that failed to advance would loop
+/// forever". It would not: both CLI loops break on an empty page. What the code
+/// actually did was hand back a cursor after a page that did not fill the
+/// limit, so every walk ended with one extra request. On this route that is not
+/// merely wasteful — a manifest read is dual-logged as a plaintext disclosure,
+/// so the trailing request wrote an audit pair for a read that served nothing.
+/// The routes now end the walk on a short page, matching `list_plans`, and the
+/// audit count below is what holds them to it.
+///
+/// # Why the pages are compared as a SET
+///
+/// The failure a paging test exists to catch is a cursor that advances wrongly
+/// and skips a row — a claim the operator can then never finish sealing.
+/// Asserting page lengths alone would pass over exactly that: two pages of two
+/// and one are the right shape whether or not they are the right three claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn both_manifests_page_and_a_short_final_page_ends_the_walk(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let mut seeded = Vec::new();
+    for n in 0..3 {
+        seeded.push(seed_subject(&pool, &world, &format!("paged subject {n}")).await);
+    }
+    let plan = applied_seal_plan(&pool, &world, &seeded).await;
+    let expected: std::collections::BTreeSet<Uuid> = seeded.iter().copied().collect();
+
+    // --- seal direction ---
+    let first = fetch_seal_manifest_page(&pool, &world, plan, None, Some(2))
+        .await
+        .expect("first seal page");
+    assert_eq!(first.items.len(), 2, "limit=2 must bound the page");
+    let cursor = first
+        .next_cursor
+        .expect("a full page must offer a cursor, or the walk cannot continue");
+
+    let second = fetch_seal_manifest_page(&pool, &world, plan, Some(cursor), Some(2))
+        .await
+        .expect("second seal page");
+    assert_eq!(second.items.len(), 1, "the tail page holds the remainder");
+    assert_eq!(
+        second.next_cursor, None,
+        "a page short of the limit is the last page; offering a cursor here buys one more \
+         request whose only answer is empty, and audits it as a plaintext read"
+    );
+
+    let walked: std::collections::BTreeSet<Uuid> = first
+        .items
+        .iter()
+        .chain(second.items.iter())
+        .map(|i| i.claim_id)
+        .collect();
+    assert_eq!(
+        walked, expected,
+        "the walk must visit every frozen claim exactly once; a cursor that advanced wrongly \
+         would skip one and the operator could never finish sealing it"
+    );
+    assert_eq!(
+        manifest_reads(&pool, plan, "plan.seal_manifest").await,
+        2,
+        "two pages, two audited reads — a third would be the trailing empty page"
+    );
+
+    // Each page is committable on its own, which is what the CLI's loop does.
+    for page in [&first, &second] {
+        let resp = post_seal_commit(&pool, &world, plan, seal_body(page).await)
+            .await
+            .expect("commit one page");
+        assert_eq!(resp.committed, page.items.len());
+    }
+
+    // --- unseal direction ---
+    let first = fetch_unseal_manifest_page(&pool, &world, plan, None, Some(2)).await;
+    assert_eq!(first.items.len(), 2);
+    let cursor = first.next_cursor.expect("a full page offers a cursor");
+    let second = fetch_unseal_manifest_page(&pool, &world, plan, Some(cursor), Some(2)).await;
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(
+        second.next_cursor, None,
+        "the unseal manifest must end its walk on a short page too — it is the direction that \
+         hands back the ciphertext, so a spurious audited read matters more here, not less"
+    );
+    let walked: std::collections::BTreeSet<Uuid> = first
+        .items
+        .iter()
+        .chain(second.items.iter())
+        .map(|i| i.claim_id)
+        .collect();
+    assert_eq!(walked, expected);
+    assert_eq!(
+        manifest_reads(&pool, plan, "plan.unseal_manifest").await,
+        2,
+        "two pages, two audited reads"
+    );
+}
+
+// ── ops F14: the runner half of the re-embedding the unseal asks for ──────
+
+/// The `EmbeddingJobService` the runner installs, over a deterministic
+/// provider.
+///
+/// The provider is a mock, and the boot-time rule is that a mock provider must
+/// NOT be registered — those are not in tension. The rule is about which
+/// PROVIDER may write the live ANN column and is asserted by
+/// `embedding_restore::tests::only_openai_may_write_the_claim_embedding_column`.
+/// What this file measures is the service's own behaviour — which row it reads,
+/// which row it writes, and which row it refuses — and that is a property of
+/// the statements it issues, not of the vectors' contents.
+fn restore_service(
+    scoped: &std::sync::Arc<epigraph_db::ScopedPool>,
+) -> epigraph_api::embedding_restore::ClaimEmbeddingJobService {
+    let embedder = std::sync::Arc::new(epigraph_embeddings::MockProvider::new(
+        epigraph_embeddings::EmbeddingConfig::openai(1536),
+    ));
+    epigraph_api::embedding_restore::ClaimEmbeddingJobService::new(
+        std::sync::Arc::clone(scoped),
+        embedder,
+    )
+}
+
+/// The one pending `embedding_generation` job naming `claim`, as the runner
+/// would see it.
+///
+/// Read through `PostgresJobQueue::get` rather than reconstructed from the row,
+/// so the `Job` the handler is given is the one the queue actually yields.
+async fn pending_embedding_job(pool: &PgPool, claim: Uuid) -> epigraph_jobs::Job {
+    let id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM jobs \
+          WHERE job_type = 'embedding_generation' AND state = 'pending' \
+            AND payload #>> '{EmbeddingGeneration,claim_id}' = $1::text",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("the unseal enqueued exactly one pending embedding job for this claim");
+    epigraph_jobs::JobQueue::get(
+        &epigraph_jobs::PostgresJobQueue::new(pool.clone()),
+        epigraph_jobs::JobId::from_uuid(id),
+    )
+    .await
+    .expect("the queue yields the enqueued job")
+}
+
+/// `(embedding, embedding_3072)` as text, so a NULL is distinguishable.
+async fn vectors(pool: &PgPool, claim: Uuid) -> (Option<String>, Option<String>) {
+    sqlx::query_as("SELECT embedding::text, embedding_3072::text FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read the claim's vector columns")
+}
+
+/// `D-PR21-embedding-handler-unregistered` — the enqueued job now RESTORES a
+/// vector instead of marking that one is wanted.
+///
+/// # What the defect was, precisely
+///
+/// `ConfigurableEmbeddingHandler` and its `EmbeddingJobService` trait have both
+/// existed for a long time. Nothing implemented the trait, so the handler could
+/// not be constructed, so the runner registered nothing for the job type
+/// `unseal-commit` enqueues. The row went in and nothing ever took it out.
+///
+/// # Why this asserts the column and not the status code
+///
+/// A `202` from `unseal-commit` and a `pending` row in `jobs` are exactly what
+/// the tree had before this change, and are exactly the defect. The only
+/// assertion that can tell the fix from the defect is `claims.embedding` moving
+/// from NULL to non-NULL — so that transition is measured at three points, with
+/// the job's departure from the queue measured beside it.
+///
+/// # `embedding_3072` is deliberately still NULL at the end
+///
+/// The seal nulls both vector columns; this job restores the 1536-dimension one
+/// that `claims.embedding` holds and that the audit's gap clause reads. The
+/// 3072-dimension column is written by `epigraph-cli reembed` and is not part
+/// of this path. The assertion is here so that the half this closes and the
+/// half it does not are both on the record.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unsealed_claim_regains_its_embedding_when_the_job_is_drained(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let plaintext = "a catalyst result whose vector must come back";
+    let claim = seed_subject(&pool, &world, plaintext).await;
+    fx::give_embedding(&pool, claim).await;
+    assert!(
+        vectors(&pool, claim).await.0.is_some(),
+        "CALIBRATION: the claim must start WITH a vector, or 'the seal removed it' is unmeasured"
+    );
+
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+    seal_through_routes(&pool, &world, plan, 1).await;
+    assert_eq!(
+        vectors(&pool, claim).await,
+        (None, None),
+        "the seal must null BOTH vector columns; a plaintext-derived vector surviving a seal is \
+         a confidentiality failure, not an embedding gap"
+    );
+
+    unseal_through_routes(&pool, &world, plan, 1).await;
+    assert_eq!(
+        vectors(&pool, claim).await.0,
+        None,
+        "CALIBRATION: unseal restores plaintext, not vectors — if the column were already \
+         non-NULL here the handler below would be proving nothing"
+    );
+
+    // Drain, exactly as the runner's loop does: take the job the queue yields,
+    // hand it to the registered handler, and record the outcome.
+    let scoped = fx::scoped(&pool).await;
+    let handler = epigraph_jobs::ConfigurableEmbeddingHandler::new(std::sync::Arc::new(
+        restore_service(&scoped),
+    ));
+    assert_eq!(
+        epigraph_jobs::JobHandler::job_type(&handler),
+        "embedding_generation",
+        "CALIBRATION: the handler must claim the job type unseal-commit enqueues, or the runner \
+         would never route this job to it"
+    );
+    let mut job = pending_embedding_job(&pool, claim).await;
+    epigraph_jobs::JobHandler::handle(&handler, &job)
+        .await
+        .expect("the embedding job must succeed for an unsealed claim");
+    job.transition_to(epigraph_jobs::JobState::Running)
+        .expect("pending -> running");
+    job.transition_to(epigraph_jobs::JobState::Completed)
+        .expect("running -> completed");
+    epigraph_jobs::JobQueue::update(&epigraph_jobs::PostgresJobQueue::new(pool.clone()), &job)
+        .await
+        .expect("record the terminal state");
+
+    let (embedding, embedding_3072) = vectors(&pool, claim).await;
+    assert!(
+        embedding.is_some(),
+        "THE FIX: a drained embedding_generation job must leave the claim with a vector; it is \
+         still NULL, so the job is still a marker"
+    );
+    assert_eq!(
+        embedding_3072, None,
+        "the 3072-dimension column is NOT restored by this path; `epigraph-cli reembed` writes \
+         it, and recording that here keeps the closed half from reading as the whole"
+    );
+
+    let still_pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+          WHERE job_type = 'embedding_generation' AND state = 'pending' \
+            AND payload #>> '{EmbeddingGeneration,claim_id}' = $1::text",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count pending embedding jobs");
+    assert_eq!(
+        still_pending, 0,
+        "the job must LEAVE the queue; a handler that ran but left the row pending would be \
+         re-run forever"
+    );
+}
+
+/// A claim that is SEALED gets no vector, and the refusal is in the statement.
+///
+/// # Why this is the more important of the two directions
+///
+/// The failure this guards is not "the restoration did not happen". It is a
+/// plaintext-derived vector written onto a row whose content is ciphertext the
+/// server cannot read — which the operational audit treats as a confidentiality
+/// violation rather than an embedding gap, and which no amount of later
+/// backfill undoes.
+///
+/// The window is real: the job is enqueued by one ceremony and drained later,
+/// and a second plan can seal the same claim in between. So the check cannot
+/// live in the handler's control flow, and both halves are asserted here — the
+/// read refuses to hand over text, and the write refuses the row even when text
+/// is supplied directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_claim_is_refused_a_vector_by_both_halves_of_the_restore(pool: PgPool) {
+    use epigraph_jobs::EmbeddingJobService as _;
+
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let claim = seed_subject(&pool, &world, "a subject that stays sealed").await;
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+    seal_through_routes(&pool, &world, plan, 1).await;
+
+    let scoped = fx::scoped(&pool).await;
+    let service = restore_service(&scoped);
+
+    // Half one: no text is handed out, so the provider is never called on a
+    // sealed row and the handler fails the job.
+    assert_eq!(
+        service.get_claim_text(claim).await,
+        None,
+        "a sealed claim must yield no text to embed"
+    );
+
+    // Half two: even given text, the write refuses the row. This is the half
+    // that closes the window between the two, and it is the half a reviewer
+    // cannot see by reading the handler.
+    let stored = service
+        .generate_and_store(claim, "plaintext that must not become a vector")
+        .await;
+    assert!(
+        stored.is_err(),
+        "storing a vector on a sealed claim must fail, got {stored:?}"
+    );
+
+    let (embedding, embedding_3072) = vectors(&pool, claim).await;
+    assert_eq!(
+        (embedding, embedding_3072),
+        (None, None),
+        "THE INVARIANT: a sealed claim carries no vector on either column"
+    );
+    let ciphertext: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claim_encryption WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("count ciphertext rows");
+    assert_eq!(
+        ciphertext, 1,
+        "CALIBRATION: the claim must still be sealed, or the refusals above are about an \
+         ordinary claim"
+    );
+}
+
+/// The runner actually registers the handler — asserted against the binary's
+/// own source.
+///
+/// # Why a source-text assertion
+///
+/// `bin/server.rs` is a `[[bin]]`, so its wiring is reachable from no test. The
+/// defect this batch closes was not a broken handler; it was a correct handler
+/// that nothing registered, and every test that drives the handler directly —
+/// including the two above — would pass just as well with the registration
+/// deleted. `resource_metadata_challenge.rs` reads the same file for the same
+/// reason.
+///
+/// # Scope, stated so this is not mistaken for a parity ratchet
+///
+/// This pins ONE job type. It does not assert that every `EpiGraphJob` variant
+/// has a registered handler; that broader property is not true today and
+/// establishing it is a separate decision with its own owner.
+#[test]
+fn the_server_binary_registers_a_handler_for_the_job_the_unseal_enqueues() {
+    const SERVER_BIN: &str = include_str!("../src/bin/server.rs");
+    assert!(
+        SERVER_BIN.contains("ConfigurableEmbeddingHandler::new"),
+        "bin/server.rs no longer constructs the embedding handler; the job unseal-commit \
+         enqueues would go back to being a marker nothing drains"
+    );
+    assert!(
+        SERVER_BIN.contains("ClaimEmbeddingJobService::new"),
+        "bin/server.rs no longer installs the production EmbeddingJobService; the handler is \
+         generic and a different service would restore something else"
+    );
+    assert!(
+        SERVER_BIN.contains("may_restore_claim_embeddings"),
+        "the registration is no longer gated on the provider; an unconditional one would let a \
+         development-fallback embedder write the live vector column"
+    );
 }
 
 /// The preview's list and the mutation's list are the SAME set.

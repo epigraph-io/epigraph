@@ -197,9 +197,17 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     // so converting them changes no behaviour — they are registered so that a
     // future REQUEST-reachable caller is a visible diff here rather than a
     // silent widening.
+    // MEASURED CORRECTION, and the reason it is written here rather than left
+    // to the grouping above: `claim.rs::store_embedding` IS request-reachable.
+    // `PUT /api/v1/claims/:id` calls it with a caller-supplied vector, gated by
+    // `claims:write` plus owner-or-admin rather than by a write predicate. It is
+    // still listed — converting it is conversion-tail work, not this register's
+    // business — but the enclosing "unreachable from a request" sentence was
+    // never true of this entry, and a register that overstates its own contents
+    // is the thing this file exists to prevent.
     (
         "claim.rs::store_embedding",
-        "embedding backfill, corpus-wide",
+        "embedding backfill corpus-wide AND PUT /claims/:id; statement refuses sealed rows",
     ),
     ("claim_theme.rs::assign_claim", "clustering, corpus-wide"),
     (

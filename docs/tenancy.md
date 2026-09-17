@@ -585,7 +585,7 @@ a future change to any of these tables can be checked against it.
 | `claims.content` | → `'[sealed:x<id-without-hyphens>]'`; ciphertext to `claim_encryption.encrypted_content` | yes, from client plaintext |
 | `claims.content_hash` | → BLAKE3 over the **ciphertext** | yes, verified against the client plaintext |
 | `claims.content_tsv` | follows `content` — `GENERATED ALWAYS`, no code | yes, the same way |
-| `claims.embedding` | → `NULL` | via an enqueued `embedding_generation` job — a marker, not yet a restoration; see the gaps below |
+| `claims.embedding` | → `NULL` | via an enqueued `embedding_generation` job, which a registered handler drains — but only on an instance whose embedding provider owns this column; see the gaps below |
 | `claims.embedding_3072` | → `NULL` | **not restored** — see the gap below |
 | `claims.labels` | → `ARRAY[]::text[]`; ciphertext to `claim_encryption.encrypted_labels` | yes |
 | `claims.properties` | → `'{}'::jsonb`; ciphertext to `claim_encryption.encrypted_properties` | yes |
@@ -638,15 +638,22 @@ is deliberately not built.
 Unseal enqueues one `embedding_generation` job per restored **claim**. Three
 things that does not amount to:
 
-- **No handler drains that queue.** `crates/epigraph-api/src/bin/server.rs`
-  registers five job handlers and none of them is an embedding handler, so today
-  the enqueued job is a MARKER of what is owed rather than a restoration. The
-  actual recovery path after an unseal is `epigraph-cli reembed`. This is also
-  why the CLAUDE.md audit clause that hides an unseal-in-flight from
-  `live_missing` is bounded to 24 hours: without the bound an unsealed claim
-  would be hidden from the audit forever, and a non-zero count of
-  `embedding_generation` jobs older than the bound is itself the signal that a
-  handler is needed.
+- **The handler is registered CONDITIONALLY.** `crates/epigraph-api/src/bin/server.rs`
+  does register a handler for that job type, so the enqueued job is a
+  restoration rather than a marker — but only where the configured embedding
+  provider is the one that owns `claims.embedding`. Writing another provider's
+  vectors into that column would put two incompatible vector spaces in one ANN
+  column and degrade recall with no error, so an instance configured for any
+  other provider — including the development fallback — registers nothing and
+  its queue does not drain. `epigraph-cli reembed` remains the recovery path
+  there, and it never selects a sealed row.
+
+  This is also why the CLAUDE.md audit clause that hides an unseal-in-flight
+  from `live_missing` is still bounded to 24 hours: without the bound an
+  unsealed claim on such an instance would be hidden from the audit forever. A
+  non-zero count of `embedding_generation` jobs older than the bound now means
+  the instance's embedding provider is not the one that owns the column, which
+  is a deployment signal rather than a missing-code one.
 - **It does not name an evidence row.** The job payload carries a claim id and
   there is no evidence-shaped variant, so an unsealed evidence row keeps NULL
   vectors until a backfill reaches it.
