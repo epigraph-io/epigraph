@@ -1,4 +1,11 @@
-//! Source lint: no request handler may mint an unrestricted `Viewer`.
+//! Source lint: no request handler may reach an authority-free corpus-wide read.
+//!
+//! Two shapes of that, and the file has always been about the first. Minting an
+//! unrestricted `Viewer` is one; calling a named function that already performs
+//! such a read, with no viewer to spend, is the other. The heading said only
+//! "unrestricted `Viewer`" until `state::hydrate_webhook_store` was extracted
+//! out of `bin/server.rs::main`, which created the second shape in this crate
+//! for the first time — see the `BANNED` entry for it below.
 //!
 //! Plan §4.13. `Viewer::system` needs a `MaintenanceLease`, which only
 //! `epigraph-db` can construct, so a handler *cannot* build a `Bypass` viewer
@@ -36,6 +43,21 @@ const BANNED: &[(&str, &str)] = &[
          connection. A request handler runs on the application pool; a lease \
          reaching one means either the proof is being forged or an \
          application request is running with maintenance privileges.",
+    ),
+    (
+        "hydrate_webhook_store(",
+        "`state::hydrate_webhook_store` enumerates EVERY principal's webhook \
+         subscriptions and takes no `&Viewer`, which is correct for the one \
+         thing it is for — filling an empty cache once, at boot, from \
+         `bin/server.rs::main`. While it lived inside `main` that constraint \
+         was structural. As a `pub fn` on `epigraph_api::state` it is not, and \
+         no other control in the workspace can see such a call: the pool \
+         arrives as a parameter rather than as `state.db_pool`, so \
+         `no_unscoped_pool.rs`'s needle misses it, and it is not a repo \
+         function, so `visibility_lint.rs` does not scan it. A handler that \
+         calls it holds every tenant's delivery topology. Hydrate at boot; a \
+         handler that needs subscriptions reads the caller's own through \
+         `list_webhooks`.",
     ),
 ];
 
@@ -116,7 +138,8 @@ fn no_handler_or_tool_mints_a_bypass_viewer() {
 
     assert!(
         violations.is_empty(),
-        "\n\nRequest-serving code must not construct an unrestricted Viewer:\n\n{}\n",
+        "\n\nRequest-serving code must not construct an unrestricted Viewer, \
+         nor call a function that already reads corpus-wide without one:\n\n{}\n",
         violations.join("\n\n")
     );
 }
