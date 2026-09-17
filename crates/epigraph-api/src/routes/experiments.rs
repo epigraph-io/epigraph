@@ -13,8 +13,9 @@
 //! Conversion shard 6. `method_gap_analysis` is the only wholly-convertible
 //! handler here, and all three of its sites now run on one viewer-stamped
 //! connection from [`AppState::read_as`], reborrowed per statement inside its
-//! two nested loops. See the comment at the acquire for the connection-hold
-//! profile that creates.
+//! two nested loops. Holding one connection for a whole handler makes the work
+//! done on it a function of the request's input, so that input is bounded above
+//! the acquire — see [`MAX_REQUIRED_CAPABILITIES`].
 //!
 //! Of those three, TWO narrow — `MethodRepository::{get_evidence_strength,
 //! get_source_papers}` reach `claims` and `edges` and splice the viewer — and
@@ -87,6 +88,20 @@ pub struct MethodGapQuery {
     pub required_capabilities: Option<Vec<String>>,
     pub max_paper_age_years: Option<i32>,
 }
+
+/// Upper bound on `MethodGapQuery::required_capabilities`.
+///
+/// `method_gap_analysis` holds one pooled connection for the duration of its
+/// analysis (conversion shard 6), and the statements it issues on that
+/// connection scale with this list. An unbounded caller-supplied list and a
+/// held connection are a bad pair, so the list is bounded above the acquire —
+/// the same control `rag.rs::rag_context` applies to `limit` with `MAX_LIMIT`.
+///
+/// 32 rather than a smaller number: a gap analysis is a planning call over a
+/// hypothesis's capability set, and the largest such set anywhere in this
+/// workspace's fixtures or docs is single-digit, so 32 leaves an order of
+/// magnitude of headroom over any real use while still being a bound.
+pub const MAX_REQUIRED_CAPABILITIES: usize = 32;
 
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
@@ -426,6 +441,24 @@ pub async fn method_gap_analysis(
 
     let capabilities = params.required_capabilities.clone().unwrap_or_default();
 
+    // Bounded before the connection is acquired, deliberately in that order.
+    // This handler now holds one pooled connection for the duration of its
+    // analysis (see the acquire below), and the work it does on that connection
+    // is a function of this list's length. An input-shaped bound above the
+    // acquire is the same control `rag.rs::rag_context` applies to `limit` with
+    // `MAX_LIMIT`, and it is applied here for the same reason. Rejected
+    // alternative: truncating silently — a caller who asks for more than the
+    // bound gets a wrong answer rather than an error, and a gap analysis that
+    // quietly drops capabilities reports them as covered.
+    if capabilities.len() > MAX_REQUIRED_CAPABILITIES {
+        return Err(ApiError::ValidationError {
+            field: "required_capabilities".to_string(),
+            reason: format!(
+                "At most {MAX_REQUIRED_CAPABILITIES} capabilities may be analysed in one request"
+            ),
+        });
+    }
+
     if capabilities.is_empty() {
         return Ok(Json(serde_json::json!({
             "hypothesis_id": params.hypothesis_id,
@@ -452,9 +485,13 @@ pub async fn method_gap_analysis(
     //
     // CONNECTION-HOLD PROFILE, recorded because the conversion changes it: this
     // handler now holds one pooled connection for the duration of its analysis,
-    // where before each statement checked one out and returned it. Shard 5
-    // recorded a related item for `structural.rs::get_structural_features`.
-    // Nothing here changes what any caller can read.
+    // where before each statement checked one out and returned it. The
+    // work done on that connection scales with the request's input, so the input
+    // is bounded above, before the acquire. That bound is the FIX; it is stated
+    // here as mechanism and its characteristics are not analysed in this
+    // repository. Shard 5 recorded a related item for
+    // `structural.rs::get_structural_features`, which differs in that its round
+    // trips are a fixed number. Nothing here changes what any caller can read.
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
