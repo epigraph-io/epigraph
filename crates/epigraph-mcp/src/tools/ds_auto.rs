@@ -513,10 +513,23 @@ pub async fn auto_wire_ds_update(
     let (bel, pl, mut betp, conflict, missing) = compute_measures(&combined);
 
     // Monotonicity clamp: supports=true evidence must not lower pignistic_prob.
+    //
+    // Bounded by plausibility (backlog 0183a294). The prior is read from
+    // `claims.pignistic_prob`, which may itself be an inflated value left by an
+    // earlier write, so raising `betp` to it unconditionally persisted
+    // `pignistic_prob > plausibility` — a triple no mass function can represent,
+    // and one Postgres accepts because `claims_plausibility_bounds` is a [0,1]
+    // range check with no Bel <= BetP <= Pl ordering constraint.
+    //
+    // Where monotonicity and the DS bound conflict, the bound wins: a BetP above
+    // plausibility is not a weaker guarantee, it is an impossible one. Clamping
+    // to `prior.min(pl)` keeps 30bfbb19's intent wherever the prior is
+    // representable, and yields to `pl` only when it is not.
     if supports {
         if let Some(prior) = prior_betp {
-            if betp < prior {
-                betp = prior;
+            let bounded_prior = prior.min(pl);
+            if betp < bounded_prior {
+                betp = bounded_prior;
             }
         }
     }

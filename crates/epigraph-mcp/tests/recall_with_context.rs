@@ -19,6 +19,7 @@
 // the reverse. #[rustfmt::skip] keeps both happy by opting out of the sort.
 #[rustfmt::skip]
 use epigraph_mcp::tools::recall::{
+    EdgeDirection,
     __test_only::{assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population},
     NeighborPath,
 };
@@ -29,6 +30,10 @@ mod fixture {
     use super::*;
 
     pub struct Fixture {
+        /// The agent every fixture claim is authored by. Exposed so tests that
+        /// add their own claims reuse it — `seed_agent` pins a fixed public_key
+        /// and `agents_public_key_unique` rejects a second call.
+        pub agent_id: Uuid,
         #[allow(dead_code)]
         pub paper_a: Uuid,
         #[allow(dead_code)]
@@ -56,7 +61,7 @@ mod fixture {
         format!("[{}]", v.join(","))
     }
 
-    async fn seed_agent(pool: &PgPool) -> Uuid {
+    pub async fn seed_agent(pool: &PgPool) -> Uuid {
         let agent_id = Uuid::new_v4();
         sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2, 'hex'))")
             .bind(agent_id)
@@ -75,7 +80,7 @@ mod fixture {
         h
     }
 
-    async fn insert_claim(
+    pub async fn insert_claim(
         pool: &PgPool,
         agent_id: Uuid,
         id: Uuid,
@@ -113,7 +118,7 @@ mod fixture {
         }
     }
 
-    async fn insert_edge(
+    pub async fn insert_edge(
         pool: &PgPool,
         source_id: Uuid,
         source_type: &str,
@@ -368,6 +373,7 @@ mod fixture {
         .await;
 
         Fixture {
+            agent_id,
             paper_a,
             paper_b,
             section,
@@ -389,6 +395,7 @@ async fn truncation_flags_when_siblings_limit_below_total(pool: PgPool) {
         &[fx.paragraphs[0]],
         /*siblings_limit=*/ 2,
         /*corroborates_limit=*/ 4,
+        /*epistemic_limit=*/ 4,
     )
     .await
     .expect("fetch_batched_context");
@@ -413,7 +420,7 @@ async fn truncation_flags_when_siblings_limit_below_total(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn bridge_to_paragraphs_populated(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
         .await
         .expect("fetch_batched_context");
 
@@ -446,7 +453,7 @@ async fn bridge_to_paragraphs_populated(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn corroborates_includes_paper_doi(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
         .await
         .expect("fetch_batched_context");
 
@@ -466,7 +473,7 @@ async fn corroborates_appears_on_both_endpoints_when_both_in_result_set(pool: Pg
     let fx = fixture::build(&pool).await;
     // paragraphs[0] -[CORROBORATES]-> corroborates_target.
     // Pass BOTH as paragraph_ids so each should see the other in its list.
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0], fx.corroborates_target], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0], fx.corroborates_target], 8, 4, 4)
         .await
         .unwrap();
 
@@ -542,6 +549,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: None,
         max_themes: None,
@@ -569,7 +577,7 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_include_continues_argument(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
         .await
         .unwrap();
     let neighbors = ctx
@@ -590,7 +598,7 @@ async fn neighbor_paragraphs_include_continues_argument(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_include_atom_atom_bridge(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
         .await
         .unwrap();
     // shared_atom (paper A) -[same_as]-> paper_b_atom (paper B);
@@ -620,7 +628,7 @@ async fn neighbor_paragraphs_include_atom_atom_bridge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_dedupe_and_via_aggregation(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
         .await
         .unwrap();
 
@@ -715,7 +723,7 @@ async fn neighbor_paragraphs_dedupe_and_via_aggregation(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn neighbor_paragraphs_truncation_flag_when_over_limit(pool: PgPool) {
     let fx = fixture::build(&pool).await;
-    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4)
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
         .await
         .unwrap();
 
@@ -937,6 +945,7 @@ fn diverse_params_with_pool(
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: Some(diverse),
         max_themes,
@@ -1533,4 +1542,126 @@ async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
         ids.contains(&para),
         "the audit row records the paragraph ids actually returned"
     );
+}
+
+/// Regression guard for backlog claim 922a1e54.
+///
+/// `recall_with_context`'s structural context advertised epistemic-edge
+/// neighbours (the `EpistemicEdgeNeighbor` type and the
+/// `epistemic_edges_by_paragraph` field both shipped), but the field was bound
+/// with `let` rather than `let mut` and initialised to an empty map, so it was
+/// structurally incapable of ever being populated. A hit therefore arrived
+/// without the relationships that determine whether it should be believed.
+///
+/// Asserts BOTH directions, because direction carries the meaning: `refutes`
+/// read backwards is "is refuted by".
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_populated_in_both_directions(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let agent_id = fx.agent_id;
+
+    // Incoming: refuter --refutes--> paragraphs[0]
+    let refuter = Uuid::new_v4();
+    fixture::insert_claim(&pool, agent_id, refuter, "a refuting claim", 2, None).await;
+    fixture::insert_edge(
+        &pool,
+        refuter,
+        "claim",
+        fx.paragraphs[0],
+        "claim",
+        "refutes",
+        None,
+    )
+    .await;
+
+    // Outgoing: paragraphs[0] --supports--> supported
+    let supported = Uuid::new_v4();
+    fixture::insert_claim(&pool, agent_id, supported, "a supported claim", 2, None).await;
+    fixture::insert_edge(
+        &pool,
+        fx.paragraphs[0],
+        "claim",
+        supported,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+
+    let ctx = fetch_batched_context(&pool, &[fx.paragraphs[0]], 8, 4, 4)
+        .await
+        .expect("fetch_batched_context");
+
+    let edges = ctx
+        .epistemic_edges_by_paragraph
+        .get(&fx.paragraphs[0])
+        .unwrap_or_else(|| {
+            panic!(
+                "no epistemic edges for paragraph {} — the context payload never traverses \
+                 supports/refutes/contradicts/specializes/elaborates/cites (claim 922a1e54)",
+                fx.paragraphs[0]
+            )
+        });
+
+    let incoming = edges
+        .iter()
+        .find(|e| e.claim_id == refuter)
+        .expect("incoming refutes neighbour missing");
+    assert_eq!(incoming.relationship, "refutes");
+    assert!(
+        matches!(incoming.direction, EdgeDirection::Incoming),
+        "refuter is the edge SOURCE, so from the paragraph's view it is Incoming"
+    );
+
+    let outgoing = edges
+        .iter()
+        .find(|e| e.claim_id == supported)
+        .expect("outgoing supports neighbour missing");
+    assert_eq!(outgoing.relationship, "supports");
+    assert!(
+        matches!(outgoing.direction, EdgeDirection::Outgoing),
+        "paragraph is the edge SOURCE, so from the paragraph's view it is Outgoing"
+    );
+
+    assert_eq!(
+        ctx.epistemic_edges_total_by_paragraph
+            .get(&fx.paragraphs[0])
+            .copied(),
+        Some(2),
+        "total must count every epistemic neighbour, not just the returned page"
+    );
+}
+
+/// `decomposes_to` and `continues_argument` are structural, not epistemic, and
+/// are already carried by their own fields. Including them here would double-count
+/// the document skeleton as argument.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_exclude_structural_relationships(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+
+    // The fixture already wires decomposes_to and continues_argument on paragraphs[0].
+    let edges = ctx_edges(&pool, fx.paragraphs[0]).await;
+    for e in &edges {
+        assert!(
+            !matches!(
+                e.relationship.as_str(),
+                "decomposes_to" | "continues_argument"
+            ),
+            "structural relationship {} leaked into the epistemic-edge payload",
+            e.relationship
+        );
+    }
+}
+
+async fn ctx_edges(
+    pool: &PgPool,
+    paragraph: Uuid,
+) -> Vec<epigraph_mcp::tools::recall::EpistemicEdgeNeighbor> {
+    let ctx = fetch_batched_context(pool, &[paragraph], 8, 4, 4)
+        .await
+        .expect("fetch_batched_context");
+    ctx.epistemic_edges_by_paragraph
+        .get(&paragraph)
+        .cloned()
+        .unwrap_or_default()
 }
