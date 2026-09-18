@@ -14,15 +14,21 @@ It has no representation in the DS layer, so most of the corpus reads `no_bbas`.
 A bare scalar conflates "85% likely true" with "credible source, incomplete
 evidence". As a consonant (simple-support) BBA those separate cleanly:
 
-    m({TRUE}) = truth_value            what the source asserts
-    m(Theta)  = 1 - truth_value        "high but not 1.0" IS the ignorance mass
+    m({asserted}) = truth_value        what the source asserts, in THIS frame
+    m(Theta)      = 1 - truth_value    "high but not 1.0" IS the ignorance mass
+
+The unit of work is a (claim, frame) PAIR, not a claim. The same provenance
+confidence is a statement about the claim in each context it applies to, so a claim
+assigned to three frames gets three BBAs — one per context, each carrying that
+context's own hypothesis index and its own Theta.
 
 SAFETY POSTURE
 --------------
 * Dry-run by default. `--execute` is required to write anything.
-* `--frame-id` and `--perspective-id` are REQUIRED and have no defaults. Two frames
-  in this system both call themselves canonical, and picking wrong means re-running
-  a ~476k-row migration. See the plan's G3.
+* `--frame-ids` and `--perspective-id` are REQUIRED and have no defaults. A claim
+  legitimately holds different beliefs in different contexts — `claim_frames` is
+  keyed PRIMARY KEY (claim_id, frame_id) — so the operator names the contexts
+  explicitly rather than the script guessing one.
 * Refuses a perspective whose `source_reliability` IS NULL. 100+ auto-minted
   perspectives currently carry null, which makes lens re-weighting an identity
   function; migrating into one produces BBAs no lens can discriminate (plan G4).
@@ -53,7 +59,7 @@ USAGE
 -----
     # Phase 0 — census, writes nothing
     DATABASE_URL=postgres://... python3 scripts/migrate_provenance_bba.py \
-        --frame-id <uuid> --perspective-id <uuid> --source-agent-id <uuid>
+        --frame-ids <uuid> [<uuid> ...] --perspective-id <uuid> --source-agent-id <uuid>
 
     # Phase 2 — one batch
     ... --execute --limit 1000 --manifest /path/run1.jsonl
@@ -84,109 +90,139 @@ TELEMETRY_PREDICATE = """
 
 
 def eligible_sql(extra: str = "") -> str:
-    """Claims eligible for a synthesized provenance BBA.
+    """(claim, frame) PAIRS eligible for a synthesized provenance BBA.
+
+    The unit is a PAIR, not a claim: `claim_frames` is keyed
+    `PRIMARY KEY (claim_id, frame_id)` because a claim legitimately holds different
+    beliefs in different contexts, and a provenance prior is a statement about the
+    claim in each of them.
+
+    `hypothesis_index` comes from the claim's OWN assignment where one exists —
+    that is the index the framed `get_belief` path reads via
+    `FrameRepository::get_claim_assignment`, so writing mass against any other index
+    would produce a BBA the engine interprets as being about a different hypothesis.
+    Where no assignment exists it falls back to --default-hypothesis-index.
 
     Deliberately narrow:
       * is_current only — superseded claims must not gain new evidence.
       * truth_value NOT NULL — there is no provenance number to migrate otherwise.
-      * no existing BBA in the TARGET frame — real evidence outranks a prior.
-        Scoped to the target frame, not to all frames, so a claim assessed in some
-        unrelated paper frame still gets its provenance recorded here.
+      * no existing BBA for THAT (claim, frame) — real evidence outranks a prior,
+        per context. A claim assessed in one frame still gets provenance in another.
     """
     return f"""
-        SELECT c.id, c.truth_value, c.labels
+        SELECT c.id AS claim_id,
+               f.id AS frame_id,
+               f.name AS frame_name,
+               array_length(f.hypotheses, 1) AS n_hypotheses,
+               c.truth_value,
+               COALESCE(cf.hypothesis_index, %(default_idx)s) AS hypothesis_index,
+               (cf.claim_id IS NULL) AS needs_assignment
         FROM claims c
+        CROSS JOIN frames f
+        LEFT JOIN claim_frames cf ON cf.claim_id = c.id AND cf.frame_id = f.id
         WHERE c.is_current
           AND c.truth_value IS NOT NULL
+          AND f.id = ANY(%(frame_ids)s::uuid[])
           AND {TELEMETRY_PREDICATE}
           AND NOT EXISTS (
               SELECT 1 FROM mass_functions mf
-              WHERE mf.claim_id = c.id AND mf.frame_id = %(frame_id)s
+              WHERE mf.claim_id = c.id AND mf.frame_id = f.id
           )
-        ORDER BY c.id
+        ORDER BY c.id, f.id
         {extra}
     """
 
 
-def census(cur, frame_id: str) -> None:
-    """Phase 0. Read-only population sizing, printed before any write."""
+def census(cur, frame_ids: list, default_idx: int) -> None:
+    """Phase 0. Read-only population sizing, per frame, printed before any write."""
+    params = {"frame_ids": frame_ids, "default_idx": default_idx}
     cur.execute(
         f"""
         WITH eligible AS ({eligible_sql()})
-        SELECT
-            COUNT(*)                                             AS eligible,
-            COUNT(*) FILTER (WHERE truth_value = 0.85)           AS at_cap_085,
-            COUNT(*) FILTER (WHERE truth_value = 0.5)            AS raw_050,
-            COUNT(*) FILTER (WHERE truth_value > 0.85)           AS above_cap,
-            COUNT(*) FILTER (WHERE truth_value < 0.05)           AS near_zero,
-            MIN(truth_value)                                     AS min_tv,
-            MAX(truth_value)                                     AS max_tv
+        SELECT frame_name,
+               COUNT(*)                                     AS pairs,
+               COUNT(*) FILTER (WHERE needs_assignment)      AS would_assign,
+               COUNT(*) FILTER (WHERE truth_value = 0.85)    AS at_cap_085,
+               COUNT(*) FILTER (WHERE truth_value = 0.5)     AS raw_050,
+               COUNT(*) FILTER (WHERE truth_value > 0.85)    AS above_cap,
+               COUNT(DISTINCT hypothesis_index)              AS distinct_idx,
+               MIN(hypothesis_index)                         AS min_idx,
+               MAX(hypothesis_index)                         AS max_idx,
+               MAX(n_hypotheses)                             AS n_hyp
         FROM eligible
+        GROUP BY frame_name
+        ORDER BY frame_name
         """,
-        {"frame_id": frame_id},
+        params,
     )
-    row = cur.fetchone()
-
-    cur.execute(
-        """
-        SELECT COUNT(*) AS already_in_frame
-        FROM mass_functions WHERE frame_id = %(frame_id)s
-        """,
-        {"frame_id": frame_id},
-    )
-    already = cur.fetchone()["already_in_frame"]
-
-    cur.execute(
-        f"""
-        SELECT COUNT(*) AS no_truth_value FROM claims c
-        WHERE c.is_current AND c.truth_value IS NULL AND {TELEMETRY_PREDICATE}
-        """
-    )
-    no_tv = cur.fetchone()["no_truth_value"]
+    rows = cur.fetchall()
 
     print("=== Phase 0 census (nothing written) ===")
-    print(f"  eligible for migration      : {row['eligible']}")
-    print(f"    at the 0.85 provenance cap: {row['at_cap_085']}")
-    print(f"    at raw 0.5 (unscored)     : {row['raw_050']}")
-    print(f"    truth_value > 0.85        : {row['above_cap']}   <- NOT from calculate_initial_truth")
-    print(f"    truth_value < 0.05        : {row['near_zero']}   <- check these are genuinely refuted")
-    print(f"    range                     : {row['min_tv']} .. {row['max_tv']}")
-    print(f"  already have a BBA in frame : {already}  (skipped — real evidence wins)")
-    print(f"  is_current, truth_value NULL: {no_tv}  (no provenance number to migrate)")
+    if not rows:
+        print("  no eligible (claim, frame) pairs")
+        return
+    total = 0
+    for r in rows:
+        total += r["pairs"]
+        print(f"  frame {r['frame_name']} ({r['n_hyp']} hypotheses)")
+        print(f"    eligible pairs            : {r['pairs']}")
+        print(f"    would create a claim_frames row: {r['would_assign']}")
+        print(f"    at the 0.85 provenance cap: {r['at_cap_085']}")
+        print(f"    at raw 0.5 (unscored)     : {r['raw_050']}")
+        print(f"    truth_value > 0.85        : {r['above_cap']}   <- NOT from calculate_initial_truth")
+        print(f"    hypothesis_index          : {r['min_idx']}..{r['max_idx']} "
+              f"({r['distinct_idx']} distinct)")
+        if r["max_idx"] is not None and r["n_hyp"] is not None and r["max_idx"] >= r["n_hyp"]:
+            sys.exit(
+                f"FATAL: frame '{r['frame_name']}' has {r['n_hyp']} hypotheses but an eligible\n"
+                f"pair carries hypothesis_index {r['max_idx']}. Writing mass against an index the\n"
+                "frame does not define would produce a BBA no reader can interpret."
+            )
+    print(f"  TOTAL eligible pairs        : {total}")
+
+    cur.execute(
+        """
+        SELECT f.name, COUNT(mf.*) AS existing
+        FROM frames f LEFT JOIN mass_functions mf ON mf.frame_id = f.id
+        WHERE f.id = ANY(%(frame_ids)s::uuid[])
+        GROUP BY f.name ORDER BY f.name
+        """,
+        {"frame_ids": frame_ids},
+    )
+    for r in cur.fetchall():
+        print(f"  {r['name']}: {r['existing']} existing BBAs (those pairs are skipped)")
     print()
-    if row["above_cap"]:
-        print(
-            f"  NOTE: {row['above_cap']} claims exceed the 0.85 cap, so their value did NOT\n"
-            "        come from calculate_initial_truth. Confirm their origin before\n"
-            "        treating them as provenance."
-        )
 
 
-def validate_targets(
-    cur, frame_id: str, perspective_id: str, agent_id: str, evidence_type: str
-) -> dict:
+def validate_targets(cur, frame_ids: list, perspective_id: str, agent_id: str,
+                     evidence_type: str, default_idx: int) -> dict:
     """Fail loudly and early rather than writing into a misconfigured target."""
-    cur.execute("SELECT id, name, hypotheses FROM frames WHERE id = %s", (frame_id,))
-    frame = cur.fetchone()
-    if frame is None:
-        sys.exit(f"FATAL: frame {frame_id} does not exist. This script does not create frames.")
-    if len(frame["hypotheses"]) != 2:
+    cur.execute(
+        "SELECT id, name, hypotheses FROM frames WHERE id = ANY(%s::uuid[]) ORDER BY name",
+        (frame_ids,),
+    )
+    frames = cur.fetchall()
+    found = {str(f["id"]) for f in frames}
+    missing = [fid for fid in frame_ids if fid not in found]
+    if missing:
         sys.exit(
-            f"FATAL: frame '{frame['name']}' has {len(frame['hypotheses'])} hypotheses "
-            f"{frame['hypotheses']}. A provenance prior is binary — the source asserts the\n"
-            "claim or it does not. Mapping it onto a 3-hypothesis frame requires inventing a\n"
-            "position on the third that no source ever took. See plan G3."
+            f"FATAL: frame(s) do not exist: {missing}. This script does not create frames."
         )
+    for f in frames:
+        # NOT a binary-only check. A provenance prior is expressible in any frame:
+        # m({asserted}) = tv and m(Theta) = 1 - tv, where Theta is the full
+        # hypothesis set. What must hold is that the asserted index EXISTS.
+        if default_idx >= len(f["hypotheses"]):
+            sys.exit(
+                f"FATAL: --default-hypothesis-index {default_idx} is out of range for frame\n"
+                f"'{f['name']}', which defines {len(f['hypotheses'])} hypotheses "
+                f"{f['hypotheses']}."
+            )
 
-    # `source_reliability` is NOT a column. It lives in `properties` as a MAP of
-    # evidence-type tag -> alpha, read by PerspectiveRow::source_reliability via
-    # `properties->'source_reliability'`. The MCP list_perspectives response
-    # surfaces it as a field, which is why it reads as a plain null there.
     cur.execute(
         """
         SELECT id, name,
-               properties->'source_reliability' AS source_reliability,
-               properties->'locality_reliability' AS locality_reliability
+               properties->'source_reliability' AS source_reliability
         FROM perspectives WHERE id = %s
         """,
         (perspective_id,),
@@ -219,12 +255,17 @@ def validate_targets(
     if cur.fetchone() is None:
         sys.exit(f"FATAL: source agent {agent_id} does not exist.")
 
-    return {"frame": frame, "perspective": persp}
+    return {"frames": frames, "perspective": persp}
+
+
+def theta_key(n_hypotheses: int) -> str:
+    """Theta (the full hypothesis set) as a mass key: "0,1" binary, "0,1,2" ternary."""
+    return ",".join(str(i) for i in range(n_hypotheses))
 
 
 def migrate(cur, args, manifest) -> int:
     extra = ""
-    params = {"frame_id": args.frame_id}
+    params = {"frame_ids": args.frame_ids, "default_idx": args.default_hypothesis_index}
     if args.limit is not None:
         extra += " LIMIT %(limit)s"
         params["limit"] = args.limit
@@ -234,18 +275,41 @@ def migrate(cur, args, manifest) -> int:
 
     cur.execute(eligible_sql(extra), params)
     rows = cur.fetchall()
-    print(f"selected {len(rows)} claims (limit={args.limit} offset={args.offset})")
+    print(f"selected {len(rows)} (claim, frame) pairs "
+          f"(limit={args.limit} offset={args.offset})")
 
     written = 0
     for r in rows:
         tv = float(r["truth_value"])
-        # Consonant simple-support BBA. m(Theta) carries the residual, so a source
-        # is never certain: the 0.85 cap becomes an ignorance FLOOR of 0.15.
-        masses = {"0": round(tv, 12), "0,1": round(1.0 - tv, 12)}
+        idx = int(r["hypothesis_index"])
+        n_hyp = int(r["n_hypotheses"])
+        if idx >= n_hyp:
+            sys.exit(
+                f"FATAL: claim {r['claim_id']} is assigned hypothesis_index {idx} in frame\n"
+                f"'{r['frame_name']}', which defines only {n_hyp} hypotheses. Refusing to write\n"
+                "mass against an index the frame does not define."
+            )
+        # m({asserted}) = tv, m(Theta) = 1 - tv. Generalizes to any arity: Theta is the
+        # full hypothesis set, so the residual stays ignorance rather than being
+        # spread across the other hypotheses as if the source had an opinion on them.
+        masses = {str(idx): round(tv, 12), theta_key(n_hyp): round(1.0 - tv, 12)}
 
         if not args.execute:
             written += 1
             continue
+
+        # Record the claim's position in this context if it has none. The framed
+        # read resolves hypothesis_index via get_claim_assignment, so a BBA without
+        # an assignment would be interpreted against index 0 regardless of intent.
+        cur.execute(
+            """
+            INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+            VALUES (%(claim)s, %(frame)s, %(idx)s)
+            ON CONFLICT (claim_id, frame_id) DO NOTHING
+            """,
+            {"claim": r["claim_id"], "frame": r["frame_id"], "idx": idx},
+        )
+        created_assignment = cur.rowcount == 1
 
         cur.execute(
             """
@@ -260,8 +324,8 @@ def migrate(cur, args, manifest) -> int:
             RETURNING id
             """,
             {
-                "claim": r["id"],
-                "frame": args.frame_id,
+                "claim": r["claim_id"],
+                "frame": r["frame_id"],
                 "agent": args.source_agent_id,
                 "persp": args.perspective_id,
                 "masses": json.dumps(masses),
@@ -280,8 +344,11 @@ def migrate(cur, args, manifest) -> int:
             json.dumps(
                 {
                     "mass_function_id": str(got["id"]),
-                    "claim_id": str(r["id"]),
-                    "frame_id": args.frame_id,
+                    "claim_id": str(r["claim_id"]),
+                    "frame_id": str(r["frame_id"]),
+                    "frame_name": r["frame_name"],
+                    "hypothesis_index": idx,
+                    "created_assignment": created_assignment,
                     "prior_truth_value": tv,
                     "masses": masses,
                     "marker": MARKER,
@@ -297,14 +364,23 @@ def migrate(cur, args, manifest) -> int:
 
 
 def rollback(cur, args, manifest_path: str) -> int:
-    """Delete exactly the rows this migration inserted, by manifest id."""
-    ids = []
+    """Delete exactly what this migration inserted, by manifest id."""
+    entries = []
     with open(manifest_path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line:
-                ids.append(json.loads(line)["mass_function_id"])
-    print(f"manifest lists {len(ids)} inserted rows")
+                entries.append(json.loads(line))
+    ids = [e["mass_function_id"] for e in entries]
+    # Only assignments THIS migration created. A pre-existing claim_frames row is
+    # not ours to remove — another writer's belief may depend on it.
+    assignments = [
+        (e["claim_id"], e["frame_id"])
+        for e in entries
+        if e.get("created_assignment")
+    ]
+    print(f"manifest lists {len(ids)} inserted BBAs and "
+          f"{len(assignments)} claim_frames rows this migration created")
 
     if not args.execute:
         cur.execute(
@@ -312,7 +388,8 @@ def rollback(cur, args, manifest_path: str) -> int:
             "WHERE id = ANY(%s::uuid[]) AND combination_method = %s",
             (ids, MARKER),
         )
-        print(f"would delete {cur.fetchone()['n']} rows (dry-run)")
+        print(f"would delete {cur.fetchone()['n']} BBAs "
+              f"and {len(assignments)} assignments (dry-run)")
         return 0
 
     # The marker predicate is belt-and-braces: even a corrupted manifest cannot
@@ -323,12 +400,27 @@ def rollback(cur, args, manifest_path: str) -> int:
         (ids, MARKER),
     )
     deleted = cur.rowcount
-    print(f"deleted {deleted} rows")
+    print(f"deleted {deleted} BBAs")
     if deleted != len(ids):
         print(
             f"  NOTE: {len(ids) - deleted} manifest rows were already absent — expected if a\n"
             "  previous rollback ran, or if the insert was rolled back before commit."
         )
+
+    dropped = 0
+    for claim_id, frame_id in assignments:
+        # Re-check emptiness: another writer may have added a BBA in this context
+        # since the migration ran, in which case the assignment is now load-bearing.
+        cur.execute(
+            "DELETE FROM claim_frames cf WHERE cf.claim_id = %s AND cf.frame_id = %s "
+            "AND NOT EXISTS (SELECT 1 FROM mass_functions mf "
+            "                WHERE mf.claim_id = cf.claim_id AND mf.frame_id = cf.frame_id)",
+            (claim_id, frame_id),
+        )
+        dropped += cur.rowcount
+    print(f"dropped {dropped}/{len(assignments)} claim_frames rows "
+          f"(kept any that another writer's BBA now depends on)")
+
     print(
         "\n  Cached claims.{belief,plausibility,pignistic_prob,...} are NOT restored by\n"
         "  this rollback. If Phase 3 (recompute_beliefs) has run, the scalars reflect the\n"
@@ -340,7 +432,21 @@ def rollback(cur, args, manifest_path: str) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     p.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
-    p.add_argument("--frame-id", help="REQUIRED for migrate. Binary frame. No default — see plan G3.")
+    p.add_argument(
+        "--frame-ids",
+        nargs="+",
+        metavar="UUID",
+        help="REQUIRED for migrate. One or more contexts. No default: a claim holds "
+        "different beliefs in different frames, so the operator names them.",
+    )
+    p.add_argument(
+        "--default-hypothesis-index",
+        type=int,
+        default=0,
+        help="Index asserted when the claim has no claim_frames row for that frame. "
+        "Where an assignment EXISTS its recorded index wins, because that is what "
+        "the framed read resolves.",
+    )
     p.add_argument("--perspective-id", help="REQUIRED for migrate. Must have non-null source_reliability.")
     p.add_argument("--source-agent-id", help="REQUIRED for migrate. Agent credited as the BBA source.")
     p.add_argument("--source-strength", type=float, default=0.7)
@@ -356,11 +462,12 @@ def main() -> None:
         sys.exit("FATAL: set DATABASE_URL or pass --database-url")
     if args.execute and not args.manifest:
         sys.exit("FATAL: --execute requires --manifest. An unjournalled write is not reversible.")
-    if not args.rollback and not (args.frame_id and args.perspective_id and args.source_agent_id):
+    if not args.rollback and not (args.frame_ids and args.perspective_id and args.source_agent_id):
         sys.exit(
-            "FATAL: --frame-id, --perspective-id and --source-agent-id are all required.\n"
-            "None has a default on purpose: two frames in this system both call themselves\n"
-            "canonical, and choosing wrong means re-running a ~476k-row migration."
+            "FATAL: --frame-ids, --perspective-id and --source-agent-id are all required.\n"
+            "None has a default on purpose: a claim legitimately holds different beliefs in\n"
+            "different contexts (claim_frames is PK (claim_id, frame_id)), so which contexts\n"
+            "receive a provenance prior is an operator decision, not a script default."
         )
 
     conn = psycopg2.connect(args.database_url)
@@ -379,15 +486,16 @@ def main() -> None:
             rollback(cur, args, args.manifest)
         else:
             meta = validate_targets(
-                cur, args.frame_id, args.perspective_id,
-                args.source_agent_id, args.evidence_type,
+                cur, args.frame_ids, args.perspective_id, args.source_agent_id,
+                args.evidence_type, args.default_hypothesis_index,
             )
-            print(f"frame      : {meta['frame']['name']} {meta['frame']['hypotheses']}")
+            for f in meta["frames"]:
+                print(f"frame      : {f['name']} {f['hypotheses']}")
             print(f"perspective: {meta['perspective']['name']} "
                   f"(alpha[{args.evidence_type}]="
                   f"{meta['perspective']['source_reliability'][args.evidence_type]})")
             print()
-            census(cur, args.frame_id)
+            census(cur, args.frame_ids, args.default_hypothesis_index)
             if args.limit is None and args.execute:
                 sys.exit(
                     "FATAL: refusing an unbounded --execute. Run in batches with --limit so the\n"

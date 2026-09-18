@@ -48,7 +48,7 @@ Migrating provenance into a BBA buys four things:
 |---|------|-----|--------|
 | G1 | `0183a294` deployed (BetP bounds) | The lens writes BetP into `truth_value` corpus-wide. An out-of-bounds BetP would be persisted for 476k claims. | merged in PR #462, **NOT deployed** |
 | G2 | `696d3a1c` deployed (one frame owns the cache) | Until it lands, ANY recompute over a multi-frame claim reverts edge-derived belief. This migration CREATES a second frame for many claims, so running it first would *widen* that bug's blast radius. | fixed in `51780ce4`, **NOT merged, NOT deployed** |
-| G3 | Frame choice ratified (see below) | Two frames both call themselves canonical. Picking wrong means re-running a 476k-row migration. | **OPEN — needs a decision** |
+| G3 | ~~Frame choice ratified~~ | DISSOLVED 2026-09-18 — multi-frame is intended, so the unit is a (claim, frame) pair and the operator names contexts via `--frame-ids`. | **closed** |
 | G4 | Perspective library exists with non-null `source_reliability` | 100+ perspectives currently exist, every one with `source_reliability: null`, auto-minted per call. A null reliability makes the lens re-weighting a no-op, so migrating into it produces BBAs that no lens can discriminate. | **OPEN** |
 | G5 | Dry-run reviewed on prod-sized counts | Population sizing must be read before writing, not after. | pending |
 | G6 | Rehearsed on a restored snapshot | 476k rows; the rollback path must be exercised, not assumed. | pending |
@@ -59,33 +59,41 @@ migration gives previously single-frame claims a second frame. Before `51780ce4`
 alphabetically last win — and `binary_truth` sorts first. Running this migration
 on an unfixed deployment converts a latent bug into a corpus-wide one.
 
-## G3 — the frame decision (needs ratification)
+## G3 — DISSOLVED (2026-09-18)
 
-Two frames both describe themselves as canonical:
+This gate asked "which ONE frame gets the provenance BBA." Under multi-frame that
+question is malformed, and the schema already said so: `claim_frames` is keyed
+`PRIMARY KEY (claim_id, frame_id)`, and 3 claims in the corpus already carry more
+than one frame.
 
-| Frame | Hypotheses | Role |
-|---|---|---|
-| `binary_truth` | `{TRUE, FALSE}` | Owns `claims.{belief,plausibility,pignistic_prob,...}` after `51780ce4`. Written by the edge-wiring path (`auto_wire_ds_for_edge`). What unframed `get_belief` serves. |
-| `claim_validity` | `{supported, refuted, uncertain}` | Frame description: "Canonical shared frame of discernment for claim validity assessment across all workflows." Where `submit_ds_evidence` workflows write. |
+A claim applies in many contexts, and a provenance prior is a statement about the
+claim *in each of them*. So the unit of work is a **(claim, frame) pair**, not a
+claim, and the operator names the contexts via `--frame-ids`.
 
-**Recommendation: `binary_truth`.** Three reasons:
+Three consequences, all now implemented:
 
-1. It owns the cache, so a provenance BBA there is immediately visible through the
-   existing unframed read path with no further wiring.
-2. A provenance prior is genuinely binary — the source asserts the claim or it does
-   not. Mapping it onto `{supported, refuted, uncertain}` requires inventing a
-   position on `uncertain` that no source ever took.
-3. `claim_validity` has three hypotheses, so its vacuous prior is 0.333. Any claim
-   this migration skips would read 0.333 there rather than "no opinion", which is
-   exactly the failure mode the lens fallback rule exists to prevent.
+1. **The binary-only guard was wrong and is gone.** It refused any frame with
+   `len(hypotheses) != 2`, justified as "mapping onto three hypotheses requires
+   inventing a position on the third." That reasoning was incorrect — Θ *is* that
+   position. `m({asserted}) = tv, m(Θ) = 1 - tv` generalizes to any arity, with Θ
+   the full hypothesis set, so the residual stays ignorance rather than being spread
+   across the other hypotheses as if the source had an opinion on them. Verified:
+   a 2-hypothesis frame yields `{"0": 0.5, "0,1": 0.5}` and a 3-hypothesis frame
+   `{"0": 0.5, "0,1,2": 0.5}`.
 
-**Counter-argument to weigh:** workflows already submit to `claim_validity`, so
-provenance in `binary_truth` means the two evidence populations live in different
-frames and never combine. If the long-term intent is one frame, that is an argument
-for consolidating FIRST and migrating SECOND.
+   What replaced it is the check that actually matters: the asserted index must
+   EXIST in the frame. Writing mass against an index the frame does not define
+   produces a BBA no reader can interpret.
 
-The script takes `--frame` explicitly and has no default, so this cannot be decided
-by accident.
+2. **The hypothesis index is read from the claim's own assignment.**
+   `claim_frames.hypothesis_index` is what the framed `get_belief` path resolves via
+   `FrameRepository::get_claim_assignment`. Writing mass against any other index
+   would produce a BBA the engine interprets as being about a different hypothesis.
+   `--default-hypothesis-index` applies only where no assignment exists.
+
+3. **The migration may create `claim_frames` rows**, and the rollback removes them —
+   but only those it created, and only where no other writer's BBA has since come to
+   depend on the assignment. Verified by constructing that race.
 
 ## G4 — the perspective problem
 
