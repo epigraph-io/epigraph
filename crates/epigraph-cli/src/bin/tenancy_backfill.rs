@@ -834,9 +834,21 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 ///
 /// # Why 086's function is checked by THIS gate and not by a new one (PR-24)
 ///
-/// `epigraph_claim_tenancy_by_ids` is what
-/// `epigraph-db`'s `ClaimRepository::hidden_claim_ids` reads `claims` through,
-/// and it reaches `claims` only because `claims_tenancy`'s
+/// `epigraph_claim_tenancy_by_ids` is what `epigraph-db`'s
+/// `ClaimRepository::hidden_claim_ids` **and `EventRepository::list` (both
+/// arms)** read `claims` through — the stake is TWO repo functions, not one,
+/// and the wider set is what an operator needs when deciding how load-bearing a
+/// skipped or failing entry is. Between them they back five read surfaces: the
+/// in-process half of `GET /api/v1/events` and the webhook fan-out (both
+/// through `hidden_claim_ids`), and the persisted half of `GET /api/v1/events`,
+/// `GET /api/v1/graph/snapshot/:version` and all of MCP `list_events` (through
+/// `EventRepository::list`). Only the first two have a Rust-side backstop; the
+/// other three are filtered in SQL by this function alone — and that filter
+/// classifies `claims` rows only, so a payload naming a row in another tenanted
+/// table is not classified at all
+/// (`F-PR25-event-suppression-is-claims-keyed-only`). Read the three as a
+/// statement about AUTHORITY, not COVERAGE. It reaches `claims` only because
+/// `claims_tenancy`'s
 /// `OR (SELECT public.epigraph_definer_bypass())` disjunct admits a frame whose
 /// `current_user` is a member of `epigraph_maintenance`. If the guarded
 /// `ALTER FUNCTION ... OWNER TO` in 086 silently no-ops — which is exactly what
@@ -1067,7 +1079,15 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
 ///   FEWER rows with no error, and `ClaimRepository::hidden_claim_ids` — which
 ///   decides what `GET /api/v1/events` and the webhook fan-out suppress —
 ///   degrades back toward reporting nothing hidden. Same silent shape as 070's,
-///   on a read path.
+///   on a read path. **And the stake is wider than that one function**: as of
+///   PR-25 `EventRepository::list` reads both of its arms through the same
+///   body, so the degradation also reaches the persisted half of
+///   `GET /api/v1/events`, `GET /api/v1/graph/snapshot/:version` and MCP
+///   `list_events` — three surfaces with no Rust-side backstop, where this
+///   function is the sole filter. Sole filter, not total coverage: the
+///   predicate classifies `claims` rows only, and that scope limit is ledgered
+///   separately as `F-PR25-event-suppression-is-claims-keyed-only` and
+///   documented at `EventRepository::list` itself.
 ///
 /// A hard failure inside the migration is the wrong instrument (a failed
 /// migration records no row, so a missing role becomes a permanent restart
