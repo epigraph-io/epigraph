@@ -114,9 +114,18 @@ async fn discover_to_snapshot() {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
-    let pkg_path = std::env::var("DISCOVERY_IN").expect("set DISCOVERY_IN");
-    let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
-    let out = std::env::var("SNAPSHOT_OUT").expect("set SNAPSHOT_OUT");
+    let Ok(pkg_path) = std::env::var("DISCOVERY_IN") else {
+        eprintln!("SKIP: DISCOVERY_IN not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(dir) = std::env::var("SEED_DIR") else {
+        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(out) = std::env::var("SNAPSHOT_OUT") else {
+        eprintln!("SKIP: SNAPSHOT_OUT not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 

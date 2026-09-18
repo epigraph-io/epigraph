@@ -432,7 +432,7 @@ impl Default for PropagationOrchestrator {
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```text
 /// let orchestrator = ConcurrentOrchestrator::new();
 ///
 /// // Clone for use in another thread
@@ -525,7 +525,7 @@ impl Default for PropagationConfig {
 ///
 /// # Usage Pattern
 ///
-/// ```ignore
+/// ```text
 /// // After claim is persisted to database
 /// let propagator = DatabasePropagator::new(pool.clone(), config);
 /// let result = propagator.propagate_from(claim_id).await?;

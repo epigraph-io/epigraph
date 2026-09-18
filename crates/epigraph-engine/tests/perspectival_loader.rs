@@ -108,7 +108,10 @@ async fn load_and_validate_open_world() {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
-    let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
+    let Ok(dir) = std::env::var("SEED_DIR") else {
+        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 
