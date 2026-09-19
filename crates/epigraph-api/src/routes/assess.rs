@@ -324,11 +324,14 @@ pub async fn assess_claim(
     epigraph_db::MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        final_bel,
-        final_pl,
-        m_empty,
-        Some(final_betp),
-        m_missing,
+        epigraph_db::CachedBelief {
+            belief: final_bel,
+            plausibility: final_pl,
+            mass_on_empty: m_empty,
+            pignistic_prob: Some(final_betp),
+            mass_on_missing: m_missing,
+            belief_frame_id: None,
+        },
     )
     .await?;
 

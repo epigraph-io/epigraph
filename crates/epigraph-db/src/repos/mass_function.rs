@@ -44,6 +44,26 @@ pub struct MassFunctionRow {
 /// Repository for mass function (BBA) operations
 pub struct MassFunctionRepository;
 
+/// The cached Dempster-Shafer summary denormalized onto `claims`.
+///
+/// These six values are one logical unit — a single frame's combined belief — and
+/// are always written together, so they travel as one value rather than six
+/// positional floats.
+///
+/// `belief_frame_id` names the frame the other five summarize (backlog 696d3a1c,
+/// migration 092). `claim_frames` is keyed `PRIMARY KEY (claim_id, frame_id)`, so a
+/// claim legitimately holds different beliefs in different contexts; without this
+/// field the cached number is an anonymous one-of-N that reads as authoritative.
+#[derive(Debug, Clone, Copy)]
+pub struct CachedBelief {
+    pub belief: f64,
+    pub plausibility: f64,
+    pub mass_on_empty: f64,
+    pub pignistic_prob: Option<f64>,
+    pub mass_on_missing: f64,
+    pub belief_frame_id: Option<Uuid>,
+}
+
 impl MassFunctionRepository {
     /// Store a mass function for a (claim, frame, agent, perspective) tuple
     ///
@@ -460,11 +480,7 @@ impl MassFunctionRepository {
     pub async fn update_claim_belief(
         pool: &PgPool,
         claim_id: Uuid,
-        belief: f64,
-        plausibility: f64,
-        mass_on_empty: f64,
-        pignistic_prob: Option<f64>,
-        mass_on_missing: f64,
+        cached: CachedBelief,
     ) -> Result<(), DbError> {
         // claims_{belief,plausibility,mass_empty}_bounds — see helper at
         // epigraph_ds::measures::clamp_claim_belief_measures.
@@ -472,18 +488,18 @@ impl MassFunctionRepository {
         // this function's parameter order differs, so arguments are threaded explicitly.
         let (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing) =
             epigraph_ds::measures::clamp_claim_belief_measures(
-                belief,
-                plausibility,
-                pignistic_prob,
-                mass_on_empty,
-                mass_on_missing,
+                cached.belief,
+                cached.plausibility,
+                cached.pignistic_prob,
+                cached.mass_on_empty,
+                cached.mass_on_missing,
             );
 
         sqlx::query(
             r#"
             UPDATE claims
             SET belief = $1, plausibility = $2, mass_on_empty = $3,
-                pignistic_prob = $4, mass_on_missing = $5,
+                pignistic_prob = $4, mass_on_missing = $5, belief_frame_id = $7,
                 updated_at = NOW()
             WHERE id = $6
             "#,
@@ -494,6 +510,7 @@ impl MassFunctionRepository {
         .bind(pignistic_prob)
         .bind(mass_on_missing)
         .bind(claim_id)
+        .bind(cached.belief_frame_id)
         .execute(pool)
         .await?;
 
@@ -1090,11 +1107,18 @@ mod tests {
         MassFunctionRepository::update_claim_belief(
             &pool,
             claim_id,
-            0.7,                  // belief
-            drifted_plausibility, // plausibility (drift; expect clamp to 1.0)
-            0.1,                  // mass_on_empty
-            Some(0.6),            // pignistic_prob
-            0.05,                 // mass_on_missing
+            CachedBelief {
+            belief: 0.7,
+            plausibility: // belief
+            drifted_plausibility,
+            mass_on_empty: // plausibility (drift; expect clamp to 1.0)
+            0.1,
+            pignistic_prob: // mass_on_empty
+            Some(0.6),
+            mass_on_missing: // pignistic_prob
+            0.05,
+            belief_frame_id: None,
+        },
         )
         .await
         .expect("update_claim_belief must succeed for in-range / drifted inputs");

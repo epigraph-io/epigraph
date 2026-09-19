@@ -120,24 +120,27 @@ pub async fn recompute_beliefs(
             claims_skipped_no_bba += 1;
             continue;
         }
+        // Exactly ONE frame owns the shared claims.* cache (backlog 696d3a1c).
+        // Looping over every frame here wrote that cache once per frame and let
+        // the alphabetically last one win, silently reverting edge-derived
+        // belief. `frame_writes` is consequently now at most 1 per claim.
+        let owner_frame = frames
+            .iter()
+            .map(|(id, _)| *id)
+            .next()
+            .expect("frames is non-empty: checked above");
         let mut wrote_any = false;
-        for (frame_id, _name) in frames {
-            match epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-                pool, claim_id, frame_id,
-            )
-            .await
-            {
-                Ok(true) => {
-                    frame_writes += 1;
-                    wrote_any = true;
-                }
-                Ok(false) => {}
-                Err(e) => errors.push(RecomputeError {
-                    claim_id: claim_id.to_string(),
-                    frame_id: frame_id.to_string(),
-                    error: e,
-                }),
+        match epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, claim_id).await {
+            Ok(true) => {
+                frame_writes += 1;
+                wrote_any = true;
             }
+            Ok(false) => {}
+            Err(e) => errors.push(RecomputeError {
+                claim_id: claim_id.to_string(),
+                frame_id: owner_frame.to_string(),
+                error: e,
+            }),
         }
         if wrote_any {
             claims_recomputed += 1;

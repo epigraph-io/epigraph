@@ -36,10 +36,18 @@ fn make_server(pool: PgPool) -> EpiGraphMcpFull {
 #[tokio::test]
 #[ignore = "operator-driven: needs INGEST_TARGET_DB + EXTRACTION_PATH"]
 async fn ingest_extraction_into_target_db() {
-    let db = std::env::var("INGEST_TARGET_DB")
-        .expect("set INGEST_TARGET_DB to the target graph connection string");
-    let path = std::env::var("EXTRACTION_PATH")
-        .expect("set EXTRACTION_PATH to the DocumentExtraction JSON file");
+    let Ok(db) = std::env::var("INGEST_TARGET_DB") else {
+        eprintln!(
+            "SKIP: INGEST_TARGET_DB not set — this is a dev ingest harness, not a regression test"
+        );
+        return;
+    };
+    let Ok(path) = std::env::var("EXTRACTION_PATH") else {
+        eprintln!(
+            "SKIP: EXTRACTION_PATH not set — this is a dev ingest harness, not a regression test"
+        );
+        return;
+    };
 
     let pool = PgPool::connect(&db).await.expect("connect to target DB");
     // Bring the chosen DB up to the repo schema; idempotent on an already-migrated DB.
