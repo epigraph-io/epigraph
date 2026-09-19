@@ -707,6 +707,43 @@ raise rather than a workload increase — but a cron fleet running several of
 these concurrently against production Postgres now has a higher ceiling than it
 did.
 
+**The two recompute binaries fan out differently as of the structural-bypass
+batch, and the cap-of-11 reasoning above is re-stated rather than assumed.**
+`epigraph-recompute-belief` (`recompute_claim_belief`) and `recompute_betp`
+previously spawned `--concurrency` tokio TASKS, each holding its own copy of the
+maintenance viewer. They now drive `--concurrency` concurrent FUTURES on a
+single task (`buffer_unordered`), borrowing the one viewer the maintenance
+session owns. Two consequences an operator should know:
+
+* **Connection demand is unchanged, so the cap of 11 still means what it meant:**
+  at most `--concurrency` claims are in flight at once, plus the one connection
+  the lease pins. `--concurrency 10` remains the value that exactly saturates
+  the cap. Nothing about pool sizing needs to move.
+* **Parallelism is not unchanged.** The per-claim work is dominated by database
+  round trips, which interleave on one task exactly as they did across several;
+  but any CPU-bound stretch of the Dempster–Shafer math now serialises against
+  its peers instead of occupying several runtime worker threads. Expect
+  comparable wall-clock on an IO-bound cohort and a longer run on a
+  compute-heavy one. **This is not covered by any test** — `run_for_real` and
+  `run` live inside their binaries, where Cargo integration tests cannot reach
+  them — so a regression here surfaces as run duration, not as a red build.
+* **A PANIC inside one claim now stops the run.** The old shape joined its
+  tasks with `let _ = h.await;`, which discarded the `JoinError` a panicking
+  task produced: the process carried on and that claim was silently left out of
+  the totals. A future that panics propagates instead, so the binary aborts and
+  says so. Ordinary per-claim FAILURES are unaffected — they were counted into
+  `errors` and printed before, and still are, and the exit-2-on-errors
+  behaviour is unchanged. This one is a deliberate trade: a maintenance binary
+  that under-counts silently is worse than one that stops, and the old
+  behaviour was an artefact of the join, not a decision. **And it stops more
+  than the one claim:** the panic unwinds through the combinator, so the up to
+  `--concurrency − 1` sibling futures sitting in the buffer are dropped at their
+  await points, and one that had begun a per-frame write but not committed it
+  simply stops. So a handful of claims beyond the panicking one can be left
+  partially recomputed. Under the old shape the siblings were independent tasks
+  and ran to completion. Both binaries are idempotent and re-runnable, so the
+  remedy is a re-run; nothing needs unpicking by hand.
+
 **The Python half warns about none of this.** `scripts/maintenance_dsn.py`
 mirrors the precedence and the database-name refusal, and deliberately does
 **not** assert privilege — these are operator one-shots, and a second

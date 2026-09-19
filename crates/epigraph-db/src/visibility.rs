@@ -174,7 +174,22 @@ const VISIBILITY_MARKER_SUFFIX: &str = "} */";
 /// Read authority for one principal, for one request.
 ///
 /// See the [module documentation](self) for the invariants this type enforces.
-#[derive(Clone, Debug)]
+///
+/// # Deliberately NOT `Clone`
+///
+/// A blanket `Clone` made an owned `Viewer` derivable from any `&Viewer`, and
+/// method resolution on a `&Viewer` receiver picks `Viewer::clone` rather than
+/// the `&T: Clone` impl. That is how an unrestricted viewer could be lifted out
+/// of the [`crate::MaintenanceSession`] that owns its privileged connection and
+/// outlive it — the residual
+/// `D-PR17-maintenance-lease-coupling-is-a-convention` named rather than fixed.
+///
+/// Dropping the derive removes the whole family at once: there is no total
+/// function from `&Viewer` to `Viewer`. The one duplication callers legitimately
+/// need — an owned copy of a REQUEST's own read authority, for a task that
+/// outlives the request — is [`Viewer::detach_scoped`], which is partial and
+/// cannot return an unrestricted viewer whatever it is given.
+#[derive(Debug)]
 pub struct Viewer {
     shape: ViewerShape,
 }
@@ -183,7 +198,18 @@ pub struct Viewer {
 ///
 /// Private on purpose: adding a shape must be a change to this file, which is
 /// the file `no_anonymous_viewer.rs` watches.
-#[derive(Clone, Debug)]
+///
+/// NOT `Clone`, for the same reason [`Viewer`] is not. The derive was dead once
+/// `Viewer` lost its own — nothing in this crate calls `shape.clone()` — and
+/// while `ViewerShape` is private, `self.shape` IS in scope everywhere inside
+/// `epigraph-db`, which is where every bypass-handling repo lives. A `Clone`
+/// here would leave `Viewer { shape: v.shape.clone() }` as a two-token total
+/// function from `&Viewer` to `Viewer` for exactly those files, and the
+/// `compile_fail` doctest that pins the guarantee links this crate externally
+/// and structurally cannot see it. The type doc on [`Viewer`] states that
+/// guarantee without qualification; dropping this derive is what makes it true
+/// without one.
+#[derive(Debug)]
 enum ViewerShape {
     /// An authenticated `agents.id` plus its live group set.
     ///
@@ -381,6 +407,47 @@ impl Viewer {
     pub const fn system(_lease: &MaintenanceLease, reason: SystemReason) -> Self {
         Viewer {
             shape: ViewerShape::Bypass { reason },
+        }
+    }
+
+    /// An OWNED copy of this viewer's scoped read authority, for a task that
+    /// outlives the request that resolved it.
+    ///
+    /// [`Viewer`] is not `Clone`, on purpose (see the type doc). This is the
+    /// narrow replacement, and it exists because three production call sites
+    /// genuinely need one: a detached `tokio::spawn` cannot borrow the request's
+    /// viewer across its `'static` bound, and re-resolving inside the task would
+    /// read the principal's membership at task start rather than at request
+    /// time.
+    ///
+    /// # Why the return type is `Option`
+    ///
+    /// `None` for the unrestricted shape, and that is the point rather than a
+    /// limitation. The unrestricted shape's authority is not a property of a
+    /// principal that can be copied around; it is one half of a pair whose other
+    /// half is a maintenance-role connection, and
+    /// [`crate::MaintenanceSession`] owns that pairing. There is no argument you
+    /// can pass to make this hand one back: the `Some` arm rebuilds a `Scoped`
+    /// viewer from `Scoped` fields, so the unrestricted arm is unreachable by
+    /// construction and not by a check that could be relaxed later.
+    ///
+    /// Callers must fail CLOSED on `None` — refuse the work — rather than
+    /// substituting any other viewer.
+    #[must_use]
+    pub fn detach_scoped(&self) -> Option<Viewer> {
+        match &self.shape {
+            ViewerShape::Scoped {
+                principal,
+                group_ids,
+                writable,
+            } => Some(Viewer {
+                shape: ViewerShape::Scoped {
+                    principal: *principal,
+                    group_ids: group_ids.clone(),
+                    writable: writable.clone(),
+                },
+            }),
+            ViewerShape::Bypass { .. } => None,
         }
     }
 

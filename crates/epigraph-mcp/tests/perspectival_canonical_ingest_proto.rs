@@ -138,23 +138,28 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
         .await
         .expect("binary frame");
 
-    let read = |claim: Uuid| {
-        let pool = pool.clone();
-        let persp = persp.clone();
-        // `async move` would otherwise move the single `viewer` binding into the
-        // first call, making `read` FnOnce and poisoning every later `&viewer`.
-        let viewer = viewer.clone();
-        async move {
-            let mut out: Vec<(String, f64)> = Vec::new();
-            for (k, id) in &persp {
-                let b = get_perspective_belief(&pool, &viewer, claim, frame, *id)
-                    .await
-                    .expect("belief");
-                out.push((k.clone(), b.pignistic_prob));
-            }
-            out
+    // An `async fn` rather than a closure returning `async move`. The closure
+    // form had to clone the viewer, because `async move` would otherwise have
+    // moved the single `viewer` binding into the first call and made `read`
+    // `FnOnce`. `epigraph_db::Viewer` is no longer `Clone`; taking every input
+    // by reference expresses the same thing without duplicating read authority
+    // per call.
+    async fn read(
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        persp: &[(String, Uuid)],
+        claim: Uuid,
+        frame: Uuid,
+    ) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = Vec::new();
+        for (k, id) in persp {
+            let b = get_perspective_belief(pool, viewer, claim, frame, *id)
+                .await
+                .expect("belief");
+            out.push((k.clone(), b.pignistic_prob));
         }
-    };
+        out
+    }
 
     // ── representative claims ──
     let c_eff = seed_claim(&pool, "treatment-e is efficacious for symptom-5.", 0.5).await;
@@ -189,9 +194,9 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     .await; // source_survey→statistical
             // c_novel: no prior evidence (practitioner-only signal)
 
-    let before_eff = read(c_eff).await;
-    let before_saf = read(c_saf).await;
-    let before_novel = read(c_novel).await;
+    let before_eff = read(&pool, &viewer, &persp, c_eff, frame).await;
+    let before_saf = read(&pool, &viewer, &persp, c_saf, frame).await;
+    let before_novel = read(&pool, &viewer, &persp, c_novel, frame).await;
 
     // ── the INTERVIEW, ingested via the real path as canonical `testimonial` ──
     add_evidence(
@@ -226,9 +231,9 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
     )
     .await;
 
-    let after_eff = read(c_eff).await;
-    let after_saf = read(c_saf).await;
-    let after_novel = read(c_novel).await;
+    let after_eff = read(&pool, &viewer, &persp, c_eff, frame).await;
+    let after_saf = read(&pool, &viewer, &persp, c_saf, frame).await;
+    let after_novel = read(&pool, &viewer, &persp, c_novel, frame).await;
 
     let show = |label: &str, before: &[(String, f64)], after: &[(String, f64)]| {
         eprintln!("\n  {label}");

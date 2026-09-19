@@ -172,6 +172,37 @@ pub async fn ingest_document(
 
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+
+    // The ingest is handed to a task DETACHED from this request, so it needs an
+    // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
+    // `Viewer` is not `Clone`; `detach_scoped` is the narrow replacement, and
+    // what it yields is the caller's own scoped read authority and nothing
+    // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
+    // over-reading is wrong: it constrains the VIEWER the detached task holds,
+    // not the task's database reach. `do_ingest_document` takes this `&Viewer`
+    // and spends it at two places; its remaining statements run on
+    // `&server.pool` with no viewer at all. Those are the registered
+    // `epigraph-mcp` limit in `no_unscoped_pool.rs` (a `PgPool`-mention count,
+    // not a converted crate), pre-existing and untouched here — this refusal
+    // does not cover them and must not be read as covering them.
+    //
+    // ABOVE `ensure_paper_node`, not below it, which is the file's own stated
+    // convention two guards up in `do_ingest_document`: fail closed BEFORE any
+    // DB write. On the refusal arm nothing has been written, so no `papers` row
+    // survives an ingest that was refused. `request_viewer` resolves an
+    // `agents.id` on both transports, so the arm is not reachable today — it is
+    // written as a refusal rather than an `expect` because the state it would
+    // represent is a widening, and those fail closed. `invalid_request` rather
+    // than `internal_error` for the same reason `request_viewer` uses it one
+    // frame up: a denial of authority is not a server fault, and classifying it
+    // as one would send an operator hunting a crash.
+    let viewer = viewer.detach_scoped().ok_or_else(|| {
+        McpError::invalid_request(
+            "ingest_document requires the caller's own read authority",
+            None,
+        )
+    })?;
+
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
@@ -180,7 +211,6 @@ pub async fn ingest_document(
         server.read_only,
     );
     let doi_log = doi.clone();
-    let viewer = viewer.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
             tracing::warn!(doi = doi_log, "background ingest_document failed: {e:?}");
@@ -202,6 +232,16 @@ pub async fn ingest_document_inline(
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+
+    // Same detached-task ownership requirement, the same refusal and the same
+    // before-any-DB-write placement as `ingest_document` above.
+    let viewer = viewer.detach_scoped().ok_or_else(|| {
+        McpError::invalid_request(
+            "ingest_document_inline requires the caller's own read authority",
+            None,
+        )
+    })?;
+
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
@@ -210,7 +250,6 @@ pub async fn ingest_document_inline(
         server.read_only,
     );
     let doi_log = doi.clone();
-    let viewer = viewer.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
             tracing::warn!(

@@ -86,7 +86,19 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("ds_auto.rs", 1, 0),
     ("link_epistemic.rs", 1, 0),
     ("novelty_gate.rs", 0, 2),
-    ("recall.rs", 12, 0),
+    // 13, not 12, since main's a3803f94 (backlog 922a1e54) landed the
+    // epistemic-edge neighbours query here. It arrived by MERGE, not by being
+    // authored on this branch, so the ratchet is being updated rather than
+    // overridden.
+    //
+    // It nevertheless belongs in crates/epigraph-db/src/repos/ per CLAUDE.md, and
+    // this test's own message says why: visibility_lint.rs cannot see an inline
+    // query, so it could not check whether the query spends its Viewer. That is
+    // precisely how it reached main with no visibility predicate while its ten
+    // siblings in the same function carried one — the predicate is added in this
+    // same commit. Moving it to the repo layer is filed as follow-up work; doing it
+    // inside a merge resolution would bury a refactor in a conflict fix.
+    ("recall.rs", 13, 0),
     ("workflow_hierarchical.rs", 3, 3),
     ("workflow_ingest.rs", 0, 10),
     ("workflows.rs", 2, 0),

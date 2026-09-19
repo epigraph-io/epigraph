@@ -1075,13 +1075,37 @@ impl ScopedPool {
     /// nobody spends. The `SystemReason` is still recorded there, so the bypass
     /// metric is unchanged.
     ///
-    /// MEASURED, because an enumeration is a claim: after this batch every
-    /// remaining production caller of [`Self::unscoped_for_maintenance`] — the
-    /// privatization job's four sites — really does mint no viewer, and the one
-    /// that did (`privatization.rs::rescan_for_drift_inner`, which paired a
-    /// locally minted `Viewer::system` with a separately-owned connection) was
-    /// converted to this constructor in the same commit. `#[sqlx::test]`
-    /// fixtures are the other population and are not production.
+    /// RE-MEASURED 2026-09-18, AND THE PREVIOUS REVISION OF THIS PARAGRAPH WAS
+    /// WRONG. It read "every remaining production caller of
+    /// [`Self::unscoped_for_maintenance`] — the privatization job's four sites —
+    /// really does mint no viewer", under the flag *MEASURED, because an
+    /// enumeration is a claim*. A false enumeration published under that word is
+    /// worse than no enumeration, so it is corrected here rather than quietly
+    /// dropped.
+    ///
+    /// [`Self::unscoped_for_maintenance`] has **eight** call sites under
+    /// `crates/*/src/` — excluding its own `pub async fn` line, and excluding
+    /// the fifteen `#[sqlx::test]` fixture sites, which are the other
+    /// population and are not production. **Four** of the eight mint a viewer,
+    /// and one of those four is THIS FUNCTION, two lines below, whose mint is
+    /// the sanctioned pairing and is the entire point of the constructor.
+    ///
+    /// So, stated the way the original paragraph meant it: **seven callers
+    /// other than this constructor, of which four are the privatization job's
+    /// and really do mint no viewer** — that half of the claim reproduces —
+    /// **and three do mint one**. Those three lie outside what
+    /// [`MaintenanceSession`] can guarantee. They are registered as `F-SBC-A1`
+    /// in `docs/tenancy/progress.json` with their locations and owner; the
+    /// analysis is held outside this repository.
+    ///
+    /// The constructor-exclusion clause is spelled out because without it the
+    /// stated scope and the stated number disagree, and a reviewer re-running
+    /// the obvious grep gets a different answer — which in THIS paragraph,
+    /// whose subject is a false enumeration, would be the same defect twice.
+    ///
+    /// `privatization.rs::rescan_for_drift_inner` was converted to this
+    /// constructor in the batch that wrote the original paragraph; that part is
+    /// unchanged and still true.
     ///
     /// # Errors
     /// Propagates [`Self::unscoped_for_maintenance`]: `DbError::ConnectionFailed`
@@ -1411,21 +1435,29 @@ impl std::ops::DerefMut for MaintenanceConn<'_> {
 /// There is no accessor that moves the `Viewer` out, and adding one would undo
 /// the whole point of the type.
 ///
-/// # WHAT THIS DOES NOT MAKE STRUCTURAL, STATED RATHER THAN IMPLIED
+/// # WHAT THIS MAKES STRUCTURAL, AND WHAT IT STILL DOES NOT
 ///
-/// [`Viewer`] is `Clone`. `session.viewer().clone()` therefore yields an OWNED
-/// bypass viewer that outlives the session and compiles — method resolution
-/// picks `Viewer::clone` at the `&Viewer` receiver, not the `&T: Clone` impl.
-/// So what this type removes is the ACCIDENTAL shape: the call site that binds
-/// the connection to `_conn`, lets it drop, and goes on using a viewer it
-/// happens to still own. A DELIBERATE clone is not prevented, and the residual
-/// is recorded on `D-PR17-maintenance-lease-coupling-is-a-convention` rather
-/// than papered over. Making it unreachable would mean `Viewer` losing `Clone`,
-/// which is a change to every holder of one across the workspace.
+/// A previous revision of this section recorded a residual: [`Viewer`] was
+/// `Clone`, so `session.viewer().clone()` yielded an OWNED bypass viewer that
+/// outlived the session and compiled, and what this type removed was only the
+/// ACCIDENTAL shape — the call site that binds the connection to `_conn`, lets
+/// it drop, and goes on using a viewer it happens to still own.
 ///
-/// No production site clones a viewer out of a session today, and the shape a
-/// clone would be used for — spending the bypass on an application pool — is
-/// what `no_hybrid_bypass_spend.rs` is keyed on.
+/// **That residual is closed.** [`Viewer`] is no longer `Clone` (see its type
+/// doc for why the derive was the whole family of the problem), so there is no
+/// total function from `&Viewer` to `Viewer` and nothing can lift this
+/// session's viewer out of it. `session.viewer().clone()` now resolves to
+/// `<&Viewer as Clone>::clone` and yields a `&Viewer` — still borrowed from the
+/// session, so the borrow checker still refuses to let it outlive one. Both
+/// halves are pinned by the doctests below.
+///
+/// **What it does not make structural, stated rather than implied.** This type
+/// governs the viewer IT owns. It is not the only way an unrestricted viewer
+/// can be obtained in this crate's public API, and the sites that obtain one
+/// another way are registered as `F-SBC-A1` in `docs/tenancy/progress.json`
+/// with their locations and owner; the analysis is held outside this
+/// repository. Nor does it govern the SPEND: which pool a viewer's statements
+/// run on is a separate key, and that one is `no_hybrid_bypass_spend.rs`.
 ///
 /// # Why [`Self::split`] exists rather than a `DerefMut` to the connection
 ///
@@ -1465,6 +1497,61 @@ impl std::ops::DerefMut for MaintenanceConn<'_> {
 /// drop(session);
 /// # Ok(()) }
 /// ```
+///
+/// # The DELIBERATE shape, as a test
+///
+/// The borrow error above is defeated by taking an owned copy instead of a
+/// borrow, which is what `Clone` used to allow. Asking for one is now a TYPE
+/// error, and the block is pinned to `E0308` rather than to "does not compile"
+/// for the same reason the one above is pinned to `E0505`:
+///
+/// ```compile_fail,E0308
+/// # async fn f(scoped: &epigraph_db::ScopedPool) -> Result<(), epigraph_db::DbError> {
+/// use epigraph_db::visibility::{SystemReason, Viewer};
+/// let session = scoped.maintenance_session(SystemReason::EmbeddingBackfill).await?;
+/// let owned: Viewer = session.viewer().clone();  // `&Viewer`, not `Viewer`. E0308.
+/// drop(session);
+/// let _ = owned.bypass_bind();
+/// # Ok(()) }
+/// ```
+///
+/// Its POSITIVE arm, and the reason the pin matters: the SAME line without the
+/// annotation compiles, because `&T: Clone` always holds and the expression is
+/// a `&Viewer`. That is the "merely changes type" case, and it is benign here
+/// only because the resulting reference is still borrowed from the session —
+/// which the `E0505` block above is what proves.
+///
+/// ```
+/// # async fn f(scoped: &epigraph_db::ScopedPool) -> Result<(), epigraph_db::DbError> {
+/// use epigraph_db::visibility::SystemReason;
+/// let session = scoped.maintenance_session(SystemReason::EmbeddingBackfill).await?;
+/// let still_a_borrow = session.viewer().clone();
+/// let _ = still_a_borrow.bypass_bind();
+/// drop(session);
+/// # Ok(()) }
+/// ```
+///
+/// And the narrow duplication that DOES exist — [`Viewer::detach_scoped`] — is
+/// not a way around any of this. THE BLOCK BELOW IS A COMPILE CHECK AND NOTHING
+/// MORE, said plainly because this section's whole thesis is that a guarantee
+/// about a shape is not proved by a block that runs: rustdoc wraps a doctest
+/// body in `fn main()`, and nothing here calls `f`, so the `assert!` never
+/// executes. What it establishes is the SIGNATURE — that `detach_scoped` is
+/// callable on this session's `&Viewer` and yields an `Option`, so a caller
+/// must handle the refusal arm.
+///
+/// ```
+/// # async fn f(scoped: &epigraph_db::ScopedPool) -> Result<(), epigraph_db::DbError> {
+/// use epigraph_db::visibility::SystemReason;
+/// let session = scoped.maintenance_session(SystemReason::EmbeddingBackfill).await?;
+/// assert!(session.viewer().detach_scoped().is_none());
+/// # Ok(()) }
+/// ```
+///
+/// That it actually returns `None` for an unrestricted viewer — so it cannot
+/// hand back what this session owns — is a RUNTIME property and lives where
+/// runtime properties can be mutation-proved:
+/// `crates/epigraph-db/tests/detached_viewer_authority.rs::an_unrestricted_viewer_cannot_be_detached`.
 pub struct MaintenanceSession<'a> {
     conn: MaintenanceConn<'a>,
     viewer: Viewer,

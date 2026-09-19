@@ -172,6 +172,7 @@ fn base_params(depth: Option<u32>, limit: u32) -> RecallWithContextParams {
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: None,
         max_themes: None,
