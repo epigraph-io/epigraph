@@ -460,6 +460,7 @@ async fn recall_context_hides_a_private_sibling_paragraph(pool: PgPool) {
         &[public_para],
         8,
         4,
+        4,
     )
     .await
     .expect("batched context");
@@ -500,6 +501,7 @@ async fn recall_context_shows_the_owner_its_private_sibling_paragraph(pool: PgPo
         &t.owner_viewer,
         &[public_para],
         8,
+        4,
         4,
     )
     .await

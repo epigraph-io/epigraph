@@ -257,6 +257,7 @@ fn rwc_params(
         paper_doi_filter: None,
         siblings_limit: None,
         corroborates_limit: None,
+        epistemic_limit: None,
         neighbor_paragraphs_limit: None,
         diverse: None,
         max_themes: None,
