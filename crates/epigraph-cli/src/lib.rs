@@ -80,9 +80,13 @@ use std::sync::Arc;
 /// `epigraph_mcp::maintenance::maintenance_viewer` inherit the same shape rather
 /// than each re-deriving it.
 ///
-/// It is not an absolute guarantee, and [`epigraph_db::MaintenanceSession`]'s
-/// own doc says why: `Viewer` is `Clone`, so a deliberate clone still produces
-/// an owned bypass. The residual is named on the obligation.
+/// A previous revision of this paragraph recorded the guarantee as partial,
+/// because `Viewer` was `Clone` and a deliberate clone still produced an owned
+/// bypass. `Viewer` is no longer `Clone`, so that half is closed too and the
+/// borrow is the whole story for the viewer this session owns — see
+/// [`epigraph_db::MaintenanceSession`], where both halves are pinned by
+/// doctests. What the type still does not govern is the SPEND: which pool the
+/// statements run on is `D-PR17-hybrid-shape-lint`'s key, not a lifetime's.
 ///
 /// ```ignore
 /// let maint = MaintenancePool::connect("epigraph-embed-backfill").await?;

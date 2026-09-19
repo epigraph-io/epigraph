@@ -189,13 +189,32 @@ async fn omitting_evidence_type_is_byte_identical_to_legacy_behavior(pool: PgPoo
     // unconditional pre-discount path for the same input. A future edit
     // that changes this value for a no-`evidence_type` call is a real
     // backward-compat regression, not test flake.
+    // RE-BASELINED for backlog 0183a294: 0.6739130434782611 -> 0.62.
+    //
+    // The delta is exactly the open-world renormalizer this input carries and
+    // `pignistic_probability` no longer applies:
+    //     0.62 / (1 - 0.08) = 0.6739130434782611
+    // where 0.08 is the post-discount mass on "~" (0.2 discounted by the step-5
+    // unknown fallback). There is NO conflict mass in this input, so the conflict
+    // factor — which all three measures still share — is 1.0 and contributes
+    // nothing. The whole change here is the open-world half.
+    //
+    // That half is the licensed one: `scripts/lib/scifact_conformal.py`, against
+    // which the 0.948-F1 conformal quantiles were fit, computes
+    // `betp_sup = m_sup + m_theta/2` and EXCLUDES open-world mass without
+    // renormalising. 0.62 is the calibration-consistent value; 0.6739 was not.
+    //
+    // The backward-compat intent of this assertion is preserved: a future edit
+    // that moves this value for a no-`evidence_type` call is still a real
+    // regression, not flake.
     let pignistic = json["pignistic_prob"].as_f64().expect("pignistic_prob");
     assert!(
-        (pignistic - 0.673_913_043_478_261_1).abs() < 1e-9,
-        "no-evidence_type call must reproduce the exact pre-change pignistic_prob for this \
-         input; got {pignistic}, expected 0.6739130434782611 (masses {{\"0\":0.8,\"~\":0.2}}, \
-         reliability=0.8, evidence_type=None -> effective_source_strength's step-5 unknown \
-         fallback of 0.5, same as origin/main's unconditional discount path)"
+        (pignistic - 0.62).abs() < 1e-9,
+        "no-evidence_type call must reproduce the pinned pignistic_prob for this \
+         input; got {pignistic}, expected 0.62 (masses {{\"0\":0.8,\"~\":0.2}}, \
+         reliability=0.8, evidence_type=None -> effective_source_strength's step-5 \
+         unknown fallback of 0.5). Pre-0183a294 this was 0.6739130434782611, which \
+         differs by exactly the removed open-world renormalizer 1/(1-0.08)."
     );
 
     let rows = MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim, frame_id)

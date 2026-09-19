@@ -78,11 +78,12 @@ use crate::server::EpiGraphMcpFull;
 ///
 /// Returns one [`MaintenanceSession`], which owns the connection and the viewer
 /// together and hands the viewer out only by reference — so a call site can no
-/// longer ACCIDENTALLY drop the connection and keep the bypass
-/// (`D-PR17-maintenance-lease-coupling-is-a-convention`; `Viewer` is `Clone`, so
-/// a deliberate clone is still possible and the residual is named on that
-/// entry). The mint is `ScopedPool::maintenance_session`, shared with the CLI
-/// and API wrappers.
+/// longer drop the connection and keep the bypass
+/// (`D-PR17-maintenance-lease-coupling-is-a-convention`). A previous revision
+/// of this parenthesis said that covered only the ACCIDENTAL shape, because
+/// `Viewer` was `Clone`; it is no longer, so the deliberate one is closed too.
+/// The mint is `ScopedPool::maintenance_session`, shared with the CLI and API
+/// wrappers.
 ///
 /// ```ignore
 /// let session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
