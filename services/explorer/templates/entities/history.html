@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Version history · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("entities.css") }}">
+{%- endblock %}
+
+{% block content %}
+<nav class="entity-tabs" aria-label="About this claim">
+  <a href="{{ claim_url }}">Claim</a>
+  <a href="{{ ctx.current_path }}" aria-current="page">Version history</a>
+  <a href="{{ provenance_url }}">Provenance</a>
+</nav>
+
+<header class="entity-head">
+  <p class="entity-kind">Version history</p>
+  <h1 class="claim-text{% if heading.redacted %} claim-text--redacted{% endif %}">{{ heading.text }}</h1>
+</header>
+
+<section class="section" aria-labelledby="versions-title">
+  <h2 id="versions-title" class="section__title">Versions, oldest first</h2>
+  {%- match history %}
+  {%- when Degraded::Available { data } %}
+  {%- if data.rows.is_empty() %}
+  <p class="muted">No versions were recorded for this claim.</p>
+  {%- else %}
+  <ol class="version-list">
+    {%- for v in data.rows %}
+    <li class="version{% if v.is_current %} version--current{% endif %}{% if v.is_requested %} version--requested{% endif %}">
+      <div class="version__head">
+        <a class="version__title" href="{{ v.url }}">Version {{ v.version }}</a>
+        <span class="mono small muted">{{ v.short }}</span>
+        {%- if v.is_current %}
+        <span class="badge badge--current">Current</span>
+        {%- endif %}
+        {%- if let Some((n, url)) = v.duplicate_of %}
+        <span class="badge badge--duplicate">Duplicate of <a href="{{ url }}">version {{ n }}</a></span>
+        {%- endif %}
+        {%- if v.superseded %}
+        <span class="badge badge--superseded">Superseded</span>
+        {%- endif %}
+        {%- if v.is_requested %}
+        <span class="badge">You are here</span>
+        {%- endif %}
+      </div>
+      <p class="version__text{% if v.text.redacted %} claim-text--redacted{% endif %}">{{ v.text.text }}</p>
+      <p class="small muted">Recorded {{ v.created }} · truth value <span class="num">{{ v.truth }}</span></p>
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- if data.has_duplicates %}
+  <p class="small muted">A version marked “duplicate of” was folded into the
+  version before it by deduplication, not replaced by a newer claim. This is
+  inferred: the version is not current and either nothing supersedes it or
+  the version before it is still current.</p>
+  {%- endif %}
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+{% endblock %}

@@ -8,6 +8,8 @@
 //! - `community` → full content if requester's perspective is a member of the owning community; otherwise coarse metadata only
 //! - `private` → full content only for the owner agent; coarse metadata for all others
 
+use std::collections::{HashMap, HashSet};
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -41,6 +43,59 @@ pub enum ContentAccess {
     Redacted,
 }
 
+/// What the partition rules say about one ownership row before any
+/// community-membership lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartitionDecision {
+    Decided(ContentAccess),
+    /// Community partition, known requester, parseable community id: `Full`
+    /// iff the requester owns a perspective that is a member of `community_id`.
+    NeedsMembership {
+        community_id: Uuid,
+        agent_id: Uuid,
+    },
+}
+
+/// The partition rules shared by [`check_content_access`] and
+/// [`batch_content_access`], so the single and batch paths cannot drift.
+fn decide_partition(
+    partition: &str,
+    owner_id: Uuid,
+    encryption_key_id: Option<&str>,
+    requester_agent_id: Option<Uuid>,
+) -> PartitionDecision {
+    use PartitionDecision::{Decided, NeedsMembership};
+    match partition {
+        "public" => Decided(ContentAccess::Full),
+        "private" => match requester_agent_id {
+            Some(agent) if agent == owner_id => Decided(ContentAccess::Full),
+            _ => Decided(ContentAccess::Redacted),
+        },
+        "community" => {
+            // For community-partition nodes, encryption_key_id stores the
+            // community UUID. We check if the requester's agent has any
+            // perspective that is a member of that community.
+            let Some(agent_id) = requester_agent_id else {
+                return Decided(ContentAccess::Redacted);
+            };
+
+            // Parse community_id from encryption_key_id
+            let community_id = encryption_key_id.and_then(|s| Uuid::parse_str(s).ok());
+
+            match community_id {
+                Some(community_id) => NeedsMembership {
+                    community_id,
+                    agent_id,
+                },
+                // No community_id stored → owner-only access as fallback
+                None if agent_id == owner_id => Decided(ContentAccess::Full),
+                None => Decided(ContentAccess::Redacted),
+            }
+        }
+        _ => Decided(ContentAccess::Full), // Unknown partition → safe default
+    }
+}
+
 /// Check whether a requester can read the full content of a node.
 ///
 /// Returns `ContentAccess::Full` when:
@@ -48,6 +103,13 @@ pub enum ContentAccess {
 /// - Partition is `public`
 /// - Partition is `community` and requester has a perspective that is a member
 /// - Partition is `private` and requester is the owner
+///
+/// Fails closed: if the ownership or membership lookup errors (pool
+/// exhaustion, statement timeout, dropped connection) the node is
+/// `Redacted`, never `Full`.
+///
+/// For more than one node use [`batch_content_access`], which applies the same
+/// rules in at most two queries.
 pub async fn check_content_access(
     pool: &PgPool,
     node_id: Uuid,
@@ -55,47 +117,39 @@ pub async fn check_content_access(
 ) -> ContentAccess {
     // 1. Look up ownership (partition_type, owner_id, encryption_key_id)
     // For community partitions, encryption_key_id stores the community UUID.
-    let ownership: Option<(String, Uuid, Option<String>)> = sqlx::query_as(
+    let ownership: Option<(String, Uuid, Option<String>)> = match sqlx::query_as(
         "SELECT partition_type, owner_id, encryption_key_id FROM ownership WHERE node_id = $1",
     )
     .bind(node_id)
     .fetch_optional(pool)
     .await
-    .unwrap_or(None);
+    {
+        Ok(row) => row,
+        // A failed lookup is NOT "no ownership row": reading it as one would
+        // serve a private node's content as public whenever the pool is
+        // exhausted.
+        Err(e) => {
+            tracing::warn!(%node_id, error = %e, "ownership lookup failed; redacting");
+            return ContentAccess::Redacted;
+        }
+    };
 
     let (partition, owner_id, encryption_key_id) = match ownership {
         Some(row) => row,
         None => return ContentAccess::Full, // No ownership → public
     };
 
-    match partition.as_str() {
-        "public" => ContentAccess::Full,
-        "private" => match requester_agent_id {
-            Some(agent) if agent == owner_id => ContentAccess::Full,
-            _ => ContentAccess::Redacted,
-        },
-        "community" => {
-            // For community-partition nodes, encryption_key_id stores the
-            // community UUID. We check if the requester's agent has any
-            // perspective that is a member of that community.
-            let Some(agent_id) = requester_agent_id else {
-                return ContentAccess::Redacted;
-            };
-
-            // Parse community_id from encryption_key_id
-            let community_id = encryption_key_id
-                .as_deref()
-                .and_then(|s| Uuid::parse_str(s).ok());
-
-            let Some(community_id) = community_id else {
-                // No community_id stored → owner-only access as fallback
-                return if agent_id == owner_id {
-                    ContentAccess::Full
-                } else {
-                    ContentAccess::Redacted
-                };
-            };
-
+    match decide_partition(
+        &partition,
+        owner_id,
+        encryption_key_id.as_deref(),
+        requester_agent_id,
+    ) {
+        PartitionDecision::Decided(access) => access,
+        PartitionDecision::NeedsMembership {
+            community_id,
+            agent_id,
+        } => {
             let is_member: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS(
@@ -110,7 +164,7 @@ pub async fn check_content_access(
             .bind(agent_id)
             .fetch_one(pool)
             .await
-            .unwrap_or(false);
+            .unwrap_or(false); // lookup error → not a member → Redacted
 
             if is_member {
                 ContentAccess::Full
@@ -118,27 +172,135 @@ pub async fn check_content_access(
                 ContentAccess::Redacted
             }
         }
-        _ => ContentAccess::Full, // Unknown partition → safe default
     }
+}
+
+/// Set-based [`check_content_access`]: the access decision for every id in
+/// `node_ids`, in one ownership query plus at most one membership query,
+/// whatever the batch size.
+///
+/// The map has exactly one entry per distinct input id, and each entry equals
+/// what `check_content_access(pool, id, requester_agent_id)` returns — same
+/// rules (no ownership row → `Full`), same fail-closed behaviour: an
+/// ownership-lookup error redacts every id, and a membership-lookup error
+/// redacts the community nodes that needed it.
+pub async fn batch_content_access(
+    pool: &PgPool,
+    node_ids: &[Uuid],
+    requester_agent_id: Option<Uuid>,
+) -> HashMap<Uuid, ContentAccess> {
+    if node_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let rows: Vec<(Uuid, String, Uuid, Option<String>)> = match sqlx::query_as(
+        "SELECT node_id, partition_type, owner_id, encryption_key_id \
+         FROM ownership WHERE node_id = ANY($1)",
+    )
+    .bind(node_ids)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                nodes = node_ids.len(),
+                error = %e,
+                "batch ownership lookup failed; redacting all"
+            );
+            return node_ids
+                .iter()
+                .map(|&id| (id, ContentAccess::Redacted))
+                .collect();
+        }
+    };
+
+    // Ids with no ownership row keep this default (backward compat → public).
+    let mut access: HashMap<Uuid, ContentAccess> = node_ids
+        .iter()
+        .map(|&id| (id, ContentAccess::Full))
+        .collect();
+    let mut pending: Vec<(Uuid, Uuid)> = Vec::new(); // (node_id, community_id)
+    for (node_id, partition, owner_id, encryption_key_id) in rows {
+        match decide_partition(
+            &partition,
+            owner_id,
+            encryption_key_id.as_deref(),
+            requester_agent_id,
+        ) {
+            PartitionDecision::Decided(decision) => {
+                access.insert(node_id, decision);
+            }
+            PartitionDecision::NeedsMembership { community_id, .. } => {
+                pending.push((node_id, community_id));
+            }
+        }
+    }
+
+    // `NeedsMembership` only arises with a known requester, so `pending` is
+    // empty whenever `requester_agent_id` is `None`.
+    if let (Some(agent_id), false) = (requester_agent_id, pending.is_empty()) {
+        let communities: Vec<Uuid> = pending
+            .iter()
+            .map(|&(_, community_id)| community_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let member_of: HashSet<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT DISTINCT cm.community_id FROM community_members cm
+            JOIN perspectives p ON p.id = cm.perspective_id
+            WHERE cm.community_id = ANY($1)
+              AND p.owner_agent_id = $2
+            "#,
+        )
+        .bind(&communities)
+        .bind(agent_id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(ids) => ids.into_iter().collect(),
+            // lookup error → not a member of anything → Redacted
+            Err(e) => {
+                tracing::warn!(
+                    communities = communities.len(),
+                    error = %e,
+                    "batch community-membership lookup failed; redacting"
+                );
+                HashSet::new()
+            }
+        };
+        for (node_id, community_id) in pending {
+            let decision = if member_of.contains(&community_id) {
+                ContentAccess::Full
+            } else {
+                ContentAccess::Redacted
+            };
+            access.insert(node_id, decision);
+        }
+    }
+
+    access
 }
 
 /// Batch check content access for multiple node IDs.
 ///
-/// Returns a list of `(node_id, ContentAccess)` in the same order as input.
+/// Returns a list of `(node_id, ContentAccess)` in the same order as input
+/// (duplicates kept). A thin ordered view over [`batch_content_access`].
 pub async fn batch_check_content_access(
     pool: &PgPool,
     node_ids: &[Uuid],
     requester_agent_id: Option<Uuid>,
 ) -> Vec<(Uuid, ContentAccess)> {
-    // For small batches, sequential is fine. For large batches a single SQL
-    // query would be more efficient, but the access control logic involves
-    // community membership checks that are hard to do in one query.
-    let mut results = Vec::with_capacity(node_ids.len());
-    for &nid in node_ids {
-        let access = check_content_access(pool, nid, requester_agent_id).await;
-        results.push((nid, access));
-    }
-    results
+    let access = batch_content_access(pool, node_ids, requester_agent_id).await;
+    node_ids
+        .iter()
+        .map(|&nid| {
+            // Every input id is in the map; an absent one would redact.
+            let decision = access.get(&nid).copied().unwrap_or(ContentAccess::Redacted);
+            (nid, decision)
+        })
+        .collect()
 }
 
 #[cfg(test)]

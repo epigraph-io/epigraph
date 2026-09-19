@@ -57,7 +57,8 @@ pub mod repos;
 
 // Re-export primary types
 pub use access_control::{
-    batch_check_content_access, check_content_access, ContentAccess, COARSE_EDGE_TYPES,
+    batch_check_content_access, batch_content_access, check_content_access, ContentAccess,
+    COARSE_EDGE_TYPES,
 };
 pub use errors::DbError;
 pub use pool::{create_pool, create_pool_from_options, create_pool_with_options};
@@ -65,11 +66,12 @@ pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentRepository, AnalysisRecord,
     AnalysisRepository, BehavioralExecutionRepository, BehavioralExecutionRow, ChallengeRepository,
     ChallengeRow, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository,
-    ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow, ClaimRepository, ClaimSummary,
-    ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow,
-    CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
-    CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
-    EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EmbeddingShareRepository,
+    ClaimEncryptionRow, ClaimNeighbor, ClaimNeighborBetpRow, ClaimPlacement, ClaimRepository,
+    ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository, ClaimVersionRow,
+    ClusterRunRepository, ClusterRunRow, CommunityRepository, ConsolidateMode, ConsolidateResult,
+    ContextRepository, CorpusCounts, CounterfactualRepository, CounterfactualRow, DedupRepair,
+    DetailedCorpusCounts, DivergenceRepository, EdgeEncryptionRepository, EdgeEncryptionRow,
+    EdgeRepository, EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository, EmbeddingShareRepository,
     EmbeddingShareRow, EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository,
     EpistemicEdgePairRow, EventRepository, EventRow, EvidenceEncryptionRepository,
     EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
@@ -87,10 +89,10 @@ pub use repos::{
     ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
     ReEncryptionKeyRepository, ReEncryptionKeyRow, ReasoningTraceRepository, RecallEventRepository,
     RecallEventRow, RefreshTokenRepository, RefreshTokenRow, ResolvedStep, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SweepCandidate, TaskRepository,
-    TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    SecurityEventRepository, SecurityEventRow, SheafRepository, StatsRepository, SweepCandidate,
+    TaskRepository, TaskRow, TripleRepository, TripleRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 
 // Re-export sqlx types that users will need

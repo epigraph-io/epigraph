@@ -1,13 +1,16 @@
 //! /api/v1/graph/neighborhoods/:id/expand — compound + atomic modes.
 //!
-//! Compound mode (this file): nodes are compound claims (those with
+//! Compound mode (the default): nodes are compound claims (those with
 //! decomposes_to children inside the neighborhood) plus standalone claims
 //! (no decomposes_to in either direction). Edges are induced from atom-level
 //! relationships (mass-weighted by `forward_strength`) plus direct
 //! compound-compound edges that exist outside the decomposition hierarchy.
 //!
-//! Atomic mode is implemented in Task 8 — for now `atomic_response` returns
-//! an empty placeholder.
+//! Atomic mode (`?mode=atomic`) returns the neighborhood's member claims
+//! themselves, the epistemic edges between them (`decomposes_to` excluded,
+//! positive `forward_strength` only), and the compound groups those atoms
+//! belong to. Neither mode applies `budget` yet, so both report
+//! `truncated: false`.
 
 use axum::{
     extract::{Path, Query, State},
@@ -123,21 +126,39 @@ pub struct CompoundGroup {
     pub member_atom_ids: Vec<Uuid>,
 }
 
+/// Expand one neighborhood of the latest run.
+///
+/// Every `label` in either mode is `claims.content`, so both response shapes
+/// carry the same partition restrictions `GET /claims/:id` enforces: labels
+/// the requester may not read become `"[REDACTED]"` (§2.6). This route is on
+/// the protected router, so the bearer is required and `auth_ctx` is always
+/// present; it stays `Option` to match every other redacting handler and to
+/// fail closed if the layering ever changes.
 pub async fn expand(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(neighborhood_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<NeighborhoodExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
-    let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM graph_neighborhoods WHERE id = $1 \
-         AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)",
-    )
-    .bind(neighborhood_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // The same lookup `graph::expand` and `GET /claims/:id/placement` use; a
+    // missing run leaves `exists` None and answers the same 404 the inlined
+    // subquery did.
+    let latest = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let exists: Option<(Uuid,)> = match &latest {
+        Some(run) => {
+            sqlx::query_as("SELECT id FROM graph_neighborhoods WHERE id = $1 AND run_id = $2")
+                .bind(neighborhood_id)
+                .bind(run.run_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(internal)?
+        }
+        None => None,
+    };
     if exists.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -145,12 +166,16 @@ pub async fn expand(
         ));
     }
 
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+
     match params.mode.as_str() {
         "atomic" => Ok(Json(NeighborhoodExpandResponse::Atomic(
-            atomic_response(pool, neighborhood_id, params.budget).await?,
+            atomic_response(pool, neighborhood_id, params.budget, requester).await?,
         ))),
         _ => Ok(Json(NeighborhoodExpandResponse::Compound(
-            compound_response(pool, neighborhood_id, params.budget).await?,
+            compound_response(pool, neighborhood_id, params.budget, requester).await?,
         ))),
     }
 }
@@ -159,8 +184,9 @@ async fn compound_response(
     pool: &PgPool,
     neighborhood_id: Uuid,
     _budget: i64,
+    requester: Option<Uuid>,
 ) -> Result<CompoundResponse, (axum::http::StatusCode, String)> {
-    let nodes: Vec<CompoundNode> = sqlx::query_as::<_, (Uuid, String, String, i32, Option<f64>, Option<Uuid>)>(
+    let mut nodes: Vec<CompoundNode> = sqlx::query_as::<_, (Uuid, String, String, i32, Option<f64>, Option<Uuid>)>(
         r#"
         WITH atoms AS (
             SELECT m.claim_id
@@ -341,6 +367,15 @@ async fn compound_response(
     })
     .collect();
 
+    // `label` is `COALESCE(c.content, c.id::text)` for both compound and
+    // standalone nodes; one ownership lookup covers the whole node set.
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
+    )
+    .await;
+
     Ok(CompoundResponse {
         neighborhood_id,
         truncated: false,
@@ -355,8 +390,9 @@ async fn atomic_response(
     pool: &PgPool,
     neighborhood_id: Uuid,
     _budget: i64,
+    requester: Option<Uuid>,
 ) -> Result<AtomicResponse, (axum::http::StatusCode, String)> {
-    let nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
+    let mut nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
         r#"
         SELECT c.id,
                COALESCE(c.content, c.id::text) AS label,
@@ -392,7 +428,7 @@ async fn atomic_response(
     .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
     .collect();
 
-    let compound_groups: Vec<CompoundGroup> = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>)>(
+    let mut compound_groups: Vec<CompoundGroup> = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>)>(
         r#"
         SELECT e.source_id AS compound_id,
                COALESCE(c.content, c.id::text) AS label,
@@ -415,6 +451,20 @@ async fn atomic_response(
         member_atom_ids,
     })
     .collect();
+
+    // Atom labels and compound-group labels are both `claims.content`, and a
+    // group's parent compound is generally not among `nodes`, so both sets go
+    // into the same single lookup.
+    let redact_targets: Vec<(Uuid, &mut String)> = nodes
+        .iter_mut()
+        .map(|n| (n.id, &mut n.label))
+        .chain(
+            compound_groups
+                .iter_mut()
+                .map(|g| (g.compound_id, &mut g.label)),
+        )
+        .collect();
+    crate::access_control::redact_claim_fields(pool, requester, redact_targets).await;
 
     Ok(AtomicResponse {
         neighborhood_id,
@@ -475,14 +525,30 @@ pub struct CompoundNeighborEdge {
     pub total_strength: f64,
 }
 
+/// Project one claim's 1-hop neighbourhood onto the compound layer.
+///
+/// Every `label` here — the centre's and every neighbour's — is `claims.content`,
+/// so this response carries the same partition restrictions `GET /claims/:id`
+/// enforces: labels the requester may not read become `"[REDACTED]"` (§2.6).
+/// Unlike the other two expand routes this one is on the **public** router, so
+/// `auth_ctx` is genuinely absent for an anonymous caller and the requester is
+/// then `None` — public content only, which is the fail-closed default.
 pub async fn claim_compound_neighborhood(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<CompoundNeighborhoodParams>,
 ) -> Result<Json<CompoundNeighborhoodResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
     let budget = params.budget.clamp(1, 200);
+
+    // SECURITY: requester from the validated bearer only; the `get_claim`
+    // convention (`agent_id`, falling back to `client_id`), shared by every
+    // handler in the §2.6 sweep.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
 
     // Fetch center claim content + verify it exists.
     let center: Option<(String,)> = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
@@ -623,6 +689,15 @@ pub async fn claim_compound_neighborhood(
             pignistic_prob: None,
         },
     );
+
+    // Centre and neighbours alike are `claims.content`; one ownership lookup
+    // covers the whole node set, matching the cost of the other swept routes.
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
+    )
+    .await;
 
     Ok(Json(CompoundNeighborhoodResponse {
         center_id: claim_id,

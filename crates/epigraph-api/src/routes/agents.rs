@@ -485,6 +485,7 @@ pub struct AttributedClaimResponse {
 #[cfg(feature = "db")]
 pub async fn agent_claims(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Query(params): Query<AgentClaimsParams>,
 ) -> Result<Json<PaginatedResponse<AttributedClaimResponse>>, ApiError> {
@@ -510,7 +511,7 @@ pub async fn agent_claims(
 
     let total = EdgeRepository::count_claims_attributed_to(&state.db_pool, id, min_truth).await?;
 
-    let items: Vec<AttributedClaimResponse> = rows
+    let mut items: Vec<AttributedClaimResponse> = rows
         .into_iter()
         .map(|row| {
             let claim = ClaimResponse {
@@ -534,6 +535,21 @@ pub async fn agent_claims(
             }
         })
         .collect();
+
+    // SECURITY (§2.6): attribution to an agent says nothing about who may
+    // read the claim — a private claim attributed to a public agent is still
+    // private. One batch lookup for the page.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    crate::access_control::redact_claim_fields(
+        &state.db_pool,
+        requester,
+        items
+            .iter_mut()
+            .map(|it| (it.claim.id, &mut it.claim.content)),
+    )
+    .await;
 
     Ok(Json(PaginatedResponse {
         items,

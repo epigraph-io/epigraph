@@ -427,8 +427,15 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 ///
 /// - Query is parameterized to prevent SQL injection
 /// - Special characters are safely handled by sqlx
+/// - Claim text the requester may not read is `"[REDACTED]"`, the `get_claim`
+///   convention. The requester is the authenticated `agent_id` (falling back
+///   to `client_id`); the route is on the optional-bearer public router, so an
+///   anonymous caller is `None` and sees only public claims' text.
 pub async fn semantic_search(
     #[allow(unused_variables)] State(state): State<AppState>,
+    #[allow(unused_variables)] auth_ctx: Option<
+        axum::Extension<crate::middleware::bearer::AuthContext>,
+    >,
     Json(request): Json<SemanticSearchRequest>,
 ) -> Result<Json<SemanticSearchResponse>, ApiError> {
     let start_time = std::time::Instant::now();
@@ -512,6 +519,13 @@ pub async fn semantic_search(
     // Execute semantic search with pgvector
     #[cfg(feature = "db")]
     {
+        // SECURITY (§2.6): derive the requester from the authenticated
+        // AuthContext, never from `request.agent_id` (that stays a plain
+        // author filter). Both result paths redact through it below.
+        let requester = auth_ctx
+            .as_ref()
+            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+
         // Validate centroid_dim hint up front (only meaningful when diverse=true,
         // but reject obvious garbage values regardless so callers get a clear error).
         if let Some(dim) = request.centroid_dim {
@@ -786,6 +800,28 @@ pub async fn semantic_search(
                     .collect();
                 results.sort_by_key(|r| id_order.get(&r.claim_id).copied().unwrap_or(usize::MAX));
 
+                // Both `statement` fields are `claims.content`: the selected
+                // claim's, and the 200-char excerpt of each graph neighbour.
+                // One batch lookup covers the union.
+                let redact_targets: Vec<(Uuid, &mut String)> = results
+                    .iter_mut()
+                    .flat_map(|r| {
+                        let mut fields = vec![(r.claim_id, &mut r.statement)];
+                        if let Some(neighbors) = r.graph_neighbors.as_mut() {
+                            fields.extend(
+                                neighbors.iter_mut().map(|n| (n.claim_id, &mut n.statement)),
+                            );
+                        }
+                        fields
+                    })
+                    .collect();
+                crate::access_control::redact_claim_fields(
+                    &state.db_pool,
+                    requester,
+                    redact_targets,
+                )
+                .await;
+
                 let total = results.len() as u64;
                 let query_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -849,7 +885,7 @@ pub async fn semantic_search(
         })?;
 
         // Step 3: Convert rows to response DTOs
-        let results: Vec<SemanticSearchResult> = rows
+        let mut results: Vec<SemanticSearchResult> = rows
             .iter()
             .map(|row| SemanticSearchResult {
                 claim_id: row.get("claim_id"),
@@ -869,6 +905,14 @@ pub async fn semantic_search(
                 cluster_id: None,
             })
             .collect();
+
+        // `statement` is `claims.content`; the flat path has no neighbours.
+        crate::access_control::redact_claim_fields(
+            &state.db_pool,
+            requester,
+            results.iter_mut().map(|r| (r.claim_id, &mut r.statement)),
+        )
+        .await;
 
         let total = results.len() as u64;
         let query_time_ms = start_time.elapsed().as_millis() as u64;
@@ -1318,7 +1362,11 @@ mod db_integration_tests {
             centroid_dim,
             candidate_pool: None,
         };
-        let response = semantic_search(axum::extract::State(state), axum::Json(request)).await?;
+        // `None` auth_ctx = the anonymous caller the public router produces
+        // without a bearer; these fixtures use public claims, which redaction
+        // leaves untouched.
+        let response =
+            semantic_search(axum::extract::State(state), None, axum::Json(request)).await?;
         Ok(response.0)
     }
 

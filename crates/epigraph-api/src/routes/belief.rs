@@ -1997,16 +1997,19 @@ pub async fn frame_claims_sorted(
         .collect();
 
     // SECURITY (A3): use the authenticated requester, not params.agent_id.
+    // §2.6: one batch lookup for the page, not a query per row — this handler
+    // pages up to `limit` claims.
     let requester = auth_ctx
         .as_ref()
         .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for row in &mut result {
-        let access =
-            crate::access_control::check_content_access(pool, row.claim_id, requester).await;
-        if access == crate::access_control::ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut row.content);
-        }
-    }
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        result
+            .iter_mut()
+            .map(|row| (row.claim_id, &mut row.content)),
+    )
+    .await;
 
     Ok(Json(result))
 }

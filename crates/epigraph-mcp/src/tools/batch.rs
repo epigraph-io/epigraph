@@ -125,56 +125,25 @@ pub async fn system_stats(
 ) -> Result<CallToolResult, McpError> {
     let detailed = params.detailed.unwrap_or(false);
 
-    let claim_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM claims")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let evidence_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM evidence")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let edge_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM edges")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let agent_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let frame_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM frames")
-        .fetch_one(&server.pool)
+    // The counts live in `epigraph_db::StatsRepository` so that this tool and
+    // `GET /api/v1/stats` report the same corpus. Same definitions, same
+    // output keys and values as when the SQL was inline here.
+    let counts = epigraph_db::StatsRepository::corpus_counts(&server.pool)
         .await
         .map_err(internal_error)?;
 
     let mut stats = serde_json::json!({
-        "claims": claim_count.0,
-        "evidence": evidence_count.0,
-        "edges": edge_count.0,
-        "agents": agent_count.0,
-        "frames": frame_count.0,
+        "claims": counts.claims,
+        "evidence": counts.evidence,
+        "edges": counts.edges,
+        "agents": counts.agents,
+        "frames": counts.frames,
     });
 
     if detailed {
-        let workflow_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM claims WHERE 'workflow' = ANY(labels)")
-                .fetch_one(&server.pool)
-                .await
-                .map_err(internal_error)?;
-
-        let challenge_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM challenges")
-            .fetch_one(&server.pool)
+        let detail = epigraph_db::StatsRepository::detailed_counts(&server.pool)
             .await
             .map_err(internal_error)?;
-
-        let embedding_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM claims WHERE embedding IS NOT NULL")
-                .fetch_one(&server.pool)
-                .await
-                .map_err(internal_error)?;
 
         // Structured triple/entity index health. Surfaced here so an empty /
         // unpopulated RDF layer is observable, rather than silently reported as
@@ -184,9 +153,9 @@ pub async fn system_stats(
             .await
             .map_err(internal_error)?;
 
-        stats["workflows"] = serde_json::json!(workflow_count.0);
-        stats["challenges"] = serde_json::json!(challenge_count.0);
-        stats["embeddings"] = serde_json::json!(embedding_count.0);
+        stats["workflows"] = serde_json::json!(detail.workflows);
+        stats["challenges"] = serde_json::json!(detail.challenges);
+        stats["embeddings"] = serde_json::json!(detail.embeddings);
         stats["triples"] = serde_json::json!(index.triples);
         stats["entities"] = serde_json::json!(index.entities);
         stats["entity_mentions"] = serde_json::json!(index.entity_mentions);

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}{{ name }} · Agent · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("entities.css") }}">
+{%- endblock %}
+
+{% block content %}
+<header class="entity-head">
+  <p class="entity-kind">Agent</p>
+  <h1{% if !named %} class="muted"{% endif %}>{{ name }}</h1>
+</header>
+
+<dl class="meta card">
+  <dt>Agent id</dt>
+  <dd class="mono">{{ id }}</dd>
+  <dt>Registered</dt>
+  <dd>{{ created }}</dd>
+  {%- if let Some(link) = orcid %}
+  <dt>{{ link.kind }}</dt>
+  <dd>{% if let Some(href) = link.href %}<a href="{{ href }}" rel="noopener noreferrer">{{ link.text }}</a>{% else %}{{ link.text }}{% endif %}</dd>
+  {%- endif %}
+  {%- if let Some(link) = ror %}
+  <dt>{{ link.kind }}</dt>
+  <dd>{% if let Some(href) = link.href %}<a href="{{ href }}" rel="noopener noreferrer">{{ link.text }}</a>{% else %}{{ link.text }}{% endif %}</dd>
+  {%- endif %}
+  {%- if let Some(key) = public_key %}
+  <dt>Public key</dt>
+  <dd class="mono small">{{ key }}</dd>
+  {%- endif %}
+</dl>
+
+{%- if !labels.is_empty() %}
+<ul class="labels" aria-label="Labels">
+  {%- for label in labels %}
+  <li class="label">{{ label }}</li>
+  {%- endfor %}
+</ul>
+{%- endif %}
+
+<section class="section" aria-labelledby="attributed-title">
+  <h2 id="attributed-title" class="section__title">Attributed claims</h2>
+  <p class="small muted">Claims linked to this agent by an attribution edge,
+  typically authorship recorded when a paper was ingested. Claims this agent
+  submitted itself are not listed here.</p>
+  {%- match claims %}
+  {%- when Degraded::Available { data } %}
+  <p class="small">{{ data.pager.summary }}</p>
+  {%- if !data.rows.is_empty() %}
+  <ul class="link-list">
+    {%- for c in data.rows %}
+    <li>
+      <a class="entity-row__text{% if c.text.redacted %} claim-text--redacted{% endif %}" href="{{ c.url }}">{{ c.text.text }}</a>
+      <p class="small muted">Recorded {{ c.created }} · truth value <span class="num">{{ c.truth }}</span></p>
+    </li>
+    {%- endfor %}
+  </ul>
+  {%- endif %}
+  {%- if data.pager.prev_url.is_some() || data.pager.next_url.is_some() %}
+  <nav class="pager" aria-label="Attributed claims pages">
+    {%- if let Some(url) = data.pager.prev_url %}
+    <a class="button-quiet button" href="{{ url }}" rel="prev">Previous</a>
+    {%- endif %}
+    {%- if let Some(url) = data.pager.next_url %}
+    <a class="button-quiet button" href="{{ url }}" rel="next">Next</a>
+    {%- endif %}
+  </nav>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+
+<section class="section" aria-labelledby="profile-title">
+  <h2 id="profile-title" class="section__title">Epistemic profile</h2>
+  {%- match profile %}
+  {%- when Degraded::Available { data } %}
+  <p class="small muted">Counts every claim this agent submitted or is
+  attributed to, so its total can differ from the attributed list above.</p>
+  <dl class="meta card">
+    <dt>Claims</dt>
+    <dd class="num">{{ data.claim_count }}</dd>
+    <dt>Mean truth value</dt>
+    <dd class="num">{{ data.mean_truth }}</dd>
+    <dt>Refutation rate</dt>
+    <dd class="num">{{ data.refutation_rate }}</dd>
+    <dt>First claim</dt>
+    <dd>{{ data.first }}</dd>
+    <dt>Latest claim</dt>
+    <dd>{{ data.last }}</dd>
+  </dl>
+  <div class="share-grid">
+    <div>
+      <h3>Evidence types</h3>
+      {%- if data.evidence.is_empty() %}
+      <p class="muted small">No evidence recorded.</p>
+      {%- else %}
+      <table class="data share-table">
+        <tbody>
+          {%- for r in data.evidence %}
+          <tr><th scope="row">{{ r.label }}</th><td><meter min="0" max="1" value="{{ r.value }}">{{ r.pct }}</meter></td><td class="num">{{ r.pct }}</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+      {%- endif %}
+    </div>
+    <div>
+      <h3>Claim status</h3>
+      {%- if data.statuses.is_empty() %}
+      <p class="muted small">No status recorded.</p>
+      {%- else %}
+      <table class="data share-table">
+        <tbody>
+          {%- for r in data.statuses %}
+          <tr><th scope="row">{{ r.label }}</th><td><meter min="0" max="1" value="{{ r.value }}">{{ r.pct }}</meter></td><td class="num">{{ r.pct }}</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+      {%- endif %}
+    </div>
+  </div>
+  {%- if !data.topics.is_empty() %}
+  <h3>Topics</h3>
+  <ul class="labels" aria-label="Topics">
+    {%- for t in data.topics %}
+    <li class="label">{{ t }}</li>
+    {%- endfor %}
+    {%- if data.more_topics > 0 %}
+    <li class="small muted">and {{ data.more_topics }} more</li>
+    {%- endif %}
+  </ul>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">{{ reason }}</p>
+  {%- endmatch %}
+</section>
+{% endblock %}

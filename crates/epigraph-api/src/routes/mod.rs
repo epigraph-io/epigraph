@@ -42,6 +42,8 @@ pub mod conventions;
 pub mod cross_source;
 pub mod crud;
 pub mod edges;
+#[cfg(feature = "db")]
+pub mod ego;
 pub mod embeddings;
 #[cfg(feature = "db")]
 pub mod entities;
@@ -84,10 +86,14 @@ pub mod ownership;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
+pub mod placement;
+#[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
 #[cfg(feature = "db")]
 pub mod provenance;
+#[cfg(feature = "db")]
+pub mod provenance_chain;
 pub mod rag;
 pub mod reasoning;
 pub mod revoke_signature;
@@ -95,6 +101,8 @@ pub mod revoke_signature;
 pub mod search;
 pub mod spans;
 pub mod staging;
+#[cfg(feature = "db")]
+pub mod stats;
 pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
@@ -576,6 +584,7 @@ pub fn create_router(state: AppState) -> Router {
             get(graph_neighborhood::claim_compound_neighborhood),
         )
         .route("/api/v1/admin/stats", get(admin::system_stats))
+        .route("/api/v1/stats", get(stats::corpus_stats))
         .route(
             "/api/v1/clusters/boundary-claims",
             get(crud::get_boundary_claims),
@@ -618,6 +627,15 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/claims/:id/provenance",
             get(edges::claim_provenance),
+        )
+        .route(
+            "/api/v1/claims/:id/provenance-chain",
+            get(provenance_chain::claim_provenance_chain),
+        )
+        .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
+        .route(
+            "/api/v1/claims/:id/placement",
+            get(placement::claim_placement),
         )
         .route(
             "/api/v1/claims/:id/supporting-evidence",

@@ -191,16 +191,18 @@ pub async fn overview(
     Query(_params): Query<OverviewParams>,
 ) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
     let pool: &PgPool = &state.db_pool;
-    let latest: Option<(Uuid, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
-        "SELECT run_id, completed_at, degraded
-         FROM graph_cluster_runs
-         ORDER BY completed_at DESC
-         LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(internal)?;
-    let Some((run_id, generated_at, degraded)) = latest else {
+    // Shared with `expand`, `graph_neighborhood::expand` and
+    // `GET /claims/:id/placement`, so an id one of them hands out is an id the
+    // others still recognise.
+    let latest = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let Some(epigraph_db::ClusterRunRow {
+        run_id,
+        completed_at: generated_at,
+        degraded,
+    }) = latest
+    else {
         return Ok(Json(OverviewResponse {
             run_id: None,
             generated_at: None,
@@ -239,21 +241,29 @@ pub async fn overview(
     }))
 }
 
+/// Expand one cluster of the latest run into its claim nodes.
+///
+/// Node `label` is `claims.content`, so it carries the same partition
+/// restrictions `GET /claims/:id` enforces: labels the requester may not read
+/// become `"[REDACTED]"` (§2.6). This route is on the protected router, so the
+/// bearer is required and `auth_ctx` is always present; it stays `Option` to
+/// match every other redacting handler and to fail closed (requester `None` ⇒
+/// public content only) if the layering ever changes.
 pub async fn expand(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(cluster_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<ExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
     let pool: &PgPool = &state.db_pool;
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let Some(run) = latest_run else {
         return Err((StatusCode::NOT_FOUND, "no completed run".into()));
     };
+    let run_id = run.run_id;
     let cluster_exists: Option<(i64,)> =
         sqlx::query_as("SELECT size::bigint FROM graph_clusters WHERE id = $1 AND run_id = $2")
             .bind(cluster_id)
@@ -277,7 +287,7 @@ pub async fn expand(
             .map(|s| (*s).to_string())
             .collect(),
     };
-    let nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
+    let mut nodes: Vec<NodeOut> = sqlx::query_as::<_, NodeOut>(
         "WITH degree AS (
             SELECT m.claim_id, COUNT(e.*) AS deg
             FROM claim_cluster_membership m
@@ -309,6 +319,18 @@ pub async fn expand(
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
     let (edges, filtered_edge_count) =
         fetch_subgraph_edges(pool, &node_ids, allowlist.as_deref()).await?;
+
+    // Every node here is a claim (the SELECT hard-codes `entity_type`), so the
+    // whole node set goes through one ownership lookup.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    crate::access_control::redact_claim_fields(
+        pool,
+        requester,
+        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
+    )
+    .await;
 
     Ok(Json(ExpandResponse {
         cluster_id,
@@ -452,14 +474,17 @@ pub async fn themes_expand(
         return Err((StatusCode::NOT_FOUND, "theme not found".into()));
     }
 
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    // The same lookup `overview`, `expand`, `graph_neighborhood::expand` and
+    // `GET /claims/:id/placement` use. Inlining it here let this route drift
+    // from the one that hands out the `neighborhood_id`s it is expected to
+    // accept; a missing run still answers the synthesized pre-run response.
+    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal)?;
+    let Some(run) = latest_run else {
         return Ok(Json(synthesize_pre_run_response(theme_id)));
     };
+    let run_id = run.run_id;
 
     let budget = params.budget.max(1);
     let neighborhoods: Vec<NeighborhoodOut> = sqlx::query_as::<_, NeighborhoodOut>(
@@ -516,7 +541,7 @@ fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
     }
 }
 
-fn internal(e: sqlx::Error) -> (axum::http::StatusCode, String) {
+fn internal<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 

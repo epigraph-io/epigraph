@@ -528,11 +528,17 @@ pub async fn mark_duplicate(
 #[cfg(feature = "db")]
 pub async fn claim_history(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<VersionHistoryResponse>, ApiError> {
     // Walk the supersession chain using database queries
-    // First, walk backwards to find the root
+    // First, walk backwards to find the root. `mark_duplicate` writes
+    // `dup.supersedes = canonical` without a cycle check, so X↔Y (or X→X)
+    // loops exist; a cycle has no root, so the walk stops at the first
+    // revisited id and starts from the last new one.
     let mut root_id = claim_id;
+    let mut seen_backward: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    seen_backward.insert(claim_id);
     loop {
         let row: Option<(Option<Uuid>,)> =
             sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1")
@@ -550,7 +556,13 @@ pub async fn claim_history(
                     id: claim_id.to_string(),
                 });
             }
-            Some((Some(prev_id),)) => root_id = prev_id,
+            Some((Some(prev_id),)) => {
+                if !seen_backward.insert(prev_id) {
+                    tracing::warn!(%claim_id, %prev_id, "supersedes cycle in claim history");
+                    break;
+                }
+                root_id = prev_id;
+            }
             Some((None,)) => break,
         }
     }
@@ -560,8 +572,13 @@ pub async fn claim_history(
     let mut current_id = Some(root_id);
     let mut version_number: u32 = 1;
     let mut current_version: u32 = 1;
+    // Forward-walk guard for the same cycles: each version is listed once.
+    let mut listed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
     while let Some(id) = current_id {
+        if !listed.insert(id) {
+            break;
+        }
         let row: Option<(Uuid, String, f64, bool, DateTime<Utc>)> = sqlx::query_as(
             "SELECT id, content, truth_value, COALESCE(is_current, true), created_at FROM claims WHERE id = $1",
         )
@@ -603,6 +620,19 @@ pub async fn claim_history(
             break;
         }
     }
+
+    // SECURITY (§2.6): each version is a distinct claim with its own
+    // ownership row — a superseded version can be public while its successor
+    // is private, or the reverse — so the batch check covers the whole chain.
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+    crate::access_control::redact_claim_fields(
+        &state.db_pool,
+        requester,
+        versions.iter_mut().map(|v| (v.claim_id, &mut v.content)),
+    )
+    .await;
 
     let total_versions = versions.len();
 
