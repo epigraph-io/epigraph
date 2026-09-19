@@ -103,7 +103,9 @@ impl BeliefInterval {
 /// - If `frame_id` is `Some`, live-recomputes Bel/Pl/BetP from stored BBAs
 ///   using Dempster's combination rule (mirrors the MCP framed path).
 /// - If `frame_id` is `None`, returns the cached DS columns from the claim row
-///   (mirrors the MCP unframed path).
+///   (mirrors the MCP unframed path). When no DS write has ever populated those
+///   columns, falls back to reconstructing an interval from `truth_value`, reported
+///   with the same `source: "cached"`.
 ///
 /// # Errors
 ///
@@ -158,6 +160,43 @@ pub async fn get_belief(
     }
 
     // ── Unframed path: cached DS columns from claim row ───────────────────
+    //
+    // Backlog 152d9af6. This previously returned
+    // `BeliefInterval::cached_from_truth(claim.truth_value)` unconditionally, so the
+    // persisted DS columns were never read and plausibility was always the hardcoded
+    // 1.0. Both the MCP tool schema and the doc comment above already promised the
+    // cached columns, and `link_epistemic`'s readback already consulted them via
+    // `ClaimRepository::get_belief_columns` — so the two channels disagreed, and a
+    // claim moved by epistemic edges reported its pre-edge truth_value here while
+    // reporting the edge-derived value there.
+    let cols = ClaimRepository::get_belief_columns(pool, ClaimId::from_uuid(claim_id)).await?;
+
+    // A claim row must exist even when its DS columns are NULL, so absence of the row
+    // — not absence of the columns — is what ClaimNotFound means.
+    let Some(cols) = cols else {
+        return Err(BeliefQueryError::ClaimNotFound(claim_id));
+    };
+
+    // `belief` and `plausibility` together are the load-bearing pair: a DS write sets
+    // both, so requiring both prevents reporting a half-written row as authoritative.
+    if let (Some(belief), Some(plausibility)) = (cols.belief, cols.plausibility) {
+        return Ok(BeliefInterval {
+            belief,
+            plausibility,
+            // BetP is derived, and older rows predate the column being populated;
+            // fall back to belief rather than to truth_value, which is the scalar this
+            // whole read path exists to stop conflating with the DS state.
+            pignistic_prob: cols.pignistic_prob.unwrap_or(belief),
+            mass_on_conflict: cols.mass_on_empty.unwrap_or(0.0),
+            mass_on_missing: cols.mass_on_missing.unwrap_or(0.0),
+            framed: false,
+            source: "cached".to_string(),
+        });
+    }
+
+    // No DS state has ever been written for this claim. Fall back to the truth_value
+    // reconstruction rather than reporting zeros — a belief of 0.0 would make an
+    // unassessed claim indistinguishable from a refuted one.
     let claim = ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id))
         .await?
         .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
