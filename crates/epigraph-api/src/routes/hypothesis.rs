@@ -434,9 +434,29 @@ pub async fn promote_hypothesis(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Re-check promotion gate
+    // Re-check promotion gate. `hypothesis_status` is an axum handler, so its
+    // viewer arrives BY VALUE through the extractor and this call needs a
+    // second owned one while `viewer` is still live for the mass-function read
+    // inside the promotion transaction below. `epigraph_db::Viewer` is no
+    // longer `Clone` — see its type doc — so the second one comes from
+    // `detach_scoped`, which hands back only the caller's own scoped read
+    // authority, so this re-check reads exactly what the extractor's viewer
+    // reads and nothing more. `ViewerExtractor` 401s a principal-less token and
+    // resolves an `agents.id`, so it never produces anything else and the
+    // refusal arm is not reachable; it is written as a refusal rather than an
+    // `expect` because the state it would represent is a widening of the
+    // caller's authority, and those fail closed.
+    //
+    // SCOPE, so the paragraph above is not over-read: it is about the VIEWER
+    // this call is given, and it changes nothing else about this handler. A
+    // separate question concerning this handler is filed as `F-SBC-A2` in
+    // `docs/tenancy/progress.json`, with an owner; the analysis is held outside
+    // this repository.
+    let status_viewer = viewer.detach_scoped().ok_or_else(|| ApiError::Forbidden {
+        reason: "promotion re-check requires the caller's own read authority".to_string(),
+    })?;
     let status_response = hypothesis_status(
-        ViewerExtractor(viewer.clone()),
+        ViewerExtractor(status_viewer),
         State(state.clone()),
         Path(id),
     )

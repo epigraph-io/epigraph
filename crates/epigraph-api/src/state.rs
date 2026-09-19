@@ -1089,9 +1089,11 @@ impl AppState {
     /// Returns one [`epigraph_db::MaintenanceSession`] owning the privileged
     /// connection and the bypass viewer together: the viewer comes out only as
     /// `&Viewer`, so a call site that drops the connection and goes on using the
-    /// viewer is now a borrow error rather than a review item. That is the
-    /// accidental half of `D-PR17-maintenance-lease-coupling-is-a-convention`;
-    /// the deliberate half is not closed, because `Viewer` is `Clone` — see
+    /// viewer is now a borrow error rather than a review item. A previous
+    /// revision of this sentence called that only the ACCIDENTAL half of
+    /// `D-PR17-maintenance-lease-coupling-is-a-convention`, the deliberate half
+    /// being open because `Viewer` was `Clone`. It is no longer `Clone`, so
+    /// both halves are closed for the viewer this session owns — see
     /// [`epigraph_db::MaintenanceSession`]. The mint is
     /// `ScopedPool::maintenance_session`, shared with the CLI and MCP wrappers.
     ///

@@ -74,8 +74,8 @@ mod fixture;
 
 use common::{build_test_server, first_text};
 use epigraph_db::visibility::Viewer;
-use epigraph_mcp::tools;
 use epigraph_mcp::types::{ListEventsParams, ListMatchCandidatesParams, SystemStatsParams};
+use epigraph_mcp::{tools, EpiGraphMcpFull};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -670,26 +670,28 @@ async fn system_stats_detailed_counts_narrow_for_a_stranger_and_widen_for_the_ow
     let t = tenants(&pool).await;
     let server = build_test_server(pool.clone());
 
-    let stats = |viewer: &'_ Viewer| {
-        let server = &server;
-        let viewer = viewer.clone();
-        async move {
-            first_text(
-                &tools::batch::system_stats(
-                    server,
-                    &viewer,
-                    SystemStatsParams {
-                        detailed: Some(true),
-                    },
-                )
-                .await
-                .expect("detailed stats"),
+    // An `async fn` rather than a closure returning `async move`: a closure's
+    // return type cannot name the lifetime of its own `&Viewer` argument, which
+    // is why the previous shape had to clone the viewer to get a `'static`-ish
+    // future. `epigraph_db::Viewer` is no longer `Clone`, and this borrows it
+    // for exactly the call that spends it — which is what the test wanted all
+    // along.
+    async fn stats(server: &EpiGraphMcpFull, viewer: &Viewer) -> serde_json::Value {
+        first_text(
+            &tools::batch::system_stats(
+                server,
+                viewer,
+                SystemStatsParams {
+                    detailed: Some(true),
+                },
             )
-        }
-    };
+            .await
+            .expect("detailed stats"),
+        )
+    }
 
-    let stranger_before = detail_count(&stats(&t.stranger_viewer).await, "workflows");
-    let owner_before = detail_count(&stats(&t.owner_viewer).await, "workflows");
+    let stranger_before = detail_count(&stats(&server, &t.stranger_viewer).await, "workflows");
+    let owner_before = detail_count(&stats(&server, &t.owner_viewer).await, "workflows");
 
     let private =
         fixture::seed_group_claim(&pool, t.owner, t.owner_group, "a private workflow claim").await;
@@ -700,13 +702,13 @@ async fn system_stats_detailed_counts_narrow_for_a_stranger_and_widen_for_the_ow
         .expect("label the claim");
 
     assert_eq!(
-        detail_count(&stats(&t.stranger_viewer).await, "workflows"),
+        detail_count(&stats(&server, &t.stranger_viewer).await, "workflows"),
         stranger_before,
         "the stranger's `workflows` count must not move for a group-private \
          claim it cannot read"
     );
     assert_eq!(
-        detail_count(&stats(&t.owner_viewer).await, "workflows"),
+        detail_count(&stats(&server, &t.owner_viewer).await, "workflows"),
         owner_before + 1,
         "the owner must count its own — without this the assertion above is \
          satisfied by a statement that returns nothing to anybody"

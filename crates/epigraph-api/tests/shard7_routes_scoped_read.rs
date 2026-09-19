@@ -487,8 +487,13 @@ async fn get_claim_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     let viewer = viewer_for(&pool, viewer_agent).await;
     let state = split_state(&pool).await;
 
+    // Two handler calls, two viewers: `ViewerExtractor` takes its viewer BY
+    // VALUE and `epigraph_db::Viewer` is no longer `Clone`. Resolving the same
+    // principal twice is what a second request would do anyway, and it keeps
+    // the fixture free of any viewer-duplication helper.
+    let viewer_again = viewer_for(&pool, viewer_agent).await;
     let served = get_claim(
-        ViewerExtractor(viewer.clone()),
+        ViewerExtractor(viewer_again),
         State(state.clone()),
         Path(mine),
         Query(GetClaimQuery {
