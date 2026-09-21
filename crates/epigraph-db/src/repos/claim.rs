@@ -30,6 +30,72 @@ pub struct ClaimBeliefColumns {
     pub mass_on_missing: Option<f64>,
 }
 
+/// Sort key for [`ClaimRepository::list_filtered`].
+///
+/// An enum, not a string: the column name is interpolated into the `ORDER BY`
+/// clause, so it must never be reachable from request data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimSortField {
+    /// `ORDER BY created_at` (the endpoint default).
+    #[default]
+    CreatedAt,
+    /// `ORDER BY truth_value`.
+    TruthValue,
+}
+
+/// Sort direction for [`ClaimRepository::list_filtered`]. Enum for the same
+/// reason as [`ClaimSortField`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimSortOrder {
+    /// Highest / most-recent first (the endpoint default).
+    #[default]
+    Desc,
+    /// Lowest / oldest first.
+    Asc,
+}
+
+/// Predicate set shared by [`ClaimRepository::list_filtered`] and
+/// [`ClaimRepository::count_filtered`].
+///
+/// Every field is `None` by default, meaning "do not constrain this column",
+/// so `ClaimListFilter::default()` selects the whole table. The two methods
+/// bind this struct through the **same** WHERE clause, which is the point of
+/// the struct: a `total` produced by a different predicate set than the rows
+/// it describes is the defect this type exists to prevent (backlog
+/// `2265a67b`).
+#[derive(Debug, Default, Clone)]
+pub struct ClaimListFilter<'a> {
+    /// Case-insensitive `content ILIKE '%search%'`.
+    pub search: Option<&'a str>,
+    /// Inclusive lower bound on `truth_value`.
+    pub truth_min: Option<f64>,
+    /// Inclusive upper bound on `truth_value`.
+    pub truth_max: Option<f64>,
+    /// Restrict to claims authored by this agent.
+    pub agent_id: Option<Uuid>,
+    /// Drop claims authored by this agent (composes with `agent_id`).
+    pub exclude_agent_id: Option<Uuid>,
+    /// Restrict to current (`true`) or superseded (`false`) claims.
+    /// `None` returns both.
+    pub is_current: Option<bool>,
+    /// Inclusive lower bound on `created_at`.
+    pub created_after: Option<DateTime<Utc>>,
+    /// Inclusive upper bound on `created_at`.
+    pub created_before: Option<DateTime<Utc>>,
+    /// Restrict to this id set (used for predicates resolved by a prior query,
+    /// e.g. "has a reasoning trace with methodology X").
+    ///
+    /// **`Some(&[])` means "nothing matches", not "no filter"** — it becomes
+    /// `id = ANY('{}')`, which is false for every row. A caller that resolved
+    /// an id set and found it empty must pass the empty slice, not `None`, or
+    /// the filter inverts into "return everything".
+    pub ids: Option<&'a [Uuid]>,
+    /// `ORDER BY` column (ignored by `count_filtered`).
+    pub sort_by: ClaimSortField,
+    /// `ORDER BY` direction (ignored by `count_filtered`).
+    pub sort_order: ClaimSortOrder,
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -1505,6 +1571,178 @@ impl ClaimRepository {
         Ok(claims)
     }
 
+    /// WHERE clause shared verbatim by [`Self::list_filtered`] and
+    /// [`Self::count_filtered`].
+    ///
+    /// Every predicate is guarded by `$n IS NULL OR …` and every parameter is
+    /// bound unconditionally in a fixed order (see [`Self::bind_filter`]), so
+    /// the two queries cannot drift apart: there is one clause string and one
+    /// bind order, used by both.
+    const FILTER_WHERE: &'static str = r#"
+            WHERE ($1::text IS NULL OR content ILIKE $1)
+              AND ($2::float8 IS NULL OR truth_value >= $2)
+              AND ($3::float8 IS NULL OR truth_value <= $3)
+              AND ($4::uuid IS NULL OR agent_id = $4)
+              AND ($5::uuid IS NULL OR agent_id <> $5)
+              AND ($6::bool IS NULL OR COALESCE(is_current, true) = $6)
+              AND ($7::timestamptz IS NULL OR created_at >= $7)
+              AND ($8::timestamptz IS NULL OR created_at <= $8)
+              AND ($9::uuid[] IS NULL OR id = ANY($9))
+    "#;
+
+    /// Bind `$1..$9` of [`Self::FILTER_WHERE`], in order.
+    ///
+    /// Generic over the query type so `query_as` (rows) and `query_scalar`
+    /// (count) share one implementation — the binds cannot diverge between
+    /// the two call sites because there is only one.
+    fn bind_filter<'q, O>(
+        query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+        search_pattern: Option<String>,
+        filter: &ClaimListFilter<'_>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+        query
+            .bind(search_pattern)
+            .bind(filter.truth_min)
+            .bind(filter.truth_max)
+            .bind(filter.agent_id)
+            .bind(filter.exclude_agent_id)
+            .bind(filter.is_current)
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .bind(filter.ids.map(|ids| ids.to_vec()))
+    }
+
+    /// `%`-wrap the substring search, or `None` when no search was requested.
+    fn filter_search_pattern(filter: &ClaimListFilter<'_>) -> Option<String> {
+        filter.search.map(|s| format!("%{}%", s))
+    }
+
+    /// Count the claims matching `filter` — a real `COUNT(*)` over the whole
+    /// table, evaluated by PostgreSQL.
+    ///
+    /// Paired with [`Self::list_filtered`], which applies the identical
+    /// predicates before `LIMIT`. Callers must use the pair: the previous
+    /// approach (fetch a capped window, filter in memory, report the slice
+    /// length as `total`) both understated the count and, because the window
+    /// was always the most-recent rows, returned an empty set for filters that
+    /// only match older claims — indistinguishable from a true zero
+    /// (backlog `2265a67b`).
+    ///
+    /// Uses the runtime `query_scalar` form (no compile-time `.sqlx` cache
+    /// entry) to keep `cargo sqlx prepare` out of this change's footprint —
+    /// same rationale as [`Self::contents_by_ids`] and [`Self::labels_by_ids`].
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn count_filtered(
+        pool: &PgPool,
+        filter: &ClaimListFilter<'_>,
+    ) -> Result<i64, DbError> {
+        let sql = format!("SELECT COUNT(*) FROM claims{}", Self::FILTER_WHERE);
+        // `query_scalar` is `query_as` over a 1-tuple; going through the
+        // tuple form lets `bind_filter` serve both methods.
+        let (count,): (i64,) = Self::bind_filter(
+            sqlx::query_as::<_, (i64,)>(&sql),
+            Self::filter_search_pattern(filter),
+            filter,
+        )
+        .fetch_one(pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// List the claims matching `filter`, sorted and paginated **in SQL**.
+    ///
+    /// All predicates run before `LIMIT`/`OFFSET`, so a matching claim is
+    /// reachable regardless of how recently it was created — the property
+    /// [`Self::list_by_truth_range`] established for `truth_value` and this
+    /// method generalises to the rest of the `GET /api/v1/claims` filter set.
+    ///
+    /// The returned `Claim`s are post-fixed with the row's `is_current` and
+    /// `supersedes`; `claim_from_row`'s signature stays untouched per
+    /// `CLAUDE.md`, same shape as [`Self::list`] and [`Self::list_by_labels`].
+    ///
+    /// `ORDER BY` is built from the [`ClaimSortField`] / [`ClaimSortOrder`]
+    /// enums, never from caller-supplied strings, and carries an `id`
+    /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across rows sharing a
+    /// `created_at` or `truth_value`.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails, or
+    /// [`DbError`] from [`TruthValue::new`] on an out-of-range stored value.
+    #[instrument(skip(pool))]
+    pub async fn list_filtered(
+        pool: &PgPool,
+        filter: &ClaimListFilter<'_>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
+        let sort_column = match filter.sort_by {
+            ClaimSortField::CreatedAt => "created_at",
+            ClaimSortField::TruthValue => "truth_value",
+        };
+        let direction = match filter.sort_order {
+            ClaimSortOrder::Desc => "DESC",
+            ClaimSortOrder::Asc => "ASC",
+        };
+
+        let sql = format!(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
+            FROM claims{where_clause}
+            ORDER BY {sort_column} {direction}, id {direction}
+            LIMIT $10 OFFSET $11
+            "#,
+            where_clause = Self::FILTER_WHERE,
+        );
+
+        let rows = Self::bind_filter(
+            sqlx::query_as::<_, Row>(&sql),
+            Self::filter_search_pattern(filter),
+            filter,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            let mut claim = claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            );
+            // Post-fix retirement state; `claim_from_row` defaults these to
+            // (true, None) regardless of what the row actually says.
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
+        }
+
+        Ok(claims)
+    }
+
     /// List claims whose `truth_value` falls within `[min_truth, max_truth]`,
     /// most-recent first. The range filter is applied in SQL **before**
     /// `LIMIT`, so matching claims are reachable regardless of how recently
@@ -1515,6 +1753,7 @@ impl ClaimRepository {
     /// outside that window is silently invisible (backlog bug `5a55a48e`:
     /// `query_claims(max_truth=0.75)` returned empty while matching claims
     /// existed).
+    ///
     pub async fn list_by_truth_range(
         pool: &PgPool,
         min_truth: f64,
