@@ -293,152 +293,65 @@ pub async fn list_claims_query(
         None => None,
     };
 
-    // ---- Fast path: no post-fetch filters, default sort ----
-    // The legacy in-memory pipeline below caps the working set at 10_000 rows
-    // and reports `total` as the slice length, which understates the true table
-    // count on large databases. When the request needs no truth/agent/date/
-    // methodology/evidence-type filtering and uses the default sort, we can let
-    // PostgreSQL do COUNT(*) + LIMIT/OFFSET directly.
-    let needs_in_memory_filters = params.truth_min.is_some()
-        || params.truth_max.is_some()
-        || params.agent_id.is_some()
-        || params.exclude_agent_id.is_some()
-        || params.is_current.is_some()
-        || params.created_after.is_some()
-        || params.created_before.is_some()
-        || methodology_ids.is_some()
-        || evidence_type_ids.is_some()
-        || sort_by != "created_at"
-        || sort_order != "desc";
+    // Intersect the two pre-resolved id sets into the single `ids` predicate
+    // the repository filter takes. `Some(empty)` is load-bearing: a
+    // methodology/evidence_type that matched nothing must select zero claims,
+    // so it stays `Some(&[])` (→ `id = ANY('{}')` → no rows). Collapsing it to
+    // `None` would invert the filter into "return every claim".
+    let id_filter: Option<Vec<uuid::Uuid>> = match (&methodology_ids, &evidence_type_ids) {
+        (Some(m), Some(e)) => Some(m.intersection(e).copied().collect()),
+        (Some(m), None) => Some(m.iter().copied().collect()),
+        (None, Some(e)) => Some(e.iter().copied().collect()),
+        (None, None) => None,
+    };
 
-    if !needs_in_memory_filters {
-        let total = ClaimRepository::count(&state.db_pool, params.content_contains.as_deref())
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Database count failed: {}", e),
-            })? as usize;
+    // ---- Single path: every predicate runs in SQL, before LIMIT ----
+    // `total` is a real COUNT(*) over the same WHERE clause that produced the
+    // rows. The previous implementation diverted any filtered request to an
+    // in-memory pipeline over the 10_000 most-recent rows and reported the
+    // filtered slice length as `total` — which both understated the count and
+    // returned an empty set (indistinguishable from a true zero) for filters
+    // that only match older claims (backlog `2265a67b`, and the push-down
+    // residual of `f1992766`).
+    let filter = epigraph_db::ClaimListFilter {
+        search: params.content_contains.as_deref(),
+        truth_min: params.truth_min,
+        truth_max: params.truth_max,
+        agent_id: params.agent_id,
+        exclude_agent_id: params.exclude_agent_id,
+        is_current: params.is_current,
+        created_after: params.created_after,
+        created_before: params.created_before,
+        ids: id_filter.as_deref(),
+        sort_by: match sort_by.as_str() {
+            "truth_value" => epigraph_db::ClaimSortField::TruthValue,
+            _ => epigraph_db::ClaimSortField::CreatedAt,
+        },
+        sort_order: if sort_order == "asc" {
+            epigraph_db::ClaimSortOrder::Asc
+        } else {
+            epigraph_db::ClaimSortOrder::Desc
+        },
+    };
 
-        let rows = ClaimRepository::list(
-            &state.db_pool,
-            limit as i64,
-            offset as i64,
-            params.content_contains.as_deref(),
-        )
+    let total = ClaimRepository::count_filtered(&state.db_pool, &filter)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Database count failed: {}", e),
+        })? as usize;
+
+    let rows = ClaimRepository::list_filtered(&state.db_pool, &filter, limit as i64, offset as i64)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {}", e),
         })?;
 
-        let paginated: Vec<ClaimSummary> = rows
-            .into_iter()
-            .map(|c| ClaimSummary {
-                id: c.id.as_uuid(),
-                statement: c.content.clone(),
-                content: c.content.clone(),
-                truth_value: c.truth_value.value(),
-                agent_id: c.agent_id.as_uuid(),
-                is_current: c.is_current,
-                created_at: c.created_at,
-                updated_at: c.updated_at,
-            })
-            .collect();
-
-        return Ok(Json(ClaimListResponse {
-            claims: paginated,
-            total,
-            limit,
-            offset,
-        }));
-    }
-
-    // ---- Slow path: filters/sort require fetching a working set into memory ----
-    // Capped at 10_000 rows; the reported `total` reflects the filtered slice.
-    let all_claims = ClaimRepository::list(
-        &state.db_pool,
-        10_000,
-        0,
-        params.content_contains.as_deref(),
-    )
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Database query failed: {}", e),
-    })?;
-
-    let mut claims: Vec<_> = all_claims.iter().collect();
-
-    // ---- Apply filters ----
-    if let Some(truth_min) = params.truth_min {
-        claims.retain(|c| c.truth_value.value() >= truth_min);
-    }
-    if let Some(truth_max) = params.truth_max {
-        claims.retain(|c| c.truth_value.value() <= truth_max);
-    }
-    if let Some(agent_id) = params.agent_id {
-        claims.retain(|c| c.agent_id.as_uuid() == agent_id);
-    }
-    // Filter out a specific agent (composes with agent_id above)
-    if let Some(exclude_agent_id) = params.exclude_agent_id {
-        claims.retain(|c| c.agent_id.as_uuid() != exclude_agent_id);
-    }
-    if let Some(is_current) = params.is_current {
-        claims.retain(|c| c.is_current == is_current);
-    }
-    if let Some(created_after) = params.created_after {
-        claims.retain(|c| c.created_at >= created_after);
-    }
-    if let Some(created_before) = params.created_before {
-        claims.retain(|c| c.created_at <= created_before);
-    }
-    if let Some(ref search) = params.content_contains {
-        let search_lower = search.to_lowercase();
-        claims.retain(|c| c.content.to_lowercase().contains(&search_lower));
-    }
-    if let Some(ref ids) = methodology_ids {
-        claims.retain(|c| ids.contains(&c.id.as_uuid()));
-    }
-    if let Some(ref ids) = evidence_type_ids {
-        claims.retain(|c| ids.contains(&c.id.as_uuid()));
-    }
-
-    // ---- Sort ----
-    let ascending = sort_order == "asc";
-    match sort_by.as_str() {
-        "truth_value" => {
-            claims.sort_by(|a, b| {
-                let cmp = a
-                    .truth_value
-                    .value()
-                    .partial_cmp(&b.truth_value.value())
-                    .unwrap_or(std::cmp::Ordering::Equal);
-                if ascending {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            });
-        }
-        _ => {
-            claims.sort_by(|a, b| {
-                let cmp = a.created_at.cmp(&b.created_at);
-                if ascending {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            });
-        }
-    }
-
-    let total = claims.len();
-
-    let paginated: Vec<ClaimSummary> = claims
+    let paginated: Vec<ClaimSummary> = rows
         .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
         .map(|c| ClaimSummary {
             id: c.id.as_uuid(),
             statement: c.content.clone(),
-            content: c.content.clone(),
+            content: c.content,
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid(),
             is_current: c.is_current,
