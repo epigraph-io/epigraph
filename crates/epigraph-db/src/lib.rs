@@ -124,7 +124,10 @@ pub use repos::graph_view::{
     AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
     SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
-pub use repos::mass_function::MassFunctionRow;
+pub use repos::mass_function::{CachedBelief, MassFunctionRow};
+// `repos::ownership` is intentionally absent: 40969da5 retired the legacy
+// `ownership` table on this line. The export came in from main, which still
+// carries the module, and is dropped rather than resurrected.
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::ScopedBeliefRow;
 

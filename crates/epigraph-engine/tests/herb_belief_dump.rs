@@ -26,8 +26,14 @@ use uuid::Uuid;
 #[tokio::test]
 #[ignore = "operator-driven: needs DATABASE_URL + MODE"]
 async fn herb_belief_dump() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-    let mode = std::env::var("MODE").expect("MODE=demo|ingest");
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("SKIP: DATABASE_URL not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(mode) = std::env::var("MODE") else {
+        eprintln!("SKIP: MODE not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     let viewer = fixture::public_viewer(&pool).await;
 

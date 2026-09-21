@@ -2732,6 +2732,27 @@ impl ClaimRepository {
 
     /// List claims with pagination
     ///
+    /// # Returns
+    /// Claims post-fixed with the row's real `is_current` and `supersedes`, so
+    /// superseded rows are distinguishable from live ones. Before backlog bug
+    /// `f1992766` this SELECT omitted both columns and every row inherited
+    /// `claim_from_row`'s defaults (`is_current = true`, `supersedes = None`) —
+    /// `GET /api/v1/claims` asserted currency it had never read, and that
+    /// endpoint's `?is_current=false` filter (an in-memory `retain` over this
+    /// result) compared against a constant and could never match.
+    ///
+    /// `supersedes` has no reader on the `ClaimSummary` path today, but it is
+    /// projected anyway: leaving a `Claim` field fabricated because nothing
+    /// currently reads it is precisely how `is_current` rotted, and the two
+    /// belong to the same retirement state. Every other retirement-aware
+    /// reader ([`Self::get_by_id`], [`Self::get_by_id_with_labels`],
+    /// [`Self::list_by_labels`]) post-fixes both.
+    ///
+    /// Uses a local `Row` rather than the shared [`ClaimRow`] because that
+    /// struct backs five other SELECTs that don't project these columns, and
+    /// `claim_from_row`'s signature stays untouched per `CLAUDE.md` — same
+    /// shape as [`Self::list_by_labels`].
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
@@ -2742,6 +2763,19 @@ impl ClaimRepository {
         offset: i64,
         search: Option<&str>,
     ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
         let search_pattern = search.map(|s| format!("%{}%", s));
 
         // Two shapes, two bind indices: the ILIKE shape consumes $3, so the
@@ -2749,7 +2783,8 @@ impl ClaimRepository {
         let (query_str, vis_bind) = if search_pattern.is_some() {
             (
                 r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
             FROM claims
             WHERE content ILIKE $3
               /* {VISIBILITY:claims} */
@@ -2761,7 +2796,8 @@ impl ClaimRepository {
         } else {
             (
                 r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
             FROM claims
             WHERE true /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
@@ -2772,7 +2808,7 @@ impl ClaimRepository {
         };
         let sql = viewer.splice(query_str, vis_bind);
 
-        let mut query = sqlx::query_as::<_, ClaimRow>(&sql).bind(limit).bind(offset);
+        let mut query = sqlx::query_as::<_, Row>(&sql).bind(limit).bind(offset);
 
         if let Some(s) = search_pattern {
             query = query.bind(s);
@@ -2788,7 +2824,7 @@ impl ClaimRepository {
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
 
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -2796,7 +2832,12 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            // Post-fix retirement state; `claim_from_row` defaults these to
+            // (true, None) regardless of what the row actually says.
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
 
         Ok(claims)

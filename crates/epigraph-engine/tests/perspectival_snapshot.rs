@@ -118,8 +118,14 @@ async fn generate_snapshot() {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
-    let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
-    let out = std::env::var("SNAPSHOT_OUT").expect("set SNAPSHOT_OUT");
+    let Ok(dir) = std::env::var("SEED_DIR") else {
+        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(out) = std::env::var("SNAPSHOT_OUT") else {
+        eprintln!("SKIP: SNAPSHOT_OUT not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 

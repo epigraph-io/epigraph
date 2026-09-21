@@ -370,11 +370,14 @@ pub async fn auto_wire_ds_for_claim(
     MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
+        epigraph_db::CachedBelief {
+            belief: bel,
+            plausibility: pl,
+            mass_on_empty: conflict,
+            pignistic_prob: Some(betp),
+            mass_on_missing: missing,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
@@ -577,11 +580,14 @@ pub async fn auto_wire_ds_update(
     MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
+        epigraph_db::CachedBelief {
+            belief: bel,
+            plausibility: pl,
+            mass_on_empty: conflict,
+            pignistic_prob: Some(betp),
+            mass_on_missing: missing,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;

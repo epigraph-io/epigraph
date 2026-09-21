@@ -138,16 +138,9 @@ pub async fn run_claim(
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<usize, String> {
-    let frames = claim_frames(pool, claim_id).await?;
-    let mut written = 0usize;
-    for frame_id in frames {
-        let did = epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-            pool, viewer, claim_id, frame_id,
-        )
-        .await?;
-        if did {
-            written += 1;
-        }
-    }
-    Ok(written)
+    // Backlog 696d3a1c: one frame owns the shared claims.* cache. Looping over
+    // every frame wrote it repeatedly and let the alphabetically last win.
+    let did =
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id).await?;
+    Ok(usize::from(did))
 }
