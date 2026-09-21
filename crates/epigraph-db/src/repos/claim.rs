@@ -2502,7 +2502,8 @@ impl ClaimRepository {
     /// generate deterministic UUIDs and rely on idempotent re-runs.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` for non-conflict failures.
+    /// Returns `DbError::QueryFailed` for non-conflict failures, or
+    /// `DbError::InvalidData` if a label carries unexpanded shell syntax.
     #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
@@ -2513,6 +2514,11 @@ impl ClaimRepository {
         truth: TruthValue,
         labels: &[String],
     ) -> Result<bool, DbError> {
+        // Labels-at-creation is the second caller-supplied label surface (the
+        // ingest paths); same predicate, refused before the INSERT so a bad
+        // label never reaches a row.
+        crate::label_validation::reject_unexpanded_labels(labels)?;
+
         let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels) \
              VALUES ($1, $2, $3, $4, $5, $6) \
@@ -4120,8 +4126,16 @@ impl ClaimRepository {
     /// Uses PostgreSQL array functions. Idempotent: adding a duplicate is a no-op,
     /// removing a nonexistent label is a no-op. Returns the updated labels array.
     ///
+    /// This is the chokepoint for caller-supplied labels: the HTTP
+    /// `PATCH /api/v1/claims/:id/labels` handler and the MCP `submit_claim`,
+    /// `update_labels` and `resolve_backlog_item` tools all route their label
+    /// writes through here, so the `add`-side validation below covers every one.
+    /// `remove` is deliberately NOT validated — it is the remediation path for
+    /// labels already corrupted in the graph.
+    ///
     /// # Errors
-    /// Returns `DbError::NotFound` if the claim doesn't exist.
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if an added label carries unexpanded shell syntax.
     #[instrument(skip(pool))]
     pub async fn update_labels(
         pool: &PgPool,
@@ -4129,6 +4143,8 @@ impl ClaimRepository {
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add)?;
+
         let row: Option<(Vec<String>,)> = sqlx::query_as(
             r#"
             WITH current AS (
@@ -4167,12 +4183,22 @@ impl ClaimRepository {
     }
 
     /// Update labels using an existing connection (e.g. inside a transaction).
+    ///
+    /// Same `add`-only validation contract as [`Self::update_labels`]; this is
+    /// the variant `patch_claim_atomic_conn` (HTTP `PATCH /api/v1/claims/:id`
+    /// and MCP `patch_claim`) calls, so the rejection reaches those too.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if an added label carries unexpanded shell syntax.
     pub async fn update_labels_conn(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add)?;
+
         use sqlx::Row;
         let row: Option<sqlx::postgres::PgRow> = sqlx::query(
             r#"WITH current AS (
@@ -4475,6 +4501,84 @@ mod label_tests {
             }
             other => panic!("Expected NotFound, got: {other:?}"),
         }
+    }
+
+    /// An unexpanded shell variable in `add` must be refused AND must leave the
+    /// stored label array untouched.
+    ///
+    /// Load-bearing: against the pre-fix `update_labels` (no
+    /// `reject_unexpanded_labels` call) the UPDATE runs, `result` is `Ok`, and
+    /// the re-read finds `group:$EPICLAW_GROUP_ID` in `claims.labels` — exactly
+    /// the corruption observed on claim 2a0125e2. Both assertions fail there.
+    #[tokio::test]
+    #[ignore] // Requires live database
+    async fn update_labels_refuses_unexpanded_shell_variable_and_writes_nothing() {
+        let (pool, claim_id, agent_id) = setup_test_claim().await;
+        ClaimRepository::update_labels(&pool, claim_id, &["keeper".into()], &[])
+            .await
+            .unwrap();
+
+        let result = ClaimRepository::update_labels(
+            &pool,
+            claim_id,
+            &["good-label".into(), "group:$EPICLAW_GROUP_ID".into()],
+            &[],
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(DbError::InvalidData { .. })),
+            "expected InvalidData, got: {result:?}"
+        );
+
+        // The write must not have happened AT ALL — neither the bad label nor
+        // its well-formed sibling from the same array.
+        let stored: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            vec!["keeper".to_string()],
+            "a refused label array must leave claims.labels byte-for-byte unchanged"
+        );
+
+        cleanup(&pool, claim_id, agent_id).await;
+    }
+
+    /// The `remove` side must NOT be validated: removal is the only remediation
+    /// path for the rows already carrying `group:$EPICLAW_GROUP_ID`.
+    ///
+    /// Load-bearing in the other direction: this fails against the plausible
+    /// over-broad fix that validates both `add` and `remove`, which would make
+    /// the existing corruption permanently unfixable through the API.
+    #[tokio::test]
+    #[ignore] // Requires live database
+    async fn update_labels_still_removes_an_already_corrupted_label() {
+        let (pool, claim_id, agent_id) = setup_test_claim().await;
+
+        // Seed the corruption the way it actually got there — a direct write,
+        // bypassing the new guard (the guard is what stops NEW ones).
+        sqlx::query(
+            "UPDATE claims SET labels = ARRAY['backlog','group:$EPICLAW_GROUP_ID'] WHERE id = $1",
+        )
+        .bind(claim_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let after = ClaimRepository::update_labels(
+            &pool,
+            claim_id,
+            &[],
+            &["group:$EPICLAW_GROUP_ID".into()],
+        )
+        .await
+        .expect("removing an already-corrupted label must remain possible");
+
+        assert_eq!(after, vec!["backlog".to_string()]);
+        cleanup(&pool, claim_id, agent_id).await;
     }
 
     /// Verify `pairwise_cosine_distance` enforces the `MAX_PAIRWISE_IDS` cap.
