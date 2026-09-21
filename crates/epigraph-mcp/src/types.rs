@@ -155,6 +155,15 @@ pub struct QueryClaimsParams {
 
     #[schemars(description = "Maximum number of results (default 20)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Retirement-state filter. DEFAULTS TO true: superseded/refuted claims are \
+                       excluded unless you pass false explicitly, which returns ONLY superseded \
+                       rows. Omitting this is not 'no filter' — it is 'current claims only', so a \
+                       queue built on this tool does not keep re-surfacing claims that have \
+                       already been resolved."
+    )]
+    pub is_current: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

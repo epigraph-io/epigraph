@@ -432,9 +432,18 @@ pub async fn query_claims(
     let min = params.min_truth.unwrap_or(0.0);
     let max = params.max_truth.unwrap_or(1.0);
 
-    // Filter by truth range in SQL (before LIMIT) so matching claims outside
-    // the most-recent `limit` rows are still reachable (bug 5a55a48e).
-    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, limit, 0)
+    // Retirement state defaults to current-only. This tool is used as an
+    // assessment-queue proxy (`query_claims(max_truth=0.4)`), and returning
+    // superseded/refuted claims made already-resolved work resurface every
+    // cycle (backlog a85ee585). `Some(false)` still yields superseded rows for
+    // callers that want them; the schema documents that omission means
+    // current-only.
+    let is_current = params.is_current.or(Some(true));
+
+    // Filter by truth range AND retirement state in SQL (before LIMIT) so
+    // matching claims outside the most-recent `limit` rows are still reachable
+    // (bug 5a55a48e) and excluded rows don't consume the limit budget.
+    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, is_current, limit, 0)
         .await
         .map_err(internal_error)?;
 
@@ -455,8 +464,8 @@ pub async fn query_claims(
     // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
     // while get_claim on the same id returned them). Batch fetch avoids the
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
-    // is_current so superseded rows (which list_by_truth_range returns) keep
-    // their labels, matching get_labels' label source. A missing id → no labels.
+    // is_current, so an explicit `is_current=false` request keeps its labels,
+    // matching get_labels' label source. A missing id → no labels.
     let labels_map = ClaimRepository::labels_by_ids(&server.pool, &ids)
         .await
         .map_err(internal_error)?;
@@ -479,8 +488,11 @@ pub async fn query_claims(
                 content_hash,
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
-                is_current: true,
-                supersedes: None,
+                // The row's real retirement state, not a hardcoded `true` /
+                // `None` (backlog a85ee585) — `list_by_truth_range` now
+                // projects both columns.
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
             }
         })
         .collect();

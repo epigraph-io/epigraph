@@ -178,6 +178,9 @@ async fn query_claims_redacts_only_unauthorized_rows(pool: PgPool) {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
             limit: Some(50),
+            // Both seeded rows are current; the default would do, but pin it
+            // so the test states which population it asserts over.
+            is_current: Some(true),
         },
         Some(stranger),
     )

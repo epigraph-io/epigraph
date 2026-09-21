@@ -1754,24 +1754,51 @@ impl ClaimRepository {
     /// `query_claims(max_truth=0.75)` returned empty while matching claims
     /// existed).
     ///
+    /// `is_current` filters retirement state in SQL for the same reason:
+    /// `Some(true)` = current claims only, `Some(false)` = superseded only,
+    /// `None` = both. The returned `Claim`s carry the row's real `is_current`
+    /// and `supersedes` (post-fixed after `claim_from_row`, whose signature
+    /// stays untouched per `CLAUDE.md`), so a caller can no longer assert
+    /// currency it never read — the defect `ClaimRepository::list` had in
+    /// backlog `f1992766` and this query still had in `a85ee585`.
     pub async fn list_by_truth_range(
         pool: &PgPool,
         min_truth: f64,
         max_truth: f64,
+        is_current: Option<bool>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Claim>, DbError> {
-        let rows = sqlx::query_as::<_, ClaimRow>(
+        // Inline row type, NOT the shared `ClaimRow`: adding these columns to
+        // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
+        // SELECT omits them, and at runtime rather than at compile time.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
+        let rows = sqlx::query_as::<_, Row>(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
             FROM claims
             WHERE truth_value >= $1 AND truth_value <= $2
+              AND ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
             ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
+            LIMIT $4 OFFSET $5
             "#,
         )
         .bind(min_truth)
         .bind(max_truth)
+        .bind(is_current)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
@@ -1780,7 +1807,7 @@ impl ClaimRepository {
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -1788,7 +1815,10 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
         Ok(claims)
     }
@@ -1858,13 +1888,15 @@ impl ClaimRepository {
     /// `get_labels` calls (backlog bug `babd5904`: `query_claims` hardcoded
     /// `labels: Vec::new()`).
     ///
-    /// Deliberately does **NOT** filter on `is_current`. `query_claims` runs
-    /// [`Self::list_by_truth_range`], which returns superseded rows, and the
-    /// single-claim label source it mirrors (`get_labels` →
-    /// `SELECT labels FROM claims WHERE id = $1`) has no `is_current` clause
-    /// either. Filtering here would silently re-drop labels for superseded
-    /// claims — the same bug class, narrowed. A missing id is simply absent
-    /// from the map (caller treats absence as "no labels").
+    /// Deliberately does **NOT** filter on `is_current`. Whether superseded
+    /// rows reach this helper is the *caller's* decision — `query_claims`
+    /// passes `is_current` through to [`Self::list_by_truth_range`] and may
+    /// legitimately ask for superseded rows — and the single-claim label
+    /// source this mirrors (`get_labels` → `SELECT labels FROM claims WHERE
+    /// id = $1`) has no `is_current` clause either. Filtering here would
+    /// silently drop labels for whichever superseded rows the caller
+    /// deliberately selected — the same bug class, narrowed. A missing id is
+    /// simply absent from the map (caller treats absence as "no labels").
     ///
     /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry)
     /// to keep `cargo sqlx prepare` out of this change's footprint.
