@@ -137,10 +137,31 @@ pub struct PatchClaimDiff {
 
 /// Build a Claim from database row data.
 ///
-/// This helper function handles the crypto fields that may not exist in
-/// the database yet (public_key, content_hash, signature). It computes
-/// the content hash from the content and uses placeholder values for
-/// the public key and signature until the database schema is migrated.
+/// # The crypto fields are PLACEHOLDERS, not data
+///
+/// `content_hash` is **recomputed from `content`**, `public_key` is
+/// `[0u8; 32]`, and `signature` is `None` — regardless of what the row says.
+/// The older comment here claimed these columns "may not exist in the database
+/// yet ... until the database schema is migrated"; that was false. `claims`
+/// has carried `content_hash bytea NOT NULL`, `signature bytea` and
+/// `signer_id uuid` (FK to `agents`, with the
+/// `claims_signature_requires_signer` CHECK) since `001_initial_schema.sql`,
+/// and `agents.public_key bytea NOT NULL` alongside them. The placeholders are
+/// a projection gap, and the false comment is why it went unnoticed long
+/// enough for MCP `verify_claim` to ship as theatre (backlog `49c17386`):
+/// recomputing the digest makes `computed == stored` a tautology, so a
+/// tampered body verified clean.
+///
+/// Callers that expose or verify crypto state MUST extend their `SELECT` and
+/// post-fix the returned `Claim` via [`post_fix_crypto_columns`] —
+/// [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
+/// [`ClaimRepository::get_by_id_with_labels`] do. The bulk list/search readers
+/// deliberately do not: they feed summary projections that never read
+/// `signature`/`public_key`, and joining `agents` per row to hydrate a field
+/// nobody reads would cost a join on every page. Anything promoted to a
+/// crypto-reading path must move to the post-fix pattern first.
+///
+/// Its signature stays fixed (~20 call sites) per `CLAUDE.md`.
 fn claim_from_row(
     id: Uuid,
     content: String,
@@ -173,6 +194,85 @@ fn claim_from_row(
         created_at,
         updated_at,
     )
+}
+
+/// The crypto columns a single-claim reader must project to make
+/// `claim_from_row`'s placeholders real: `claims.content_hash`,
+/// `claims.signature`, and the signer's `agents.public_key` resolved through
+/// `claims.signer_id`.
+///
+/// `signer_public_key` is `Option` because the join that supplies it MUST be a
+/// `LEFT JOIN` — `signer_id` is NULL on every claim written by today's
+/// `create*` methods (none of them insert `signature`/`signer_id`), so an inner
+/// join would turn every single-claim read into "not found".
+struct RowCryptoColumns {
+    content_hash: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    signer_public_key: Option<Vec<u8>>,
+}
+
+/// Replace [`claim_from_row`]'s fabricated crypto fields with the row's stored
+/// values.
+///
+/// - `content_hash` is the **stored** digest, so a hash check against a
+///   freshly computed digest is falsifiable: if the body was mutated without
+///   rewriting the column, they differ.
+/// - `signature` is `None` unless the column holds exactly
+///   [`SIGNATURE_SIZE`](epigraph_crypto::SIGNATURE_SIZE) bytes. A wrong-length
+///   blob is a corrupt signature, and `None` ("unsigned") is the only safe
+///   reading — decoding it as valid is impossible and panicking on a row is
+///   worse than reporting it unverifiable.
+/// - `public_key` is the **signer's** key, not the author's. It stays
+///   `[0u8; 32]` when `signer_id` is NULL: there is no signing agent, and
+///   substituting `agents.public_key` for `claims.agent_id` would re-introduce
+///   a fabricated value (and verify a signature against the wrong key if one
+///   were ever present without a signer).
+///
+/// # Errors
+/// [`DbError::InvalidData`] if `content_hash` is not 32 bytes. Unlike the
+/// signature there is no safe fallback: the column is `NOT NULL` and a
+/// wrong-length digest means the row cannot be integrity-checked at all.
+fn post_fix_crypto_columns(claim: &mut Claim, cols: RowCryptoColumns) -> Result<(), DbError> {
+    let len = cols.content_hash.len();
+    claim.content_hash =
+        <[u8; 32]>::try_from(cols.content_hash.as_slice()).map_err(|_| DbError::InvalidData {
+            reason: format!(
+                "claims.content_hash for {} is {len} bytes, expected 32",
+                claim.id.as_uuid()
+            ),
+        })?;
+
+    claim.signature = match cols.signature {
+        Some(sig) => match <[u8; epigraph_crypto::SIGNATURE_SIZE]>::try_from(sig.as_slice()) {
+            Ok(sig) => Some(sig),
+            Err(_) => {
+                tracing::warn!(
+                    claim_id = %claim.id.as_uuid(),
+                    len = sig.len(),
+                    "claims.signature is not 64 bytes; treating claim as unsigned"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    claim.public_key = match cols.signer_public_key {
+        Some(key) => match <[u8; 32]>::try_from(key.as_slice()) {
+            Ok(key) => key,
+            Err(_) => {
+                tracing::warn!(
+                    claim_id = %claim.id.as_uuid(),
+                    len = key.len(),
+                    "signer agents.public_key is not 32 bytes; leaving key unset"
+                );
+                [0u8; 32]
+            }
+        },
+        None => [0u8; 32],
+    };
+
+    Ok(())
 }
 
 impl ClaimRepository {
@@ -517,21 +617,58 @@ impl ClaimRepository {
 
     /// Get a claim by ID
     ///
+    /// # Returns
+    /// A `Claim` post-fixed with the row's real retirement state
+    /// (`is_current`, `supersedes`) **and** its real crypto state
+    /// (`content_hash`, `signature`, signer `public_key`) — see
+    /// [`post_fix_crypto_columns`]. This is the read MCP `verify_claim` runs
+    /// on, and until backlog `49c17386` it inherited `claim_from_row`'s
+    /// placeholders: `content_hash` recomputed from `content` (so
+    /// `computed == stored` compared a value against itself and a tampered
+    /// body verified clean) and `signature = None` (so the signature check
+    /// could never pass).
+    ///
+    /// Uses a runtime `query_as` with a local `Row` rather than `sqlx::query!`,
+    /// mirroring [`Self::list`]: the `LEFT JOIN agents` needed to resolve
+    /// `signer_id → public_key` would otherwise require regenerating `.sqlx`,
+    /// which is a serialized, separately owned step in this repo.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
     #[instrument(skip(pool))]
     pub async fn get_by_id(pool: &PgPool, id: ClaimId) -> Result<Option<Claim>, DbError> {
         let uuid: Uuid = id.into();
 
-        let row = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+            content_hash: Vec<u8>,
+            signature: Option<Vec<u8>>,
+            signer_public_key: Option<Vec<u8>>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id,
-                   created_at, updated_at, is_current, supersedes
-            FROM claims
-            WHERE id = $1
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes,
+                   c.content_hash, c.signature,
+                   s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = $1
             "#,
-            uuid
         )
+        .bind(uuid)
         .fetch_optional(pool)
         .await?;
 
@@ -549,11 +686,17 @@ impl ClaimRepository {
                 );
                 // Post-fix retirement state so callers see real DB values
                 // instead of `claim_from_row`'s defaults (is_current=true,
-                // supersedes=None). sqlx::query! returns is_current as a
-                // plain bool here because the schema marks it NOT NULL with
-                // a DEFAULT — the macro trusts the NOT NULL annotation.
+                // supersedes=None).
                 claim.is_current = row.is_current;
                 claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+                post_fix_crypto_columns(
+                    &mut claim,
+                    RowCryptoColumns {
+                        content_hash: row.content_hash,
+                        signature: row.signature,
+                        signer_public_key: row.signer_public_key,
+                    },
+                )?;
                 Ok(Some(claim))
             }
             None => Ok(None),
@@ -595,10 +738,14 @@ impl ClaimRepository {
         use sqlx::Row;
         let row = sqlx::query(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id,
-                   created_at, updated_at, is_current, supersedes, labels
-            FROM claims
-            WHERE id = $1
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes,
+                   c.labels, c.content_hash, c.signature,
+                   s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = $1
             "#,
         )
         .bind(uuid)
@@ -623,6 +770,19 @@ impl ClaimRepository {
                 claim.supersedes = row
                     .get::<Option<Uuid>, _>("supersedes")
                     .map(ClaimId::from_uuid);
+                // ... and the crypto state, for the same reason. MCP
+                // `get_claim` renders this `content_hash` to the caller as hex
+                // and feeds it to `redact_content` as the claim's stable
+                // identity; serving a digest recomputed from the body there is
+                // the same fabrication `verify_claim` was caught on.
+                post_fix_crypto_columns(
+                    &mut claim,
+                    RowCryptoColumns {
+                        content_hash: row.get("content_hash"),
+                        signature: row.get("signature"),
+                        signer_public_key: row.get("signer_public_key"),
+                    },
+                )?;
                 let labels: Vec<String> = row.get("labels");
                 Ok(Some((claim, labels)))
             }
@@ -1375,6 +1535,19 @@ impl ClaimRepository {
     }
 
     /// Get a claim by ID within an existing transaction.
+    ///
+    /// Projects and post-fixes the stored crypto columns exactly as
+    /// [`Self::get_by_id`] does, so a caller that reads `content_hash` /
+    /// `signature` gets the same answer inside a transaction as outside one.
+    ///
+    /// Retirement state (`is_current`, `supersedes`) is deliberately still
+    /// `claim_from_row`'s default here: this reader predates that projection
+    /// and its callers read content/truth only. Fixing it is a separate
+    /// decision from the crypto gap.
+    ///
+    /// # Errors
+    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
     pub async fn get_by_id_conn(
         conn: &mut sqlx::PgConnection,
         id: ClaimId,
@@ -1383,8 +1556,12 @@ impl ClaimRepository {
 
         use sqlx::Row;
         let row = sqlx::query(
-            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims WHERE id = $1"#,
+            r#"SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                      c.created_at, c.updated_at, c.content_hash, c.signature,
+                      s.public_key AS signer_public_key
+               FROM claims c
+               LEFT JOIN agents s ON s.id = c.signer_id
+               WHERE c.id = $1"#,
         )
         .bind(uuid)
         .fetch_optional(&mut *conn)
@@ -1393,7 +1570,7 @@ impl ClaimRepository {
         match row {
             Some(row) => {
                 let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                Ok(Some(claim_from_row(
+                let mut claim = claim_from_row(
                     row.get("id"),
                     row.get("content"),
                     row.get("agent_id"),
@@ -1401,7 +1578,16 @@ impl ClaimRepository {
                     tv,
                     row.get("created_at"),
                     row.get("updated_at"),
-                )))
+                );
+                post_fix_crypto_columns(
+                    &mut claim,
+                    RowCryptoColumns {
+                        content_hash: row.get("content_hash"),
+                        signature: row.get("signature"),
+                        signer_public_key: row.get("signer_public_key"),
+                    },
+                )?;
+                Ok(Some(claim))
             }
             None => Ok(None),
         }
