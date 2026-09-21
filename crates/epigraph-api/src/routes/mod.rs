@@ -161,6 +161,17 @@ use axum::{
 /// for authenticated requests and per-IP for unauthenticated requests.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Router::new())
+}
+
+/// Like `create_router`, but merges `extra_routes` into the *protected* route
+/// table before the authentication middleware is applied, so embedder-supplied
+/// routes inherit the same authentication, body-limit and rate-limit stack as
+/// the first-party protected routes. Passing an empty router is equivalent to
+/// `create_router`. Note: a path+method collision with a first-party route panics
+/// at router construction, as with any axum `merge`.
+#[cfg(feature = "db")]
+pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppState>) -> Router {
     // Protected write operations - require signature verification
     let protected = Router::new()
         .route("/claims", post(claims::create_claim))
@@ -496,6 +507,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/match_candidates/:id/decide",
             post(cross_source::decide_candidate),
         );
+
+    // Extension seam: merge embedder-supplied routes into `protected` BEFORE the
+    // auth middleware so they inherit the same authentication stack.
+    let protected = protected.merge(extra_routes);
 
     // Auth middleware stack (outermost runs first):
     // 1. bearer_auth_middleware: if Bearer token present, validate JWT + inject AuthContext
@@ -871,6 +886,13 @@ pub fn create_router(state: AppState) -> Router {
 /// a rate limiter is configured in AppState.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
+    create_router_with_extensions(state, Router::new())
+}
+
+/// Like `create_router` (non-db build), merging embedder-supplied `extra_routes` into
+/// protected before the middleware stack.
+#[cfg(not(feature = "db"))]
+pub fn create_router_with_extensions(state: AppState, extra_routes: Router<AppState>) -> Router {
     // Protected write operations
     let protected = Router::new()
         // NO claim-deletion route. `DELETE /api/v1/claims/:id` and
@@ -1016,6 +1038,9 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/coalitions", post(political::create_coalition));
     // /api/v1/mpc/joint-recall is an enterprise route; register via enterprise feature
+
+    // Extension seam: merge embedder-supplied routes into `protected` before auth.
+    let protected = protected.merge(extra_routes);
 
     // Auth middleware: bearer first, then signature fallback (same as db variant)
     let protected = if state.config.require_signatures {
