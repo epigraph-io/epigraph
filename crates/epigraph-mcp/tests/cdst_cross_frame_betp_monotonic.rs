@@ -119,11 +119,14 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     MassFunctionRepository::update_claim_belief(
         &pool,
         claim_id,
-        measures::belief(&legacy_combined, &true_fe),
-        measures::plausibility(&legacy_combined, &true_fe),
-        legacy_combined.mass_of_conflict(),
-        Some(betp0),
-        legacy_combined.mass_of_missing(),
+        epigraph_db::CachedBelief {
+            belief: measures::belief(&legacy_combined, &true_fe),
+            plausibility: measures::plausibility(&legacy_combined, &true_fe),
+            mass_on_empty: legacy_combined.mass_of_conflict(),
+            pignistic_prob: Some(betp0),
+            mass_on_missing: legacy_combined.mass_of_missing(),
+            belief_frame_id: None,
+        },
     )
     .await
     .expect("write initial belief from legacy BBAs");

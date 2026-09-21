@@ -899,11 +899,14 @@ async fn recompute_combined_belief(
     MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        preview.belief,
-        preview.plausibility,
-        preview.conflict_k,
-        Some(preview.pignistic_prob),
-        preview.missing_mass,
+        epigraph_db::CachedBelief {
+            belief: preview.belief,
+            plausibility: preview.plausibility,
+            mass_on_empty: preview.conflict_k,
+            pignistic_prob: Some(preview.pignistic_prob),
+            mass_on_missing: preview.missing_mass,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
@@ -915,6 +918,73 @@ async fn recompute_combined_belief(
     }
 
     Ok(())
+}
+
+/// Recompute a claim's cached DS scalars, letting exactly ONE frame own them.
+///
+/// Backlog 696d3a1c. `recompute_claim_belief_on_frame` persists nothing per-frame —
+/// it writes only the five SHARED `claims.{belief, plausibility, mass_on_empty,
+/// pignistic_prob, mass_on_missing}` columns plus `claims.classification`. Callers
+/// that looped over every frame a claim has BBAs on therefore wrote that one cache
+/// repeatedly, and the last frame processed won.
+///
+/// `list_frames_for_claim` orders `BY f.name`, and the canonical `binary_truth`
+/// frame sorts FIRST (b < c < f < p < t). So the edge-derived belief that
+/// `auto_wire_ds_for_edge` writes there was reliably clobbered by any
+/// `claim_validity`, `paper_validity_*` or `textbook_veracity_*` frame the claim
+/// also carried — usually one holding the pre-edge intrinsic assessment. That is
+/// what silently reverted every `contradicts`/`refutes` edge written since the
+/// previous recompute, and it reported `errors: []` while doing it.
+///
+/// ## What this function is, and what it is NOT
+///
+/// It is NOT an assertion that a claim has one frame. Multi-frame claims are
+/// intended and already first-class: `claim_frames` is keyed
+/// `PRIMARY KEY (claim_id, frame_id)`, and the same claim legitimately carries
+/// different beliefs in different contexts.
+///
+/// The actual defect is narrower and lives in the schema: `claims` holds SIX
+/// belief columns — `belief`, `plausibility`, `mass_on_empty`, `pignistic_prob`,
+/// `mass_on_missing`, `open_world_mass` — and NO frame reference. So a
+/// denormalized single-valued cache is being asked to summarize N frames. The
+/// clobber was the symptom of that, not of multi-frame itself.
+///
+/// This function does not resolve the modeling error. It makes the cache
+/// deterministic and non-destructive by designating ONE frame as the summarized
+/// one, so the cached scalars stop silently reverting edge-derived belief.
+///
+/// **Per-frame belief is not lost and never was.** It is recomputed on demand from
+/// `mass_functions` by the framed `get_belief` path, which is correct today. The
+/// cache is a performance artifact for the unframed read; the framed read is the
+/// source of truth for any specific context.
+///
+/// `binary_truth` is the designated summary frame because it is what the
+/// edge-wiring path writes and what unframed `get_belief` serves. The claim row
+/// records which frame the cache summarizes in `belief_frame_id`, so the number is
+/// self-describing rather than an anonymous one-of-N.
+///
+/// When the claim has no `binary_truth` BBA there is no canonical opinion to
+/// preserve, so the previous last-frame-wins behaviour is kept rather than leaving
+/// the cache unwritten — this function never makes a claim's cache emptier than it
+/// was.
+///
+/// Returns whether the cache was written.
+pub async fn recompute_claim_cached_belief(pool: &PgPool, claim_id: Uuid) -> Result<bool, String> {
+    let frames = MassFunctionRepository::list_frames_for_claim(pool, claim_id)
+        .await
+        .map_err(|e| format!("list_frames_for_claim: {e}"))?;
+    let Some((last_frame, _)) = frames.last().cloned() else {
+        return Ok(false);
+    };
+
+    let canonical = ensure_binary_frame(pool).await?;
+    let owner = if frames.iter().any(|(id, _)| *id == canonical) {
+        canonical
+    } else {
+        last_frame
+    };
+
+    recompute_claim_belief_on_frame(pool, claim_id, owner).await
 }
 
 /// Get-or-create the canonical `binary_truth` frame.

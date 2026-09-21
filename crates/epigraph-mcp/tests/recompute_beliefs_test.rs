@@ -270,3 +270,125 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
         "exactly limit claims, none remain — must not false-positive"
     );
 }
+
+/// Backlog 696d3a1c: `recompute_beliefs` reverted edge-derived belief.
+///
+/// The claim hypothesised the edge mass was never persisted, or persisted in a
+/// form the enumeration could not read. Neither: it IS persisted on
+/// `binary_truth` and it IS read. It is then OVERWRITTEN.
+///
+/// `recompute_claim_belief_on_frame` persists nothing per-frame — it writes only
+/// the five SHARED `claims.{belief, plausibility, mass_on_empty, pignistic_prob,
+/// mass_on_missing}` columns. `recompute_beliefs` calls it once per frame the
+/// claim has BBAs on, over `list_frames_for_claim`'s `ORDER BY f.name`. So with
+/// N frames the cache ends up holding the ALPHABETICALLY LAST frame's numbers.
+///
+/// `binary_truth` sorts first (b < c < f < p < t), so the edge-derived values it
+/// owns are written first and clobbered by every other frame — typically a
+/// `paper_validity_*` or `textbook_veracity_*` frame carrying the PRE-EDGE
+/// intrinsic assessment. That is exactly the reported symptom: ee862955 reset to
+/// "exactly the claim's pre-edge intrinsic BBA", with `errors=[]`.
+///
+/// Deterministic rather than racy, which makes it worse: it reverts the same way
+/// every run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool: PgPool) {
+    let server = make_server(pool.clone());
+    let agent = insert_agent(&pool, "696d3a1c-multiframe").await;
+    let claim = insert_claim(&pool, agent, &format!("696d3a1c-{}", Uuid::new_v4())).await;
+
+    // Canonical binary_truth BBA — this is what the link_epistemic wiring path
+    // writes, and what unframed get_belief is documented to serve.
+    wire_bba(&pool, claim, agent).await;
+    let canonical = pignistic(&pool, claim).await;
+
+    // A second frame whose name sorts AFTER "binary_truth", carrying a clearly
+    // different opinion. "zz_" makes the ordering explicit rather than relying on
+    // a realistic name that happens to sort later.
+    let other_frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, description, hypotheses)
+         VALUES ($1, 'sorts after binary_truth', ARRAY['TRUE','FALSE'])
+         RETURNING id",
+    )
+    .bind(format!("zz_other_frame_{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("insert second frame");
+
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+         VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+    )
+    .bind(claim)
+    .bind(other_frame)
+    .execute(&pool)
+    .await
+    .expect("assign claim to second frame");
+
+    let other_agent = insert_agent(&pool, "696d3a1c-other").await;
+    sqlx::query(
+        "INSERT INTO mass_functions
+           (id, claim_id, frame_id, source_agent_id, masses, conflict_k,
+            combination_method, source_strength, evidence_type, locality_tag)
+         VALUES (gen_random_uuid(), $1, $2, $3, '{\"1\":0.85,\"0,1\":0.15}'::jsonb,
+                 0.0, 'auto_wire', 0.9, 'empirical', 'intra_self_cite')",
+    )
+    .bind(claim)
+    .bind(other_frame)
+    .bind(other_agent)
+    .execute(&pool)
+    .await
+    .expect("insert second-frame BBA");
+
+    let out = tools::cdst_maintenance::recompute_beliefs(
+        &server,
+        RecomputeBeliefsParams {
+            claim_ids: Some(vec![claim.to_string()]),
+            labels: None,
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("recompute_beliefs");
+    let json = result_json(out);
+
+    assert_eq!(
+        json["errors"].as_array().map(Vec::len),
+        Some(0),
+        "the clobber is the happy path — it must not be masked by an error: {json}"
+    );
+
+    let after = pignistic(&pool, claim).await;
+    assert!(
+        (after - canonical).abs() < 1e-9,
+        "recompute_beliefs must leave the canonical binary_truth belief intact, \
+         not overwrite it with a non-canonical frame's opinion. \
+         canonical(binary_truth)={canonical}, after recompute={after}. \
+         The second frame sorts after 'binary_truth' and won the shared \
+         claims.pignistic_prob cache — this is backlog 696d3a1c, and it is what \
+         silently reverts every contradicts/refutes edge written since the last \
+         recompute."
+    );
+
+    // The cache must also SAY which frame it summarizes. `claims` carries six
+    // belief columns and, before migration 092, no frame reference — so the number
+    // looked authoritative while silently describing one of N contexts. Multi-frame
+    // claims are intended (claim_frames is PK (claim_id, frame_id)), which is
+    // exactly why the cache has to be self-describing.
+    let cached_frame: Option<Uuid> =
+        sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("belief_frame_id");
+    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
+        .await
+        .expect("ensure_binary_frame");
+    assert_eq!(
+        cached_frame,
+        Some(binary),
+        "claims.belief_frame_id must name the frame the cached scalars summarize, \
+         so a reader can tell which context the number describes"
+    );
+}
