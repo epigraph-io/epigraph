@@ -1059,10 +1059,37 @@ pub struct SubmitClaimResponse {
     pub frame_id: Option<String>,
 }
 
+/// Result of MCP `verify_claim`.
+///
+/// # A claim is trustworthy only when `signed && signature_valid && hash_matches`
+///
+/// The two checks are INDEPENDENT and neither implies the other. The signature
+/// attests the digest; the digest attests the body. An attacker who mutates
+/// `claims.content` while leaving `content_hash` and `signature` untouched
+/// yields `{signed: true, signature_valid: true, hash_matches: false}` — the
+/// signature is genuinely valid over a digest the body no longer matches, so a
+/// caller reading `signature_valid` alone is still fooled. Conversely a
+/// consistent body/digest pair says nothing about who wrote it.
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
+    /// Whether the stored Ed25519 signature verifies against the signer's
+    /// `agents.public_key` over the **stored** `content_hash`.
+    ///
+    /// `false` covers two very different states — read it together with
+    /// [`Self::signed`]: `signed = false` means the claim carries no signature
+    /// at all (nothing to verify), `signed = true` with
+    /// `signature_valid = false` means a signature is present and REJECTED.
     pub signature_valid: bool,
+    /// Whether the claim was signed at all (`claims.signature IS NOT NULL`).
+    ///
+    /// Added with backlog `49c17386`: `signature_valid` alone conflated
+    /// "unsigned" with "bad signature", and while `claim_from_row` hardcoded
+    /// `signature = None` every claim looked like the latter.
+    pub signed: bool,
+    /// Whether BLAKE3 over the claim body reproduces the **stored**
+    /// `claims.content_hash`. `false` means the body and its digest disagree —
+    /// i.e. the content was mutated without rewriting the hash.
     pub hash_matches: bool,
     pub truth_value: f64,
 }

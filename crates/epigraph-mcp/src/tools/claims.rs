@@ -593,11 +593,25 @@ pub async fn verify_claim(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
 
-    // Verify content hash
+    // Integrity: BLAKE3 over the body vs. the digest STORED on the row.
+    //
+    // `ClaimRepository::get_by_id` projects `claims.content_hash` (backlog
+    // `49c17386`). It used to inherit `claim_from_row`'s placeholder, which was
+    // itself `ContentHasher::hash(content)` — so this line compared a value
+    // against itself, `hash_matches` was unconditionally true, and a claim
+    // whose body had been mutated without rewriting its digest verified clean.
     let computed_hash = ContentHasher::hash(claim.content.as_bytes());
     let hash_matches = computed_hash == claim.content_hash;
 
-    // Verify signature
+    // Authenticity: the stored Ed25519 signature over the stored digest,
+    // checked against the SIGNER's public key (resolved by `get_by_id` through
+    // `claims.signer_id -> agents.public_key`). Previously `public_key` was
+    // hardcoded `[0u8; 32]` and `signature` hardcoded `None`, so this check
+    // could never pass for any claim.
+    //
+    // `signed` keeps "no signature to check" distinguishable from "signature
+    // present and rejected" — both of which report `signature_valid = false`.
+    let signed = claim.signature.is_some();
     let signature_valid = match claim.signature {
         Some(sig) => {
             epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
@@ -609,6 +623,7 @@ pub async fn verify_claim(
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
+        signed,
         hash_matches,
         truth_value: claim.truth_value.value(),
     })
