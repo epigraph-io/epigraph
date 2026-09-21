@@ -47,6 +47,71 @@ pub struct WebhookRegistration {
 const MIN_SECRET_LENGTH: usize = 32;
 
 // =============================================================================
+// SSRF GUARD
+// =============================================================================
+
+/// Validate a webhook target URL for SSRF safety.
+///
+/// The webhook dispatcher POSTs HMAC-signed event payloads to whatever URL a
+/// `webhooks:write` caller registers, from inside the server's network
+/// namespace. Without this gate, a caller can aim it at
+/// `http://169.254.169.254/` (cloud instance metadata), at a loopback admin
+/// port, or at any RFC 1918 neighbour, and read the response status as an
+/// oracle.
+///
+/// Rules:
+/// - The URL must parse as an absolute URL with a host.
+/// - The scheme must be `http` or `https` (blocks `file:`, `gopher:`, …).
+/// - The host must not be an internal/private/loopback/link-local address.
+///
+/// Host classification is delegated to `epigraph_jobs::is_internal_addr` /
+/// `is_internal_ip` so the API and the job runner cannot drift apart on what
+/// "internal" means.
+///
+/// # Errors
+///
+/// Returns a human-readable reason string when the URL must be rejected.
+pub fn validate_webhook_url(raw: &str) -> Result<(), String> {
+    use url::{Host, Url};
+
+    let parsed = Url::parse(raw.trim())
+        .map_err(|e| format!("Webhook URL is not a valid absolute URL: {e}"))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "Webhook URL scheme must be http or https, got `{other}`"
+            ))
+        }
+    }
+
+    // `Url::host()` is the authority's host *after* WHATWG normalisation, so
+    // userinfo (`http://example.com@127.0.0.1/`) cannot smuggle a fake host
+    // past the check, bracketed IPv6 is already unwrapped, and obfuscated IPv4
+    // spellings (`http://127.1/`, `http://2130706433/`) are canonicalised to
+    // the address they actually dial.
+    let host = parsed
+        .host()
+        .ok_or_else(|| "Webhook URL must have a host".to_string())?;
+
+    let blocked = match host {
+        Host::Ipv4(ip) => epigraph_jobs::is_internal_addr(std::net::IpAddr::V4(ip)),
+        Host::Ipv6(ip) => epigraph_jobs::is_internal_addr(std::net::IpAddr::V6(ip)),
+        Host::Domain(domain) => epigraph_jobs::is_internal_ip(domain),
+    };
+
+    if blocked {
+        return Err(format!(
+            "Webhook URL host `{}` resolves to an internal address and is not an allowed target",
+            parsed.host_str().unwrap_or("<none>")
+        ));
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // HMAC-SHA256 PAYLOAD SIGNING
 // =============================================================================
 
@@ -82,7 +147,9 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: Empty URL or secret shorter than 32 characters
+/// - 400 Bad Request: Empty URL; a URL that is unparseable, non-`http(s)`, or
+///   aimed at an internal/loopback/link-local host (see
+///   [`validate_webhook_url`]); or a secret shorter than 32 characters
 /// - 401 Unauthorized: Missing or invalid Bearer token
 /// - 403 Forbidden: Missing `webhooks:write` scope
 /// - 201 Created: Webhook subscription registered successfully
@@ -102,7 +169,13 @@ pub async fn register_webhook(
         });
     }
 
-    // 2. Validate secret length (minimum 32 characters for adequate entropy)
+    // 2. Reject SSRF targets (internal hosts, non-http schemes) before the
+    //    subscription is ever stored.
+    if let Err(reason) = validate_webhook_url(&registration.url) {
+        return Err(ApiError::BadRequest { message: reason });
+    }
+
+    // 3. Validate secret length (minimum 32 characters for adequate entropy)
     if registration.secret.len() < MIN_SECRET_LENGTH {
         return Err(ApiError::BadRequest {
             message: format!(
@@ -113,10 +186,10 @@ pub async fn register_webhook(
         });
     }
 
-    // 3. Determine owner principal from auth context
+    // 4. Determine owner principal from auth context
     let owner_id = Some(auth.owner_id.unwrap_or(auth.client_id));
 
-    // 4. Create the subscription
+    // 5. Create the subscription
     let subscription = WebhookSubscription {
         id: Uuid::new_v4(),
         url: registration.url,
@@ -127,7 +200,7 @@ pub async fn register_webhook(
         owner_id,
     };
 
-    // 5. Store the subscription
+    // 6. Store the subscription
     {
         let mut store = state.webhook_store.write().await;
         store.insert(subscription.id, subscription.clone());
@@ -305,6 +378,11 @@ pub struct WebhookDeliveryResult {
 }
 
 /// Deliver a payload to a single webhook subscription with retry logic
+///
+/// Re-validates the target URL immediately before dialling. The registration
+/// gate is not sufficient on its own: the store is an in-memory map that other
+/// code paths can insert into, and subscriptions registered before the gate
+/// existed would otherwise stay deliverable for the lifetime of the process.
 async fn deliver_to_subscription(
     client: &reqwest::Client,
     subscription: &crate::state::WebhookSubscription,
@@ -312,6 +390,24 @@ async fn deliver_to_subscription(
     signature: &str,
     config: &WebhookDeliveryConfig,
 ) -> WebhookDeliveryResult {
+    // SSRF guard: refuse to make the request at all. `attempts: 0` records
+    // that no connection was opened, distinguishing a blocked target from one
+    // that was dialled and refused the connection.
+    if let Err(reason) = validate_webhook_url(&subscription.url) {
+        tracing::warn!(
+            subscription_id = %subscription.id,
+            reason = %reason,
+            "Refusing webhook delivery to disallowed target URL"
+        );
+        return WebhookDeliveryResult {
+            subscription_id: subscription.id,
+            success: false,
+            status_code: None,
+            attempts: 0,
+            error: Some(format!("blocked by SSRF guard: {reason}")),
+        };
+    }
+
     let mut last_error = None;
 
     for attempt in 0..=config.max_retries {
@@ -701,7 +797,10 @@ mod tests {
 
         let results = deliver_event(&client, &store, &event, &config).await;
         assert_eq!(results.len(), 1, "Empty filter should match all events");
-        // Will fail because the URL is unreachable, but the attempt should be made
+        // Delivery itself fails: 127.0.0.1 is refused by the SSRF guard (see
+        // `test_deliver_event_does_not_dial_internal_target`). What this test
+        // asserts is the *filter*, i.e. that the subscription was selected at
+        // all and produced a result row.
         assert!(!results[0].success);
         assert_eq!(results[0].subscription_id, sub_id);
     }
@@ -744,6 +843,166 @@ mod tests {
             results.is_empty(),
             "Inactive subscriptions should be skipped"
         );
+    }
+
+    // ---- SSRF guard (backlog cf05eb0d) ----
+
+    /// The dispatcher must not open a TCP connection to an internal target.
+    ///
+    /// This binds a REAL listener on loopback and counts accepted connections,
+    /// rather than asserting `success == false` on an unreachable port — an
+    /// unguarded dispatcher also reports failure there (connection refused),
+    /// so that assertion would pass over the unfixed code and prove nothing.
+    /// Zero accepted connections can only happen if the request was never
+    /// made.
+    #[tokio::test]
+    async fn test_deliver_event_does_not_dial_internal_target() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&connections);
+        let accept_task = tokio::spawn(async move {
+            while let Ok((_stream, _peer)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let store: crate::state::WebhookStore =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let sub_id = Uuid::new_v4();
+        {
+            let mut s = store.write().await;
+            s.insert(
+                sub_id,
+                WebhookSubscription {
+                    id: sub_id,
+                    // Bypasses registration entirely: inserted straight into
+                    // the store, which is exactly the case the delivery-side
+                    // re-check exists for.
+                    url: format!("http://{addr}/hook"),
+                    event_types: vec![],
+                    created_at: Utc::now(),
+                    active: true,
+                    secret: "x".repeat(32),
+                    owner_id: None,
+                },
+            );
+        }
+
+        let event = epigraph_events::EpiGraphEvent::ClaimSubmitted {
+            claim_id: epigraph_core::ClaimId::new(),
+            agent_id: epigraph_core::AgentId::new(),
+            initial_truth: epigraph_core::TruthValue::new(0.5).unwrap(),
+        };
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(500),
+            max_retries: 0,
+        };
+
+        let results = deliver_event(&client, &store, &event, &config).await;
+
+        // Give any in-flight connection a chance to be accepted before we
+        // read the counter, so a pre-fix run is definitely observed.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        accept_task.abort();
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "no TCP connection may reach an internal target"
+        );
+        assert_eq!(results.len(), 1, "subscription should still yield a result");
+        assert!(!results[0].success, "delivery must not be reported as sent");
+        assert_eq!(
+            results[0].attempts, 0,
+            "guard must refuse before any HTTP attempt is counted"
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SSRF guard"),
+            "failure must be attributed to the guard, not to a network error: {:?}",
+            results[0].error
+        );
+    }
+
+    #[test]
+    fn test_validate_webhook_url_accepts_public_https() {
+        assert!(validate_webhook_url("https://example.com/webhook").is_ok());
+        assert!(validate_webhook_url("http://93.184.216.34:8080/hook").is_ok());
+        assert!(validate_webhook_url("  https://hooks.example.org/x  ").is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_internal_hosts() {
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9000/admin",
+            "http://localhost/hook",
+            "http://sub.localhost/hook",
+            "http://10.0.0.5/hook",
+            "http://172.16.0.1/hook",
+            "http://192.168.1.1/hook",
+            "http://0.0.0.0/hook",
+        ] {
+            assert!(
+                validate_webhook_url(url).is_err(),
+                "{url} must be rejected as an internal target"
+            );
+        }
+    }
+
+    /// Obfuscated spellings of loopback must be rejected too.
+    ///
+    /// These are the cases a naive `strip_prefix("http://")` + substring host
+    /// extractor lets through: WHATWG URL parsing canonicalises `127.1` and
+    /// the 32-bit decimal form to `127.0.0.1`, and resolves the authority
+    /// correctly when a userinfo component is present.
+    #[test]
+    fn test_validate_webhook_url_rejects_obfuscated_loopback() {
+        for url in [
+            "http://127.1/hook",
+            "http://2130706433/hook",
+            "http://example.com@127.0.0.1/hook",
+            "http://user:pass@169.254.169.254/hook",
+            "http://[::1]:8080/hook",
+            "http://[::ffff:127.0.0.1]/hook",
+        ] {
+            assert!(
+                validate_webhook_url(url).is_err(),
+                "{url} must be rejected as an internal target"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_non_http_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "gopher://example.com/x",
+            "ftp://example.com/x",
+        ] {
+            assert!(
+                validate_webhook_url(url).is_err(),
+                "{url} must be rejected: only http/https are deliverable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_webhook_url_rejects_unparseable() {
+        assert!(validate_webhook_url("").is_err());
+        assert!(validate_webhook_url("not a url").is_err());
+        assert!(validate_webhook_url("/relative/path").is_err());
     }
 
     // ---- Handler integration tests (need AppState without DB) ----
@@ -1489,6 +1748,139 @@ mod tests {
                 response.status(),
                 StatusCode::NOT_FOUND,
                 "Second delete of same webhook should return 404"
+            );
+        }
+    }
+}
+
+// =============================================================================
+// SSRF REGISTRATION GATE — HANDLER-LEVEL TESTS (backlog cf05eb0d)
+// =============================================================================
+//
+// The `handler_tests` module above is `#[cfg(not(feature = "db"))]`, and `db`
+// is a DEFAULT feature — so none of it is compiled by `cargo test -p
+// epigraph-api`. These tests are gated the other way so the registration gate
+// is actually exercised under the default build.
+//
+// They call `register_webhook` directly (the scope extractor is a public
+// newtype over `AuthContext`), with a lazy pg pool that never connects: the
+// handler issues no query.
+
+#[cfg(all(test, feature = "db"))]
+mod ssrf_registration_tests {
+    use super::{register_webhook, WebhookRegistration};
+    use crate::errors::ApiError;
+    use crate::middleware::bearer::{AuthContext, ClientType, RequireScopeWebhooksWrite};
+    use crate::state::{ApiConfig, AppState};
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::Json;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    fn webhooks_write_auth() -> AuthContext {
+        AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: None,
+            owner_id: None,
+            client_type: ClientType::Service,
+            scopes: vec!["webhooks:write".to_string()],
+            jti: Uuid::new_v4(),
+        }
+    }
+
+    /// Lazy pg pool that never connects — `register_webhook` issues no query.
+    fn test_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
+            .expect("lazy pool construction must succeed");
+        AppState::with_db(pool, ApiConfig::default())
+    }
+
+    fn registration(url: &str) -> WebhookRegistration {
+        WebhookRegistration {
+            url: url.to_string(),
+            event_types: vec!["ClaimSubmitted".to_string()],
+            secret: "Xk9mP2qL7vN8wBjH5cT0yDrF3gU6eA1s".to_string(),
+        }
+    }
+
+    /// Positive control: the gate must not reject legitimate public targets.
+    #[tokio::test]
+    async fn register_webhook_accepts_public_https_target() {
+        let state = test_state();
+        let result = register_webhook(
+            State(state.clone()),
+            RequireScopeWebhooksWrite(webhooks_write_auth()),
+            Json(registration("https://example.com/webhook")),
+        )
+        .await;
+
+        let (status, Json(sub)) = result.expect("public https target must be accepted");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(sub.url, "https://example.com/webhook");
+        assert_eq!(
+            state.webhook_store.read().await.len(),
+            1,
+            "accepted subscription must be stored"
+        );
+    }
+
+    /// The cloud instance-metadata endpoint is the canonical SSRF target named
+    /// in backlog cf05eb0d. Registration must 400 and store nothing.
+    #[tokio::test]
+    async fn register_webhook_rejects_cloud_metadata_endpoint() {
+        let state = test_state();
+        let result = register_webhook(
+            State(state.clone()),
+            RequireScopeWebhooksWrite(webhooks_write_auth()),
+            Json(registration("http://169.254.169.254/latest/meta-data/")),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::BadRequest { message }) => {
+                assert!(
+                    message.contains("169.254.169.254"),
+                    "rejection must name the offending host: {message}"
+                );
+            }
+            Err(other) => panic!("expected 400 BadRequest, got {other:?}"),
+            Ok(_) => panic!("link-local metadata endpoint must not be registrable"),
+        }
+
+        assert!(
+            state.webhook_store.read().await.is_empty(),
+            "rejected subscription must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_webhook_rejects_loopback_and_non_http_targets() {
+        for url in [
+            "http://127.0.0.1:9000/admin",
+            "http://localhost/hook",
+            "http://10.0.0.5/hook",
+            "http://127.1/hook",
+            "http://example.com@127.0.0.1/hook",
+            "file:///etc/passwd",
+        ] {
+            let state = test_state();
+            let result = register_webhook(
+                State(state.clone()),
+                RequireScopeWebhooksWrite(webhooks_write_auth()),
+                Json(registration(url)),
+            )
+            .await;
+
+            assert!(
+                matches!(result, Err(ApiError::BadRequest { .. })),
+                "{url} must be rejected with 400"
+            );
+            assert!(
+                state.webhook_store.read().await.is_empty(),
+                "{url} must not be stored"
             );
         }
     }
