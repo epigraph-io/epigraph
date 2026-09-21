@@ -3670,7 +3670,7 @@ mod db_tests {
     // entity_types registry (Phase 1 + Phase 2)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// All 23 seeded types are valid; the 6 DB-only ones the old Rust list
+    /// All 24 seeded types are valid; the 6 DB-only ones the old Rust list
     /// omitted are present; case-variants and junk are rejected. This absorbs
     /// the ex-`edges_validation.rs::synthesis_entity_type_is_valid` coverage.
     #[sqlx::test(migrations = "../../migrations")]
@@ -3690,11 +3690,16 @@ mod db_tests {
             "claim",
             "node",
             "frame",
+            // Seeded by migration 094 (backlog 895a74e5): `public.methods` has
+            // existed since 001 but migration 054 omitted its registry row, so
+            // after 055 swapped the static CHECK for an FK every method edge
+            // was refused.
+            "method",
         ] {
             assert!(is_valid_entity_type(&state, t).await, "{t} should be valid");
         }
-        // Exactly the 23 seeded rows.
-        assert_eq!(valid_entity_type_names(&state).len(), 23);
+        // Exactly the 24 seeded rows (23 from migration 054 + `method` from 094).
+        assert_eq!(valid_entity_type_names(&state).len(), 24);
         // Rejections.
         for bad in ["invalid", "", "CLAIM", "public.claims"] {
             assert!(
