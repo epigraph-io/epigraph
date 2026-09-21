@@ -130,6 +130,53 @@ async fn patch_labels_rejects_unexpanded_add_with_400_not_500() {
     );
 }
 
+/// `POST /api/v1/conventions` extends its label array with caller-supplied
+/// `tags` (`labels.extend(request.tags)`) and writes them with a raw
+/// `UPDATE claims SET labels`, bypassing the `ClaimRepository` chokepoint.
+///
+/// The claim row is created BEFORE that UPDATE, so a late check would leave an
+/// orphan convention claim behind; this asserts the 400 AND the absent row.
+#[tokio::test(flavor = "multi_thread")]
+async fn learn_convention_rejects_unexpanded_tag_and_writes_no_claim() {
+    let (pool, addr, _shutdown) = pool_and_app().await;
+    let (admin_token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:admin"]).await;
+    let content = format!(
+        "convention with an un-interpolated tag {}",
+        uuid::Uuid::new_v4()
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/conventions"))
+        .bearer_auth(&admin_token)
+        .json(&serde_json::json!({
+            "content": content,
+            "evidence": "seeded for label-validation test",
+            "tags": ["fine-tag", BAD_LABEL],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 400,
+        "an unexpanded shell variable in `tags` must be a 400; got {status} — body={text}"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "the convention claim was created despite the 400 — the tag check must run \
+         before ClaimRepository::create, not after it"
+    );
+}
+
 /// Removal of an already-corrupted label must keep working — it is the
 /// remediation path for every row that already carries `group:$EPICLAW_GROUP_ID`.
 #[tokio::test(flavor = "multi_thread")]
