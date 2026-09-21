@@ -204,7 +204,19 @@ Current reservation:
   | **092** | obligation batch `tenancy/fix-force-tail-and-registers` (no plan section — all 22 are delivered) | `epigraph_group_roster_admits_principal` + a narrowed `epigraph_is_group_creator` + an `ALTER POLICY` on `groups_tenancy`: bounds migration 077's group-creation bootstrap arm to the group's roster, so it ends where the creator's own membership ends instead of never. Closes `D-PR17-creator-arm-outlives-membership` (COMPLETION-PLAN §2.2.5). The arm is carried by THREE policies in TWO spellings — an inline column comparison on `groups`, the shared `epigraph_is_group_creator()` helper on `group_memberships` and `group_key_epochs` — and both are narrowed, because a single-site fix is incomplete by construction. `ALTER POLICY`, not DROP + CREATE, so `pg_policy.polcmd` keeps `*` and no command coverage can be lost; pinned by `locked_decisions.rs::d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster`. The new definer body's OWNER is a correctness control rather than hygiene — see the file's section 5 — and is pinned in CI by `schema_contract.rs::migration_092_roster_definer_is_revoked_from_public` and at deploy by `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS` (plan §9.2 step 11c). File: `092_group_creator_arm_roster_bound.sql`. **No undo runbook ships**, on the same ground as 089 and 090: reversing it is one `CREATE OR REPLACE FUNCTION public.epigraph_is_group_creator(uuid)` back to 077's body, one `ALTER POLICY groups_tenancy ON public.groups USING (…)` back to 077's text and one `DROP FUNCTION IF EXISTS public.epigraph_group_roster_admits_principal(uuid)` — the roster predicate is NEW in 092 and has no 077 body to be replaced back to, so it is dropped rather than replaced — all three named in the file's own closing section, and it creates no rows to un-create. **No deploy precondition**: it adds no constraint and no index, so there is no pre-existing state it can fail on. **Claimed 2026-09-16.** **Applied to a throwaway database only, NOT to any deployed database.** |
   | **093–099** | — | headroom |
 
-- **100+**: public next
+- **100**: public `claims_belief_frame_id` (backlog 696d3a1c) — records WHICH frame
+  the cached `claims.{belief, plausibility, mass_on_empty, pignistic_prob,
+  mass_on_missing, open_world_mass}` scalars summarize. Nullable, additive, no
+  backfill: NULL honestly means "written before this column existed".
+
+  **Why 100 and not 093.** It was authored as `093` against `main`, whose README
+  read "092+: public next" — the second reserved block `092–099` is recorded only
+  on the tenancy line, so the public branch had no way to see it and CI could not
+  catch it. The merge brought both files together cleanly and the contradiction
+  surfaced only on reading. Renumbered here rather than on main because it has
+  never been applied to a deployed database — production is at 59.
+
+- **101+**: public next
 
 Next public migration **outside both reserved tenancy ranges** must be `100` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
