@@ -14,6 +14,7 @@ async fn update_labels_adds_and_removes(pool: PgPool) {
             add: vec!["new1".into(), "new2".into()],
             remove: vec!["existing".into()],
         },
+        None,
     )
     .await
     .unwrap();

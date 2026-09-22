@@ -242,6 +242,7 @@ async fn update_labels_tool_rejects_unexpanded_add_and_changes_nothing(pool: PgP
             add: vec!["good-label".into(), BAD_LABEL.into()],
             remove: vec![],
         },
+        None,
     )
     .await
     .expect_err("an unexpanded shell variable must be refused");
