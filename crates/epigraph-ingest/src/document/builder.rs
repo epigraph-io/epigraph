@@ -69,10 +69,25 @@ pub const DOCUMENT_SOURCE_TYPES: [&str; 7] = [
 ///
 /// # Class predicate, not a security boundary
 ///
-/// The inputs are `claims.properties`, which a writer with UPDATE on `claims`
-/// controls. Such a writer can also rewrite `content_hash` outright, so this
-/// adds no attack surface; but do not read a `true` here as an attestation of
-/// anything. It classifies, it does not verify.
+/// The inputs are `claims.properties`, and reaching them does NOT require
+/// database access: `ClaimRepository::patch_claim_atomic_conn` merges
+/// caller-supplied properties with `properties = COALESCE(properties,'{}') || $1`,
+/// reachable from MCP `patch_claim` and HTTP `PATCH /claims/:id`. A caller with
+/// patch rights can therefore add `{"level":0,"source_type":"Paper"}` to a
+/// plain-hash claim and turn a future `mismatch` verdict into `not_applicable`.
+///
+/// That is a defence-in-depth degradation rather than a bypass, for one specific
+/// reason worth stating so a later reader does not have to re-derive it: no API
+/// surface can create the mismatch it would be masking. `PatchClaimInput` is
+/// only `{trace_id, properties, add_labels, remove_labels}`, and there is no
+/// `UPDATE claims SET content` anywhere in the workspace — so the attacker who
+/// could produce a body/digest disagreement is one with direct table access, and
+/// that attacker can rewrite `content_hash` regardless of this predicate.
+/// (`POST /claims` accepting a caller-supplied `content_hash` override is a
+/// separate, pre-existing gap — backlog 365bc9f0.)
+///
+/// Do not read a `true` here as an attestation of anything. It classifies, it
+/// does not verify.
 #[must_use]
 pub fn stored_content_hash_is_seed_scoped(properties: &serde_json::Value) -> bool {
     // `level` is written as a JSON number by both builders, but every query in

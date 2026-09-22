@@ -11,11 +11,19 @@ pub const REDACTED: &str = "[REDACTED]";
 /// Compute the `(content, content_hash)` pair to put on a `ClaimResponse`,
 /// applying redaction in lockstep.
 ///
-/// `content_hash` is an unsalted `BLAKE3(content)` — a *deterministic function
-/// of the exact field we redact*. Returning the real hash for a redacted claim
-/// is a confirmation oracle: a stranger could compute `BLAKE3(guess)` and
-/// compare to confirm any guessable/low-entropy private claim, leaking the
-/// redacted `content` through a sibling field. (The HTTP `ClaimResponse` has no
+/// For most claims `content_hash` is an unsalted `BLAKE3(content)` — a
+/// *deterministic function of the exact field we redact*. Returning the real
+/// hash for a redacted claim is a confirmation oracle: a stranger could compute
+/// `BLAKE3(guess)` and compare to confirm any guessable/low-entropy private
+/// claim, leaking the redacted `content` through a sibling field.
+///
+/// The oracle is narrower for one class: document structural rows (level 0/1/2)
+/// store `compound_content_hash(BLAKE3(text), artifact_seed)`, and the seed is
+/// not carried on the claim row, so guessing `content` alone is not sufficient
+/// to reproduce the digest. We blank the hash for that class too — the argument
+/// below is about where redaction must hold, not about which rows happen to be
+/// guessable, and a rule that exempted a subclass would rot the moment the
+/// ingest writer changed. (The HTTP `ClaimResponse` has no
 /// `content_hash` field at all, so this is an MCP-only exposure with no HTTP
 /// parity to preserve.) We therefore blank the hash in the *same* branch as the
 /// content, never separately — keeping the oracle closed wherever a tool
