@@ -1372,7 +1372,7 @@ async fn deliver_to_subscription(
 /// `db` arm gained a `pool` parameter in PR-10 and nothing else; a client
 /// constructed inline in only one arm is a redirect policy that holds in one
 /// build configuration and not the other.
-fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+pub fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
@@ -1416,7 +1416,41 @@ pub fn start_webhook_dispatcher(
     let client = dispatcher_client_builder(config.timeout)
         .build()
         .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
+    start_webhook_dispatcher_with_client(event_bus, pool, webhook_store, config, client)
+}
 
+/// [`start_webhook_dispatcher`] over a caller-supplied client.
+///
+/// # This seam exists because the delivery-time SSRF guard closed the old one
+///
+/// `deliver_to_subscription` re-validates `subscription.url` immediately before
+/// dialling (backlog `cf05eb0d`), because the store is an in-memory map other
+/// code paths insert into and rows registered before the gate existed would
+/// otherwise stay deliverable for the process lifetime. A consequence, and not
+/// an incidental one: **a loopback sink is unreachable through this dispatcher
+/// by design.** `tests/webhook_dispatcher_wiring.rs` previously pointed a
+/// subscription straight at a `wiremock::MockServer` on `127.0.0.1` — the guard
+/// refuses it, and the test's positive control failed.
+///
+/// A behavioural test of the dispatcher therefore needs a host the guard
+/// ACCEPTS (a name under RFC 2606 `.example`, which is judged on its face
+/// because no DNS resolution happens in the guard) pointed at a local listener
+/// with reqwest's `.resolve()` — which requires the client to be injectable.
+/// That is the whole of what this function adds.
+///
+/// **It weakens nothing.** The client still comes from
+/// [`dispatcher_client_builder`], the SSRF guard still runs per delivery, and
+/// `.resolve()` overrides only DNS — it cannot make the guard accept an address
+/// literal it would otherwise refuse. A test that pointed this at
+/// `http://127.0.0.1/` would still be refused.
+#[cfg(feature = "db")]
+pub fn start_webhook_dispatcher_with_client(
+    event_bus: &crate::state::SharedEventBus,
+    pool: sqlx::PgPool,
+    webhook_store: crate::state::WebhookStore,
+    config: WebhookDeliveryConfig,
+    client: reqwest::Client,
+) -> epigraph_events::SubscriptionId {
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
 
