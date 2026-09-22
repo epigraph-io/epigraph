@@ -1077,11 +1077,27 @@ pub async fn resolve_backlog_item(
     let resolution_uuid = parse_uuid(&resolution_id)?;
     let mut basis_edge_ids: Vec<String> = Vec::with_capacity(basis_ids.len());
     for basis_uuid in &basis_ids {
+        // Direction is `basis -justifies-> resolution`, NOT the reverse. Two
+        // reasons, and the second is the load-bearing one:
+        //   1. It is the correct English reading — the basis justifies the
+        //      resolution, not the other way round.
+        //   2. `EdgeRepository::list_current_claim_targets`, which
+        //      `retraction_cascade` uses to enumerate downstream work, takes a
+        //      `source_id` and walks `WHERE e.source_id = $1`. With the basis on
+        //      the TARGET side, retracting a basis could never reach the
+        //      resolution that rested on it.
+        // NOTE this alone does NOT make the closure defeasible — see the
+        // `basis_claim_ids` doc in types.rs. `sheaf::restriction_kind_with_profile`
+        // does not name "justifies", so it takes the `_ => Neutral` arm, and
+        // `auto_wire_edge_if_epistemic` short-circuits on Neutral, so the edge
+        // carries no BBA and the cascade's BBA filter skips it regardless of
+        // direction. This direction is a precondition for a future fix, not the
+        // fix itself.
         let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists(
             &server.pool,
-            resolution_uuid,
-            "claim",
             *basis_uuid,
+            "claim",
+            resolution_uuid,
             "claim",
             JUSTIFIES_RELATIONSHIP,
             Some(serde_json::json!({

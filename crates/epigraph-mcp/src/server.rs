@@ -734,7 +734,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Returns {resolution_claim_id, original_id, original_labels}."
+        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}."
     )]
     async fn resolve_backlog_item(
         &self,

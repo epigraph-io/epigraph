@@ -92,8 +92,8 @@ async fn closure_basis_is_recorded_as_justifies_edges(pool: PgPool) {
     // back out of the database rather than trusting the response body — the
     // response is what the tool says it did; the edge table is what it did.
     let targets: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT target_id FROM edges \
-         WHERE source_id = $1 AND relationship = $2 ORDER BY target_id",
+        "SELECT source_id FROM edges \
+         WHERE target_id = $1 AND relationship = $2 ORDER BY source_id",
     )
     .bind(resolution_id)
     .bind(JUSTIFIES_RELATIONSHIP)
@@ -109,10 +109,13 @@ async fn closure_basis_is_recorded_as_justifies_edges(pool: PgPool) {
          a repeated id must not become a second edge"
     );
 
-    // Edges are claim→claim, so a traversal from the basis side finds the
-    // closure that rests on it — which is how a reopen candidate gets flagged.
+    // The basis is on the SOURCE side, which is the side
+    // `EdgeRepository::list_current_claim_targets` walks (`WHERE e.source_id = $1`).
+    // So a retracted basis can reach the closure resting on it — a precondition
+    // for a future automatic reopen, not a mechanism that fires today (see the
+    // `basis_claim_ids` doc: `justifies` is Neutral and carries no BBA).
     let back: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT source_id FROM edges WHERE target_id = $1 AND relationship = $2",
+        "SELECT target_id FROM edges WHERE source_id = $1 AND relationship = $2",
     )
     .bind(basis_a)
     .bind(JUSTIFIES_RELATIONSHIP)
