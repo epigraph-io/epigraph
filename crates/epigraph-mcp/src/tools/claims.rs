@@ -1004,6 +1004,41 @@ pub async fn resolve_backlog_item(
     let target_agent = original.agent_id.as_uuid();
     require_owner_or_admin(server, auth, target_agent).await?;
 
+    // Resolve the closure basis BEFORE anything is created.
+    //
+    // Ordering is the load-bearing decision here: a bad or unreadable basis id
+    // discovered AFTER `submit_claim` would leave an orphan resolution claim
+    // with no edges — and, once the label patch ran, an item that looks closed
+    // with no recorded basis at all, which is the exact failure this parameter
+    // exists to prevent.
+    //
+    // The existence check goes through the caller's `viewer`, the same read
+    // `original` above uses. That is deliberate and is the tenancy property of
+    // this feature: a caller cannot point a `justifies` edge at a claim they
+    // cannot see, and an invisible basis is REFUSED rather than silently
+    // dropped. Silently dropping would be worse than either alternative — it
+    // would record a closure whose basis set is quietly smaller than the one
+    // the caller asked for.
+    let mut basis_ids: Vec<uuid::Uuid> = Vec::with_capacity(params.basis_claim_ids.len());
+    for raw in &params.basis_claim_ids {
+        let basis_uuid = parse_uuid(raw)?;
+        if basis_uuid == original_id {
+            return Err(invalid_params(format!(
+                "basis claim {basis_uuid} is the backlog item being resolved; a closure \
+                 cannot be its own justification"
+            )));
+        }
+        ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(basis_uuid))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!("basis claim {basis_uuid} not found or not visible"))
+            })?;
+        if !basis_ids.contains(&basis_uuid) {
+            basis_ids.push(basis_uuid);
+        }
+    }
+
     // 1. Submit the resolution claim via the canonical pipeline.
     let methodology = params
         .methodology
@@ -1031,7 +1066,48 @@ pub async fn resolve_backlog_item(
     let submit_result = submit_claim(server, viewer, submit_params).await?;
     let resolution_id = extract_submit_claim_id(&submit_result)?;
 
-    // 2. PATCH the original's labels: add "resolved", keep "backlog".
+    // 2. Record the closure basis as `resolution -justifies-> basis` edges,
+    //    BEFORE the label patch. Ordering again: the item must not read as
+    //    closed until its basis is on the graph, because a closure with a
+    //    `resolved` label and no basis is precisely the un-reopenable state
+    //    this records against.
+    //
+    //    `create_if_not_exists` keys on (source, target, relationship), so a
+    //    retried call re-asserts rather than duplicating.
+    let resolution_uuid = parse_uuid(&resolution_id)?;
+    let mut basis_edge_ids: Vec<String> = Vec::with_capacity(basis_ids.len());
+    for basis_uuid in &basis_ids {
+        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists(
+            &server.pool,
+            resolution_uuid,
+            "claim",
+            *basis_uuid,
+            "claim",
+            JUSTIFIES_RELATIONSHIP,
+            Some(serde_json::json!({
+                "via": "resolve_backlog_item",
+                "closure_of": original_id.to_string(),
+            })),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| McpError {
+            code: rmcp::model::ErrorCode::INTERNAL_ERROR,
+            message: format!(
+                "resolution claim {resolution_id} created but failed to record basis \
+                 {basis_uuid}: {e}"
+            )
+            .into(),
+            data: Some(serde_json::json!({
+                "resolution_claim_id": resolution_id,
+                "original_id": original_id.to_string(),
+            })),
+        })?;
+        basis_edge_ids.push(row.id.to_string());
+    }
+
+    // 3. PATCH the original's labels: add "resolved", keep "backlog".
     //    Best-effort: if this fails the resolution claim already exists,
     //    return a partial-success error so the reconciler can back-fill.
     let after_labels = match ClaimRepository::update_labels(
@@ -1062,8 +1138,20 @@ pub async fn resolve_backlog_item(
         "resolution_claim_id": resolution_id,
         "original_id": original_id.to_string(),
         "original_labels": after_labels,
+        "basis_claim_ids": basis_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "basis_edge_ids": basis_edge_ids,
     }))
 }
+
+/// Relationship byte string for a closure-basis edge: resolution → basis.
+///
+/// LOWERCASE, and the same literal on both surfaces. `epigraph-api`'s
+/// `is_valid_relationship` matches `VALID_RELATIONSHIPS` case-sensitively and
+/// carries both spellings of several names (`DERIVED_FROM` and `derived_from`),
+/// so a mismatch here would make an edge this tool writes unreachable through
+/// `POST /api/v1/edges`. Lowercase matches the claim→claim cluster it belongs
+/// with: `alternative_of`, `asserts`, `decomposes_to`.
+pub const JUSTIFIES_RELATIONSHIP: &str = "justifies";
 
 /// Pull `claim_id` out of a `submit_claim` response. Mirrors the
 /// `first_text` helper in `tests/common/mod.rs` (the proven shape for

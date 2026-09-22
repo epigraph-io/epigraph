@@ -1938,6 +1938,22 @@ pub struct ResolveBacklogItemParams {
         description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
     )]
     pub methodology: Option<String>,
+
+    /// The CLOSURE BASIS: the claims whose content justified closing the item.
+    ///
+    /// Without it a closure is one-way and therefore not defeasible — nothing
+    /// can flag a reopen candidate when later evidence contradicts whatever
+    /// the resolution rested on. Each id becomes a
+    /// `resolution -justifies-> basis` edge, which makes the closure
+    /// reachable by `supersede_claim`, `retraction_cascade` and
+    /// `recompute_beliefs`, all of which already traverse edges.
+    ///
+    /// Optional and defaulted so every existing caller stays wire-compatible.
+    #[schemars(
+        description = "UUIDs of the claims that justified this resolution (the closure basis). Each becomes a `justifies` edge from the resolution claim, so the closure can be reopened when later evidence contradicts its basis. Must be visible to the caller."
+    )]
+    #[serde(default)]
+    pub basis_claim_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
