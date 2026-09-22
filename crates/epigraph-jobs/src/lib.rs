@@ -2189,13 +2189,21 @@ pub fn verify_hmac_signature(secret: &str, payload: &str, signature: &str) -> bo
     mac.verify_slice(&sig_bytes).is_ok()
 }
 
-/// Check if an IP address is an internal/private address (SSRF protection).
+/// Check if a URL host is an internal/private address (SSRF protection).
+///
+/// Accepts a bare IP literal (`127.0.0.1`, `::1`), a bracketed IPv6 literal
+/// with or without a port (`[::1]`, `[fe80::1]:8080`), an `ipv4:port` pair, or
+/// a hostname.
 ///
 /// Blocks:
-/// - Loopback (127.0.0.0/8)
-/// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-/// - Link-local (169.254.0.0/16)
+/// - Loopback (127.0.0.0/8, `::1`)
+/// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7)
+/// - Link-local (169.254.0.0/16, fe80::/10)
 /// - Localhost variants
+///
+/// Hostnames that are not IP literals are *allowed*: this function does no DNS
+/// resolution, so a name that resolves to an internal address is not caught
+/// here. Callers that need that guarantee must resolve and re-check.
 ///
 /// # Returns
 /// `true` if the address is internal and should be blocked, `false` if it's safe.
@@ -2203,19 +2211,66 @@ pub fn verify_hmac_signature(secret: &str, payload: &str, signature: &str) -> bo
 pub fn is_internal_ip(host: &str) -> bool {
     use std::net::IpAddr;
 
+    // Drop a single trailing dot. `localhost.` is the fully-qualified spelling
+    // of `localhost` and every resolver treats the two identically, but it is a
+    // different *string*, so the comparisons below reported it external. URL
+    // normalisation does not save callers either: WHATWG strips the trailing
+    // dot only on the numeric path, so a domain reaches this function with the
+    // dot intact. Stripping here also lets `127.0.0.1.` parse as an address
+    // instead of falling through the "not an IP, allow it" arm.
+    let host = host.strip_suffix('.').unwrap_or(host);
+
     // Handle localhost explicitly
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
 
-    // Strip port if present
+    // Try the whole host as a bare IP literal FIRST. This must precede any
+    // `split(':')` port strip: every IPv6 literal contains ':', so splitting
+    // first truncates `::1` to the empty string, which fails to parse and is
+    // then reported as external.
+    if let Ok(addr) = host.parse::<IpAddr>() {
+        return is_internal_addr(addr);
+    }
+
+    // Bracketed IPv6 authority, with or without a port: `[::1]`, `[::1]:8080`.
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .and_then(|(inner, _)| inner.parse::<IpAddr>().ok())
+            .is_some_and(is_internal_addr);
+    }
+
+    // `host:port` — IPv4 literal or hostname. The trailing dot is not at the
+    // end of the string in this shape (`localhost.:8080`), so strip it again
+    // once the port is off.
     let host_part = host.split(':').next().unwrap_or(host);
+    let host_part = host_part.strip_suffix('.').unwrap_or(host_part);
+    if host_part == "localhost" || host_part.ends_with(".localhost") {
+        return true;
+    }
 
-    // Also strip brackets for IPv6
-    let host_clean = host_part.trim_start_matches('[').trim_end_matches(']');
+    match host_part.parse::<IpAddr>() {
+        Ok(addr) => is_internal_addr(addr),
+        // Not a valid IP address; a hostname. Allowed (see the DNS note above).
+        Err(_) => false,
+    }
+}
 
-    match host_clean.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ipv4)) => {
+/// Classify an already-parsed IP address as internal/private (SSRF protection).
+///
+/// This is the address-level half of [`is_internal_ip`]. Prefer it when the
+/// caller already holds a parsed address (e.g. `url::Host::Ipv4` / `Ipv6`), so
+/// no host-string re-parsing — and no parsing ambiguity — is involved.
+///
+/// # Returns
+/// `true` if the address is internal and should be blocked, `false` if it's safe.
+#[must_use]
+pub fn is_internal_addr(addr: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
+    match addr {
+        IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
 
             // Loopback: 127.0.0.0/8
@@ -2250,7 +2305,7 @@ pub fn is_internal_ip(host: &str) -> bool {
 
             false
         }
-        Ok(IpAddr::V6(ipv6)) => {
+        IpAddr::V6(ipv6) => {
             // Loopback ::1
             if ipv6.is_loopback() {
                 return true;
@@ -2286,11 +2341,6 @@ pub fn is_internal_ip(host: &str) -> bool {
                 return true;
             }
 
-            false
-        }
-        Err(_) => {
-            // Not a valid IP address, allow (will be DNS resolved)
-            // In production, you'd want to resolve DNS and check the resulting IP
             false
         }
     }
