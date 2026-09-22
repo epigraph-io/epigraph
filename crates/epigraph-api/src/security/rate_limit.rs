@@ -187,14 +187,45 @@ impl AgentRateLimiter {
     ///
     /// * `Ok(())` if the request is allowed
     /// * `Err(RateLimitError)` if the rate limit is exceeded
+    ///
+    /// # Order: the caller's own bucket first, the shared one second
+    ///
+    /// The per-agent bucket is charged BEFORE the global one, and a global
+    /// rejection refunds the per-agent token it just took.
+    ///
+    /// The reverse order made the global bucket a quota that one caller could
+    /// drain for everyone: every request spent a global token before its own
+    /// limit was consulted, so a single client hammering past its own limit
+    /// kept consuming global capacity with requests that were then rejected
+    /// anyway, and every other client got `GlobalLimitExceeded`. That is the
+    /// same "one client 429s everyone" failure as a shared bucket, only
+    /// larger. Charging the private bucket first means a request the caller's
+    /// own limit rejects never touches shared capacity.
+    ///
+    /// The refund keeps the converse honest: a request the SERVICE refused for
+    /// load is not billed to the caller's private quota.
     pub fn check(&self, agent_id: &AgentId) -> Result<(), RateLimitError> {
-        // Check global limit first
+        self.check_agent(agent_id)?;
+
         if self.config.enable_global_limit {
-            self.check_global()?;
+            if let Err(global) = self.check_global() {
+                self.refund_agent(agent_id);
+                return Err(global);
+            }
         }
 
-        // Check per-agent limit
-        self.check_agent(agent_id)
+        Ok(())
+    }
+
+    /// Return the token [`Self::check_agent`] just took, capped at capacity.
+    fn refund_agent(&self, agent_id: &AgentId) {
+        let mut buckets = self
+            .agent_buckets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(bucket) = buckets.get_mut(agent_id) {
+            bucket.tokens = (bucket.tokens + 1.0).min(bucket.max_tokens);
+        }
     }
 
     /// Check global rate limit
@@ -395,5 +426,65 @@ mod tests {
         let limiter = AgentRateLimiter::with_defaults();
         assert_eq!(limiter.config.default_rpm, 60);
         assert_eq!(limiter.config.global_rpm, 1000);
+    }
+
+    fn slow_config(default_rpm: u32, global_rpm: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            default_rpm,
+            global_rpm,
+            replenish_interval_secs: 60,
+            enable_global_limit: true,
+        }
+    }
+
+    /// One caller hammering past its OWN limit must not spend the global
+    /// quota. With the global bucket charged first, the flood's rejected
+    /// requests drained it and the next, well-behaved caller got
+    /// `GlobalLimitExceeded` without having made a single prior request.
+    #[test]
+    fn a_caller_over_its_own_limit_does_not_drain_the_global_bucket() {
+        let limiter = AgentRateLimiter::new(slow_config(1, 3));
+        let flooder = AgentId::new();
+        let bystander = AgentId::new();
+
+        assert!(limiter.check(&flooder).is_ok(), "first request is in quota");
+        for _ in 0..10 {
+            assert!(
+                matches!(
+                    limiter.check(&flooder),
+                    Err(RateLimitError::AgentLimitExceeded { .. })
+                ),
+                "the flooder is refused by its own bucket"
+            );
+        }
+
+        assert_eq!(
+            limiter.check(&bystander),
+            Ok(()),
+            "a bystander's first request must not be refused because another \
+             caller's rejected requests spent the shared quota"
+        );
+    }
+
+    /// A request the SERVICE refused for load is not billed to the caller.
+    #[test]
+    fn a_global_rejection_refunds_the_callers_own_token() {
+        let limiter = AgentRateLimiter::new(slow_config(2, 1));
+        let first = AgentId::new();
+        let second = AgentId::new();
+
+        assert!(
+            limiter.check(&first).is_ok(),
+            "spends the only global token"
+        );
+        assert!(matches!(
+            limiter.check(&second),
+            Err(RateLimitError::GlobalLimitExceeded { .. })
+        ));
+        assert_eq!(
+            limiter.remaining_quota(&second),
+            2,
+            "the globally-refused request must not have cost the caller a token"
+        );
     }
 }
