@@ -519,6 +519,376 @@ async fn recall_context_shows_the_owner_its_private_sibling_paragraph(pool: PgPo
     );
 }
 
+// ── fetch_batched_context: the `edges` aliases (F-edges-unfiltered) ─────────
+//
+// The two tests above hide a neighbour whose CLAIMS row is private. These hide
+// a PRIVATE EDGE between claims that are all public — the shape migration 070
+// arm (b) keeps when an edge is declared ('group', G) between public endpoints.
+// No claims predicate can withhold it; only the edge predicate can. The
+// fixture exercises every one of the fifteen `edges` aliases, both `UNION ALL`
+// arms of each bidirectional block included, and pins each hidden relation
+// from both sides (stranger withheld, owner shown).
+
+/// A claim→`target` edge of `relationship` from `source` of `source_type`,
+/// returned by id so it can be privatised.
+async fn edge_of(
+    pool: &PgPool,
+    source: Uuid,
+    source_type: &str,
+    target: Uuid,
+    relationship: &str,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, 'claim', $4) RETURNING id",
+    )
+    .bind(source)
+    .bind(source_type)
+    .bind(target)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .expect("insert edge")
+}
+
+async fn private_edge_of(
+    pool: &PgPool,
+    source: Uuid,
+    source_type: &str,
+    target: Uuid,
+    relationship: &str,
+    group: Uuid,
+) {
+    let id = edge_of(pool, source, source_type, target, relationship).await;
+    insert_edge_visibility(pool, id, group).await;
+}
+
+async fn leveled(pool: &PgPool, agent: Uuid, label: &str, level: Option<i32>) -> Uuid {
+    let id = fixture::seed_public_claim(pool, agent, label).await;
+    if let Some(l) = level {
+        set_level(pool, id, l).await;
+    }
+    id
+}
+
+async fn paper(pool: &PgPool, doi: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'fixture') RETURNING id")
+        .bind(doi)
+        .fetch_one(pool)
+        .await
+        .expect("insert paper")
+}
+
+/// Every claim public; every "hidden" relation is a group-private edge.
+struct RecallEdges {
+    p: Uuid,
+    q: Uuid,
+    p2: Uuid,
+    p3: Uuid,
+    p4: Uuid,
+    a0: Uuid,
+    a1: Uuid,
+    x: Uuid,
+    b0: Uuid,
+    b1: Uuid,
+    b2: Uuid,
+    y: Uuid,
+    n1: Uuid,
+    n2: Uuid,
+    n3: Uuid,
+    n4: Uuid,
+    n5: Uuid,
+}
+
+async fn recall_edge_fixture(pool: &PgPool, t: &Tenants) -> RecallEdges {
+    let a = t.owner;
+    let g = t.owner_group;
+    let s = leveled(pool, a, "section S", Some(1)).await;
+    let s2 = leveled(pool, a, "section S2", Some(1)).await;
+    let p = leveled(pool, a, "paragraph P", Some(2)).await;
+    let q = leveled(pool, a, "paragraph Q", Some(2)).await;
+    let p2 = leveled(pool, a, "sibling P2", Some(2)).await;
+    let p3 = leveled(pool, a, "continuation P3", Some(2)).await;
+    let p4 = leveled(pool, a, "continued-from P4", Some(2)).await;
+    let x = leveled(pool, a, "other parent X", Some(2)).await;
+    let y = leveled(pool, a, "atom-b parent Y", Some(2)).await;
+    let a0 = leveled(pool, a, "atom A0", Some(3)).await;
+    let a1 = leveled(pool, a, "atom A1", Some(3)).await;
+    let b0 = leveled(pool, a, "atom B0", Some(3)).await;
+    let b1 = leveled(pool, a, "atom B1", Some(3)).await;
+    let b2 = leveled(pool, a, "atom B2", Some(3)).await;
+    let n1 = leveled(pool, a, "corroborator N1", None).await;
+    let n2 = leveled(pool, a, "contradicted N2", None).await;
+    let n3 = leveled(pool, a, "corroborator N3", None).await;
+    let n4 = leveled(pool, a, "corroborating-in N4", None).await;
+    let n5 = leveled(pool, a, "refuting-in N5", None).await;
+
+    edge_of(pool, s, "claim", p, "decomposes_to").await;
+    private_edge_of(pool, s, "claim", p2, "decomposes_to", g).await; // 6. sibling
+    private_edge_of(pool, s2, "claim", q, "decomposes_to", g).await; // 3. section parent
+    edge_of(pool, p, "claim", a0, "decomposes_to").await;
+    private_edge_of(pool, p, "claim", a1, "decomposes_to", g).await; // 4. atom
+    private_edge_of(pool, x, "claim", a0, "decomposes_to", g).await; // 5. bridge
+    private_edge_of(pool, p, "claim", n1, "CORROBORATES", g).await; // 7. source arm
+    private_edge_of(pool, n4, "claim", p, "CORROBORATES", g).await; // 7. target arm
+    edge_of(pool, p, "claim", n3, "CORROBORATES").await;
+    let paper_n3 = paper(pool, "10.0/hidden-n3").await;
+    private_edge_of(pool, paper_n3, "paper", n3, "asserts", g).await; // 7. asserts_e
+    private_edge_of(pool, p, "claim", n2, "contradicts", g).await; // 7b. source arm
+    private_edge_of(pool, n5, "claim", p, "refutes", g).await; // 7b. target arm
+    private_edge_of(pool, p, "claim", p3, "continues_argument", g).await; // 8. source arm
+    private_edge_of(pool, p4, "claim", p, "continues_argument", g).await; // 8. target arm
+    private_edge_of(pool, a0, "claim", b0, "supports", g).await; // 9. forward
+    private_edge_of(pool, b2, "claim", a0, "supports", g).await; // 9. backward
+    edge_of(pool, a0, "claim", b1, "supports").await;
+    private_edge_of(pool, y, "claim", b1, "decomposes_to", g).await; // 10. atom_b parent
+    let paper_p = paper(pool, "10.0/hidden-p").await;
+    private_edge_of(pool, paper_p, "paper", p, "asserts", g).await; // 2. paper
+
+    RecallEdges {
+        p,
+        q,
+        p2,
+        p3,
+        p4,
+        a0,
+        a1,
+        x,
+        b0,
+        b1,
+        b2,
+        y,
+        n1,
+        n2,
+        n3,
+        n4,
+        n5,
+    }
+}
+
+async fn edge_context(
+    pool: &PgPool,
+    viewer: &Viewer,
+    f: &RecallEdges,
+) -> tools::recall::__test_only::BatchedContext {
+    tools::recall::__test_only::fetch_batched_context(pool, viewer, &[f.p, f.q], 8, 8, 8)
+        .await
+        .expect("batched context")
+}
+
+/// Which of the fixture's hidden relations a context exposes, one flag each.
+fn exposed(
+    ctx: &tools::recall::__test_only::BatchedContext,
+    f: &RecallEdges,
+) -> Vec<(&'static str, bool)> {
+    let siblings = ctx
+        .siblings_by_paragraph
+        .get(&f.p)
+        .cloned()
+        .unwrap_or_default();
+    let atoms = ctx
+        .atoms_by_paragraph
+        .get(&f.p)
+        .cloned()
+        .unwrap_or_default();
+    let a0 = atoms.iter().find(|x| x.atom_id == f.a0);
+    let corr = ctx
+        .corroborates_by_paragraph
+        .get(&f.p)
+        .cloned()
+        .unwrap_or_default();
+    let epi = ctx
+        .epistemic_edges_by_paragraph
+        .get(&f.p)
+        .cloned()
+        .unwrap_or_default();
+    let cont = ctx
+        .continues_argument_by_paragraph
+        .get(&f.p)
+        .cloned()
+        .unwrap_or_default();
+    let links = ctx
+        .atom_atom_links_by_atom
+        .get(&f.a0)
+        .cloned()
+        .unwrap_or_default();
+    let b1_parents = ctx
+        .paragraphs_by_atom
+        .get(&f.b1)
+        .cloned()
+        .unwrap_or_default();
+    vec![
+        (
+            "3. section parent of Q",
+            ctx.section_meta.contains_key(&f.q),
+        ),
+        ("4. atom A1 of P", atoms.iter().any(|x| x.atom_id == f.a1)),
+        (
+            "4. atoms_total of P counts A1",
+            ctx.atoms_total_by_paragraph.get(&f.p) == Some(&2),
+        ),
+        (
+            "5. bridge A0 -> X",
+            a0.is_some_and(|x| x.bridge_to_paragraphs.contains(&f.x)),
+        ),
+        (
+            "6. sibling P2 of P",
+            siblings.iter().any(|x| x.paragraph_id == f.p2),
+        ),
+        (
+            "7. CORROBORATES P -> N1",
+            corr.iter().any(|x| x.claim_id == f.n1),
+        ),
+        (
+            "7. CORROBORATES N4 -> P",
+            corr.iter().any(|x| x.claim_id == f.n4),
+        ),
+        (
+            "7. paper_doi of N3 via asserts_e",
+            corr.iter()
+                .any(|x| x.claim_id == f.n3 && x.paper_doi.is_some()),
+        ),
+        (
+            "7b. contradicts P -> N2",
+            epi.iter().any(|x| x.claim_id == f.n2),
+        ),
+        (
+            "7b. refutes N5 -> P",
+            epi.iter().any(|x| x.claim_id == f.n5),
+        ),
+        ("8. continues_argument P -> P3", cont.contains(&f.p3)),
+        ("8. continues_argument P4 -> P", cont.contains(&f.p4)),
+        (
+            "9. atom link A0 -> B0",
+            links.iter().any(|(b, _)| *b == f.b0),
+        ),
+        (
+            "9. atom link B2 -> A0",
+            links.iter().any(|(b, _)| *b == f.b2),
+        ),
+        ("10. parent Y of B1", b1_parents.contains(&f.y)),
+        ("2. paper of P", ctx.paper_meta.contains_key(&f.p)),
+    ]
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_context_withholds_every_private_edge_between_public_claims(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let f = recall_edge_fixture(&pool, &t).await;
+    let ctx = edge_context(&pool, &t.stranger_viewer, &f).await;
+
+    let leaked: Vec<&str> = exposed(&ctx, &f)
+        .into_iter()
+        .filter_map(|(what, shown)| shown.then_some(what))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "every claim in this fixture is public and each listed relation is a \
+         group-private EDGE; a stranger's recall context must expose none of \
+         them. Leaked: {leaked:?}"
+    );
+
+    // The public relations beside them still arrive, so the empty list above
+    // is not an empty context.
+    let corr = ctx
+        .corroborates_by_paragraph
+        .get(&f.p)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        corr.iter().any(|x| x.claim_id == f.n3),
+        "public N3 still corroborates P"
+    );
+    let links = ctx
+        .atom_atom_links_by_atom
+        .get(&f.a0)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        links.iter().any(|(b, _)| *b == f.b1),
+        "public A0 -> B1 still links"
+    );
+    assert_eq!(
+        ctx.atoms_total_by_paragraph.get(&f.p),
+        Some(&1),
+        "P's atom total counts only the public child"
+    );
+}
+
+/// Class P: the owner — a member of every private edge's group — sees all of
+/// them on the same fixture.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_context_shows_the_owner_every_private_edge(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let f = recall_edge_fixture(&pool, &t).await;
+    let ctx = edge_context(&pool, &t.owner_viewer, &f).await;
+
+    let missing: Vec<&str> = exposed(&ctx, &f)
+        .into_iter()
+        .filter_map(|(what, shown)| (!shown).then_some(what))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the owner must receive every relation the stranger is denied — without \
+         this an over-matching edge predicate looks identical to a correct one. \
+         Missing: {missing:?}"
+    );
+}
+
+/// The static edge form is the co-owner INTERSECTION, not `owner_group_id`
+/// alone. An edge co-owned by G and H (migration 072's cross-group shape) must
+/// not reach a principal in G only — here, the owner. A transcription that
+/// dropped the `co_owner_group_id` clause would pass every other test in this
+/// file, because none of their edges has a co-owner.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_context_withholds_a_co_owned_edge_from_a_member_of_one_owner(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let (_other, other_group) = fixture::seed_agent_with_group(&pool, "co-owner").await;
+    let p = leveled(&pool, t.owner, "paragraph P", Some(2)).await;
+    let n = leveled(&pool, t.owner, "corroborator N", None).await;
+    let e = edge_of(&pool, p, "claim", n, "CORROBORATES").await;
+
+    let before = edge_context_for(&pool, &t.owner_viewer, p).await;
+    assert!(
+        before
+            .corroborates_by_paragraph
+            .get(&p)
+            .is_some_and(|v| v.iter().any(|x| x.claim_id == n)),
+        "calibration: while the edge is public the owner receives N"
+    );
+
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(e)
+    .bind(t.owner_group)
+    .bind(other_group)
+    .execute(&pool)
+    .await
+    .expect("co-own the edge");
+
+    let after = edge_context_for(&pool, &t.owner_viewer, p).await;
+    assert!(
+        !after
+            .corroborates_by_paragraph
+            .get(&p)
+            .is_some_and(|v| v.iter().any(|x| x.claim_id == n)),
+        "the owner is a member of the edge's owner_group only, not its \
+         co_owner_group; membership in one of the two groups must not be enough"
+    );
+}
+
+async fn edge_context_for(
+    pool: &PgPool,
+    viewer: &Viewer,
+    paragraph: Uuid,
+) -> tools::recall::__test_only::BatchedContext {
+    tools::recall::__test_only::fetch_batched_context(pool, viewer, &[paragraph], 8, 8, 8)
+        .await
+        .expect("batched context")
+}
+
 /// `properties->>'level'` is what the recall queries key on; the fixture's
 /// `seed_claim` does not set it.
 async fn set_level(pool: &PgPool, claim: Uuid, level: i32) {
