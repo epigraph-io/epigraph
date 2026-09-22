@@ -1,0 +1,2165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>EpiGraph Backlog</title>
+<style>
+:root {
+  --bg: #f5f6f8;
+  --col-bg: #eceef2;
+  --surface: #ffffff;
+  --surface-2: #f3f4f7;
+  --surface-3: #e9ebef;
+  --border: #e1e4e9;
+  --border-strong: #c9ced6;
+  --text: #1b1f24;
+  --text-2: #57606b;
+  --text-3: #8a929c;
+  --accent: #4a5bd4;
+  --accent-hover: #3d4dc0;
+  --accent-weak: #eceffd;
+  --on-accent: #ffffff;
+  --on-status: #ffffff;
+  --red: #cf3f3a;
+  --red-weak: #fdeceb;
+  --amber: #a86a12;
+  --amber-weak: #fcf2df;
+  --green: #2b8453;
+  --green-weak: #e5f4ec;
+  --blue: #2667d6;
+  --blue-weak: #e7effd;
+  --purple: #7547c9;
+  --purple-weak: #f0eafc;
+  --teal: #177f86;
+  --teal-weak: #e1f3f4;
+  --shadow-sm: 0 1px 0 rgba(20, 24, 31, .04), 0 1px 2px rgba(20, 24, 31, .05);
+  --shadow-lg: 0 12px 40px rgba(20, 24, 31, .16), 0 2px 8px rgba(20, 24, 31, .08);
+  --log-bg: #fafbfc;
+  --focus: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111317;
+    --col-bg: #16191e;
+    --surface: #1c2026;
+    --surface-2: #232830;
+    --surface-3: #2b313a;
+    --border: #2c323b;
+    --border-strong: #3c444f;
+    --text: #e6e8eb;
+    --text-2: #a3abb5;
+    --text-3: #707984;
+    --accent: #7d8bf0;
+    --accent-hover: #919df3;
+    --accent-weak: #262b4a;
+    --on-accent: #0f1220;
+    --on-status: #14161a;
+    --red: #f07670;
+    --red-weak: #3a1f1f;
+    --amber: #e3ad55;
+    --amber-weak: #372a15;
+    --green: #5cc58c;
+    --green-weak: #173125;
+    --blue: #6aa2f5;
+    --blue-weak: #1a2a44;
+    --purple: #b193f2;
+    --purple-weak: #2b2344;
+    --teal: #5cc7cc;
+    --teal-weak: #16312f;
+    --shadow-sm: 0 1px 0 rgba(0, 0, 0, .25);
+    --shadow-lg: 0 16px 48px rgba(0, 0, 0, .5), 0 2px 8px rgba(0, 0, 0, .3);
+    --log-bg: #15181d;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111317; --col-bg: #16191e; --surface: #1c2026; --surface-2: #232830; --surface-3: #2b313a;
+  --border: #2c323b; --border-strong: #3c444f; --text: #e6e8eb; --text-2: #a3abb5; --text-3: #707984;
+  --accent: #7d8bf0; --accent-hover: #919df3; --accent-weak: #262b4a; --on-accent: #0f1220; --on-status: #14161a;
+  --red: #f07670; --red-weak: #3a1f1f; --amber: #e3ad55; --amber-weak: #372a15; --green: #5cc58c; --green-weak: #173125;
+  --blue: #6aa2f5; --blue-weak: #1a2a44; --purple: #b193f2; --purple-weak: #2b2344; --teal: #5cc7cc; --teal-weak: #16312f;
+  --shadow-sm: 0 1px 0 rgba(0, 0, 0, .25); --shadow-lg: 0 16px 48px rgba(0, 0, 0, .5), 0 2px 8px rgba(0, 0, 0, .3);
+  --log-bg: #15181d; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+.grow { flex: 1 1 auto; }
+.muted { color: var(--text-3); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: none; box-shadow: var(--focus); border-radius: 6px; }
+svg.ic { flex: none; display: block; }
+
+/* ---------- buttons & inputs ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  height: 28px; padding: 0 10px;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  background: var(--surface); color: var(--text);
+  font: inherit; font-weight: 500; white-space: nowrap; cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.btn:hover:not(:disabled) { background: var(--surface-2); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+.btn.danger:hover:not(:disabled) { background: var(--red-weak); }
+.btn.danger.solid { background: var(--red); color: var(--on-status); border-color: var(--red); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--text-2); }
+.btn.ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+.btn.sm { height: 24px; padding: 0 8px; font-size: 12px; gap: 4px; }
+.btn.xs { height: 22px; padding: 0 6px; font-size: 11.5px; gap: 4px; border-radius: 5px; }
+.btn.icon { width: 28px; padding: 0; }
+.btn.sm.icon { width: 24px; }
+.btn.on { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+
+input[type="text"], input[type="search"], textarea, select {
+  font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 4px 8px; min-height: 28px;
+}
+textarea { width: 100%; resize: vertical; line-height: 1.45; padding: 7px 9px; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px; margin: 0; cursor: pointer; }
+label.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-2); user-select: none; }
+
+/* ---------- pills, chips, flags ---------- */
+.pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 20px; padding: 0 7px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; white-space: nowrap;
+  background: var(--surface-3); color: var(--text-2);
+}
+.pill.blue { background: var(--blue-weak); color: var(--blue); }
+.pill.amber { background: var(--amber-weak); color: var(--amber); }
+.pill.purple { background: var(--purple-weak); color: var(--purple); }
+.pill.green { background: var(--green-weak); color: var(--green); }
+.pill.red { background: var(--red-weak); color: var(--red); }
+.pill.teal { background: var(--teal-weak); color: var(--teal); }
+.pill.accent { background: var(--accent-weak); color: var(--accent); }
+.pill.outline { background: transparent; border: 1px solid var(--border-strong); font-weight: 500; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+.dot.pulse { animation: pulse 1.6s ease-out infinite; }
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+  70% { box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.chip {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 6px;
+  border-radius: 4px; font-size: 11px; line-height: 1;
+  background: var(--surface-2); color: var(--text-2); border: 1px solid var(--border);
+  white-space: nowrap; max-width: 140px; overflow: hidden; text-overflow: ellipsis;
+}
+.chip.l-bug { background: var(--red-weak); color: var(--red); border-color: transparent; }
+.chip.l-feature-request { background: var(--blue-weak); color: var(--blue); border-color: transparent; }
+.chip.l-security { background: var(--amber-weak); color: var(--amber); border-color: transparent; }
+.flag {
+  display: inline-flex; align-items: center; gap: 3px;
+  height: 20px; padding: 0 6px; border-radius: 5px;
+  background: var(--red); color: var(--on-status); font-size: 11px; font-weight: 700;
+}
+.flag.warn { background: var(--amber-weak); color: var(--amber); }
+
+/* ---------- header ---------- */
+header.top {
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 16px; height: 52px; flex: none;
+  background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 650; font-size: 14.5px; letter-spacing: -.01em; }
+.brand-mark {
+  width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center;
+  background: var(--accent); color: var(--on-accent);
+}
+.hdr-stat { display: inline-flex; align-items: center; gap: 6px; color: var(--text-2); font-size: 12px; }
+.hdr-stat b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.meter { display: inline-flex; gap: 2px; }
+.meter i { width: 6px; height: 12px; border-radius: 2px; background: var(--surface-3); }
+.meter i.on { background: var(--blue); }
+.sep { width: 1px; height: 20px; background: var(--border); }
+.integ-pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px;
+  border-radius: 999px; border: 1px solid var(--border-strong); background: var(--surface-2);
+  color: var(--text); font: inherit; font-size: 12px; cursor: pointer; max-width: 360px;
+}
+.integ-pill:hover { border-color: var(--accent); }
+.integ-pill[aria-expanded="true"] { border-color: var(--accent); background: var(--accent-weak); }
+.integ-pill .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.integ-pill .none { color: var(--text-3); }
+
+.banner {
+  flex: none; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 16px; font-size: 12.5px; border-bottom: 1px solid var(--border);
+}
+.banner.demo { background: var(--purple-weak); color: var(--purple); }
+.banner.err { background: var(--red-weak); color: var(--red); }
+.banner input { min-width: 260px; }
+
+/* ---------- toolbar ---------- */
+.toolbar {
+  flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
+}
+.search { position: relative; display: flex; align-items: center; }
+.search svg { position: absolute; left: 8px; color: var(--text-3); pointer-events: none; }
+.search input { padding-left: 28px; width: 240px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.chips.label-row { flex: 1 1 200px; min-width: 0; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; padding: 2px 0;
+  mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); }
+.chips.label-row::-webkit-scrollbar { display: none; }
+.fchip {
+  display: inline-flex; align-items: center; gap: 5px; height: 24px; padding: 0 8px;
+  border-radius: 999px; border: 1px solid var(--border); background: var(--surface);
+  color: var(--text-2); font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.fchip:hover { border-color: var(--border-strong); color: var(--text); }
+.fchip[aria-pressed="true"] { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+.fchip .n { color: var(--text-3); font-variant-numeric: tabular-nums; font-size: 11px; }
+.fchip[aria-pressed="true"] .n { color: inherit; opacity: .75; }
+.fchip.bug[aria-pressed="true"] { background: var(--red-weak); border-color: var(--red); color: var(--red); }
+.fchip.blk[aria-pressed="true"] { background: var(--red-weak); border-color: var(--red); color: var(--red); }
+.refresh-meta { font-size: 12px; color: var(--text-3); display: inline-flex; align-items: center; gap: 6px; }
+.refresh-meta .err { color: var(--red); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spin { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- integration panel ---------- */
+.integ {
+  flex: none; background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 14px 16px 16px; max-height: 48vh; overflow: auto;
+}
+.integ-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.integ-head h2 { font-size: 13.5px; margin: 0; font-weight: 650; }
+.integ-head p { margin: 0; color: var(--text-3); font-size: 12px; }
+.integ-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; }
+@media (max-width: 980px) { .integ-grid { grid-template-columns: 1fr; } }
+.tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+.tree ul { margin-left: 13px; padding-left: 20px; border-left: 1px solid var(--border-strong); }
+.tree li { position: relative; padding: 4px 0; }
+.tree ul > li::before {
+  content: ""; position: absolute; left: -20px; top: 19px; width: 16px;
+  border-top: 1px solid var(--border-strong);
+}
+.tree ul > li:last-child::after {
+  content: ""; position: absolute; left: -21px; top: 20px; bottom: 0; width: 3px; background: var(--surface);
+}
+.tnode {
+  display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  min-height: 30px; padding: 4px 10px; max-width: 100%;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--surface);
+}
+.tnode.root { background: var(--surface-2); font-weight: 600; }
+.tnode.integration { border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.tnode.empty { border-style: dashed; color: var(--text-3); }
+.tnode .t-title { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; background: none; border: 0; padding: 0; font: inherit; cursor: pointer; text-align: left; }
+.tnode .t-title:hover { color: var(--accent); }
+.tnode .arrow { color: var(--text-3); font-size: 11px; }
+.checks { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--text-2); }
+.checks .dot { width: 7px; height: 7px; }
+.checks.pass { color: var(--green); } .checks.fail { color: var(--red); } .checks.pending { color: var(--amber); } .checks.none { color: var(--text-3); }
+.side-box { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--surface-2); }
+.side-box + .side-box { margin-top: 10px; }
+.side-box h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); font-weight: 650; }
+.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 12px; font-size: 12px; margin: 0; }
+.kv dt { color: var(--text-3); white-space: nowrap; }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.integ-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- board ---------- */
+main.board {
+  flex: 1 1 auto; min-height: 0;
+  display: grid; grid-template-columns: repeat(5, minmax(272px, 1fr)); gap: 12px;
+  padding: 12px 16px 16px; overflow-x: auto; overflow-y: hidden;
+}
+@media (min-width: 1760px) { body.drawer-open main.board { padding-right: calc(560px + 16px); } }
+.col {
+  display: flex; flex-direction: column; min-height: 0; min-width: 0;
+  background: var(--col-bg); border-radius: 10px; border: 1px solid transparent;
+  transition: background .12s, border-color .12s;
+}
+.col.drop-ok { border: 1px dashed var(--accent); background: var(--accent-weak); }
+.col.drop-no { border: 1px dashed var(--red); }
+.col-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 8px; font-weight: 650; font-size: 12.5px; }
+.col-head .ci { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.col-head .sub { font-weight: 500; color: var(--text-3); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.count { font-weight: 600; font-size: 11px; color: var(--text-2); background: var(--surface-3); border-radius: 999px; padding: 1px 7px; font-variant-numeric: tabular-nums; }
+.col-body { flex: 1 1 auto; overflow-y: auto; padding: 2px 8px 12px; display: flex; flex-direction: column; gap: 8px; }
+.col-empty { color: var(--text-3); font-size: 12px; text-align: center; padding: 22px 10px; border: 1px dashed var(--border-strong); border-radius: 8px; }
+.col-more { color: var(--text-3); font-size: 11.5px; text-align: center; padding: 6px; }
+
+.card {
+  position: relative; display: flex; flex-direction: column; gap: 6px;
+  padding: 9px 10px 8px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow-sm);
+  cursor: pointer; transition: border-color .12s, box-shadow .12s;
+}
+.card:hover { border-color: var(--border-strong); }
+.card.open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.card.selected { background: color-mix(in srgb, var(--accent-weak) 70%, var(--surface)); border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.card.blocked { box-shadow: inset 3px 0 0 var(--red), var(--shadow-sm); }
+.card.blocked.open { box-shadow: inset 3px 0 0 var(--red), 0 0 0 1px var(--accent); }
+.card.stale { opacity: .62; }
+.card.dragging { opacity: .45; }
+.c-top { display: flex; align-items: center; gap: 6px; min-height: 20px; }
+.cid { color: var(--text-3); font-size: 11px; }
+.elapsed { color: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.c-title {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  background: none; border: 0; padding: 0; margin: 0; text-align: left; color: var(--text);
+  font: inherit; font-weight: 550; font-size: 13px; line-height: 1.38; cursor: pointer; overflow-wrap: anywhere;
+}
+.c-labels { display: flex; flex-wrap: wrap; gap: 4px; }
+.c-activity {
+  display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--blue);
+  background: var(--blue-weak); border-radius: 5px; padding: 3px 7px; min-width: 0;
+}
+.c-activity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.c-foot { display: flex; align-items: center; gap: 6px; min-height: 22px; }
+.c-foot .pr { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 500; }
+.c-actions { display: flex; gap: 4px; margin-left: auto; }
+
+/* ---------- drawer ---------- */
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 40;
+  width: min(560px, 100vw); display: flex; flex-direction: column;
+  background: var(--surface); border-left: 1px solid var(--border); box-shadow: var(--shadow-lg);
+  animation: slidein .16s ease-out;
+}
+.drawer[hidden] { display: none; }
+@keyframes slidein { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.dr-head { padding: 12px 16px 10px; border-bottom: 1px solid var(--border); flex: none; }
+.dr-idrow { display: flex; align-items: center; gap: 6px; color: var(--text-3); }
+.dr-head h2 { margin: 6px 0 8px; font-size: 15.5px; line-height: 1.35; font-weight: 650; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.dr-head h2:focus-visible { box-shadow: none; outline: none; }
+.dr-pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.dr-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 10px 16px; border-bottom: 1px solid var(--border); flex: none; align-items: center; }
+.dr-actions:empty { display: none; }
+.dr-actions .note { color: var(--text-2); font-size: 12px; }
+.composer { padding: 10px 16px 12px; border-bottom: 1px solid var(--border); background: var(--surface-2); flex: none; }
+.composer[hidden] { display: none; }
+.composer label { display: block; font-weight: 600; font-size: 12px; margin-bottom: 6px; }
+.composer .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; align-items: center; }
+.composer .hint { color: var(--text-3); font-size: 11.5px; margin-right: auto; }
+.tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); flex: none; }
+.tab {
+  background: none; border: 0; border-bottom: 2px solid transparent; padding: 9px 8px 8px;
+  font: inherit; font-weight: 550; color: var(--text-2); cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.tab .count { font-size: 10.5px; }
+.dr-body { flex: 1 1 auto; overflow-y: auto; }
+.dr-sec { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.dr-sec:last-child { border-bottom: 0; }
+.dr-sec h3 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); font-weight: 650; display: flex; align-items: center; gap: 6px; }
+.content { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; margin: 0; }
+.prose-sm { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12.5px; margin: 0; color: var(--text); }
+.subhead { font-size: 11.5px; font-weight: 600; color: var(--text-2); margin: 10px 0 4px; }
+.subhead:first-child { margin-top: 0; }
+
+.blk-list { display: flex; flex-direction: column; gap: 6px; }
+.blk { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; background: var(--surface); }
+.blk.sev-blocker:not(.resolved) { border-color: color-mix(in srgb, var(--red) 40%, var(--border)); background: color-mix(in srgb, var(--red-weak) 55%, var(--surface)); }
+.blk.sev-warning:not(.resolved) { border-color: color-mix(in srgb, var(--amber) 35%, var(--border)); background: color-mix(in srgb, var(--amber-weak) 50%, var(--surface)); }
+.blk.resolved { opacity: .7; }
+.blk.resolved .blk-text { text-decoration: line-through; text-decoration-color: var(--text-3); }
+.blk-meta { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-3); margin-bottom: 4px; }
+.blk-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.blk-note { margin-top: 5px; font-size: 12px; color: var(--text-2); }
+.blk-resolve { display: flex; gap: 6px; margin-top: 7px; }
+.blk-resolve input { flex: 1; }
+.add-blk { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.add-blk .row { display: flex; gap: 6px; align-items: center; }
+.add-blk .row select { min-width: 110px; }
+.git-kv dd .mono { font-size: 11.5px; }
+.copyable { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; }
+.copyable span { overflow-wrap: anywhere; }
+
+.timeline { list-style: none; margin: 0; padding: 0; position: relative; }
+.timeline li { position: relative; padding: 0 0 12px 18px; }
+.timeline li::before { content: ""; position: absolute; left: 4px; top: 6px; width: 7px; height: 7px; border-radius: 50%; background: var(--border-strong); }
+.timeline li::after { content: ""; position: absolute; left: 7px; top: 15px; bottom: 0; width: 1px; background: var(--border); }
+.timeline li:last-child::after { display: none; }
+.timeline li:first-child::before { background: var(--accent); }
+.tl-ev { font-weight: 600; font-size: 12.5px; }
+.tl-ts { color: var(--text-3); font-size: 11px; margin-left: 6px; }
+.tl-detail { color: var(--text-2); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.log {
+  background: var(--log-bg); border: 1px solid var(--border); border-radius: 7px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; line-height: 1.5;
+  height: calc(100vh - 330px); min-height: 240px; overflow: auto; padding: 8px 0;
+}
+.logline { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 8px; padding: 1px 10px; }
+.logline:hover { background: var(--surface-2); }
+.logline .k { color: var(--text-3); text-transform: lowercase; text-align: right; }
+.logline .t { white-space: pre-wrap; overflow-wrap: anywhere; }
+.logline.kind-tool .k, .logline.kind-tool .t { color: var(--accent); }
+.logline.kind-result .k, .logline.kind-result .t { color: var(--green); }
+.logline.kind-system .t { color: var(--text-3); }
+.logline.kind-stderr .k, .logline.kind-stderr .t { color: var(--red); }
+.log-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12px; color: var(--text-3); }
+
+/* ---------- dialogs & toasts ---------- */
+dialog.dlg {
+  border: 1px solid var(--border); border-radius: 12px; padding: 0;
+  background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg);
+  width: min(500px, calc(100vw - 32px));
+}
+dialog.dlg::backdrop { background: rgba(10, 12, 16, .38); }
+.dlg form { margin: 0; }
+.dlg-head { padding: 16px 18px 4px; }
+.dlg-head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+.dlg-body { padding: 8px 18px 4px; display: flex; flex-direction: column; gap: 10px; color: var(--text-2); }
+.dlg-body p { margin: 0; }
+.dlg-body .field { display: flex; flex-direction: column; gap: 5px; }
+.dlg-body .field > span { font-weight: 600; font-size: 12px; color: var(--text); }
+.dlg-body ul { margin: 0; padding-left: 18px; }
+.dlg-err { color: var(--red); font-size: 12px; min-height: 0; }
+.dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 18px 16px; }
+
+.toasts { position: fixed; left: 16px; bottom: 16px; z-index: 100; display: flex; flex-direction: column; gap: 8px; max-width: min(440px, calc(100vw - 32px)); }
+.toast {
+  display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px 9px 12px;
+  border-radius: 8px; background: var(--text); color: var(--bg); box-shadow: var(--shadow-lg);
+  font-size: 12.5px; animation: slideup .16s ease-out;
+}
+.toast .msg { flex: 1; overflow-wrap: anywhere; padding-top: 2px; }
+.toast.error { background: var(--red); color: var(--on-status); }
+.toast.warn { background: var(--amber); color: var(--on-status); }
+.toast.ok { background: var(--green); color: var(--on-status); }
+.toast button { background: none; border: 0; color: inherit; opacity: .75; cursor: pointer; padding: 2px; border-radius: 4px; }
+.toast button:hover { opacity: 1; }
+@keyframes slideup { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+@media (max-width: 720px) {
+  header.top { gap: 8px; height: auto; min-height: 52px; flex-wrap: wrap; padding: 8px 16px; }
+  .search input { width: 180px; }
+  .hide-narrow { display: none !important; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="brand-mark" id="brandMark"></span><span>EpiGraph Backlog</span></div>
+  <div class="sep hide-narrow"></div>
+  <div class="hdr-stat" id="runStat" title="Agents running / max concurrent"></div>
+  <button type="button" class="fchip blk hide-narrow" id="hdrBlocked" aria-pressed="false" hidden></button>
+  <div class="grow"></div>
+  <button type="button" class="integ-pill" id="integPill" aria-expanded="false" aria-controls="integPanel"></button>
+  <button type="button" class="btn ghost sm" id="clearSel" hidden>Clear</button>
+  <button type="button" class="btn primary" id="devSelected" disabled></button>
+</header>
+<div id="banner" class="banner" hidden></div>
+<section id="integPanel" class="integ" hidden aria-label="Integration"></section>
+<div class="toolbar" id="toolbar">
+  <label class="search"><span class="sr-only">Search cards</span><span id="searchIcon"></span><input type="search" id="search" placeholder="Search content, labels, id   ( / )" autocomplete="off"></label>
+  <div class="chips" id="quickChips"></div>
+  <div class="sep hide-narrow"></div>
+  <div class="chips label-row" id="labelChips" aria-label="Filter by label"></div>
+  <label class="check"><input type="checkbox" id="hideStale"> Hide stale <span class="muted" id="staleCount"></span></label>
+  <label class="check" for="sortSel">Sort
+    <select id="sortSel">
+      <option value="newest">Newest</option>
+      <option value="oldest">Oldest</option>
+      <option value="truth">Truth value</option>
+    </select>
+  </label>
+  <div class="sep hide-narrow"></div>
+  <span class="refresh-meta" id="refreshMeta"></span>
+  <button type="button" class="btn sm" id="importBtn" title="Import a JSON array of backlog claims">Import</button>
+  <input type="file" id="importFile" accept="application/json,.json" hidden>
+  <button type="button" class="btn sm" id="refreshBtn"></button>
+</div>
+<main class="board" id="board"></main>
+
+<aside class="drawer" id="drawer" hidden aria-labelledby="drTitle" role="complementary">
+  <div class="dr-head">
+    <div class="dr-idrow">
+      <span class="mono" id="drShort"></span>
+      <button type="button" class="btn ghost xs" id="drCopy" title="Copy full claim id"></button>
+      <span class="grow"></span>
+      <button type="button" class="btn ghost sm icon" id="drClose" aria-label="Close details (Esc)"></button>
+    </div>
+    <h2 id="drTitle" tabindex="-1"></h2>
+    <div class="dr-pills" id="drPills"></div>
+  </div>
+  <div class="dr-actions" id="drActions"></div>
+  <div class="composer" id="drComposer" hidden></div>
+  <div class="tabs" role="tablist" aria-label="Card sections">
+    <button type="button" class="tab" role="tab" id="tab-overview" aria-controls="pane-overview" aria-selected="true">Overview</button>
+    <button type="button" class="tab" role="tab" id="tab-log" aria-controls="pane-log" aria-selected="false">Agent log <span id="logLive"></span></button>
+    <button type="button" class="tab" role="tab" id="tab-history" aria-controls="pane-history" aria-selected="false">History <span class="count" id="histCount"></span></button>
+  </div>
+  <div class="dr-body">
+    <div id="pane-overview" role="tabpanel" aria-labelledby="tab-overview">
+      <section class="dr-sec">
+        <h3 id="blkHead">Blockers</h3>
+        <div id="drBlockers"></div>
+        <form class="add-blk" id="addBlk">
+          <label class="sr-only" for="addBlkText">New blocker</label>
+          <textarea id="addBlkText" rows="2" placeholder="Flag a blocker or warning on this item"></textarea>
+          <div class="row">
+            <select id="addBlkSev" aria-label="Severity">
+              <option value="blocker">Blocker</option>
+              <option value="warning">Warning</option>
+            </select>
+            <span class="grow"></span>
+            <button type="submit" class="btn sm">Add flag</button>
+          </div>
+        </form>
+      </section>
+      <section class="dr-sec" id="drReport"></section>
+      <section class="dr-sec" id="drContent"></section>
+      <section class="dr-sec" id="drGit"></section>
+    </div>
+    <div id="pane-log" role="tabpanel" aria-labelledby="tab-log" hidden>
+      <section class="dr-sec">
+        <div class="log-head" id="logHead"></div>
+        <div class="log" id="drLog" tabindex="0" aria-label="Agent log"></div>
+      </section>
+    </div>
+    <div id="pane-history" role="tabpanel" aria-labelledby="tab-history" hidden>
+      <section class="dr-sec"><ol class="timeline" id="drHistory"></ol></section>
+    </div>
+  </div>
+</aside>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+'use strict';
+
+/* ================= basics ================= */
+var $ = function (s, r) { return (r || document).querySelector(s); };
+function h(tag, attrs) {
+  var el = document.createElement(tag);
+  if (attrs) {
+    for (var k in attrs) {
+      if (!Object.prototype.hasOwnProperty.call(attrs, k)) continue;
+      var v = attrs[k];
+      if (v == null || v === false) continue;
+      if (k === 'class') el.className = v;
+      else if (k === 'text') el.textContent = v;
+      else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), v);
+      else if (k === 'checked' || k === 'disabled' || k === 'value' || k === 'indeterminate') el[k] = v;
+      else el.setAttribute(k, v === true ? '' : String(v));
+    }
+  }
+  for (var i = 2; i < arguments.length; i++) append(el, arguments[i]);
+  return el;
+}
+function setKids(el) { el.replaceChildren(); for (var i = 1; i < arguments.length; i++) append(el, arguments[i]); return el; }
+function append(el, kid) {
+  if (kid == null || kid === false) return;
+  if (Array.isArray(kid)) { kid.forEach(function (k) { append(el, k); }); return; }
+  if (typeof kid === 'string' || typeof kid === 'number') el.appendChild(document.createTextNode(String(kid)));
+  else el.appendChild(kid);
+}
+
+var SVGNS = 'http://www.w3.org/2000/svg';
+var ICONS = {
+  flag: 'M4 22V4M4 4h13l-2.5 4.5L17 13H4',
+  branch: 'M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9',
+  pr: 'M18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM13 6h3a2 2 0 0 1 2 2v7M6 9v12',
+  merge: 'M18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21V9a9 9 0 0 0 9 9',
+  copy: 'M9 9h11v11H9zM5 15H4V4h11v1',
+  x: 'M18 6 6 18M6 6l12 12',
+  refresh: 'M21 12a9 9 0 1 1-2.64-6.36L21 8M21 3v5h-5',
+  play: 'M7 4.5v15l12-7.5z',
+  stop: 'M7 7h10v10H7z',
+  check: 'M20 6 9 17l-5-5',
+  message: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z',
+  undo: 'M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11',
+  external: 'M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6',
+  search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3',
+  layers: 'M12 2 2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5',
+  activity: 'M22 12h-4l-3 9L9 3l-3 9H2',
+  plus: 'M12 5v14M5 12h14',
+  upload: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12'
+};
+function icon(name, size) {
+  size = size || 14;
+  var svg = document.createElementNS(SVGNS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', size); svg.setAttribute('height', size);
+  svg.setAttribute('fill', 'none'); svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2'); svg.setAttribute('stroke-linecap', 'round'); svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true'); svg.setAttribute('class', 'ic');
+  var p = document.createElementNS(SVGNS, 'path'); p.setAttribute('d', ICONS[name] || ''); svg.appendChild(p);
+  return svg;
+}
+
+function short(id) { return String(id || '').slice(0, 8); }
+function tsOf(v) { if (!v) return null; var t = typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v); return isNaN(t) ? null : t; }
+function dur(ms) {
+  if (ms == null || ms < 0) return '';
+  var s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  var m = Math.floor(s / 60); if (m < 60) return m + 'm';
+  var hh = Math.floor(m / 60); if (hh < 24) return hh + 'h ' + (m % 60) + 'm';
+  var d = Math.floor(hh / 24); return d + 'd ' + (hh % 24) + 'h';
+}
+function rel(v) {
+  var t = tsOf(v); if (t == null) return '';
+  var diff = Date.now() - t;
+  if (diff < 45000) return 'just now';
+  if (diff < 3600000) return Math.round(diff / 60000) + 'm ago';
+  if (diff < 86400000) return Math.round(diff / 3600000) + 'h ago';
+  if (diff < 30 * 86400000) return Math.round(diff / 86400000) + 'd ago';
+  return new Date(t).toLocaleDateString();
+}
+function fmtDate(v) { var t = tsOf(v); return t == null ? '' : new Date(t).toLocaleString(); }
+function safeUrl(u) { return (typeof u === 'string' && /^https?:\/\//i.test(u)) ? u : null; }
+function titleOf(c) {
+  if (c.title) return String(c.title);
+  var line = String(c.content || '').split('\n').filter(function (l) { return l.trim(); })[0] || '(no content)';
+  line = line.replace(/^\s*(BACKLOG|BUG)\s*[:\-–]\s*/i, '').trim();
+  return line.length > 110 ? line.slice(0, 107) + '…' : line;
+}
+function openBlockers(c) { return (c.blockers || []).filter(function (b) { return !b.resolved; }); }
+function hardBlockers(c) { return openBlockers(c).filter(function (b) { return b.severity !== 'warning'; }); }
+function isBusy(c) { return c.status === 'running' || c.status === 'queued' || c.status === 'merging'; }
+function lastTs(c) {
+  var t = tsOf(c.finished_at) || tsOf(c.started_at) || tsOf(c.created_at) || 0;
+  (c.history || []).forEach(function (e) { var x = tsOf(e.ts); if (x && x > t) t = x; });
+  return t;
+}
+function store(key, val) { try { if (val === undefined) return JSON.parse(localStorage.getItem('kanban.' + key)); localStorage.setItem('kanban.' + key, JSON.stringify(val)); } catch (e) { return null; } }
+
+/* ================= token & mode ================= */
+var params = new URLSearchParams(location.search);
+var DEMO = params.get('demo') === '1';
+var TOKEN = null;
+try { TOKEN = sessionStorage.getItem('kanban.token'); } catch (e) { /* storage blocked */ }
+if (params.get('t')) {
+  TOKEN = params.get('t');
+  try { sessionStorage.setItem('kanban.token', TOKEN); } catch (e) { /* ignore */ }
+  params.delete('t');
+  var qs = params.toString();
+  try { history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + location.hash); } catch (e) { /* file:// */ }
+}
+
+/* ================= API wrapper ================= */
+function apiError(status, msg, data) { var e = new Error(msg); e.status = status; e.data = data; return e; }
+function api(method, path, body) {
+  if (DEMO) {
+    return new Promise(function (resolve, reject) {
+      setTimeout(function () {
+        try { resolve(JSON.parse(JSON.stringify(demo.handle(method, path, body)))); }
+        catch (e) { reject(e.status ? e : apiError(500, String(e && e.message || e))); }
+      }, method === 'GET' ? 40 : 160);
+    });
+  }
+  var headers = { 'Accept': 'application/json' };
+  if (TOKEN) headers['X-Kanban-Token'] = TOKEN;
+  var opts = { method: method, headers: headers, cache: 'no-store', credentials: 'same-origin' };
+  if (method !== 'GET') { headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body === undefined ? {} : body); }
+  return fetch(path, opts).then(function (res) {
+    return res.text().then(function (text) {
+      var data = null;
+      try { data = text ? JSON.parse(text) : null; } catch (e) { data = { error: text.slice(0, 300) }; }
+      if (!res.ok) throw apiError(res.status, (data && data.error) || ('HTTP ' + res.status), data);
+      return data;
+    });
+  });
+}
+
+/* ================= toasts ================= */
+function toast(msg, kind) {
+  kind = kind || 'info';
+  var t = h('div', { class: 'toast ' + kind, role: kind === 'error' ? 'alert' : null },
+    h('span', { class: 'msg', text: String(msg) }),
+    h('button', { type: 'button', 'aria-label': 'Dismiss', onclick: function () { t.remove(); } }, icon('x', 13)));
+  $('#toasts').appendChild(t);
+  setTimeout(function () { t.remove(); }, kind === 'error' ? 9000 : 4500);
+  var all = $('#toasts').children; if (all.length > 5) all[0].remove();
+}
+
+/* ================= dialogs ================= */
+function dialog(o) {
+  return new Promise(function (resolve) {
+    var done = false;
+    var err = h('div', { class: 'dlg-err', role: 'alert' });
+    var okBtn = h('button', { type: 'submit', class: 'btn ' + (o.danger ? 'danger solid' : 'primary'), text: o.confirm || 'Confirm' });
+    var dlg = h('dialog', { class: 'dlg', 'aria-labelledby': 'dlgTitle' },
+      h('form', { method: 'dialog', novalidate: true, onsubmit: function (e) {
+        e.preventDefault();
+        if (o.validate) { var m = o.validate(); if (m) { err.textContent = m; return; } }
+        finish(true);
+      } },
+        h('div', { class: 'dlg-head' }, h('h2', { id: 'dlgTitle', text: o.title })),
+        h('div', { class: 'dlg-body' }, o.body || null, err),
+        h('div', { class: 'dlg-foot' },
+          h('button', { type: 'button', class: 'btn', text: o.cancel || 'Cancel', onclick: function () { finish(false); } }),
+          okBtn)));
+    function finish(v) {
+      if (done) return; done = true;
+      try { dlg.close(); } catch (e) { /* already closed */ }
+      dlg.remove(); resolve(v);
+    }
+    dlg.addEventListener('cancel', function (e) { e.preventDefault(); finish(false); });
+    dlg.addEventListener('close', function () { finish(false); });
+    document.body.appendChild(dlg);
+    dlg.showModal();
+    var first = dlg.querySelector('textarea, input[type="text"]');
+    (first || okBtn).focus();
+  });
+}
+function field(label, input) { return h('label', { class: 'field' }, h('span', { text: label }), input); }
+
+/* ================= UI state ================= */
+var COLS = [
+  { key: 'backlog', name: 'Backlog', color: 'var(--text-3)' },
+  { key: 'develop', name: 'In development', color: 'var(--blue)' },
+  { key: 'review', name: 'Review', color: 'var(--purple)' },
+  { key: 'accepted', name: 'Accepted', sub: '→ staging', color: 'var(--teal)' },
+  { key: 'shipped', name: 'Shipped', color: 'var(--green)' }
+];
+var COLNAME = {}; COLS.forEach(function (c) { COLNAME[c.key] = c.name; });
+var STATUS = {
+  idle: ['Idle', ''], queued: ['Queued', 'amber'], running: ['Running', 'blue'],
+  awaiting_review: ['Awaiting review', 'purple'], merging: ['Merging', 'teal'], merged: ['Merged', 'green'],
+  failed: ['Failed', 'red'], stopped: ['Stopped', '']
+};
+var QUICK = ['bug', 'feature-request'];
+
+var S = null;
+var selected = new Set();
+var ui = {
+  search: '',
+  labels: new Set(store('labels') || []),
+  sort: store('sort') || 'newest',
+  hideStale: !!store('hideStale'),
+  hasBlockers: !!store('hasBlockers'),
+  integOpen: false,
+  dragging: null
+};
+function savePrefs() {
+  store('labels', Array.from(ui.labels)); store('sort', ui.sort);
+  store('hideStale', ui.hideStale); store('hasBlockers', ui.hasBlockers);
+}
+function cardById(id) { if (!S) return null; for (var i = 0; i < S.cards.length; i++) if (S.cards[i].id === id) return S.cards[i]; return null; }
+function cfg(names, dflt) {
+  var c = (S && S.config) || {};
+  for (var i = 0; i < names.length; i++) if (c[names[i]] != null && c[names[i]] !== '') return c[names[i]];
+  return dflt;
+}
+function maxAgents() { return Number(cfg(['max_agents', 'KANBAN_MAX_AGENTS', 'maxAgents'], 3)) || 3; }
+function baseBranch() { return (S && S.integration && S.integration.base) || cfg(['base_branch', 'KANBAN_BASE_BRANCH'], 'main'); }
+
+function normalize(s) {
+  s = s || {};
+  var cards = Array.isArray(s.cards) ? s.cards : Object.values(s.cards || {});
+  cards.forEach(function (c) {
+    c.labels = Array.isArray(c.labels) ? c.labels : [];
+    c.blockers = Array.isArray(c.blockers) ? c.blockers : [];
+    c.history = Array.isArray(c.history) ? c.history : [];
+    c.column = c.column || 'backlog';
+    c.status = c.status || 'idle';
+  });
+  s.cards = cards;
+  s.integration = s.integration || {};
+  s.config = s.config || {};
+  s.backlog_refresh = s.backlog_refresh || {};
+  return s;
+}
+
+/* ================= polling ================= */
+var pollTimer = null, polling = false, pollAgain = false;
+function poll() {
+  if (polling) { pollAgain = true; return; }
+  polling = true;
+  api('GET', '/api/state').then(function (data) {
+    S = normalize(data); setBanner(null); render();
+  }).catch(function (e) {
+    if (e.status === 401 || e.status === 403) setBanner('auth', e.message);
+    else setBanner('down', e.message);
+  }).then(function () {
+    polling = false;
+    clearTimeout(pollTimer);
+    if (pollAgain) { pollAgain = false; pollTimer = setTimeout(poll, 50); }
+    else pollTimer = setTimeout(poll, 3000);
+  });
+}
+function refreshSoon() { if (polling) { pollAgain = true; return; } clearTimeout(pollTimer); pollTimer = setTimeout(poll, 120); }
+
+var bannerMode = null;
+function setBanner(mode, msg) {
+  var b = $('#banner');
+  if (DEMO && !mode) mode = 'demo';
+  if (mode === bannerMode && mode !== 'down') return;
+  bannerMode = mode;
+  b.replaceChildren();
+  if (!mode) { b.hidden = true; return; }
+  b.hidden = false;
+  if (mode === 'demo') {
+    b.className = 'banner demo';
+    append(b, [h('strong', { text: 'Demo mode' }), h('span', { text: 'In-memory fake API with sample cards. Nothing is dispatched, pushed or merged.' })]);
+  } else if (mode === 'auth') {
+    b.className = 'banner err';
+    var inp = h('input', { type: 'text', placeholder: 'Paste token', 'aria-label': 'Kanban token', class: 'mono' });
+    append(b, [
+      h('strong', { text: 'Not authorised.' }),
+      h('span', { text: 'Open the URL printed by server.py (http://127.0.0.1:PORT/?t=TOKEN), or paste the token:' }),
+      inp,
+      h('button', { type: 'button', class: 'btn sm', text: 'Use token', onclick: function () {
+        var v = inp.value.trim(); if (!v) return;
+        TOKEN = v; try { sessionStorage.setItem('kanban.token', v); } catch (e) { /* ignore */ }
+        bannerMode = null; refreshSoon();
+      } })
+    ]);
+  } else {
+    b.className = 'banner err';
+    append(b, [h('strong', { text: 'Cannot reach the kanban server.' }),
+      h('span', { text: (msg ? msg + ' — ' : '') + 'Retrying every 3s. Start it with: python3 services/kanban/server.py (or open this page with ?demo=1).' })]);
+  }
+}
+
+/* ================= rendering: header & toolbar ================= */
+function render() {
+  if (!S) return;
+  pruneSelection();
+  renderHeader();
+  renderToolbar();
+  if (!ui.dragging) renderBoard();
+  if (drawer.id) renderDrawer();
+  if (ui.integOpen) renderIntegration();
+}
+
+function pruneSelection() {
+  selected.forEach(function (id) {
+    var c = cardById(id);
+    if (!c || c.column !== 'backlog' || isBusy(c)) selected.delete(id);
+  });
+}
+
+function renderHeader() {
+  var running = S.running != null ? S.running : S.cards.filter(function (c) { return c.status === 'running'; }).length;
+  var queued = S.queued != null ? S.queued : S.cards.filter(function (c) { return c.status === 'queued'; }).length;
+  var max = maxAgents();
+  var stat = $('#runStat');
+  var meter = h('span', { class: 'meter', 'aria-hidden': 'true' });
+  for (var i = 0; i < Math.min(max, 12); i++) meter.appendChild(h('i', { class: i < running ? 'on' : '' }));
+  setKids(stat, meter, h('span', null, h('b', { text: running + '/' + max }), ' agents running'),
+    queued ? h('span', { class: 'pill amber', text: queued + ' queued' }) : null);
+
+  var nBlocked = S.cards.filter(function (c) { return c.column !== 'shipped' && hardBlockers(c).length; }).length;
+  var hb = $('#hdrBlocked');
+  hb.hidden = !nBlocked && !ui.hasBlockers;
+  hb.setAttribute('aria-pressed', String(ui.hasBlockers));
+  setKids(hb, icon('flag', 12), nBlocked + ' blocked');
+  hb.title = 'Show only cards with open blockers';
+
+  var ig = S.integration || {};
+  var pill = $('#integPill');
+  pill.setAttribute('aria-expanded', String(ui.integOpen));
+  setKids(pill, icon('merge', 13),
+    ig.branch ? h('span', { class: 'mono', text: ig.branch }) : h('span', { class: 'none', text: 'No integration branch' }),
+    ig.pr_number ? h('span', { class: 'pill outline', text: '#' + ig.pr_number }) : null);
+  pill.title = 'Integration: ' + baseBranch() + ' ← ' + (ig.branch || '(none yet)') + ' ← item PRs';
+
+  var n = selected.size;
+  var ds = $('#devSelected');
+  ds.disabled = n === 0;
+  setKids(ds, icon('play', 12), 'Develop selected (' + n + ')');
+  $('#clearSel').hidden = n === 0;
+}
+
+var toolbarSig = '';
+function renderToolbar() {
+  var freq = {};
+  S.cards.forEach(function (c) {
+    if (c.column === 'shipped') return;
+    c.labels.forEach(function (l) { if (l !== 'backlog') freq[l] = (freq[l] || 0) + 1; });
+  });
+  var top = Object.keys(freq).filter(function (l) { return QUICK.indexOf(l) < 0; })
+    .sort(function (a, b) { return freq[b] - freq[a] || a.localeCompare(b); }).slice(0, 12);
+  ui.labels.forEach(function (l) { if (QUICK.indexOf(l) < 0 && top.indexOf(l) < 0) top.push(l); });
+  var br = S.backlog_refresh || {};
+  var fetched = br.fetched_at || S.backlog_fetched_at;
+  var stale = S.cards.filter(function (c) { return c.stale; }).length;
+  var sig = JSON.stringify([freq, top, Array.from(ui.labels), ui.hasBlockers, br, fetched, S.backlog_source, stale, rel(fetched)]);
+  if (sig === toolbarSig) return;
+  toolbarSig = sig;
+
+  function chip(l, cls) {
+    var on = ui.labels.has(l);
+    return h('button', { type: 'button', class: 'fchip ' + (cls || ''), 'aria-pressed': String(on), onclick: function () {
+      if (ui.labels.has(l)) ui.labels.delete(l); else ui.labels.add(l);
+      savePrefs(); toolbarSig = ''; render();
+    } }, l, h('span', { class: 'n', text: String(freq[l] || 0) }));
+  }
+  setKids($('#quickChips'), 
+    chip('bug', 'bug'), chip('feature-request'),
+    h('button', { type: 'button', class: 'fchip blk', 'aria-pressed': String(ui.hasBlockers), onclick: function () {
+      ui.hasBlockers = !ui.hasBlockers; savePrefs(); toolbarSig = ''; render();
+    } }, icon('flag', 11), 'Has blockers'));
+  $('#labelChips').replaceChildren.apply($('#labelChips'), top.map(function (l) { return chip(l); }));
+  $('#staleCount').textContent = stale ? '(' + stale + ')' : '';
+
+  var rb = $('#refreshBtn');
+  var spinning = !!br.running;
+  var ic = icon('refresh', 13); if (spinning) ic.classList.add('spin');
+  setKids(rb, ic, spinning ? 'Refreshing…' : 'Refresh backlog');
+  rb.disabled = spinning;
+  var src = br.source || br.last_source || S.backlog_source || cfg(['backlog_source', 'KANBAN_BACKLOG_SOURCE'], '');
+  var meta = $('#refreshMeta');
+  meta.replaceChildren();
+  if (fetched) meta.appendChild(h('span', { title: fmtDate(fetched), text: 'fetched ' + rel(fetched) }));
+  else meta.appendChild(h('span', { text: 'never fetched' }));
+  if (src) meta.appendChild(h('span', { class: 'pill outline', text: String(src) }));
+  if (br.error) meta.appendChild(h('span', { class: 'err', title: String(br.error), text: String(br.error) }));
+}
+
+/* ================= board ================= */
+var colEls = {};
+var cardCache = new Map();
+function buildColumns() {
+  var board = $('#board');
+  COLS.forEach(function (col) {
+    var count = h('span', { class: 'count' });
+    var sub = h('span', { class: 'sub', text: col.sub || '' });
+    var selAll = null;
+    if (col.key === 'backlog') {
+      selAll = h('input', { type: 'checkbox', 'aria-label': 'Select all visible backlog items', title: 'Select all visible', onchange: function (e) {
+        var vis = visibleBacklog();
+        if (e.target.checked) vis.forEach(function (c) { selected.add(c.id); });
+        else vis.forEach(function (c) { selected.delete(c.id); });
+        render();
+      } });
+    }
+    var body = h('div', { class: 'col-body', 'data-col': col.key });
+    var empty = h('div', { class: 'col-empty' });
+    var more = h('div', { class: 'col-more' });
+    var el = h('section', { class: 'col', 'data-col': col.key, 'aria-label': col.name },
+      h('div', { class: 'col-head' }, selAll, h('span', { class: 'ci', style: 'background:' + col.color }),
+        h('span', { text: col.name }), count, sub),
+      body);
+    el.addEventListener('dragover', function (e) {
+      if (!ui.dragging) return;
+      e.preventDefault();
+      var a = dropAction(ui.dragging.from, col.key);
+      // keep 'move' even for disallowed targets so the drop event fires and handleDrop can explain why
+      e.dataTransfer.dropEffect = a === null ? 'none' : 'move';
+      el.classList.toggle('drop-ok', !!a);
+      el.classList.toggle('drop-no', a === false);
+    });
+    el.addEventListener('dragleave', function (e) {
+      if (e.relatedTarget && el.contains(e.relatedTarget)) return;
+      el.classList.remove('drop-ok', 'drop-no');
+    });
+    el.addEventListener('drop', function (e) {
+      e.preventDefault();
+      el.classList.remove('drop-ok', 'drop-no');
+      if (!ui.dragging) return;
+      var d = ui.dragging; ui.dragging = null;
+      handleDrop(d.id, d.from, col.key);
+    });
+    colEls[col.key] = { el: el, body: body, count: count, sub: sub, empty: empty, more: more, selAll: selAll };
+    board.appendChild(el);
+  });
+}
+
+function matches(c) {
+  if (ui.search) {
+    var hay = (titleOf(c) + ' ' + (c.content || '') + ' ' + c.labels.join(' ') + ' ' + c.id + ' ' + (c.branch || '')).toLowerCase();
+    var toks = ui.search.toLowerCase().split(/\s+/).filter(Boolean);
+    for (var i = 0; i < toks.length; i++) if (hay.indexOf(toks[i]) < 0) return false;
+  }
+  if (ui.labels.size && !c.labels.some(function (l) { return ui.labels.has(l); })) return false;
+  if (ui.hasBlockers && !hardBlockers(c).length) return false;
+  if (ui.hideStale && c.stale) return false;
+  return true;
+}
+function visibleBacklog() {
+  return S ? S.cards.filter(function (c) { return c.column === 'backlog' && !isBusy(c) && matches(c); }) : [];
+}
+function sortCol(key, list) {
+  if (key === 'backlog') {
+    list.sort(function (a, b) {
+      if (ui.sort === 'truth') return (b.truth_value == null ? -1 : b.truth_value) - (a.truth_value == null ? -1 : a.truth_value);
+      var d = (tsOf(b.created_at) || 0) - (tsOf(a.created_at) || 0);
+      return ui.sort === 'oldest' ? -d : d;
+    });
+  } else if (key === 'develop') {
+    var rank = { running: 0, merging: 0, queued: 1 };
+    list.sort(function (a, b) {
+      var ra = rank[a.status] != null ? rank[a.status] : 2, rb = rank[b.status] != null ? rank[b.status] : 2;
+      return ra - rb || lastTs(b) - lastTs(a);
+    });
+  } else {
+    list.sort(function (a, b) { return lastTs(b) - lastTs(a); });
+  }
+  return list;
+}
+
+function renderBoard() {
+  var by = {}, totals = {};
+  COLS.forEach(function (c) { by[c.key] = []; totals[c.key] = 0; });
+  S.cards.forEach(function (c) {
+    if (!by[c.column]) return;
+    totals[c.column]++;
+    if (matches(c)) by[c.column].push(c);
+  });
+  var seen = new Set();
+  COLS.forEach(function (col) {
+    var ce = colEls[col.key];
+    var list = sortCol(col.key, by[col.key]);
+    var limit = col.key === 'shipped' ? 60 : 400;
+    var shown = list.slice(0, limit);
+    ce.count.textContent = shown.length === totals[col.key] ? String(totals[col.key]) : list.length + ' / ' + totals[col.key];
+    if (col.key === 'accepted') ce.sub.textContent = S.integration.branch ? '→ ' + S.integration.branch : '→ staging';
+    var els = shown.map(function (c) { seen.add(c.id); return cardEl(c); });
+    if (!shown.length) {
+      ce.empty.textContent = totals[col.key] ? 'No cards match the filters' : emptyText(col.key);
+      els.push(ce.empty);
+    }
+    if (list.length > shown.length) { ce.more.textContent = (list.length - shown.length) + ' older cards not shown'; els.push(ce.more); }
+    reconcile(ce.body, els);
+    if (ce.selAll) {
+      var vis = visibleBacklog();
+      var nsel = vis.filter(function (c) { return selected.has(c.id); }).length;
+      ce.selAll.checked = vis.length > 0 && nsel === vis.length;
+      ce.selAll.indeterminate = nsel > 0 && nsel < vis.length;
+      ce.selAll.disabled = vis.length === 0;
+    }
+  });
+  cardCache.forEach(function (v, id) { if (!seen.has(id)) cardCache.delete(id); });
+}
+function emptyText(key) {
+  return {
+    backlog: 'No backlog items. Refresh to pull from EpiGraph.',
+    develop: 'Drag items here or use Develop to dispatch agents.',
+    review: 'Agent results land here for review.',
+    accepted: 'Accepted items are merged into the integration branch.',
+    shipped: 'Nothing shipped yet.'
+  }[key];
+}
+function reconcile(parent, els) {
+  var keep = new Set(els);
+  Array.prototype.slice.call(parent.children).forEach(function (ch) { if (!keep.has(ch)) ch.remove(); });
+  els.forEach(function (el, i) { if (parent.children[i] !== el) parent.insertBefore(el, parent.children[i] || null); });
+}
+
+function elapsedOf(c) {
+  var s = tsOf(c.started_at); if (!s) return '';
+  if (c.column === 'backlog' || c.column === 'shipped') return '';
+  if (c.status === 'queued') return '';
+  var e = (c.status === 'running' || c.status === 'merging') ? Date.now() : (tsOf(c.finished_at) || null);
+  return e ? dur(e - s) : '';
+}
+function cardSig(c) {
+  return JSON.stringify([c.column, c.status, c.stale, titleOf(c), c.labels,
+    c.blockers.map(function (b) { return [b.id, b.resolved, b.severity]; }),
+    c.pr_url, c.pr_number, c.last_activity, elapsedOf(c), selected.has(c.id), drawer.id === c.id]);
+}
+function cardEl(c) {
+  var sig = cardSig(c);
+  var cached = cardCache.get(c.id);
+  if (cached && cached.sig === sig) return cached.el;
+  var el = buildCard(c);
+  if (cached && cached.el.parentNode) cached.el.parentNode.replaceChild(el, cached.el);
+  cardCache.set(c.id, { sig: sig, el: el });
+  return el;
+}
+function statusPill(s) {
+  var m = STATUS[s] || [String(s), ''];
+  var p = h('span', { class: 'pill ' + m[1] });
+  if (s === 'running' || s === 'merging') p.appendChild(h('span', { class: 'dot pulse' }));
+  else if (s === 'queued') p.appendChild(h('span', { class: 'dot' }));
+  p.appendChild(document.createTextNode(m[0]));
+  return p;
+}
+function flagBadges(c) {
+  var ob = openBlockers(c);
+  var nb = ob.filter(function (b) { return b.severity !== 'warning'; }).length, nw = ob.length - nb;
+  var out = [];
+  if (nb) out.push(h('span', { class: 'flag', title: nb + ' open blocker' + (nb > 1 ? 's' : '') }, icon('flag', 11), String(nb)));
+  if (nw) out.push(h('span', { class: 'flag warn', title: nw + ' open warning' + (nw > 1 ? 's' : '') }, icon('flag', 11), String(nw)));
+  return out;
+}
+function labelChips(labels, max) {
+  var ls = labels.filter(function (l) { return l !== 'backlog'; });
+  var out = ls.slice(0, max).map(function (l) { return h('span', { class: 'chip l-' + l.replace(/[^a-z0-9-]/gi, ''), text: l, title: l }); });
+  if (ls.length > max) out.push(h('span', { class: 'chip', text: '+' + (ls.length - max), title: ls.slice(max).join(', ') }));
+  return out;
+}
+function prLink(c, withIcon) {
+  var u = safeUrl(c.pr_url);
+  if (!u && !c.pr_number) return null;
+  var label = c.pr_number ? '#' + c.pr_number : 'PR';
+  if (!u) return h('span', { class: 'pr' }, withIcon ? icon('pr', 12) : null, label);
+  return h('a', { class: 'pr', href: u, target: '_blank', rel: 'noopener noreferrer', title: u }, withIcon ? icon('pr', 12) : null, label);
+}
+function smallBtn(label, ic, fn, cls) {
+  return h('button', { type: 'button', class: 'btn xs ' + (cls || ''), onclick: function (e) { e.stopPropagation(); fn(); } }, ic ? icon(ic, 11) : null, label);
+}
+function cardActions(c) {
+  var a = [];
+  if (c.status === 'merging') return [h('span', { class: 'muted', text: 'Merging…' })];
+  if (c.column === 'backlog' && !isBusy(c)) a.push(smallBtn('Develop', 'play', function () { developCard(c.id); }, 'primary'));
+  else if (c.column === 'develop') {
+    if (isBusy(c)) a.push(smallBtn('Stop', 'stop', function () { stopCard(c.id); }));
+    else a.push(smallBtn('Re-run', 'play', function () { developCard(c.id); }));
+    a.push(smallBtn('Reject', null, function () { rejectCard(c.id); }, 'ghost'));
+  } else if (c.column === 'review') {
+    if (c.pr_number || c.pr_url) a.push(smallBtn('Accept', 'check', function () { acceptCard(c.id); }, hardBlockers(c).length ? '' : 'primary'));
+    a.push(smallBtn('Changes', null, function () { feedbackCard(c.id); }));
+    a.push(smallBtn('Reject', null, function () { rejectCard(c.id); }, 'ghost'));
+  }
+  return a;
+}
+function buildCard(c) {
+  var cls = 'card';
+  if (c.stale) cls += ' stale';
+  if (selected.has(c.id)) cls += ' selected';
+  if (drawer.id === c.id) cls += ' open';
+  if (hardBlockers(c).length && c.column !== 'shipped') cls += ' blocked';
+  var el = h('article', { class: cls, draggable: 'true', 'data-id': c.id });
+  var top = h('div', { class: 'c-top' });
+  if (c.column === 'backlog' && !isBusy(c)) {
+    top.appendChild(h('input', { type: 'checkbox', checked: selected.has(c.id), 'aria-label': 'Select ' + short(c.id) + ' for development',
+      onclick: function (e) { e.stopPropagation(); },
+      onchange: function (e) { if (e.target.checked) selected.add(c.id); else selected.delete(c.id); render(); } }));
+  }
+  top.appendChild(h('span', { class: 'cid mono', text: short(c.id) }));
+  if (c.status && c.status !== 'idle') top.appendChild(statusPill(c.status));
+  if (c.stale) top.appendChild(h('span', { class: 'pill', text: 'stale', title: 'No longer in the EpiGraph backlog source' }));
+  top.appendChild(h('span', { class: 'grow' }));
+  append(top, flagBadges(c));
+  var el2 = elapsedOf(c);
+  if (el2) top.appendChild(h('span', { class: 'elapsed', text: el2, title: 'Started ' + fmtDate(c.started_at) + (c.finished_at ? '\nFinished ' + fmtDate(c.finished_at) : '') }));
+  el.appendChild(top);
+  el.appendChild(h('button', { type: 'button', class: 'c-title', text: titleOf(c), title: titleOf(c), onclick: function (e) { e.stopPropagation(); openDrawer(c.id); } }));
+  var chips = labelChips(c.labels, 4);
+  if (chips.length) el.appendChild(h('div', { class: 'c-labels' }, chips));
+  if ((c.status === 'running' || c.status === 'merging') && c.last_activity) {
+    el.appendChild(h('div', { class: 'c-activity', title: String(c.last_activity) }, icon('activity', 11), h('span', { class: 'mono', text: String(c.last_activity) })));
+  }
+  var acts = cardActions(c);
+  var pr = prLink(c, true);
+  if (pr || acts.length) el.appendChild(h('div', { class: 'c-foot' }, pr, h('div', { class: 'c-actions' }, acts)));
+
+  el.addEventListener('click', function (e) {
+    if (e.target.closest('button, a, input, label')) return;
+    openDrawer(c.id);
+  });
+  el.addEventListener('dragstart', function (e) {
+    ui.dragging = { id: c.id, from: c.column };
+    try { e.dataTransfer.setData('text/plain', c.id); } catch (x) { /* ignore */ }
+    e.dataTransfer.effectAllowed = 'move';
+    requestAnimationFrame(function () { el.classList.add('dragging'); });
+  });
+  el.addEventListener('dragend', function () {
+    el.classList.remove('dragging');
+    ui.dragging = null;
+    Object.keys(colEls).forEach(function (k) { colEls[k].el.classList.remove('drop-ok', 'drop-no'); });
+    render();
+  });
+  return el;
+}
+
+/* ================= drag & drop mapping ================= */
+function dropAction(from, to) {
+  if (from === to) return null;
+  if (from === 'backlog' && to === 'develop') return 'develop';
+  if (from === 'review' && to === 'accepted') return 'accept';
+  if (from === 'review' && to === 'develop') return 'feedback';
+  if ((from === 'develop' || from === 'review') && to === 'backlog') return 'reject';
+  return false;
+}
+function handleDrop(id, from, to) {
+  var a = dropAction(from, to);
+  if (a === null) return;
+  if (a === false) { toast('Not allowed: ' + COLNAME[from] + ' → ' + COLNAME[to], 'warn'); render(); return; }
+  if (a === 'develop') {
+    if (selected.has(id) && selected.size > 1) developSelected();
+    else developCard(id);
+  } else if (a === 'accept') acceptCard(id);
+  else if (a === 'feedback') feedbackCard(id);
+  else if (a === 'reject') rejectCard(id);
+}
+
+/* ================= actions ================= */
+function cpath(id, rest) { return '/api/cards/' + encodeURIComponent(id) + rest; }
+function run(promise, okMsg) {
+  return promise.then(function (r) { if (okMsg) toast(okMsg, 'ok'); refreshSoon(); return r || true; })
+    .catch(function (e) { toast(e.message, 'error'); refreshSoon(); return null; });
+}
+function developCard(id, notes) {
+  var body = {}; if (notes) body.notes = notes;
+  var c = cardById(id);
+  return run(api('POST', cpath(id, '/develop'), body), 'Dispatched agent for ' + short(id) + (c ? ': ' + titleOf(c).slice(0, 60) : ''));
+}
+function developSelected() {
+  var ids = Array.from(selected);
+  if (!ids.length) return;
+  var notes = h('textarea', { rows: 3, placeholder: 'Optional notes appended to every agent prompt' });
+  var max = maxAgents();
+  dialog({
+    title: 'Develop ' + ids.length + ' item' + (ids.length > 1 ? 's' : ''),
+    body: [
+      h('p', { text: 'Each item gets its own worktree and headless ultracode agent. At most ' + max + ' run at once; the rest queue in order.' }),
+      h('ul', null, ids.slice(0, 8).map(function (id) { var c = cardById(id); return h('li', null, h('span', { class: 'mono', text: short(id) + ' ' }), c ? titleOf(c) : ''); }),
+        ids.length > 8 ? h('li', { text: '…and ' + (ids.length - 8) + ' more' }) : null),
+      field('Notes (optional)', notes)
+    ],
+    confirm: 'Dispatch ' + ids.length + ' agent' + (ids.length > 1 ? 's' : '')
+  }).then(function (ok) {
+    if (!ok) return;
+    var n = notes.value.trim(), okCount = 0, errs = [];
+    var chain = Promise.resolve();
+    ids.forEach(function (id) {
+      chain = chain.then(function () {
+        var body = {}; if (n) body.notes = n;
+        return api('POST', cpath(id, '/develop'), body).then(function () { okCount++; selected.delete(id); })
+          .catch(function (e) { errs.push(short(id) + ': ' + e.message); });
+      });
+    });
+    chain.then(function () {
+      if (okCount) toast('Dispatched ' + okCount + ' item' + (okCount > 1 ? 's' : ''), 'ok');
+      if (errs.length) toast(errs.join('\n'), 'error');
+      refreshSoon(); render();
+    });
+  });
+}
+function stopCard(id) {
+  var c = cardById(id);
+  dialog({ title: 'Stop agent?', danger: true, confirm: 'Stop agent',
+    body: h('p', { text: 'Kills the agent process group for ' + short(id) + (c ? ' (' + titleOf(c).slice(0, 80) + ')' : '') + '. The worktree and branch are kept; you can re-run later.' })
+  }).then(function (ok) { if (ok) run(api('POST', cpath(id, '/stop')), 'Stopped ' + short(id)); });
+}
+function feedbackCard(id) {
+  var ta = h('textarea', { rows: 6, placeholder: 'What should change? The agent resumes its session, pushes to the same branch and the PR updates.' });
+  dialog({ title: 'Request changes', confirm: 'Send to agent',
+    body: [h('p', { text: short(id) + ' — ' + (cardById(id) ? titleOf(cardById(id)) : '') }), field('Review feedback', ta)],
+    validate: function () { return ta.value.trim() ? null : 'Feedback text is required.'; }
+  }).then(function (ok) { if (ok) sendFeedback(id, ta.value.trim()); });
+}
+function sendFeedback(id, text) { return run(api('POST', cpath(id, '/feedback'), { text: text }), 'Feedback sent; agent resumed'); }
+function acceptCard(id) {
+  var c = cardById(id); if (!c) return;
+  var hb = hardBlockers(c);
+  if (hb.length) { forceAccept(c, hb); return; }
+  var integ = c.integration_branch || S.integration.branch || 'the integration branch';
+  dialog({ title: 'Accept and merge?', confirm: 'Merge into staging',
+    body: [h('p', null, 'Merges ', c.pr_number ? h('strong', { text: 'PR #' + c.pr_number }) : 'the item PR', ' into ', h('span', { class: 'mono', text: integ }),
+      ' with a merge commit, deletes the item branch and removes the worktree.'),
+      openBlockers(c).length ? h('p', { text: openBlockers(c).length + ' open warning(s) remain on this card.' }) : null]
+  }).then(function (ok) {
+    if (!ok) return;
+    api('POST', cpath(id, '/accept'), {}).then(function () { toast('Merged ' + short(id) + ' into ' + integ, 'ok'); refreshSoon(); })
+      .catch(function (e) {
+        if (e.status === 409 && /block/i.test(e.message)) forceAccept(c, hardBlockers(c), e.message);
+        else { toast(e.message, 'error'); refreshSoon(); }
+      });
+  });
+}
+function forceAccept(c, hb, msg) {
+  dialog({ title: 'Force accept with open blockers?', danger: true, confirm: 'Force accept and merge',
+    body: [
+      msg ? h('p', { text: msg }) : null,
+      h('p', { text: hb.length + ' unresolved blocker' + (hb.length === 1 ? '' : 's') + ' on ' + short(c.id) + ':' }),
+      h('ul', null, hb.map(function (b) { return h('li', { text: b.text }); })),
+      h('p', { text: 'The PR will be merged into the integration branch anyway. Resolving the blockers first is usually better.' })
+    ]
+  }).then(function (ok) { if (ok) run(api('POST', cpath(c.id, '/accept'), { force: true }), 'Force-accepted ' + short(c.id)); });
+}
+function rejectCard(id) {
+  var c = cardById(id);
+  var reason = h('textarea', { rows: 3, placeholder: 'Why is this going back to the backlog? (optional)' });
+  var cleanup = h('input', { type: 'checkbox' });
+  dialog({ title: 'Reject back to backlog?', danger: true, confirm: 'Reject',
+    body: [
+      h('p', { text: short(id) + (c ? ' — ' + titleOf(c) : '') }),
+      c && isBusy(c) ? h('p', { text: 'The running agent will be stopped.' }) : null,
+      h('p', { text: 'Any open PR is left open and recorded on the card.' }),
+      field('Reason', reason),
+      h('label', { class: 'check' }, cleanup, 'Also remove the worktree')
+    ]
+  }).then(function (ok) {
+    if (ok) run(api('POST', cpath(id, '/reject'), { reason: reason.value.trim() || undefined, cleanup: cleanup.checked }), 'Moved ' + short(id) + ' back to backlog');
+  });
+}
+function addBlocker(id, text, severity) { return run(api('POST', cpath(id, '/blockers'), { text: text, severity: severity }), 'Flag added'); }
+function resolveBlocker(id, bid, note) { return run(api('POST', cpath(id, '/blockers/' + encodeURIComponent(bid) + '/resolve'), { note: note || undefined }), 'Blocker resolved'); }
+
+/* ================= drawer ================= */
+var drawer = { id: null, tab: 'overview', composer: null, sigs: {}, resolving: null, resolveNote: '', log: null, logErr: null, logSig: '', logTimer: null, returnFocus: null };
+function openDrawer(id) {
+  if (drawer.id !== id) {
+    drawer.id = id; drawer.composer = null; drawer.sigs = {}; drawer.resolving = null; drawer.resolveNote = '';
+    drawer.log = null; drawer.logErr = null; drawer.logSig = '';
+    $('#drComposer').dataset.mode = ' ';
+    $('#addBlkText').value = '';
+    $('#drLog').replaceChildren();
+  }
+  drawer.returnFocus = document.activeElement;
+  $('#drawer').hidden = false;
+  document.body.classList.add('drawer-open');
+  renderDrawer();
+  renderBoard();
+  loadLog();
+  clearInterval(drawer.logTimer);
+  drawer.wasBusy = null;
+  drawer.logTimer = setInterval(function () {
+    var c = cardById(drawer.id);
+    if (!c) return;
+    var busy = isBusy(c);
+    // one extra fetch after the agent finishes, so the final assistant text and result event show up
+    var justFinished = drawer.wasBusy === true && !busy;
+    drawer.wasBusy = busy;
+    if (busy || justFinished || drawer.tab === 'log' && !drawer.log) loadLog();
+  }, 3000);
+  $('#drTitle').focus({ preventScroll: true });
+}
+function closeDrawer() {
+  if (!drawer.id) return;
+  var id = drawer.id;
+  drawer.id = null;
+  clearInterval(drawer.logTimer);
+  $('#drawer').hidden = true;
+  document.body.classList.remove('drawer-open');
+  if (S) renderBoard();
+  var cached = cardCache.get(id);
+  var target = cached && cached.el.isConnected ? cached.el.querySelector('.c-title') : drawer.returnFocus;
+  if (target && target.focus) target.focus({ preventScroll: true });
+}
+function setTab(t) {
+  drawer.tab = t;
+  ['overview', 'log', 'history'].forEach(function (k) {
+    $('#tab-' + k).setAttribute('aria-selected', String(k === t));
+    $('#pane-' + k).hidden = k !== t;
+  });
+  if (t === 'log') { loadLog(); scrollLogBottom(); }
+}
+function isEditing(container) {
+  var a = document.activeElement;
+  return !!(a && container.contains(a) && /^(TEXTAREA|INPUT|SELECT)$/.test(a.tagName));
+}
+function section(key, el, sig, build) {
+  if (drawer.sigs[key] === sig) return;
+  if (isEditing(el)) return;
+  drawer.sigs[key] = sig;
+  el.replaceChildren();
+  append(el, build());
+}
+function copyText(text) {
+  var done = function () { toast('Copied ' + text, 'ok'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function () { fallbackCopy(text); done(); });
+  } else { fallbackCopy(text); done(); }
+}
+function fallbackCopy(text) {
+  var ta = h('textarea', { style: 'position:fixed;left:-9999px' }); ta.value = text;
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+  ta.remove();
+}
+function renderDrawer() {
+  var c = cardById(drawer.id);
+  if (!c) {
+    $('#drTitle').textContent = 'This card is no longer on the board.';
+    $('#drPills').replaceChildren(); $('#drActions').replaceChildren();
+    return;
+  }
+  $('#drShort').textContent = short(c.id);
+  $('#drTitle').textContent = titleOf(c);
+
+  section('pills', $('#drPills'), JSON.stringify([c.status, c.column, c.stale, c.blockers, c.truth_value]), function () {
+    return [
+      h('span', { class: 'pill accent', text: COLNAME[c.column] || c.column }),
+      c.status !== 'idle' ? statusPill(c.status) : null,
+      c.stale ? h('span', { class: 'pill', text: 'stale', title: 'No longer in the EpiGraph backlog source' }) : null,
+      flagBadges(c),
+      c.truth_value != null ? h('span', { class: 'pill outline', title: 'Claim truth value', text: 'truth ' + Number(c.truth_value).toFixed(2) }) : null
+    ];
+  });
+
+  var acts = drawerActions(c);
+  section('actions', $('#drActions'), JSON.stringify(acts.map(function (a) { return [a.label, a.cls, a.disabled, a.note]; })), function () {
+    return acts.map(function (a) {
+      if (a.note) return h('span', { class: 'note', text: a.note });
+      return h('button', { type: 'button', class: 'btn sm ' + (a.cls || ''), disabled: !!a.disabled, title: a.title || null, onclick: a.fn }, a.icon ? icon(a.icon, 12) : null, a.label);
+    });
+  });
+  renderComposer(c);
+
+  var ob = openBlockers(c);
+  setKids($('#blkHead'), 'Blockers', ob.length ? h('span', { class: 'count', text: String(ob.length) }) : null);
+  section('blockers', $('#drBlockers'), JSON.stringify([c.blockers, drawer.resolving]), function () { return buildBlockers(c); });
+
+  section('report', $('#drReport'), JSON.stringify([c.summary, c.verification, c.cost_usd, c.status]), function () {
+    var out = [h('h3', { text: 'Agent report' })];
+    if (!c.summary && !c.verification) {
+      out.push(h('p', { class: 'muted', style: 'margin:0', text: isBusy(c) ? 'Agent is working; the report appears when it exits.' : 'No agent report yet.' }));
+    } else {
+      if (c.summary) out.push(h('div', { class: 'subhead', text: 'Summary' }), h('p', { class: 'prose-sm', text: String(c.summary) }));
+      if (c.verification) out.push(h('div', { class: 'subhead', text: 'Verification' }), h('p', { class: 'prose-sm mono', text: String(c.verification) }));
+    }
+    if (c.cost_usd != null) out.push(h('div', { class: 'subhead', text: 'Cost' }), h('span', { class: 'mono', text: '$' + Number(c.cost_usd).toFixed(2) }));
+    return out;
+  });
+
+  section('content', $('#drContent'), JSON.stringify([c.content, c.labels, c.created_at, c.id]), function () {
+    return [
+      h('h3', { text: 'Backlog claim' }),
+      h('p', { class: 'content', text: String(c.content || '') }),
+      h('div', { class: 'c-labels', style: 'margin-top:10px' }, labelChips(c.labels, 50)),
+      h('dl', { class: 'kv', style: 'margin-top:10px' },
+        h('dt', { text: 'Claim id' }), h('dd', null, h('span', { class: 'copyable' }, h('span', { class: 'mono', text: c.id }),
+          h('button', { type: 'button', class: 'btn ghost xs icon', 'aria-label': 'Copy claim id', onclick: function () { copyText(c.id); } }, icon('copy', 11)))),
+        h('dt', { text: 'Created' }), h('dd', { text: fmtDate(c.created_at) + (c.created_at ? ' (' + rel(c.created_at) + ')' : '') }))
+    ];
+  });
+
+  section('git', $('#drGit'), JSON.stringify([c.branch, c.worktree, c.pr_url, c.pr_number, c.session_id, c.integration_branch, c.started_at, c.finished_at, c.last_activity, elapsedOf(c)]), function () {
+    var rows = [];
+    function row(k, v) { if (v == null || v === '') return; rows.push(h('dt', { text: k }), h('dd', null, v)); }
+    function mono(v) { return v ? h('span', { class: 'copyable' }, h('span', { class: 'mono', text: String(v) }),
+      h('button', { type: 'button', class: 'btn ghost xs icon', 'aria-label': 'Copy', onclick: function () { copyText(String(v)); } }, icon('copy', 11))) : null; }
+    row('Branch', mono(c.branch));
+    row('Base (PR into)', c.integration_branch ? h('span', { class: 'mono', text: c.integration_branch }) : null);
+    var pu = safeUrl(c.pr_url);
+    row('Pull request', pu ? h('a', { href: pu, target: '_blank', rel: 'noopener noreferrer' }, (c.pr_number ? '#' + c.pr_number + ' ' : ''), icon('external', 11)) : (c.pr_number ? '#' + c.pr_number : null));
+    row('Worktree', mono(c.worktree));
+    row('Session', mono(c.session_id));
+    row('Started', c.started_at ? fmtDate(c.started_at) : null);
+    row('Finished', c.finished_at ? fmtDate(c.finished_at) : null);
+    row('Elapsed', elapsedOf(c) || null);
+    row('Last activity', c.last_activity ? h('span', { class: 'mono', text: String(c.last_activity) }) : null);
+    if (!rows.length) return [h('h3', { text: 'Git & PR' }), h('p', { class: 'muted', style: 'margin:0', text: 'No branch yet. Dispatching creates a worktree off the integration branch.' })];
+    return [h('h3', { text: 'Git & PR' }), h('dl', { class: 'kv git-kv' }, rows)];
+  });
+
+  $('#histCount').textContent = c.history.length ? String(c.history.length) : '';
+  section('history', $('#drHistory'), JSON.stringify(c.history), function () {
+    if (!c.history.length) return h('li', { class: 'muted', text: 'No events yet.' });
+    return c.history.slice().reverse().map(function (e) {
+      return h('li', null, h('span', { class: 'tl-ev', text: String(e.event || '') }), h('span', { class: 'tl-ts', title: fmtDate(e.ts), text: rel(e.ts) }),
+        e.detail ? h('div', { class: 'tl-detail', text: typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail) }) : null);
+    });
+  });
+
+  var live = $('#logLive');
+  setKids(live, isBusy(c) ? h('span', { class: 'pill blue', style: 'height:16px;font-size:10px' }, h('span', { class: 'dot pulse' }), 'live') : '');
+}
+
+function drawerActions(c) {
+  var A = [];
+  var busy = isBusy(c);
+  var nb = hardBlockers(c).length;
+  if (c.column === 'backlog') {
+    if (!busy) {
+      A.push({ label: 'Develop', icon: 'play', cls: 'primary', fn: function () { developCard(c.id); } });
+      A.push({ label: 'Develop with notes…', icon: 'message', fn: function () { setComposer('develop'); } });
+    }
+  } else if (c.column === 'develop') {
+    if (busy) A.push({ label: 'Stop agent', icon: 'stop', cls: 'danger', fn: function () { stopCard(c.id); } });
+    else A.push({ label: 'Re-run with notes…', icon: 'play', cls: 'primary', fn: function () { setComposer('develop'); } });
+    A.push({ label: 'Reject to backlog', icon: 'undo', fn: function () { rejectCard(c.id); } });
+  } else if (c.column === 'review' && c.status === 'merging') {
+    A.push({ note: 'Merging PR' + (c.pr_number ? ' #' + c.pr_number : '') + ' into ' + (c.integration_branch || 'the integration branch') + '…' });
+  } else if (c.column === 'review') {
+    var hasPr = !!(c.pr_number || c.pr_url);
+    if (!hasPr) A.push({ note: 'No PR to merge.' });
+    else A.push({ label: 'Accept & merge', icon: 'check', cls: 'primary', disabled: nb > 0, title: nb ? 'Resolve ' + nb + ' blocker(s) first, or force accept' : 'Merge the item PR into the integration branch', fn: function () { acceptCard(c.id); } });
+    if (nb && hasPr) A.push({ label: 'Force accept…', icon: 'check', cls: 'danger', fn: function () { forceAccept(c, hardBlockers(c)); } });
+    A.push({ label: 'Request changes…', icon: 'message', fn: function () { setComposer('feedback'); } });
+    A.push({ label: 'Re-run…', icon: 'play', fn: function () { setComposer('develop'); } });
+    A.push({ label: 'Reject', icon: 'undo', cls: 'ghost', fn: function () { rejectCard(c.id); } });
+  } else if (c.column === 'accepted') {
+    A.push({ note: 'Merged into ' + (c.integration_branch || 'the integration branch') + '. Ships to ' + baseBranch() + ' with the integration PR.' });
+  } else if (c.column === 'shipped') {
+    A.push({ note: 'Shipped to ' + baseBranch() + '.' });
+  }
+  return A;
+}
+function setComposer(mode) { drawer.composer = mode; renderComposer(cardById(drawer.id)); var ta = $('#drComposer textarea'); if (ta) ta.focus(); }
+function renderComposer(c) {
+  var el = $('#drComposer');
+  var mode = drawer.composer || '';
+  if (el.dataset.mode === mode) return;
+  el.dataset.mode = mode;
+  el.replaceChildren();
+  if (!mode || !c) { el.hidden = true; return; }
+  el.hidden = false;
+  var fb = mode === 'feedback';
+  var id = c.id;
+  var ta = h('textarea', { id: 'composerText', rows: fb ? 5 : 3,
+    placeholder: fb ? 'What should change? The agent resumes its session, pushes to the same branch, and the PR updates.'
+      : 'Optional notes appended to the agent prompt: constraints, hints, scope limits.' });
+  var submit = h('button', { type: 'button', class: 'btn primary sm', text: fb ? 'Send to agent' : 'Dispatch agent' });
+  submit.addEventListener('click', function () {
+    var v = ta.value.trim();
+    if (fb && !v) { toast('Write some feedback first', 'warn'); ta.focus(); return; }
+    submit.disabled = true;
+    (fb ? sendFeedback(id, v) : developCard(id, v)).then(function (ok) {
+      submit.disabled = false;
+      if (ok && drawer.id === id) { drawer.composer = null; renderComposer(cardById(id)); }
+    });
+  });
+  ta.addEventListener('keydown', function (e) { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); submit.click(); } });
+  append(el, [
+    h('label', { for: 'composerText', text: fb ? 'Request changes' : (c.column === 'backlog' ? 'Develop with notes' : 'Re-run agent') }),
+    ta,
+    h('div', { class: 'row' }, h('span', { class: 'hint', text: 'Cmd/Ctrl+Enter to send' }),
+      h('button', { type: 'button', class: 'btn ghost sm', text: 'Cancel', onclick: function () { drawer.composer = null; renderComposer(cardById(id)); } }),
+      submit)
+  ]);
+}
+function buildBlockers(c) {
+  if (!c.blockers.length) return h('p', { class: 'muted', style: 'margin:0', text: 'No flags. Agents write blockers here live as they find them.' });
+  var list = c.blockers.slice().sort(function (a, b) {
+    return (a.resolved ? 1 : 0) - (b.resolved ? 1 : 0) || (a.severity === 'warning' ? 1 : 0) - (b.severity === 'warning' ? 1 : 0);
+  });
+  return h('div', { class: 'blk-list' }, list.map(function (b) {
+    var sev = b.severity === 'warning' ? 'warning' : 'blocker';
+    var item = h('div', { class: 'blk sev-' + sev + (b.resolved ? ' resolved' : '') });
+    item.appendChild(h('div', { class: 'blk-meta' },
+      h('span', { class: 'pill ' + (b.resolved ? '' : sev === 'blocker' ? 'red' : 'amber'), text: b.resolved ? 'resolved' : sev }),
+      h('span', { text: b.source === 'user' ? 'flagged by you' : 'flagged by agent' }),
+      h('span', { title: fmtDate(b.created_at), text: rel(b.created_at) }),
+      h('span', { class: 'grow' }),
+      !b.resolved && drawer.resolving !== b.id ? h('button', { type: 'button', class: 'btn xs', onclick: function () {
+        drawer.resolving = b.id; drawer.resolveNote = ''; drawer.sigs.blockers = ''; renderDrawer();
+        var inp = $('#resolveNote'); if (inp) inp.focus();
+      } }, icon('check', 11), 'Resolve') : null));
+    item.appendChild(h('div', { class: 'blk-text', text: String(b.text || '') }));
+    if (b.note) item.appendChild(h('div', { class: 'blk-note', text: 'Note: ' + b.note }));
+    if (!b.resolved && drawer.resolving === b.id) {
+      var inp = h('input', { type: 'text', id: 'resolveNote', placeholder: 'Resolution note (optional)', value: drawer.resolveNote,
+        oninput: function (e) { drawer.resolveNote = e.target.value; },
+        onkeydown: function (e) { if (e.key === 'Enter') { e.preventDefault(); go(); } } });
+      var go = function () {
+        var cid = c.id, bid = b.id, note = drawer.resolveNote.trim();
+        drawer.resolving = null; drawer.resolveNote = ''; drawer.sigs.blockers = '';
+        if (document.activeElement === inp) inp.blur();
+        resolveBlocker(cid, bid, note);
+        renderDrawer();
+      };
+      item.appendChild(h('div', { class: 'blk-resolve' }, inp,
+        h('button', { type: 'button', class: 'btn sm primary', text: 'Resolve', onclick: go }),
+        h('button', { type: 'button', class: 'btn sm ghost', text: 'Cancel', onclick: function () {
+          drawer.resolving = null; drawer.sigs.blockers = ''; if (document.activeElement === inp) inp.blur(); renderDrawer();
+        } })));
+    }
+    return item;
+  }));
+}
+
+/* ----- log ----- */
+function loadLog() {
+  var id = drawer.id; if (!id) return;
+  api('GET', cpath(id, '/log?tail=300')).then(function (r) {
+    if (drawer.id !== id) return;
+    drawer.log = (r && r.lines) || []; drawer.logErr = null; renderLog();
+  }).catch(function (e) {
+    if (drawer.id !== id) return;
+    drawer.logErr = e.message; renderLog();
+  });
+}
+function scrollLogBottom() { var l = $('#drLog'); l.scrollTop = l.scrollHeight; }
+function renderLog() {
+  var box = $('#drLog');
+  var lines = drawer.log || [];
+  var sig = lines.length + '|' + (lines.length ? JSON.stringify(lines[lines.length - 1]) : '') + '|' + drawer.logErr;
+  var c = cardById(drawer.id);
+  setKids($('#logHead'), 
+    h('span', { text: lines.length ? lines.length + ' events (tail 300)' : '' }),
+    c && isBusy(c) ? h('span', { class: 'pill blue' }, h('span', { class: 'dot pulse' }), 'polling every 3s') : null,
+    h('span', { class: 'grow' }),
+    h('button', { type: 'button', class: 'btn xs', onclick: loadLog }, icon('refresh', 11), 'Reload'));
+  if (sig === drawer.logSig) return;
+  drawer.logSig = sig;
+  var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30 || !box.childElementCount;
+  box.replaceChildren();
+  if (drawer.logErr) box.appendChild(h('div', { class: 'logline kind-stderr' }, h('span', { class: 'k', text: 'error' }), h('span', { class: 't', text: drawer.logErr })));
+  if (!lines.length && !drawer.logErr) box.appendChild(h('div', { class: 'logline kind-system' }, h('span', { class: 'k', text: '' }), h('span', { class: 't', text: drawer.log ? 'No log output yet.' : 'Loading…' })));
+  var frag = document.createDocumentFragment();
+  lines.forEach(function (l) {
+    var kind = String(l.kind || 'system').replace(/[^a-z]/g, '');
+    frag.appendChild(h('div', { class: 'logline kind-' + kind, title: l.ts ? fmtDate(l.ts) : null },
+      h('span', { class: 'k', text: kind }), h('span', { class: 't', text: String(l.text == null ? '' : l.text) })));
+  });
+  box.appendChild(frag);
+  if (atBottom) scrollLogBottom();
+}
+
+/* ================= integration panel ================= */
+var integ = { data: null, err: null, loading: false, timer: null, sig: '' };
+function toggleInteg(force) {
+  ui.integOpen = force != null ? force : !ui.integOpen;
+  $('#integPanel').hidden = !ui.integOpen;
+  $('#integPill').setAttribute('aria-expanded', String(ui.integOpen));
+  clearInterval(integ.timer);
+  if (ui.integOpen) {
+    loadInteg();
+    integ.timer = setInterval(loadInteg, 15000);
+    renderIntegration();
+  }
+}
+function loadInteg() {
+  integ.loading = true; renderIntegration();
+  api('GET', '/api/integration').then(function (d) {
+    integ.data = d || {}; integ.err = (d && d.error) || null;
+  }).catch(function (e) { integ.err = e.message; }).then(function () { integ.loading = false; renderIntegration(); });
+}
+function checksEl(v) {
+  v = String(v || 'none').toLowerCase();
+  var txt = { pass: 'checks pass', fail: 'checks failing', pending: 'checks pending', none: 'no checks' }[v] || v;
+  return h('span', { class: 'checks ' + v }, h('span', { class: 'dot' + (v === 'pending' ? ' pulse' : '') }), txt);
+}
+function prStatePill(s) {
+  s = String(s || '').toUpperCase();
+  if (!s) return null;
+  var cls = { OPEN: 'green', MERGED: 'purple', CLOSED: 'red', DRAFT: '' }[s] || '';
+  return h('span', { class: 'pill ' + cls, text: s.toLowerCase() });
+}
+function mergeablePill(m) {
+  m = String(m || '').toUpperCase();
+  if (!m) return null;
+  if (m === 'MERGEABLE') return h('span', { class: 'pill green', text: 'mergeable' });
+  if (m === 'CONFLICTING') return h('span', { class: 'pill red', text: 'conflicts' });
+  return h('span', { class: 'pill', text: m.toLowerCase() });
+}
+function renderIntegration() {
+  if (!S) return;
+  var panel = $('#integPanel');
+  var d = integ.data || {};
+  var ig = S.integration || {};
+  var accepted = S.cards.filter(function (c) { return c.column === 'accepted'; });
+  var sig = JSON.stringify([d, ig, integ.err, integ.loading, accepted.map(function (c) { return c.id; }), S.config,
+    S.cards.map(function (c) { return [c.id, c.pr_number, c.column, c.integration_branch]; })]);
+  if (sig === integ.sig) return;
+  integ.sig = sig;
+
+  var base = d.base || ig.base || baseBranch();
+  var branch = d.branch || ig.branch || '';
+  var prNum = d.pr_number || ig.pr_number;
+  var prUrl = safeUrl(d.pr_url || ig.pr_url);
+
+  var refreshIc = icon('refresh', 12); if (integ.loading) refreshIc.classList.add('spin');
+  var head = h('div', { class: 'integ-head' },
+    h('h2', { text: 'Integration' }),
+    h('p', { text: 'Item PRs merge into the staging branch on Accept; shipping merges staging into ' + base + '.' }),
+    h('span', { class: 'grow' }),
+    h('div', { class: 'integ-actions' },
+      prNum ? (prUrl ? h('a', { class: 'btn sm', href: prUrl, target: '_blank', rel: 'noopener noreferrer' }, icon('external', 12), 'View integration PR') : null)
+        : h('button', { type: 'button', class: 'btn sm', disabled: !branch, title: branch ? 'Open (or reuse) the PR ' + base + ' ← ' + branch : 'No integration branch yet', onclick: openIntegrationPr }, icon('pr', 12), 'Open integration PR'),
+      h('button', { type: 'button', class: 'btn sm primary', disabled: !prNum, title: prNum ? 'Merge ' + branch + ' into ' + base : 'Open the integration PR first', onclick: function () { mergeIntegration(branch, base, prNum, accepted); } }, icon('merge', 12), 'Merge integration → ' + base),
+      h('button', { type: 'button', class: 'btn sm', disabled: accepted.length > 0, title: accepted.length ? accepted.length + ' accepted item(s) have not shipped yet' : 'Start a fresh integration branch', onclick: newIntegration }, icon('plus', 12), 'Start new integration branch'),
+      h('button', { type: 'button', class: 'btn sm ghost icon', 'aria-label': 'Reload integration status', onclick: loadInteg }, refreshIc),
+      h('button', { type: 'button', class: 'btn sm ghost icon', 'aria-label': 'Close integration panel', onclick: function () { toggleInteg(false); } }, icon('x', 13))));
+
+  // members: prefer server list, fallback to cards on this branch
+  var members = Array.isArray(d.members) ? d.members : S.cards.filter(function (c) {
+    return branch && c.integration_branch === branch && (c.pr_number || c.pr_url) && c.column !== 'shipped';
+  }).map(function (c) { return { card_id: c.id, title: titleOf(c), pr_number: c.pr_number, pr_url: c.pr_url, state: c.column === 'accepted' ? 'MERGED' : 'OPEN', checks: null }; });
+
+  var tree = h('ul', { class: 'tree' });
+  var rootLi = h('li', null, h('div', { class: 'tnode root' }, icon('branch', 13), h('span', { class: 'mono', text: base }), h('span', { class: 'pill outline', text: 'base' })));
+  tree.appendChild(rootLi);
+  var lvl1 = h('ul');
+  rootLi.appendChild(lvl1);
+  if (!branch) {
+    lvl1.appendChild(h('li', null, h('div', { class: 'tnode empty', text: 'No integration branch yet. One is created from ' + base + ' when the first item is dispatched.' })));
+  } else {
+    var inode = h('div', { class: 'tnode integration' },
+      h('span', { class: 'arrow', text: '↑ merges into ' + base }),
+      icon('merge', 13),
+      prNum ? (prUrl ? h('a', { href: prUrl, target: '_blank', rel: 'noopener noreferrer', text: 'PR #' + prNum }) : h('strong', { text: 'PR #' + prNum })) : h('span', { class: 'muted', text: 'no PR yet' }),
+      h('span', { class: 'mono', text: branch }),
+      prStatePill(d.pr_state), prNum ? checksEl(d.checks) : null, mergeablePill(d.mergeable));
+    var ili = h('li', null, inode);
+    lvl1.appendChild(ili);
+    var lvl2 = h('ul');
+    if (!members.length) lvl2.appendChild(h('li', null, h('div', { class: 'tnode empty', text: 'No item PRs yet. Agents open PRs into this branch.' })));
+    members.forEach(function (m) {
+      var mu = safeUrl(m.pr_url);
+      var cid = m.card_id;
+      lvl2.appendChild(h('li', null, h('div', { class: 'tnode' },
+        h('span', { class: 'arrow', text: '↑' }),
+        icon('pr', 12),
+        m.pr_number ? (mu ? h('a', { href: mu, target: '_blank', rel: 'noopener noreferrer', text: '#' + m.pr_number }) : h('span', { text: '#' + m.pr_number })) : null,
+        h('span', { class: 'mono muted', text: short(cid) }),
+        h('button', { type: 'button', class: 't-title', text: String(m.title || (cardById(cid) ? titleOf(cardById(cid)) : '')), title: 'Open card', onclick: function () { if (cardById(cid)) openDrawer(cid); } }),
+        prStatePill(m.state), m.checks ? checksEl(m.checks) : null)));
+    });
+    ili.appendChild(lvl2);
+  }
+
+  var cfgRows = [];
+  Object.keys(S.config || {}).forEach(function (k) {
+    var v = S.config[k];
+    cfgRows.push(h('dt', { text: k }), h('dd', { class: 'mono', text: v == null ? '—' : (typeof v === 'object' ? JSON.stringify(v) : String(v)) }));
+  });
+  var side = h('div', null,
+    h('div', { class: 'side-box' }, h('h3', { text: 'Status' }),
+      h('dl', { class: 'kv' },
+        h('dt', { text: 'Branch' }), h('dd', { class: 'mono', text: branch || '—' }),
+        h('dt', { text: 'Created' }), h('dd', { text: ig.created_at ? rel(ig.created_at) : '—' }),
+        h('dt', { text: 'Accepted' }), h('dd', { text: accepted.length + ' item' + (accepted.length === 1 ? '' : 's') + ' waiting to ship' }),
+        h('dt', { text: 'Status' }), h('dd', { text: String(ig.status || d.pr_state || '—') })),
+      integ.err ? h('p', { class: 'dlg-err', style: 'margin:8px 0 0', text: String(integ.err) }) : null),
+    cfgRows.length ? h('details', { class: 'side-box' }, h('summary', { style: 'cursor:pointer;font-size:12px;color:var(--text-2)', text: 'Server config (read-only)' }),
+      h('dl', { class: 'kv', style: 'margin-top:8px' }, cfgRows)) : null);
+
+  setKids(panel, head, h('div', { class: 'integ-grid' }, h('div', null, tree), side));
+}
+function openIntegrationPr() {
+  run(api('POST', '/api/integration/open-pr'), 'Integration PR ready').then(function (r) { if (r) { integ.sig = ''; loadInteg(); } });
+}
+function mergeIntegration(branch, base, prNum, accepted) {
+  var cb = h('input', { type: 'checkbox', checked: true });
+  accepted = accepted.filter(function (c) { return c.integration_branch === branch; });
+  var busy = S.cards.filter(function (c) { return c.status === 'queued' || c.status === 'running' || c.status === 'merging'; });
+  var inflight = S.cards.filter(function (c) {
+    return (c.column === 'develop' || c.column === 'review') && c.integration_branch === branch && busy.indexOf(c) < 0;
+  });
+  if (busy.length) {
+    toast(busy.length + ' card(s) have an agent queued/running or a merge in flight; wait for them or stop them before shipping.', 'warn');
+    return;
+  }
+  var force = h('input', { type: 'checkbox' });
+  dialog({ title: 'Merge integration → ' + base + '?', confirm: 'Merge to ' + base,
+    body: [
+      inflight.length ? h('div', { class: 'side-box' },
+        h('p', { text: inflight.length + ' card(s) in development/review still target this branch. Merging deletes the branch, which closes their PRs; they would need to be re-developed:' }),
+        h('ul', null, inflight.slice(0, 10).map(function (c) { return h('li', null, h('span', { class: 'mono', text: short(c.id) + ' ' }), titleOf(c)); })),
+        h('label', { class: 'check' }, force, 'Ship anyway and leave these cards out (force)')) : null,
+      h('p', null, 'Merges ', h('strong', { text: 'PR #' + prNum }), ' (', h('span', { class: 'mono', text: branch }), ') into ', h('span', { class: 'mono', text: base }), ' with a merge commit and deletes the integration branch.'),
+      accepted.length ? h('p', { text: accepted.length + ' accepted item' + (accepted.length === 1 ? '' : 's') + ' will move to Shipped:' }) : h('p', { text: 'No accepted items on this branch.' }),
+      accepted.length ? h('ul', null, accepted.slice(0, 10).map(function (c) { return h('li', null, h('span', { class: 'mono', text: short(c.id) + ' ' }), titleOf(c)); })) : null,
+      h('label', { class: 'check' }, cb, 'Resolve backlog items in EpiGraph (resolve_backlog_item)')
+    ]
+  }).then(function (ok) {
+    if (!ok) return;
+    if (inflight.length && !force.checked) { toast('Not merged: tick "force" or accept/reject the in-flight cards first.', 'warn'); return; }
+    var payload = { resolve_backlog: cb.checked };
+    if (inflight.length) payload.force = true;
+    run(api('POST', '/api/integration/merge', payload), 'Merged ' + branch + ' into ' + base + (cb.checked ? '; resolving backlog items' : ''))
+      .then(function (r) { if (r) { integ.data = null; integ.sig = ''; loadInteg(); } });
+  });
+}
+function newIntegration() {
+  var name = h('input', { type: 'text', class: 'mono', placeholder: cfg(['integration_prefix', 'KANBAN_INTEGRATION_PREFIX'], 'integration/kanban-') + 'YYYY-MM-DD' });
+  dialog({ title: 'Start new integration branch', confirm: 'Start branch',
+    body: [h('p', { text: 'The next dispatched item branches from a fresh integration branch cut from ' + baseBranch() + '.' }), field('Name (optional)', name)]
+  }).then(function (ok) {
+    if (!ok) return;
+    var body = {}; if (name.value.trim()) body.name = name.value.trim();
+    run(api('POST', '/api/integration/new', body), 'New integration branch started').then(function (r) { if (r) { integ.data = null; integ.sig = ''; loadInteg(); } });
+  });
+}
+
+/* ================= wiring ================= */
+function wire() {
+  $('#brandMark').appendChild(icon('layers', 13));
+  $('#searchIcon').appendChild(icon('search', 13));
+  $('#drClose').appendChild(icon('x', 14));
+  $('#drCopy').append(icon('copy', 11), 'Copy id');
+  $('#drCopy').addEventListener('click', function () { if (drawer.id) copyText(drawer.id); });
+  $('#drClose').addEventListener('click', closeDrawer);
+  ['overview', 'log', 'history'].forEach(function (k) { $('#tab-' + k).addEventListener('click', function () { setTab(k); }); });
+  $('#integPill').addEventListener('click', function () { toggleInteg(); });
+  $('#devSelected').addEventListener('click', developSelected);
+  $('#clearSel').addEventListener('click', function () { selected.clear(); render(); });
+  $('#hdrBlocked').addEventListener('click', function () { ui.hasBlockers = !ui.hasBlockers; savePrefs(); toolbarSig = ''; render(); });
+
+  var search = $('#search'), st;
+  search.addEventListener('input', function () { clearTimeout(st); st = setTimeout(function () { ui.search = search.value.trim(); render(); }, 120); });
+  var hs = $('#hideStale'); hs.checked = ui.hideStale;
+  hs.addEventListener('change', function () { ui.hideStale = hs.checked; savePrefs(); render(); });
+  var ss = $('#sortSel'); ss.value = ui.sort;
+  ss.addEventListener('change', function () { ui.sort = ss.value; savePrefs(); render(); });
+
+  $('#refreshBtn').addEventListener('click', function () {
+    run(api('POST', '/api/backlog/refresh'), 'Backlog refresh started').then(function () { toolbarSig = ''; });
+  });
+  $('#importBtn').prepend(icon('upload', 12));
+  $('#importBtn').addEventListener('click', function () { $('#importFile').click(); });
+  $('#importFile').addEventListener('change', function (e) {
+    var f = e.target.files && e.target.files[0]; e.target.value = '';
+    if (!f) return;
+    f.text().then(function (txt) {
+      var data;
+      try { data = JSON.parse(txt); } catch (x) { toast('Not valid JSON: ' + x.message, 'error'); return; }
+      if (!Array.isArray(data)) { toast('Expected a JSON array of claims', 'error'); return; }
+      api('POST', '/api/backlog/import', data).then(function (r) {
+        toast('Imported: ' + ((r && r.added) || 0) + ' added, ' + ((r && r.updated) || 0) + ' updated', 'ok'); refreshSoon();
+      }).catch(function (x) { toast(x.message, 'error'); });
+    });
+  });
+
+  $('#addBlk').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var ta = $('#addBlkText'), text = ta.value.trim();
+    if (!drawer.id) return;
+    if (!text) { ta.focus(); return; }
+    addBlocker(drawer.id, text, $('#addBlkSev').value).then(function (ok) { if (ok) ta.value = ''; });
+  });
+  $('#addBlkText').addEventListener('keydown', function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); $('#addBlk').requestSubmit(); }
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') {
+      if (document.querySelector('dialog[open]')) return;
+      if (drawer.composer && $('#drComposer').contains(document.activeElement)) { drawer.composer = null; renderComposer(cardById(drawer.id)); return; }
+      if (drawer.id) { closeDrawer(); return; }
+      if (ui.integOpen) { toggleInteg(false); return; }
+    }
+    if (e.key === '/' && !/^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || '') && !document.querySelector('dialog[open]')) {
+      e.preventDefault(); search.focus(); search.select();
+    }
+  });
+  buildColumns();
+}
+
+/* ================= demo mode (in-memory fake API) ================= */
+var demo = null;
+function createDemo() {
+  var now = Date.now();
+  function ago(min) { return new Date(Date.now() - min * 60000).toISOString(); }
+  function uid() {
+    var hx = '0123456789abcdef', s = '';
+    for (var i = 0; i < 32; i++) s += hx[Math.floor(Math.random() * 16)];
+    return s.slice(0, 8) + '-' + s.slice(8, 12) + '-4' + s.slice(13, 16) + '-a' + s.slice(17, 20) + '-' + s.slice(20, 32);
+  }
+  function err(status, msg) { return apiError(status, msg, { error: msg }); }
+  var INTEG = 'integration/kanban-2026-09-18';
+  var st = {
+    cards: {},
+    integration: { branch: INTEG, base: 'main', pr_url: 'https://github.com/example/epigraph/pull/412', pr_number: 412, created_at: ago(310), status: 'open' },
+    backlog_refresh: { running: false, error: null, source: 'http', fetched_at: ago(4) },
+    backlog_source: 'http',
+    config: {
+      api_base: 'http://127.0.0.1:8080', backlog_source: 'auto', auth: 'EPIGRAPH_JWT_SECRET (HS256)', claude_bin: 'claude', gh_bin: 'gh', git_bin: 'git',
+      max_agents: 2, permission_mode: 'auto', model: null, integration_prefix: 'integration/kanban-', base_branch: 'main', remote: 'origin',
+      repo: '/Users/you/Projects/epigraph', kanban_home: '~/.epigraph-kanban'
+    },
+    nextPr: 420, q: 0
+  };
+  var logs = {};
+  function slug(t) { return t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40).replace(/-$/, ''); }
+  function hist(c, event, detail, minAgo) { c.history.push({ ts: minAgo != null ? ago(minAgo) : new Date().toISOString(), event: event, detail: detail || '' }); }
+  function log(c, kind, text) { (logs[c.id] = logs[c.id] || []).push({ ts: new Date().toISOString(), kind: kind, text: text }); }
+  function blk(text, severity, source, minAgo, resolved, note) {
+    return { id: uid().slice(0, 12), text: text, severity: severity, source: source, resolved: !!resolved, note: note || null, created_at: ago(minAgo) };
+  }
+  function mk(o) {
+    var c = {
+      id: uid(), labels: ['backlog'], truth_value: 0.6, created_at: ago(60 * 24), column: 'backlog', status: 'idle', stale: false,
+      blockers: [], branch: null, worktree: null, pr_url: null, pr_number: null, session_id: null, integration_branch: null,
+      summary: null, verification: null, started_at: null, finished_at: null, cost_usd: null, last_activity: null, history: []
+    };
+    for (var k in o) c[k] = o[k];
+    c.labels = ['backlog'].concat(o.labels || []);
+    c.title = titleOf({ content: c.content });
+    if (c.column !== 'backlog' || c.status !== 'idle') {
+      c.branch = c.branch || 'kanban/' + short(c.id) + '-' + slug(c.title);
+      c.worktree = c.worktree || '~/.epigraph-kanban/worktrees/' + short(c.id);
+      c.session_id = c.session_id || uid();
+      c.integration_branch = c.integration_branch || INTEG;
+    }
+    hist(c, 'imported', 'from http backlog source', 60 * 24);
+    st.cards[c.id] = c;
+    return c;
+  }
+  function withPr(c, n) { c.pr_number = n; c.pr_url = 'https://github.com/example/epigraph/pull/' + n; return c; }
+
+  // Backlog
+  mk({ content: 'BUG: recall_with_context surfaces superseded claims when the supersede path skipped the embedding null.\n\nRepro: supersede a claim via supersede_claim, then recall() with the old wording; the stale row ranks first. Expected: only is_current rows carry embeddings (see CLAUDE.md embedding policy).', labels: ['bug', 'embeddings', 'recall'], truth_value: 0.82, created_at: ago(60 * 30) });
+  mk({ content: 'Expose live_missing / stale_present embedding-gap counters in system_stats so the embedding invariant is observable without ad-hoc SQL.', labels: ['feature-request', 'observability', 'embeddings'], truth_value: 0.71, created_at: ago(60 * 24 * 5) });
+  mk({ content: 'Switch /api/v1/claims/by-labels pagination from OFFSET to keyset (created_at, id). Offset scans dominate latency past 180k claims.', labels: ['perf', 'api', 'db'], truth_value: 0.64, created_at: ago(60 * 24 * 9) });
+  mk({ content: 'theme_cluster: bound cluster-run memory. The 200k-claim run OOMs the API process at roughly 6 GiB.', labels: ['bug', 'clustering', 'perf'], truth_value: 0.77, created_at: ago(60 * 20) });
+  mk({ content: 'Add a coverage test asserting federated tools never appear in SCOPE_MAP; they are gated by the scope= in EPIGRAPH_MCP_EXTENSIONS instead.', labels: ['test', 'mcp', 'federation'], truth_value: 0.55, created_at: ago(60 * 24 * 20), stale: true });
+  mk({ content: 'Explorer: keyboard navigation between neighbouring nodes in the ego canvas (arrow keys follow edges, Enter opens the claim).', labels: ['feature-request', 'explorer', 'a11y'], truth_value: 0.48, created_at: ago(60 * 24 * 12) });
+  mk({ content: 'Document the local Postgres recipe (no Docker, no brew, no admin) in docs/dev-setup.md, including the four traps.', labels: ['docs', 'dev-experience'], truth_value: 0.6, created_at: ago(60 * 24 * 31) });
+
+  // In development
+  var r1 = mk({ content: 'Redact labels in compound_neighborhood for callers without claims:read on the owning partition; the section 2.6 sweep missed this read.', labels: ['security', 'api', 'redaction'], truth_value: 0.9, created_at: ago(60 * 24 * 2), column: 'develop', status: 'running', started_at: ago(7), last_activity: 'Bash: cargo test -p epigraph-api compound_neighborhood' });
+  r1.blockers.push(blk('Two helpers exist (redact_labels, mask_labels) with different semantics for system labels. Picked redact_labels; confirm this is the intended one.', 'warning', 'agent', 3));
+  r1._endAt = now + 150000;
+  hist(r1, 'develop', 'dispatched', 7); hist(r1, 'started', 'agent session ' + short(r1.session_id), 7); hist(r1, 'blocker', 'agent flagged a warning', 3);
+  var r2 = mk({ content: 'find_workflow semantic path silently falls back to ILIKE when goal_embedding is NULL; backfill goal embeddings and log the fallback.', labels: ['bug', 'workflows', 'embeddings'], truth_value: 0.74, created_at: ago(60 * 24 * 3), column: 'develop', status: 'running', started_at: ago(2), last_activity: 'Read: crates/epigraph-mcp/src/tools/workflows.rs' });
+  r2._endAt = now + 55000;
+  hist(r2, 'develop', 'dispatched', 2); hist(r2, 'started', 'agent session ' + short(r2.session_id), 2);
+  var q1 = mk({ content: 'mark_duplicate must null the embedding in the same transaction that flips is_current=false.', labels: ['bug', 'embeddings', 'db'], truth_value: 0.86, created_at: ago(60 * 24 * 4), column: 'develop', status: 'queued' });
+  q1._q = 1; hist(q1, 'develop', 'queued (2/2 agents busy)', 1);
+
+  // Review
+  var v1 = withPr(mk({ content: 'reconcile_backlog_labels.py should call resolve_backlog_item instead of patching labels directly, so every retirement leaves a resolution claim.', labels: ['scripts', 'backlog-hygiene'], truth_value: 0.8, created_at: ago(60 * 24 * 6), column: 'review', status: 'awaiting_review', started_at: ago(95), finished_at: ago(61), cost_usd: 3.42,
+    summary: 'Replaced the raw label patch with a resolve_backlog_item call per unambiguous match. Ambiguous matches are still written to reconciler-needs-review.log. Added a dry-run flag.',
+    verification: 'python3 -m pytest scripts/tests/test_reconcile.py  -> 14 passed\nruff check scripts/  -> clean' }), 418);
+  v1.blockers.push(blk('Needs a decision: when 2+ originals match one free-text "Resolves" claim, auto-resolve the newest, or keep writing them to the review log?', 'blocker', 'agent', 70));
+  hist(v1, 'develop', 'dispatched', 95); hist(v1, 'pr_opened', 'PR #418 into ' + INTEG, 63); hist(v1, 'finished', 'report: blocked (1 blocker)', 61);
+  var v2 = withPr(mk({ content: 'Regenerate the .sqlx offline cache after the list_by_labels SELECT change; CI fails SQLX_OFFLINE=true cargo check.', labels: ['chore', 'sqlx', 'ci'], truth_value: 0.68, created_at: ago(60 * 24 * 2), column: 'review', status: 'awaiting_review', started_at: ago(40), finished_at: ago(22), cost_usd: 1.18,
+    summary: 'Ran cargo sqlx prepare --workspace -- --tests against epigraph_db_repo_test and committed .sqlx/.',
+    verification: 'SQLX_OFFLINE=true cargo check --workspace  -> ok' }), 419);
+  v2.blockers.push(blk('Two queries in epigraph-cli were not re-prepared because the bin target needs a feature flag; they still compile offline but may be stale.', 'warning', 'agent', 25));
+  hist(v2, 'develop', 'dispatched', 40); hist(v2, 'pr_opened', 'PR #419', 23); hist(v2, 'finished', 'report: done', 22);
+  var v3 = mk({ content: 'evaluate_workflow_promotion ignores deprecated steps when scoring lineage, so deprecated variants can be promoted.', labels: ['bug', 'workflows'], truth_value: 0.58, created_at: ago(60 * 24 * 8), column: 'review', status: 'failed', started_at: ago(130), finished_at: ago(118), cost_usd: 0.61,
+    verification: 'cargo test -p epigraph-mcp promotion  -> 2 failed' });
+  v3.blockers.push(blk('Agent exited with code 1 without a report', 'blocker', 'agent', 118));
+  hist(v3, 'develop', 'dispatched', 130); hist(v3, 'failed', 'exit code 1, no report.json', 118);
+
+  // Accepted
+  var a1 = withPr(mk({ content: 'CLI: mint HS256 service tokens with the claim shape the API expects (iss, aud, scopes, client_type).', labels: ['feature-request', 'cli', 'auth'], truth_value: 0.75, created_at: ago(60 * 24 * 10), column: 'accepted', status: 'merged', started_at: ago(300), finished_at: ago(260), cost_usd: 2.07,
+    summary: 'Added epigraph-cli token mint subcommand; claims mirror the service-token shape.', verification: 'cargo test -p epigraph-cli token  -> 6 passed' }), 415);
+  hist(a1, 'accepted', 'merged PR #415 into ' + INTEG, 200);
+  var a2 = withPr(mk({ content: 'Bump rustls 0.23.37 to 0.23.45 to clear RUSTSEC-2026-0285.', labels: ['security', 'deps'], truth_value: 0.95, created_at: ago(60 * 24), column: 'accepted', status: 'merged', started_at: ago(240), finished_at: ago(228), cost_usd: 0.44,
+    summary: 'Lockfile-only bump.', verification: 'cargo audit  -> 0 vulnerabilities\ncargo check --workspace -> ok' }), 416);
+  hist(a2, 'accepted', 'merged PR #416 into ' + INTEG, 150);
+
+  // Shipped
+  var s1 = withPr(mk({ content: 'Make /claims/:id/ego total_edges redaction-aware so hidden neighbours are not counted.', labels: ['security', 'api', 'redaction'], truth_value: 0.88, created_at: ago(60 * 24 * 14), column: 'shipped', status: 'merged', started_at: ago(60 * 24 * 7), finished_at: ago(60 * 24 * 7 - 50), integration_branch: 'integration/kanban-2026-09-11', cost_usd: 2.9,
+    summary: 'total_edges now counts only visible edges.', verification: 'cargo test -p epigraph-api ego -> 11 passed' }), 401);
+  hist(s1, 'shipped', 'integration/kanban-2026-09-11 merged to main (PR #405)', 60 * 24 * 6);
+  hist(s1, 'backlog_resolved', 'resolve_backlog_item ok', 60 * 24 * 6);
+
+  // seed logs
+  Object.keys(st.cards).forEach(function (id) {
+    var c = st.cards[id];
+    if (c.column === 'backlog') return;
+    logs[id] = [];
+    log(c, 'system', 'init: session ' + c.session_id + ' cwd=' + c.worktree);
+    log(c, 'assistant', 'ultracode: reading the backlog claim and repo CLAUDE.md before planning.');
+    log(c, 'tool', 'Read: CLAUDE.md');
+    log(c, 'tool', 'Grep: "' + c.title.split(' ').slice(0, 2).join(' ') + '"');
+    log(c, 'assistant', 'Plan: 1) locate the code path 2) add a failing test against epigraph_db_repo_test 3) fix 4) cargo check 5) push and open PR into ' + (c.integration_branch || INTEG) + '.');
+    log(c, 'tool', 'Workflow: spawning 3 agents (implement, test, review)');
+    log(c, 'tool', 'Bash: cargo check -p epigraph-api');
+    if (c.status === 'failed') { log(c, 'stderr', 'error[E0599]: no method named `is_deprecated` found for struct `WorkflowStep`'); log(c, 'result', 'exit code 1 (no report.json)'); }
+    else if (c.column !== 'develop') { log(c, 'tool', 'Bash: gh pr create --base ' + (c.integration_branch || INTEG)); log(c, 'result', 'done. cost $' + (c.cost_usd || 0).toFixed(2)); }
+  });
+
+  var ACTS = ['Read: crates/epigraph-db/src/repos/claim.rs', 'Grep: "redact_labels"', 'Edit: crates/epigraph-api/src/routes/neighborhood.rs',
+    'Bash: cargo check -p epigraph-api', 'Bash: cargo test -p epigraph-api compound_neighborhood', 'Workflow: 3 reviewers checking the diff',
+    'Bash: DATABASE_URL=.../epigraph_db_repo_test cargo test -p epigraph-db', 'Bash: git commit (security(api): ...)', 'Bash: git push -u origin HEAD',
+    'Bash: gh pr create --base ' + INTEG];
+  var THOUGHTS = ['The repo layer already has a visibility filter; reusing it keeps SQL out of the route.', 'Test reproduces the leak; now applying the fix.',
+    'cargo check is clean; running the targeted tests against the test DB only.', 'Writing .kanban/report.json with the verification output.'];
+
+  function startQueued() {
+    var cs = Object.keys(st.cards).map(function (k) { return st.cards[k]; });
+    var running = cs.filter(function (c) { return c.status === 'running'; }).length;
+    cs.filter(function (c) { return c.status === 'queued'; }).sort(function (a, b) { return (a._q || 0) - (b._q || 0); }).forEach(function (c) {
+      if (running >= st.config.max_agents) return;
+      c.status = 'running'; c.started_at = new Date().toISOString(); c.finished_at = null;
+      c._endAt = Date.now() + 25000 + Math.random() * 20000; c._step = 0;
+      c.last_activity = 'Read: CLAUDE.md';
+      hist(c, 'started', 'agent session ' + short(c.session_id));
+      log(c, 'system', 'init: session ' + c.session_id + ' cwd=' + c.worktree);
+      running++;
+    });
+  }
+  function finish(c) {
+    c.column = 'review'; c.finished_at = new Date().toISOString(); c._endAt = null;
+    c.cost_usd = Math.round((0.8 + Math.random() * 3) * 100) / 100;
+    if (!c.pr_number) withPr(c, st.nextPr++);
+    c.status = 'awaiting_review';
+    c.summary = c.summary || 'Implemented the change scoped to this backlog item and opened PR #' + c.pr_number + ' into ' + c.integration_branch + '.';
+    c.verification = c.verification || 'cargo check --workspace  -> ok\ncargo test (epigraph_db_repo_test)  -> all passed';
+    c.last_activity = 'Wrote .kanban/report.json';
+    log(c, 'result', 'done. PR #' + c.pr_number + ', cost $' + c.cost_usd.toFixed(2));
+    hist(c, 'pr_opened', 'PR #' + c.pr_number + ' into ' + c.integration_branch);
+    hist(c, 'finished', 'report: done');
+  }
+  function tick() {
+    startQueued();
+    Object.keys(st.cards).forEach(function (k) {
+      var c = st.cards[k];
+      if (c.status !== 'running') return;
+      c._step = c._step || 0;
+      if (Math.random() < 0.55) {
+        var a = ACTS[c._step++ % ACTS.length];
+        c.last_activity = a; log(c, 'tool', a);
+        if (Math.random() < 0.35) log(c, 'assistant', THOUGHTS[Math.floor(Math.random() * THOUGHTS.length)]);
+      }
+      if (!c._blk && c._endAt && Date.now() > c._endAt - 15000 && Math.random() < 0.2) {
+        c._blk = true;
+        c.blockers.push(blk('Scope question: the fix also touches the HTTP route. Keep it in this PR or split it out?', 'warning', 'agent', 0));
+        hist(c, 'blocker', 'agent flagged a warning'); log(c, 'assistant', 'Flagged a scope question in .kanban/blockers.jsonl; continuing.');
+      }
+      if (c._endAt && Date.now() >= c._endAt) finish(c);
+    });
+  }
+  setInterval(tick, 1500);
+
+  function list() { return Object.keys(st.cards).map(function (k) { return st.cards[k]; }); }
+  function snapshot() {
+    var cards = list();
+    return {
+      cards: JSON.parse(JSON.stringify(cards, function (k, v) { return k.charAt(0) === '_' ? undefined : v; })),
+      integration: st.integration, config: st.config,
+      running: cards.filter(function (c) { return c.status === 'running'; }).length,
+      queued: cards.filter(function (c) { return c.status === 'queued'; }).length,
+      backlog_refresh: st.backlog_refresh, backlog_fetched_at: st.backlog_refresh.fetched_at, backlog_source: st.backlog_source
+    };
+  }
+  function get(id) { var c = st.cards[decodeURIComponent(id)]; if (!c) throw err(404, 'unknown card ' + id); return c; }
+  function ensureInteg() {
+    if (!st.integration.branch) {
+      st.integration = { branch: 'integration/kanban-2026-09-18-2', base: 'main', pr_url: null, pr_number: null, created_at: new Date().toISOString(), status: 'open' };
+    }
+    return st.integration.branch;
+  }
+
+  function handle(method, path, body) {
+    var u = new URL(path, 'http://demo.local');
+    var p = u.pathname, m;
+    if (method === 'GET' && p === '/api/state') return snapshot();
+    if (method === 'POST' && p === '/api/backlog/refresh') {
+      if (st.backlog_refresh.running) throw err(409, 'refresh already running');
+      st.backlog_refresh.running = true;
+      setTimeout(function () { st.backlog_refresh.running = false; st.backlog_refresh.fetched_at = new Date().toISOString(); }, 2200);
+      return { ok: true };
+    }
+    if (method === 'POST' && p === '/api/backlog/import') {
+      if (!Array.isArray(body)) throw err(400, 'expected a JSON array');
+      var added = 0, updated = 0;
+      body.forEach(function (cl) {
+        if (!cl || !cl.id) return;
+        if (st.cards[cl.id]) { st.cards[cl.id].content = cl.content || st.cards[cl.id].content; updated++; }
+        else { var c = mk({ content: cl.content || '', created_at: cl.created_at || new Date().toISOString(), truth_value: cl.truth_value }); delete st.cards[c.id]; c.id = cl.id; c.labels = cl.labels || c.labels; st.cards[c.id] = c; added++; }
+      });
+      return { ok: true, added: added, updated: updated };
+    }
+    if ((m = p.match(/^\/api\/cards\/([^/]+)\/blockers\/([^/]+)\/resolve$/)) && method === 'POST') {
+      var cb = get(m[1]);
+      var b = cb.blockers.filter(function (x) { return x.id === decodeURIComponent(m[2]); })[0];
+      if (!b) throw err(404, 'unknown blocker');
+      b.resolved = true; b.note = (body && body.note) || null;
+      hist(cb, 'blocker_resolved', b.text.slice(0, 80) + (b.note ? ' — ' + b.note : ''));
+      return { ok: true };
+    }
+    if ((m = p.match(/^\/api\/cards\/([^/]+)\/(develop|stop|feedback|accept|reject|blockers|log)$/))) {
+      var c = get(m[1]), act = m[2];
+      if (act === 'log' && method === 'GET') {
+        var tail = Number(u.searchParams.get('tail')) || 300;
+        return { lines: (logs[c.id] || []).slice(-tail) };
+      }
+      if (method !== 'POST') throw err(405, 'method not allowed');
+      if (act === 'develop') {
+        var okFrom = c.column === 'backlog' || c.column === 'review' || c.status === 'failed' || c.status === 'stopped';
+        if (!okFrom || c.status === 'running' || c.status === 'queued') throw err(409, 'cannot develop from ' + c.column + '/' + c.status);
+        c.integration_branch = c.integration_branch && c.column !== 'backlog' ? c.integration_branch : ensureInteg();
+        c.branch = c.branch || 'kanban/' + short(c.id) + '-' + slug(c.title);
+        c.worktree = c.worktree || '~/.epigraph-kanban/worktrees/' + short(c.id);
+        c.session_id = uid();
+        c.column = 'develop'; c.status = 'queued'; c._q = ++st.q; c.finished_at = null; c.last_activity = null; c._blk = false;
+        hist(c, 'develop', (body && body.notes) ? 'notes: ' + body.notes : 'dispatched');
+        logs[c.id] = logs[c.id] || [];
+        log(c, 'system', 'queued; waiting for an agent slot');
+        return { ok: true };
+      }
+      if (act === 'stop') {
+        if (!isBusy(c)) throw err(409, 'card is not running');
+        c.status = 'stopped'; c.finished_at = new Date().toISOString(); c._endAt = null; c.last_activity = null;
+        hist(c, 'stopped', 'process group killed by user'); log(c, 'system', 'SIGTERM sent to process group');
+        return { ok: true };
+      }
+      if (act === 'feedback') {
+        if (c.column !== 'review') throw err(409, 'feedback is only allowed from review');
+        if (!body || !String(body.text || '').trim()) throw err(400, 'text is required');
+        c.column = 'develop'; c.status = 'queued'; c._q = ++st.q; c._blk = true;
+        hist(c, 'feedback', body.text); log(c, 'system', 'resuming session ' + c.session_id + ' with reviewer feedback');
+        return { ok: true };
+      }
+      if (act === 'accept') {
+        if (c.column !== 'review') throw err(409, 'accept is only allowed from review');
+        var open = hardBlockers(c);
+        if (open.length && !(body && body.force)) throw err(409, 'card has ' + open.length + ' unresolved blocker(s); pass force to override');
+        if (!c.pr_number) throw err(409, 'no PR to merge for this card');
+        c.column = 'accepted'; c.status = 'merged';
+        hist(c, 'accepted', 'merged PR #' + c.pr_number + ' into ' + c.integration_branch + (body && body.force ? ' (forced)' : ''));
+        return { ok: true };
+      }
+      if (act === 'reject') {
+        if (c.column !== 'develop' && c.column !== 'review') throw err(409, 'reject is only allowed from develop or review');
+        c.column = 'backlog'; c.status = 'idle'; c._endAt = null; c.last_activity = null;
+        hist(c, 'rejected', (body && body.reason) || 'no reason given' + (c.pr_number ? '; PR #' + c.pr_number + ' left open' : ''));
+        if (body && body.cleanup) c.worktree = null;
+        return { ok: true };
+      }
+      if (act === 'blockers') {
+        if (!body || !String(body.text || '').trim()) throw err(400, 'text is required');
+        c.blockers.push(blk(String(body.text), body.severity === 'warning' ? 'warning' : 'blocker', 'user', 0));
+        hist(c, 'blocker', 'user flagged: ' + String(body.text).slice(0, 80));
+        return { ok: true };
+      }
+    }
+    if (method === 'GET' && p === '/api/integration') {
+      var ig = st.integration;
+      var members = list().filter(function (c) { return ig.branch && c.integration_branch === ig.branch && c.pr_number && c.column !== 'shipped' && c.column !== 'backlog'; })
+        .map(function (c) {
+          return { card_id: c.id, title: c.title, pr_number: c.pr_number, pr_url: c.pr_url,
+            state: c.column === 'accepted' ? 'MERGED' : 'OPEN',
+            checks: c.column === 'accepted' ? 'pass' : (c.status === 'failed' ? 'fail' : (c.column === 'develop' ? 'pending' : 'pass')) };
+        });
+      return { branch: ig.branch, base: ig.base, pr_url: ig.pr_url, pr_number: ig.pr_number,
+        pr_state: ig.pr_number ? 'OPEN' : null, mergeable: ig.pr_number ? 'MERGEABLE' : null, checks: ig.pr_number ? 'pass' : 'none', members: members };
+    }
+    if (method === 'POST' && p === '/api/integration/open-pr') {
+      if (!st.integration.branch) throw err(409, 'no integration branch');
+      if (!st.integration.pr_number) { st.integration.pr_number = st.nextPr++; st.integration.pr_url = 'https://github.com/example/epigraph/pull/' + st.integration.pr_number; }
+      return { ok: true, pr_url: st.integration.pr_url, pr_number: st.integration.pr_number };
+    }
+    if (method === 'POST' && p === '/api/integration/merge') {
+      if (!st.integration.pr_number) throw err(409, 'open the integration PR first');
+      var shipped = list().filter(function (c) { return c.column === 'accepted'; });
+      var prn = st.integration.pr_number, brn = st.integration.branch;
+      shipped.forEach(function (c) { c.column = 'shipped'; hist(c, 'shipped', brn + ' merged to main (PR #' + prn + ')'); });
+      if (!body || body.resolve_backlog !== false) {
+        setTimeout(function () { shipped.forEach(function (c) { hist(c, 'backlog_resolved', 'resolve_backlog_item ok'); }); }, 2500);
+      }
+      st.integration = { branch: '', base: 'main', pr_url: null, pr_number: null, created_at: null, status: 'none' };
+      return { ok: true, shipped: shipped.length };
+    }
+    if (method === 'POST' && p === '/api/integration/new') {
+      if (list().some(function (c) { return c.column === 'accepted'; })) throw err(409, 'accepted items have not shipped yet');
+      var name = (body && body.name) || 'integration/kanban-2026-09-18-' + (st.nextPr % 7 + 2);
+      st.integration = { branch: name, base: 'main', pr_url: null, pr_number: null, created_at: new Date().toISOString(), status: 'open' };
+      return { ok: true, branch: name };
+    }
+    throw err(404, 'not found: ' + method + ' ' + p);
+  }
+  return { handle: handle };
+}
+
+/* ================= boot ================= */
+if (DEMO) demo = createDemo();
+wire();
+setBanner(null);
+poll();
+// elapsed timers tick between polls (cheap: only cards whose signature changed are rebuilt)
+setInterval(function () { if (S && !ui.dragging) renderBoard(); }, 15000);
+})();
+</script>
+</body>
+</html>
