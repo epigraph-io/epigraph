@@ -161,7 +161,11 @@ pub struct QueryClaimsParams {
                        excluded unless you pass false explicitly, which returns ONLY superseded \
                        rows. Omitting this is not 'no filter' — it is 'current claims only', so a \
                        queue built on this tool does not keep re-surfacing claims that have \
-                       already been resolved."
+                       already been resolved. THERE IS NO VALUE THAT RETURNS BOTH POPULATIONS: \
+                       true and false are the only two states and each excludes the other \
+                       (this tool did return both when the parameter was omitted; it no longer \
+                       does). To see both, call twice — once with true, once with false — and \
+                       merge the results."
     )]
     pub is_current: Option<bool>,
 }
