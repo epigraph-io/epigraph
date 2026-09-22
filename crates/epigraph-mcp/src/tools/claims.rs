@@ -1163,7 +1163,13 @@ async fn gate_retirement_label(
     // "claim not found" for a missing id where it previously fell through to a
     // repo-layer no-op — deliberate: the gate cannot decide ownership of a row
     // it cannot read.
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id))
+    //
+    // Read with the CALLER's own authority, not a maintenance viewer: this is
+    // an ownership gate, and a principal who cannot see the row cannot own it.
+    // A viewer-invisible claim therefore takes the same "not found" branch as a
+    // nonexistent one, which is the behaviour the paragraph above describes.
+    let viewer = crate::tools::viewer::request_viewer(server, Some(auth)).await?;
+    let claim = ClaimRepository::get_by_id(&server.pool, &viewer, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
