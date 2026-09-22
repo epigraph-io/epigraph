@@ -26,6 +26,24 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
+/// The subset of [`EPISTEMIC_RELATIONSHIPS`] that WEAKENS its target's belief.
+///
+/// Every other member of that list strengthens the target; these two are the
+/// only ones that subtract. The distinction is not cosmetic — it decides what
+/// may be re-pointed when a claim is replaced. A `refutes`/`contradicts` edge
+/// is an assertion about a *specific pair of contents* ("this text refutes
+/// THAT text"), so re-pointing either endpoint at a different text silently
+/// re-asserts something nobody checked, and the direction of the error is
+/// always suppression: `ClaimRepository::dispute_batch` turns these two
+/// relationships (and only these two) into `is_contested`, which
+/// `recall(exclude_contested: true)` uses to drop results.
+///
+/// Consumed by [`crate::repos::claim::ClaimRepository::supersede`]; kept here
+/// next to `EPISTEMIC_RELATIONSHIPS` so the two sets cannot drift, and bound
+/// into the SQL rather than inlined so adding a third weakening relationship
+/// above automatically covers the supersede path.
+pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
+
 /// SQL predicate selecting edges that are currently in force.
 ///
 /// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until

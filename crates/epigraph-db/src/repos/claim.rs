@@ -2714,6 +2714,74 @@ impl ClaimRepository {
     /// — must preserve this single-statement invariant.  See also
     /// [`ClaimRepository::mark_duplicate`] which is subject to the same
     /// constraint.
+    ///
+    /// # Edge migration policy (issue #398)
+    ///
+    /// Edges are re-pointed at the replacement in both directions, with one
+    /// exception: the WEAKENING relationships
+    /// ([`crate::repos::edge::WEAKENING_RELATIONSHIPS`] — `refutes`,
+    /// `contradicts`) do NOT migrate, in either direction. They stay on
+    /// `old_claim_id`.
+    ///
+    /// The rule follows from what an edge asserts. `A -refutes-> B` is a claim
+    /// about a *specific pair of contents*. Supersession replaces one of those
+    /// contents, so the relation has to be re-established, not assumed — and
+    /// the same reasoning already stated fifty lines below for `properties`
+    /// ("blanket copy would propagate the bug the supersede was meant to
+    /// correct") applies with more force here, because a migrated weakening
+    /// edge does not merely carry a stale value forward, it *suppresses the
+    /// correction*: [`ClaimRepository::dispute_batch`] reads exactly these two
+    /// relationships into `is_contested`, and `recall(exclude_contested: true)`
+    /// drops contested rows.
+    ///
+    /// Both directions are excluded because both were observed corrupting
+    /// production (issue #398):
+    ///
+    /// * **Incoming.** Refute the false claim, then correct it — the natural
+    ///   correction workflow — and the refutation lands on the correction. The
+    ///   fix arrives pre-refuted, by the very claim that motivated it.
+    /// * **Outgoing.** A claim holding two `contradicts` edges was superseded
+    ///   by a replacement that *retracted* those objections; the edges followed,
+    ///   recording the retraction as contesting the claims it declared correct.
+    ///   That instance was cleaned up by hand with `DELETE /api/v1/edges/:id`.
+    ///
+    /// Leaving an outgoing weakening edge on the superseded source is not a
+    /// leak, because `dispute_batch` joins `claims src ON … AND src.is_current`:
+    /// a retired contester stops counting automatically. The cost of the rule is
+    /// therefore bounded and one-directional — a supersession that merely
+    /// *sharpens* an existing refutation must re-file it via `link_epistemic`,
+    /// exactly as it must re-set `properties`. The cost of the opposite default
+    /// is unbounded and silent.
+    ///
+    /// Incoming STRENGTHENING edges still migrate, unchanged. They are the
+    /// mirror-image judgement call, but their failure mode is the loss of a
+    /// positive signal rather than the manufacture of a negative one, and
+    /// changing them is not this function's decision to make.
+    ///
+    /// ## Self-loop guards — deliberately unreachable
+    ///
+    /// Both statements also carry [`ClaimRepository::mark_duplicate`]'s
+    /// `source_id`/`target_id` self-loop guards, and unlike there they are
+    /// **defence in depth, not a live defect fix**. Issue #398 reports the
+    /// guards as missing; they are, but nothing can currently reach them:
+    ///
+    /// * `supersede` MINTS `new_uuid` in this transaction, so no pre-existing
+    ///   edge can already name it (the only one that does is the `supersedes`
+    ///   edge inserted above, excluded by `relationship != 'supersedes'`).
+    ///   Contrast `mark_duplicate`, whose canonical claim pre-exists and
+    ///   routinely already has edges — there the guards are load-bearing.
+    /// * The remaining shape — a pre-existing `old -rel-> old` self-edge that
+    ///   the two statements would compose into `new -rel-> new` — cannot be
+    ///   stored at all: `edges_no_self_loop`
+    ///   (`CHECK (source_id <> target_id OR source_type <> target_type)`,
+    ///   migration 001) rejects claim→claim self-edges on insert.
+    ///
+    /// They are kept anyway because the schema CHECK's failure mode is worse
+    /// than the guards': were a future migration to relax it, an ungarded
+    /// UPDATE that produced a self-loop would abort the whole transaction and
+    /// turn a bad edge into a failed supersession. The guard degrades that to
+    /// "this one edge does not migrate". There is no test pinning them, because
+    /// the precondition cannot be constructed through the schema.
     #[instrument(skip(pool))]
     pub async fn supersede(
         pool: &PgPool,
@@ -2805,23 +2873,46 @@ impl ClaimRepository {
         .execute(&mut *tx)
         .await?;
 
-        // Migrate incoming edges: redirect edges pointing TO old claim to point to new claim
+        // Edge migration. Both directions carry the STRENGTHENING relationships
+        // forward and leave the WEAKENING ones
+        // (`crate::repos::edge::WEAKENING_RELATIONSHIPS` — `refutes`,
+        // `contradicts`) attached to the claim they were filed against or by.
+        // See the "Edge migration policy" section of this function's doc comment
+        // for why (issue #398).
+        let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        // Migrate incoming edges: redirect edges pointing TO old claim to point
+        // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
+        // mark_duplicate's self-loop guard, carried over so the two replacement
+        // paths share one rule; see the doc comment for the one shape that
+        // reaches it here.
         sqlx::query(
             "UPDATE edges SET target_id = $1 \
-             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes'",
+             WHERE target_id = $2 AND target_type = 'claim' \
+               AND relationship != 'supersedes' \
+               AND NOT (relationship = ANY($3)) \
+               AND NOT (source_type = 'claim' AND source_id = $1)",
         )
         .bind(new_uuid)
         .bind(old_uuid)
+        .bind(&weakening)
         .execute(&mut *tx)
         .await?;
 
         // Migrate outgoing edges: redirect edges FROM old claim to come from new claim
         sqlx::query(
             "UPDATE edges SET source_id = $1 \
-             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes'",
+             WHERE source_id = $2 AND source_type = 'claim' \
+               AND relationship != 'supersedes' \
+               AND NOT (relationship = ANY($3)) \
+               AND NOT (target_type = 'claim' AND target_id = $1)",
         )
         .bind(new_uuid)
         .bind(old_uuid)
+        .bind(&weakening)
         .execute(&mut *tx)
         .await?;
 
