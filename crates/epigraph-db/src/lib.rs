@@ -99,13 +99,13 @@ pub use repos::{
     PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
     ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
     ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition,
-    TraceProvenanceStep, TripleRepository, TripleRow, WebhookSubscriptionRepository,
-    WebhookSubscriptionRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    RefreshTokenRow, ResolvedStep, RevocationStoreStatus, RevokeOutcome,
+    RevokedAccessTokenRepository, RotateOutcome, ScopedBeliefRepository, SecurityEventRepository,
+    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, TraceProvenanceStep, TripleRepository, TripleRow,
+    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 
