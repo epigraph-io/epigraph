@@ -190,12 +190,17 @@ const ALLOWED_WEBHOOK_SCHEMES: &[&str] = &["http", "https"];
 ///   It judges every address a name resolves to at the moment the connector
 ///   dials, which also covers DNS rebinding after registration. Registration
 ///   accepting such a name is therefore not the same as delivering to it.
-/// * **It applies at REGISTRATION only, so existing rows are grandfathered.**
-///   `bin/server.rs` re-hydrates `AppState::webhook_store` from
-///   `WebhookSubscriptionRepository::list_active` on every boot, so any row
-///   already in `webhook_subscriptions` is re-armed on the next deploy without
-///   passing through here. Rows written before this check are unaffected by it;
-///   auditing them is an operator task, not something this function performs.
+/// * **It is one policy with three call sites, and none of them is
+///   sufficient alone.** `register_webhook` runs it, so an internal literal is
+///   never stored. `deliver_to_subscription` runs it again before every POST,
+///   so a store entry that bypassed registration is never dialled.
+///   `state::hydrate_webhook_store` runs it on every row `list_active` returns
+///   at boot. A row written before this check existed, or before it was
+///   widened, is therefore not re-armed: it is left out of the store,
+///   deactivated in `webhook_subscriptions`, and logged at `warn`. That is safe
+///   to do at boot only because this function resolves nothing. Its verdict
+///   is a property of the stored string, so a DNS outage cannot deactivate a
+///   legitimate row.
 /// * **Migration 085's constraint is unchanged.** `CHECK (btrim(url) <> '')`
 ///   still mirrors only the non-empty check. That migration is applied; this
 ///   policy lives in the handler, not the schema, and the schema was not
@@ -203,7 +208,7 @@ const ALLOWED_WEBHOOK_SCHEMES: &[&str] = &["http", "https"];
 /// * **It is not an allowlist.** Any public host is accepted. This narrows the
 ///   set of targets that are reachable-but-internal; it does not constrain who
 ///   may be POSTed to.
-fn validate_webhook_url(raw: &str) -> Result<(), String> {
+pub(crate) fn validate_webhook_url(raw: &str) -> Result<(), String> {
     // `.trim()` HERE and not only at the call site. `register_webhook` trims
     // before calling and stores the trimmed string, so on that path this is a
     // no-op — but `deliver_to_subscription` re-checks `subscription.url` from
@@ -373,9 +378,10 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 /// unspecified IP **literals**. Read that function's doc for the four things
 /// this policy deliberately does not cover. Chiefly: a hostname is accepted on
 /// its face here, and names are resolved and judged only at delivery, by the
-/// dispatcher's [`SsrfGuardedResolver`]. Also, the check applies at
-/// registration only, so rows already in `webhook_subscriptions` are
-/// grandfathered and re-armed by boot hydration on every deploy.
+/// dispatcher's [`SsrfGuardedResolver`]. Also, the same check runs again at
+/// every delivery and at boot hydration, so rows that were in
+/// `webhook_subscriptions` before it existed are neither delivered to nor
+/// re-armed.
 ///
 /// The check sits in the handler BODY, not in an extractor and not in the
 /// schema. Body, because it is a validation of the parsed payload and belongs

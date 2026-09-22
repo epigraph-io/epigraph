@@ -170,8 +170,9 @@ pub type WebhookStore = Arc<RwLock<HashMap<Uuid, WebhookSubscription>>>;
 /// table*: a second call yields the UNION of what the store already held and
 /// what `list_active` returned this time, not the table's current set. That is
 /// the right shape for the one call site there is — an empty store at boot —
-/// and it is the reason the returned `usize` is the number of rows `list_active`
-/// returned rather than the size of the store afterwards.
+/// and it is the reason the returned `usize` is the number of rows THIS CALL
+/// loaded (`list_active`'s rows minus those refused below) rather than the size
+/// of the store afterwards.
 ///
 /// This is stated because the obvious next use is not boot. Anything that wants
 /// the store to track the table over time needs a mechanism that can also drop
@@ -190,6 +191,37 @@ pub type WebhookStore = Arc<RwLock<HashMap<Uuid, WebhookSubscription>>>;
 /// is indistinguishable from an idle corpus. Tenancy for webhooks is applied to
 /// the EVENT against the subscriber's viewer, one level up, in `deliver_event`.
 ///
+/// # Grandfathered rows are re-validated here, and refused ones switched off
+///
+/// Registration validates the URL, but a row written before that check existed
+/// (or before it was widened) never passed through it, and this function is
+/// what re-arms rows on every deploy. So each row is run through
+/// `routes::webhooks::validate_webhook_url`, the registration policy itself
+/// and not a copy. A row it refuses is:
+///
+/// * **not loaded**, so it is never a delivery candidate. The delivery-time
+///   re-check would refuse it anyway; skipping it here also keeps it out of
+///   `system_stats`' count and out of the fan-out's per-event work.
+/// * **switched off in the table**, via
+///   [`epigraph_db::WebhookSubscriptionRepository::deactivate_refused_at_boot`],
+///   so the next boot does not re-arm it and the table stops calling it
+///   active. The row is kept, not deleted, so an operator can inspect it.
+/// * **logged at `warn`**, with its id, owner and the policy's reason. That
+///   log line is the audit record of the grandfathered row.
+///
+/// Deactivating at boot is safe only because `validate_webhook_url` resolves no
+/// names. Its verdict is a property of the stored string, so a DNS outage
+/// during boot cannot switch off a legitimate subscription. A resolved-address
+/// check belongs at connect time (`SsrfGuardedResolver`) and must never be
+/// moved here. A failed deactivation is logged and the row is still not
+/// loaded. It does not fail hydration: the row stays inert in this process,
+/// and the next boot tries again.
+///
+/// A refused row's owner no longer sees it in `list_webhooks`, and
+/// `delete_webhook` answers 404 for it, because both read the store. That is
+/// deliberate. The row is inactive, and re-registering the same URL fails with
+/// 400 for the same reason.
+///
 /// # Errors
 /// Propagates [`epigraph_db::DbError`] from
 /// [`epigraph_db::WebhookSubscriptionRepository::list_active`]. The caller
@@ -202,8 +234,42 @@ pub async fn hydrate_webhook_store(
     store: &WebhookStore,
 ) -> Result<usize, epigraph_db::DbError> {
     let rows = epigraph_db::WebhookSubscriptionRepository::list_active(pool).await?;
+
+    // Judge every row BEFORE taking the write guard. The deactivation is a
+    // database round trip, and tokio's RwLock is fair: holding the write guard
+    // across it would stall every reader of the store (see `delete_webhook`).
+    let mut admitted = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Err(reason) = crate::routes::webhooks::validate_webhook_url(&row.url) else {
+            admitted.push(row);
+            continue;
+        };
+        match epigraph_db::WebhookSubscriptionRepository::deactivate_refused_at_boot(pool, row.id)
+            .await
+        {
+            Ok(switched_off) => tracing::warn!(
+                subscription_id = %row.id,
+                agent_id = %row.agent_id,
+                reason = %reason,
+                switched_off,
+                "grandfathered webhook subscription refused at hydration: its URL fails \
+                 the delivery-target policy; not loaded, and deactivated in \
+                 webhook_subscriptions"
+            ),
+            Err(e) => tracing::warn!(
+                subscription_id = %row.id,
+                agent_id = %row.agent_id,
+                reason = %reason,
+                error = %e,
+                "grandfathered webhook subscription refused at hydration: its URL fails \
+                 the delivery-target policy; not loaded, but deactivating it failed, so \
+                 the next boot will refuse it again"
+            ),
+        }
+    }
+
     let mut guard = store.write().await;
-    for row in &rows {
+    for row in &admitted {
         guard.insert(
             row.id,
             WebhookSubscription {
@@ -217,7 +283,7 @@ pub async fn hydrate_webhook_store(
             },
         );
     }
-    Ok(rows.len())
+    Ok(admitted.len())
 }
 
 /// Thread-safe embedding service type alias

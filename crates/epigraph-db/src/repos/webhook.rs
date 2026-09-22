@@ -23,10 +23,12 @@
 //! annotation would be worse: an exemption implies a rule was set aside. No
 //! rule applies. Ownership is enforced positionally instead:
 //! [`WebhookSubscriptionRepository::delete_owned`] takes the caller's principal
-//! and puts it in the `WHERE` clause, and the two functions that carry no
-//! principal — [`WebhookSubscriptionRepository::list_active`] (process boot) and
-//! [`WebhookSubscriptionRepository::delete_as_admin`] (`claims:admin` only) —
-//! say so on themselves and are named so a reviewer greps them.
+//! and puts it in the `WHERE` clause. The three functions that carry no
+//! principal say so on themselves and are named so a reviewer greps them:
+//! [`WebhookSubscriptionRepository::list_active`] (process boot),
+//! [`WebhookSubscriptionRepository::deactivate_refused_at_boot`] (process
+//! boot) and [`WebhookSubscriptionRepository::delete_as_admin`]
+//! (`claims:admin` only).
 //!
 //! Reads that serve a request never come through here at all: `list_webhooks`
 //! and `get_webhook` answer from `AppState::webhook_store`, filtered on the
@@ -152,6 +154,41 @@ impl WebhookSubscriptionRepository {
                 },
             )
             .collect())
+    }
+
+    /// Switch `id` off because its URL fails the delivery-target policy.
+    /// **Process boot only.** Returns the rows affected.
+    ///
+    /// `epigraph-api`'s `state::hydrate_webhook_store` calls this for a row
+    /// that `list_active` returned but that `validate_webhook_url` now
+    /// refuses. Those are "grandfathered" rows, written before the policy
+    /// existed or before it was widened. Deactivating, rather than deleting,
+    /// keeps the row for an operator to inspect. It can be restored with
+    /// `UPDATE … SET active = true` once the policy accepts its URL; until
+    /// then the next boot refuses it again. Setting the
+    /// flag, rather than only skipping the row in memory, means the next boot
+    /// does not re-arm it or log it again. It also means the table stops
+    /// reporting the row as a live subscription to anyone who audits it.
+    ///
+    /// No principal, like [`Self::list_active`]: the caller is boot, acting on
+    /// every tenant's rows, and the decision is a property of the URL, not of
+    /// who asks. `AND active` makes a repeat call, or a second instance booting
+    /// concurrently, a no-op that returns 0.
+    ///
+    /// The caller must only pass rows refused by a check that performs no DNS
+    /// resolution. A transient resolver failure must never be able to switch
+    /// off a legitimate subscription, and `validate_webhook_url` judges
+    /// literals only.
+    ///
+    /// # Errors
+    /// [`DbError`] on any database error.
+    pub async fn deactivate_refused_at_boot(pool: &PgPool, id: Uuid) -> Result<u64, DbError> {
+        let res =
+            sqlx::query("UPDATE webhook_subscriptions SET active = false WHERE id = $1 AND active")
+                .bind(id)
+                .execute(pool)
+                .await?;
+        Ok(res.rows_affected())
     }
 
     /// Delete `id` **only if** `agent_id` owns it. Returns the rows affected.

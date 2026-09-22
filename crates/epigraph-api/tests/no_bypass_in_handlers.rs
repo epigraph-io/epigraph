@@ -59,6 +59,16 @@ const BANNED: &[(&str, &str)] = &[
          handler that needs subscriptions reads the caller's own through \
          `list_webhooks`.",
     ),
+    (
+        "deactivate_refused_at_boot(",
+        "`WebhookSubscriptionRepository::deactivate_refused_at_boot` switches \
+         off ANY principal's subscription by id and takes no principal. That is \
+         correct only inside `state::hydrate_webhook_store`, for a row the \
+         delivery-target policy has just refused. A handler that calls it can \
+         silence another tenant's webhook. An owner removes their own \
+         subscription through `delete_webhook`, which puts the principal in \
+         the WHERE clause.",
+    ),
 ];
 
 fn scan_roots() -> Vec<PathBuf> {

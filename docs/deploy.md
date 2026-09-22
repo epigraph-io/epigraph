@@ -302,13 +302,20 @@ reserves to loopback (`localhost` and anything under `.localhost`).
 
 What an operator should know rather than infer:
 
-* **It applies at registration only.** `bin/server.rs` re-hydrates
-  `AppState::webhook_store` from `webhook_subscriptions` on every boot, so rows
-  written before this release are grandfathered and are re-armed on each deploy
-  without passing through the check. Auditing them is an operator task. The
-  asymmetry is worth stating plainly: an existing subscription pointed at an
-  internal consumer keeps being delivered to, while **re-registering that same
-  URL after a redeploy now fails with 400**.
+* **It also runs at every delivery and at boot, so older rows are not
+  grandfathered.** `bin/server.rs` re-hydrates `AppState::webhook_store` from
+  `webhook_subscriptions` on every boot, and hydration now runs each active
+  row through the same check. A row it refuses is left out of the store, set
+  to `active = false` in `webhook_subscriptions` (kept, not deleted) and logged
+  at `warn` as "grandfathered webhook subscription refused at hydration", with
+  its `subscription_id`, `agent_id` and reason. That log line is the audit. To
+  see what the first boot of this release switched off:
+  `SELECT id, agent_id, url FROM webhook_subscriptions WHERE NOT active;`.
+  An owner whose subscription was switched off no longer sees it in
+  `GET /api/v1/webhooks` and cannot re-register the URL (400). Running
+  `UPDATE … SET active = true` alone does not restore such a row: every
+  delivery and the next boot refuse it again until the policy accepts its URL.
+  The check does no DNS, so a DNS outage at boot cannot switch a row off.
 * **Registration does not resolve names; delivery does.** At registration any
   other hostname is accepted on its face, including one that resolves to a
   private address. At delivery, the dispatcher's HTTP client resolves the name
