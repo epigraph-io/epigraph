@@ -133,6 +133,15 @@ pub async fn record_outcome(
 }
 
 /// POST /api/v1/policy-challenges — create a pending challenge claim.
+///
+/// Idempotent on `(host, port, protocol)`: the handler builds a
+/// deterministic `content` string from those fields and inserts it bound
+/// to the fixed system agent id, so a repeat request produces the exact
+/// same `(content_hash, agent_id)` pair as an earlier one. Rather than let
+/// that collide with the `uq_claims_content_hash_agent` unique constraint
+/// and surface as an opaque 500, the collision is caught and the existing
+/// challenge is looked up and returned as a 200 — matching the shape of
+/// `get_challenge`.
 #[cfg(feature = "db")]
 pub async fn create_challenge(
     State(state): State<AppState>,
@@ -159,7 +168,7 @@ pub async fn create_challenge(
     );
     let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
-    let id: Uuid = sqlx::query_scalar(
+    let insert_result: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
          VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4) \
          RETURNING id",
@@ -174,10 +183,47 @@ pub async fn create_challenge(
         "status": "pending",
     }))
     .fetch_one(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to create challenge: {e}"),
-    })?;
+    .await;
+
+    let id = match insert_result {
+        Ok(id) => id,
+        // Same (content_hash, agent_id) as an earlier identical request —
+        // `uq_claims_content_hash_agent` (migrations/013_code_review_hardening.sql)
+        // fired instead of a fresh row being inserted. Reuse the existing
+        // challenge instead of surfacing the raw DB error as a 500.
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            let existing: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
+                "SELECT id, properties FROM claims \
+                 WHERE content_hash = $1 AND agent_id = $2",
+            )
+            .bind(content_hash.as_slice())
+            .bind(sys_agent_id)
+            .fetch_optional(&state.db_pool)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to look up existing challenge: {e}"),
+            })?;
+
+            let (existing_id, existing_properties) =
+                existing.ok_or_else(|| ApiError::InternalError {
+                    message: "Duplicate key on challenge insert but no row found on re-find"
+                        .to_string(),
+                })?;
+
+            return Ok(Json(serde_json::json!({
+                "id": existing_id,
+                "host": existing_properties.get("host"),
+                "port": existing_properties.get("port"),
+                "protocol": existing_properties.get("protocol"),
+                "status": existing_properties.get("status"),
+            })));
+        }
+        Err(e) => {
+            return Err(ApiError::InternalError {
+                message: format!("Failed to create challenge: {e}"),
+            })
+        }
+    };
 
     Ok(Json(serde_json::json!({ "id": id })))
 }

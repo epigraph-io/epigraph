@@ -185,6 +185,60 @@ async fn create_challenge_with_claims_write_returns_200() {
     );
 }
 
+/// A repeat request for the same (host, port, protocol) must NOT surface the
+/// raw `uq_claims_content_hash_agent` unique-constraint violation as a 500 —
+/// it should respond idempotently with the existing challenge.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_challenge_called_twice_is_idempotent() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let body = serde_json::json!({
+        "host": "idempotent-example.com",
+        "port": 8443,
+        "protocol": "https"
+    });
+
+    let first = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/policy-challenges"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_text = first.text().await.unwrap_or_default();
+    assert_eq!(
+        first_status, 200,
+        "expected first request to return 200 OK; body={first_text}"
+    );
+    let first_body: serde_json::Value = serde_json::from_str(&first_text).unwrap();
+    let first_id = first_body["id"].as_str().expect("id present").to_string();
+
+    let second = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/policy-challenges"))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let second_status = second.status();
+    let second_text = second.text().await.unwrap_or_default();
+    assert_eq!(
+        second_status, 200,
+        "expected repeat request to return 200 OK, not a 500 from the raw \
+         unique-constraint violation; body={second_text}"
+    );
+    let second_body: serde_json::Value = serde_json::from_str(&second_text).unwrap();
+    assert_eq!(
+        second_body["id"].as_str().expect("id present"),
+        first_id,
+        "repeat request for the same (host, port, protocol) must return the \
+         existing challenge's id, not create a duplicate"
+    );
+}
+
 // ── resolve_challenge ─────────────────────────────────────────────────────────
 
 /// No token → 401.
