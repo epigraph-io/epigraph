@@ -420,19 +420,30 @@ async fn validate_packet(
     // `packet.claim.labels` is caller-supplied and is written by a raw
     // `UPDATE claims SET labels` in `submit_packet`, NOT through
     // `ClaimRepository`, so it does not inherit the repo-layer guard.
-    if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
-        let reason = match e {
-            epigraph_db::DbError::InvalidData { reason } => reason,
-            other => other.to_string(),
-        };
-        return Err((
-            StatusCode::BAD_REQUEST,
-            ErrorResponse::with_details(
-                "ValidationError",
-                reason,
-                serde_json::json!({ "field": "claim.labels" }),
-            ),
-        ));
+    //
+    // Gated on `db` because `epigraph-db` is an optional dependency
+    // (`db = ["dep:epigraph-db", ...]`) while `validate_packet` itself is not
+    // feature-gated, so an unconditional reference here breaks the
+    // `--no-default-features` variant that CI checks. Gating loses nothing: the
+    // write this guard protects — `submit_packet`'s raw `UPDATE claims SET
+    // labels` — is itself `#[cfg(feature = "db")]`, so without `db` there is no
+    // persistence path for an unexpanded label to reach.
+    #[cfg(feature = "db")]
+    {
+        if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
+            let reason = match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            };
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ErrorResponse::with_details(
+                    "ValidationError",
+                    reason,
+                    serde_json::json!({ "field": "claim.labels" }),
+                ),
+            ));
+        }
     }
 
     // 1c. Validate idempotency key length (DoS prevention)
