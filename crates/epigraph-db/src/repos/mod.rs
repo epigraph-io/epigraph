@@ -123,8 +123,8 @@ pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
 pub use trace::ReasoningTraceRepository;
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use workflow::{
-    HierarchicalWorkflowRow, ResolvedStep, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository,
+    HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit,
+    WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories

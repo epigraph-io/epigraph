@@ -891,7 +891,7 @@ impl EpiGraphMcpFull {
     // ── Workflows (8 tools) ──
 
     #[tool(
-        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table; use `report_workflow_outcome` with that returned id to record execution results."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results."
     )]
     async fn store_workflow(
         &self,
@@ -901,7 +901,9 @@ impl EpiGraphMcpFull {
         tools::workflows::store_workflow(self, params).await
     }
 
-    #[tool(description = "Search for existing workflows by goal using semantic search.")]
+    #[tool(
+        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array."
+    )]
     async fn find_workflow(
         &self,
         Parameters(params): Parameters<FindWorkflowParams>,
@@ -992,7 +994,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table — distinct from `find_workflow` which searches flat workflow claims."
+        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps."
     )]
     async fn find_workflow_hierarchical(
         &self,
