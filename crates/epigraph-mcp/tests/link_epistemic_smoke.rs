@@ -44,6 +44,7 @@ struct LinkEpistemicResponse {
     was_created: bool,
     relationship: String,
     belief_wired: bool,
+    belief_target_claim_id: String,
     target_belief: Option<Belief>,
 }
 
@@ -683,5 +684,277 @@ async fn missing_target_claim_is_rejected(pool: PgPool) {
     assert!(
         msg.contains("target_claim_id") && msg.contains(&bogus.to_string()),
         "error should identify the missing side and its UUID; got: {msg}"
+    );
+}
+
+// ── symmetric relationships dedup on the UNORDERED pair (backlog 9a0bd3e2) ──
+
+/// Count `relationship` edges between `a` and `b` in EITHER direction. This is
+/// the shape every conflict-density consumer uses (`silence_alarm`'s
+/// `check_conflict_density` among them): it counts ROWS describing the pair,
+/// which is exactly the number the directional write path inflated.
+async fn symmetric_edge_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM edges \
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+           AND relationship = $3",
+    )
+    .bind(a)
+    .bind(b)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .expect("count symmetric edges")
+}
+
+/// `contradicts` is semantically symmetric: "A contradicts B" and "B
+/// contradicts A" are ONE disagreement. Filing both orders must leave ONE row.
+///
+/// Pre-fix, `do_link_epistemic` routed every relationship through the
+/// directional `EdgeRepository::create_if_not_exists`, whose idempotency key is
+/// the ordered `(source, target, relationship)` triple — so the reverse call
+/// matched nothing and inserted a second row. Every conflict-density measure
+/// counts rows, so one dispute read as two.
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let b = seed_claim(&pool, "the disputed claim", 0.5).await;
+
+    let forward = parse_response(
+        &do_link_epistemic(
+            &server,
+            LinkEpistemicParams {
+                source_claim_id: a.to_string(),
+                target_claim_id: b.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+        )
+        .await
+        .expect("A contradicts B"),
+    );
+    assert!(forward.was_created, "the first order creates the row");
+    assert_eq!(
+        forward.belief_target_claim_id,
+        b.to_string(),
+        "on a fresh insert the belief target is the caller's target"
+    );
+
+    // Same fact, opposite argument order.
+    let reverse = parse_response(
+        &do_link_epistemic(
+            &server,
+            LinkEpistemicParams {
+                source_claim_id: b.to_string(),
+                target_claim_id: a.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+        )
+        .await
+        .expect("B contradicts A"),
+    );
+
+    assert!(
+        !reverse.was_created,
+        "the reverse order describes the SAME disagreement — it must not create \
+         a second row"
+    );
+    assert_eq!(
+        reverse.edge_id, forward.edge_id,
+        "the reverse call must resolve to the edge the forward call created"
+    );
+    assert_eq!(
+        symmetric_edge_count(&pool, a, b, "contradicts").await,
+        1,
+        "one disagreement must be ONE row — this count is what every \
+         conflict-density measure reads"
+    );
+}
+
+/// The same collapse for `corroborates`, the other semantically symmetric
+/// member of the epistemic set.
+///
+/// NOTE the casing caveat documented on `SYMMETRIC_RELATIONSHIPS`: this
+/// unifies the two call ORDERS of `link_epistemic`'s lowercase
+/// `corroborates`. It does NOT unify with the cross-source matcher's
+/// upper-case `CORROBORATES`, which dedup treats as a different relationship
+/// entirely — asserted below so the limit of this fix is pinned, not implied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let b = seed_claim(&pool, "the corroborated claim", 0.5).await;
+
+    for (src, tgt) in [(a, b), (b, a)] {
+        do_link_epistemic(
+            &server,
+            LinkEpistemicParams {
+                source_claim_id: src.to_string(),
+                target_claim_id: tgt.to_string(),
+                relationship: "corroborates".to_string(),
+                properties: None,
+            },
+        )
+        .await
+        .expect("corroborates link");
+    }
+
+    assert_eq!(
+        symmetric_edge_count(&pool, a, b, "corroborates").await,
+        1,
+        "both orders of `corroborates` must collapse to one row"
+    );
+    assert_eq!(
+        symmetric_edge_count(&pool, a, b, "CORROBORATES").await,
+        0,
+        "scope pin: dedup is byte-exact on `relationship`, so the lowercase \
+         link_epistemic edge is NOT the matcher's upper-case CORROBORATES"
+    );
+}
+
+/// The mirror-image guard: DIRECTIONAL relationships must NOT be collapsed.
+///
+/// "A supports B" and "B supports A" are two different assertions (mutual
+/// support), and each is its own DS factor — one on B's belief, one on A's.
+/// Adding `supports` (or `refutes`/`generalizes`/`specializes`/`elaborates`)
+/// to `SYMMETRIC_RELATIONSHIPS` would silently erase one of them. This test
+/// fails the moment someone does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let b = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+
+    for (src, tgt) in [(a, b), (b, a)] {
+        let resp = parse_response(
+            &do_link_epistemic(
+                &server,
+                LinkEpistemicParams {
+                    source_claim_id: src.to_string(),
+                    target_claim_id: tgt.to_string(),
+                    relationship: "supports".to_string(),
+                    properties: None,
+                },
+            )
+            .await
+            .expect("supports link"),
+        );
+        assert!(
+            resp.was_created,
+            "each direction of `supports` is a distinct assertion and must \
+             create its own row"
+        );
+    }
+
+    assert_eq!(
+        symmetric_edge_count(&pool, a, b, "supports").await,
+        2,
+        "mutual support is TWO assertions — collapsing them would erase one \
+         claim's evidence for the other"
+    );
+    assert_eq!(edge_count(&pool, a, b, "supports").await, 1);
+    assert_eq!(edge_count(&pool, b, a, "supports").await, 1);
+}
+
+/// Belief semantics of the collapse, not just the row count.
+///
+/// The BBA an epistemic edge materializes is keyed on `edge_id` and encodes
+/// "source's interval restricts target". Once both orders share ONE row, a
+/// reverse-order re-assertion must wire the STORED orientation, otherwise the
+/// factor attached to that edge_id would describe the opposite of the row it
+/// hangs on.
+///
+/// Sequenced to force the decision to matter: the row is written while its
+/// stored source A is factorless (no BBA materialized, nothing wired), A then
+/// gains belief, and the wake-up is triggered by a call in the REVERSE order.
+/// The wire must therefore run A→B — moving B's belief, not A's — even though
+/// this caller named A as its target.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    let a = seed_claim(&pool, "stored source, factorless at first", 0.5).await;
+    let b = seed_claim(&pool, "stored target", 0.5).await;
+
+    // Row is written A → B, but A has no interval yet so nothing is wired.
+    let first = parse_response(
+        &do_link_epistemic(
+            &server,
+            LinkEpistemicParams {
+                source_claim_id: a.to_string(),
+                target_claim_id: b.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+        )
+        .await
+        .expect("A contradicts B"),
+    );
+    assert!(first.was_created && !first.belief_wired);
+
+    // BOTH claims now gain identical belief intervals. This is what makes the
+    // test discriminating rather than merely descriptive: with either endpoint
+    // able to act as a source, the two candidate orientations produce
+    // OPPOSITE, mutually exclusive outcomes on the same edge_id —
+    //   stored  (A -> B): B is recomputed and drops, A keeps its 0.9
+    //   caller  (B -> A): A is recomputed and drops, B keeps its 0.9
+    // and `auto_wire_edge_if_epistemic` materializes at most one BBA per
+    // edge_id, so exactly one of them can happen.
+    sqlx::query(
+        "UPDATE claims SET belief = 0.9, plausibility = 0.9, pignistic_prob = 0.9 \
+         WHERE id = ANY($1)",
+    )
+    .bind(vec![a, b])
+    .execute(&pool)
+    .await
+    .expect("give both claims a belief interval");
+
+    // Wake-up arrives in the REVERSE order: caller says "B contradicts A".
+    let reverse = parse_response(
+        &do_link_epistemic(
+            &server,
+            LinkEpistemicParams {
+                source_claim_id: b.to_string(),
+                target_claim_id: a.to_string(),
+                relationship: "contradicts".to_string(),
+                properties: None,
+            },
+        )
+        .await
+        .expect("B contradicts A"),
+    );
+
+    assert!(!reverse.was_created, "same disagreement, one row");
+    assert!(
+        reverse.belief_wired,
+        "no BBA has ever been materialized for this edge, and both endpoints \
+         now carry an interval, so the wake-up must fire"
+    );
+    assert_eq!(
+        reverse.belief_target_claim_id,
+        b.to_string(),
+        "the wire follows the ROW's orientation (A -> B), so the belief that \
+         moved is B's — the caller's SOURCE, not its target. The response must \
+         say so rather than leave the caller to assume its own target_claim_id"
+    );
+
+    let b_betp = read_betp(&pool, b)
+        .await
+        .expect("B is the stored target, so B is what the recompute wrote");
+    assert!(
+        b_betp < 0.5,
+        "a contradicts factor from a high-belief source must push B below the \
+         0.5 neutral point, got {b_betp}"
+    );
+    let a_betp = read_betp(&pool, a)
+        .await
+        .expect("A still carries the interval the UPDATE gave it");
+    assert!(
+        (a_betp - 0.9).abs() < 1e-9,
+        "A is the stored SOURCE and must be left exactly as seeded (0.9). \
+         Wiring the caller's orientation (B -> A) instead would have recomputed \
+         A downward, so any drift here means the orientation was taken from the \
+         argument order rather than the row. Got {a_betp}"
     );
 }

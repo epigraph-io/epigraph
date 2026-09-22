@@ -81,6 +81,21 @@ pub struct EdgeRow {
     pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Outcome of [`EdgeRepository::create_symmetric_if_absent_oriented`].
+///
+/// `source_id` / `target_id` are the endpoints AS RECORDED on the surviving
+/// row, not necessarily the `(a, b)` the caller passed — on a dedup hit
+/// against the reverse direction they are swapped. See that method's doc
+/// comment for why belief-wiring callers must use these and not their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymmetricEdgeUpsert {
+    pub edge_id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    /// `true` when this call inserted the row, `false` on a dedup hit.
+    pub was_created: bool,
+}
+
 /// Repository for Edge operations
 pub struct EdgeRepository;
 
@@ -411,6 +426,88 @@ impl EdgeRepository {
         .await?;
 
         Ok((existing, false))
+    }
+
+    /// Symmetric idempotent create that reports the STORED row's orientation.
+    ///
+    /// Same bidirectional-dedup contract as
+    /// [`Self::create_symmetric_if_absent_returning`], but the result also
+    /// carries the `(source_id, target_id)` actually recorded on the surviving
+    /// row rather than the `(a, b)` the caller passed. On a fresh insert those
+    /// are the same; on a dedup hit against the REVERSE direction they are
+    /// swapped.
+    ///
+    /// That distinction is load-bearing for belief-wiring callers. The matcher
+    /// paths that use the plain `create_symmetric_if_absent` never wire belief
+    /// (see `routes/cross_source.rs`'s "never `auto_wire_edge_if_epistemic`"
+    /// note), so orientation is inert for them. `link_epistemic` DOES wire: it
+    /// materializes a BBA keyed on `edge_id` from the source claim's interval
+    /// onto the target. Handing it the caller's orientation on a reverse dedup
+    /// hit would attach a factor that contradicts the row it is keyed to —
+    /// "B contradicts A" on disk, "A's interval restricts B" in the BBA. With
+    /// the stored orientation returned, the wire always matches the row.
+    ///
+    /// Runtime `sqlx::query*` throughout — no `.sqlx/` prepared-cache entry.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, properties))]
+    pub async fn create_symmetric_if_absent_oriented(
+        pool: &PgPool,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<SymmetricEdgeUpsert, DbError> {
+        let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type,
+                                relationship, properties)
+             SELECT $1, 'claim', $2, 'claim', $3, $4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM edges
+                 WHERE ((source_id = $1 AND target_id = $2)
+                     OR (source_id = $2 AND target_id = $1))
+                   AND relationship = $3
+             )
+             RETURNING id, source_id, target_id",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .bind(Json(properties))
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some((edge_id, source_id, target_id)) = inserted {
+            return Ok(SymmetricEdgeUpsert {
+                edge_id,
+                source_id,
+                target_id,
+                was_created: true,
+            });
+        }
+
+        // Dedup hit — surface the existing row AS STORED, which may be the
+        // reverse of the caller's (a, b).
+        let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(
+            "SELECT id, source_id, target_id FROM edges
+             WHERE ((source_id = $1 AND target_id = $2)
+                 OR (source_id = $2 AND target_id = $1))
+               AND relationship = $3
+             LIMIT 1",
+        )
+        .bind(a)
+        .bind(b)
+        .bind(relationship)
+        .fetch_one(pool)
+        .await?;
+
+        Ok(SymmetricEdgeUpsert {
+            edge_id,
+            source_id,
+            target_id,
+            was_created: false,
+        })
     }
 
     /// Get edges by source entity

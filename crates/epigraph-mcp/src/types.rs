@@ -1561,6 +1561,18 @@ pub struct LinkEpistemicResponse {
     pub was_created: bool,
     pub relationship: String,
     pub belief_wired: bool,
+    /// The claim `target_belief` describes, and the one the belief wire
+    /// recomputed.
+    ///
+    /// Normally equals the request's `target_claim_id`. It is the request's
+    /// `source_claim_id` in exactly one case: a SYMMETRIC relationship
+    /// (`contradicts` / `corroborates`) that deduped against an edge already
+    /// stored in the opposite direction. Those two orderings are one fact, so
+    /// only one row exists, and both the wire and this readback follow the
+    /// row's recorded orientation rather than the caller's argument order.
+    /// Always echoed so a caller never has to infer which claim the interval
+    /// belongs to.
+    pub belief_target_claim_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_belief: Option<LinkEpistemicBelief>,
 }

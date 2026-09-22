@@ -102,9 +102,9 @@ pub use repos::{
     ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
     ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
     RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome,
-    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository,
-    SortDirection, StructuralRepository, SweepCandidate, TaskRepository, TaskRow,
-    TenancyPrecondition, TraceProvenanceStep, TripleRepository, TripleRow,
+    ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
+    SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, TraceProvenanceStep, TripleRepository, TripleRow,
     WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
@@ -119,7 +119,7 @@ pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
-pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
+pub use repos::edge::{AttributedClaimRow, EdgeRow, SymmetricEdgeUpsert, EPISTEMIC_RELATIONSHIPS};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::graph_view::{
