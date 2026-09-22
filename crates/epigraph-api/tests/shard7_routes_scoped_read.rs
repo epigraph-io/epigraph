@@ -139,6 +139,15 @@
 //! three gates at the raw-pool `is_member` failed every arm on the live-admin
 //! case, and forcing the helper to admit failed every arm on the revoked case.
 //!
+//! Two more arms, [`claim_label_reads_propagate_a_statement_error`] and
+//! [`list_claims_encryption_lookup_propagates_a_statement_error`], discharge the
+//! propagate-don't-default exemption this shard recorded for the same file.
+//! They inject a statement error by renaming one column in the test's own
+//! database and assert the handler fails with the side read's own fixed-text
+//! error, after calibrating the healthy answer. Adjudicated per site: restoring
+//! `.unwrap_or_default()` on either label read, or `if let Ok(Some(enc))` on the
+//! encryption lookup, fails exactly the arm that drives it.
+//!
 //! # What is still NOT proven here
 //!
 //! `ScopedPoolOptions` exposes no `after_connect`, so the SCOPED arm is still a
@@ -890,6 +899,192 @@ async fn create_claim_group_gate_admits_live_members_on_an_rls_subject_raw_pool(
             );
         }
     }
+}
+
+// ── routes/claims.rs: side reads propagate instead of defaulting ──
+//
+// `get_claim`'s label read, `list_claims`' batched label read and
+// `list_claims`' per-item `claim_encryption` lookup used to swallow a statement
+// ERROR into a 200 with the field empty or missing. The fault is injected by
+// renaming ONE column the side read names, in this test's own `#[sqlx::test]`
+// database. That is the only failure this fixture can force deterministically:
+// the scoped pool is superuser, so a revoked grant or a policy change would not
+// reach it. Each arm first CALIBRATES the healthy answer, so the fault is the
+// only thing that changes between the two calls, and then asserts the handler
+// fails with the side read's OWN fixed-text error. That rules out an earlier
+// statement (the claim read, the count) being what failed.
+
+/// Seal `claim` under `group`: the epoch-0 key row the FK requires, then a
+/// `claim_encryption` row. The claim must already be non-public — migration
+/// 081's `claim_encryption_no_public_sealed` refuses it otherwise.
+async fn seal_claim(pool: &PgPool, claim: Uuid, group: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed the group key epoch the FK requires");
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, \
+                                       encrypted_content) \
+         VALUES ($1, $2, 0, 'fully_private', decode('0badc0de', 'hex'))",
+    )
+    .bind(claim)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a claim_encryption row");
+}
+
+/// Break the side read under test by renaming a column it names. Test-local
+/// literals only; the database is this test's own and is dropped after it.
+async fn rename_column(pool: &PgPool, table: &str, from: &str, to: &str) {
+    sqlx::query(&format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to}"))
+        .execute(pool)
+        .await
+        .expect("inject the fault");
+}
+
+fn is_internal_error(result: &Result<impl Sized, ApiError>, expected: &str) -> bool {
+    matches!(result, Err(ApiError::InternalError { message }) if message == expected)
+}
+
+/// `GET /claims/:id` and `GET /claims` — the two label reads.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_label_reads_propagate_a_statement_error(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "shard7-labels-err").await;
+    let mine = seed_group_claim(&pool, viewer_agent, viewer_group, "shard7 labels err").await;
+    set_labels(&pool, mine, &["shard7-labels-err"]).await;
+    let state = split_state(&pool).await;
+
+    let get = |state: AppState, viewer| {
+        get_claim(
+            ViewerExtractor(viewer),
+            State(state),
+            Path(mine),
+            Query(GetClaimQuery::default()),
+        )
+    };
+    let list = |state: AppState, viewer| {
+        list_claims(
+            ViewerExtractor(viewer),
+            State(state),
+            Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                search: None,
+                agent_id: None,
+                group_id: None,
+            }),
+        )
+    };
+
+    // CALIBRATION: both reads serve the label while the column exists.
+    let healthy = get(state.clone(), viewer_for(&pool, viewer_agent).await)
+        .await
+        .expect("CALIBRATION: get_claim before the fault")
+        .0;
+    assert_eq!(
+        healthy.labels,
+        vec!["shard7-labels-err".to_string()],
+        "CALIBRATION: get_claim must serve the label before the fault"
+    );
+    let healthy = list(state.clone(), viewer_for(&pool, viewer_agent).await)
+        .await
+        .expect("CALIBRATION: list_claims before the fault")
+        .0;
+    let item = healthy
+        .items
+        .iter()
+        .find(|c| c.id == mine)
+        .expect("CALIBRATION: list_claims must serve the viewer's own claim");
+    assert_eq!(
+        item.labels,
+        vec!["shard7-labels-err".to_string()],
+        "CALIBRATION: list_claims must serve the label before the fault"
+    );
+
+    rename_column(&pool, "claims", "labels", "labels_fault_injected").await;
+
+    let got = get(state.clone(), viewer_for(&pool, viewer_agent).await).await;
+    assert!(
+        is_internal_error(&got, "Failed to read claim labels"),
+        "get_claim must FAIL when its label read errors, not serve the claim with an \
+         empty label set; got {:?}",
+        got.map(|j| j.0.labels)
+    );
+    let listed = list(state, viewer_for(&pool, viewer_agent).await).await;
+    assert!(
+        is_internal_error(&listed, "Failed to read claim labels"),
+        "list_claims must FAIL when its batched label read errors, not serve the page \
+         with every label set empty; got {:?}",
+        listed.map(|j| j.0.items.into_iter().map(|c| c.labels).collect::<Vec<_>>())
+    );
+}
+
+/// `GET /claims` — the per-item `claim_encryption` lookup.
+///
+/// The claim is SEALED, so the healthy answer carries all four encryption
+/// fields. The swallowed error dropped exactly those, which made the claim
+/// indistinguishable from an unencrypted one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_encryption_lookup_propagates_a_statement_error(pool: PgPool) {
+    let (viewer_agent, viewer_group) = seed_agent_with_group(&pool, "shard7-enc-err").await;
+    let sealed = seed_group_claim(&pool, viewer_agent, viewer_group, "shard7 enc err").await;
+    seal_claim(&pool, sealed, viewer_group).await;
+    let state = split_state(&pool).await;
+
+    let list = |state: AppState, viewer| {
+        list_claims(
+            ViewerExtractor(viewer),
+            State(state),
+            Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                search: None,
+                agent_id: None,
+                group_id: None,
+            }),
+        )
+    };
+
+    let healthy = list(state.clone(), viewer_for(&pool, viewer_agent).await)
+        .await
+        .expect("CALIBRATION: list_claims before the fault")
+        .0;
+    let item = healthy
+        .items
+        .iter()
+        .find(|c| c.id == sealed)
+        .expect("CALIBRATION: list_claims must serve the viewer's own sealed claim");
+    assert_eq!(
+        (item.privacy_tier.as_deref(), item.group_id),
+        (Some("fully_private"), Some(viewer_group)),
+        "CALIBRATION: a sealed claim must carry its encryption fields before the fault"
+    );
+
+    rename_column(
+        &pool,
+        "claim_encryption",
+        "encrypted_labels",
+        "encrypted_labels_fault_injected",
+    )
+    .await;
+
+    let listed = list(state, viewer_for(&pool, viewer_agent).await).await;
+    assert!(
+        is_internal_error(&listed, "Failed to read claim encryption metadata"),
+        "list_claims must FAIL when its encryption lookup errors, not serve a sealed claim \
+         as if it were unencrypted; got {:?}",
+        listed.map(|j| j
+            .0
+            .items
+            .into_iter()
+            .map(|c| (c.id, c.privacy_tier))
+            .collect::<Vec<_>>())
+    );
 }
 
 // ── routes/versioning.rs ──

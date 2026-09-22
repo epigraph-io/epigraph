@@ -35,22 +35,25 @@
 //! the helper, and `tests/shard7_routes_scoped_read.rs` drives all three gates
 //! against an `epigraph_app` raw pool.
 //!
-//! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
-//! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and
-//! `routes/crud.rs` state that rule; three statements in this file do not follow
-//! it. `get_claim`'s inline label read and `list_claims`' batched label read
-//! both keep `.unwrap_or_default()`, and `list_claims`' per-item encryption
-//! lookup keeps `if let Ok(Some(enc))`. The rule was applied only where this
-//! shard changed the statement anyway; these three ALREADY shared a connection
-//! via the `db_pool.begin()` transaction the conversion replaced, so nothing
-//! about their sharing changed, they cover a non-tenancy-bearing projection
-//! (labels, encryption metadata) rather than the rows the viewer predicate
-//! selects, and the direction of failure is safe — a swallowed error drops a
-//! field from the response and can never add a row. One consequence is worth
-//! writing down: `claim_encryption` DOES carry a narrowing policy at head 92, so
-//! at step 11d that `if let Ok(Some(enc))` becomes the branch that absorbs a
-//! policy denial and answers 200 with the field simply missing, indistinguishable
-//! from an unencrypted claim. Changing it is not this batch's.
+//! **THE PROPAGATE-DON'T-DEFAULT RULE HOLDS IN THIS FILE WITHOUT EXEMPTION.**
+//! `routes/workflows.rs` and `routes/crud.rs` state that rule. Shard 7 left
+//! three statements here outside it, as a recorded decision: `get_claim`'s
+//! inline label read and `list_claims`' batched label read kept
+//! `.unwrap_or_default()`, and `list_claims`' per-item encryption lookup kept
+//! `if let Ok(Some(enc))`. That decision rested on "a swallowed error only drops
+//! a field", which is true and is the problem. At step 11d a statement error on
+//! the stamped connection (a `42501` from a policy helper, a GUC failure, or
+//! under `SessionGucMode::Transaction` the aborted transaction an earlier
+//! failure leaves) would have answered 200 with the labels empty or the
+//! encryption fields missing: an encrypted claim indistinguishable from an
+//! unencrypted one, and a fault indistinguishable from a real absence. All three now log
+//! under `tenancy.scoped_read` and fail the request with a fixed-text
+//! `InternalError`. A policy FILTER is still zero rows and still reads as absent,
+//! which is a true answer.
+//!
+//! This is a behaviour change: a transient failure on either side read now
+//! fails the whole `list_claims` page instead of serving it with fields
+//! silently missing.
 //!
 //! The other 18 sites sit in WRITE handlers — `create_claim` (8),
 //! `update_claim` (6), `patch_claim` (2), `update_labels` (2), which is all 18
@@ -1124,12 +1127,29 @@ pub async fn get_claim(
             message: format!("Failed to query claim encryption: {e}"),
         })?;
 
-    // Fetch labels from DB (not part of Claim domain model)
+    // Fetch labels from DB (not part of Claim domain model).
+    //
+    // PROPAGATE, do not default. A policy FILTER here is zero rows and reads as
+    // "no labels", which is a true answer; an ERROR (a `42501` from a policy
+    // helper, a GUC failure, or — under `SessionGucMode::Transaction` — the
+    // aborted transaction an earlier failure leaves behind) is not, and
+    // defaulting it served a 200 with the label set silently empty.
     let labels: Vec<String> = sqlx::query_scalar("SELECT unnest(labels) FROM claims WHERE id = $1")
         .bind(id)
         .fetch_all(&mut *read)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "get_claim",
+                statement = "labels",
+                "claim label read failed"
+            );
+            ApiError::InternalError {
+                message: "Failed to read claim labels".to_string(),
+            }
+        })?;
 
     drop(read);
 
@@ -1240,7 +1260,9 @@ pub async fn list_claims(
 
     let mut items: Vec<ClaimResponse> = claims.into_iter().map(Into::into).collect();
 
-    // Fetch labels for all listed claims in one query
+    // Fetch labels for all listed claims in one query. PROPAGATE, do not
+    // default — the same reasoning as `get_claim`'s label read: an error here
+    // used to serve the whole page with every label set silently empty.
     if !items.is_empty() {
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
         let label_rows: Vec<(Uuid, String)> = sqlx::query_as(
@@ -1249,7 +1271,18 @@ pub async fn list_claims(
         .bind(&claim_ids)
         .fetch_all(&mut *read)
         .await
-        .unwrap_or_default();
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "list_claims",
+                statement = "labels",
+                "claim label read failed"
+            );
+            ApiError::InternalError {
+                message: "Failed to read claim labels".to_string(),
+            }
+        })?;
 
         for item in &mut items {
             item.labels = label_rows
@@ -1262,11 +1295,29 @@ pub async fn list_claims(
 
     // Fetch encryption metadata on the SAME stamped connection, so the tenancy
     // context that selected `items` is still the one in force.
+    //
+    // `Ok(None)` — no row, or a row `claim_encryption`'s policy filters — is a
+    // real answer and leaves the fields absent. `Err` is NOT: swallowing it
+    // served an encrypted claim with `privacy_tier`, `encrypted_content`,
+    // `encryption_epoch` and `group_id` all missing, indistinguishable from an
+    // unencrypted one, so it fails the request like `get_claim`'s own lookup.
     if !items.is_empty() {
         for item in &mut items {
-            if let Ok(Some(enc)) =
-                ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, item.id).await
-            {
+            let encryption = ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, item.id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        target: "tenancy.scoped_read",
+                        error = %e,
+                        handler = "list_claims",
+                        statement = "claim_encryption",
+                        "claim encryption lookup failed"
+                    );
+                    ApiError::InternalError {
+                        message: "Failed to read claim encryption metadata".to_string(),
+                    }
+                })?;
+            if let Some(enc) = encryption {
                 item.privacy_tier = Some(enc.privacy_tier);
                 item.encrypted_content =
                     Some(base64::engine::general_purpose::STANDARD.encode(&enc.encrypted_content));
