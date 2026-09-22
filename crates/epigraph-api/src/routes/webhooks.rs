@@ -178,20 +178,18 @@ const ALLOWED_WEBHOOK_SCHEMES: &[&str] = &["http", "https"];
 ///
 /// # What this policy does NOT cover — stated, not implied
 ///
-/// * **DNS rebinding is not covered, and neither is any other name that
-///   resolves somewhere internal.** Rule 5 covers the names that are reserved to
+/// * **This function resolves no names, so a name that resolves somewhere
+///   internal passes it.** Rule 5 covers the names that are reserved to
 ///   loopback; it does not and cannot cover a name that merely *resolves* to a
 ///   private address — `internal-consumer.corp.example` is accepted, as is a
 ///   name placed on the loopback line of the delivering host's `/etc/hosts`.
-///   The check runs at registration, against
-///   the literal the caller supplied. A *hostname* is accepted on its face; if
-///   it resolves to a private address at delivery time — either because it
-///   always did, or because the record changed afterwards — this function has
-///   already returned `Ok`. Closing that is a different control (egress policy
-///   on the delivering process, or resolve-and-recheck immediately before each
-///   POST), and no resolution happens here deliberately: resolving inside a
-///   request handler makes registration latency a function of DNS and makes
-///   this crate's tests depend on the network.
+///   No resolution happens here deliberately: resolving inside a request
+///   handler makes registration latency a function of DNS and makes this
+///   crate's tests depend on the network. That half of the policy is enforced
+///   at DELIVERY instead, by the dispatcher client's [`SsrfGuardedResolver`].
+///   It judges every address a name resolves to at the moment the connector
+///   dials, which also covers DNS rebinding after registration. Registration
+///   accepting such a name is therefore not the same as delivering to it.
 /// * **It applies at REGISTRATION only, so existing rows are grandfathered.**
 ///   `bin/server.rs` re-hydrates `AppState::webhook_store` from
 ///   `WebhookSubscriptionRepository::list_active` on every boot, so any row
@@ -373,8 +371,9 @@ pub fn sign_webhook_payload(secret: &str, payload: &[u8]) -> String {
 /// The URL is checked against [`validate_webhook_url`], which requires an
 /// `http`/`https` scheme and refuses loopback, link-local, private-range and
 /// unspecified IP **literals**. Read that function's doc for the four things
-/// this policy deliberately does not cover — chiefly that DNS rebinding is out
-/// of scope (a hostname is accepted on its face) and that the check applies at
+/// this policy deliberately does not cover. Chiefly: a hostname is accepted on
+/// its face here, and names are resolved and judged only at delivery, by the
+/// dispatcher's [`SsrfGuardedResolver`]. Also, the check applies at
 /// registration only, so rows already in `webhook_subscriptions` are
 /// grandfathered and re-armed by boot hydration on every deploy.
 ///
@@ -1247,6 +1246,12 @@ pub struct WebhookDeliveryResult {
 /// gate is not sufficient on its own: the store is an in-memory map that other
 /// code paths can insert into, and subscriptions registered before the gate
 /// existed would otherwise stay deliverable for the lifetime of the process.
+///
+/// That re-check judges the URL's literal host. A NAME that passes it is
+/// judged again at connect time by the client's [`SsrfGuardedResolver`],
+/// against the addresses the connector is about to dial. That refusal comes
+/// back here as a send error and is reported the same way: terminal, and
+/// attributed to the SSRF guard.
 async fn deliver_to_subscription(
     client: &reqwest::Client,
     subscription: &crate::state::WebhookSubscription,
@@ -1331,6 +1336,27 @@ async fn deliver_to_subscription(
                 last_error = Some(format!("HTTP {status}"));
             }
             Err(e) => {
+                // The connect-time half of the guard (`SsrfGuardedResolver`)
+                // refused the name's resolved address. This is terminal: no
+                // socket was opened, and retrying only asks the same resolver
+                // again. `attempts` counts the tries that reached the
+                // network, so a refusal on the first try reports 0, the same
+                // as the literal check above.
+                if let Some(refusal) = connect_time_ssrf_refusal(&e) {
+                    tracing::warn!(
+                        subscription_id = %subscription.id,
+                        host = %refusal.host,
+                        resolved = %refusal.addr,
+                        "Refusing webhook delivery: target name resolves to an internal address"
+                    );
+                    return WebhookDeliveryResult {
+                        subscription_id: subscription.id,
+                        success: false,
+                        status_code: None,
+                        attempts: attempt,
+                        error: Some(format!("blocked by SSRF guard: {refusal}")),
+                    };
+                }
                 last_error = Some(e.to_string());
             }
         }
@@ -1351,31 +1377,204 @@ async fn deliver_to_subscription(
     }
 }
 
+// =============================================================================
+// CONNECT-TIME RESOLUTION GUARD
+// =============================================================================
+
+/// A resolved address the SSRF guard refused to let the dispatcher dial.
+///
+/// This is the error [`SsrfGuardedResolver`] returns. `reqwest` wraps it in its
+/// own connect error. `deliver_to_subscription` walks the `source()` chain back
+/// to this type, so a refusal is reported as the guard's verdict and not as a
+/// generic "error sending request".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToInternalAddress {
+    /// The name the delivery URL carried.
+    pub host: String,
+    /// The first internal address that name resolved to.
+    pub addr: std::net::IpAddr,
+}
+
+impl std::fmt::Display for ResolvedToInternalAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "webhook target {} resolves to internal address {}; refused by the SSRF guard \
+             at connect time",
+            self.host, self.addr
+        )
+    }
+}
+
+impl std::error::Error for ResolvedToInternalAddress {}
+
+/// The dispatcher's DNS resolver. It resolves a name, then refuses the whole
+/// name if **any** address it resolved to is internal.
+///
+/// # Why resolve here, when registration deliberately does not
+///
+/// `validate_webhook_url` judges the literal the caller supplied. It accepts a
+/// hostname on its face and says why: resolving inside a request handler would
+/// make registration latency depend on DNS. That leaves every name that
+/// *resolves* internal, e.g. `127-0-0-1.nip.io`, `localtest.me`, a corp name
+/// with a private A record, or a DNS-rebinding record flipped after
+/// registration. This type closes that gap at the only point where the answer
+/// matters: the resolution reqwest performs immediately before it opens the
+/// socket. The addresses it returns are the ones the connector dials, so no
+/// second lookup can disagree with the one that was checked. That is the
+/// time-of-check/time-of-use gap a separate "resolve, check, then POST" step
+/// would leave open to a rebinding record with a zero TTL.
+///
+/// # Any, not all
+///
+/// A mixed answer (one public address and one private one) is refused
+/// outright. Filtering the private addresses out and dialling the public one
+/// would keep the name deliverable. But the connector's address choice (happy
+/// eyeballs, fallback on connect failure) is not something this guard
+/// controls, and a name that answers with an internal address is not a target
+/// this server should be sending signed payloads to at all.
+///
+/// # What bypasses it, by construction
+///
+/// * **IP-literal URLs.** reqwest never calls a resolver for `http://10.0.0.5/`.
+///   Those are covered by `deliver_to_subscription` re-running
+///   `validate_webhook_url` on every delivery, which judges literals. The two
+///   checks are complementary and neither is sufficient alone.
+/// * **`ClientBuilder::resolve` overrides.** reqwest consults its override map
+///   BEFORE the configured resolver. [`dispatcher_client_builder`] sets no
+///   overrides. The dispatcher tests add them on purpose to reach a loopback
+///   sink. A production client must never gain one.
+/// * **A proxy.** Through an HTTP proxy the client resolves the PROXY'S name,
+///   not the target's. [`dispatcher_client_builder`] therefore calls
+///   `.no_proxy()`, so `HTTP(S)_PROXY` in the environment cannot silently
+///   turn this guard off.
+///
+/// The classification is `epigraph_jobs::is_internal_addr`, the same function
+/// `validate_webhook_url` delegates to. Keeping one definition means "internal"
+/// cannot mean one thing at registration and another at connect time.
+pub struct SsrfGuardedResolver {
+    lookup: std::sync::Arc<dyn reqwest::dns::Resolve>,
+}
+
+impl SsrfGuardedResolver {
+    /// Guard the answers of `lookup`.
+    ///
+    /// Production passes the system resolver (see
+    /// [`dispatcher_client_builder`]). Tests pass a fixed answer. The guard
+    /// runs either way. The seam decides what a name resolves to, never
+    /// whether the answer is judged.
+    #[must_use]
+    pub fn over(lookup: std::sync::Arc<dyn reqwest::dns::Resolve>) -> Self {
+        Self { lookup }
+    }
+}
+
+impl reqwest::dns::Resolve for SsrfGuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let answer = self.lookup.resolve(name);
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> = answer.await?.collect();
+            if let Some(bad) = addrs
+                .iter()
+                .find(|sa| epigraph_jobs::is_internal_addr(sa.ip()))
+            {
+                return Err(Box::new(ResolvedToInternalAddress {
+                    host,
+                    addr: bad.ip(),
+                })
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// `getaddrinfo` via tokio, which is what reqwest's own default resolver does.
+/// It is spelled out here because that resolver is not public, and the guard
+/// needs something to wrap.
+struct SystemLookup;
+
+impl reqwest::dns::Resolve for SystemLookup {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            // Port 0: reqwest replaces it with the URL's port before dialling.
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The [`ResolvedToInternalAddress`] somewhere in `err`'s `source()` chain, if
+/// the connect-time guard is why the request failed.
+fn connect_time_ssrf_refusal<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a ResolvedToInternalAddress> {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(refusal) = e.downcast_ref::<ResolvedToInternalAddress>() {
+            return Some(refusal);
+        }
+        cur = e.source();
+    }
+    None
+}
+
 /// Build the HTTP client the dispatcher delivers with.
 ///
 /// Single construction site on purpose: the SSRF guard is a property of this
 /// client as much as of `validate_webhook_url`, so a second ad-hoc
 /// `reqwest::Client::new()` on the delivery path would silently reinstate the
-/// default redirect policy. Tests build through this function for the same
-/// reason — a test that configured its own client would prove nothing about
-/// what the server actually dials with.
+/// default redirect policy, the default resolver and the environment's proxy.
+/// Tests build through this function (or
+/// [`dispatcher_client_builder_with_lookup`], which it delegates to) for the
+/// same reason: a test that configured its own client would prove nothing
+/// about what the server actually dials with.
 ///
-/// `Policy::none()` is the load-bearing setting: `validate_webhook_url` only
-/// ever classifies `subscription.url`, so with reqwest's default policy (follow
-/// up to 10 hops) a registered public endpoint can answer `307 Location:
-/// http://169.254.169.254/…` and the signed payload is delivered to a host the
-/// guard had just rejected by name. A webhook receiver has no legitimate reason
-/// to redirect, so refusing outright is preferred over a `Policy::custom` that
-/// re-runs the guard per hop.
+/// Three settings are load-bearing:
+///
+/// * **`Policy::none()`.** `validate_webhook_url` only ever classifies
+///   `subscription.url`, so with reqwest's default policy (follow up to 10
+///   hops) a registered public endpoint can answer `307 Location:
+///   http://169.254.169.254/…` and the signed payload is delivered to a host
+///   the guard had just rejected by name. A webhook receiver has no legitimate
+///   reason to redirect, so refusing outright is preferred over a
+///   `Policy::custom` that re-runs the guard per hop.
+/// * **`dns_resolver(SsrfGuardedResolver)`.** It refuses a name that resolves
+///   to an internal address, at the resolution the connector actually dials.
+///   See [`SsrfGuardedResolver`].
+/// * **`no_proxy()`.** Without it reqwest reads `HTTP_PROXY`/`HTTPS_PROXY`/
+///   `ALL_PROXY` from the environment. Behind a proxy the resolver is asked
+///   for the proxy's name, never the target's, so the resolver guard would be
+///   bypassed silently and the proxy would make the internal connection on the
+///   server's behalf.
 ///
 /// **Both `cfg` arms of [`start_webhook_dispatcher`] build through it.** The
 /// `db` arm gained a `pool` parameter in PR-10 and nothing else; a client
 /// constructed inline in only one arm is a redirect policy that holds in one
 /// build configuration and not the other.
 pub fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    dispatcher_client_builder_with_lookup(timeout, std::sync::Arc::new(SystemLookup))
+}
+
+/// [`dispatcher_client_builder`] with the name lookup supplied by the caller.
+///
+/// The lookup decides only what a name resolves to. It is always wrapped in
+/// [`SsrfGuardedResolver`], so a test can make `rebind.example` answer
+/// `127.0.0.1` without also deciding whether that answer is judged. Every
+/// other setting is identical, because [`dispatcher_client_builder`] is this
+/// function with the system lookup.
+pub fn dispatcher_client_builder_with_lookup(
+    timeout: std::time::Duration,
+    lookup: std::sync::Arc<dyn reqwest::dns::Resolve>,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver::over(lookup)))
+        .no_proxy()
 }
 
 /// Start the webhook dispatcher background task
@@ -1438,11 +1637,16 @@ pub fn start_webhook_dispatcher(
 /// with reqwest's `.resolve()` — which requires the client to be injectable.
 /// That is the whole of what this function adds.
 ///
-/// **It weakens nothing.** The client still comes from
-/// [`dispatcher_client_builder`], the SSRF guard still runs per delivery, and
-/// `.resolve()` overrides only DNS — it cannot make the guard accept an address
-/// literal it would otherwise refuse. A test that pointed this at
-/// `http://127.0.0.1/` would still be refused.
+/// **It weakens nothing in production.** The client still comes from
+/// [`dispatcher_client_builder`], the literal SSRF guard still runs per
+/// delivery, and `.resolve()` cannot make that guard accept an address literal
+/// it would otherwise refuse. A test that pointed this at `http://127.0.0.1/`
+/// would still be refused. One thing a `.resolve()` override DOES do, and the
+/// tests rely on it: reqwest consults overrides before the configured resolver,
+/// so an overridden name skips [`SsrfGuardedResolver`]'s connect-time check.
+/// That is how a test reaches its loopback sink at all. It is a test-only
+/// affordance, because the production caller, [`start_webhook_dispatcher`],
+/// builds a client with no overrides.
 #[cfg(feature = "db")]
 pub fn start_webhook_dispatcher_with_client(
     event_bus: &crate::state::SharedEventBus,
@@ -2093,6 +2297,188 @@ mod tests {
                 .contains("redirect"),
             "failure must be attributed to the refused redirect: {:?}",
             results[0].error
+        );
+    }
+
+    // ---- Connect-time resolution guard (screen key webhook-ssrf-egress-grandfathered) ----
+
+    /// A lookup that answers every name with the same fixed addresses. It
+    /// stands in for DNS. The addresses are what a rebinding record, a
+    /// `127-0-0-1.nip.io`-style name or a private corp A record would return.
+    struct FixedLookup(Vec<std::net::IpAddr>);
+
+    impl reqwest::dns::Resolve for FixedLookup {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            let addrs: Vec<std::net::SocketAddr> = self
+                .0
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(*ip, 0))
+                .collect();
+            Box::pin(async move { Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs) })
+        }
+    }
+
+    fn fixed_lookup(addrs: &[&str]) -> std::sync::Arc<FixedLookup> {
+        std::sync::Arc::new(FixedLookup(
+            addrs
+                .iter()
+                .map(|a| a.parse().expect("test address parses"))
+                .collect(),
+        ))
+    }
+
+    /// Ask [`SsrfGuardedResolver`] over a fixed answer to resolve
+    /// `rebind.example`.
+    async fn guarded_answer(
+        addrs: &[&str],
+    ) -> Result<Vec<std::net::IpAddr>, Box<dyn std::error::Error + Send + Sync>> {
+        use reqwest::dns::Resolve;
+        let resolver = SsrfGuardedResolver::over(fixed_lookup(addrs));
+        let name: reqwest::dns::Name = "rebind.example".parse().expect("valid dns name");
+        resolver
+            .resolve(name)
+            .await
+            .map(|it| it.map(|sa| sa.ip()).collect())
+    }
+
+    /// Every internal answer refuses the name. So does a MIXED answer, where
+    /// one public address does not launder a private one.
+    #[tokio::test]
+    async fn test_guarded_resolver_refuses_a_name_that_resolves_internal() {
+        for (answer, offending) in [
+            (vec!["127.0.0.1"], "127.0.0.1"),
+            (vec!["169.254.169.254"], "169.254.169.254"),
+            (vec!["10.1.2.3"], "10.1.2.3"),
+            (vec!["172.20.0.1"], "172.20.0.1"),
+            (vec!["192.168.1.10"], "192.168.1.10"),
+            (vec!["0.0.0.0"], "0.0.0.0"),
+            (vec!["::1"], "::1"),
+            (vec!["fd00::1"], "fd00::1"),
+            (vec!["fe80::1"], "fe80::1"),
+            // A AAAA record can carry an IPv4-mapped address. The connector
+            // dials it as the IPv4 address it names.
+            (vec!["::ffff:127.0.0.1"], "::ffff:127.0.0.1"),
+            (vec!["::ffff:169.254.169.254"], "::ffff:169.254.169.254"),
+            // Mixed: any internal address refuses the whole name.
+            (vec!["93.184.216.34", "192.168.0.10"], "192.168.0.10"),
+            (
+                vec!["2606:2800:220:1:248:1893:25c8:1946", "127.0.0.1"],
+                "127.0.0.1",
+            ),
+        ] {
+            let err = guarded_answer(&answer)
+                .await
+                .expect_err(&format!("{answer:?} must be refused"));
+            let refusal = err
+                .downcast_ref::<ResolvedToInternalAddress>()
+                .unwrap_or_else(|| panic!("{answer:?}: refusal must be the guard's type: {err}"));
+            assert_eq!(refusal.host, "rebind.example");
+            assert_eq!(
+                refusal.addr,
+                offending.parse::<std::net::IpAddr>().expect("parses"),
+                "{answer:?}: the refusal must name the internal address"
+            );
+        }
+    }
+
+    /// Positive control: public answers pass through unchanged. Without it,
+    /// a resolver that refused every name would pass the test above.
+    #[tokio::test]
+    async fn test_guarded_resolver_passes_public_answers_through() {
+        let answer = ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"];
+        let got = guarded_answer(&answer)
+            .await
+            .expect("a name that resolves only to public addresses must resolve");
+        let want: Vec<std::net::IpAddr> = answer.iter().map(|a| a.parse().unwrap()).collect();
+        assert_eq!(got, want);
+    }
+
+    /// A NAME that the literal guard accepts, but that resolves to loopback,
+    /// must not be dialled.
+    ///
+    /// This is the `127-0-0-1.nip.io` / `localtest.me` / DNS-rebinding shape.
+    /// It passes `validate_webhook_url`, which is asserted as a precondition,
+    /// so this test is about the OTHER guard. Only the dispatcher client's
+    /// resolver can refuse it. The listener counts accepted connections for the
+    /// same reason the literal-guard test does: a refused request and a
+    /// connection-refused request both report `success == false`.
+    ///
+    /// `max_retries: 2` makes "terminal" observable. A refusal that fell
+    /// through to the generic error arm would retry and report `attempts: 3`
+    /// under a transport error that does not name the guard.
+    #[tokio::test]
+    async fn test_delivery_does_not_dial_a_name_that_resolves_internal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&connections);
+        let accept_task = tokio::spawn(async move {
+            while let Ok((_stream, _peer)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(500),
+            max_retries: 2,
+        };
+        let client =
+            dispatcher_client_builder_with_lookup(config.timeout, fixed_lookup(&["127.0.0.1"]))
+                .build()
+                .expect("dispatcher client must build");
+        let subscription = ssrf_sub(format!("http://rebind.example:{}/hook", addr.port()));
+        assert!(
+            validate_webhook_url(&subscription.url).is_ok(),
+            "precondition: the literal guard accepts this name, so only the \
+             connect-time guard can refuse it"
+        );
+
+        let result =
+            deliver_to_subscription(&client, &subscription, b"{}", "deadbeef", &config).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "no TCP connection may reach a name that resolves to loopback"
+        );
+        assert!(!result.success, "delivery must not be reported as sent");
+        assert_eq!(result.status_code, None);
+        assert_eq!(
+            result.attempts, 0,
+            "the refusal is terminal and no attempt reached the network"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("SSRF guard") && error.contains("127.0.0.1"),
+            "failure must be attributed to the connect-time guard and name the \
+             address: {error:?}"
+        );
+
+        // Non-vacuity: the same listener IS reachable and counted by a client
+        // from the same builder, when the name is pinned with an override
+        // (which reqwest consults before the guarded resolver). Without this,
+        // a dead listener would satisfy the zero above.
+        let control =
+            dispatcher_client_builder_with_lookup(config.timeout, fixed_lookup(&["127.0.0.1"]))
+                .resolve("control.example", addr)
+                .build()
+                .expect("control client must build");
+        let _ = control
+            .post(format!("http://control.example:{}/hook", addr.port()))
+            .timeout(std::time::Duration::from_millis(300))
+            .send()
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        accept_task.abort();
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "control: the listener must observe a connection it is actually sent"
         );
     }
 

@@ -17,9 +17,13 @@
 //! names RFC 6761 reserves to loopback. Every other hostname is accepted on its
 //! face, so none of these tests asserts anything about DNS: there is no
 //! resolution in the checked path, on purpose, and the registration-time check is
-//! not a defence against a name that merely resolves somewhere private. See
+//! not a defence against a name that merely resolves somewhere private. That
+//! defence runs at DELIVERY, in the dispatcher client's `SsrfGuardedResolver`,
+//! and is tested there (`routes::webhooks` tests
+//! `test_delivery_does_not_dial_a_name_that_resolves_internal` and
+//! `tests/webhook_dispatcher_proxy_env.rs`). See
 //! `routes/webhooks.rs::validate_webhook_url`'s doc for the full statement of
-//! what the policy does not cover.
+//! what the registration policy does not cover.
 //!
 //! `a_conventional_https_target_is_still_accepted` is the control, and it is not
 //! optional: a validator that refuses everything satisfies every rejection test
@@ -194,8 +198,9 @@ async fn a_hostname_is_not_resolved_and_is_accepted_on_its_face() {
         resp.status(),
         201,
         "the registration-time check judges IP literals and the reserved-to-\
-         loopback name set only; any other name is accepted and DNS rebinding is \
-         explicitly out of scope; got {}",
+         loopback name set only; any other name is accepted here, and what it \
+         resolves to is judged at delivery by the dispatcher's \
+         SsrfGuardedResolver; got {}",
         resp.status()
     );
 }

@@ -31,10 +31,15 @@
 //! guard accepts on its face because it performs no DNS resolution, and
 //! reqwest is told to resolve that name to the wiremock port with
 //! `ClientBuilder::resolve`. The client is handed to
-//! `start_webhook_dispatcher_with_client`. `.resolve()` overrides DNS and
-//! nothing else: it cannot make the guard accept an address literal, so the
-//! SSRF property is untouched and only the reachability of the test's own sink
-//! is restored.
+//! `start_webhook_dispatcher_with_client`. `.resolve()` cannot make the literal
+//! guard accept an address literal. It DOES skip the dispatcher client's
+//! connect-time `SsrfGuardedResolver`, because reqwest consults overrides
+//! before the configured resolver. That skip is exactly what lets this file
+//! reach a loopback sink by name at all. Without the override, the name would
+//! resolve to loopback and be refused. The production client sets no
+//! overrides. `routes::webhooks`'
+//! `test_delivery_does_not_dial_a_name_that_resolves_internal` pins the
+//! refusal this file deliberately steps around.
 //!
 //! # Why the assertion is a received request and not a result vector
 //!

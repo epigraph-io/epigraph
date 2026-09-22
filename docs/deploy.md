@@ -300,7 +300,7 @@ Registration validates the URL. **400** is returned for a scheme other than
 (including the IPv4-mapped IPv6 spelling of one), and for the names RFC 6761
 reserves to loopback (`localhost` and anything under `.localhost`).
 
-Three boundaries an operator should know rather than infer:
+What an operator should know rather than infer:
 
 * **It applies at registration only.** `bin/server.rs` re-hydrates
   `AppState::webhook_store` from `webhook_subscriptions` on every boot, so rows
@@ -309,10 +309,24 @@ Three boundaries an operator should know rather than infer:
   asymmetry is worth stating plainly: an existing subscription pointed at an
   internal consumer keeps being delivered to, while **re-registering that same
   URL after a redeploy now fails with 400**.
-* **It is not an allowlist and it does not resolve names.** Any other hostname
-  is accepted on its face, including one that resolves to a private address.
-  DNS rebinding is a different control (egress policy on the delivering
-  process).
+* **Registration does not resolve names; delivery does.** At registration any
+  other hostname is accepted on its face, including one that resolves to a
+  private address. At delivery, the dispatcher's HTTP client resolves the name
+  through `SsrfGuardedResolver`. If ANY address in the answer is loopback,
+  link-local (including `169.254.169.254`), private-range or unspecified, it
+  refuses the whole name before connecting. That covers names like
+  `127-0-0-1.nip.io` and DNS rebinding after registration. A refused delivery
+  is logged at `warn` as "target name resolves to an internal address". It is
+  still not an allowlist: any public address is delivered to.
+* **The webhook dispatcher ignores `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`.**
+  Behind a proxy the client would resolve the proxy's name instead of the
+  target's, and the check above would never run. If this deployment routes
+  outbound traffic through a proxy, webhook deliveries now go direct and need
+  direct egress. An egress deny for `169.254.0.0/16`, RFC 1918 and loopback
+  on the API process is still worth having as defence in depth. It is not
+  required.
+* **Redirects are not followed.** A receiver that answers `3xx` gets a failed
+  delivery naming the refused `Location`, not a second request.
 * **Migration 085 is unchanged.** Its `CHECK (btrim(url) <> '')` still mirrors
   only the non-empty check; this policy lives in the handler.
 
