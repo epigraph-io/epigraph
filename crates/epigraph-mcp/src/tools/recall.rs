@@ -173,8 +173,11 @@ pub struct RecallWithContextParams {
     pub groundedness_gate: Option<bool>,
     /// Optional lens frame UUID (from `list_frames`). Must be paired with
     /// `perspective_id`. When both are set, each returned hit carries an
-    /// additive `lensed_belief` computed under that `(frame, perspective)` lens;
-    /// retrieval, rerank, and `min_truth` stay on the global `truth_value`.
+    /// additive `lensed_belief` computed under that `(frame, perspective)` lens.
+    /// Retrieval and rerank stay on similarity; `min_truth` stays UNLENSED —
+    /// since backlog `14b98adc` it gates on the global DS pignistic probability
+    /// (`belief_score`), which is a different value from `lensed_belief` and
+    /// from the raw `truth_value` the gate used to read.
     pub frame_id: Option<String>,
     /// Optional lens perspective UUID (from `list_perspectives`). Must be paired
     /// with `frame_id`. The perspective's source/locality reliability re-weights
@@ -372,7 +375,17 @@ pub struct RecallHit {
     /// global `truth_value`, not instead of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lensed_belief: Option<crate::types::LensedBelief>,
+    /// The paragraph claim's independently authored `claims.truth_value`,
+    /// reported unchanged. NOT what `min_truth` gates on — see `belief_score`.
     pub truth_value: f64,
+    /// The scalar `min_truth` was actually compared against (backlog
+    /// `14b98adc`): the UNLENSED Dempster–Shafer pignistic probability when the
+    /// paragraph carries a DS cache, and `truth_value` when it does not.
+    ///
+    /// Equality with `truth_value` means "no DS state, the gate fell back".
+    /// Distinct from `lensed_belief`, which is a per-perspective annotation and
+    /// gates nothing.
+    pub belief_score: f64,
     pub paper: PaperMeta,
     pub section: Option<SectionMeta>,
     pub atoms: Vec<AtomChild>,
@@ -991,6 +1004,31 @@ async fn recall_with_context_post_embed(
     .await
     .map_err(|e| internal_error(format!("batch fetch: {e}")))?;
 
+    // Backlog 14b98adc: the min_truth gate below reads the DS pignistic
+    // probability, not `claims.truth_value` — which no DS write path refreshes,
+    // so a paragraph refuted by epistemic edges kept clearing a gate set
+    // against its pre-edge authored value. One round-trip for the whole page,
+    // over the ids the batch context fetch already resolved. Degrade-not-fail:
+    // an error yields an empty map and every hit falls back to the
+    // `core.truth_value` the context fetch already carries, i.e. to exactly the
+    // pre-fix behaviour.
+    let belief_by_paragraph = match epigraph_db::ClaimRepository::effective_belief_batch(
+        &server.pool,
+        viewer,
+        &paragraph_ids,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
+            );
+            std::collections::HashMap::new()
+        }
+    };
+
     // Stage 4 + 6: filter min_truth, drop paragraphs missing core or paper, assemble.
     let mut results = Vec::with_capacity(raw_hits.len());
     for hit in raw_hits {
@@ -1003,7 +1041,13 @@ async fn recall_with_context_post_embed(
             Some(c) => c,
             None => continue, // paragraph deleted between kNN and batch fetch
         };
-        if core.truth_value < min_truth {
+        // Absent key == invisible to this viewer / deleted between the kNN and
+        // this read; fall back to the truth_value already in hand.
+        let belief_score = belief_by_paragraph
+            .get(&paragraph_id)
+            .copied()
+            .unwrap_or(core.truth_value);
+        if belief_score < min_truth {
             continue;
         }
         let paper = match ctx.paper_meta.get(&paragraph_id) {
@@ -1066,6 +1110,7 @@ async fn recall_with_context_post_embed(
             // once per page, keyed by paragraph_id. None until then.
             lensed_belief: None,
             truth_value: core.truth_value,
+            belief_score,
             paper,
             section: ctx.section_meta.get(&paragraph_id).cloned(),
             atoms,
@@ -1091,8 +1136,9 @@ async fn recall_with_context_post_embed(
 
     // Bounded lens post-pass: when a lens is active, annotate each already-built
     // hit with its lensed belief, keyed by paragraph_id. This does NOT touch
-    // retrieval, rerank, diverse selection, or min_truth (all on the global
-    // value). Per-claim degrade-not-fail: a compute error for ONE hit yields
+    // retrieval, rerank, diverse selection, or min_truth (all unlensed —
+    // min_truth on the global DS `belief_score`, backlog 14b98adc, the others
+    // on similarity). Per-claim degrade-not-fail: a compute error for ONE hit yields
     // null + a warn, never an aborted page (spec §8).
     if let Some((frame_id, perspective_id)) = lens {
         // Batch the lens post-pass so the perspective row + per-frame overrides

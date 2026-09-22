@@ -1056,6 +1056,65 @@ impl ClaimRepository {
         Ok(row)
     }
 
+    /// The scalar an epistemic quality gate (`min_truth`) should compare
+    /// against, for a whole page of claims in ONE round-trip.
+    ///
+    /// Backlog `14b98adc`. `claims.truth_value` is an **independently authored**
+    /// scalar: `submit_claim` and `update_with_evidence` seed it from BetP, but
+    /// `patch_claim`, `POST /api/v1/claims`, `routes/conventions.rs` and
+    /// `tools/workflows.rs` all set it directly, and NO Dempster–Shafer write
+    /// path ever refreshes it — `auto_wire_ds_for_edge` →
+    /// `recompute_combined_belief` and `recompute_beliefs` both write
+    /// `claims.{belief, plausibility, pignistic_prob, …}` and leave
+    /// `truth_value` alone. So the two columns agree only until the first
+    /// epistemic edge is wired, after which a thoroughly refuted claim still
+    /// carries its pre-edge `truth_value` (production 2026-09-07: claim
+    /// `8f192373` at `truth_value` 1.0000 against BetP 0.1797).
+    ///
+    /// Because `truth_value` has independent authorship, syncing it FROM the DS
+    /// state is the wrong repair — a third party's `refutes` edge would silently
+    /// overwrite an operator-set value. The repair is that the *gate* reads the
+    /// DS state, which is what this method returns.
+    ///
+    /// The selection is the exact SQL twin of `belief_query::get_belief`'s
+    /// unframed branch, deliberately including its both-of-`(belief,
+    /// plausibility)` guard: a bare `COALESCE(pignistic_prob, belief,
+    /// truth_value)` would report a half-written DS row as authoritative, which
+    /// is precisely what that guard exists to prevent. `truth_value` is
+    /// `NOT NULL` (migration 001), so the `ELSE` arm always yields a value and
+    /// the returned `f64` is never null.
+    ///
+    /// Claims absent from the returned map are absent because the **viewer
+    /// cannot see them** (or they were deleted mid-page). Callers must fall back
+    /// to the `truth_value` they already hydrated rather than treating absence
+    /// as pass-or-drop — see the four `min_truth` call sites.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn effective_belief_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, f64>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, \
+             (CASE WHEN belief IS NOT NULL AND plausibility IS NOT NULL \
+                   THEN COALESCE(pignistic_prob, belief) \
+                   ELSE truth_value END)::float8 AS score \
+             FROM claims WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
     /// Walk a claim's supersession chain and return every version the viewer
     /// may see, oldest first (`depth` 0 = root).
     ///

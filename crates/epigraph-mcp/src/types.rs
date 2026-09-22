@@ -1269,7 +1269,22 @@ pub struct MemorizeResponse {
 pub struct RecallResult {
     pub claim_id: String,
     pub content: String,
+    /// The claim's independently authored `claims.truth_value`, reported
+    /// unchanged. NOT what `min_truth` gates on — see `belief_score`.
     pub truth_value: f64,
+    /// The scalar `min_truth` was actually compared against (backlog
+    /// `14b98adc`): the Dempster–Shafer pignistic probability when the claim
+    /// carries a DS cache, and `truth_value` when it does not.
+    ///
+    /// `belief_score == truth_value` means the claim has no DS state and the
+    /// gate fell back; a divergence means epistemic edges have moved the claim
+    /// away from its authored value, which no DS write path copies back into
+    /// `truth_value`.
+    ///
+    /// Workflow-origin hits (`result_type == "workflow"`) are not claims and
+    /// carry no DS cache, so their `belief_score` always equals their
+    /// `truth_value`.
+    pub belief_score: f64,
     /// Dense cosine similarity in `[0,1]`; `0.0` for a lexical-only hit.
     pub similarity: f64,
     /// Reciprocal Rank Fusion score (primary ordering).
@@ -1788,7 +1803,17 @@ pub struct TraverseNode {
     pub id: String,
     pub node_type: String,
     pub label: Option<String>,
+    /// The node's independently authored `claims.truth_value`, reported
+    /// unchanged. `None` for a non-claim node. NOT what `min_truth` gates on.
     pub truth_value: Option<f64>,
+    /// The scalar `min_truth` was compared against (backlog `14b98adc`): the
+    /// Dempster–Shafer pignistic probability when the node carries a DS cache,
+    /// else `truth_value`. `None` for a non-claim node.
+    ///
+    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
+    /// value of it could change which nodes are kept — so this equals
+    /// `truth_value` there.
+    pub belief_score: Option<f64>,
     pub depth: i32,
 }
 
