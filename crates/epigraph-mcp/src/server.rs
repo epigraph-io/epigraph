@@ -681,7 +681,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recall relevant memories using semantic search with epistemic quality scoring."
+        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart."
     )]
     async fn recall(
         &self,

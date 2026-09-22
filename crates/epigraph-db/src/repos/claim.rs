@@ -1216,6 +1216,89 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_hybrid_scoped_since_in_theme(
+            pool,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            0,
+            tags,
+            agent_id,
+            since,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped_since`] plus an optional `claims.theme_id`
+    /// narrowing and an `offset` for paging the fused output.
+    ///
+    /// `theme_id` is pushed into **both** the `dense` and `lex` CTEs, above
+    /// their `LIMIT $3`, for exactly the reason spelled out on
+    /// `search_hybrid_scoped_since` for `since`: a theme predicate applied to
+    /// the fused output would let `candidate_pool` off-theme rows consume the
+    /// whole pool and then be discarded, returning `[]` for a theme that has a
+    /// real answer. Off-theme rows must never enter the pool in the first
+    /// place.
+    ///
+    /// `offset` pages the fused output so a caller can walk one theme to
+    /// exhaustion (the stated requirement of backlog `c95a2509`). For that walk
+    /// to be sound the final `ORDER BY` must be TOTAL, so it carries a
+    /// `claim_id` tiebreaker: `rrf_score` is a sum of `1/(k+rank)` terms and
+    /// ties are common (two claims appearing in the same pair of legs at
+    /// mirrored ranks collide exactly), and under a non-total sort Postgres may
+    /// return tied rows in a different order per page — showing the caller one
+    /// claim twice and another never.
+    ///
+    /// ## The tiebreaker is on the FUSED output only, deliberately
+    ///
+    /// The two CTEs' own `ORDER BY`s are left alone. An earlier revision added
+    /// `, c.id` to each CTE's `row_number()` window and `LIMIT` as well, on the
+    /// theory that a deterministic candidate-pool cut is strictly better. It is
+    /// not free: the dense and lexical legs then break their ties on
+    /// *independent* keys, so a claim can be 2nd in one leg and 3rd in the
+    /// other where previously the two arbitrary orders were correlated, and the
+    /// RRF sum flips. That regressed
+    /// `claim_search_hybrid::hybrid_fuses_both_legs_ranking_the_overlap_first`
+    /// in 2 of 6 runs (6 of 6 green before, 6 of 6 green again after this was
+    /// reverted). Making the pool cut deterministic is a real improvement but
+    /// it is a RANKING change, not a paging one, and it belongs in its own
+    /// commit with its own analysis of which tied row deserves the pool slot.
+    ///
+    /// ## Residual, recorded rather than fixed
+    ///
+    /// The fused `ORDER BY` is total WITHIN one execution. A walk spans several
+    /// executions, and across them two things are still arbitrary:
+    ///
+    ///  - which rows of a tie group enter the pool when `candidate_pool`
+    ///    truncates it (needs a tie group straddling the 200th candidate at
+    ///    `HYBRID_CANDIDATE_POOL = 200`); and
+    ///  - the `row_number()` ranks assigned inside a tie group, which feed
+    ///    `rrf_score`, so two executions could in principle score a tied group
+    ///    differently and reorder it.
+    ///
+    /// In practice the legs stay correlated — each sees the same physical scan
+    /// order, so a fully tied group scores `2/(k+r)`, monotone in the same `r`
+    /// — which is why the paging walk is stable. Both hazards predate this
+    /// change; neither is introduced by it. Closing them properly means an
+    /// explicit deterministic key inside each leg, which is the ranking change
+    /// described above.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since_in_theme(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -1232,6 +1315,7 @@ impl ClaimRepository {
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
+                  AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                 ORDER BY c.embedding <=> $1::vector
                 LIMIT $3
             ),
@@ -1243,6 +1327,7 @@ impl ClaimRepository {
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
+                  AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC
                 LIMIT $3
             )
@@ -1253,8 +1338,8 @@ impl ClaimRepository {
                    (l.rank IS NOT NULL) AS in_lexical
             FROM dense d
             FULL OUTER JOIN lex l ON d.id = l.id
-            ORDER BY rrf_score DESC
-            LIMIT $5
+            ORDER BY rrf_score DESC, claim_id
+            LIMIT $5 OFFSET $9
             "#,
         )
         .bind(query_embedding_pgvector) // $1
@@ -1265,6 +1350,8 @@ impl ClaimRepository {
         .bind(tags_owned) // $6
         .bind(agent_id) // $7
         .bind(since) // $8
+        .bind(offset) // $9
+        .bind(theme_id) // $10
         .fetch_all(pool)
         .await?;
 
@@ -1308,6 +1395,38 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_lexical_scoped_since_in_theme(
+            pool, query_text, k_rrf, limit, 0, tags, agent_id, since, None,
+        )
+        .await
+    }
+
+    /// [`Self::search_lexical_scoped_since`] plus the same optional
+    /// `claims.theme_id` narrowing and `offset` paging as
+    /// [`Self::search_hybrid_scoped_since_in_theme`].
+    ///
+    /// This is `recall`'s embedder-down fallback. The theme filter has to hold
+    /// HERE as well as on the hybrid path, or the scope would silently widen to
+    /// the whole corpus exactly when the embedder is unavailable — the same
+    /// argument that put `since` on both surfaces.
+    ///
+    /// `row_number()` is evaluated over the whole filtered set before
+    /// `LIMIT`/`OFFSET`, so the reported `rrf_score` stays on the global rank
+    /// rather than restarting at 1 on each page. Its window and the outer
+    /// `ORDER BY` share the `c.id` tiebreaker so the two agree and the walk is
+    /// repeat-free.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_lexical_scoped_since_in_theme(
+        pool: &PgPool,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -1317,7 +1436,7 @@ impl ClaimRepository {
             r#"
             SELECT c.id AS claim_id,
                    (1.0 / ($2 + row_number() OVER (
-                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC)))::float8 AS rrf_score,
+                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id)))::float8 AS rrf_score,
                    NULL::float8 AS dense_similarity,
                    true AS in_lexical
             FROM claims c, websearch_to_tsquery('english', $1) q
@@ -1325,8 +1444,9 @@ impl ClaimRepository {
               AND ($4::text[] IS NULL OR c.labels @> $4::text[])
               AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
               AND ($6::timestamptz IS NULL OR c.created_at >= $6::timestamptz)
-            ORDER BY ts_rank_cd(c.content_tsv, q) DESC
-            LIMIT $3
+              AND ($8::uuid IS NULL OR c.theme_id = $8::uuid)
+            ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id
+            LIMIT $3 OFFSET $7
             "#,
         )
         .bind(query_text) // $1
@@ -1335,6 +1455,8 @@ impl ClaimRepository {
         .bind(tags_owned) // $4
         .bind(agent_id) // $5
         .bind(since) // $6
+        .bind(offset) // $7
+        .bind(theme_id) // $8
         .fetch_all(pool)
         .await?;
 

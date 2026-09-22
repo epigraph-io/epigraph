@@ -521,6 +521,46 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Optional theme UUID (from list_themes / get_theme). When set, the CANDIDATE \
+                       POOL of every claims retrieval surface — the hybrid dense leg, the hybrid \
+                       lexical leg, and the embedder-down lexical fallback — is narrowed in SQL to \
+                       that theme's members BEFORE each leg's LIMIT, so no off-theme claim can \
+                       reach the caller and no off-theme claim consumes pool budget. Distinct from \
+                       recall_with_context's diverse=true, which picks themes internally by \
+                       centroid similarity and lets you pin none of them. Mutually exclusive with \
+                       theme_label. A malformed UUID or an unknown theme is REJECTED, never \
+                       silently ignored — a dropped scope filter would widen recall to the whole \
+                       corpus while you believe it is scoped."
+    )]
+    #[serde(default)]
+    pub theme_id: Option<String>,
+
+    #[schemars(
+        description = "Optional exact theme label, resolved to a theme UUID. Mutually exclusive \
+                       with theme_id. Rejected when it matches zero themes, and rejected (listing \
+                       the candidates) when it matches more than one — claim_themes has no \
+                       UNIQUE(label) constraint, so 'the first match' could be any of several \
+                       distinct themes."
+    )]
+    #[serde(default)]
+    pub theme_label: Option<String>,
+
+    #[schemars(
+        description = "Skip the first N ranked claims (default 0). Combine with limit to walk a \
+                       theme to exhaustion; the response carries next_offset and more_available. \
+                       Applied in SQL on the fused ranking, whose ORDER BY carries a claim_id \
+                       tiebreaker so a page boundary cannot show one claim twice and another \
+                       never. CAVEAT: min_truth and exclude_contested are applied in Rust AFTER \
+                       the SQL page, so a page can come back SHORTER than limit while more pages \
+                       remain — use more_available, not an empty page, as the stop condition. \
+                       Rejected together with include_workflows=true: workflows are a separate \
+                       id-space with no ranking continuity across claim pages, so paging them \
+                       alongside claims would re-serve the same workflows on every page."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 // ── Ingestion ──

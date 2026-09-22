@@ -55,6 +55,12 @@ fn params(query: &str) -> RecallParams {
         include_workflows: false,
         exclude_contested: false,
         since: None,
+        // Theme scope / paging (backlog c95a2509) default to unscoped here: this
+        // fixture pins a different axis, and None/None/None is byte-identical to
+        // the pre-theme behaviour.
+        theme_id: None,
+        theme_label: None,
+        offset: None,
     }
 }
 
