@@ -22,6 +22,28 @@
 //!   everything" — the loudest possible failure, in the quietest possible way.
 //! * Predicates must run before `LIMIT`, the property that makes an old
 //!   matching row reachable at all.
+//! * **The viewer predicate is one of those predicates, and it is in BOTH
+//!   statements.** See [`the_viewer_filters_both_halves_of_the_pair`].
+//!
+//! # Why every other case here uses `public_viewer`, and why that is not enough
+//!
+//! `public_viewer` resolves the nil principal: a genuinely `Scoped` viewer with
+//! an empty group set, so `Viewer::splice` renders a real
+//! `visibility = 'public' OR owner_group_id = ANY($n)` predicate and the cases
+//! above execute the same SQL shape production does. What they cannot show is
+//! that the predicate *discriminates*, because every row they seed is visible
+//! to every viewer — a `count_filtered` that dropped its viewer entirely would
+//! pass all of them, and so would one whose bind index pointed at the wrong
+//! parameter.
+//!
+//! `Viewer::splice`'s missing-marker panic covers the case where the marker is
+//! gone. It does not cover a marker spliced at a bind index nothing binds, and
+//! it says nothing at all about the two statements agreeing. That is the gap
+//! the last case in this file closes, and it is worth its fixture: the pair
+//! exists because a `total` describing a different population than the rows was
+//! the defect (`2265a67b`), and "the rows are tenancy-filtered but the count is
+//! not" is that defect in its widest possible form — `total` reporting the whole
+//! corpus while the page shows one tenant's slice.
 
 mod viewer_fixture;
 
@@ -280,6 +302,108 @@ async fn is_current_partitions_the_table(pool: PgPool) {
             .await
             .unwrap(),
         2
+    );
+}
+
+/// A viewer scoped to group A must see A's private rows and the public row, and
+/// **`count_filtered` must report exactly what `list_filtered` returns.**
+///
+/// # The three failures this is built to catch, and why the rest of the file
+/// catches none of them
+///
+/// 1. **A viewerless `count_filtered`.** `total` would be 3 (the whole corpus)
+///    against 2 rows. No other case can see this: they seed nothing invisible,
+///    so an unfiltered count and a filtered one are the same number.
+/// 2. **A viewerless `list_filtered`.** B's private row appears in the page.
+/// 3. **A viewer spliced at a bind index nothing binds, in either method.**
+///    Postgres refuses the statement, so it surfaces as an error rather than as
+///    a wrong number — but it surfaces, which "no test executes this shape
+///    against a non-empty group set" would not have.
+///
+/// The `A == B` assertion is what makes (1) and (2) each visible on its own
+/// rather than only in combination. Both are checked against `expected`, not
+/// only against each other: two reads that agree because NEITHER filters is the
+/// fail-open this pair's whole design is meant to exclude, and `count == list`
+/// alone is satisfied by it.
+///
+/// The viewer is `Viewer::resolve` on a real agent with a real `admin`
+/// membership — the production path — not `Viewer::test_bypass`. A bypass
+/// viewer renders `" "`: it emits no predicate and binds nothing, so every
+/// assertion below would hold over a pair that had lost its marker entirely.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_viewer_filters_both_halves_of_the_pair(pool: PgPool) {
+    let (agent_a, group_a) = viewer_fixture::seed_agent_with_group(&pool, "tenant-a").await;
+    let (agent_b, group_b) = viewer_fixture::seed_agent_with_group(&pool, "tenant-b").await;
+
+    let public = viewer_fixture::seed_public_claim(&pool, agent_a, "public row").await;
+    let mine = viewer_fixture::seed_group_claim(&pool, agent_a, group_a, "group A row").await;
+    let theirs = viewer_fixture::seed_group_claim(&pool, agent_b, group_b, "group B row").await;
+
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent_a)
+        .await
+        .expect("resolve viewer for agent A");
+    assert!(
+        !viewer.is_bypass(),
+        "a bypass viewer emits no predicate at all, which would make every \
+         assertion below vacuous"
+    );
+
+    // No predicate but the viewer's: whatever these two disagree about is the
+    // viewer.
+    let filter = ClaimListFilter::default();
+
+    let rows = ClaimRepository::list_filtered(&pool, &viewer, &filter, 100, 0)
+        .await
+        .unwrap();
+    let mut seen: Vec<Uuid> = rows.iter().map(|c| c.id.as_uuid()).collect();
+    seen.sort();
+
+    let mut expected = vec![public, mine];
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "the page must carry A's own group row and the public row, and must NOT \
+         carry group B's row ({theirs})"
+    );
+
+    let total = ClaimRepository::count_filtered(&pool, &viewer, &filter)
+        .await
+        .unwrap();
+    assert_eq!(
+        total as usize,
+        expected.len(),
+        "`total` must count the population the page came from; a count that \
+         reports {} here is counting rows this viewer cannot read",
+        seen.len() + 1
+    );
+    assert_eq!(
+        total as usize,
+        rows.len(),
+        "the pair must agree: `total` and the page are two statements over one \
+         WHERE clause, and the viewer is part of that clause"
+    );
+
+    // The control. Without it "A cannot see it" is indistinguishable from "the
+    // fixture never wrote it" — the failure mode that makes an isolation test
+    // pass over a broken seeder.
+    let viewer_b = epigraph_db::visibility::Viewer::resolve(&pool, agent_b)
+        .await
+        .expect("resolve viewer for agent B");
+    let b_rows = ClaimRepository::list_filtered(&pool, &viewer_b, &filter, 100, 0)
+        .await
+        .unwrap();
+    assert!(
+        b_rows.iter().any(|c| c.id.as_uuid() == theirs),
+        "group B's own row must be readable BY group B, or the assertion above \
+         proves nothing about filtering"
+    );
+    assert_eq!(
+        ClaimRepository::count_filtered(&pool, &viewer_b, &filter)
+            .await
+            .unwrap() as usize,
+        b_rows.len(),
+        "the pair must agree for B as well — a count that happens to match one \
+         viewer's page is not the invariant"
     );
 }
 
