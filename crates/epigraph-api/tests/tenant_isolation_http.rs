@@ -53,11 +53,11 @@
 //!
 //! These cover the reads PR-07 converted. They do NOT cover the graph
 //! cluster/run metadata (`graph_clusters`, `graph_neighborhoods`,
-//! `cluster_edges`, `neighborhood_edges`), which carry no tenancy columns, or
-//! the `edges` traversals inside the graph projections, which do and are the
-//! module's recorded residual — see `epigraph_db::repos::graph_view`'s module
-//! docs and the `F-edges-unfiltered` entry in `docs/tenancy/progress.json`
-//! (assigned to PR-13).
+//! `cluster_edges`, `neighborhood_edges`), which carry no tenancy columns. The
+//! `edges` traversals inside the graph projections — this module's recorded
+//! residual until `F-edges-unfiltered` was discharged — are covered by
+//! `crates/epigraph-db/tests/edge_viewer_predicates.rs`, which seeds the
+//! private-edge-between-public-claims shape each of them used to leak.
 
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{

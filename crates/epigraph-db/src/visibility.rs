@@ -90,7 +90,7 @@
 //! form `AgentRepository::get_public_profile` already uses (PR-04), and
 //! `visibility_lint.rs` accepts both spellings.
 //!
-//! # What is deliberately NOT here yet
+//! # What was deliberately NOT here yet — both halves have since landed
 //!
 //! Nothing on the fragment side. PR-13 landed
 //! [`Viewer::edge_predicate_fragment`] together with migration 072, which
@@ -98,17 +98,20 @@
 //! to enforce, because a fragment naming a column that does not exist is
 //! compile-time-clean and runtime-fatal.
 //!
-//! What remains open is *coverage*, not capability: the never-filtered `edges`
-//! traversals in `repos/graph_view.rs` (`expand_cluster_nodes`,
+//! Coverage, which is what remained open after PR-13, is now closed too:
+//! **`F-edges-unfiltered` is DISCHARGED.** The never-filtered `edges`
+//! traversals — `repos/graph_view.rs` (`expand_cluster_nodes`,
 //! `neighborhood_*`, `compound_neighbors`), `repos/claim.rs`'s
-//! `rag_hybrid_context.edge_count` and — the strongest of them, because it
-//! projects `e.source_id`, `e.target_id` and `e.relationship` rather than a
-//! scalar — `repos/claim.rs::semantic_graph_neighbors` still join `edges` with
-//! no predicate at all. They are open finding `F-edges-unfiltered` in
-//! `docs/tenancy/progress.json`, re-scoped there rather than left as a comment
-//! nobody owns. That list is bounded to `crates/epigraph-db`; the MCP tool
-//! layer has its own unfiltered `edges` traversals (`epigraph-mcp/src/tools/
-//! recall.rs` spends its viewer on `claims` only) and is recorded separately.
+//! `semantic_graph_neighbors`, `rag_hybrid_context.edge_count` and
+//! `search_by_embedding_since`'s DOI filter, the route SQL of
+//! `routes/graph.rs` / `routes/graph_neighborhood.rs` (moved into
+//! `GraphViewRepository`), and the fifteen `edges` aliases of
+//! `epigraph-mcp/src/tools/recall.rs::fetch_batched_context` (static form) —
+//! each gained a predicate with its placement argued at the site.
+//! `tests/visibility_lint.rs::every_edges_read_carries_an_edge_predicate_or_is_exempt`
+//! now requires one on every `edges` read in `repos/` and in the MCP tool layer,
+//! with the remaining exclusion probes and write-path reads named in an exact,
+//! shrink-only exemption set.
 //!
 //! PR-13 converted the reads that ALREADY carried a predicate and did not ADD
 //! one anywhere, because a never-filtered statement needs its own

@@ -1644,6 +1644,13 @@ fn every_spliced_statement_carries_the_canonical_marker_spelling() {
 /// including this one. The conversion is complete TODAY (no `edges` read
 /// outside the documented exemptions still uses the single-owner form); it is
 /// the RATCHET that covers the marker half only.
+///
+/// **The complementary check** — that every `edges` READ carries SOME edge
+/// predicate (marker, static co-owner form, or a named exemption), including
+/// reads with no marker at all and the MCP tool layer — is
+/// [`every_edges_read_carries_an_edge_predicate_or_is_exempt`] below. It was
+/// added when `F-edges-unfiltered` was discharged, because that finding's whole
+/// class was invisible to this test.
 #[test]
 fn every_edges_marker_uses_the_edge_spelling_and_no_others_do() {
     let mut plain_on_edges = Vec::new();
@@ -1889,4 +1896,410 @@ fn last_binding(window: &str, alias: &str) -> Option<String> {
         }
     }
     found
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// F-edges-unfiltered: every `edges` READ carries an edge predicate
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `edges` reads that carry NO edge predicate, by `(file, fn)`, each with the
+/// reason it needs none. An EXACT set: a new unfiltered read fails the test
+/// below, and so does an entry here whose read has since been filtered or
+/// deleted — the list can only shrink.
+///
+/// It exists because [`every_edges_marker_uses_the_edge_spelling_and_no_others_do`]
+/// only checks reads that ALREADY carry a marker, so it was structurally blind
+/// to the class `F-edges-unfiltered` named: `edges` reads with no predicate at
+/// all. Those were discharged (graph_view.rs, claim.rs, recall.rs); this is what
+/// stops the class coming back.
+///
+/// Files are `crates/epigraph-db/src/repos/<file>` or, prefixed `mcp:`,
+/// `crates/epigraph-mcp/src/tools/<file>`.
+const EDGES_READS_WITHOUT_AN_EDGE_PREDICATE: &[(&str, &str, &str)] = &[
+    // ── Exclusion / suppression probes. Filtering these WIDENS the result: a
+    //    hidden row would stop excluding, which is the fail-open. Each is
+    //    argued at its own site.
+    (
+        "alternative_set.rs",
+        "scan_candidates",
+        "`LEFT JOIN edges existing ... WHERE existing.id IS NULL` is an anti-join \
+         suppressing already-linked pairs; filtering it re-offers a pair and invites \
+         a duplicate `alternative_of` write (module doc, 'the `existing` join \
+         deliberately is not')",
+    ),
+    (
+        "claim.rs",
+        "latest_in_lineage",
+        "`NOT EXISTS` supersedes probe: a supersedes edge the viewer cannot see \
+         still makes its target stale; filtering returns stale heads (site comment)",
+    ),
+    (
+        "claim.rs",
+        "list_undecomposed",
+        "two `NOT EXISTS` decomposes_to probes over a decomposition WORK QUEUE: a \
+         privately-decomposed claim is not undecomposed, and filtering would queue it \
+         for re-decomposition (site comment)",
+    ),
+    (
+        "workflow.rs",
+        "resolve_steps_to_heads_batched",
+        "`NOT EXISTS` supersedes probe, same reason as `latest_in_lineage` (site comment)",
+    ),
+    // ── Write paths. The read is part of the mutation it guards and returns
+    //    no edge row to the caller; write authorization is write_gate_lint.rs's.
+    (
+        "edge.rs",
+        "create_symmetric_if_absent",
+        "dedup `NOT EXISTS` inside the INSERT: must see every edge regardless of \
+         viewer or it writes a duplicate; returns only whether a row was inserted",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_returning",
+        "the same dedup `NOT EXISTS` inside the INSERT; its follow-up id probe is \
+         the `VISIBILITY-EXEMPT` statement beside it",
+    ),
+    (
+        "edge.rs",
+        "is_in_force",
+        "re-derivation guard for edge_factor.rs's BBA auto-wire on an edge id the \
+         caller itself just wrote; returns one bool that only gates a derived write, \
+         and fails closed",
+    ),
+    (
+        "match_candidate.rs",
+        "retire",
+        "undo snapshot of the cross_source_matcher edges being retracted, read under \
+         the retire transaction's FOR UPDATE; it describes the rows the mutation \
+         touches",
+    ),
+    (
+        "mcp:workflow_hierarchical.rs",
+        "do_report_hierarchical_outcome_via_pool",
+        "resolves step claim ids through the workflow's `executes` edges to stamp \
+         `behavioral_executions.step_claim_id`; the tool response carries counts \
+         only, never the ids",
+    ),
+];
+
+/// A read counts as carrying an edge predicate when its statement window holds
+/// the EDGE marker for its alias, the static transcription (`<alias>.co_owner_group_id`
+/// — the one column only the edge form names), or a `VISIBILITY-EXEMPT:` note.
+const EDGE_EXEMPT_NOTE: &str = "VISIBILITY-EXEMPT:";
+
+fn mcp_tools_files() -> Vec<(String, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../epigraph-mcp/src/tools");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read epigraph-mcp/src/tools") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf-8 file name")
+            .to_string();
+        out.push((
+            format!("mcp:{name}"),
+            std::fs::read_to_string(&path).expect("read tool file"),
+        ));
+    }
+    out.sort();
+    assert!(
+        out.len() > 20,
+        "expected epigraph-mcp/src/tools to hold the tool layer, found {} files",
+        out.len()
+    );
+    out
+}
+
+/// `(line, fn, alias, covered)` for every `FROM edges` / `JOIN edges` read.
+///
+/// Comment lines are blanked first (doc prose quotes SQL), and so is a trailing
+/// `#[cfg(test)] mod …` block (fixture SQL is not a read path). `DELETE FROM
+/// edges` is a write and is skipped; `write_gate_lint.rs` owns writes.
+fn edges_reads(src: &str) -> Vec<(usize, String, String, bool)> {
+    const ANCHORS: &[&str] = &[".splice(", "sqlx::query", "format!("];
+    const NOT_AN_ALIAS: &[&str] = &[
+        "WHERE",
+        "ON",
+        "JOIN",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "OUTER",
+        "FULL",
+        "CROSS",
+        "GROUP",
+        "ORDER",
+        "LIMIT",
+        "OFFSET",
+        "SET",
+        "USING",
+        "UNION",
+        "RETURNING",
+        "FOR",
+        "AND",
+        "OR",
+        "HAVING",
+        "WINDOW",
+        "EXCEPT",
+        "INTERSECT",
+        "LATERAL",
+        "NATURAL",
+    ];
+
+    // Blank comment lines and a trailing test module, preserving offsets.
+    let mut text = String::with_capacity(src.len());
+    let mut in_tests = false;
+    let lines: Vec<&str> = src.split_inclusive('\n').collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if !in_tests && t.starts_with("#[cfg(test)]") {
+            let next = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            if next.starts_with("mod ") || next.starts_with("pub mod ") {
+                in_tests = true;
+            }
+        }
+        if in_tests || t.starts_with("//") {
+            text.extend(line.chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+        } else {
+            text.push_str(line);
+        }
+    }
+
+    // Whitespace-separated words with their byte offsets.
+    let mut words: Vec<(usize, &str)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s) = start.take() {
+                words.push((s, &text[s..i]));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        words.push((s, &text[s..]));
+    }
+
+    let ident = |w: &str| -> String {
+        w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let mut out = Vec::new();
+    for i in 0..words.len() {
+        let kw = words[i].1.trim_start_matches(['(', ',', '"']);
+        if !kw.eq_ignore_ascii_case("FROM") && !kw.eq_ignore_ascii_case("JOIN") {
+            continue;
+        }
+        // The previous word's LAST identifier run, so `sqlx::query("DELETE`
+        // reads as `DELETE`.
+        let prev_is_delete = i > 0
+            && words[i - 1]
+                .1
+                .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .find(|w| !w.is_empty())
+                .is_some_and(|w| w.eq_ignore_ascii_case("DELETE"));
+        if prev_is_delete {
+            continue;
+        }
+        let Some(&(pos, tbl)) = words.get(i + 1) else {
+            continue;
+        };
+        if ident(tbl) != "edges" {
+            continue;
+        }
+        // The alias: the next word that is not bare punctuation (`\` line
+        // continuations), skipping `AS`; a keyword means "no alias".
+        let mut alias = "edges".to_string();
+        let mut j = i + 2;
+        while let Some(&(_, w)) = words.get(j) {
+            let a = ident(w);
+            if a.is_empty() {
+                j += 1;
+                continue;
+            }
+            if a.eq_ignore_ascii_case("AS") {
+                j += 1;
+                continue;
+            }
+            let starts_alpha = a.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+            if starts_alpha
+                && !NOT_AN_ALIAS.iter().any(|k| a.eq_ignore_ascii_case(k))
+                && a.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
+                alias = a;
+            }
+            break;
+        }
+
+        let win_start = ANCHORS
+            .iter()
+            .filter_map(|a| text[..pos].rfind(a))
+            .max()
+            .unwrap_or(0);
+        let win_end = ANCHORS
+            .iter()
+            .filter_map(|a| text[pos..].find(a).map(|k| pos + k))
+            .min()
+            .unwrap_or(text.len());
+        let window = &text[win_start..win_end];
+        let covered = window.contains(&format!("EDGE_VISIBILITY:{alias}}}"))
+            || window.contains(&format!("{alias}.co_owner_group_id"))
+            || (alias == "edges" && window.contains("co_owner_group_id"))
+            || window.contains(EDGE_EXEMPT_NOTE);
+
+        let func = text[..pos]
+            .rfind("fn ")
+            .map(|k| {
+                text[k + 3..]
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "?".to_string());
+        out.push((text[..pos].matches('\n').count() + 1, func, alias, covered));
+    }
+    out
+}
+
+#[test]
+fn every_edges_read_carries_an_edge_predicate_or_is_exempt() {
+    let mut found: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut scanned = 0usize;
+    for (file, src) in repo_files().into_iter().chain(mcp_tools_files()) {
+        for (line, func, alias, covered) in edges_reads(&src) {
+            scanned += 1;
+            if !covered {
+                found
+                    .entry((file.clone(), func))
+                    .or_default()
+                    .push(format!("{line} (`{alias}`)"));
+            }
+        }
+    }
+    assert!(
+        scanned > 80,
+        "the scanner found only {scanned} `edges` reads — it is probably not \
+         matching and would pass vacuously"
+    );
+
+    let expected: std::collections::BTreeSet<(String, String)> =
+        EDGES_READS_WITHOUT_AN_EDGE_PREDICATE
+            .iter()
+            .map(|(f, n, _)| ((*f).to_string(), (*n).to_string()))
+            .collect();
+    let actual: std::collections::BTreeSet<(String, String)> = found.keys().cloned().collect();
+
+    let new: Vec<String> = actual
+        .difference(&expected)
+        .map(|k| {
+            format!(
+                "  (\"{}\", \"{}\") — lines {}",
+                k.0,
+                k.1,
+                found[k].join(", ")
+            )
+        })
+        .collect();
+    let stale: Vec<String> = expected
+        .difference(&actual)
+        .map(|k| format!("  (\"{}\", \"{}\")", k.0, k.1))
+        .collect();
+    assert!(
+        new.is_empty() && stale.is_empty(),
+        "\n\nUNFILTERED `edges` reads not in EDGES_READS_WITHOUT_AN_EDGE_PREDICATE:\n{}\n\n\
+         Stale entries (the read is now filtered or gone — delete the entry):\n{}\n\n\
+         An `edges` row carries its own tenancy (migration 062 + 072's co-owner). \
+         Filtering its endpoints does not filter it: migration 070 arm (b) keeps an \
+         edge declared ('group', G) between two PUBLIC claims. Splice \
+         `/* {{EDGE_VISIBILITY:<alias>}} */`, or for a `sqlx::query!` macro write the \
+         static form `($B::bool OR e.visibility = 'public' OR (e.owner_group_id = \
+         ANY($G::uuid[]) AND (e.co_owner_group_id IS NULL OR e.co_owner_group_id = \
+         ANY($G::uuid[]))))`.\n",
+        new.join("\n"),
+        stale.join("\n")
+    );
+}
+
+/// The scanner above is an approximation of a SQL parser, so it is calibrated
+/// rather than trusted: one that matched nothing, or marked everything covered,
+/// would keep the ratchet green forever.
+#[test]
+fn the_edges_read_scanner_is_not_vacuous() {
+    let covered = |src: &str| -> Vec<(String, bool)> {
+        edges_reads(src)
+            .into_iter()
+            .map(|(_, _, alias, c)| (alias, c))
+            .collect()
+    };
+
+    // Unfiltered, aliased: seen and NOT covered.
+    assert_eq!(
+        covered("fn a() { sqlx::query(\"SELECT 1 FROM edges e WHERE e.id = $1\"); }"),
+        vec![("e".to_string(), false)]
+    );
+    // Unaliased, and `AS` alias.
+    assert_eq!(
+        covered("fn a() { sqlx::query(\"SELECT 1 FROM edges WHERE id = $1\"); }"),
+        vec![("edges".to_string(), false)]
+    );
+    assert_eq!(
+        covered("fn a() { sqlx::query(\"SELECT 1 FROM public.edges AS ed WHERE true\"); }"),
+        vec![("ed".to_string(), false)]
+    );
+    // The marker for THIS alias covers it; a marker for a different alias does not.
+    assert_eq!(
+        covered("fn a() { let s = v.splice(\"SELECT 1 FROM edges e WHERE true /* {EDGE_VISIBILITY:e} */\", 2); }"),
+        vec![("e".to_string(), true)]
+    );
+    assert_eq!(
+        covered("fn a() { let s = v.splice(\"SELECT 1 FROM edges e JOIN edges e2 ON true WHERE true /* {EDGE_VISIBILITY:e} */\", 2); }"),
+        vec![("e".to_string(), true), ("e2".to_string(), false)]
+    );
+    // `format!`-doubled braces and the static macro form.
+    assert_eq!(
+        covered("fn a() { let s = v.splice(&format!(\"SELECT 1 FROM edges e WHERE true /* {{EDGE_VISIBILITY:e}} */\"), 2); }"),
+        vec![("e".to_string(), true)]
+    );
+    assert_eq!(
+        covered("fn a() { sqlx::query!(\"SELECT 1 FROM edges e WHERE ($2::bool OR e.visibility = 'public' OR (e.owner_group_id = ANY($3) AND (e.co_owner_group_id IS NULL OR e.co_owner_group_id = ANY($3))))\"); }"),
+        vec![("e".to_string(), true)]
+    );
+    // The PLAIN (single-owner) marker is NOT an edge predicate.
+    assert_eq!(
+        covered("fn a() { let s = v.splice(\"SELECT 1 FROM edges e WHERE true /* {VISIBILITY:e} */\", 2); }"),
+        vec![("e".to_string(), false)]
+    );
+    // A statement's window ends at the next statement: a marker in the NEXT
+    // statement cannot cover this one.
+    assert_eq!(
+        covered("fn a() { sqlx::query(\"SELECT 1 FROM edges e\"); let s = v.splice(\"SELECT 1 FROM edges e WHERE true /* {EDGE_VISIBILITY:e} */\", 2); }"),
+        vec![("e".to_string(), false), ("e".to_string(), true)]
+    );
+    // Not reads: DELETE, comment lines, a trailing `#[cfg(test)] mod`.
+    assert!(covered("fn a() { sqlx::query(\"DELETE FROM edges WHERE id = $1\"); }").is_empty());
+    assert!(covered("/// doc: SELECT 1 FROM edges e\nfn a() {}").is_empty());
+    assert!(covered(
+        "fn a() {}\n#[cfg(test)]\nmod tests { fn t() { sqlx::query(\"SELECT 1 FROM edges\"); } }"
+    )
+    .is_empty());
+    // The fn name is the enclosing one.
+    let got =
+        edges_reads("fn outer() {}\nfn inner_one() { sqlx::query(\"SELECT 1 FROM edges e\"); }");
+    assert_eq!(got[0].1, "inner_one");
 }
