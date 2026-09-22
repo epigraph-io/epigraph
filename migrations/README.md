@@ -60,11 +60,22 @@ Current reservation:
   headroom. **Do not allocate here**, even though the branch has not merged:
   its numbers are fixed and its `docs/tenancy/` ledger pins them.
 - **091**: public `alternative_of_uniq_ignores_retracted` (PR #411)
-- **092+**: public next
+- **093**: public `claims_belief_frame_id`
+- **094**: public `seed_method_entity_type` (backlog 895a74e5). **`epigraph-internal`
+  also carries a `094`** (`094_stop_truth_value_overwrite.sql`), a different file
+  under the same version. Harmless while the two repos do not share a
+  `_sqlx_migrations` table (see "The epigraph-internal overlap" below), but a
+  merge of internal history into public — or applying both sets to one database —
+  is a checksum collision that crash-loops the api binary. Before deploying
+  `094`, confirm the target holds no version 94:
+  `SELECT version FROM _sqlx_migrations WHERE version = 94;`
+- **095+**: public next
 
-Next public migration must be `092` or later. Picking a colliding version
+Next public migration must be `095` or later. Picking a colliding version
 (checksum mismatch on a `_sqlx_migrations` row that's already applied) will
-panic the api binary on restart.
+panic the api binary on restart. The same panic follows from EDITING an already
+applied migration file, which is why an applied migration is immutable once it
+has reached any database you do not intend to rebuild.
 
 ### Why 091 and not 060
 
