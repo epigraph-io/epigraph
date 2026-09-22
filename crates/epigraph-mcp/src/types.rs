@@ -498,7 +498,7 @@ pub struct RecallParams {
 
     #[schemars(
         description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
-                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking and min_truth stay on the global truth_value."
+                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking stays on the global truth_value; min_truth gates on the UNFRAMED DS pignistic probability (falling back to truth_value for a claim with no DS cache), so it is not the lensed value and not the authored scalar."
     )]
     #[serde(default)]
     pub frame_id: Option<String>,
