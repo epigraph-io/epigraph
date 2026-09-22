@@ -35,6 +35,7 @@ mod common;
 mod viewer_fixture;
 
 use serde_json::Value;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use tokio::sync::oneshot;
@@ -43,7 +44,17 @@ use uuid::Uuid;
 /// The collection path answers with a body, not a 405 — and `total` is a real
 /// `COUNT(*)` over the filter, not the length of the page.
 #[sqlx::test(migrations = "../../migrations")]
-async fn list_evidence_answers_the_collection_path_with_an_exact_total(pool: PgPool) {
+async fn list_evidence_answers_the_collection_path_with_an_exact_total(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    // `#[sqlx::test]` accepts either a `PgPool` or the (options, options) pair,
+    // not a mix — and the pair is what `spawn_app` needs, because `ScopedPool`
+    // connects by URL and the ephemeral database name lives in `conn_opts`.
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
     let agent = seed_agent(&pool).await;
     let claim_a = seed_claim(&pool, agent, "claim A body").await;
     let claim_b = seed_claim(&pool, agent, "claim B body").await;
@@ -80,7 +91,7 @@ async fn list_evidence_answers_the_collection_path_with_an_exact_total(pool: PgP
         .await;
     }
 
-    let (addr, _shutdown) = spawn_app(pool.clone()).await;
+    let (addr, _shutdown) = spawn_app(pool.clone(), &conn_opts).await;
     let client = reqwest::Client::new();
     // These fixtures declare no tenancy, so migration 070 stamps them
     // `visibility = 'public'` and any authenticated reader sees all 9.
@@ -205,7 +216,17 @@ async fn list_evidence_answers_the_collection_path_with_an_exact_total(pool: PgP
 /// leak the exact number of rows a caller may not read while the page itself
 /// looked correct — the defect the shared `FILTER_WHERE` exists to prevent.
 #[sqlx::test(migrations = "../../migrations")]
-async fn list_evidence_hides_group_private_rows_from_a_stranger(pool: PgPool) {
+async fn list_evidence_hides_group_private_rows_from_a_stranger(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    // `#[sqlx::test]` accepts either a `PgPool` or the (options, options) pair,
+    // not a mix — and the pair is what `spawn_app` needs, because `ScopedPool`
+    // connects by URL and the ephemeral database name lives in `conn_opts`.
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
     let (owner, owner_group) = viewer_fixture::seed_agent_with_group(&pool, "evidence-owner").await;
 
     let private_claim =
@@ -245,7 +266,7 @@ async fn list_evidence_hides_group_private_rows_from_a_stranger(pool: PgPool) {
          claim's group tenancy, or the stranger assertions below prove nothing"
     );
 
-    let (addr, _shutdown) = spawn_app(pool.clone()).await;
+    let (addr, _shutdown) = spawn_app(pool.clone(), &conn_opts).await;
     let client = reqwest::Client::new();
 
     // ---- A stranger: the private row is ABSENT, and uncounted ----
@@ -347,10 +368,43 @@ async fn get(client: &reqwest::Client, addr: SocketAddr, path: &str, token: &str
     resp.json().await.expect("json body")
 }
 
-/// Same wiring as `epigraph_api::build_app_for_tests`, but from the existing
-/// `#[sqlx::test]` pool so the ephemeral database is the one under test.
-async fn spawn_app(pool: PgPool) -> (SocketAddr, oneshot::Sender<()>) {
-    let state = epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default());
+/// Same wiring as `epigraph_api::build_app_for_tests`, pointed at the existing
+/// `#[sqlx::test]` ephemeral database so that database is the one under test.
+///
+/// Builds through `AppState::with_scoped_pool`, NOT `with_db`. `with_db` leaves
+/// `scoped: None`, and every viewer-scoped read reaches the pool through
+/// `AppState::read_as`, which FAIL-CLOSES on a `None` scoped pool rather than
+/// silently falling back to the raw one — so `with_db` here made
+/// `GET /api/v1/evidence` answer 500 and the route look broken when it was the
+/// harness that was wrong. The fail-closed behaviour is correct and deliberate;
+/// see the ~10 sibling `*_scoped_read` tests that wire it this way.
+///
+/// The DSN is rebuilt from `conn_opts` because `#[sqlx::test]` mints a fresh
+/// database per test and `ScopedPool` connects by URL, not from an existing
+/// `PgPool`.
+async fn spawn_app(
+    pool: PgPool,
+    conn_opts: &PgConnectOptions,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let _ = &pool;
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let db = conn_opts.get_database().expect("test database name");
+    let prefix = base
+        .split_once('?')
+        .map_or(base.as_str(), |(a, _)| a)
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0
+        .to_string();
+    let scoped = epigraph_db::ScopedPool::connect(
+        &format!("{prefix}/{db}"),
+        epigraph_db::SessionGucMode::Session,
+    )
+    .await
+    .expect("ScopedPool::connect");
+    let state =
+        epigraph_api::AppState::with_scoped_pool(scoped, epigraph_api::ApiConfig::default());
     let app = epigraph_api::routes::create_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
