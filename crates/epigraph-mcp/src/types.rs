@@ -597,6 +597,25 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub epistemic_partition: bool,
+
+    #[schemars(
+        description = "Optional intra-result diversity constraint, as a COSINE DISTANCE in \
+                       (0.0, 2.0] over claims.embedding. When set, a greedy MMR pass walks the \
+                       ranked page top-down and DROPS any hit sitting closer than this to a hit \
+                       already kept above it, so a query cannot come back as ten paraphrases of \
+                       one fact. 0.15 is a reasonable starting value; larger = more aggressive \
+                       de-duplication. SHRINKS the page rather than back-filling — the SQL page \
+                       is already truncated to limit, so there is nothing below to promote, and \
+                       this matches how min_truth and exclude_contested already behave. Use \
+                       paging.more_available, not a short page, as the stop condition. Hits \
+                       whose distance cannot be MEASURED are always KEPT, never dropped: that \
+                       covers workflow hits (include_workflows=true — they are not claims rows) \
+                       and any claim with no embedding, as on the embedder-down lexical \
+                       fallback, where this parameter therefore does nothing. A value outside \
+                       the range is REJECTED, not clamped. Default: no diversity filtering."
+    )]
+    #[serde(default)]
+    pub diversity_radius: Option<f64>,
 }
 
 // ── Ingestion ──
@@ -1427,6 +1446,90 @@ impl<T> EpistemicPartition<T> {
             }
         }
         out
+    }
+}
+
+/// Widest cosine distance `diversity_radius` will accept.
+///
+/// pgvector's `<=>` is cosine distance on `[0, 2]`, so 2.0 is "drop everything
+/// not diametrically opposed to an already-selected hit" — already absurd, and
+/// the ceiling past which the value cannot mean anything at all.
+pub(crate) const MAX_DIVERSITY_RADIUS: f64 = 2.0;
+
+/// Validate a caller-supplied `diversity_radius`.
+///
+/// REJECTS rather than clamps. A silently clamped radius produces a page that
+/// looks filtered and is not, and this parameter's whole job is to change which
+/// hits come back — the one class of mistake a caller most needs told. `0.0` is
+/// rejected too: nothing is ever strictly nearer than zero, so it is a no-op
+/// spelled like a setting, and `None` is the way to say "off".
+///
+/// # Errors
+/// Returns the caller-facing message when the value is not finite, or is
+/// outside `(0.0, 2.0]`.
+pub(crate) fn validate_diversity_radius(radius: f64) -> Result<f64, String> {
+    if !radius.is_finite() || radius <= 0.0 || radius > MAX_DIVERSITY_RADIUS {
+        return Err(format!(
+            "diversity_radius must be a finite value in (0.0, {MAX_DIVERSITY_RADIUS}] — \
+             cosine distance is bounded on [0, 2], and 0.0 would drop nothing. \
+             Got {radius}. Omit the parameter to disable diversity filtering."
+        ));
+    }
+    Ok(radius)
+}
+
+/// Greedy maximal-marginal-relevance pass over a ranked page (backlog
+/// a9397e8a): walk the page in rank order and drop any hit that sits within
+/// `diversity_radius` cosine distance of a hit ALREADY selected above it.
+///
+/// `too_similar` is the set of unordered id pairs the DB measured as closer
+/// than the radius — i.e. `ClaimRepository::pairwise_cosine_distance_at_dim`'s
+/// output, which already applies the `< max_distance` cut in SQL.
+///
+/// Returns the ids to KEEP, in the input order.
+///
+/// # A pair that is not in `too_similar` is KEPT
+///
+/// This is the load-bearing default, and it is the opposite of the one that
+/// looks natural. A pair is missing from the measured set for two very
+/// different reasons — it is genuinely far apart, OR it could not be measured
+/// at all (an unembedded hit from the embedder-down lexical leg, a workflow hit
+/// whose id is not in `claims`, a row the viewer cannot see). Defaulting an
+/// unmeasurable pair to "distance 0" would make every such hit a duplicate of
+/// everything and silently empty the page down to one row. Keeping is the
+/// honest reading: not known to be near.
+///
+/// # Shrink-only, never back-fill
+///
+/// The candidate list this runs on has already been truncated to `limit` by
+/// SQL, so dropping a redundant hit returns a SHORTER page rather than pulling
+/// a more diverse hit up from below. That matches `min_truth` and
+/// `exclude_contested`, which are documented on both recall surfaces as
+/// returning a short page rather than back-filling with worse-ranked material,
+/// and it leaves `paging.more_available` — derived from the SQL page size, not
+/// from `results.len()` — correct without modification.
+pub(crate) fn greedy_diversity_keep(
+    ranked_ids: &[uuid::Uuid],
+    too_similar: &std::collections::HashSet<(uuid::Uuid, uuid::Uuid)>,
+) -> Vec<uuid::Uuid> {
+    let mut kept: Vec<uuid::Uuid> = Vec::with_capacity(ranked_ids.len());
+    for &candidate in ranked_ids {
+        let redundant = kept
+            .iter()
+            .any(|&selected| too_similar.contains(&unordered_pair(selected, candidate)));
+        if !redundant {
+            kept.push(candidate);
+        }
+    }
+    kept
+}
+
+/// Normalise an unordered id pair so lookups cannot miss by argument order.
+pub(crate) fn unordered_pair(a: uuid::Uuid, b: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 

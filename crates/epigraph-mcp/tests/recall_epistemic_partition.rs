@@ -105,6 +105,7 @@ fn params(query: &str, epistemic_partition: bool) -> RecallParams {
         theme_label: None,
         offset: None,
         epistemic_partition,
+        diversity_radius: None,
     }
 }
 
@@ -393,6 +394,7 @@ mod ctxfx {
             exclude_contested: false,
             since: None,
             epistemic_partition,
+            diversity_radius: None,
         }
     }
 }

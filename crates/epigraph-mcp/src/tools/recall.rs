@@ -244,6 +244,30 @@ pub struct RecallWithContextParams {
     /// byte-identical to `recall_with_context` without this parameter.
     #[serde(default)]
     pub epistemic_partition: bool,
+    /// Optional intra-result diversity constraint, as a COSINE DISTANCE in
+    /// `(0.0, 2.0]`. When set, a greedy MMR pass walks the ranked page
+    /// top-down and DROPS any hit sitting closer than this to a hit already
+    /// kept above it, so a query cannot come back as ten paraphrases of one
+    /// paragraph. `0.15` is a reasonable starting value.
+    ///
+    /// Measured in the SAME vector space the retrieval used — whichever of
+    /// `claims.embedding` / `claims.embedding_3072` `centroid_dim_used` names.
+    /// Comparing a 3072-retrieved page against the 1536 column would measure
+    /// vectors that were never comparable.
+    ///
+    /// SHRINKS the page rather than back-filling: with `rerank=false` the
+    /// candidate pool is exactly `limit`, so there is nothing below to promote.
+    /// Same contract as `min_truth` / `exclude_contested`.
+    ///
+    /// Hits whose distance cannot be MEASURED are always KEPT — a paragraph
+    /// with no vector in the searched column is not known to be near anything.
+    ///
+    /// Runs BEFORE structural context is compared but AFTER ranking, rerank and
+    /// graph expansion, so it de-duplicates whatever seed set those stages
+    /// produced. A value outside the range is REJECTED, not clamped. Default:
+    /// no diversity filtering.
+    #[serde(default)]
+    pub diversity_radius: Option<f64>,
 }
 
 /// Why a recall audit row has no owner — and therefore must not be written.
@@ -750,6 +774,17 @@ async fn recall_with_context_post_embed(
     neighbor_paragraphs_limit: u32,
     lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
+    // Validated before any retrieval runs, so a mistyped radius is reported
+    // instead of being paid for and then discarded. Checked here rather than in
+    // the wrapper because `__test_only::recall_with_context_with_pgvec` enters
+    // at this function, and a validation the test path skips is a validation
+    // the tests cannot pin.
+    let diversity_radius = params
+        .diversity_radius
+        .map(crate::types::validate_diversity_radius)
+        .transpose()
+        .map_err(invalid_params)?;
+
     // Stage 3: candidate retrieval. Two paths:
     //
     //  - `diverse=true`: run the shared diverse-retrieval pipeline
@@ -1015,6 +1050,63 @@ async fn recall_with_context_post_embed(
     // may have been widened above.
     raw_hits.truncate(want);
 
+    // Stage 4.6: diversity post-filter (backlog a9397e8a). Greedy MMR over the
+    // ranked seed set, dropping any hit within `diversity_radius` cosine
+    // distance of a hit already kept above it.
+    //
+    // Placed HERE, after truncation and before `fetch_batched_context`, for two
+    // reasons. It de-duplicates whatever seed set the diverse / rerank / graph-
+    // expansion stages actually produced, rather than the raw ANN order; and
+    // context enrichment is the expensive stage on this tool (siblings, atoms,
+    // corroborates, neighbour paragraphs, all fanned out per hit), so dropping
+    // a redundant paragraph before it runs is strictly cheaper than dropping it
+    // after. It is also comfortably ahead of `spawn_recall_audit`, which
+    // derives its `returned_claim_ids` from the final `results`.
+    //
+    // `centroid_dim` — NOT a hardcoded 1536. This tool auto-detects its vector
+    // space, and measuring a 3072-retrieved page against `claims.embedding`
+    // would compare vectors that were never comparable, or find no pairs at all
+    // on a corpus embedded only at 3072 and silently report a perfectly diverse
+    // page.
+    if let Some(radius) = diversity_radius {
+        let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
+        match epigraph_db::ClaimRepository::pairwise_cosine_distance_at_dim(
+            &server.pool,
+            viewer,
+            &ids,
+            radius,
+            centroid_dim,
+        )
+        .await
+        {
+            Ok(pairs) => {
+                // The repo applied the `< radius` cut in SQL, so every returned
+                // pair IS a too-similar pair. A pair that is ABSENT is kept —
+                // see `greedy_diversity_keep`; a paragraph with no vector in
+                // the searched column is not known to be near anything.
+                let too_similar: std::collections::HashSet<(Uuid, Uuid)> = pairs
+                    .iter()
+                    .map(|p| crate::types::unordered_pair(p.claim_a, p.claim_b))
+                    .collect();
+                let keep: std::collections::HashSet<Uuid> =
+                    crate::types::greedy_diversity_keep(&ids, &too_similar)
+                        .into_iter()
+                        .collect();
+                raw_hits.retain(|h| keep.contains(&h.claim_id));
+            }
+            Err(e) => {
+                // Degrade-not-fail, matching the lens and dispute post-passes:
+                // serve the undiversified page rather than lose hits already
+                // retrieved, and say so in the log so an unfiltered page is
+                // distinguishable from one with nothing to filter.
+                tracing::warn!(
+                    error = %e,
+                    "diversity filter failed; serving the page without it"
+                );
+            }
+        }
+    }
+
     // Stage 5: batch context fetches.
     let paragraph_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
     let ctx = fetch_batched_context(
@@ -1254,6 +1346,12 @@ async fn recall_with_context_post_embed(
             // See the empty-path literal above: the window is part of the
             // question, so it has to survive into the audit row.
             "since": params.since,
+            // Same argument: the radius changes WHICH paragraphs came back, so
+            // a retrieval whose diversity cut cannot be reconstructed from its
+            // audit row is an unauditable retrieval. `epistemic_partition` is
+            // deliberately absent — it regroups the response without changing
+            // the set.
+            "diversity_radius": params.diversity_radius,
         }),
         results.iter().map(|h| h.paragraph_id).collect(),
     );

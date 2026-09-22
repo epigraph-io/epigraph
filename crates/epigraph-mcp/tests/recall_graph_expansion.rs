@@ -187,6 +187,7 @@ fn base_params(depth: Option<u32>, limit: u32) -> RecallWithContextParams {
         exclude_contested: false,
         since: None,
         epistemic_partition: false,
+        diversity_radius: None,
     }
 }
 

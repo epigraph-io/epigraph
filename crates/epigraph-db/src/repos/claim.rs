@@ -5535,15 +5535,15 @@ impl ClaimRepository {
     /// this threshold query time becomes unreasonable and the result set itself is huge.
     pub const MAX_PAIRWISE_IDS: usize = 1_000;
 
-    /// Compute pairwise cosine distances between claims in the given set.
+    /// Compute pairwise cosine distances between claims in the given set, over
+    /// `claims.embedding` (1536d).
     ///
-    /// Returns all pairs where distance < `max_distance`, ordered ascending.
-    /// Uses pgvector `<=>` operator. Note: this is a brute-force O(N²) scan
-    /// — HNSW indexes do not accelerate distance filters.
+    /// Thin wrapper over [`Self::pairwise_cosine_distance_at_dim`] at
+    /// `dim = 1536`, kept because 1536 is this repo's default vector space and
+    /// most callers have no dim to thread.
     ///
     /// # Errors
-    /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
-    /// - `DbError::QueryFailed` if the database query fails.
+    /// See [`Self::pairwise_cosine_distance_at_dim`].
     #[instrument(skip(executor))]
     pub async fn pairwise_cosine_distance<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -5551,6 +5551,60 @@ impl ClaimRepository {
         claim_ids: &[Uuid],
         max_distance: f64,
     ) -> Result<Vec<ClaimPairDistance>, DbError> {
+        Self::pairwise_cosine_distance_at_dim(executor, viewer, claim_ids, max_distance, 1536).await
+    }
+
+    /// Compute pairwise cosine distances between claims in the given set, in
+    /// the vector space named by `dim`.
+    ///
+    /// Returns all pairs where distance < `max_distance`, ordered ascending.
+    /// Uses pgvector `<=>` operator, so distances are on `[0, 2]` and a
+    /// SMALLER number means MORE similar. Note: this is a brute-force O(N²)
+    /// scan — HNSW indexes do not accelerate distance filters.
+    ///
+    /// # `dim` must be the dim the retrieval being filtered actually searched
+    ///
+    /// `claims.embedding` (1536) and `claims.embedding_3072` are different
+    /// spaces. Measuring a page retrieved at 3072 against the 1536 column
+    /// compares vectors that were never comparable, and on a corpus embedded
+    /// only at 3072 it silently returns NO pairs at all — which every caller
+    /// that reads "no pair" as "far apart" would report as a perfectly diverse
+    /// result set. `recall_with_context` chooses its dim at runtime
+    /// (`detect_centroid_dim`), which is why this parameter exists rather than
+    /// the column being hardcoded as it was when this function had no callers.
+    ///
+    /// # An unmeasurable pair is ABSENT from the result, never distance 0
+    ///
+    /// A pair is absent when either side has a NULL vector in the selected
+    /// column (the embedder-down lexical leg produces such hits; so does a
+    /// corpus half-migrated between the two columns), when either id is not a
+    /// `claims` row at all, or when the viewer predicate excludes it. Callers
+    /// must read absence as "not known to be near": treating it as distance 0
+    /// would mark every unembedded row a duplicate of everything.
+    ///
+    /// # Errors
+    /// - `DbError::InvalidData` for a `dim` other than 1536 or 3072
+    /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
+    /// - `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor))]
+    pub async fn pairwise_cosine_distance_at_dim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        max_distance: f64,
+        dim: u32,
+    ) -> Result<Vec<ClaimPairDistance>, DbError> {
+        // A closed match, never caller-supplied text: `column` is interpolated
+        // into the statement, so only these two spellings can reach it.
+        let column = match dim {
+            1536 => "embedding",
+            3072 => "embedding_3072",
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"),
+                });
+            }
+        };
         if claim_ids.len() < 2 {
             return Ok(vec![]);
         }
@@ -5565,22 +5619,30 @@ impl ClaimRepository {
             });
         }
 
+        // `{{VISIBILITY:…}}` is doubled because this is now a `format!`
+        // template; see `search_by_embedding_since` for the same doubling and
+        // why `visibility_lint.rs` normalises it before matching. Both aliases
+        // stay marked — they resolve to the SAME bind index, so two markers
+        // still cost one bind, and marking only `c1` would measure a pair
+        // against a `c2` the reader cannot see.
         let sql = viewer.splice(
-            r#"
+            &format!(
+                r#"
             SELECT
                 c1.id AS claim_a,
                 c2.id AS claim_b,
-                (c1.embedding <=> c2.embedding)::float8 AS distance
+                (c1.{column} <=> c2.{column})::float8 AS distance
             FROM claims c1
             JOIN claims c2 ON c1.id < c2.id
             WHERE c1.id = ANY($1)
               AND c2.id = ANY($1)
-              AND c1.embedding IS NOT NULL
-              AND c2.embedding IS NOT NULL
-              AND (c1.embedding <=> c2.embedding) < $2
-              /* {VISIBILITY:c1} */ /* {VISIBILITY:c2} */
-            ORDER BY (c1.embedding <=> c2.embedding)
-            "#,
+              AND c1.{column} IS NOT NULL
+              AND c2.{column} IS NOT NULL
+              AND (c1.{column} <=> c2.{column}) < $2
+              /* {{VISIBILITY:c1}} */ /* {{VISIBILITY:c2}} */
+            ORDER BY (c1.{column} <=> c2.{column})
+            "#
+            ),
             3,
         );
         let mut q = sqlx::query_as::<_, ClaimPairDistance>(&sql)

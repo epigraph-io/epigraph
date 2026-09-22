@@ -82,6 +82,7 @@ fn params(query: &str) -> RecallParams {
         theme_label: None,
         offset: None,
         epistemic_partition: false,
+        diversity_radius: None,
     }
 }
 
