@@ -238,7 +238,17 @@ def merge_cluster(
         stats.traces_redirected += cur.rowcount
 
         # 6. Preserve cross-agent provenance: each dup's authoring agent gets
-        #    an AUTHORED edge to the canonical (idempotent on the triple-UNIQUE).
+        #    an AUTHORED edge to the canonical, idempotently.
+        #
+        #    Idempotence is enforced by NOT EXISTS, not by ON CONFLICT. There is
+        #    no `UNIQUE (source_id, target_id, relationship)` on `edges` to
+        #    conflict against: migration 017 deliberately made AUTHORED edges
+        #    multi-valued, 018 dropped the triple-unique constraint, and 053
+        #    dropped the drifted unique index that had survived it. An
+        #    `ON CONFLICT` naming those columns therefore raises "there is no
+        #    unique or exclusion constraint matching the ON CONFLICT
+        #    specification", which aborts the cluster transaction — every
+        #    cluster, every run.
         cur.execute(
             """
             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -246,9 +256,14 @@ def merge_cluster(
                    jsonb_build_object('via', 'fuzzy_dedup_claims', 'merged_from', c.id::text)
               FROM claims c
              WHERE c.id = %s::uuid
-            ON CONFLICT (source_id, target_id, relationship) DO NOTHING
+               AND NOT EXISTS (
+                   SELECT 1 FROM edges e
+                    WHERE e.source_id = c.agent_id
+                      AND e.target_id = %s::uuid
+                      AND e.relationship = 'AUTHORED'
+               )
             """,
-            (canonical_id, dup_id),
+            (canonical_id, dup_id, canonical_id),
         )
         stats.authored_edges_added += cur.rowcount
 
