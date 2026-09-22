@@ -19,6 +19,23 @@
 //! HTTP and a store built by hand is the supported route (the same one
 //! `webhook_tenancy.rs::store_of` takes).
 //!
+//! # A hand-built store is no longer ENOUGH, and that is a security property
+//!
+//! Backlog `cf05eb0d` added a DELIVERY-time re-run of the same guard, precisely
+//! because the store is a map other code paths insert into. Measured: with the
+//! sink addressed as `http://127.0.0.1:<port>/sink-b` this file's positive
+//! control failed, 0 POSTs against 1 expected — the guard refused the dial. The
+//! bypass the guard closes is the one this fixture was using.
+//!
+//! So the sink is now addressed by a NAME under RFC 2606 `.example`, which the
+//! guard accepts on its face because it performs no DNS resolution, and
+//! reqwest is told to resolve that name to the wiremock port with
+//! `ClientBuilder::resolve`. The client is handed to
+//! `start_webhook_dispatcher_with_client`. `.resolve()` overrides DNS and
+//! nothing else: it cannot make the guard accept an address literal, so the
+//! SSRF property is untouched and only the reachability of the test's own sink
+//! is restored.
+//!
 //! # Why the assertion is a received request and not a result vector
 //!
 //! `webhook_tenancy.rs` discriminates on `deliver_event`'s returned
@@ -61,7 +78,9 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryConfig};
+use epigraph_api::routes::webhooks::{
+    dispatcher_client_builder, start_webhook_dispatcher_with_client, WebhookDeliveryConfig,
+};
 use epigraph_api::state::{SharedEventBus, WebhookStore, WebhookSubscription};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
@@ -74,6 +93,31 @@ const SECRET: &str = "Xk9mP2qL7vN8wBjH5cT0yDrF3gU6eA1s"; // 32 chars
 
 const SINK_A: &str = "/sink-a";
 const SINK_B: &str = "/sink-b";
+
+/// The name the subscriptions are addressed by.
+///
+/// RFC 2606 reserves `.example`, so it never resolves anywhere real and carries
+/// no loopback semantics — the same choice, for the same reason, as
+/// `webhook_url_policy_test.rs::a_hostname_is_not_resolved_and_is_accepted_on_its_face`.
+/// The guard accepts it; `ClientBuilder::resolve` is what points it at wiremock.
+const SINK_HOST: &str = "dispatcher-sink.example";
+
+/// The dispatcher's own client, with DNS for [`SINK_HOST`] pointed at `sink`.
+///
+/// Built through `dispatcher_client_builder` and not `reqwest::Client::new()`:
+/// a test that configured its own client would prove nothing about what the
+/// server actually dials with, and would silently drop the no-redirect policy.
+fn client_resolving_to(sink: &MockServer, config: &WebhookDeliveryConfig) -> reqwest::Client {
+    dispatcher_client_builder(config.timeout)
+        .resolve(SINK_HOST, *sink.address())
+        .build()
+        .expect("dispatcher client must build")
+}
+
+/// `http://dispatcher-sink.example:<wiremock port><path>`.
+fn sink_url(sink: &MockServer, path: &str) -> String {
+    format!("http://{SINK_HOST}:{}{path}", sink.address().port())
+}
 
 async fn test_pool() -> sqlx::PgPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -172,8 +216,8 @@ async fn a_published_event_reaches_the_subscriber_who_may_read_its_claim_and_no_
             .await;
     }
 
-    let sub_a = sub_to(format!("{}{SINK_A}", sink.uri()), agent_a);
-    let sub_b = sub_to(format!("{}{SINK_B}", sink.uri()), agent_b);
+    let sub_a = sub_to(sink_url(&sink, SINK_A), agent_a);
+    let sub_b = sub_to(sink_url(&sink, SINK_B), agent_b);
     let store = store_of(&[sub_a, sub_b]);
 
     let bus: SharedEventBus = Arc::new(epigraph_events::EventBus::new(64));
@@ -184,7 +228,14 @@ async fn a_published_event_reaches_the_subscriber_who_may_read_its_claim_and_no_
     // newtype over a `Uuid` with no `Drop` impl, and the subscription lives in
     // the `EventBus` until someone passes that id to `EventBus::unsubscribe`.
     // `bin/server.rs::main` binds it the same way and for the same reason.
-    let _dispatcher = start_webhook_dispatcher(&bus, pool.clone(), store.clone(), fast_config());
+    let config = fast_config();
+    let _dispatcher = start_webhook_dispatcher_with_client(
+        &bus,
+        pool.clone(),
+        store.clone(),
+        config.clone(),
+        client_resolving_to(&sink, &config),
+    );
 
     bus.publish(claim_submitted(claim_b, agent_b))
         .await
@@ -229,13 +280,20 @@ async fn the_event_type_filter_still_applies_through_the_dispatcher() {
             .await;
     }
 
-    let mut narrowed = sub_to(format!("{}{SINK_A}", sink.uri()), agent);
+    let mut narrowed = sub_to(sink_url(&sink, SINK_A), agent);
     narrowed.event_types = vec!["some.other.type".to_string()];
-    let catch_all = sub_to(format!("{}{SINK_B}", sink.uri()), agent);
+    let catch_all = sub_to(sink_url(&sink, SINK_B), agent);
     let store = store_of(&[narrowed, catch_all]);
 
     let bus: SharedEventBus = Arc::new(epigraph_events::EventBus::new(64));
-    let _dispatcher = start_webhook_dispatcher(&bus, pool.clone(), store.clone(), fast_config());
+    let config = fast_config();
+    let _dispatcher = start_webhook_dispatcher_with_client(
+        &bus,
+        pool.clone(),
+        store.clone(),
+        config.clone(),
+        client_resolving_to(&sink, &config),
+    );
 
     bus.publish(claim_submitted(claim, agent))
         .await

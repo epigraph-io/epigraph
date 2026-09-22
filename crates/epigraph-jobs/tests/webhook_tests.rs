@@ -414,6 +414,103 @@ fn test_ssrf_allows_external_addresses() {
     );
 }
 
+/// IPv6 literals must be classified, not silently allowed.
+///
+/// Regression: `is_internal_ip` used to strip the port with
+/// `host.split(':').next()` *before* parsing. Every IPv6 literal contains
+/// ':', so `::1` was truncated to `""`, failed to parse, and fell through to
+/// the "not an IP, allow it" arm — making the entire `IpAddr::V6` branch
+/// unreachable. Each assertion below returned `false` before the fix.
+#[test]
+fn test_ssrf_blocks_ipv6_internal_literals() {
+    assert!(is_internal_ip("::1"), "IPv6 loopback ::1 should be blocked");
+    assert!(
+        is_internal_ip("[::1]"),
+        "bracketed IPv6 loopback should be blocked"
+    );
+    assert!(
+        is_internal_ip("[::1]:8080"),
+        "bracketed IPv6 loopback with port should be blocked"
+    );
+    assert!(is_internal_ip("::"), "unspecified :: should be blocked");
+    assert!(
+        is_internal_ip("fe80::1"),
+        "IPv6 link-local fe80::/10 should be blocked"
+    );
+    assert!(
+        is_internal_ip("fd00::1"),
+        "IPv6 unique-local fc00::/7 should be blocked"
+    );
+    assert!(
+        is_internal_ip("::ffff:169.254.169.254"),
+        "IPv4-mapped cloud metadata address should be blocked"
+    );
+    assert!(
+        is_internal_ip("[::ffff:127.0.0.1]:443"),
+        "bracketed IPv4-mapped loopback with port should be blocked"
+    );
+}
+
+/// A trailing dot is the fully-qualified spelling of the same name and must
+/// not defeat the localhost check.
+///
+/// Regression: `is_internal_ip` compared the host string against `"localhost"`
+/// and `".localhost"` verbatim, so `localhost.` — which `getent ahostsv4`
+/// resolves to 127.0.0.1/::1 exactly like `localhost` — was reported external.
+/// WHATWG URL normalisation does not save the caller here: it strips the
+/// trailing dot only on the numeric path, so `localhost.` reaches this function
+/// as a domain. Each assertion below returned `false` before the fix.
+#[test]
+fn test_ssrf_blocks_trailing_dot_localhost() {
+    assert!(
+        is_internal_ip("localhost."),
+        "fully-qualified `localhost.` should be blocked"
+    );
+    assert!(
+        is_internal_ip("sub.localhost."),
+        "fully-qualified `sub.localhost.` should be blocked"
+    );
+    assert!(
+        is_internal_ip("localhost.:8080"),
+        "fully-qualified `localhost.` with a port should be blocked"
+    );
+    assert!(
+        is_internal_ip("127.0.0.1."),
+        "fully-qualified loopback literal should be blocked"
+    );
+    assert!(
+        is_internal_ip("169.254.169.254.:80"),
+        "fully-qualified metadata literal with a port should be blocked"
+    );
+}
+
+/// The trailing-dot strip must not turn public FQDNs into a blanket deny.
+#[test]
+fn test_ssrf_allows_trailing_dot_public_hosts() {
+    assert!(
+        !is_internal_ip("example.com."),
+        "fully-qualified public domain should still be allowed"
+    );
+    assert!(
+        !is_internal_ip("8.8.8.8."),
+        "fully-qualified public IPv4 literal should still be allowed"
+    );
+}
+
+/// Public IPv6 addresses must still be allowed — the fix must not turn the
+/// V6 branch into a blanket deny.
+#[test]
+fn test_ssrf_allows_external_ipv6_literals() {
+    assert!(
+        !is_internal_ip("2001:4860:4860::8888"),
+        "Google public DNS over IPv6 should be allowed"
+    );
+    assert!(
+        !is_internal_ip("[2606:4700:4700::1111]:443"),
+        "bracketed public IPv6 with port should be allowed"
+    );
+}
+
 /// URL host extraction should work correctly
 #[test]
 fn test_extract_host_from_url() {
