@@ -104,10 +104,11 @@ pub use repos::{
     RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome,
     ScopedBeliefRepository, ScoredHierarchicalWorkflowRow, SecurityEventRepository,
     SecurityEventRow, SheafRepository, SortDirection, StructuralRepository, SweepCandidate,
-    TaskRepository, TaskRow, TenancyPrecondition, TraceProvenanceStep, TripleRepository, TripleRow,
-    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
-    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
-    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
+    TraceProvenanceStep, TripleRepository, TripleRow, WebhookSubscriptionRepository,
+    WebhookSubscriptionRow, WorkflowExecutionRepository, WorkflowExecutionRow,
+    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 

@@ -72,6 +72,12 @@ async fn recall_falls_back_to_scope_honoring_lexical_when_embedder_down(pool: Pg
         include_workflows: false,
         exclude_contested: false,
         since: None,
+        // Theme scope / paging (backlog c95a2509) default to unscoped here: this
+        // fixture pins a different axis, and None/None/None is byte-identical to
+        // the pre-theme behaviour.
+        theme_id: None,
+        theme_label: None,
+        offset: None,
     };
     let out = recall(&server, &viewer, params).await.expect("recall ok");
     let arr = parse_results(out);

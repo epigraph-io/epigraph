@@ -882,7 +882,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recall relevant memories using semantic search with epistemic quality scoring."
+        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart."
     )]
     async fn recall(
         &self,
@@ -1632,7 +1632,33 @@ impl EpiGraphMcpFull {
         crate::tools::embeddings::backfill_embeddings(self, viewer, params).await
     }
 
-    // ── Themes (1 tool) ──
+    // ── Themes (3 tools) ──
+
+    #[tool(
+        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of is_current claims actually assigned — authoritative), stored_claim_count (the denormalised claim_themes.claim_count column, which the assignment writers do NOT maintain; reported only so drift is visible), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Optional label_prefix filter (e.g. \"auto\" for the k-means family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME prefix predicate, so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this instead of theme_cluster to answer \"what topics does this graph cover\"."
+    )]
+    async fn list_themes(
+        &self,
+        Parameters(params): Parameters<crate::tools::themes::ListThemesParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::themes::list_themes(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "READ-ONLY detail for ONE theme: its list_themes summary plus a page of member claim IDs (ids + truth_value + created_at — deliberately NOT content, so this is not a second unredacted content surface; resolve ids via get_claim, which redacts). Select with theme_id OR theme_label, never both; a malformed theme_id, a label matching nothing, and a label matching several themes are all REJECTED rather than silently widening the query (claim_themes has no UNIQUE(label) constraint). Members are ordered created_at ASC, id ASC — a total order, so a members_limit/members_offset walk yields each member exactly once. Defaults: members_limit=50 (max 500; 0 = summary only), members_offset=0. Response carries members_total / members_returned / members_has_more."
+    )]
+    async fn get_theme(
+        &self,
+        Parameters(params): Parameters<crate::tools::themes::GetThemeParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::themes::get_theme(self, viewer, params).await
+    }
 
     #[tool(
         description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536. Default `wipe_first=true` ensures clean rebuilds on each call. Pass `false` only for additive runs with a unique `label_prefix` (otherwise duplicate themes accumulate — see backlog: missing UNIQUE constraint on claim_themes.label)."

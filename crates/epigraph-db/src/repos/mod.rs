@@ -85,7 +85,7 @@ pub use claim::{
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
-    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
+    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow, ThemeMemberRow, ThemeSummaryRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::{CommunityRepository, MembershipOutcome};

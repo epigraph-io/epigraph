@@ -296,8 +296,50 @@ async fn recall_post_embed(
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
     let agent_filter = parse_agent_filter(params.agent_id.as_deref()).map_err(invalid_params)?;
+    let offset = params.offset.unwrap_or(0).max(0);
     let tags = params.tags;
     let tags_opt: Option<&[String]> = if tags.is_empty() { None } else { Some(&tags) };
+
+    // Theme scope (backlog c95a2509). Resolved up front, and fails closed on
+    // every ambiguity — see `themes::resolve_theme_selector`. Sharing that
+    // resolver with `get_theme` is what makes `theme_label` mean the same thing
+    // on both tools.
+    let theme = crate::tools::themes::resolve_theme_selector(
+        &server.pool,
+        viewer,
+        params.theme_id.as_deref(),
+        params.theme_label.as_deref(),
+    )
+    .await?;
+    let theme_filter = theme.as_ref().map(|t| t.id);
+
+    // The workflows leg is the fourth candidate-producing surface on this tool,
+    // and it is the one a theme filter CANNOT be pushed into: `workflows` rows
+    // carry no `theme_id`, so a theme-scoped recall that still ran that leg
+    // would hand back unthemed workflow hits inside a result the caller asked
+    // to be confined to one theme. Rejecting is chosen over silently skipping
+    // the leg because a caller who passed `include_workflows=true` asked for
+    // something this combination cannot deliver, and a quietly-dropped option
+    // is the failure mode the `since`-window work already had to stamp out on
+    // this surface.
+    if theme_filter.is_some() && params.include_workflows {
+        return Err(invalid_params(
+            "theme_id/theme_label cannot be combined with include_workflows=true: workflows carry \
+             no theme_id, so the workflow hits could not be confined to the theme. Drop one.",
+        ));
+    }
+
+    // Paging and the workflows leg are likewise incompatible. The two hit lists
+    // are disjoint id-spaces RRF-merged in Rust after the SQL page; an offset
+    // applied to the claims leg alone would re-serve the same top workflows on
+    // every page, and there is no ranking continuity to offset them by.
+    if offset > 0 && params.include_workflows {
+        return Err(invalid_params(
+            "offset cannot be combined with include_workflows=true: offset pages the claims \
+             ranking, and the workflows leg has no page-consistent counterpart, so the same \
+             workflows would reappear on every page.",
+        ));
+    }
 
     // Resolve the optional (frame, perspective) lens up front (both-or-neither,
     // parse, existence) so the bulk retrieval / ranking / min_truth path — all
@@ -319,8 +361,12 @@ async fn recall_post_embed(
     //
     // `params.since` is threaded into BOTH branches: the window must not
     // silently widen just because the embedder happened to be down.
+    //
+    // `theme_filter` and `offset` are threaded into BOTH branches for the same
+    // reason: a scope that held on the hybrid path but not on the degrade path
+    // would widen to the whole corpus precisely when the embedder is down.
     let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
-        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since(
+        Some(pgvec) => ClaimRepository::search_hybrid_scoped_since_in_theme(
             &server.pool,
             viewer,
             pgvec,
@@ -328,25 +374,36 @@ async fn recall_post_embed(
             HYBRID_CANDIDATE_POOL,
             HYBRID_RRF_K,
             limit,
+            offset,
             tags_opt,
             agent_filter,
             params.since,
+            theme_filter,
         )
         .await
         .map_err(internal_error)?,
-        None => ClaimRepository::search_lexical_scoped_since(
+        None => ClaimRepository::search_lexical_scoped_since_in_theme(
             &server.pool,
             viewer,
             &params.query,
             HYBRID_RRF_K,
             limit,
+            offset,
             tags_opt,
             agent_filter,
             params.since,
+            theme_filter,
         )
         .await
         .map_err(internal_error)?,
     };
+
+    // Captured BEFORE the min_truth / exclude_contested post-filters shrink the
+    // page. `hits.len()` is what SQL could supply for this window, so
+    // `== limit` is the exact "another page may exist" signal; the post-filtered
+    // `results.len()` is not (a page filtered down to zero is not the end of the
+    // walk).
+    let sql_page_len = hits.len() as i64;
 
     // Workflows ANN leg (opt-in, backlog 88a09fd2 / Task 6.3). Only runs when
     // BOTH include_workflows=true AND the query embedding succeeded — there is
@@ -641,6 +698,15 @@ async fn recall_post_embed(
             // and without a window returns different sets, so the window is
             // part of what was asked.
             "since": params.since,
+            // Same argument for the theme scope and the page offset: the same
+            // query pinned to a theme, or taken at offset 20, returns a
+            // different set, so both are part of what was asked and a
+            // retrieval whose scope cannot be reconstructed from its audit row
+            // is an unauditable retrieval. The RESOLVED theme id is logged, not
+            // the raw selector, so a `theme_label` lookup stays reconstructible
+            // after the label is renamed.
+            "theme_id": theme_filter,
+            "offset": offset,
         });
         let pool = server.pool.clone();
         tokio::spawn(async move {
@@ -675,7 +741,51 @@ async fn recall_post_embed(
     success_json(&RecallEnvelope {
         results,
         recall_event_id: Some(event_id.to_string()),
+        // Echoed only when a theme scope or a page offset was actually
+        // requested, so an unscoped recall's response stays byte-identical to
+        // what it produced before this feature existed.
+        theme_scope: theme.as_ref().map(|t| ThemeScopeOut {
+            theme_id: t.id.to_string(),
+            label: t.label.clone(),
+            member_count: t.member_count,
+        }),
+        paging: (offset > 0 || theme_filter.is_some()).then(|| RecallPaging {
+            offset,
+            limit,
+            sql_page_len,
+            next_offset: offset + sql_page_len,
+            more_available: sql_page_len == limit,
+        }),
     })
+}
+
+/// The theme a recall was confined to, echoed back so a theme-scoped retrieval
+/// is self-describing rather than opaque: the caller can see WHICH theme the
+/// label resolved to, and `member_count` bounds how far a walk can go.
+#[derive(serde::Serialize)]
+struct ThemeScopeOut {
+    theme_id: String,
+    label: String,
+    /// Live count of `is_current` claims in the theme — the ceiling on what a
+    /// limit/offset walk can enumerate, before `min_truth` and the lexical /
+    /// dense predicates cut it further.
+    member_count: i64,
+}
+
+/// Paging state for a theme-scoped or offset recall.
+///
+/// `more_available` is derived from `sql_page_len`, the size of the page SQL
+/// produced, NOT from `results.len()`. `min_truth` and `exclude_contested` run
+/// in Rust after the SQL page, so a fully-filtered page has `results == []`
+/// while more pages remain. Treating an empty `results` as the end of the walk
+/// would silently truncate it.
+#[derive(serde::Serialize)]
+struct RecallPaging {
+    offset: i64,
+    limit: i64,
+    sql_page_len: i64,
+    next_offset: i64,
+    more_available: bool,
 }
 
 /// Response envelope carrying the audit-event id alongside the hits, so an
@@ -686,6 +796,10 @@ struct RecallEnvelope {
     results: Vec<RecallResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme_scope: Option<ThemeScopeOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paging: Option<RecallPaging>,
 }
 
 #[doc(hidden)]
