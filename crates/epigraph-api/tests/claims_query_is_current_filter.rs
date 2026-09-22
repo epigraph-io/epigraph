@@ -6,13 +6,13 @@
 //! compared against a constant and could never match, returning an empty set
 //! with HTTP 200.
 //!
-//! Both handler paths are exercised: the COUNT(*) fast path (no filters) must
-//! report the real currency per row, and the in-memory slow path (reached by
-//! `is_current`, which sets `needs_in_memory_filters`) must actually partition
-//! the seeded rows. `content_contains` is pushed into the SQL `ILIKE`, so the
-//! slow path's 10,000-row working set is already restricted to our marker and
-//! this test is unaffected by the size of the shared test database (that cap
-//! is separately tracked as backlog `2265a67b`).
+//! Both an unfiltered and an `is_current`-filtered request are exercised: the
+//! unfiltered listing must report the real currency per row, and
+//! `?is_current=` must actually partition the seeded rows. Every predicate now
+//! runs in SQL (backlog `2265a67b` removed the in-memory pipeline and its
+//! 10,000-row working set), and `content_contains` scopes both requests to
+//! this run's marker, so the test is unaffected by the size of the shared test
+//! database.
 #![cfg(feature = "db")]
 
 use serde_json::Value;
