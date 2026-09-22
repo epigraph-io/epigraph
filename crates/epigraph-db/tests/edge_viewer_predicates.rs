@@ -976,3 +976,99 @@ async fn decomposition_flags_ignore_edges_the_viewer_cannot_read(pool: PgPool) {
          confirm a decomposition edge it cannot read"
     );
 }
+
+// ── ClaimRepository::search_by_embedding_since's DOI filter ────────────────
+
+/// The `paper_doi_filter` shape keeps a paragraph only if an `asserts` edge
+/// ties it to that paper. A match through a PRIVATE attribution edge confirms
+/// the hidden edge to whoever asked — the paragraph and the paper are public.
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_by_embedding_doi_filter_ignores_a_private_attribution_edge(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let para = fixture::seed_public_claim(&pool, t.agent, "attributed paragraph").await;
+    sqlx::query(
+        "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"level\": 2}' \
+         WHERE id = $1",
+    )
+    .bind(para)
+    .execute(&pool)
+    .await
+    .expect("level 2");
+    let v = unit_ish(0.5);
+    fixture::set_claim_embedding(&pool, para, &v).await;
+    let paper: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title) VALUES ('10.0/doi-x', 't') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("paper");
+    let e: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'paper', $2, 'claim', 'asserts') RETURNING id",
+    )
+    .bind(paper)
+    .bind(para)
+    .fetch_one(&pool)
+    .await
+    .expect("asserts edge");
+    sqlx::query("UPDATE edges SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(e)
+        .bind(t.group)
+        .execute(&pool)
+        .await
+        .expect("privatise asserts edge");
+
+    let hits = |rows: Vec<epigraph_db::repos::claim::ClaimEmbeddingHit>| {
+        rows.into_iter().map(|h| h.claim_id).collect::<Vec<_>>()
+    };
+
+    let owner = hits(
+        epigraph_db::ClaimRepository::search_by_embedding_since(
+            &pool,
+            &t.owner,
+            &v,
+            1536,
+            10,
+            Some("10.0/doi-x"),
+            None,
+        )
+        .await
+        .expect("owner search"),
+    );
+    assert_eq!(owner, vec![para], "the owner reads the attribution edge");
+
+    let stranger = hits(
+        epigraph_db::ClaimRepository::search_by_embedding_since(
+            &pool,
+            &t.stranger,
+            &v,
+            1536,
+            10,
+            Some("10.0/doi-x"),
+            None,
+        )
+        .await
+        .expect("stranger search"),
+    );
+    assert!(
+        stranger.is_empty(),
+        "the only attribution to 10.0/doi-x is a private edge: the stranger's DOI \
+         filter must not match through it. Got {stranger:?}"
+    );
+
+    // Without the DOI filter the paragraph itself is public and is returned.
+    let unfiltered = hits(
+        epigraph_db::ClaimRepository::search_by_embedding_since(
+            &pool,
+            &t.stranger,
+            &v,
+            1536,
+            10,
+            None,
+            None,
+        )
+        .await
+        .expect("stranger search, no DOI"),
+    );
+    assert_eq!(unfiltered, vec![para], "the paragraph itself is public");
+}

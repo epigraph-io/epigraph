@@ -1943,6 +1943,7 @@ impl ClaimRepository {
                       WHERE e.target_id = c.id
                         AND e.relationship = 'asserts'
                         AND p.doi = $4
+                        /* {{EDGE_VISIBILITY:e}} */
                   )
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -1968,6 +1969,13 @@ impl ClaimRepository {
         // The DOI shape binds its filter at $4, so the group bind lands at $5
         // there and at $4 without it. Splicing per-shape is what keeps the two
         // literals from sharing a wrong index.
+        //
+        // The DOI shape's `EXISTS` over `asserts` edges carries
+        // `{{EDGE_VISIBILITY:e}}` (same `$5`). It is a positive semi-join, not an
+        // exclusion test, so filtering it can only NARROW the result: a visible
+        // paragraph whose only attribution to `paper_doi_filter` is a private
+        // `asserts` edge no longer matches. Unfiltered, matching it confirmed
+        // that hidden attribution to a caller who cannot read the edge.
         let vis_bind = if paper_doi_filter.is_some() { 5 } else { 4 };
         let sql = viewer.splice(&sql, vis_bind);
 
