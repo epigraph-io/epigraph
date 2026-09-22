@@ -451,6 +451,52 @@ fn test_ssrf_blocks_ipv6_internal_literals() {
     );
 }
 
+/// A trailing dot is the fully-qualified spelling of the same name and must
+/// not defeat the localhost check.
+///
+/// Regression: `is_internal_ip` compared the host string against `"localhost"`
+/// and `".localhost"` verbatim, so `localhost.` — which `getent ahostsv4`
+/// resolves to 127.0.0.1/::1 exactly like `localhost` — was reported external.
+/// WHATWG URL normalisation does not save the caller here: it strips the
+/// trailing dot only on the numeric path, so `localhost.` reaches this function
+/// as a domain. Each assertion below returned `false` before the fix.
+#[test]
+fn test_ssrf_blocks_trailing_dot_localhost() {
+    assert!(
+        is_internal_ip("localhost."),
+        "fully-qualified `localhost.` should be blocked"
+    );
+    assert!(
+        is_internal_ip("sub.localhost."),
+        "fully-qualified `sub.localhost.` should be blocked"
+    );
+    assert!(
+        is_internal_ip("localhost.:8080"),
+        "fully-qualified `localhost.` with a port should be blocked"
+    );
+    assert!(
+        is_internal_ip("127.0.0.1."),
+        "fully-qualified loopback literal should be blocked"
+    );
+    assert!(
+        is_internal_ip("169.254.169.254.:80"),
+        "fully-qualified metadata literal with a port should be blocked"
+    );
+}
+
+/// The trailing-dot strip must not turn public FQDNs into a blanket deny.
+#[test]
+fn test_ssrf_allows_trailing_dot_public_hosts() {
+    assert!(
+        !is_internal_ip("example.com."),
+        "fully-qualified public domain should still be allowed"
+    );
+    assert!(
+        !is_internal_ip("8.8.8.8."),
+        "fully-qualified public IPv4 literal should still be allowed"
+    );
+}
+
 /// Public IPv6 addresses must still be allowed — the fix must not turn the
 /// V6 branch into a blanket deny.
 #[test]

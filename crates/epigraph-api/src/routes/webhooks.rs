@@ -949,6 +949,12 @@ mod tests {
             "http://127.0.0.1:9000/admin",
             "http://localhost/hook",
             "http://sub.localhost/hook",
+            // Fully-qualified spellings. WHATWG normalisation strips the
+            // trailing dot only on the numeric path, so these arrive here as
+            // `Host::Domain("localhost.")` and must be classified by name.
+            "http://localhost./hook",
+            "http://sub.localhost./hook",
+            "http://localhost.:9000/admin",
             "http://10.0.0.5/hook",
             "http://172.16.0.1/hook",
             "http://192.168.1.1/hook",
@@ -1861,6 +1867,8 @@ mod ssrf_registration_tests {
         for url in [
             "http://127.0.0.1:9000/admin",
             "http://localhost/hook",
+            "http://localhost./hook",
+            "http://sub.localhost./hook",
             "http://10.0.0.5/hook",
             "http://127.1/hook",
             "http://example.com@127.0.0.1/hook",

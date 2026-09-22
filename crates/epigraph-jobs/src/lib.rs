@@ -2211,6 +2211,15 @@ pub fn verify_hmac_signature(secret: &str, payload: &str, signature: &str) -> bo
 pub fn is_internal_ip(host: &str) -> bool {
     use std::net::IpAddr;
 
+    // Drop a single trailing dot. `localhost.` is the fully-qualified spelling
+    // of `localhost` and every resolver treats the two identically, but it is a
+    // different *string*, so the comparisons below reported it external. URL
+    // normalisation does not save callers either: WHATWG strips the trailing
+    // dot only on the numeric path, so a domain reaches this function with the
+    // dot intact. Stripping here also lets `127.0.0.1.` parse as an address
+    // instead of falling through the "not an IP, allow it" arm.
+    let host = host.strip_suffix('.').unwrap_or(host);
+
     // Handle localhost explicitly
     if host == "localhost" || host.ends_with(".localhost") {
         return true;
@@ -2232,8 +2241,11 @@ pub fn is_internal_ip(host: &str) -> bool {
             .is_some_and(is_internal_addr);
     }
 
-    // `host:port` — IPv4 literal or hostname.
+    // `host:port` — IPv4 literal or hostname. The trailing dot is not at the
+    // end of the string in this shape (`localhost.:8080`), so strip it again
+    // once the port is off.
     let host_part = host.split(':').next().unwrap_or(host);
+    let host_part = host_part.strip_suffix('.').unwrap_or(host_part);
     if host_part == "localhost" || host_part.ends_with(".localhost") {
         return true;
     }
