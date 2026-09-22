@@ -497,3 +497,67 @@ async fn compound_neighbors_treats_a_centre_with_only_private_children_as_standa
          and its public supports edge to n is found"
     );
 }
+
+// ── F-atom-count-cardinality ────────────────────────────────────────────────
+
+/// `atom_count` must not count an atom whose own claims row the viewer cannot
+/// read, EVEN WHEN the edge to it is readable.
+///
+/// This pins why `F-atom-count-cardinality` is closed WITHOUT a claims join on
+/// the `atoms` CTE. The register entry reasoned that `{VISIBILITY:m}` is inert
+/// because `claim_neighborhood_membership.visibility` "defaults to 'public'".
+/// That premise predates migration 070: the table is in arm (c)'s
+/// `inheritors` array, whose stamp is UNCONDITIONAL, so a membership row takes
+/// its claim's `(visibility, owner_group_id)` whatever the writer declared —
+/// and arm (d) re-stamps it when the claim's tenancy changes. `{VISIBILITY:m}`
+/// is therefore a predicate on the atom's claims row by construction.
+///
+/// The fixture breaks the OTHER layer to prove it: the edge to the private atom
+/// is forced `('public', world)` — a state 070/072 never produce — so the edge
+/// predicate cannot be what hides the atom, and the membership row is declared
+/// `'public'` on INSERT, which arm (c) overwrites. Measured while writing this:
+/// additionally forcing the MEMBERSHIP row public by a bare `UPDATE` (which no
+/// trigger re-stamps) makes the stranger's count 2 — so the assertion below is
+/// reading the inheritance, not an empty corpus.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_compound_nodes_atom_count_excludes_unreadable_atoms(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let p = fixture::seed_public_claim(&pool, t.agent, "compound P").await;
+    let a_pub = fixture::seed_public_claim(&pool, t.agent, "public atom").await;
+    let a_priv = fixture::seed_group_claim(&pool, t.agent, t.group, "private atom").await;
+    edge(&pool, p, a_pub, "decomposes_to").await;
+    let world = fixture::world_group(&pool).await;
+    let forced = edge(&pool, p, a_priv, "decomposes_to").await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(forced)
+    .bind(world)
+    .execute(&pool)
+    .await
+    .expect("force the edge public");
+    // Both memberships are DECLARED public; arm (c) re-stamps a_priv's.
+    let nbhd = neighborhood(&pool, &[a_pub, a_priv]).await;
+
+    let count_for = |rows: &[epigraph_db::CompoundNodeRow]| {
+        rows.iter()
+            .find(|r| r.id == p)
+            .map(|r| r.atom_count)
+            .expect("P is a compound")
+    };
+
+    let owner = GraphViewRepository::neighborhood_compound_nodes(&pool, &t.owner, nbhd)
+        .await
+        .expect("owner compound nodes");
+    assert_eq!(count_for(&owner), 2, "the owner reads both atoms");
+
+    let stranger = GraphViewRepository::neighborhood_compound_nodes(&pool, &t.stranger, nbhd)
+        .await
+        .expect("stranger compound nodes");
+    assert_eq!(
+        count_for(&stranger),
+        1,
+        "a stranger must not learn that P decomposes into an atom it cannot read"
+    );
+}

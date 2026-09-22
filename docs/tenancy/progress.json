@@ -2087,17 +2087,6 @@
       "disposition_date": "2026-09-12"
     },
     {
-      "id": "F-atom-count-cardinality",
-      "where": "crates/epigraph-db/src/repos/graph_view.rs::neighborhood_compound_nodes",
-      "what": "atom_count is derived from an `atoms` CTE filtered only on claim_neighborhood_membership, not on claims",
-      "detail": "The CTE carries /* {VISIBILITY:m} */ only; the returned atom_count therefore tells a stranger how many atoms a compound decomposes into, including atoms whose claims rows it cannot read. No invisible content escapes - the final SELECT filters the compound's own claims row. Inert today because claim_neighborhood_membership.visibility defaults to 'public'. Reportable because MassFunctionRepository::count_for_claim's doc, added by this same PR, spends a paragraph forbidding exactly this shape ('a bare COUNT(*) here would be a cardinality oracle'), and applying that standard in one file and not two files away is an inconsistency worth recording.",
-      "status": "open",
-      "assigned": "PR-16 — travels with F-edges-unfiltered's residual (neighborhood_compound_nodes is one of the never-filtered statements PR-13 left open, so the two must be fixed by the same pass over graph_view.rs)",
-      "disposition": "CONVERSION-TAIL",
-      "disposition_note": "Belongs to the unnumbered conversion tail. Re-labelled from an owner that is now delivered, or from 'the conversion-shard series', which is not a scheduled PR and so was not an owner. This is real remaining work with no owner TODAY; whether to schedule it is an open operator decision and the expectation is that some of it will be scheduled. The label records the absence of a current owner, NOT a decision to leave it undone.",
-      "disposition_date": "2026-09-12"
-    },
-    {
       "id": "F-single-spend-handlers-unreviewed",
       "where": "crates/epigraph-api/src/routes/ (97 ViewerExtractor handlers, 62 of which reference `viewer` exactly once)",
       "what": "No mechanical check distinguishes a handler that spends its Viewer on the content read from one that spends it on an unrelated scalar",
@@ -3130,6 +3119,19 @@
       "pre_fix_owner_reasoning": "An UNCONDITIONAL entry is ruled out by measurement, not by preference: it would refuse every pre-089 database, which is the plan 9.2 step (i) failure the two-tier split exists to prevent. A gate on 089's own function (or on the _sqlx_migrations version-89 row) is available and would not be vacuous - it would catch a manually dropped trigger. That is the reasoning the delivered tier follows.",
       "closed_date": "2026-09-14",
       "closed_by": "tenancy/fix-security-track"
+    },
+    {
+      "id": "F-atom-count-cardinality",
+      "where": "crates/epigraph-db/src/repos/graph_view.rs::neighborhood_compound_nodes",
+      "what": "atom_count is derived from an `atoms` CTE filtered only on claim_neighborhood_membership, not on claims",
+      "detail": "The CTE carries /* {VISIBILITY:m} */ only; the returned atom_count therefore tells a stranger how many atoms a compound decomposes into, including atoms whose claims rows it cannot read. No invisible content escapes - the final SELECT filters the compound's own claims row. Inert today because claim_neighborhood_membership.visibility defaults to 'public'. Reportable because MassFunctionRepository::count_for_claim's doc, added by this same PR, spends a paragraph forbidding exactly this shape ('a bare COUNT(*) here would be a cardinality oracle'), and applying that standard in one file and not two files away is an inconsistency worth recording.",
+      "status": "CLOSED 2026-09-22 by the edges-unfiltered pass (fix/deferred-2026-09-22-lane-b). DISCHARGED without a code change: the entry's premise was stale -- see closing_measurement; pinned by crates/epigraph-db/tests/edge_viewer_predicates.rs::neighborhood_compound_nodes_atom_count_excludes_unreadable_atoms.",
+      "assigned": "PR-16 — travels with F-edges-unfiltered's residual (neighborhood_compound_nodes is one of the never-filtered statements PR-13 left open, so the two must be fixed by the same pass over graph_view.rs)",
+      "disposition": "CLOSED",
+      "disposition_note": "RE-DISPOSED 2026-09-22 from CONVERSION-TAIL. The 2026-09-12 note ('real remaining work with no owner TODAY') is superseded: the work it named -- adding a claims predicate to the `atoms` CTE -- turned out to be unnecessary, because the predicate the CTE already carries IS a claims predicate by construction (closing_measurement). The earlier CONVERSION-TAIL label is not retroactively wrong; it was assigned before anyone re-measured the premise.",
+      "disposition_date": "2026-09-22",
+      "fix_batch": "fix/deferred-2026-09-22-lane-b (deferred-commitment screen key edges-unfiltered)",
+      "closing_measurement": "THE DETAIL'S PREMISE PREDATES MIGRATION 070. It reasoned that /* {VISIBILITY:m} */ is inert because claim_neighborhood_membership.visibility 'defaults to public'. But claim_neighborhood_membership (and claim_cluster_membership) are in 070 arm (c)'s `inheritors` array, whose statement-level stamp is UNCONDITIONAL -- a membership row takes its claim's (visibility, owner_group_id) whatever the writer declared -- and arm (d) re-stamps it whenever the claim's tenancy changes. So {VISIBILITY:m} filters on the atom's claims row by construction, and atom_count never counted an atom the viewer cannot read on any row the triggers wrote. MEASURED on the lane DB (head 100): a fixture that declares BOTH memberships 'public' and additionally forces the compound->private-atom edge ('public', world) -- so the edge predicate added for F-edges-unfiltered cannot be what hides it -- gives the stranger atom_count 1 and the owner 2 with graph_view.rs unchanged; the membership row reads back visibility='group'. Forcing the MEMBERSHIP row public as well, by a bare UPDATE no trigger re-stamps, makes the stranger's count 2 -- so the pin reads the inheritance, not an empty corpus. A redundant `JOIN claims ac ... /* {VISIBILITY:ac} */` on the CTE was written, measured to change no observable result on any trigger-written state, and withdrawn: a PK join per member that defends only against a hand-UPDATE making a membership row's tenancy diverge from its claim's, a state no trigger and no repo write produces."
     }
   ],
   "halted": null,
