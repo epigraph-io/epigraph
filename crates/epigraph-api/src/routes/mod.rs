@@ -614,6 +614,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/entities/:id/neighborhood",
             get(entities::entity_neighborhood),
         )
+        .route("/api/v1/evidence", get(crud::list_evidence))
         .route("/api/v1/evidence/:id", get(edges::get_evidence))
         .route(
             "/api/v1/claims/:id/provenance",
@@ -1094,6 +1095,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/graph/edges", get(edges::graph_edges))
         .route("/api/v1/graph/full", get(edges::graph_full))
+        .route("/api/v1/evidence", get(crud::list_evidence))
         .route("/api/v1/evidence/:id", get(edges::get_evidence))
         .route(
             "/api/v1/claims/:id/provenance",

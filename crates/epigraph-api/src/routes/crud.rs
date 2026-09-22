@@ -1,5 +1,6 @@
 //! CRUD endpoints for entities missing create/update routes.
 //!
+//! - `GET  /api/v1/evidence` — List evidence (paged, filtered, redacted)
 //! - `POST /api/v1/evidence` — Create evidence record
 //! - `PUT /api/v1/evidence/:id` — Update evidence (raw_content backfill)
 //! - `POST /api/v1/reasoning-traces` — Create reasoning trace
@@ -11,12 +12,187 @@
 use crate::errors::ApiError;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// =============================================================================
+// LIST EVIDENCE
+// =============================================================================
+
+/// Query parameters for `GET /api/v1/evidence`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListEvidenceQuery {
+    /// Restrict to evidence attached to this claim.
+    pub claim_id: Option<Uuid>,
+    /// Exact match on the stored `evidence_type` column. Vocabulary:
+    /// `document`, `observation`, `testimony`, `computation`, `reference`,
+    /// `figure`, `conversational` (the `evidence_type_valid` CHECK
+    /// constraint). Note `Literature` is stored as `reference` and
+    /// `Consensus` as `computation`.
+    pub evidence_type: Option<String>,
+    /// Case-insensitive substring match on `raw_content`. Rows with a NULL
+    /// `raw_content` never match this predicate.
+    pub content_contains: Option<String>,
+    /// Page size; clamped to `[MIN_PAGE_LIMIT, MAX_PAGE_LIMIT]`.
+    pub limit: Option<i64>,
+    /// Rows to skip; negative values are clamped to 0.
+    pub offset: Option<i64>,
+}
+
+/// One row of `GET /api/v1/evidence`.
+///
+/// Field set is the redaction-relevant subset of
+/// [`super::edges::get_evidence`]'s single-row response: `content`,
+/// `source_url` and `caption` are the fields that carry substance and are
+/// therefore gated together.
+#[derive(Debug, Serialize)]
+pub struct EvidenceListItem {
+    pub id: Uuid,
+    pub claim_id: Uuid,
+    pub evidence_type: String,
+    pub content: Option<String>,
+    pub content_hash: String,
+    pub source_url: Option<String>,
+    pub caption: Option<String>,
+    /// `evidence.signer_id`; NULL for unsigned evidence.
+    pub agent_id: Option<Uuid>,
+    pub created_at: String,
+    /// `true` when the requester lacks access to the linked claim and
+    /// `content` / `source_url` / `caption` were gated. Explicit so a sweep
+    /// can tell "no transcript stored" apart from "withheld".
+    pub redacted: bool,
+}
+
+/// Response body for `GET /api/v1/evidence`.
+#[derive(Debug, Serialize)]
+pub struct ListEvidenceResponse {
+    pub evidence: Vec<EvidenceListItem>,
+    /// Exact `COUNT(*)` over the same predicates, evaluated by PostgreSQL —
+    /// NOT `evidence.len()`.
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// List evidence rows, paged and filtered.
+///
+/// `GET /api/v1/evidence?claim_id=…&evidence_type=…&content_contains=…&limit=…&offset=…`
+///
+/// Before this route existed the collection path carried only `post`, so a
+/// `GET` fell through to axum's 405 and the 123k-row `evidence` table could
+/// only be read one row at a time through `GET /api/v1/evidence/:id` (backlog
+/// `d7aab418`). An export or redaction sweep had to either join from a claim
+/// keep-set — which misses evidence whose claim is gone — or go around the API
+/// with raw SQL, which the no-raw-SQL convention forbids.
+///
+/// # Redaction
+///
+/// Evidence rows hold verbatim tool/API transcripts and routinely name people
+/// the claim text never mentions, so every row is passed through
+/// [`check_content_access`] against its linked claim and gated exactly as
+/// [`super::edges::get_evidence`] gates a single row. The requester is derived
+/// from the authenticated `AuthContext` only; there is no wire `agent_id`
+/// parameter to spoof.
+///
+/// Access is keyed on the `evidence.claim_id` **foreign key**, not on the
+/// `claim -> evidence` edge that `get_evidence` follows. The FK is `NOT NULL`
+/// on every row, whereas the edge is written by a separate statement and is
+/// absent for evidence created through `POST /api/v1/evidence`; keying a
+/// collection sweep on the edge would silently return *unredacted* content for
+/// every row whose edge was never written.
+///
+/// # Cost
+///
+/// One `check_content_access` round-trip per returned row, bounded by
+/// `MAX_PAGE_LIMIT` (100). This matches the existing per-item pattern in
+/// `claims::list_claims` and `paper_queries::query_paper`; it is an N+1 that a
+/// batched ownership lookup could flatten, but diverging from the shared
+/// helper would risk diverging from its community-membership semantics.
+#[cfg(feature = "db")]
+pub async fn list_evidence(
+    State(state): State<AppState>,
+    Query(params): Query<ListEvidenceQuery>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<ListEvidenceResponse>, ApiError> {
+    use epigraph_db::access_control::{check_content_access, ContentAccess};
+    use epigraph_db::{EvidenceListFilter, EvidenceRepository};
+
+    let limit = params
+        .limit
+        .unwrap_or(super::claims::DEFAULT_PAGE_LIMIT)
+        .clamp(super::claims::MIN_PAGE_LIMIT, super::claims::MAX_PAGE_LIMIT);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let filter = EvidenceListFilter {
+        claim_id: params.claim_id,
+        evidence_type: params.evidence_type.as_deref(),
+        content_contains: params.content_contains.as_deref(),
+    };
+
+    let rows = EvidenceRepository::list_filtered(&state.db_pool, &filter, limit, offset).await?;
+    let total = EvidenceRepository::count_filtered(&state.db_pool, &filter).await?;
+
+    // SECURITY: the requester is the authenticated identity, never a wire
+    // parameter (the A3 hardening applied to every other read path).
+    let requester = auth_ctx
+        .as_ref()
+        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
+
+    let mut evidence = Vec::with_capacity(rows.len());
+    for row in rows {
+        let redacted = check_content_access(&state.db_pool, row.claim_id, requester).await
+            == ContentAccess::Redacted;
+
+        let caption = row
+            .properties
+            .get("caption")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+
+        evidence.push(EvidenceListItem {
+            id: row.id,
+            claim_id: row.claim_id,
+            evidence_type: row.evidence_type,
+            content: if redacted {
+                Some("[REDACTED]".to_string())
+            } else {
+                row.raw_content
+            },
+            content_hash: hex::encode(&row.content_hash),
+            source_url: if redacted { None } else { row.source_url },
+            caption: if redacted { None } else { caption },
+            agent_id: row.signer_id,
+            created_at: row.created_at.to_rfc3339(),
+            redacted,
+        });
+    }
+
+    Ok(Json(ListEvidenceResponse {
+        evidence,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+/// List evidence rows (no-database build).
+///
+/// Mirrors [`super::edges::get_evidence`]'s `cfg(not(feature = "db"))` twin:
+/// the route stays registered so the path reports "no backing store" rather
+/// than reverting to the 405 this change removed.
+#[cfg(not(feature = "db"))]
+pub async fn list_evidence(
+    State(_state): State<AppState>,
+    Query(_params): Query<ListEvidenceQuery>,
+) -> Result<Json<ListEvidenceResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "database".to_string(),
+    })
+}
 
 // =============================================================================
 // CREATE EVIDENCE

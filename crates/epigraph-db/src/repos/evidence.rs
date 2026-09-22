@@ -9,6 +9,59 @@ use uuid::Uuid;
 /// Repository for Evidence operations
 pub struct EvidenceRepository;
 
+/// Filter set for [`EvidenceRepository::list_filtered`] /
+/// [`EvidenceRepository::count_filtered`].
+///
+/// Every field is `None` by default, which means "no predicate" — a
+/// `Default`-constructed filter selects the whole `evidence` table.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EvidenceListFilter<'a> {
+    /// Restrict to evidence attached to this claim, via the `evidence.claim_id`
+    /// foreign key (`NOT NULL` since migration 001).
+    pub claim_id: Option<Uuid>,
+    /// Exact match on the `evidence.evidence_type` **text column**.
+    ///
+    /// That column — not the `properties` JSONB blob — is what
+    /// [`EvidenceRepository::evidence_type_to_db_string`] writes, and its
+    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint in
+    /// migration 001: `document`, `observation`, `testimony`, `computation`,
+    /// `reference`, `figure`, `conversational`. Note that the Rust
+    /// `EvidenceType` variant names do **not** all match: `Literature` is
+    /// stored as `reference` and `Consensus` as `computation`. Callers filter
+    /// with the stored spelling.
+    pub evidence_type: Option<&'a str>,
+    /// Case-insensitive substring match on `raw_content`.
+    ///
+    /// `raw_content` is nullable and `NULL ILIKE '%x%'` is NULL, not true, so
+    /// this predicate silently excludes every row with no stored transcript.
+    /// That is the intended behaviour for a content sweep, but it means
+    /// `total` under this filter is not comparable with the unfiltered total.
+    pub content_contains: Option<&'a str>,
+}
+
+/// One row of [`EvidenceRepository::list_filtered`].
+///
+/// Deliberately a row struct rather than the domain [`Evidence`] type: the
+/// `source_url` column and the raw `properties` JSONB (which carries the
+/// figure `caption`) are both needed by the HTTP read route for field-level
+/// redaction, and neither survives the round-trip through `Evidence`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EvidenceListRow {
+    pub id: Uuid,
+    pub claim_id: Uuid,
+    /// The stored `evidence_type` text column (see
+    /// [`EvidenceListFilter::evidence_type`] for the vocabulary).
+    pub evidence_type: String,
+    pub raw_content: Option<String>,
+    pub content_hash: Vec<u8>,
+    pub source_url: Option<String>,
+    pub properties: serde_json::Value,
+    /// `NULL` for unsigned evidence (DB constraint
+    /// `evidence_signature_requires_signer`).
+    pub signer_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Build Evidence from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -266,6 +319,101 @@ impl EvidenceRepository {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Shared `WHERE` clause for [`Self::list_filtered`] and
+    /// [`Self::count_filtered`], mirroring `ClaimRepository::FILTER_WHERE`.
+    ///
+    /// One clause, one bind helper: the count and the page it describes cannot
+    /// drift apart, because there is only one place either could change.
+    const FILTER_WHERE: &'static str = r#"
+            WHERE ($1::uuid IS NULL OR claim_id = $1)
+              AND ($2::text IS NULL OR evidence_type = $2)
+              AND ($3::text IS NULL OR raw_content ILIKE $3)
+    "#;
+
+    /// Bind `$1..$3` of [`Self::FILTER_WHERE`], in order.
+    ///
+    /// Generic over the output type so the row query and the count query share
+    /// one implementation.
+    fn bind_filter<'q, O>(
+        query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+        filter: &EvidenceListFilter<'_>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+        query
+            .bind(filter.claim_id)
+            .bind(filter.evidence_type.map(str::to_owned))
+            .bind(filter.content_contains.map(|s| format!("%{s}%")))
+    }
+
+    /// Count the evidence rows matching `filter` — a real `COUNT(*)`
+    /// evaluated by PostgreSQL over the whole table.
+    ///
+    /// Paired with [`Self::list_filtered`], which applies the identical
+    /// predicates before `LIMIT`/`OFFSET`. A caller reporting
+    /// `rows.len()` as the total would understate any result larger than one
+    /// page, which is the defect this pair exists to avoid (backlog
+    /// `d7aab418`).
+    ///
+    /// Uses the runtime `query_as` form deliberately: no compile-time `.sqlx`
+    /// cache entry, so this change needs no `cargo sqlx prepare`.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    #[instrument(skip(pool, filter))]
+    pub async fn count_filtered(
+        pool: &PgPool,
+        filter: &EvidenceListFilter<'_>,
+    ) -> Result<i64, DbError> {
+        let sql = format!("SELECT COUNT(*) FROM evidence{}", Self::FILTER_WHERE);
+        // `query_scalar` is `query_as` over a 1-tuple; going through the tuple
+        // form lets `bind_filter` serve both methods.
+        let (count,): (i64,) = Self::bind_filter(sqlx::query_as::<_, (i64,)>(&sql), filter)
+            .fetch_one(pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// List the evidence rows matching `filter`, paginated **in SQL**.
+    ///
+    /// All predicates run before `LIMIT`/`OFFSET`, so a matching row is
+    /// reachable regardless of how old it is — the property that makes the
+    /// 123k-row `evidence` table sweepable through the API at all.
+    ///
+    /// `ORDER BY created_at DESC, id DESC` carries an `id` tiebreaker so paging
+    /// is stable across rows sharing a `created_at` (bulk ingestion writes many
+    /// evidence rows inside one transaction, all with the same timestamp — an
+    /// unstable sort there would both duplicate and skip rows across pages).
+    ///
+    /// Uses the runtime `query_as` form; see [`Self::count_filtered`].
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    #[instrument(skip(pool, filter))]
+    pub async fn list_filtered(
+        pool: &PgPool,
+        filter: &EvidenceListFilter<'_>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<EvidenceListRow>, DbError> {
+        let sql = format!(
+            r#"
+            SELECT id, claim_id, evidence_type, raw_content, content_hash,
+                   source_url, properties, signer_id, created_at
+            FROM evidence{where_clause}
+            ORDER BY created_at DESC, id DESC
+            LIMIT $4 OFFSET $5
+            "#,
+            where_clause = Self::FILTER_WHERE,
+        );
+
+        let rows = Self::bind_filter(sqlx::query_as::<_, EvidenceListRow>(&sql), filter)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?;
+
+        Ok(rows)
     }
 
     /// Convert EvidenceType enum to database string
