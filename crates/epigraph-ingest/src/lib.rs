@@ -439,6 +439,90 @@ mod tests {
         }
     }
 
+    /// Drift guard for `document::stored_content_hash_is_seed_scoped`.
+    ///
+    /// MCP `verify_claim` routes on that predicate to decide between "this body
+    /// disagrees with its digest" (tampering) and "this digest is not a function
+    /// of the body, so content-hash verification does not apply". A false
+    /// negative turns every untampered structural row of every ingested document
+    /// into a tampering accusation; a false positive silently excuses a real
+    /// mutation. Both directions are asserted here, against the plans the
+    /// builders actually produce and against the actual stored digest — so the
+    /// predicate is pinned to the writer, not to a snapshot of it.
+    #[test]
+    fn seed_scoped_predicate_matches_the_stored_digest() {
+        use crate::common::ids::content_hash;
+        use crate::document::stored_content_hash_is_seed_scoped;
+
+        let doc_json = r#"{
+            "source": {"title": "Seed Scope Guard Paper", "source_type": "Paper", "authors": []},
+            "thesis": "Thesis statement",
+            "sections": [{
+                "title": "Intro",
+                "paragraphs": [{
+                    "text": "A paragraph.",
+                    "atoms": ["An atomic assertion."],
+                    "generality": [1],
+                    "confidence": 0.8
+                }]
+            }],
+            "relationships": []
+        }"#;
+        let doc: DocumentExtraction = serde_json::from_str(doc_json).unwrap();
+        let doc_plan = crate::document::build_ingest_plan(&doc);
+
+        let wf_json = r#"{
+            "source": {"canonical_name": "seed-scope-guard-wf", "goal": "G", "generation": 0, "authors": []},
+            "thesis": "Workflow thesis",
+            "phases": [{
+                "title": "Phase", "summary": "Phase summary",
+                "steps": [{
+                    "compound": "Step compound",
+                    "operations": ["An operation."],
+                    "generality": [1], "confidence": 0.9
+                }]
+            }]
+        }"#;
+        let wf: crate::workflow::WorkflowExtraction = serde_json::from_str(wf_json).unwrap();
+        let wf_plan = crate::workflow::build_ingest_plan(&wf);
+
+        // The predicate must agree with the observable fact it stands in for:
+        // "the stored digest is not blake3(content)". Checked over BOTH builders,
+        // because the workflow builder binds the PLAIN hash on its compound
+        // nodes — `level < 3` alone would misclassify all of them.
+        let mut seed_scoped_seen = 0_usize;
+        for (label, plan) in [("document", &doc_plan), ("workflow", &wf_plan)] {
+            for c in &plan.claims {
+                let plain = content_hash(&c.content);
+                let digest_is_derivable = c.content_hash == plain;
+                let predicate = stored_content_hash_is_seed_scoped(&c.properties);
+                if predicate {
+                    seed_scoped_seen += 1;
+                }
+                assert_eq!(
+                    predicate,
+                    !digest_is_derivable,
+                    "{label} level-{} claim {:?}: predicate said {predicate} but the plan \
+                     stores {} — a reader routing on this would report the wrong integrity \
+                     state (properties: {})",
+                    c.level,
+                    c.content,
+                    if digest_is_derivable {
+                        "blake3(content)"
+                    } else {
+                        "a seed-scoped digest"
+                    },
+                    c.properties
+                );
+            }
+        }
+        assert!(
+            seed_scoped_seen >= 3,
+            "guard is vacuous unless the document plan contributes its thesis, section and \
+             paragraph rows; saw {seed_scoped_seen}"
+        );
+    }
+
     #[test]
     fn test_normalize_claim_path() {
         use crate::builder::normalize_claim_path;

@@ -1072,11 +1072,92 @@ pub struct SubmitClaimResponse {
     pub frame_id: Option<String>,
 }
 
+/// Outcome of the content-integrity half of MCP `verify_claim`.
+///
+/// Three states, not two, because `claims.content_hash` is NOT `blake3(content)`
+/// for every row. The canonical Tier-1 document pipeline deliberately binds
+/// `compound_content_hash(blake3(text), artifact_seed)` on every level-0/1/2
+/// (thesis / section / paragraph) node —
+/// `epigraph_ingest::common::plan::PlannedClaim::content_hash` states the
+/// contract, and migration 013's `UNIQUE (content_hash, agent_id)` is why it
+/// exists. Collapsing that class into a boolean forces a wrong answer whichever
+/// way the boolean falls: `true` is the always-passing theatre backlog
+/// `49c17386` was filed about, `false` is a confident tampering accusation
+/// against every untampered structural row in the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HashCheck {
+    /// BLAKE3 over the body reproduces the stored digest. The body is intact
+    /// *with respect to the digest* — who vouched for the digest is
+    /// [`VerifyResponse::signature_valid`]'s question, not this one.
+    Match,
+    /// BLAKE3 over the body does NOT reproduce the stored digest, and this row's
+    /// digest is supposed to be `blake3(content)`. **This is the tampering
+    /// signal** — the body was mutated without rewriting the hash.
+    Mismatch,
+    /// The stored digest is not a function of the body alone, so comparing them
+    /// decides nothing. Reported for document-scoped compound rows, detected via
+    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`.
+    ///
+    /// **Undecided, not clean.** Content-hash verification cannot rule tampering
+    /// in *or* out here: the artifact seed that went into the stored digest is
+    /// not carried on the claim, so the digest cannot be recomputed, and a
+    /// guessed seed would manufacture false confidence. Treat this as "no
+    /// integrity evidence available", and use the signature half plus the
+    /// document's own provenance instead.
+    NotApplicable,
+}
+
+/// Result of MCP `verify_claim`.
+///
+/// # A claim is attested only when `signed && signature_valid && hash_check == match`
+///
+/// The two checks are INDEPENDENT and neither implies the other. The signature
+/// attests the digest; the digest attests the body. An attacker who mutates
+/// `claims.content` while leaving `content_hash` and `signature` untouched
+/// yields `{signed: true, signature_valid: true, hash_check: "mismatch"}` — the
+/// signature is genuinely valid over a digest the body no longer matches, so a
+/// caller reading `signature_valid` alone is still fooled. Conversely a
+/// consistent body/digest pair says nothing about who wrote it.
+///
+/// `hash_check: "not_applicable"` is a third outcome and is NOT a failure
+/// report: it means this row's digest is not derivable from its body by
+/// construction (see [`HashCheck::NotApplicable`]), so the body-attests step is
+/// simply unavailable. `{signed: true, signature_valid: true, hash_check:
+/// "not_applicable"}` says a known key vouched for the stored digest and says
+/// nothing at all about whether the body still matches it. Do not read that
+/// combination as attestation of the content.
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
+    /// Whether the stored Ed25519 signature verifies against the signer's
+    /// `agents.public_key` over the **stored** `content_hash`.
+    ///
+    /// `false` covers two very different states — read it together with
+    /// [`Self::signed`]: `signed = false` means the claim carries no signature
+    /// at all (nothing to verify), `signed = true` with
+    /// `signature_valid = false` means a signature is present and REJECTED.
     pub signature_valid: bool,
-    pub hash_matches: bool,
+    /// Whether the claim was signed at all (`claims.signature IS NOT NULL`).
+    ///
+    /// Added with backlog `49c17386`: `signature_valid` alone conflated
+    /// "unsigned" with "bad signature", and while `claim_from_row` hardcoded
+    /// `signature = None` every claim looked like the latter.
+    pub signed: bool,
+    /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
+    /// only [`HashCheck::Mismatch`] is evidence of tampering.
+    pub hash_check: HashCheck,
+    /// [`Self::hash_check`] as a boolean for callers that only branch two ways:
+    /// `Some(true)` for `match`, `Some(false)` for `mismatch`, and `None` (JSON
+    /// `null`) for `not_applicable`.
+    ///
+    /// Never `false` for the not-applicable class. That is the whole point: a
+    /// `false` here is a positive claim that the body and its digest disagree,
+    /// and emitting it for a row whose digest was never `blake3(content)` would
+    /// libel every thesis/section/paragraph written by `ingest_document`. A
+    /// consumer that treats `null` as untrustworthy fails safe; one that treats
+    /// it as a mismatch is reading a verdict that was not given.
+    pub hash_matches: Option<bool>,
     pub truth_value: f64,
 }
 
