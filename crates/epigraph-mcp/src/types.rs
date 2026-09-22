@@ -2196,6 +2196,7 @@ pub struct ResolveBacklogItemParams {
     ///     skips it.
     ///   * `semantic_graph_neighbors` hard-codes its relationship set and does
     ///     not include `justifies`, so no existing traversal consumes it.
+    ///
     /// What it DOES buy: the basis is recorded durably and is reverse-queryable
     /// — given a retracted basis, a query on `edges.source_id` finds every
     /// closure that rested on it. Making the cascade act on that automatically
