@@ -1115,6 +1115,58 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
+    /// The subset of `claim_ids` that occupy the **paragraph** role —
+    /// `(properties->>'level')::int = 2` — as the viewer sees them.
+    ///
+    /// Backlog `4e856a99`. `recall_with_context` is paragraph-primary on every
+    /// ANN surface it has: the flat kNN is level=2 only and the diverse path
+    /// coerces to level=2. Its graph-expansion pool
+    /// ([`Self::graph_expand_seeds_since`]) had no level predicate at all, so a
+    /// level-3 atom reached over a `supports`/`elaborates` edge could be folded
+    /// straight into the top-level hit list beside paragraphs — and
+    /// `ingest_document` writes a `paper -asserts-> claim` edge for EVERY
+    /// planned claim including atoms, so the paper-attribution drop downstream
+    /// does not catch it. This is the predicate that does.
+    ///
+    /// The spelling is deliberately IDENTICAL to the one the seed surfaces use
+    /// (`recall.rs`'s flat kNN and sibling queries, `Self::nearest_by_embedding`
+    /// and friends), so the two candidate-producing surfaces cannot drift into
+    /// disagreeing about what a paragraph is.
+    ///
+    /// A claim with NO `level` property is therefore also excluded — `NULL` is
+    /// not `2`. That is the `decompose_claims` population, which carries no
+    /// level property at all and was never reachable as a top-level
+    /// `recall_with_context` hit on any path, so excluding it here changes
+    /// nothing; it is stated because the arm is silent in the SQL.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn paragraph_level_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id FROM claims \
+             WHERE id = ANY($1) AND (properties->>'level')::int = 2 \
+             /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect())
+    }
+
     /// Walk a claim's supersession chain and return every version the viewer
     /// may see, oldest first (`depth` 0 = root).
     ///

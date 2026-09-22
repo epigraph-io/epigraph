@@ -617,7 +617,11 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    tool layer (which only takes a single relationship string and returns
 ///    a serialized `CallToolResult`).
 /// 2. Dedup: a claim already in `seeds` is never added a second time as an
-///    expansion hit, even if graph-reachable from another seed.
+///    expansion hit, even if graph-reachable from another seed. Then the level
+///    filter (backlog `4e856a99`): only `(properties->>'level')::int = 2`
+///    claims are EMITTED, matching both ANN seed surfaces. The walk still
+///    traverses through non-paragraphs; it just cannot promote one into the
+///    top-level hit list.
 /// 3. Assign each expanded claim a base "similarity" derived from the
 ///    HIGHEST-similarity seed in the whole seed set, decayed by the hop
 ///    count at which BFS first reached the claim
@@ -661,6 +665,36 @@ async fn apply_graph_expansion(
     )
     .await
     .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+
+    // ... and every row it contributes must ALSO be a paragraph (backlog
+    // 4e856a99). Both ANN seed surfaces are level=2 only — the flat kNN by its
+    // own SQL, the diverse path by `paragraph_only: true` — but the walk above
+    // has no level predicate, and `EXPANSION_RELATIONSHIPS`
+    // (supports/corroborates/elaborates) includes atom-atom edges. So a level-3
+    // atom could be folded into `raw_hits` as a TOP-LEVEL hit, where the
+    // batched context fetch then returns it with empty `atoms` and no
+    // `section`, beside paragraphs that have both.
+    //
+    // The paper-attribution drop further down does NOT already catch this:
+    // `ingest_document` writes a `paper -asserts-> claim` edge for every
+    // planned claim, atoms included, so an atom has paper meta and survives.
+    //
+    // Filtered HERE rather than inside the SQL walk on purpose: the BFS must
+    // still be able to traverse THROUGH an atom to reach a paragraph beyond it.
+    // Pushing the predicate into the walk would silently change reachability,
+    // not just emission. The cost is that a filtered-out atom has already
+    // consumed one unit of the walk's emission budget.
+    let paragraph_ids = epigraph_db::ClaimRepository::paragraph_level_ids(
+        pool,
+        viewer,
+        &expansion.iter().map(|h| h.claim_id).collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|e| internal_error(format!("graph expansion level filter: {e}")))?;
+    let expansion: Vec<_> = expansion
+        .into_iter()
+        .filter(|h| paragraph_ids.contains(&h.claim_id))
+        .collect();
 
     // Best (highest) decayed score per expanded claim, in case it's
     // reachable from more than one seed at different hop counts / seed
