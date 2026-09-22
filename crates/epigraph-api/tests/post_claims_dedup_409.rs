@@ -22,7 +22,11 @@ async fn duplicate_create_strict_returns_409() {
 
     let agent = common::seed_system_agent(&pool).await;
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    // PR-03: `create_claim` derives the author's public key from the token's
+    // `agent_id` and 401s when there is none — the `[0u8; 32]` fallback is gone.
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["claims:write"], agent)
+            .await;
 
     // Unique content per run so the test is independent of prior DB state.
     let content = format!("c11c1295 dedup regression {}", uuid::Uuid::new_v4());

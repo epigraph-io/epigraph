@@ -5,6 +5,39 @@
 //!
 //! - `POST /api/v1/papers` — Create or upsert a paper by DOI
 //! - `GET  /api/v1/papers` — List papers with optional `?doi=` filter
+//!
+//! # Tenancy: shard 4 measured this file and converted NOTHING
+//!
+//! That is the result of the measurement, not an omission from it.
+//!
+//! `epigraph-db/tests/no_unscoped_pool.rs` records 8 sites here, and the recon
+//! that sized conversion shard 4 classified all 8 as reads. Re-measured against
+//! the tree and the schema, neither half of that holds, and the register keeps
+//! its row at 8:
+//!
+//! * **Two of the eight are writes** (`create_paper`'s `UPDATE papers` and its
+//!   `INSERT ... RETURNING`, the latter issued as a `fetch_one` so a needle
+//!   looking for `execute` misses it). `read_as` is read-only by construction;
+//!   see `routes/belief.rs`'s module doc for why routing a write through it is a
+//!   silent rollback rather than a compile error.
+//! * **Neither handler holds a `Viewer`**, so all eight sites would need an
+//!   extractor added to BOTH `#[cfg]` arms before any of them could be
+//!   converted. Both routes already sit on the authenticated router, so that is
+//!   not an anonymous-access change — but `ViewerExtractor` additionally refuses
+//!   a token that carries no agent id, which IS a callable behaviour change and
+//!   needs its own evidence.
+//! * **Converting the remaining six would have moved `HIGH_WATER` by 6 and
+//!   changed no row this endpoint returns.** That is the operational
+//!   conclusion of a schema measurement taken at migration head 092; the
+//!   measurement itself is registered as `F-SHARD4-A3` and is not restated
+//!   here. The ratchet counts these sites because its needle is textual.
+//!
+//! So converting this file would have cost a real behaviour change and bought
+//! a counter movement — the exact trade the ratchet's own module doc warns a
+//! shard against ("check the CONTROL before the counter").
+//!
+//! `F-SHARD4-A3` needs an operator decision and this batch is not positioned to
+//! make it. Analysis held outside this repository.
 
 use crate::errors::ApiError;
 use crate::state::AppState;

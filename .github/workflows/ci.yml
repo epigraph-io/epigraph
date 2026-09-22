@@ -13,6 +13,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Bound the job. Every job here inherited GitHub's 6-hour default, so a
+    # hung step burned six hours and left the merge watcher reporting "pending"
+    # with no signal to act on — PR-19 saw one step run ~40 minutes against a
+    # 7-12 minute norm with nothing to compare it to. 90 minutes is ~7x the
+    # observed norm: a real slowdown still finishes, a hang is cut off with a
+    # named cause.
+    timeout-minutes: 90
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -28,12 +35,33 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      # PR-16 (ops F9). `epigraph-migrate` reads MIGRATION_DATABASE_URL and
+      # falls back to DATABASE_URL with a WARN, so CI would still pass without
+      # this line -- and would then never exercise the variable the deploy path
+      # uses. Set it explicitly so the "Run migrations" step below is a real
+      # test of the new code path rather than of the fallback.
+      #
+      # Same DSN as DATABASE_URL here on purpose: the service container's
+      # POSTGRES_USER is a superuser, so there is only one credential to give.
+      # Splitting the migration role from the application role is a DEPLOYMENT
+      # concern (docs/deploy.md) that a single-container CI service cannot
+      # model, and pretending otherwise with a second identical-privilege role
+      # would assert a separation that is not there.
+      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
       SQLX_OFFLINE: "true"
-      # The claim fixtures in crates/epigraph-db/tests/claim_repo_helpers.rs and
-      # crates/epigraph-mcp/tests/common/mod.rs DROP uq_claims_content_hash_agent
-      # and run a table-wide dedup DELETE on `claims`. They now refuse to run
-      # unless the target database looks disposable (`_sqlx_test*` / `*_test`) or
-      # this flag is set.
+      # The claim fixtures in crates/epigraph-mcp/tests/common/mod.rs DROP
+      # uq_claims_content_hash_agent and run a table-wide dedup DELETE on
+      # `claims`. They refuse to run unless the target database looks disposable
+      # (`_sqlx_test*` / `*_test`) or this flag is set.
+      #
+      # epigraph-db's claim_repo_helpers.rs was on this list until its fixtures
+      # moved to #[sqlx::test]. It now gets a private database per test, so the
+      # pool-construction guard had nothing left to protect and was removed with
+      # the shared-pool harness. (The db_is_disposable CLASSIFIER stays in that
+      # file — it is the reference implementation the mcp and api copies cite —
+      # but nothing in epigraph-db consults this variable any more.)
+      #
+      # This variable STAYS: epigraph-mcp still needs it.
       #
       # The postgres service above is named `epigraph` — the same name as the
       # long-lived deployment — so no name-based rule can tell them apart. This
@@ -126,12 +154,69 @@ jobs:
           --exclude epigraph-engine
           --exclude epigraph-mcp
           --exclude epigraph-embeddings
-      - name: Test (epigraph-db, serialized)
-        # #[sqlx::test] creates a postgres template DB per binary; concurrent
-        # binaries race on _sqlx_migrations → "tuple concurrently updated".
-        # --test-threads=1 serializes within the binary; running packages
-        # sequentially prevents cross-binary races.
-        run: cargo test -p epigraph-db --locked -- --test-threads=1
+      - name: Test (epigraph-db, parallel within package)
+        # Packages still run SEQUENTIALLY -- one cargo invocation at a time --
+        # which is what prevents the cross-binary _sqlx_migrations race
+        # ("tuple concurrently updated"). What changes here is only IN-binary
+        # concurrency, and only for this package.
+        #
+        # Every test in crates/epigraph-db/TESTS/ now provisions its own
+        # database via #[sqlx::test(migrations = "../../migrations")]. The last
+        # fixtures that shared one physical database -- and that ADDed/DROPped a
+        # constraint on `claims` in contradictory directions -- were converted,
+        # so nothing under tests/ depends on being the only writer any more.
+        # Measured before that conversion: at 4 threads exactly one of the 65
+        # binaries failed, with a DIFFERENT arm failing on each of 4 runs. The
+        # other 64 were already parallel-safe and were being serialized on its
+        # behalf.
+        #
+        # Scope that sentence honestly: `-p epigraph-db` ALSO runs the lib
+        # target, and src/repos/claim.rs still has arms that connect to the
+        # ambient DATABASE_URL and DELETE from `claims`/`agents`
+        # (setup_test_claim / cleanup). Every one of them carries
+        # `#[ignore] // Requires live database`, so none executes here, and the
+        # three non-ignored lib arms use invalid or lazy URLs and never reach a
+        # server. They are safe at 4 threads because they do not run -- NOT
+        # because they were converted. Un-ignoring any of them requires
+        # converting it first.
+        #
+        # Why 4, honestly: it is NOT the top of the measured curve. On a 4-vCPU
+        # reference host the whole package ran 420s at 1 thread, 231s at 2 (1.8x),
+        # 191s at 4 (2.2x) and 146s at 8 (2.9x) -- all 65 binaries green at every
+        # setting. 8 was faster, and is a deliberate DEFERRAL rather than a dead
+        # end.
+        #
+        # The variable to measure before bumping to 8 is PEAK POSTGRES BACKENDS,
+        # not disk. sqlx's own per-test pools cannot be the limit: sqlx 0.8
+        # builds each one as max_connections(5).parent(master_pool) and the
+        # master pool is max_connections(20), so every #[sqlx::test] pool in the
+        # process shares one 20-permit semaphore no matter what --test-threads
+        # says. (That shared cap is also why 4 -> 8 only bought 191s -> 146s
+        # rather than halving: tests queue on it.) What is NOT capped are the
+        # pools the tests construct themselves -- ScopedPool defaults to
+        # max_connections = 10 and viewer_fixture::downgraded_pool to 5, both
+        # unparented -- and those scale LINEARLY with thread count. Measured at
+        # --test-threads=4: peak 17 backends against the postgres service's
+        # default max_connections of 100. Comfortable at 4; re-measure that peak
+        # before 8. Per-test databases are ~24 MB against a runner with tens of
+        # GB free, so they are not the ENOSPC driver the "Free disk space on /"
+        # step above exists for -- build artifacts and WAL are.
+        #
+        # One arm in this package asserts an ABSOLUTE wall-clock bound rather
+        # than a ratio: lineage_tests.rs::test_lineage_performance_with_large_graph
+        # (< 100ms over a 1,111-node tree). #[sqlx::test] isolates its DATA but
+        # not the CPU it competes for, so it is the arm to re-measure before any
+        # bump past 4. Headroom measured: it passes 3/3 at 4 threads under 4
+        # concurrent CPU hogs, and 2/2 under 16 hogs on 4 cores. Do NOT widen the
+        # bound if it ever flakes -- that is the index-regression property it
+        # exists to prove; give it its own target with --test-threads=1 instead,
+        # which is what we already do for the api timing test.
+        #
+        # The explicit flag is REQUIRED, not redundant: .cargo/config.toml sets
+        # RUST_TEST_THREADS = "1" workspace-wide as the safe default for the
+        # packages not yet cleared, and libtest's CLI argument is what overrides
+        # that env var. Removing this flag silently re-serializes the package.
+        run: cargo test -p epigraph-db --locked -- --test-threads=4
       - name: Test (epigraph-api, serialized)
         run: cargo test -p epigraph-api --locked -- --test-threads=1
       - name: Test (epigraph-engine, serialized)
@@ -182,6 +267,9 @@ jobs:
   audit:
     name: Security audit (advisory)
     runs-on: ubuntu-latest
+    # Same bound as `test`. `continue-on-error` makes a FAILURE advisory; it
+    # does nothing about a HANG, which still occupies a runner for six hours.
+    timeout-minutes: 90
     continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

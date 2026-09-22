@@ -49,12 +49,19 @@ async fn claims_query_is_current_reflects_the_stored_column() {
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
+    // Tenancy has no anonymous viewer — `ViewerExtractor` rejects an
+    // unauthenticated request with 401, which is pinned by
+    // `epigraph-db/tests/no_anonymous_viewer.rs`. This test predates that and was
+    // calling the endpoint bare, so it failed on a missing `claims` key rather
+    // than on the `is_current` projection it exists to check.
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:read"]).await;
 
     // ---- Fast path (no filters): per-row is_current must be the real column ----
     let body: Value = client
         .get(format!(
             "http://{addr}/api/v1/claims?content_contains={marker}&limit=50"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -83,6 +90,7 @@ async fn claims_query_is_current_reflects_the_stored_column() {
         .get(format!(
             "http://{addr}/api/v1/claims?content_contains={marker}&is_current=false&limit=50"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -103,6 +111,7 @@ async fn claims_query_is_current_reflects_the_stored_column() {
         .get(format!(
             "http://{addr}/api/v1/claims?content_contains={marker}&is_current=true&limit=50"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap()
@@ -150,10 +159,15 @@ async fn seed_claim(
         .chain(std::iter::repeat_n(0, 16))
         .take(32)
         .collect();
+    // `visibility = 'public'` is explicit, not incidental: this test drives
+    // `GET /api/v1/claims` through the `ViewerExtractor`, so an unauthenticated
+    // request resolves a public viewer. A row seeded without it is filtered out
+    // and the assertion below fails on a missing `claims` array rather than on
+    // the `is_current` projection it is actually about.
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
-                             is_current, supersedes) \
-         VALUES ($1, $2, $3, 0.5, $4, $5, $6)",
+                             is_current, supersedes, visibility) \
+         VALUES ($1, $2, $3, 0.5, $4, $5, $6, 'public')",
     )
     .bind(id)
     .bind(content)

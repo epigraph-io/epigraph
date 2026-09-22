@@ -11,6 +11,9 @@
 //!   - the original claim is NOT superseded (is_current stays true, supersedes
 //!     stays None) — resolution is label-side, not lineage-side.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::tools::claims::resolve_backlog_item;
@@ -25,6 +28,7 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     // Author the backlog claim through the MCP server's own signer so the
@@ -36,6 +40,7 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
 
     let result = resolve_backlog_item(
         &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: original.as_uuid().to_string(),
             resolution_content: "Fixed by replacing the index with a GIN BTREE.".to_string(),
@@ -71,7 +76,7 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
     );
 
     // Fetch the resolution claim and assert content prefix + labels.
-    let resolution = ClaimRepository::get_by_id(&pool, ClaimId::from_uuid(resolution_id))
+    let resolution = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(resolution_id))
         .await
         .expect("get_by_id resolution")
         .expect("resolution claim exists");
@@ -82,9 +87,10 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
         resolution.content
     );
 
-    let resolution_labels = ClaimRepository::get_labels(&pool, ClaimId::from_uuid(resolution_id))
-        .await
-        .expect("get_labels resolution");
+    let resolution_labels =
+        ClaimRepository::get_labels(&pool, &viewer, ClaimId::from_uuid(resolution_id))
+            .await
+            .expect("get_labels resolution");
     assert!(
         resolution_labels.contains(&"resolved".to_string()),
         "resolution claim must be labeled 'resolved': {resolution_labels:?}"
@@ -92,11 +98,11 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
 
     // Re-fetch the original and confirm label PATCH stuck without touching
     // is_current / supersedes (label-side retirement, not lineage-side).
-    let original_after = ClaimRepository::get_by_id(&pool, original)
+    let original_after = ClaimRepository::get_by_id(&pool, &viewer, original)
         .await
         .expect("get_by_id original")
         .expect("original claim still exists");
-    let original_labels = ClaimRepository::get_labels(&pool, original)
+    let original_labels = ClaimRepository::get_labels(&pool, &viewer, original)
         .await
         .expect("get_labels original");
     assert!(
@@ -132,8 +138,10 @@ fn parse_json(result: &CallToolResult) -> Value {
 /// agent (not a freshly-seeded random agent) because
 /// `resolve_backlog_item` now enforces caller-owns-claim.
 async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
+    let viewer = fixture::public_viewer(pool).await;
     let result = epigraph_mcp::tools::claims::submit_claim(
         server,
+        &viewer,
         epigraph_mcp::types::SubmitClaimParams {
             content: "bootstrap claim for resolve_backlog_item test".into(),
             methodology: "deductive_logic".into(),

@@ -5,8 +5,14 @@ exclude = [
 ]
 members = [
     "crates/epigraph-interfaces",
+    "crates/epigraph-authz",
     "crates/epigraph-core",
     "crates/epigraph-crypto",
+    # The plan places this "between epigraph-crypto and epigraph-db", which is
+    # where it is. Immediately AFTER epigraph-crypto, whose primitives it
+    # composes, rather than immediately BEFORE epigraph-db: epigraph-ds sits
+    # between those two, so only one of the readings can be the literal one.
+    "crates/epigraph-privacy",
     "crates/epigraph-ds",
     "crates/epigraph-db",
     "crates/epigraph-embeddings",
@@ -65,10 +71,12 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 curve25519-dalek = "4"
 
 # Internal crates (kernel only)
-epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
+epigraph-interfaces = { path = "crates/epigraph-interfaces" }  # Extension point traits (PolicyGate, LlmProvider)
+epigraph-authz = { path = "crates/epigraph-authz" }  # Fail-closed, resource-aware write gate (GroupPolicyGate)
 epigraph-auth = { path = "crates/epigraph-auth" }
 epigraph-core = { path = "crates/epigraph-core" }
 epigraph-crypto = { path = "crates/epigraph-crypto" }
+epigraph-privacy = { path = "crates/epigraph-privacy" }  # Client-side sealing (no DB, no key custody)
 epigraph-db = { path = "crates/epigraph-db" }
 epigraph-engine = { path = "crates/epigraph-engine" }
 epigraph-api = { path = "crates/epigraph-api" }

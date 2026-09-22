@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,\n                                labels, properties, visibility, owner_group_id)\n            VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8)\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Float8",
+        "Uuid",
+        "TextArray",
+        "Jsonb",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9944af960d954ca14e46a62e62023351638b69ddeb5df562057d3f221a719b30"
+}

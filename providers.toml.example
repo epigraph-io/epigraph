@@ -1,6 +1,15 @@
 # Example providers.toml — copy to providers.toml and edit, or set EPIGRAPH_PROVIDERS_CONFIG to override path.
 # providers.toml itself is gitignored (it holds real allowlisted emails); this
 # checked-in copy is the template new deployments start from.
+#
+# EPIGRAPH_ENV (PR-02). UNSET MEANS PRODUCTION. An auto-provisioning provider
+# with both allowlists empty and no EPIGRAPH_ALLOW_ALL_IDENTITIES=true makes the
+# server refuse to boot. Set EPIGRAPH_ENV to one of development / dev / test /
+# testing / local / ci to downgrade that abort to a warning for dev and CI.
+# The default is the strict side deliberately: EPIGRAPH_ENV is new, so it is
+# unset in every deployment that exists today, and those are exactly the ones
+# that would otherwise upgrade into the fail-closed allowlist and discover it as
+# a silent authentication outage instead of a startup error.
 
 [[provider]]
 name              = "google"
@@ -16,21 +25,46 @@ auth_endpoint     = "https://accounts.google.com/o/oauth2/v2/auth"
 token_endpoint    = "https://oauth2.googleapis.com/token"
 redirect_uri_env  = "EPIGRAPH_REDIRECT_URI"
 auto_provision    = true
-# authorized external users; empty list = allow ALL (insecure). Add emails/domains
-# before relying on this in prod. With auto_provision=true, any identity NOT on this
-# allowlist is refused (HTTP 403) before any client is created.
-allowed_emails    = []
-# allowed_domains = ["baros.associates"]
+# Authorized external users. FAIL CLOSED as of PR-02: leaving BOTH lists empty
+# now REFUSES all provisioning through this provider (HTTP 403, before any client
+# is created), and with EPIGRAPH_ENV=production the server refuses to BOOT at all.
+# Set EPIGRAPH_ALLOW_ALL_IDENTITIES=true to declare explicitly that any identity
+# this IdP authenticates may have an account here — that is the old (silent)
+# behaviour, and it is now something an operator has to say out loud.
+#
+# The same gate re-runs on refresh_token and authorization_code exchange, so
+# removing an address here also stops an already-provisioned client renewing.
+#
+# Populate at least one of these before deploying:
+allowed_emails    = ["you@example.com"]
+allowed_domains   = ["example.com"]
+# Scopes granted to every client this provider auto-provisions. Every entry MUST
+# exist in crates/epigraph-core/src/canonical_scopes.rs — a scope that does not
+# is written into granted_scopes and then checked by nothing, which is exactly
+# how `groups:read` became decorative. (PR-02 corrected three phantoms here:
+# `claims:challenge` -> `policy:challenge`, `groups:manage` -> `groups:write`,
+# and `clients:register`, which does not exist at all, removed. `clients:admin`
+# is the real client-management scope and is deliberately NOT granted to an
+# externally provisioned identity.)
+#
+# CEILING, STATED OUT LOUD: `agents:write` below is the strongest entry in this
+# list. POST /api/v1/agents auto-activates a new OAuth client carrying
+# AGENT_PROVISION_SCOPES (claims:write included) for any `agents:write` holder —
+# that path treats `agents:write` as BEING the admin approval that
+# POST /oauth/register's agent arm now withholds. Granting it here therefore
+# lets anyone the IdP gate admits mint write-capable agent credentials one hop
+# later. Keep it only if your allowed_emails/allowed_domains are the set of
+# people you would give that to; otherwise drop `agents:write` from this list
+# and grant it per-client through the admin approval route.
 default_scopes = [
-  "claims:read", "claims:write", "claims:challenge",
+  "claims:read", "claims:write", "policy:challenge",
   "evidence:read", "evidence:submit",
   "edges:read", "edges:write",
   "agents:read", "agents:write",
-  "groups:read", "groups:manage",
+  "groups:read", "groups:write",
   "analysis:belief", "analysis:propagation", "analysis:reasoning",
   "analysis:gaps", "analysis:structural", "analysis:hypothesis",
   "analysis:political",
-  "clients:register",
 ]
 
 # Uncomment to enable Cloudflare Access:
@@ -43,7 +77,9 @@ default_scopes = [
 # audience_env   = "CF_ACCESS_AUD"
 # auto_provision = true
 # default_scopes = ["claims:read", "claims:write", "evidence:read", "evidence:submit"]
-# # authorized external users; empty list = allow ALL (insecure). The same gate
-# # applies to every provider, so populate this before enabling CF in prod.
-# allowed_emails = []
-# allowed_domains = []
+# # Authorized external users. The same fail-closed gate applies to EVERY
+# # provider: both lists empty means nobody provisions (and, under
+# # EPIGRAPH_ENV=production, the server refuses to boot) unless
+# # EPIGRAPH_ALLOW_ALL_IDENTITIES=true. Populate before enabling CF.
+# allowed_emails = ["you@example.com"]
+# allowed_domains = ["example.com"]

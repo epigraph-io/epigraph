@@ -12,6 +12,9 @@
 //! PERSISTED row read back through `MatchCandidateRepo::get`.
 
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
 use epigraph_engine::matching::policy::{Policy, PolicyAction};
 use epigraph_engine::matching::scorer::MatchFeatures;
 use epigraph_engine::matching::verifier::Verdict;
@@ -115,7 +118,7 @@ async fn act_does_not_rewrite_the_verdict_of_a_decided_candidate(pool: PgPool) {
         .expect("night 1 act");
 
     let staged = repo
-        .list_for_claim(lo)
+        .list_for_claim(&fixture::public_viewer(&pool).await, lo)
         .await
         .expect("list")
         .into_iter()
@@ -216,7 +219,7 @@ async fn act_still_updates_the_verdict_of_an_undecided_candidate(pool: PgPool) {
         .expect("first act");
 
     let id = repo
-        .list_for_claim(lo)
+        .list_for_claim(&fixture::public_viewer(&pool).await, lo)
         .await
         .expect("list")
         .into_iter()
@@ -274,7 +277,7 @@ async fn act_with_no_verdict_preserves_an_existing_one(pool: PgPool) {
         .expect("verdict act");
 
     let id = repo
-        .list_for_claim(lo)
+        .list_for_claim(&fixture::public_viewer(&pool).await, lo)
         .await
         .expect("list")
         .into_iter()

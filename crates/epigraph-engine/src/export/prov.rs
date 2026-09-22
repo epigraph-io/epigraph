@@ -117,6 +117,7 @@ fn prov_relation_endpoints(
 /// Returns [`epigraph_db::DbError`] if any underlying repository call fails.
 pub async fn export_provenance_prov_o(
     pool: &epigraph_db::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     root_claim_id: uuid::Uuid,
     max_depth: Option<i32>,
 ) -> Result<serde_json::Value, epigraph_db::DbError> {
@@ -132,7 +133,8 @@ pub async fn export_provenance_prov_o(
     // at something already in the lineage — the direction is inverted
     // relative to what the CTE looks for. So we add supersedes targets
     // explicitly, one hop per claim already in the set.
-    let ancestor_ids = LineageRepository::get_ancestor_ids(pool, root_claim_id, max_depth).await?;
+    let ancestor_ids =
+        LineageRepository::get_ancestor_ids(pool, viewer, root_claim_id, max_depth).await?;
     let mut claim_ids = ancestor_ids;
     if !claim_ids.contains(&root_claim_id) {
         claim_ids.push(root_claim_id);
@@ -140,7 +142,7 @@ pub async fn export_provenance_prov_o(
 
     let mut supersedes_targets = Vec::new();
     for &claim_id in &claim_ids {
-        let outgoing = EdgeRepository::get_by_source(pool, claim_id, "claim").await?;
+        let outgoing = EdgeRepository::get_by_source(pool, viewer, claim_id, "claim").await?;
         for edge in outgoing {
             if edge.target_type == "claim"
                 && edge.relationship == "supersedes"
@@ -165,7 +167,8 @@ pub async fn export_provenance_prov_o(
     let mut edges_seen = std::collections::HashSet::new();
 
     for &claim_id in &claim_ids {
-        let Some(claim) = ClaimRepository::get_by_id(pool, ClaimId::from_uuid(claim_id)).await?
+        let Some(claim) =
+            ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(claim_id)).await?
         else {
             continue;
         };
@@ -204,8 +207,9 @@ pub async fn export_provenance_prov_o(
         // edge id since a claim can appear on both sides across the loop
         // (e.g. the root is both a target of its ancestor's edge and a
         // source of its own supersedes edge).
-        let mut claim_edges = EdgeRepository::get_by_target(pool, claim_id, "claim").await?;
-        claim_edges.extend(EdgeRepository::get_by_source(pool, claim_id, "claim").await?);
+        let mut claim_edges =
+            EdgeRepository::get_by_target(pool, viewer, claim_id, "claim").await?;
+        claim_edges.extend(EdgeRepository::get_by_source(pool, viewer, claim_id, "claim").await?);
 
         for edge in claim_edges {
             if !edges_seen.insert(edge.id) {

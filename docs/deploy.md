@@ -2,15 +2,26 @@
 
 ## Database migrations
 
-Applied automatically by the API binary on startup. The first deploy after
-2026-05-05 also requires a one-shot reconcile of `_sqlx_migrations`:
+Applied by the `epigraph-migrate` binary, run explicitly — as an
+`ExecStartPre=` on `epigraph-api.service` or by hand — **before** the API
+starts. The API binary does *not* migrate at boot unless
+`EPIGRAPH_MIGRATE_ON_BOOT=1` (also accepts `true`/`yes`, case-insensitively and
+ignoring surrounding whitespace) is set in its environment; migrations
+074/075/084 are designed to `RAISE` when their tenancy preconditions do not
+hold, and the server call site `.expect()`s, so an unattended boot-time apply
+turns a precondition failure into a crash loop. Any other value — including
+`0`, `false` and the empty string — skips.
+
+The first deploy after 2026-05-05 also requires a one-shot reconcile of
+`_sqlx_migrations`:
 
 1. `pg_dump -Fc $DATABASE_URL > epigraph_pre_reconcile_$(date -I).dump`
 2. `psql $DATABASE_URL -f ops/reconcile_2026_05_05.sql`
 3. `cargo run -p epigraph-api --bin epigraph-migrate`  (applies 015–026)
 4. Restart `epigraph-api.service`.
 
-Subsequent deploys: just restart; `sqlx::migrate!()` runs at boot.
+Subsequent deploys: run `cargo run -p epigraph-api --bin epigraph-migrate`
+(or let `ExecStartPre=` do it), then restart `epigraph-api.service`.
 
 ### Cross-worktree binary caching (foot-gun)
 
@@ -22,9 +33,11 @@ crate being compiled. If a different worktree previously built `server` or
 artifact and you end up installing a binary whose embedded migration list
 predates the worktree you think you're building from.
 
-Symptoms on deploy:
+Symptoms on deploy — watch the `epigraph-migrate` run, not the server; since
+the API stopped migrating at boot it emits `EPIGRAPH_MIGRATE_ON_BOOT unset —
+skipping migrations` and says nothing at all about migration state:
 
-* `systemctl restart epigraph-api` succeeds and reports `Migrations up to date`.
+* `epigraph-migrate` exits 0 and applies nothing.
 * `_sqlx_migrations` is missing the migration version your branch added.
 * `information_schema.columns` confirms the new column doesn't exist.
 * Health check passes (the binary doesn't crash — it just doesn't know about
@@ -98,3 +111,973 @@ name like `_reconcile.sql` produces an empty version string and is a
 hard parse error, not a skip. Keeping the file under `ops/` avoids
 that entirely — the embedded migrator never sees it, and it is run
 by hand exactly once.
+
+## PR-02 (multi-user tenancy) — required rollout steps
+
+PR-02 changes two things that a plain `git pull && restart` does **not** carry
+over. Both fail closed, so the symptom is 403s and a refused boot, not silent
+degradation — but both need an operator action.
+
+### 1. Re-run `bootstrap_clients` to widen the canonical scopes
+
+`POST /api/v1/groups` now requires `groups:write`, and
+`POST`/`DELETE /api/v1/groups/:id/members` now require `groups:admin`. Both are
+new entries in `epigraph_core::canonical_scopes`, and `oauth_clients.granted_scopes`
+is persisted per client at registration — so an instance bootstrapped before this
+release keeps its old arrays and 403s on all three routes, `epigraph-admin`
+included. No migration can fix this: the rows are data, not schema.
+
+```bash
+cargo run -p epigraph-cli --bin bootstrap_clients -- \
+  --legal-entity-name "<same as before>" --legal-contact-email "<same as before>"
+```
+
+It is convergent as of PR-02: an existing canonical client has its
+`allowed_scopes`/`granted_scopes` rewritten to `scopes_for(<name>)` and is
+reported `EXISTS: … scopes=RECONCILED`. Non-canonical clients are untouched.
+Externally provisioned humans get theirs from `default_scopes` in
+`providers.toml`; if yours still says `groups:manage` (a scope that never
+existed), change it to `groups:write` — see `providers.toml.example`.
+
+### 2. Set `EPIGRAPH_ENV`
+
+`EPIGRAPH_ENV` is introduced by PR-02 and is therefore **unset everywhere
+today**, so **unset is treated as production**. With a provider whose
+`allowed_emails` and `allowed_domains` are both empty, `auto_provision = true`,
+and no `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`, the server now **refuses to boot**.
+
+That is the intended discovery mechanism: PR-02 also makes
+`provision_external_user_client` and the refresh-token gate deny by default, so
+an instance that booted in that posture would 403 every already-provisioned
+Google identity on its next refresh, with nothing in the logs naming the cause.
+
+Choose one before deploying:
+
+* populate `allowed_emails` / `allowed_domains` in `providers.toml` (recommended);
+* or set `EPIGRAPH_ALLOW_ALL_IDENTITIES=true` to declare that any identity the
+  IdP authenticates may have an account here (the pre-PR-02 behaviour, now said
+  out loud);
+* dev/CI only: set `EPIGRAPH_ENV` to `development` / `dev` / `test` / `testing` /
+  `local` / `ci` to downgrade the abort to a warning.
+
+Existing external clients are re-checked against the allowlist on **refresh**
+too, so removing an address stops that client renewing.
+
+## PR-03 (router inversion) — BREAKING, and deploy-coordinated
+
+PR-03 inverts the HTTP router from an anonymous-by-default surface to an
+allowlist. This is the largest behavioural change in the tenancy series and
+**two of its five steps are operator actions, not code**. Read all of it before
+deploying.
+
+### 0. Precondition — do not deploy this until it reads 1.0
+
+```sql
+SELECT count(*) FILTER (WHERE agent_id IS NOT NULL)::float
+       / NULLIF(count(*), 0)
+FROM oauth_clients WHERE status = 'active';
+```
+
+Every active OAuth client must have a non-null `agent_id`. PR-02 populates it
+for newly issued clients (`ensure_for_client`), but rows that predate PR-02 may
+still be null, and `oauth_clients.agent_id` is what the JWT's `agent_id` claim
+is copied from.
+
+**A null `agent_id` breaks writes in THIS release, not in a later one.**
+`POST /api/v1/claims` and `POST /claims` refuse such a token with 401
+`invalid_token` as of PR-03: the handler used to fall back to a `[0u8; 32]`
+author key, and that fallback is deleted. Read a "PR-07" in the paragraph below
+as "and then it gets worse", not as "so this is not yet my problem" — deploying
+at less than 1.0 coverage is an immediate write outage on the primary write
+path.
+
+The read paths follow when PR-07 attaches `ViewerExtractor`; a null `agent_id`
+is also already the reason a client cannot administer a group.
+
+If this query returns anything below 1.0, back-fill first. Deploying without
+measuring it is a self-inflicted outage.
+
+### 1. BREAKING — 105 previously anonymous routes now require a Bearer token
+
+Everything that returns claim content, claim-derived structure, ACLs,
+embeddings or aggregates moved from the `public` router to `protected`. The
+notable ones: `GET /claims`, `GET /claims/:id`, `GET /api/v1/claims`,
+`GET /agents`, `GET /lineage/:claim_id`, `POST /api/v1/search/semantic`,
+**`GET /api/v1/query/rag`**, **`GET /api/v1/search/evidence`**,
+`GET /api/v1/admin/stats` (see §1a — it now needs `claims:admin`, not merely a
+token), `GET /api/v1/themes/:id/embeddings`,
+`GET /api/v1/events`, all `/api/v1/graph/*`,
+all `/frames/*`, all `/belief*`, and every `/api/v1/perspectives*`,
+`/communities*`, `/contexts*`, `/workflows*`, `/methods*` and `/tasks*` read.
+
+`GET /api/v1/ownership/:node_id` was on that list until **PR-14 deleted the
+route**, so it is not listed above: it does not require a token, it does not
+exist. The same release removed `POST /api/v1/ownership`,
+`PUT /api/v1/ownership/:node_id` and `GET /api/v1/agents/:id/owned-nodes`, plus
+the MCP tools `assign_ownership`, `update_partition` and `get_ownership`.
+Callers of any of them now get **404, not 401**.
+
+**Those endpoints are removed, not relocated.** There is no replacement
+reclassification surface in this release. After PR-14 no HTTP route and no MCP
+tool can change an existing node's partition: tenancy is stamped at INSERT by
+migration 070's inherit trigger and by 074's per-table `_require_tenancy`
+guards, and nothing else writes `claims.visibility` or `claims.owner_group_id`.
+(071's write-through shim on the legacy `ownership` table was the third such
+writer until PR-22 retired both.) A claim created public stays public until a
+reclassification surface returns — PR-16 owns the write-side predicate, and no
+PR before it restores one. Plan accordingly if your rollout assumed you could
+demote a claim after the fact.
+
+**The RAG and evidence-search public-access guarantees are revoked.** Announce
+this; anything scraping those two endpoints anonymously stops working the
+moment this deploys.
+
+### 1a. BREAKING — `GET /api/v1/admin/stats` now requires `claims:admin`
+
+A Bearer token is no longer sufficient. The handler took `State(state)` alone —
+no auth extractor, no scope check — so any authenticated principal holding any
+scope read the whole fourteen-field `SystemStats` aggregate. One of its fields,
+`webhooks.webhook_count`, stopped being a per-process artefact when boot
+hydration started filling `AppState::webhook_store` from
+`webhook_subscriptions`: it is now the cross-tenant cardinality of that table,
+and this route is the only unfiltered path out of the store.
+
+`claims:admin` is in `ADMIN_ONLY_SCOPES`, which means it is **not** in
+`read_only_scopes()`, **not** in the read-write role, **not** in
+`AGENT_PROVISION_SCOPES` and **not** in `PUBLIC_CLIENT_READ_SCOPES`. So every
+`epigraph-ro` token, every `epigraph-wo` token, every agent auto-provisioned by
+`POST /api/v1/agents` and every DCR-registered public client now receives
+**403** here. Point dashboards and monitoring at an `epigraph-admin` token, or
+mint a dedicated client with exactly `["claims:admin"]`.
+
+Two things that did NOT change, so nobody has to test for them: the response
+body shape is identical (including the `require_signatures` field documented
+below), and the MCP tool also called `system_stats` is a different aggregate —
+corpus counts, viewer-scoped, `claims:read` — and is untouched.
+
+### 1b. BREAKING — the community write routes now carry group scopes
+
+Three routes that took a bare Bearer token now take a scope as well:
+
+| route | scope now required |
+|---|---|
+| `POST /api/v1/communities` | `groups:write` |
+| `POST /api/v1/communities/:id/members` | `groups:admin` **and** live membership |
+| `DELETE /api/v1/communities/:id/members/:perspective_id` | `groups:admin` **and** live membership, or own perspective |
+
+Why: migration 068 projects every community onto a `groups` row
+ID-preservingly. Creating a community creates a group (and installs the creator
+as its `role='admin'` member); adding a community member writes the same
+`group_memberships` row `POST /api/v1/groups/:id/members` writes. §1 above
+already charges `groups:write` and `groups:admin` for those effects on the
+`/api/v1/groups/*` spelling — these routes were the cheaper path to the same
+grant, and now cost the same.
+
+**Availability.** `groups:admin` is in `ADMIN_ONLY_SCOPES`: not in
+`read_only_scopes()`, not in the read-write role, not in
+`AGENT_PROVISION_SCOPES`, not in `PUBLIC_CLIENT_READ_SCOPES`. So every
+`epigraph-ro` token, every `epigraph-wo` token and every agent auto-provisioned
+by `POST /api/v1/agents` now gets **403** on the two membership routes. Mint an
+`epigraph-admin` token, or a dedicated client with `["groups:admin"]`, for
+anything that manages community membership. `groups:write` is in the read-write
+role, so `epigraph-wo` keeps working on `POST /api/v1/communities` — only
+`epigraph-ro` loses it, and it could not write before either.
+
+**Expected consequence, so it is not mistaken for a bug.** A principal holding
+only `groups:write` can create a community and cannot then add another
+perspective to it. That mirrors `/api/v1/groups`: the creator becomes the new
+group's administrator by construction, so no separate add is needed to own what
+you made, but populating it with others is admin-only.
+
+If you re-ran `bootstrap_clients` for §1 you have already done the work for
+this section; §1's scopes are the ones these routes check.
+
+### 1c. `POST /api/v1/webhooks` now refuses internal delivery targets
+
+Registration validates the URL. **400** is returned for a scheme other than
+`http`/`https`, for a URL that does not parse or names no host, for an IP
+**literal** that is loopback, link-local, private-range or unspecified
+(including the IPv4-mapped IPv6 spelling of one), and for the names RFC 6761
+reserves to loopback (`localhost` and anything under `.localhost`).
+
+Three boundaries an operator should know rather than infer:
+
+* **It applies at registration only.** `bin/server.rs` re-hydrates
+  `AppState::webhook_store` from `webhook_subscriptions` on every boot, so rows
+  written before this release are grandfathered and are re-armed on each deploy
+  without passing through the check. Auditing them is an operator task. The
+  asymmetry is worth stating plainly: an existing subscription pointed at an
+  internal consumer keeps being delivered to, while **re-registering that same
+  URL after a redeploy now fails with 400**.
+* **It is not an allowlist and it does not resolve names.** Any other hostname
+  is accepted on its face, including one that resolves to a private address.
+  DNS rebinding is a different control (egress policy on the delivering
+  process).
+* **Migration 085 is unchanged.** Its `CHECK (btrim(url) <> '')` still mirrors
+  only the non-empty check; this policy lives in the handler.
+
+### 1d. `POST /api/v1/claims/batch` no longer publishes `ClaimSubmitted`
+
+That handler writes only to the in-memory `AppState::claim_store`, never to
+`claims`, so the ids it published named no row and the fan-out could make no
+tenancy decision about them. It now creates the claims and publishes nothing.
+
+Two observable effects, both small and both silent otherwise: a webhook
+subscriber filtering on `ClaimSubmitted` stops seeing batch imports, and
+`SystemStats.event_bus.history_size` stops counting them. No other subscriber is
+affected — `start_webhook_dispatcher` is the only wired `EventBus` consumer, and
+`GET /api/v1/events` reads the database rather than the in-memory ring.
+
+**Announce PR-14's read-path change in the same note.** A caller that used to
+receive a `200` whose claim `content` was the placeholder `"[REDACTED]"` now
+receives an absence instead: `404` on HTTP `GET /claims/:id`, a not-found error
+from MCP `get_claim`, or simple omission from a list. This is deliberate — a
+placeholder body confirms that a private claim exists at that id, and the two
+responses are now indistinguishable — but it is a breaking wire change for any
+client that pattern-matched on the placeholder string.
+
+**Deploy order for PR-14.** The read path no longer consults the legacy
+`ownership` table; the tenancy columns are the sole source of truth. Run
+`epigraph-tenancy-backfill` to completion and confirm its `verify` step reports
+zero outstanding rows **before** rolling out this release.
+
+**Deploy order for PR-22 — and this is the LAST point at which the backfill's
+transcription pass exists.** Migration 084 DROPS `public.ownership`. Its second
+pre-flight refuses to run while any non-public row lacks a
+`tenancy_transcription_log` entry, and PR-22 retires the transcription pass and
+the two `verify` checks that cleared exactly that condition — safely, and only
+because the pre-flight proves the condition is already met. So:
+
+1. run `epigraph-tenancy-backfill run` to completion on the RELEASE THAT STILL
+   HAS IT, i.e. before deploying PR-22's binaries;
+2. confirm `epigraph-tenancy-backfill verify` exits 0;
+3. then apply 084.
+
+If 084's pre-flight raises, do not work around it. `refusing to DROP ownership:
+N non-public row(s) were never transcribed` means those nodes' declarations
+never reached a visibility column and dropping them would silently widen the
+nodes; `... N quarantined encryption_key_id row(s) are untriaged` means rows
+naming an encryption key that no longer resolves. Both are operator action
+items. The plan sequences 084 "one release after PR-14"; production has not
+deployed this series at all, so **the operator decides what that means here** —
+the mechanical requirement is (1)-(3) above, not a particular release count.
+
+084 is a **one-way door** and `sqlx migrate revert` does not exist in this tree.
+`docs/runbooks/084-undo.sql` recreates the EMPTY SHAPE only; read it before
+applying 084 to anything you cannot rebuild.
+
+#### One route needs more than a token
+
+| Route | Was | Now | Failure if you get it wrong |
+|---|---|---|---|
+| `GET /api/v1/claims/needing-embeddings` | anonymous | requires the **`claims:admin`** scope | **403**, not 401 — a token with `claims:read` is refused |
+
+Everything else in the list above needs only a valid Bearer token with the
+scope it already needed. This one is singled out because it is a maintenance
+worklist: it enumerates claim ids *and* raw content corpus-wide, ordered by an
+internal invariant (which rows the embedder has not reached), which is an
+operator's backfill queue rather than a query a reader would ask. If you run a
+backfill job against this endpoint, widen its token's scopes to include
+`claims:admin` in the same window as this deploy.
+
+The complete anonymous surface afterwards is 13 paths:
+
+| Path | Why |
+|---|---|
+| `GET /health` | stateless; load balancers cannot mint a token |
+| `GET /api/v1/openapi.json` | a client cannot read the schema that tells it how to authenticate if reading the schema requires authentication |
+| the 11 `/oauth/*` and `/.well-known/*` endpoints | discovery and token issuance must precede authentication |
+
+Enforced by `crates/epigraph-api/tests/public_router_allowlist.rs`, which fails
+the build if a fourteenth appears.
+
+Refused requests carry an RFC 6750 challenge:
+
+```
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://<host>/.well-known/oauth-protected-resource", error="invalid_token"
+```
+
+### 2. REQUIRED ACTION — `/metrics` moved to a separate internal listener
+
+`/metrics` is **no longer on the application port at all**. It is served by a
+second listener bound from `EPIGRAPH_METRICS_ADDR`, default `127.0.0.1:9090`.
+
+**Update the Prometheus scrape target in the same window as this deploy**, or
+monitoring goes dark at exactly the moment 105 routes start returning 401 —
+which is the worst possible time to be blind.
+
+```ini
+# epigraph-api.service
+Environment=EPIGRAPH_METRICS_ADDR=127.0.0.1:9090
+```
+
+Binding to loopback means a scraper must be on the host or in the same network
+namespace; widen it deliberately (e.g. `0.0.0.0:9090` inside a private network)
+if yours is not. A bind failure on this listener logs an error and lets the API
+keep serving — losing metrics must not take the API down — so check the log line
+`Internal metrics listener started` rather than assuming.
+
+**If you run two instances side by side with `EPIGRAPH_PORT`, set
+`EPIGRAPH_METRICS_ADDR` on the second one too.** The metrics port has no
+equivalent of `EPIGRAPH_PORT`'s per-instance default, so the second instance
+tries to bind the same `127.0.0.1:9090`, fails, logs
+`Failed to bind the internal metrics listener`, and serves the API with no
+metrics — which is easy to miss precisely because the API itself is fine.
+
+The listener is spawned before the TLS branch, so it works under both
+`EPIGRAPH_TLS_CERT`/`EPIGRAPH_TLS_KEY` and plain HTTP.
+
+### 3. New: `EPIGRAPH_RESOURCE_METADATA_URL`, and the process refuses to boot on a bad value
+
+Defaults to `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource`,
+which is the document this deployment already serves, so most deployments need
+nothing. Set it only when the metadata document is fronted by a different host.
+
+A value that cannot be embedded in an HTTP header (control characters,
+non-ASCII, an embedded newline) makes the process `exit(1)` at boot rather than
+silently dropping the challenge from every 401. Same fail-fast shape as
+`epigraph-mcp`'s `--resource-metadata-url`.
+
+### 4. New: `EPIGRAPH_AGENT_ID` for the in-repo Python helpers
+
+`scripts/_api_client.py::mint_bearer_token` now defaults its `agent_id` claim
+from `EPIGRAPH_AGENT_ID`. It always *emitted* the claim; it never had a value to
+put in it, so it was always null — the exact token shape the API refuses.
+
+There is deliberately no default: `agent_id` names the principal whose group
+membership decides what the token can read, and defaulting it would hand every
+script one identity's view of the corpus by accident.
+
+`scripts/_api_client.py::EpiGraphClient` **exits at construction** when neither
+an explicit `agent_id=` nor `EPIGRAPH_AGENT_ID` is available, rather than
+minting a principal-less token and dying on an opaque 401 at the first request.
+That covers `anchor_papers_to_themes.py`, `classify_paper_document_type.py`,
+`update_theme_workflow_steps.py` and `lib/nli_stance.py`. The lower-level
+`mint_bearer_token` is deliberately *not* guarded — a caller exercising the 401
+path is a legitimate use of a raw token helper.
+
+`scripts/reconcile_backlog_labels.py` (the daily reconciler named in
+`CLAUDE.md`), `scripts/cleanup_backlog_labels.py` and
+`scripts/maintain_themes.py` now **exit** when `EPIGRAPH_TOKEN` is unset. They
+previously degraded to no `Authorization` header, which used to mean "read-only
+mode" and now means "401 on the first request". The `dekg` CLI likewise
+requires `--token` / `EPIGRAPH_TOKEN`.
+
+### 5. `EPIGRAPH_REQUIRE_SIGNATURES` — unchanged name, narrower meaning
+
+The env var is unchanged. The Rust config field behind it was renamed
+`ApiConfig::require_packet_signatures`, and it now gates **only** payload-level
+Ed25519 packet signatures on `POST /api/v1/submit/packet`.
+
+The request-signing middleware (`middleware::require_signature`, the
+`X-Signature` / `X-Public-Key` / `X-Timestamp` headers) is **deleted**. It was
+unreachable through either `create_router`, so no live behaviour changes — but
+it was the only writer of `SecurityEvent::signature_verification` and
+`auth_attempt` rows into `security_events`. Any dashboard reading those two
+event types will read empty from now on.
+
+The `require_signatures` field in the `GET /api/v1/admin/stats` response body is
+**unchanged on the wire** (pinned by `#[serde(rename)]`), so nothing that parses
+that response needs updating.
+
+### Known gap, filed rather than hidden
+
+`GET /api/v1/openapi.json` will under-report authentication. utoipa's
+`security(...)` annotations are per-operation and the 105 moved read operations
+carry none, so the schema advertises them as requiring nothing. The document
+itself is still anonymous, which is correct. Annotating them is a follow-up.
+
+---
+
+## PR-04 (tenancy columns, ScopedPool) — new env var, and the repo's first `-- no-transaction` migrations
+
+Migrations `062`–`067`. Nothing in PR-04 changes an HTTP response: it widens 25
+tables with two columns that need no table rewrite, creates the world and seed
+groups, adds **five** partial indexes — four built `CONCURRENTLY` in `063`–`066`
+plus `idx_agents_default_group`, an ordinary `CREATE INDEX` inside `062` — and
+creates the five session/bypass SQL functions the RLS policies will read from
+PR-17 onward. RLS is **not** enabled by this PR.
+
+### 1. New: `EPIGRAPH_SESSION_GUC_MODE`
+
+| Value | Meaning |
+|---|---|
+| *unset* (default), or anything other than `transaction` | `session` — the fast path |
+| `transaction` | every scoped read runs inside a transaction |
+
+Tenancy context reaches the database as three session GUCs —
+`epigraph.group_ids`, `epigraph.writable_group_ids`, `epigraph.principal_id` —
+stamped once at connection checkout by `ScopedPool::acquire_as`, in one extra
+statement and no transaction.
+
+**Behind a transaction-mode pooler that mechanism silently does not work.** A
+`set_config(..., is_local = false)` on one statement is not visible to the next,
+so from PR-17 on every RLS policy would collapse to `visibility = 'public'` and
+`epigraph_principal_id()` would be NULL. That is a *fail-closed* failure: no
+errors, no 500s, just permanently empty result sets that look like data loss.
+
+**The boot probe.** `bin/server.rs` therefore runs
+`ScopedPool::probe_session_gucs()` immediately after the pool connects, before
+anything else. It:
+
+1. acquires a connection and stamps a sentinel UUID into all three tenancy GUCs
+   — through the *same* `set_config` triple the request path uses, not a scratch
+   GUC;
+2. reads all three back **as a second statement on the same handle** — they must
+   still carry the sentinel;
+3. releases the connection, acquires again, and asserts all three are now empty
+   — which proves the `after_release` scrub is running, because step 1 is what
+   put values there.
+
+Step 3 is written that way on purpose. An earlier draft stamped a scratch
+`epigraph.probe` GUC in step 1 and then checked the *tenancy* GUCs in step 3;
+since nothing had ever set those, they read empty whether or not the scrub was
+installed, and the check could not fail. Stamping the real three is what makes
+the boot control non-vacuous.
+
+If step 2 fails the process **refuses to serve**, with:
+
+```
+FATAL: session GUCs do not survive between statements on one pooled connection.
+This deployment is behind a transaction-mode pooler. Set
+EPIGRAPH_SESSION_GUC_MODE=transaction to switch every read to begin_as, or
+point DATABASE_URL at a session-mode endpoint.
+```
+
+**When to set `transaction`.** pgbouncer with `pool_mode = transaction`, or RDS
+Proxy without session pinning, in front of `DATABASE_URL`. Setting it skips the
+probe (a `WARN` is logged saying so) and every scoped read runs inside
+`ScopedPool::begin_as`. **Measured cost: two extra round trips per read**
+(`BEGIN` and `COMMIT`). Prefer pointing `DATABASE_URL` at a session-mode
+endpoint if one exists; the fallback is supported, not recommended.
+
+A typo (`EPIGRAPH_SESSION_GUC_MODE=tranaction`) selects `session` and the probe
+then proves whether that was right. Failing over to the slow mode on a typo
+would hide the misconfiguration behind a permanent latency cost nobody
+attributes.
+
+**Not exercised in this repo's CI:** the *refusal* half. There is no
+pgbouncer-in-transaction-mode fixture available here, so the pooler's behaviour
+is reasoned about but not measured. Verify it against staging before relying on
+it in production. What *is* covered: the verdict itself is a pure function
+(`pool.rs::probe_verdict`) with unit tests pinning that a lost stamp is
+diagnosed as a pooler and names `EPIGRAPH_SESSION_GUC_MODE=transaction`, that a
+carried-over stamp is diagnosed as a dead scrub, and that an all-empty
+observation is reported as the former rather than the latter.
+
+### 1b. The release scrub costs one extra round trip on **every** connection
+
+`after_release` runs the `set_config` triple on every release from the API pool,
+including the ~100 % of requests that stamp nothing until PR-06 lands. Measured
+on this loopback cluster (3000 sequential statements through `psql`):
+`SELECT 1` 0.15–0.19 s, the scrub triple 0.19–0.20 s — i.e. **≈55 µs per
+release**, of which the triple itself is ~13 µs and the rest is the round trip.
+Over a real network hop the round trip dominates, so budget one extra p50 RTT
+per released connection. It is not made conditional: a scrub that only runs when
+someone remembered to set a flag is not a security control.
+
+### 1c. Obligations this PR hands to PR-15 and PR-16
+
+* ~~**PR-15** — `ScopedPool::unscoped_for_maintenance` draws from the
+  *application* pool.~~ **Discharged.** It now draws from the pool
+  `ScopedPool::with_maintenance_pool` attached, falling back to the application
+  pool when none was. `bin/server.rs` attaches one; test fixtures deliberately
+  do not (a `#[sqlx::test]` database has one DSN and one role).
+* ~~**PR-15** — the background `job_pool` has no scrub.~~ **Discharged.** It is
+  built by `ScopedPool::connect_with_options`, which PR-15 added because
+  `ScopedPool::connect` hardcoded sizing and had no `after_connect` — so the
+  choice was otherwise between the scrub and the 45-minute
+  `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`. Both are kept.
+* **PR-16** — after the backfill, `REINDEX INDEX CONCURRENTLY
+  idx_claims_world_owned;`. That index is corpus-sized when `066` builds it
+  (`owner_group_id` defaults to the world group, so the partial predicate
+  matches every row) and the backfill empties it without reclaiming the pages.
+
+### 1c-bis. `MAINTENANCE_DATABASE_URL` (PR-15)
+
+**What it is.** The DSN every background writer connects on: the CLI binaries,
+the API's job pool and its `AppState::maintenance_viewer` pool, and the operator
+scripts under `scripts/`. It should differ from `DATABASE_URL` **only in the
+role** — a role that is a member of `epigraph_maintenance`, so
+`epigraph_bypass()` is true on it.
+
+**If it is unset**, every one of those falls back to `DATABASE_URL` and logs a
+WARN. That is correct today and only today: no table in `public` has row
+security at head 91, so a bypass viewer on an ordinary connection still sees
+everything. Once PR-17's policies land it would see nothing — and
+`epigraph_db::assert_maintenance_privilege` refuses to start rather than let
+that happen, so the refusal arms itself with no second deploy step. The refusal
+is deliberately *not* an unconditional `epigraph_bypass()` assertion: migration
+060 downgrades `insufficient_privilege` on its `CREATE ROLE` to a NOTICE, so on
+a managed cluster where that fired the role may not exist at all, and an
+unconditional assertion would take the whole fleet down to prevent a failure
+that cannot yet occur.
+
+**The arming signal is `ENABLE`, not `FORCE`.** The probe keys on
+`relrowsecurity OR relforcerowsecurity`. A policy filters every role except the
+table's owner and holders of `BYPASSRLS`; `FORCE` only *additionally* subjects
+the owner. Every protected table here is owned by `epigraph` (superuser,
+`rolbypassrls = t`), and every role a background writer connects as is a
+non-owner without `BYPASSRLS` — so plain `ENABLE ROW LEVEL SECURITY` is already
+what starts truncating their results. **Operationally this matters at two
+moments:** the window between the migration that applies policies and the one
+that adds `FORCE` (they are separate migrations), and after an operator pulls
+the documented `ALTER TABLE … NO FORCE ROW LEVEL SECURITY` kill switch, which
+drops FORCE and leaves the policies enabled. A FORCE-only probe would be
+disarmed in both.
+
+**The kill switch covers 39 relations from PR-18a onward, not 35.** `079` is an
+applied migration and could not name the four privatization tables, so
+migrations `080`/`082`/`083` FORCE the tables they create. The boot assertion
+counts the **catalog** rather than 079's array, so running a copy of
+`docs/runbooks/079-undo.sql` that predates PR-18a un-FORCEs only the original 35
+and leaves the API refusing to boot on a **partially** FORCEd set — the rollback
+turns into an outage. Always run the script from the tree you are rolling back
+to, and finish with the VERIFY query at the foot of it, which is what detects a
+partial flip.
+
+**It must name the same database as `DATABASE_URL`.** A maintenance DSN pointing
+elsewhere does not error — it reads zero rows and writes nowhere — so
+`maintenance_database_url` compares the two **effective** database names (the
+path, or the role name when the DSN is pathless, exactly as libpq defaults it)
+and refuses on a mismatch. **Host and port are compared but only WARN.**
+Refusing on host equality would boot-fail every deployment where `localhost`,
+`127.0.0.1` and a container DNS name denote the same server. The residual is
+real and is stated rather than hidden: a `MAINTENANCE_DATABASE_URL` copied from
+staging beside a production `DATABASE_URL` names the same database `epigraph` on
+a different cluster, and produces a warning naming both endpoints, not a
+refusal. **Read that warning.**
+
+**A bad value now blocks the whole api process, not just background work.** The
+resolution and the privilege probe run before the router is built, so an
+unusable `MAINTENANCE_DATABASE_URL` takes `/health` and the openapi document
+down with it. That is deliberate: the alternative is an API that reports healthy
+while every background write silently lands nowhere. Treat this variable as a
+boot-critical setting and change it the way you would change `DATABASE_URL`.
+
+**The role needs more than `epigraph_maintenance` membership.** The api's
+background job pool — `PostgresJobQueue`, the stale-job reaper,
+`ClusterGraphHandler`, `ThemeClusterRebuildHandler` — now connects on this DSN
+instead of `DATABASE_URL`. `assert_maintenance_privilege` probes bypass and row
+security; it does **not** probe table grants, and CI connects as the superuser,
+so the role dimension is not exercised by any test. Whatever role you point
+`MAINTENANCE_DATABASE_URL` at must hold the API's full job-path INSERT/UPDATE
+grants, not merely membership of `epigraph_maintenance`. Enumerate them
+alongside the `GRANT` below before the first non-superuser deploy.
+
+**Connection budget.** The api process now opens API(10) + jobs(8) +
+maintenance(4) = **22** connections at boot. The maintenance pool is separate
+from the job pool on purpose: sharing it would give the request-path maintenance
+read the job pool's 45-minute `statement_timeout`. Every consumer runs its
+statement *on the connection it leases from the pool*, which is what makes the
+pool load-bearing rather than decorative.
+
+**Why the maintenance pool went from 2 to 4, in PR-18's apply slice.** It was
+sized at 2 when it had one consumer — `GET /api/v1/claims/needing-embeddings`,
+an occasional operator-triggered read. It now also serves the whole D4 admin
+surface: plan creation, and the FINAL-PLAN §6.6 authority check that
+`GET /plans/:id`, `GET /plans/:id/items`, `approve`, `apply`, `abort`, `revert`
+and `GET /audit` each perform. That is a change of KIND as well as of number —
+an operator-triggered read became a caller-facing route.
+
+Two properties bound what the resize has to cover, and both are held in code
+rather than assumed:
+
+* **No request pins more than one of these connections at a time.** Every D4
+  handler commits its application-pool transaction before acquiring here, and
+  the state-changing routes release the authority-check connection before
+  acquiring the one their transaction runs on.
+* **The job handlers do NOT draw from this pool.** They take the job pool
+  (`ScopedPool`, 8 connections, its own statement timeout), so a running
+  privatization consumes none of the four.
+
+So four connections admit four concurrent admin requests, where two admitted
+two. This is a deliberate, reviewed availability change to the request path and
+not a side effect: an operator running an approval while a colleague walks a
+plan's item pages and the embedding enumerator is mid-sweep was previously one
+request away from an acquire-timeout. If you are tuning `max_connections` on the
+server, the api process's share is now 22 per replica.
+
+**Fleet-wide pool sizing changed.** `MaintenancePool` uses one cap of 11 (10 for
+work, 1 for the connection the bypass lease holds) for every converted CLI
+binary. Several bins previously chose 2, 4 or 5 explicitly. sqlx opens
+connections lazily and most of these are single-threaded, so this is a ceiling
+raise rather than a workload increase — but a cron fleet running several of
+these concurrently against production Postgres now has a higher ceiling than it
+did.
+
+**The two recompute binaries fan out differently as of the structural-bypass
+batch, and the cap-of-11 reasoning above is re-stated rather than assumed.**
+`epigraph-recompute-belief` (`recompute_claim_belief`) and `recompute_betp`
+previously spawned `--concurrency` tokio TASKS, each holding its own copy of the
+maintenance viewer. They now drive `--concurrency` concurrent FUTURES on a
+single task (`buffer_unordered`), borrowing the one viewer the maintenance
+session owns. Two consequences an operator should know:
+
+* **Connection demand is unchanged, so the cap of 11 still means what it meant:**
+  at most `--concurrency` claims are in flight at once, plus the one connection
+  the lease pins. `--concurrency 10` remains the value that exactly saturates
+  the cap. Nothing about pool sizing needs to move.
+* **Parallelism is not unchanged.** The per-claim work is dominated by database
+  round trips, which interleave on one task exactly as they did across several;
+  but any CPU-bound stretch of the Dempster–Shafer math now serialises against
+  its peers instead of occupying several runtime worker threads. Expect
+  comparable wall-clock on an IO-bound cohort and a longer run on a
+  compute-heavy one. **This is not covered by any test** — `run_for_real` and
+  `run` live inside their binaries, where Cargo integration tests cannot reach
+  them — so a regression here surfaces as run duration, not as a red build.
+* **A PANIC inside one claim now stops the run.** The old shape joined its
+  tasks with `let _ = h.await;`, which discarded the `JoinError` a panicking
+  task produced: the process carried on and that claim was silently left out of
+  the totals. A future that panics propagates instead, so the binary aborts and
+  says so. Ordinary per-claim FAILURES are unaffected — they were counted into
+  `errors` and printed before, and still are, and the exit-2-on-errors
+  behaviour is unchanged. This one is a deliberate trade: a maintenance binary
+  that under-counts silently is worse than one that stops, and the old
+  behaviour was an artefact of the join, not a decision. **And it stops more
+  than the one claim:** the panic unwinds through the combinator, so the up to
+  `--concurrency − 1` sibling futures sitting in the buffer are dropped at their
+  await points, and one that had begun a per-frame write but not committed it
+  simply stops. So a handful of claims beyond the panicking one can be left
+  partially recomputed. Under the old shape the siblings were independent tasks
+  and ran to completion. Both binaries are idempotent and re-runnable, so the
+  remedy is a re-run; nothing needs unpicking by hand.
+
+**The Python half warns about none of this.** `scripts/maintenance_dsn.py`
+mirrors the precedence and the database-name refusal, and deliberately does
+**not** assert privilege — these are operator one-shots, and a second
+implementation of the verdict rule would drift from the Rust one. So a script
+run on an unprivileged role once policies land reads a subset and exits 0 with
+no warning. The refusal that protects you is at the API and CLI boundary only.
+
+**Deploy surfaces that need the variable** (each currently takes the WARN
+fallback): `decompose_claims` (a bind-mounted host binary, not baked into the
+image), the binaries layered into `epigraph-agent:latest`, `epiclaw.env`, the
+decomposition-cycle schedule, and foreman.
+
+**Known prerequisite, NOT shipped by PR-15.** `epigraph_maintenance` is NOLOGIN
+and `epigraph_admin` is not a member of it, so today no non-superuser role both
+connects *and* satisfies `epigraph_bypass()`. `GRANT epigraph_maintenance TO
+epigraph_admin` is a PR-17 runbook step; it adds no migration. Until it is run,
+the only role that satisfies the bypass is the superuser, which is what the
+throwaway test database and CI use. **Do that GRANT together with the job-path
+table grants named above** — a role that satisfies `epigraph_bypass()` but
+cannot INSERT into the job tables passes the boot probe and then fails on first
+use, which is a worse outcome than failing at boot.
+
+**PR-17 adds a SECOND reason for that same GRANT, and it is a hard one.**
+`GroupMembershipRepository::list_live_for_agent` now reads through
+`public.epigraph_live_memberships()`, a `SECURITY DEFINER` function migration 077
+`REVOKE`s from `PUBLIC`. Measured with `has_function_privilege`: only `epigraph`,
+`epigraph_app` and `epigraph_maintenance` may EXECUTE it — `epigraph_admin`,
+`epigraph_dev` and `epigraph_ro` may not, and
+`pg_has_role('epigraph_admin','epigraph_maintenance','MEMBER')` is false today.
+So `GRANT epigraph_maintenance TO epigraph_admin` was previously needed only to
+satisfy `epigraph_bypass()`; it is now ALSO needed for EXECUTE on a definer
+function that `Viewer::resolve` calls. This is not a live outage — the only
+non-test caller is on the API pool, and maintenance pools mint a `Bypass` viewer
+via `MaintenancePool::viewer` rather than resolving — but a maintenance-role
+process that ever resolves a viewer fails with `42501 permission denied for
+function epigraph_live_memberships` until the GRANT is run.
+
+### 1c-ter. The role inventory, including `epigraph_admin` (PR-15)
+
+The plan's PR-15 acceptance asks that `epigraph_admin` be *"either mapped to
+`epigraph_maintenance` or documented as a fourth deliberate role"*. It is the
+latter, and this is that record. Measured with `SELECT rolname, rolcanlogin,
+rolsuper, rolbypassrls FROM pg_roles`:
+
+| role | login | superuser | bypassrls | what it is for |
+|---|---|---|---|---|
+| `epigraph` | yes | **yes** | yes | The migration/dev/CI superuser. Every `#[sqlx::test]` and `ci.yml` connect as this, which is why `epigraph_bypass()` is unconditionally true in the test suite and why PR-15's refusal rule is unit-tested on a pure function rather than asserted against a live connection. |
+| `epigraph_app` | **no** | no | no | The request-path role RLS is written against. **Still NOLOGIN after PR-17.** Migration 077 grants it schema `USAGE`, table DML and sequence access — the migration-shaped half — but `ALTER ROLE epigraph_app LOGIN PASSWORD …` is an out-of-band operator step in the 11d runbook, because this repository is public and a credential must never land in it. That `ALTER ROLE` is what arms every PR-17 posture refusal: they are staged on `current_user`, so they are inert until it runs. `current_user <> 'epigraph_app'` remains a WARN and not a refusal — see `epigraph_api::state::rls_verdict`. |
+| `epigraph_maintenance` | **no** | no | no | The bypass role. `epigraph_bypass()` (migration 067) is membership of this. NOLOGIN, so it is a *membership grant target*, not a connect-as identity. |
+| `epigraph_seed` | **no** | no | no | Migration 074 arm 4's fixture escape hatch (PR-16). |
+| `epigraph_ro` | yes | no | no | Read-only. Used by `scripts/subcluster_outliers.py` and `run_assessment_worker.py`'s read side, both of which PR-15 deliberately left alone. |
+| `epigraph_dev` | yes | no | no | Developer convenience. |
+| **`epigraph_admin`** | yes | no | no | **A deliberate fourth role, not an accident.** It is the operator identity the Python scripts default to (`scripts/theme_lib.py` and eleven siblings) and the natural home for `MAINTENANCE_DATABASE_URL`: of the three login-capable non-superusers (`epigraph_ro`, `epigraph_dev`, `epigraph_admin`) it is the only one intended for writes. PR-15 does **not** grant it `epigraph_maintenance` — that is a privilege change, it needs no code, and doing it inside a code-only PR would put a security-relevant GRANT somewhere nobody would look for it. It is a PR-17 runbook step. |
+
+**The consequence, stated plainly:** until `GRANT epigraph_maintenance TO
+epigraph_admin` is run, the only role that both connects and satisfies
+`epigraph_bypass()` is the superuser. That is why PR-15's refusal is gated on
+row security being active at all — an unconditional assertion would refuse to
+start on every correctly-configured cluster that exists today.
+
+**Pre-existing, flagged not fixed:** twelve scripts under `scripts/` hardcode a
+**production** DSN (`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph`
+and two `epigraph_ro` variants) as the default when `DATABASE_URL` is unset.
+PR-15 added `MAINTENANCE_DATABASE_URL` ahead of that default in the precedence
+chain but did **not** change the default itself: that is a long-standing
+property of this script family, and changing where a dozen operator scripts
+point by default is not a decision to make inside a pool-plumbing PR.
+
+**Where the Python rule lives.** `scripts/maintenance_dsn.py` — standard library
+only, so the seventeen scripts that need the rule but not numpy do not acquire a
+numpy dependency to get it. `scripts/theme_lib.py::maintenance_dsn` is now a thin
+binding of it to this family's default. The refusal it carries is not optional
+politeness: giving `MAINTENANCE_DATABASE_URL` precedence means an operator
+pointing `DATABASE_URL` at a scratch database, while a sibling job has that
+variable exported, would otherwise have every write in this family silently
+redirected — and several of these scripts write.
+
+### 1d. Deleting a group is a maintenance-window operation
+
+Migration `062` adds 25 `owner_group_id → groups(id)` foreign keys, all
+`ON DELETE RESTRICT`, and **none of them is indexed**. The partial indexes in
+`063`–`065` lead on `owner_group_id` but predicate on `visibility`, and the RI
+check for a RESTRICT parent delete is an unqualified `owner_group_id = $1`
+lookup, so none of them can serve it.
+
+`DELETE FROM groups` is blocked outright by migration `060`'s trigger. Its
+documented escape hatch —
+
+```sql
+SET LOCAL epigraph.allow_group_delete = 'yes';
+```
+
+— therefore costs **25 sequential scans, one of them on `claims`**, inside the
+deleting transaction with row locks held throughout. Take it in a maintenance
+window. An online deprovisioning path must first add plain `(owner_group_id)`
+indexes on the tables it touches.
+
+### 2. Migrations 063–066 are the repo's first `-- no-transaction` migrations
+
+They run `CREATE INDEX CONCURRENTLY`. Consequences an operator must know:
+
+* **They hold no `ACCESS EXCLUSIVE` lock** — that is why they are concurrent.
+  Writes to `claims`, `evidence` and `edges` continue throughout.
+* **sqlx cannot roll them back.** There is no enclosing transaction, and the
+  `_sqlx_migrations` bookkeeping is not atomic with the DDL. A failure leaves an
+  **INVALID index** behind and no migration row.
+* **One statement per file, deliberately.** sqlx sends a whole migration file as
+  one simple query; PostgreSQL wraps a multi-statement simple query in an
+  implicit transaction block; `CREATE INDEX CONCURRENTLY` inside one fails with
+  SQLSTATE 25001. Do not merge 063–066 back into one file — a test fails if you
+  do. Full explanation in `migrations/README.md`.
+
+**Detection:**
+
+```sql
+SELECT c.relname FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+ WHERE NOT i.indisvalid;
+```
+
+**Recovery** — drop the leftover, then re-run the migration (`IF NOT EXISTS`
+means re-running is safe, but it will *not* rebuild an index that already exists
+in an invalid state):
+
+```sql
+DROP INDEX CONCURRENTLY <name>;
+```
+
+**Window.** `CREATE INDEX CONCURRENTLY` waits for every transaction older than
+itself in the same database. The background job pool's `statement_timeout`
+defaults to **45 minutes** (`EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`), so one long
+clustering job can stall these migrations for that long. `SET LOCAL
+lock_timeout` in a `-- no-transaction` file is *legal* but useless — outside a
+transaction block it is a silent no-op with a `WARNING`, and it would not bound
+this wait even if it took effect. Run them during a quiet window, or check
+first:
+
+```sql
+SELECT max(now() - xact_start) FROM pg_stat_activity
+ WHERE state <> 'idle' AND datname = current_database();
+```
+
+### 3. Migration 062 rewrites no table, but it locks 25 of them
+
+`ADD COLUMN ... NOT NULL DEFAULT ...` is metadata-only on PostgreSQL 11+, so
+widening `claims` does not rewrite the table. Measured against a 5,000,000-row /
+1028 MB clone of `claims` on PostgreSQL 16.2: the two-column `ADD COLUMN` took
+**3.5 ms** and the `NOT VALID` CHECK **3.6 ms**, with `pg_relation_size`
+identical before and after. Every constraint it adds is `NOT VALID`: new rows
+are checked, existing rows are not scanned. Validation is migration 075's job,
+after the backfill.
+
+**That is duration, not locks.** Each `ALTER TABLE` still takes `ACCESS
+EXCLUSIVE`, and sqlx runs the whole file in one transaction, so a lock is held
+until `COMMIT` — by the last table this migration holds `ACCESS EXCLUSIVE` on
+**25 tables simultaneously**, `claims` among them. `SET LOCAL lock_timeout =
+'3s'` bounds how long each `ALTER TABLE` *waits*, not how long the transaction
+*holds*; and while one is queued behind a long-running reader it blocks every
+new query on that table for up to 3 s. Worst case on a busy cluster is a series
+of rolling 3-second stalls ending in a rollback and a restart from table 1. Run
+it in a quiet window, expect to retry, and pre-check with the `pg_stat_activity`
+query above.
+
+The `DEFAULT 'public'` and `DEFAULT <world group>` are **transition artifacts**
+and are dropped by migration 074. Do not build anything that relies on them.
+
+If 062 aborts on its `lock_timeout`, sqlx records no row and the fix is simply
+to re-run it: the whole file is `IF NOT EXISTS` / catalog-guarded and applies
+cleanly a second time.
+
+### 4. `epigraph-migrate` is still the supported migration path
+
+Unchanged from PR-01. The api binary runs migrations only when
+`EPIGRAPH_MIGRATE_ON_BOOT` is set; `ExecStartPre=` running `epigraph-migrate` is
+the supported path, and it honours `-- no-transaction` (the flag is propagated
+into the compile-time `migrate!()` literal).
+
+#### `MIGRATION_DATABASE_URL` (PR-16)
+
+`epigraph-migrate` now reads **`MIGRATION_DATABASE_URL`**, falling back to
+`DATABASE_URL` with a `WARN`. Set it in the unit that runs `ExecStartPre=`.
+
+The two are different credentials on purpose. Applying migrations needs **DDL
+privilege on every tier-A table** — from migration 074 on, the migrator drops
+column defaults and creates 23 triggers — and that is strictly stronger than
+either of the other two roles:
+
+| Role | Holds | Can it migrate? |
+|---|---|---|
+| `epigraph_app` | the application's DML | **No.** After 074 it cannot even `ALTER TABLE … SET DEFAULT`; `tenancy_required.rs` asserts that. |
+| `epigraph_maintenance` | `SELECT, INSERT, UPDATE` schema-wide (migration 070) | **No.** No DDL at all. |
+| the migration role | table ownership / DDL | Yes. This is what `MIGRATION_DATABASE_URL` points at. |
+
+The fallback exists so this change is not itself a deploy break: a unit that
+still sets only `DATABASE_URL` keeps working and logs the WARN. It is a
+migration path, not an end state — the whole point of the split is that the
+serving process must NOT hold DDL privilege.
+
+#### Deploy ordering for 074/075/076 — do not compress this
+
+Plan §9.2 / ops F10, and the largest single outage risk in the tenancy series.
+**The migrations do not ship in the same deploy step as the code.**
+
+1. Deploy the binaries carrying the patched `INSERT INTO claims` call sites,
+   with 074/075/076 **not applied**.
+2. Watch `epigraph_tenancy_undeclared_writes` (PR-12's gauge, scraped from
+   `EPIGRAPH_METRICS_ADDR`) **flat at zero for 24 hours across every tier-A
+   table**.
+
+   **Falsify the counter FIRST, before the 24 hours start.** Zero and unwired
+   look identical on a dashboard, and after 074 no test exercises the
+   trigger→counter link any more (074's `CREATE OR REPLACE` removes migration
+   070 arm (a)'s counting limb, so the link only exists on a pre-074 database —
+   which is exactly the database you are standing on at this step, and the only
+   place it can still be demonstrated). On a canary pod, perform ONE deliberate
+   undeclared insert as the application role and confirm the series increments
+   and appears in the scrape; then reset the observation window. A gate whose
+   instrument was never proved live is not a gate.
+
+   Tracked as `D-PR16-undeclared-write-counter-link-uncovered` in
+   `docs/tenancy/progress.json`.
+3. Then apply 074, then 075, then 076, as **three separate steps** — 075 and 076
+   are split so `claims`'s `VALIDATE CONSTRAINT` scan does not hold
+   `SHARE UPDATE EXCLUSIVE` for the sum of every other table's.
+
+Skipping step 2 is the failure: the previous pods still run
+`ClaimRepository::create` without the tenancy columns, and **every claim write
+raises `23502` the instant 074 commits**.
+
+Run `epigraph-tenancy-backfill verify` before step 3; its exit code is the
+guard, and it prints the offending ids. Migration 066's header also requires
+`REINDEX INDEX CONCURRENTLY idx_claims_world_owned` as a post-backfill step —
+that is required, not an optimisation.
+
+074 is a **one-way door**. Its undo script is `docs/runbooks/074-undo.sql`; read
+it before applying 074 to anything you cannot rebuild.
+
+## `tenancy/fix-security-track` — four operator-visible behaviour changes
+
+Same convention as PR-03's §1a–§1d: **one section per change, each naming the
+affected credential and the remedy.** "BREAKING" without the affected credential
+is not actionable. No migration ships with this batch; every item below is a
+code-only change and takes effect the moment the binaries roll.
+
+### 1a. BREAKING — `POST /api/v1/hypothesis` now requires a token bound to a principal
+
+The handler took no authentication at all and read the claim's author from the
+request body. It now takes `ViewerExtractor`, which refuses a request in two
+cases, in this order:
+
+1. no `AuthContext` at all — already impossible on the protected router;
+2. **an `AuthContext` whose `agent_id` is `None`** — a token that authenticates
+   but carries no principal.
+
+**The affected credential:** an OAuth client registered *before* PR-02 began
+populating `oauth_clients.agent_id` mints exactly that token. Such a client
+previously got a `200` from this route and now gets a `401` with
+`token carries no agent_id`.
+
+**Remedy:** re-mint the client through `/oauth/token`. Every principal minted
+since PR-02 carries an `agents.id`. This is the same remedy §1 records for the
+router inversion; nothing new has to be provisioned.
+
+**How to find them before they find you:** the refusal emits
+`visibility.viewer.rejected{reason="no_agent_id", route, client_id}` as a
+structured tracing event. Grep the API logs for that target on
+`route=/api/v1/hypothesis` for one retention window *before* rolling, and re-mint
+whatever `client_id` appears.
+
+### 1b. `POST /api/v1/hypothesis` — ownership now comes from the token, not the body
+
+`claims.owner_group_id` for a hypothesis was derived from the body's `agent_id`.
+It is now derived from the authenticated principal, which is what
+`routes/claims.rs::create_claim` already does.
+
+**Who this moves:** a *delegating* caller — one that authenticates as A and posts
+`agent_id: B`. Its rows previously landed in B's personal group and now land in
+A's. `claims.agent_id` is unchanged and still comes from the body, so authorship
+and ownership can now disagree on the same row; that is deliberate and is the
+same split `create_claim` documents (`agent_id` records who said it,
+`owner_group_id` records who is accountable for the row).
+
+**Action:** none, unless an operator has been relying on delegated posts to place
+rows into a group the caller is not a member of — which is the behaviour this
+closes. Rows already written are not restamped.
+
+### 1c. `POST /api/v1/hypothesis` — the VOI score is now viewer-scoped
+
+The response's `voi.score`, `voi.neighbor_count`, `voi.avg_belief_gap` and
+`neighborhood_size` are aggregates over an embedding-neighborhood scan of
+`claims`. That scan is now filtered by the caller's viewer, and so is the
+`edges` subquery that decides which neighbours count as grounded.
+
+**On a wholly public corpus nothing changes** — `visibility = 'public'` is the
+leading disjunct of both predicates. Once `routes/privatization.rs` has produced
+private claims, a caller outside their groups gets a smaller neighborhood and
+therefore a **different VOI score for the same statement**. That is the intended
+effect; it is called out here because the number is cached onto the claim's
+`properties->>'voi_score'` and a dashboard comparing scores across callers will
+now see them diverge.
+
+### 1d. BREAKING — the MCP tool `get_recall_events` is now self-scoped
+
+`recall_events` rows are written with `visibility = 'group'` and owned by the
+querying principal's personal group, instead of `('public', world)`. The read
+predicate was always correct; the data is what made it vacuous.
+
+**Effect:** an agent reads its own recall history and no longer reads anyone
+else's. The tool's `agent_id` filter still works but is now effectively
+self-only, and **the instance-wide audit view is gone with no compensating
+path** — `tools/viewer.rs::request_viewer` has no admin or bypass arm, so there
+is no credential that restores a cross-agent view of this table. If an operator
+needs one, it has to be built; it does not exist today.
+
+**This is FORWARD-ONLY, and that is the part to plan around.** Every
+`recall_events` row written *before* this deploys still carries
+`visibility = 'public'`, from migration 062's column default and from
+`epigraph-tenancy-backfill`'s `recall_events` pass, and the read predicate's
+middle disjunct admits every one of them to every authenticated reader. No
+migration in this batch restamps them. Two consequences:
+
+* the narrowing applies to new rows only, so the historical audit log stays
+  instance-wide until it ages out;
+* `RecallEventRepository::prune_older_than` — `RECALL_EVENTS_RETENTION_DAYS`,
+  default 90 — is what retires those rows, so **confirm the retention prune is
+  actually scheduled and running** rather than assuming it.
+
+The one-off reconciliation (set `visibility = 'group'` where `agent_id IS NOT
+NULL` and `owner_group_id` already names that agent's personal group) is
+recorded as an outstanding operator decision in `docs/tenancy/progress.json`,
+in the same shape as `D-PR18-stale-cross-group-edges`' remediation. Do not
+improvise it against a live database without that entry's context.
+
+**One path still writes instance-wide, on purpose:** the `epigraph-engine`
+library recall has no principal at all, so there is no personal group to name
+and migration 062's `recall_events_group_needs_real_group` CHECK forbids
+substituting a sentinel. Rows from that path remain `('public', world)` and are
+identifiable by `agent_id IS NULL`.

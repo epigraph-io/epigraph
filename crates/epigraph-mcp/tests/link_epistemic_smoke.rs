@@ -18,6 +18,9 @@
 //!     `belief_query::get_belief`, which reads `truth_value` and would show no
 //!     movement.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
 use common::{build_test_server, seed_claim, seed_claim_with_belief};
@@ -86,6 +89,7 @@ async fn edge_count(pool: &PgPool, source: Uuid, target: Uuid, relationship: &st
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     // High-commitment source so the wire produces `Wired` (not SourceFactorless).
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
@@ -99,6 +103,7 @@ async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
 
     let first = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -159,6 +164,7 @@ async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
     let pre_betp = read_betp(&pool, target).await.expect("betp present");
     let second = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -198,6 +204,7 @@ async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn contradicts_lowers_target_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let target = seed_claim(&pool, "target under attack", 0.5).await;
@@ -205,6 +212,7 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
     let resp = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: source.to_string(),
                 target_claim_id: target.to_string(),
@@ -250,6 +258,7 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
 /// edge anyway because no BBA has ever been materialized for it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     // `seed_claim` plants an agent_id but leaves belief/plausibility/pignistic
     // NULL → the engine finds no source interval → SourceFactorless.
@@ -259,6 +268,7 @@ async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
     let resp = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: source.to_string(),
                 target_claim_id: target.to_string(),
@@ -333,6 +343,7 @@ async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
 /// edge-factor BBA already exist for this edge_id" (GREEN).
 #[sqlx::test(migrations = "../../migrations")]
 async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let source = seed_claim(&pool, "will gain belief later", 0.5).await;
     let target = seed_claim(&pool, "dependent on source", 0.5).await;
@@ -341,6 +352,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
     let first = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: source.to_string(),
                 target_claim_id: target.to_string(),
@@ -374,6 +386,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
     let second = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: source.to_string(),
                 target_claim_id: target.to_string(),
@@ -431,6 +444,7 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
     let third = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: source.to_string(),
                 target_claim_id: target.to_string(),
@@ -471,12 +485,14 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn structural_relationship_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let source = seed_claim(&pool, "s", 0.5).await;
     let target = seed_claim(&pool, "t", 0.5).await;
 
     let err = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -513,6 +529,7 @@ async fn structural_relationship_is_rejected(pool: PgPool) {
 /// `auto_wire_edge_if_epistemic` no-ops on Neutral relationships.
 #[sqlx::test(migrations = "../../migrations")]
 async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     // Same high-commitment source as the `supports` test, so a failure to
     // no-op couldn't hide behind `SourceFactorless`.
@@ -526,6 +543,7 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
 
     let result = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -558,6 +576,7 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
     // duplicate edge or attempt to re-wire.
     let second = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -583,12 +602,14 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersedes_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let source = seed_claim(&pool, "newer", 0.5).await;
     let target = seed_claim(&pool, "older", 0.5).await;
 
     let err = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: target.to_string(),
@@ -614,11 +635,13 @@ async fn supersedes_is_rejected(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn self_loop_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let claim = seed_claim(&pool, "loop", 0.5).await;
 
     let err = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: claim.to_string(),
             target_claim_id: claim.to_string(),
@@ -639,12 +662,14 @@ async fn self_loop_is_rejected(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_target_claim_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let bogus = Uuid::new_v4();
 
     let err = do_link_epistemic(
         &server,
+        &viewer,
         LinkEpistemicParams {
             source_claim_id: source.to_string(),
             target_claim_id: bogus.to_string(),

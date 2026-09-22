@@ -20,6 +20,19 @@ pub async fn authorization_server_metadata(State(state): State<AppState>) -> Jso
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        // RFC 8414 `scopes_supported` is a statement about what an APPROVED
+        // client may hold, not about what registration hands out. Since PR-02
+        // `/oauth/register` grants NONE of the write scopes below without an
+        // admin approval: the DCR arm grants
+        // `canonical_scopes::PUBLIC_CLIENT_READ_SCOPES` (read/analysis only) and
+        // the `client_type:"agent"` arm grants an EMPTY set.
+        //
+        // This list mirrors, entry for entry, the eleven-scope set that arm used
+        // to auto-activate — that is why it looks like a grant list. It is not
+        // one. If it drifts from `epigraph_core::canonical_scopes`, fix it there
+        // and here together; a scope advertised here and unknown to
+        // canonical_scopes is decorative, which is exactly how `groups:read`
+        // ended up checked by nothing.
         "scopes_supported": [
             "claims:read", "claims:write", "evidence:read", "evidence:write",
             "edges:read", "edges:write", "agents:read", "analysis:belief",

@@ -58,6 +58,9 @@
 //! is verified by inspection only. See the task report for the full
 //! coverage boundary.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -119,14 +122,16 @@ fn submit_params(
 #[tokio::test]
 async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
     let server = build_test_server(pool.clone(), [0x61u8; 32]);
 
     let content = format!("novelty-gate exact-resubmit test {}", Uuid::new_v4());
 
-    let first = tools::claims::submit_claim(&server, submit_params(&content, "ev-0", None))
-        .await
-        .expect("first submit_claim");
+    let first =
+        tools::claims::submit_claim(&server, &viewer, submit_params(&content, "ev-0", None))
+            .await
+            .expect("first submit_claim");
     let first_id = first_text_claim_id(&first);
 
     // Resubmit the SAME content with a variety of novelty_threshold values,
@@ -139,10 +144,13 @@ async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
         .enumerate()
     {
         let evidence = format!("ev-{}", i + 1);
-        let again =
-            tools::claims::submit_claim(&server, submit_params(&content, &evidence, threshold))
-                .await
-                .unwrap_or_else(|e| panic!("resubmit with threshold {threshold:?} failed: {e:?}"));
+        let again = tools::claims::submit_claim(
+            &server,
+            &viewer,
+            submit_params(&content, &evidence, threshold),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("resubmit with threshold {threshold:?} failed: {e:?}"));
         let again_id = first_text_claim_id(&again);
         assert_eq!(
             again_id, first_id,
@@ -167,14 +175,16 @@ async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
 #[tokio::test]
 async fn distinct_content_inserts_normally_when_embedder_unavailable() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
     let server = build_test_server(pool.clone(), [0x62u8; 32]);
 
     for (i, threshold) in [None, Some(0.05), Some(0.0)].into_iter().enumerate() {
         let content = format!("novelty-gate distinct content {i} {}", Uuid::new_v4());
-        let result = tools::claims::submit_claim(&server, submit_params(&content, "ev", threshold))
-            .await
-            .unwrap_or_else(|e| panic!("submit_claim (threshold={threshold:?}) failed: {e:?}"));
+        let result =
+            tools::claims::submit_claim(&server, &viewer, submit_params(&content, "ev", threshold))
+                .await
+                .unwrap_or_else(|e| panic!("submit_claim (threshold={threshold:?}) failed: {e:?}"));
         let claim_id = first_text_claim_id(&result);
 
         let row_count = claims_with_content_hash_count(&pool, &content).await;
@@ -203,6 +213,7 @@ async fn distinct_content_inserts_normally_when_embedder_unavailable() {
 #[tokio::test]
 async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
     let server = build_test_server(pool.clone(), [0x63u8; 32]);
 
@@ -213,7 +224,7 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
         tags: None,
         novelty_threshold: Some(0.05),
     };
-    tools::memory::memorize(&server, params)
+    tools::memory::memorize(&server, &viewer, params)
         .await
         .expect("memorize");
 

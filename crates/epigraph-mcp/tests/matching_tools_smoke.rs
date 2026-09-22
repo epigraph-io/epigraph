@@ -1,5 +1,8 @@
 //! T19: smoke tests for the cross-source matching MCP tools.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -158,6 +161,7 @@ async fn list_match_candidates_returns_only_status_filter(pool: PgPool) {
 
     let out = tools::matching::list_match_candidates(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListMatchCandidatesParams {
             status: Some("pending".into()),
             limit: Some(10),
@@ -179,9 +183,11 @@ async fn list_match_candidates_returns_only_status_filter(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_match_candidates_rejects_invalid_status(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool, false).await;
     let err = tools::matching::list_match_candidates(
         &server,
+        &viewer,
         ListMatchCandidatesParams {
             status: Some("garbage".into()),
             limit: None,
@@ -218,6 +224,7 @@ async fn find_cross_source_matches_returns_candidates_and_edges(pool: PgPool) {
 
     let out = tools::matching::find_cross_source_matches(
         &server,
+        &fixture::public_viewer(&pool).await,
         FindCrossSourceMatchesParams {
             claim_id: a.to_string(),
         },
@@ -232,6 +239,7 @@ async fn find_cross_source_matches_returns_candidates_and_edges(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -240,6 +248,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -271,6 +280,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
     // Second decide is idempotent at the edge layer.
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -297,6 +307,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -305,6 +316,7 @@ async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool)
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
@@ -333,6 +345,7 @@ async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool)
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), true).await; // read_only=true
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -341,6 +354,7 @@ async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
 
     let err = tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -362,6 +376,7 @@ async fn decide_match_candidate_rejected_in_read_only_mode(pool: PgPool) {
 /// 5c7fc645 would re-open.
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await; // write-enabled
     let agent = insert_agent(&pool).await;
     let live = insert_claim(&pool, agent).await;
@@ -370,6 +385,7 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
 
     let err = tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -414,6 +430,7 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
 /// every pair the auto path had already handled.
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -422,6 +439,7 @@ async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -455,6 +473,7 @@ async fn decide_match_candidate_promote_contradicts_writes_contradicts_edge(pool
 /// (`pending`) so the operator can still reject it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -463,6 +482,7 @@ async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(p
 
     let err = tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -495,6 +515,7 @@ async fn decide_match_candidate_promote_distinct_is_refused_and_writes_no_edge(p
 /// unchanged half of the branch so a future edit can't collapse both arms.
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
@@ -503,6 +524,7 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -530,6 +552,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
 
     tools::matching::decide_match_candidate(
         &server,
+        &fixture::public_viewer(&pool).await,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -609,6 +632,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
     let writable = build_server(pool.clone(), false).await;
     tools::matching::decide_match_candidate(
         &writable,
+        &fixture::public_viewer(&pool).await,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),

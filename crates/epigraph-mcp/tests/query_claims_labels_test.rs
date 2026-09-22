@@ -15,6 +15,9 @@
 //! keeps the babd5904 coverage intact — the label fetch must stay
 //! `is_current`-blind for whichever rows the caller asked for.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::claims::query_claims;
 use epigraph_mcp::types::QueryClaimsParams;
 use rmcp::model::CallToolResult;
@@ -27,6 +30,7 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // Two claims with distinct truth values so both land in the [min,max]
@@ -40,13 +44,13 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
     // ---- Current selection (the default) ----
     let result = query_claims(
         &server,
+        &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
             limit: Some(50),
             is_current: None,
         },
-        None,
     )
     .await
     .expect("query_claims");
@@ -63,13 +67,13 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
     // ---- Superseded selection ----
     let result = query_claims(
         &server,
+        &viewer,
         QueryClaimsParams {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
             limit: Some(50),
             is_current: Some(false),
         },
-        None,
     )
     .await
     .expect("query_claims(is_current = false)");

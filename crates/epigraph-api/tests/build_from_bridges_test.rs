@@ -11,61 +11,45 @@
 //! Asserts cluster_count, paragraph_count, bridge_edge_count, and persistence
 //! invariants on the run row + memberships.
 
+//! # Why this arm takes an injected `pool`
+//!
+//! It opened by deleting every row of `neighborhood_edges`,
+//! `claim_neighborhood_membership`, `graph_neighborhoods`,
+//! `claim_cluster_membership`, `cluster_edges`, `graph_clusters` and
+//! `graph_cluster_runs`, plus every `decomposes_to` edge and every claim at
+//! `properties->>'level'` 2 or 3 — unfiltered, on whatever database
+//! `DATABASE_URL` named. The comment justifying that named a database
+//! (`epigraph_5b_test`) that this suite has not run against for a long time.
+//!
+//! MEASURED, at `c4d3f304`: run as a concurrent process alongside
+//! `graph_themes_test` with both at `--test-threads=4`, this binary passed
+//! every time and made `graph_themes_test::themes_expand_returns_neighborhoods_for_seeded_theme`
+//! fail 2 of 3 runs with `23503 neighborhood_edges_neighborhood_a_fkey`. That
+//! is the asymmetry the finding warns about: the binary that does the damage is
+//! not the one that goes red, which is why this one had grep evidence and no
+//! measured failure of its own.
+//!
+//! Converted TOGETHER with `graph_themes_test.rs`: they truncate the same three
+//! neighborhood tables, and those are the same three the already-isolated
+//! `graph_neighborhoods_test.rs` used to truncate. Leaving either on the shared
+//! pool keeps its truncation pointed at two isolated siblings.
+//!
+//! `#[sqlx::test]` supplies the empty database the DELETEs were faking, so
+//! every assertion below is unchanged. `spawn_app` builds its own pool from a
+//! URL, so the arm passes `fixture::database_url_for(&pool)`.
+
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn build_from_bridges_clusters_paragraphs() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
-    // Wipe cluster fixture state. We DELETE memberships before runs to avoid
-    // FK trouble with `claim_cluster_membership.cluster_id → graph_clusters`.
-    // We also wipe neighborhood tables if present, since they FK back to runs.
-    let _ = sqlx::query("DELETE FROM neighborhood_edges")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM claim_neighborhood_membership")
-        .execute(&pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM graph_neighborhoods")
-        .execute(&pool)
-        .await;
-    sqlx::query("DELETE FROM claim_cluster_membership")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM cluster_edges")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_clusters")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // The test DB (`epigraph_5b_test`) is dedicated to this Phase-5.B test.
-    // Wipe all bridge-relevant data from prior runs: decomposes_to edges and
-    // every claim that was tagged as paragraph (level=2) or atom (level=3).
-    sqlx::query("DELETE FROM edges WHERE relationship = 'decomposes_to'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claims WHERE (properties->>'level')::int IN (2, 3)")
-        .execute(&pool)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn build_from_bridges_clusters_paragraphs(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000dd").unwrap();
 
     sqlx::query(

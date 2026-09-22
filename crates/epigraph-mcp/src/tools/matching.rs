@@ -64,27 +64,26 @@ fn row_to_out(r: epigraph_db::MatchCandidateRow) -> CandidateOut {
 
 pub async fn find_cross_source_matches(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindCrossSourceMatchesParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let repo = MatchCandidateRepo::new(server.pool.clone());
 
     let candidates = repo
-        .list_for_claim(claim_id)
+        .list_for_claim(viewer, claim_id)
         .await
         .map_err(internal_error)?;
     let candidates_out: Vec<CandidateOut> = candidates.into_iter().map(row_to_out).collect();
 
     // Pull CORROBORATES edges incident on the claim — already-promoted matches.
-    let edges: Vec<(uuid::Uuid, uuid::Uuid, uuid::Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, source_id, target_id, properties FROM edges
-         WHERE relationship = 'CORROBORATES'
-           AND (source_id = $1 OR target_id = $1)",
-    )
-    .bind(claim_id)
-    .fetch_all(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    // The SQL moved to `MatchCandidateRepo::corroborates_edges_for_claim`
+    // (PR-09): it was inline here and byte-identical inline in
+    // `routes/cross_source.rs`, and neither copy filtered.
+    let edges = repo
+        .corroborates_edges_for_claim(viewer, claim_id)
+        .await
+        .map_err(internal_error)?;
 
     let corroborates: Vec<serde_json::Value> = edges
         .into_iter()
@@ -107,6 +106,7 @@ pub async fn find_cross_source_matches(
 
 pub async fn list_match_candidates(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListMatchCandidatesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
@@ -123,13 +123,17 @@ pub async fn list_match_candidates(
     };
 
     let repo = MatchCandidateRepo::new(server.pool.clone());
-    let rows = repo.list(status_ref, limit).await.map_err(internal_error)?;
+    let rows = repo
+        .list(viewer, status_ref, limit)
+        .await
+        .map_err(internal_error)?;
     let out: Vec<CandidateOut> = rows.into_iter().map(row_to_out).collect();
     success_json(&out)
 }
 
 pub async fn decide_match_candidate(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DecideMatchCandidateParams,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
@@ -170,7 +174,7 @@ pub async fn decide_match_candidate(
             // false) since the candidate was generated, promoting would create
             // a structural inconsistency — an edge incident on a retired claim
             // (backlog bug 5c7fc645). Refuse rather than write it.
-            if !ClaimRepository::are_all_current(&server.pool, &[row.claim_a, row.claim_b])
+            if !ClaimRepository::are_all_current(&server.pool, viewer, &[row.claim_a, row.claim_b])
                 .await
                 .map_err(internal_error)?
             {
@@ -186,12 +190,15 @@ pub async fn decide_match_candidate(
                 .await
                 .map_err(internal_error)?;
 
-            // Write the edge if it doesn't already exist (either
-            // direction). The unique-triple index was dropped in migrations
-            // 017/018, so this explicit existence check — now centralized in
-            // `EdgeRepository::create_symmetric_if_absent` — is the only guard
-            // against duplicates from repeated `decide` calls. The
-            // are_all_current guard above stays here at the call site.
+            // Write the edge if it doesn't already exist (either direction).
+            // The unique-triple index was dropped in migrations 017/018, and
+            // migration 090's `edges_symmetric_relationship_uniq` replaces it:
+            // the explicit existence check — now centralized in
+            // `EdgeRepository::create_symmetric_if_absent` — is the FAST PATH,
+            // and that index is what makes the answer true for a duplicate the
+            // check cannot see. The index is keyed on the
+            // `"source": "cross_source_matcher"` marker the props below stamp.
+            // The are_all_current guard above stays here at the call site.
             let props = serde_json::json!({
                 "candidate_id":     candidate_id,
                 "score":            row.score,

@@ -109,6 +109,10 @@ async fn create_with_id_if_absent_refuses_unexpanded_label_and_inserts_no_row(po
         agent_id,
         TruthValue::clamped(0.5),
         &["claim".into(), BAD_LABEL.into()],
+        // `Inherited`, not a declared group: the guard under test runs BEFORE
+        // the INSERT, so the row's tenancy is never reached — and a declared
+        // group would make this test also depend on group seeding.
+        epigraph_core::TenancyDecl::Inherited,
     )
     .await;
 

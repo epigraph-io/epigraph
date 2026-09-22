@@ -107,14 +107,16 @@ async fn claim_frames(pool: &PgPool, claim_id: Uuid) -> Result<Vec<Uuid>, String
 /// `epigraph_engine::edge_factor::preview_claim_belief_on_frame`.
 pub async fn preview_claim(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<Vec<(Uuid, epigraph_engine::edge_factor::CombinedBeliefPreview)>, String> {
     let frames = claim_frames(pool, claim_id).await?;
     let mut out = Vec::with_capacity(frames.len());
     for frame_id in frames {
-        if let Some(preview) =
-            epigraph_engine::edge_factor::preview_claim_belief_on_frame(pool, claim_id, frame_id)
-                .await?
+        if let Some(preview) = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+            pool, viewer, claim_id, frame_id,
+        )
+        .await?
         {
             out.push((frame_id, preview));
         }
@@ -131,9 +133,14 @@ pub async fn preview_claim(
 /// # Errors
 /// Propagates any error from the frame-discovery query or from the engine's
 /// recompute-and-write call.
-pub async fn run_claim(pool: &PgPool, claim_id: Uuid) -> Result<usize, String> {
+pub async fn run_claim(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<usize, String> {
     // Backlog 696d3a1c: one frame owns the shared claims.* cache. Looping over
     // every frame wrote it repeatedly and let the alphabetically last win.
-    let did = epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, claim_id).await?;
+    let did =
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id).await?;
     Ok(usize::from(did))
 }

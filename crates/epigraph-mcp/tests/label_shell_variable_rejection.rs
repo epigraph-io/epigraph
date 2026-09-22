@@ -19,6 +19,9 @@
 //! `expect_err` (`memorize`), and `batch_...` fails on its orphan-count
 //! assertion.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -37,11 +40,13 @@ async fn claim_count_for_content(pool: &PgPool, content: &str) -> i64 {
 /// `submit_claim` must refuse the label and persist NO claim.
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let content = "mcp submit_claim label guard subject";
 
     let err = epigraph_mcp::tools::claims::submit_claim(
         &server,
+        &viewer,
         epigraph_mcp::types::SubmitClaimParams {
             content: content.into(),
             methodology: "deductive_logic".into(),
@@ -83,11 +88,13 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
 /// rejects on the wrong predicate (e.g. any `:` or `-`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let content = "mcp submit_claim label guard negative control";
 
     epigraph_mcp::tools::claims::submit_claim(
         &server,
+        &viewer,
         epigraph_mcp::types::SubmitClaimParams {
             content: content.into(),
             methodology: "deductive_logic".into(),
@@ -124,11 +131,13 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
 /// this call returned SUCCESS.
 #[sqlx::test(migrations = "../../migrations")]
 async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let content = "mcp memorize tag guard subject";
 
     let err = epigraph_mcp::tools::memory::memorize(
         &server,
+        &viewer,
         epigraph_mcp::types::MemorizeParams {
             content: content.into(),
             confidence: Some(0.7),
@@ -162,12 +171,14 @@ async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
 /// row, while its well-formed neighbours are still ingested.
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let good = "mcp batch good entry";
     let bad = "mcp batch bad entry";
 
     let result = epigraph_mcp::tools::batch::batch_submit_claims(
         &server,
+        &viewer,
         epigraph_mcp::types::BatchSubmitClaimsParams {
             claims: vec![
                 epigraph_mcp::types::BatchClaimEntry {
@@ -262,10 +273,12 @@ async fn update_labels_tool_rejects_unexpanded_add_and_changes_nothing(pool: PgP
 async fn update_with_evidence_rejects_unexpanded_label_before_writing_evidence(pool: PgPool) {
     let claim_id =
         seed_claim_with_labels(&pool, "update_with_evidence guard subject", &["keeper"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let err = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
+        &viewer,
         epigraph_mcp::types::UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,
@@ -317,6 +330,7 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
     let signer = epigraph_crypto::AgentSigner::generate();
     let embedder = epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None);
     let server = epigraph_mcp::EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    let viewer = fixture::public_viewer(&pool).await;
 
     // Same shape as ingest_document_smoke.rs's fixture, with the DOI carrying an
     // unexpanded variable (how a shell-driven ingest script mangles it).
@@ -343,7 +357,7 @@ async fn ingest_document_rejects_an_unexpanded_doi_before_writing_anything(pool:
     let extraction: epigraph_ingest::schema::DocumentExtraction =
         serde_json::from_str(fixture).expect("fixture parses");
 
-    let err = epigraph_mcp::tools::ingestion::do_ingest_document(&server, &extraction)
+    let err = epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction)
         .await
         .expect_err("an unexpandable DOI must be refused");
 

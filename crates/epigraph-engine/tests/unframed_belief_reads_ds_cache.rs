@@ -17,6 +17,9 @@
 //! `truth_value` through one channel and its edge-derived value through the other —
 //! which is what made a recompute look like a clean revert in backlog 696d3a1c.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use epigraph_engine::belief_query::get_belief;
@@ -71,7 +74,10 @@ async fn unframed_get_belief_returns_the_persisted_ds_columns(pool: PgPool) {
     .await
     .expect("seed DS columns");
 
-    let got = get_belief(&pool, claim, None).await.expect("get_belief");
+    let viewer = fixture::public_viewer(&pool).await;
+    let got = get_belief(&pool, &viewer, claim, None)
+        .await
+        .expect("get_belief");
 
     assert!(
         (got.belief - 0.12).abs() < 1e-9,
@@ -119,8 +125,11 @@ async fn unframed_get_belief_agrees_with_get_belief_columns(pool: PgPool) {
     .await
     .expect("seed DS columns");
 
-    let via_engine = get_belief(&pool, claim, None).await.expect("get_belief");
-    let via_repo = ClaimRepository::get_belief_columns(&pool, ClaimId::from_uuid(claim))
+    let viewer = fixture::public_viewer(&pool).await;
+    let via_engine = get_belief(&pool, &viewer, claim, None)
+        .await
+        .expect("get_belief");
+    let via_repo = ClaimRepository::get_belief_columns(&pool, &viewer, ClaimId::from_uuid(claim))
         .await
         .expect("get_belief_columns")
         .expect("columns present");
@@ -148,7 +157,10 @@ async fn unframed_get_belief_falls_back_when_no_ds_columns(pool: PgPool) {
     let agent = insert_agent(&pool).await;
     let claim = insert_claim(&pool, agent, 0.73).await;
 
-    let got = get_belief(&pool, claim, None).await.expect("get_belief");
+    let viewer = fixture::public_viewer(&pool).await;
+    let got = get_belief(&pool, &viewer, claim, None)
+        .await
+        .expect("get_belief");
 
     assert!(
         (got.belief - 0.73).abs() < 1e-9 && (got.plausibility - 1.0).abs() < 1e-9,

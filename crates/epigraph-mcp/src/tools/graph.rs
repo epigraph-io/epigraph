@@ -19,6 +19,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn get_neighborhood(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetNeighborhoodParams,
 ) -> Result<CallToolResult, McpError> {
     let node_id = parse_uuid(&params.node_id)?;
@@ -28,7 +29,7 @@ pub async fn get_neighborhood(
     let mut edges = Vec::new();
 
     if direction == "outgoing" || direction == "both" {
-        let outgoing = EdgeRepository::get_by_source(&server.pool, node_id, "claim")
+        let outgoing = EdgeRepository::get_by_source(&server.pool, viewer, node_id, "claim")
             .await
             .map_err(internal_error)?;
         for e in outgoing {
@@ -49,7 +50,7 @@ pub async fn get_neighborhood(
     }
 
     if direction == "incoming" || direction == "both" {
-        let incoming = EdgeRepository::get_by_target(&server.pool, node_id, "claim")
+        let incoming = EdgeRepository::get_by_target(&server.pool, viewer, node_id, "claim")
             .await
             .map_err(internal_error)?;
         for e in incoming {
@@ -80,6 +81,7 @@ pub async fn get_neighborhood(
 
 pub async fn traverse(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: TraverseParams,
 ) -> Result<CallToolResult, McpError> {
     let start_id = parse_uuid(&params.start_id)?;
@@ -104,7 +106,9 @@ pub async fn traverse(
 
         // Try to get claim info for label/truth
         let (label, truth) =
-            match ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(current_id)).await {
+            match ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(current_id))
+                .await
+            {
                 Ok(Some(claim)) => (
                     Some(claim.content.chars().take(100).collect::<String>()),
                     Some(claim.truth_value.value()),
@@ -133,7 +137,7 @@ pub async fn traverse(
 
         if depth < max_depth {
             // Get outgoing edges
-            let outgoing = EdgeRepository::get_by_source(&server.pool, current_id, "claim")
+            let outgoing = EdgeRepository::get_by_source(&server.pool, viewer, current_id, "claim")
                 .await
                 .unwrap_or_default();
 

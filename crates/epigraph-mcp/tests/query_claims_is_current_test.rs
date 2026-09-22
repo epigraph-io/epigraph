@@ -17,6 +17,9 @@
 //! inside the low-truth window the queue actually queries: a test that only
 //! looked at a wide `[0,1]` range would not exercise the queue's real call.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::claims::query_claims;
 use epigraph_mcp::types::QueryClaimsParams;
 use rmcp::model::CallToolResult;
@@ -36,10 +39,11 @@ async fn query_claims_excludes_superseded_by_default(pool: PgPool) {
     let live = seed_claim(&pool, agent, 0.30, true, None).await;
     let refuted = seed_claim(&pool, agent, 0.10, false, Some(live)).await;
 
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     // ---- Default (is_current omitted) == the assessment-queue call ----
-    let claims = run(&server, 0.0, 0.4, None).await;
+    let claims = run(&server, &viewer, 0.0, 0.4, None).await;
     let ids = ids_of(&claims);
     assert!(
         ids.contains(&live.to_string()),
@@ -52,7 +56,7 @@ async fn query_claims_excludes_superseded_by_default(pool: PgPool) {
     );
 
     // ---- Explicit is_current = false: superseded rows ONLY ----
-    let claims = run(&server, 0.0, 0.4, Some(false)).await;
+    let claims = run(&server, &viewer, 0.0, 0.4, Some(false)).await;
     let ids = ids_of(&claims);
     assert_eq!(
         ids,
@@ -76,7 +80,7 @@ async fn query_claims_excludes_superseded_by_default(pool: PgPool) {
     );
 
     // ---- And the live row still reports true / no supersedes ----
-    let claims = run(&server, 0.0, 0.4, Some(true)).await;
+    let claims = run(&server, &viewer, 0.0, 0.4, Some(true)).await;
     assert_eq!(ids_of(&claims), vec![live.to_string()]);
     assert_eq!(claims[0]["is_current"], Value::Bool(true));
     assert_eq!(claims[0]["supersedes"], Value::Null);
@@ -84,19 +88,20 @@ async fn query_claims_excludes_superseded_by_default(pool: PgPool) {
 
 async fn run(
     server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     min_truth: f64,
     max_truth: f64,
     is_current: Option<bool>,
 ) -> Vec<Value> {
     let result = query_claims(
         server,
+        viewer,
         QueryClaimsParams {
             min_truth: Some(min_truth),
             max_truth: Some(max_truth),
             limit: Some(50),
             is_current,
         },
-        None,
     )
     .await
     .expect("query_claims");

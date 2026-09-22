@@ -55,6 +55,7 @@ pub enum EdgeFactorOutcome {
 /// before any DB query).
 pub async fn auto_wire_ds_for_edge(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     edge_id: Uuid,
     edge_signer_agent_id: Uuid,
     source_id: Uuid,
@@ -158,7 +159,7 @@ pub async fn auto_wire_ds_for_edge(
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
     // per-frame override naturally follows because we look up by frame_id.
-    let frame_id = ensure_binary_frame(pool).await?;
+    let frame_id = ensure_binary_frame(pool, viewer).await?;
     let per_frame_factor = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
         .await
         .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
@@ -237,7 +238,7 @@ pub async fn auto_wire_ds_for_edge(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    recompute_combined_belief(pool, target_id, frame_id, &frame).await?;
+    recompute_combined_belief(pool, viewer, target_id, frame_id, &frame).await?;
     Ok(EdgeFactorOutcome::Wired)
 }
 
@@ -267,6 +268,7 @@ pub async fn auto_wire_ds_for_edge(
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_edge_if_epistemic(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     was_created: bool,
     edge_id: Uuid,
     source_id: Uuid,
@@ -296,7 +298,7 @@ pub async fn auto_wire_edge_if_epistemic(
         }
     }
     if !was_created {
-        match MassFunctionRepository::exists_for_perspective(pool, edge_id).await {
+        match MassFunctionRepository::exists_for_perspective(pool, viewer, edge_id).await {
             Ok(true) => return None,
             Ok(false) => {} // never wired — attempt the wake-up below
             Err(e) => {
@@ -308,7 +310,17 @@ pub async fn auto_wire_edge_if_epistemic(
             }
         }
     }
-    match auto_wire_ds_for_edge(pool, edge_id, agent_id, source_id, target_id, relationship).await {
+    match auto_wire_ds_for_edge(
+        pool,
+        viewer,
+        edge_id,
+        agent_id,
+        source_id,
+        target_id,
+        relationship,
+    )
+    .await
+    {
         Ok(outcome) => Some(outcome),
         Err(e) => {
             tracing::warn!(
@@ -326,9 +338,13 @@ pub async fn auto_wire_edge_if_epistemic(
 /// combine, and write the resulting Bel/Pl/BetP/conflict/missing to the
 /// claim's row. Public so other belief-recompute paths (e.g. HTTP
 /// `propagate_to_dependents`) can share the cascade.
-pub async fn recompute_claim_belief_binary(pool: &PgPool, claim_id: Uuid) -> Result<bool, String> {
-    let frame_id = ensure_binary_frame(pool).await?;
-    recompute_claim_belief_on_frame(pool, claim_id, frame_id).await
+pub async fn recompute_claim_belief_binary(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    let frame_id = ensure_binary_frame(pool, viewer).await?;
+    recompute_claim_belief_on_frame(pool, viewer, claim_id, frame_id).await
 }
 
 /// Generalized variant of [`recompute_claim_belief_binary`] for any frame.
@@ -350,22 +366,23 @@ pub async fn recompute_claim_belief_binary(pool: &PgPool, claim_id: Uuid) -> Res
 /// step fails.
 pub async fn recompute_claim_belief_on_frame(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
 ) -> Result<bool, String> {
-    let row = FrameRepository::get_by_id(pool, frame_id)
+    let row = FrameRepository::get_by_id(pool, viewer, frame_id)
         .await
         .map_err(|e| format!("frame get_by_id: {e}"))?
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     if all_rows.is_empty() {
         return Ok(false);
     }
-    recompute_combined_belief(pool, claim_id, frame_id, &frame).await?;
+    recompute_combined_belief(pool, viewer, claim_id, frame_id, &frame).await?;
     Ok(true)
 }
 
@@ -390,16 +407,17 @@ pub async fn recompute_claim_belief_on_frame(
 /// Same failure modes as [`recompute_claim_belief_on_frame`].
 pub async fn preview_claim_belief_on_frame(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
-    let row = FrameRepository::get_by_id(pool, frame_id)
+    let row = FrameRepository::get_by_id(pool, viewer, frame_id)
         .await
         .map_err(|e| format!("frame get_by_id: {e}"))?
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    compute_combined_belief(pool, claim_id, frame_id, &frame).await
+    compute_combined_belief(pool, viewer, claim_id, frame_id, &frame).await
 }
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
@@ -717,11 +735,12 @@ fn warn_on_unknown_evidence_type_keys(
 /// transaction can't substitute for this split.
 async fn compute_combined_belief(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     if all_rows.is_empty() {
@@ -813,7 +832,7 @@ async fn compute_combined_belief(
     //
     // Missing assignment or NULL index ⇒ 0, matching the read side's
     // `unwrap_or(0)`.
-    let hypothesis_index = FrameRepository::get_claim_assignment(pool, claim_id, frame_id)
+    let hypothesis_index = FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_claim_assignment: {e}"))?
         .and_then(|a| a.hypothesis_index)
@@ -888,11 +907,13 @@ async fn compute_combined_belief(
 /// No-ops (does not write) when the claim has no BBAs on `frame_id`.
 async fn recompute_combined_belief(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
 ) -> Result<(), String> {
-    let Some(preview) = compute_combined_belief(pool, claim_id, frame_id, frame).await? else {
+    let Some(preview) = compute_combined_belief(pool, viewer, claim_id, frame_id, frame).await?
+    else {
         return Ok(());
     };
 
@@ -969,27 +990,34 @@ async fn recompute_combined_belief(
 /// was.
 ///
 /// Returns whether the cache was written.
-pub async fn recompute_claim_cached_belief(pool: &PgPool, claim_id: Uuid) -> Result<bool, String> {
-    let frames = MassFunctionRepository::list_frames_for_claim(pool, claim_id)
+pub async fn recompute_claim_cached_belief(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    let frames = MassFunctionRepository::list_frames_for_claim(pool, viewer, claim_id)
         .await
         .map_err(|e| format!("list_frames_for_claim: {e}"))?;
     let Some((last_frame, _)) = frames.last().cloned() else {
         return Ok(false);
     };
 
-    let canonical = ensure_binary_frame(pool).await?;
+    let canonical = ensure_binary_frame(pool, viewer).await?;
     let owner = if frames.iter().any(|(id, _)| *id == canonical) {
         canonical
     } else {
         last_frame
     };
 
-    recompute_claim_belief_on_frame(pool, claim_id, owner).await
+    recompute_claim_belief_on_frame(pool, viewer, claim_id, owner).await
 }
 
 /// Get-or-create the canonical `binary_truth` frame.
-pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
-    if let Some(row) = FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
+pub async fn ensure_binary_frame(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Uuid, String> {
+    if let Some(row) = FrameRepository::get_by_name(pool, viewer, BINARY_FRAME_NAME)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
@@ -1005,7 +1033,7 @@ pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
     .await
     {
         Ok(row) => Ok(row.id),
-        Err(_) => FrameRepository::get_by_name(pool, BINARY_FRAME_NAME)
+        Err(_) => FrameRepository::get_by_name(pool, viewer, BINARY_FRAME_NAME)
             .await
             .map_err(|e| format!("fallback get_by_name: {e}"))?
             .map(|r| r.id)

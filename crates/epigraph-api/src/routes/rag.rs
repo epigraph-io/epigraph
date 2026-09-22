@@ -15,6 +15,29 @@
 //! ```text
 //! GET /api/v1/query/rag?query=climate+change+effects&limit=5&min_truth=0.8&domain=factual
 //! ```
+//!
+//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
+//!
+//! Conversion shard 6. `rag_context` and `search_evidence` each run their single
+//! read on a viewer-stamped connection from [`AppState::read_as`].
+//! `ClaimRepository::rag_hybrid_context` and
+//! `EvidenceRepository::search_by_embedding` already spliced the viewer; what
+//! changed is which connection carries the session GUCs the `claims` and
+//! `evidence` policies read.
+//!
+//! **Both acquire the connection AFTER `generate_query_embedding`, deliberately.**
+//! That call leaves the process, and each handler issues exactly one statement,
+//! so there is no coherence to preserve across the wait and no reason to hold one
+//! of the request pool's ten connections while a third party answers.
+//!
+//! `generate_claim_embedding` and `generate_evidence_embedding` are NOT
+//! converted: both WRITE, and [`AppState::read_as`] is read-only — a write routed
+//! through a `ScopedRead` type-checks and is then rolled back on drop under
+//! `SessionGucMode::Transaction`. They remain counted, and
+//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
+//! `("rag.rs", 2)` for them, unchanged by this shard.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -22,9 +45,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[cfg(feature = "db")]
-use sqlx::Row;
-
+// Not `#[cfg(feature = "db")]`: `rag_context` is a single cfg-free handler
+// with a cfg'd body, so it names `ViewerExtractor` in both configurations.
+// The `not(db)` shim in `middleware::bearer` exists precisely so that the
+// authentication precondition — and the handler signature — stay identical
+// across the two builds.
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // ============================================================================
@@ -254,6 +280,7 @@ fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
 /// - Query length bounded to prevent memory exhaustion
 /// - Result count bounded to prevent large response payloads
 pub async fn rag_context(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     #[allow(unused_variables)] State(state): State<AppState>,
     Query(params): Query<RagQueryParams>,
 ) -> Result<Json<RagContextResponse>, ApiError> {
@@ -336,59 +363,40 @@ pub async fn rag_context(
         let embedding_str = format_embedding_for_pgvector(&query_embedding);
         let embedding_mode = if is_real_embedding { "real" } else { "mock" }.to_string();
 
-        // Step 2: Execute hybrid search combining vector similarity, truth, and connectivity
+        // Step 2: Execute hybrid search combining vector similarity, truth, and
+        // connectivity, filtered by the caller's Viewer.
         //
-        // Hybrid scoring formula:
-        //   hybrid_score = similarity * 0.6 + truth_value * 0.2 + connectivity * 0.2
+        // The statement itself now lives in
+        // `ClaimRepository::rag_hybrid_context`; see that function for the
+        // scoring formula and for why an unfiltered version of this read was
+        // the single highest-value exfiltration primitive in the API.
         //
-        // Where:
-        //   - similarity: cosine similarity between query and claim embedding
-        //   - truth_value: epistemic quality gate (already filtered by min_truth)
-        //   - connectivity: min(edge_count / 10.0, 1.0) — well-connected claims ranked higher
-        //
-        // The truth_value >= $2 clause is the epistemic quality gate that
-        // distinguishes this from general semantic search.
-        let rows = sqlx::query(
-            r#"
-            WITH query_vec AS (
-                SELECT $1::vector AS vec
-            ),
-            base AS (
-                SELECT
-                    c.id as claim_id,
-                    c.content,
-                    c.truth_value,
-                    1 - (c.embedding <=> q.vec) as similarity,
-                    c.labels[1] as domain,
-                    c.trace_id,
-                    c.agent_id,
-                    c.created_at,
-                    COALESCE((
-                        SELECT COUNT(*)
-                        FROM edges e
-                        WHERE e.source_id = c.id OR e.target_id = c.id
-                    ), 0) as edge_count
-                FROM claims c, query_vec q
-                WHERE c.embedding IS NOT NULL
-                  AND c.truth_value >= $2
-                  AND 1 - (c.embedding <=> q.vec) >= 0.0
-                  AND ($3::text IS NULL OR $3 = ANY(c.labels))
-            )
-            SELECT *,
-                similarity * 0.6
-                    + truth_value * 0.2
-                    + LEAST(edge_count::float / 10.0, 1.0) * 0.2
-                as hybrid_score
-            FROM base
-            ORDER BY hybrid_score DESC
-            LIMIT $4
-            "#,
+        // THE CONNECTION IS TAKEN HERE, NOT AT THE HANDLER HEAD, and the
+        // ordering is load-bearing rather than stylistic. `generate_query_embedding`
+        // above is an outbound call to the embedding provider; acquiring first
+        // would hold one of the request pool's ten connections
+        // (`ScopedPoolOptions::default`) across a network round trip to a third
+        // party. This handler runs exactly ONE statement, so there is nothing to
+        // keep coherent across the wait and no reason to pay for it.
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "rag_context",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let rows = epigraph_db::ClaimRepository::rag_hybrid_context(
+            &mut *read,
+            &viewer,
+            &embedding_str,
+            min_truth,
+            params.domain.as_deref(),
+            limit as i64,
         )
-        .bind(&embedding_str)
-        .bind(min_truth)
-        .bind(params.domain.as_deref())
-        .bind(limit as i64)
-        .fetch_all(&state.db_pool)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {}", e),
@@ -396,18 +404,18 @@ pub async fn rag_context(
 
         // Step 3: Convert rows to response DTOs
         let results: Vec<RagContextResult> = rows
-            .iter()
+            .into_iter()
             .map(|row| RagContextResult {
-                claim_id: row.get("claim_id"),
-                content: row.get("content"),
-                truth_value: row.get("truth_value"),
-                similarity: row.get("similarity"),
-                domain: row.get("domain"),
-                trace_id: row.get("trace_id"),
-                agent_id: row.get("agent_id"),
-                created_at: row.get("created_at"),
-                edge_count: row.get("edge_count"),
-                hybrid_score: row.get("hybrid_score"),
+                claim_id: row.claim_id,
+                content: row.content,
+                truth_value: row.truth_value,
+                similarity: row.similarity,
+                domain: row.domain,
+                trace_id: row.trace_id,
+                agent_id: row.agent_id,
+                created_at: Some(row.created_at),
+                edge_count: Some(row.edge_count),
+                hybrid_score: Some(row.hybrid_score),
             })
             .collect();
 
@@ -423,9 +431,12 @@ pub async fn rag_context(
         }))
     }
 
-    // Fallback when db feature is disabled
+    // Fallback when db feature is disabled. The viewer is still REQUIRED to
+    // reach this handler — `ViewerExtractor` enforces the same two 401
+    // branches in both builds — but there is no corpus to retrieve from.
     #[cfg(not(feature = "db"))]
     {
+        let _ = &viewer;
         let results: Vec<RagContextResult> = Vec::new();
         let count = 0;
         let query_time_ms = start_time.elapsed().as_millis() as u64;
@@ -575,9 +586,18 @@ pub struct EvidenceEmbeddingResponse {
 /// `GET /api/v1/search/evidence`
 ///
 /// Returns evidence items ranked by vector similarity to the query.
-/// Public endpoint — no authentication required.
+///
+/// Requires a Bearer token. PR-03 revoked this endpoint's public-access
+/// guarantee: corpus-wide semantic search over evidence is the highest-value
+/// anonymous read the API had. PR-07 finishes the job: a token alone bounded
+/// *who* could run the search but not *what* it returned, so any authenticated
+/// principal could rank the entire evidence corpus — including other tenants'
+/// `raw_content` — by similarity to an arbitrary probe. The search now runs
+/// through `EvidenceRepository::search_by_embedding`, which filters both the
+/// evidence row and its parent claim by the caller's `Viewer`.
 #[cfg(feature = "db")]
 pub async fn search_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<EvidenceSearchParams>,
 ) -> Result<Json<EvidenceSearchResponse>, ApiError> {
@@ -616,23 +636,27 @@ pub async fn search_evidence(
     let (query_embedding, _is_real) = generate_query_embedding(&state, query).await;
     let embedding_str = format_embedding_for_pgvector(&query_embedding);
 
-    let rows = sqlx::query_as::<_, EvidenceSearchRow>(
-        r#"
-        SELECT
-            e.id as evidence_id,
-            e.claim_id,
-            e.raw_content,
-            e.evidence_type,
-            1 - (e.embedding <=> $1::vector) AS similarity
-        FROM evidence e
-        WHERE e.embedding IS NOT NULL
-        ORDER BY e.embedding <=> $1::vector
-        LIMIT $2
-        "#,
+    // Acquired AFTER `generate_query_embedding`, for the reason `rag_context`
+    // states above: that call leaves the process, this handler runs exactly one
+    // statement, and a connection held across the wait buys nothing.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "search_evidence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let rows = epigraph_db::EvidenceRepository::search_by_embedding(
+        &mut *read,
+        &viewer,
+        &embedding_str,
+        limit,
     )
-    .bind(&embedding_str)
-    .bind(limit)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Database query failed: {}", e),
@@ -641,7 +665,7 @@ pub async fn search_evidence(
     let results: Vec<EvidenceSearchResultDto> = rows
         .into_iter()
         .map(|row| EvidenceSearchResultDto {
-            evidence_id: row.evidence_id,
+            evidence_id: row.id,
             claim_id: row.claim_id,
             raw_content: row.raw_content,
             evidence_type: row.evidence_type,
@@ -703,16 +727,11 @@ pub struct EvidenceSearchResponse {
     pub count: usize,
 }
 
-/// Row struct for evidence search query results
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct EvidenceSearchRow {
-    evidence_id: Uuid,
-    claim_id: Uuid,
-    raw_content: Option<String>,
-    evidence_type: String,
-    similarity: f64,
-}
+// `EvidenceSearchRow` was the row type for the inline, unfiltered evidence
+// search this module ran before PR-07. `search_evidence` now reads through
+// `EvidenceRepository::search_by_embedding`, which returns
+// `epigraph_db::EvidenceSearchResult` with the visibility predicate already
+// spliced on, so the local row struct has no remaining use.
 
 /// Non-DB stub for embedding generation
 #[cfg(not(feature = "db"))]
@@ -888,6 +907,12 @@ mod tests {
     // These tests exercise the validation logic in the handler without needing
     // a real database, by using the non-db feature gate path.
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::*;
@@ -1094,13 +1119,23 @@ mod tests {
             assert_eq!(resp["embedding_mode"], "mock");
         }
 
-        /// Test RAG endpoint is accessible as a public (unauthenticated) route
-        /// through the full application router, including rate-limiting and
-        /// signature verification middleware layers.
+        /// PR-03 INVERSION. This asserted 200 — that the RAG endpoint was
+        /// reachable with no credential — and the assertion message said so out
+        /// loud. `GET /api/v1/query/rag` returns claim CONTENT for the
+        /// highest-truth claims in the corpus (`rag.rs` `:402`), which makes it
+        /// the single highest-value route on the old anonymous surface.
+        ///
+        /// The public-access guarantee is deliberately revoked. What is asserted
+        /// now is that revoking it produced a usable failure: 401 with the
+        /// RFC 6750 challenge, not a bare status code.
+        ///
+        /// The `min_truth` plumbing this test used to cover moves to
+        /// `test_rag_min_truth` above, which drives the handler through
+        /// `test_router()` and needs no credential.
         #[tokio::test]
-        async fn test_rag_returns_200_via_full_router() {
+        async fn test_rag_is_401_via_full_router() {
             let state = AppState::new(ApiConfig {
-                require_signatures: true,
+                require_packet_signatures: true,
                 ..ApiConfig::default()
             });
             let router = crate::routes::create_router(state);
@@ -1113,26 +1148,26 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "RAG endpoint should be publicly accessible even with require_signatures enabled"
+                StatusCode::UNAUTHORIZED,
+                "RAG returns claim content and is no longer anonymously readable"
             );
-
-            let body = http_body_util::BodyExt::collect(response.into_body())
-                .await
-                .unwrap()
-                .to_bytes();
-            let resp: RagContextResponse = serde_json::from_slice(&body).unwrap();
-            assert_eq!(resp.count, 0, "No DB means empty results");
+            let challenge = response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("401 carries an RFC 6750 challenge")
+                .to_str()
+                .unwrap();
             assert!(
-                (resp.min_truth_applied - 0.7).abs() < f64::EPSILON,
-                "Default min_truth should be 0.7"
+                challenge.contains(r#"error="invalid_token""#),
+                "got: {challenge}"
             );
         }
 
-        /// Test that the min_truth parameter correctly flows through the full
-        /// router and is reflected in the response.
+        /// PR-03: `min_truth` still flows through the router, but the router
+        /// answers 401 before the handler parses it. The parameter's own
+        /// behaviour is covered by the `test_router()` cases above.
         #[tokio::test]
-        async fn test_rag_min_truth_via_full_router() {
+        async fn test_rag_min_truth_via_full_router_is_401() {
             let state = AppState::new(ApiConfig::default());
             let router = crate::routes::create_router(state);
 
@@ -1142,18 +1177,7 @@ mod tests {
                 .unwrap();
 
             let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let body = http_body_util::BodyExt::collect(response.into_body())
-                .await
-                .unwrap()
-                .to_bytes();
-            let resp: RagContextResponse = serde_json::from_slice(&body).unwrap();
-            assert!(
-                (resp.min_truth_applied - 0.95).abs() < f64::EPSILON,
-                "min_truth=0.95 should be reflected in response, got {}",
-                resp.min_truth_applied
-            );
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
     }
 
@@ -1271,6 +1295,12 @@ mod tests {
 
     // ---- Evidence Search Handler Tests (non-DB) ----
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod evidence_search_handler_tests {
         use super::*;
@@ -1331,8 +1361,11 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
 
+        /// PR-03 INVERSION: the evidence-search public-access guarantee is
+        /// revoked alongside RAG's. Same reasoning — the endpoint searches
+        /// evidence bodies corpus-wide.
         #[tokio::test]
-        async fn test_evidence_search_via_full_router() {
+        async fn test_evidence_search_via_full_router_is_401() {
             let state = AppState::new(ApiConfig::default());
             let router = crate::routes::create_router(state);
 
@@ -1344,14 +1377,20 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "Evidence search should be publicly accessible"
+                StatusCode::UNAUTHORIZED,
+                "Evidence search is no longer anonymously readable"
             );
         }
     }
 
     // ---- Evidence Embedding Handler Test (non-DB) ----
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod evidence_embedding_handler_tests {
         use super::*;

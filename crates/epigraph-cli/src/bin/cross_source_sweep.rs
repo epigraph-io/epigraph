@@ -12,7 +12,6 @@ use epigraph_cli::matching_client::RerankBridgesClient;
 use epigraph_engine::matching::calibration::MatcherConfig;
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
 use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
-use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
 /// Stub verifier for `--count-only`: **no answer** for every pair, so the band
@@ -92,12 +91,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let auto_promote = apply;
 
-    let db_url =
-        std::env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&db_url)
-        .await?;
+    // Corpus-wide by construction: a cross-SOURCE match that only sees one
+    // tenant's rows is the one match this sweep exists to find and would
+    // silently not find. It also writes match_candidates.
+    // See `epigraph_cli::MaintenancePool`.
+    //
+    // Constructed after the argv validation above, so `--dry-run`/`--apply`
+    // misuse is still reported as misuse rather than as a connection error
+    // (pinned by `tests/cross_source_sweep_smoke.rs`).
+    let maint = epigraph_cli::MaintenancePool::connect("cross_source_sweep")
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pool = maint.pool().clone();
 
     let cfg = match args.calibration {
         Some(p) => MatcherConfig::load_from(&p)?,

@@ -102,6 +102,7 @@ struct SweepResponse {
 
 pub async fn sweep_semantic_duplicates(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SweepSemanticDuplicatesParams,
 ) -> Result<CallToolResult, McpError> {
     let threshold = params.similarity_threshold.unwrap_or(0.10).clamp(0.0, 2.0);
@@ -120,6 +121,7 @@ pub async fn sweep_semantic_duplicates(
 
     let candidates = ClaimRepository::enumerate_current_embedded(
         &server.pool,
+        viewer,
         agent_scope.as_deref(),
         params.labels_scope.as_deref(),
         offset,
@@ -135,7 +137,7 @@ pub async fn sweep_semantic_duplicates(
 
     for c in &candidates {
         meta.insert(c.id, (c.truth_value, c.created_at));
-        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&server.pool, c.id, 5)
+        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&server.pool, viewer, c.id, 5)
             .await
             .map_err(internal_error)?;
         for n in neighbors {
@@ -163,7 +165,7 @@ pub async fn sweep_semantic_duplicates(
     }
 
     let all_ids: Vec<Uuid> = meta.keys().copied().collect();
-    let hashes = ClaimRepository::content_hashes_for(&server.pool, &all_ids)
+    let hashes = ClaimRepository::content_hashes_for(&server.pool, viewer, &all_ids)
         .await
         .map_err(internal_error)?;
 
@@ -226,6 +228,7 @@ pub async fn sweep_semantic_duplicates(
                 // still counts the pair.
                 match epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
                     &server.pool,
+                    viewer,
                     *dup,
                     *survivor,
                 )

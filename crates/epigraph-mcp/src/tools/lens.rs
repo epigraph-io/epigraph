@@ -92,17 +92,18 @@ pub fn resolve_lens_get_belief(
 /// `INTERNAL_ERROR` on a database failure.
 pub async fn validate_lens_exists(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<(), McpError> {
-    if FrameRepository::get_by_id(pool, frame_id)
+    if FrameRepository::get_by_id(pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .is_none()
     {
         return Err(invalid_params(format!("frame {frame_id} not found")));
     }
-    if PerspectiveRepository::get_by_id(pool, perspective_id)
+    if PerspectiveRepository::get_by_id(pool, viewer, perspective_id)
         .await
         .map_err(internal_error)?
         .is_none()

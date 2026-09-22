@@ -12,9 +12,6 @@ use epigraph_core::{
     TruthValue,
 };
 use epigraph_crypto::ContentHasher;
-use epigraph_db::access_control::{
-    batch_check_content_access, check_content_access, ContentAccess,
-};
 use epigraph_db::PatchClaimInput;
 use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
 use uuid::Uuid;
@@ -141,6 +138,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn submit_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     mut params: SubmitClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
@@ -184,7 +182,7 @@ pub async fn submit_claim(
     // path, it does not replace it). See crate::tools::novelty_gate.
     let is_exact_resubmit = {
         let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, viewer, &content_hash, agent_id)
             .await
             .map_err(internal_error)?
             .is_some()
@@ -196,6 +194,7 @@ pub async fn submit_claim(
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
         if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
             &server.pool,
+            viewer,
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
@@ -233,15 +232,18 @@ pub async fn submit_claim(
                 //      nothing is inserted. `resolve_backlog_item` is
                 //      unaffected (it hardcodes novelty_threshold=0.0 so
                 //      this branch never fires for it).
-                let existing =
-                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
-                        .await
-                        .map_err(internal_error)?
-                        .ok_or_else(|| {
-                            internal_error(format!(
-                            "novelty gate: nearest claim {existing_id} vanished before read-back"
-                        ))
-                        })?;
+                let existing = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    ClaimId::from_uuid(existing_id),
+                )
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    internal_error(format!(
+                        "novelty gate: nearest claim {existing_id} vanished before read-back"
+                    ))
+                })?;
                 return success_json(&SubmitClaimResponse {
                     claim_id: existing_id.to_string(),
                     truth_value: existing.truth_value.value(),
@@ -272,7 +274,8 @@ pub async fn submit_claim(
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "submit_claim").await?;
+        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "submit_claim")
+            .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Already validated above, before the claim write. This call can now only
@@ -369,12 +372,15 @@ pub async fn submit_claim(
 
         let ds_result = ds_auto::auto_wire_ds_for_claim(
             &server.pool,
+            viewer,
             claim_uuid,
             agent_id,
-            confidence,
-            weight,
-            true,
-            Some(&params.evidence_type),
+            ds_auto::DsAutoInput {
+                confidence,
+                weight,
+                supports: true,
+                evidence_type: Some(&params.evidence_type),
+            },
         )
         .await;
         if let Err(ref e) = ds_result {
@@ -444,8 +450,8 @@ pub async fn submit_claim(
 
 pub async fn query_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min = params.min_truth.unwrap_or(0.0);
@@ -462,22 +468,16 @@ pub async fn query_claims(
     // Filter by truth range AND retirement state in SQL (before LIMIT) so
     // matching claims outside the most-recent `limit` rows are still reachable
     // (bug 5a55a48e) and excluded rows don't consume the limit budget.
-    let claims = ClaimRepository::list_by_truth_range(&server.pool, min, max, is_current, limit, 0)
-        .await
-        .map_err(internal_error)?;
-
-    // Redact PRIVATE content the requester cannot read (A3 §7.5). Build a
-    // per-id access map and look each claim's decision up BY ITS OWN ID rather
-    // than positionally zipping the batch result. The lookup fails closed
-    // (`unwrap_or(Redacted)`), so a future reorder — or any id the batch helper
-    // fails to return — redacts rather than leaks. This is a durable runtime
-    // guard, not a debug-only tripwire.
-    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
-        batch_check_content_access(&server.pool, &ids, requester)
+    let claims =
+        ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, is_current, limit, 0)
             .await
-            .into_iter()
-            .collect();
+            .map_err(internal_error)?;
+
+    // No per-id access map. `list_by_truth_range` is spliced with `viewer`, so
+    // a claim this caller may not read is not in `claims`. The map existed to
+    // fail closed on an id the batch helper skipped — a hazard created by
+    // doing the check in a second pass keyed by id, which no longer happens.
+    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
 
     // Populate labels via a single batch round-trip for all returned ids
     // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
@@ -485,7 +485,7 @@ pub async fn query_claims(
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
     // is_current, so an explicit `is_current=false` request keeps its labels,
     // matching get_labels' label source. A missing id → no labels.
-    let labels_map = ClaimRepository::labels_by_ids(&server.pool, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
         .await
         .map_err(internal_error)?;
 
@@ -493,18 +493,12 @@ pub async fn query_claims(
         .into_iter()
         .map(|c| {
             let id = c.id.as_uuid();
-            let access = access_map
-                .get(&id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted);
-            let (content, content_hash) =
-                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
             ClaimResponse {
                 id: id.to_string(),
-                content,
+                content: c.content.clone(),
                 truth_value: c.truth_value.value(),
                 agent_id: c.agent_id.as_uuid().to_string(),
-                content_hash,
+                content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
                 // The row's real retirement state, not a hardcoded `true` /
@@ -521,8 +515,8 @@ pub async fn query_claims(
 
 pub async fn get_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetClaimParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
@@ -534,20 +528,24 @@ pub async fn get_claim(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+            .await?;
     }
 
-    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, claim_id)
+    let (claim, labels) = ClaimRepository::get_by_id_with_labels(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
-    let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-    let (content, content_hash) =
-        crate::tools::redaction::redact_content(access, &claim.content, &claim.content_hash);
+    // The `ok_or_else` above is now the ONLY outcome for a claim this viewer
+    // cannot read: `get_by_id_with_labels` filters, and the redaction pass that
+    // used to turn an already-fetched row into `("[REDACTED]", "")` is gone. A
+    // private claim and a nonexistent uuid therefore produce the same error.
+    let content = claim.content.clone();
+    let content_hash = ContentHasher::to_hex(&claim.content_hash);
     // Cached CDST classification ('supported' | 'contradicted' |
     // 'not_enough_info' | null). Flattened onto the standard claim response so
     // existing `ClaimResponse` consumers are unaffected.
-    let classification = ClaimRepository::get_classification(&server.pool, id)
+    let classification = ClaimRepository::get_classification(&server.pool, viewer, id)
         .await
         .map_err(internal_error)?;
 
@@ -559,6 +557,7 @@ pub async fn get_claim(
         Some((frame_id, perspective_id)) => {
             let interval = epigraph_engine::belief_query::get_perspective_belief(
                 &server.pool,
+                viewer,
                 id,
                 frame_id,
                 perspective_id,
@@ -636,11 +635,12 @@ pub async fn get_claim(
 /// exactly that, one level deeper.
 pub async fn verify_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let claim_id = ClaimId::from_uuid(id);
-    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -707,6 +707,7 @@ pub async fn verify_claim(
 
 pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: UpdateWithEvidenceParams,
 ) -> Result<CallToolResult, McpError> {
     // Two addressing modes, exactly one required: id-mode (`claim_id`) or
@@ -720,7 +721,7 @@ pub async fn update_with_evidence(
         }
         parse_uuid(params.claim_id.trim())?
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
-        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
+        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
             .map_err(internal_error)?
             .ok_or_else(|| {
@@ -743,7 +744,7 @@ pub async fn update_with_evidence(
     // on the strength of a submission the caller was told had failed.
     epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
 
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id))
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
@@ -781,7 +782,7 @@ pub async fn update_with_evidence(
     // by the prior column value for supports=true, so the warning is only ever
     // reachable on the NULL-column (no-prior-DS-state) path.
     let pre_pignistic =
-        ClaimRepository::get_belief_columns(&server.pool, ClaimId::from_uuid(claim_id))
+        ClaimRepository::get_belief_columns(&server.pool, viewer, ClaimId::from_uuid(claim_id))
             .await
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
@@ -794,6 +795,7 @@ pub async fn update_with_evidence(
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
     let ds = ds_auto::auto_wire_ds_update(
         &server.pool,
+        viewer,
         claim_id,
         agent_id,
         strength,
@@ -976,6 +978,7 @@ pub(crate) async fn require_owner_or_admin(
 /// the `resolution_claim_id` so the reconciler can back-fill.
 pub async fn resolve_backlog_item(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::ResolveBacklogItemParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -985,7 +988,7 @@ pub async fn resolve_backlog_item(
     // Confirm the target exists; we do NOT require the "backlog" label —
     // a stricter precondition belongs to the call site (HTTP filters /
     // operator UI) rather than the verb.
-    let original = ClaimRepository::get_by_id(&server.pool, original_claim_id)
+    let original = ClaimRepository::get_by_id(&server.pool, viewer, original_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {original_id} not found")))?;
@@ -1025,7 +1028,7 @@ pub async fn resolve_backlog_item(
         // never suppress or flag them via the semantic gate.
         novelty_threshold: Some(0.0),
     };
-    let submit_result = submit_claim(server, submit_params).await?;
+    let submit_result = submit_claim(server, viewer, submit_params).await?;
     let resolution_id = extract_submit_claim_id(&submit_result)?;
 
     // 2. PATCH the original's labels: add "resolved", keep "backlog".
@@ -1140,43 +1143,30 @@ pub async fn patch_claim(
 
 pub async fn query_undecomposed_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::QueryUndecomposedClaimsParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let claims = ClaimRepository::list_undecomposed(&server.pool, limit, offset)
+    let claims = ClaimRepository::list_undecomposed(&server.pool, viewer, limit, offset)
         .await
         .map_err(internal_error)?;
 
-    // Apply partition-aware content redaction so private/community-partitioned
-    // claims are not exposed to requesters who don't own them (parity with
-    // query_claims and get_claim — security finding: this path previously
-    // bypassed the check_content_access / batch_check_content_access layer).
-    let ids: Vec<Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let access_map: std::collections::HashMap<Uuid, ContentAccess> =
-        batch_check_content_access(&server.pool, &ids, requester)
-            .await
-            .into_iter()
-            .collect();
-
+    // `list_undecomposed` is spliced with `viewer`. This path once bypassed the
+    // redaction layer entirely — a finding fixed by adding a second pass; the
+    // durable fix is that the read itself filters, so there is no second pass
+    // left to forget.
     let results: Vec<ClaimResponse> = claims
         .into_iter()
         .map(|c| {
             let id = c.id.as_uuid();
-            let access = access_map
-                .get(&id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted);
-            let (content, content_hash) =
-                crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
             ClaimResponse {
                 id: id.to_string(),
-                content,
+                content: c.content.clone(),
                 truth_value: c.truth_value.value(),
                 agent_id: c.agent_id.as_uuid().to_string(),
-                content_hash,
+                content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
                 labels: Vec::new(),
                 is_current: true,

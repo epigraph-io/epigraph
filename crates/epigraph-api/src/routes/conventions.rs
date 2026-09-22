@@ -5,10 +5,38 @@
 //! - `DELETE /api/v1/conventions/:id` — forget a convention (add counter-evidence)
 //! - `POST /api/v1/skills/share` — share a workflow to global scope
 //!
-//! Public (GET):
+//! Authenticated (GET):
 //! - `GET /api/v1/skills` — list workflow skills
+//!
+//! (This header said "Public (GET)" and was stale. `list_skills` carries a
+//! `ViewerExtractor`, which 401s an unauthenticated caller, so the endpoint has
+//! not been public for some time. `forget_convention` and `share_skill` carry
+//! one too; `learn_convention` does not, and gates instead on an `AuthContext`
+//! plus a `claims:admin` scope check — authenticated either way. No handler's
+//! posture was changed by conversion shard 7: no `ViewerExtractor` was added or
+//! removed anywhere in `src/routes/` and no routed handler signature changed.
+//! The header was describing a contract the code had already left behind.)
+//!
+//! # Tenancy: 1 of this file's 4 raw-pool sites is converted
+//!
+//! Conversion shard 7. `list_skills` reads through a viewer-stamped connection
+//! from [`AppState::read_as`]. It shares `WorkflowRepository::list` with
+//! `routes/workflows.rs::list_workflows`, so ONE repository signature widening
+//! serves two converted sites in two files; that statement already carried
+//! `/* {VISIBILITY:c} */` over `claims`.
+//!
+//! The other 3 sites — `learn_convention`, `forget_convention`, `share_skill` —
+//! all WRITE. [`AppState::read_as`] is documented read-only and a write routed
+//! through a `ScopedRead` is rolled back on drop under
+//! `SessionGucMode::Transaction` while still type-checking. Their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`, and
+//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
+//! `("conventions.rs", 2)` for two of them, unchanged by this shard.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -155,7 +183,12 @@ pub async fn learn_convention(
     let mut claim = epigraph_core::Claim::new(request.content.clone(), agent_id, pub_key, truth);
     claim.content_hash = epigraph_crypto::ContentHasher::hash(request.content.as_bytes());
 
-    epigraph_db::ClaimRepository::create(pool, &claim).await?;
+    // A convention is authored by the SYSTEM agent, so the declaration names
+    // the system agent's own personal group. There is no caller-supplied group
+    // on this surface -- a convention is instance-wide by construction.
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
+    epigraph_db::ClaimRepository::create(pool, &claim, decl).await?;
 
     // Set labels: convention + any user tags
     let mut labels = vec!["convention".to_string(), "learned".to_string()];
@@ -252,6 +285,7 @@ pub async fn learn_convention(
 ///
 /// `DELETE /api/v1/conventions/:id`
 pub async fn forget_convention(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
@@ -266,7 +300,7 @@ pub async fn forget_convention(
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(claim_id);
 
-    let claim = epigraph_db::ClaimRepository::get_by_id(pool, claim_id_typed)
+    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id_typed)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "convention".to_string(),
@@ -361,13 +395,25 @@ pub async fn forget_convention(
 ///
 /// `GET /api/v1/skills`
 pub async fn list_skills(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListSkillsQuery>,
 ) -> Result<Json<Vec<SkillResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_skills",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     let rows = epigraph_db::WorkflowRepository::list(
-        pool,
+        &mut *read,
+        &viewer,
         params.min_truth,
         params.category.as_deref(),
         params.limit,
@@ -394,13 +440,14 @@ pub async fn list_skills(
 ///
 /// `POST /api/v1/skills/share`
 pub async fn share_skill(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ShareSkillRequest>,
 ) -> Result<(StatusCode, Json<ShareSkillResponse>), ApiError> {
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(request.workflow_id);
 
-    let claim = epigraph_db::ClaimRepository::get_by_id(pool, claim_id_typed)
+    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id_typed)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "workflow".to_string(),
@@ -430,7 +477,12 @@ pub async fn share_skill(
         epigraph_core::Claim::new(claim.content.clone(), agent_id, pub_key, claim.truth_value);
     shared_claim.content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
 
-    epigraph_db::ClaimRepository::create(pool, &shared_claim).await?;
+    // Same as `record_convention` above: the system agent's personal group.
+    // A "shared" workflow claim is explicitly instance-wide; making it
+    // group-private would defeat the sharing this endpoint exists to do.
+    let decl =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
+    epigraph_db::ClaimRepository::create(pool, &shared_claim, decl).await?;
 
     // Set labels
     let labels = vec![

@@ -405,10 +405,28 @@ async fn tampered_non_document_level_two_reports_mismatch(pool: PgPool) {
     );
 }
 
+/// Run `verify_claim` as the claim's OWN author.
+///
+/// A real `Viewer::resolve` on the authoring agent, not `Viewer::test_bypass`.
+/// A bypass viewer renders no predicate at all, so every assertion below would
+/// hold over a `get_by_id` that had silently lost its visibility marker — the
+/// class `visibility.rs` exists to make unbuildable. Resolving the author is
+/// also the only principal guaranteed to see the row regardless of what the
+/// tenancy defaults make of a raw-SQL fixture.
 async fn run_verify(pool: &PgPool, claim_id: Uuid) -> Value {
+    let (agent_id,): (Uuid,) = sqlx::query_as("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("fixture claim must exist");
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, agent_id)
+        .await
+        .expect("resolve author viewer");
+
     let server = build_test_server(pool.clone());
     let result = verify_claim(
         &server,
+        &viewer,
         VerifyClaimParams {
             claim_id: claim_id.to_string(),
         },

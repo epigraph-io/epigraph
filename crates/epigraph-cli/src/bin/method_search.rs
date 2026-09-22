@@ -1,6 +1,7 @@
 //! Web search for experimental method evidence.
 //!
-//! Usage: method_search <hypothesis_id> [--gaps-only] [--gap "PEG-silane SAM on HfO2"]
+//! Usage: method_search <hypothesis_id> (--public | --group UUID) [--agent-id UUID]
+//!                       [--gaps-only] [--gap "PEG-silane SAM on HfO2"]
 
 use clap::Parser;
 use uuid::Uuid;
@@ -8,11 +9,33 @@ use uuid::Uuid;
 #[derive(Parser)]
 #[command(
     name = "method_search",
-    about = "Search web for method evidence to fill gaps"
+    about = "Search web for method evidence to fill gaps",
+    group(clap::ArgGroup::new("tenancy").required(true).multiple(false))
 )]
 struct Args {
     /// Hypothesis claim UUID
     hypothesis_id: Uuid,
+
+    /// Readable by every authenticated agent; owned by the author's personal
+    /// group.
+    #[arg(long, group = "tenancy")]
+    public: bool,
+
+    /// Readable only by live members of this group.
+    #[arg(long, group = "tenancy", value_name = "UUID")]
+    group: Option<Uuid>,
+
+    /// Agent UUID that authors the ingested claims.
+    ///
+    /// REQUIRED, and this is a BUG FIX, not a new obligation. Before PR-16 the
+    /// INSERT below named no `agent_id` at all, and `claims.agent_id` is
+    /// `NOT NULL` with no `DEFAULT` (migration 001), so **every invocation of
+    /// this binary that reached the insert already raised 23502**. There was
+    /// no working path to preserve. Naming the author is also what makes a
+    /// tenancy declaration possible: `--public` owns the row with the author's
+    /// personal group, and without an author there is no group to name.
+    #[arg(long, env = "EPIGRAPH_AGENT_ID")]
+    agent_id: Uuid,
 
     /// Only process methods with evidence_score < 0.3
     #[arg(long)]
@@ -31,7 +54,24 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let exit_code = match run(args).await {
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("method_search")
+        .await
+        .expect("maintenance pool");
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance viewer");
+    let viewer = session.viewer();
+    let exit_code = match run(args, maint.pool().clone(), viewer).await {
         Ok(all_filled) => {
             if all_filled {
                 0
@@ -48,10 +88,28 @@ async fn main() {
 }
 
 /// Returns true if all gaps filled, false if gaps remain.
-async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
-    let pool = epigraph_cli::db_connect().await?;
+async fn run(
+    args: Args,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let embedder = epigraph_cli::embedding_service()
         .ok_or("OPENAI_API_KEY not set — embeddings required for method_search ingestion")?;
+
+    // Tenancy declaration (PR-16), resolved once for the whole run: every claim
+    // this binary ingests is the same operator's answer to the same gap, so a
+    // per-claim choice would be a distinction with no caller to make it.
+    // clap's ArgGroup guarantees exactly one flag was given; the `None` arm is
+    // a hard error rather than a default, for the reason spelled out in
+    // `hypothesis.rs`.
+    let decl = match (args.public, args.group) {
+        (_, Some(g)) => epigraph_core::TenancyDecl::group(g),
+        (true, None) => {
+            let mut conn = pool.acquire().await?;
+            epigraph_db::ClaimRepository::default_decl_for_author(&mut conn, args.agent_id).await?
+        }
+        (false, None) => return Err("exactly one of --public / --group <uuid> is required".into()),
+    };
 
     // 1. Load hypothesis
     let (statement,): (String,) = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
@@ -70,10 +128,11 @@ async fn run(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
         if let Some(method_ids) = &exp.method_ids {
             for mid in method_ids {
                 if let Some(method) = epigraph_db::MethodRepository::get(&pool, *mid).await? {
-                    let evidence =
-                        epigraph_db::MethodRepository::get_evidence_strength(&pool, method.id)
-                            .await
-                            .ok();
+                    let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+                        &pool, viewer, method.id,
+                    )
+                    .await
+                    .ok();
                     let score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
 
                     let is_gap = method.source_claim_ids.is_empty() || score < 0.3;
@@ -217,14 +276,15 @@ Return 3-8 claims."#,
             // Insert claim
             let claim_id: (Uuid,) = sqlx::query_as(
                 r#"
-                INSERT INTO claims (content, content_hash, truth_value, labels, properties, embedding)
-                VALUES ($1, $2, $3, ARRAY['experimental', 'web_search'], $4, $5::vector)
+                INSERT INTO claims (content, content_hash, truth_value, agent_id, labels, properties, embedding, visibility, owner_group_id)
+                VALUES ($1, $2, $3, $4, ARRAY['experimental', 'web_search'], $5, $6::vector, $7, $8)
                 RETURNING id
                 "#,
             )
             .bind(content)
             .bind(content_hash.as_slice())
             .bind(tv)
+            .bind(args.agent_id)
             .bind(serde_json::json!({
                 "source": "web_search",
                 "doi": doi,
@@ -233,6 +293,8 @@ Return 3-8 claims."#,
                 "protocol_parameters": claim.get("protocol_parameters"),
             }))
             .bind(&embedding_str)
+            .bind(decl.visibility_bind())
+            .bind(decl.owner_group_bind())
             .fetch_one(&pool)
             .await?;
 
@@ -269,9 +331,10 @@ Return 3-8 claims."#,
     // 5. Report updated evidence scores
     println!("\nUpdated evidence scores:");
     for (method_id, method_name, old_score) in &gaps {
-        let evidence = epigraph_db::MethodRepository::get_evidence_strength(&pool, *method_id)
-            .await
-            .ok();
+        let evidence =
+            epigraph_db::MethodRepository::get_evidence_strength(&pool, viewer, *method_id)
+                .await
+                .ok();
         let new_score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
         let filled = if new_score >= 0.3 { "FILLED" } else { "GAP" };
         println!("  {method_name}: {old_score:.3} → {new_score:.3} [{filled}]");

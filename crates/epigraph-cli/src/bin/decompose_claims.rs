@@ -138,9 +138,23 @@ async fn mint_service_token(api_base: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    let pool = epigraph_cli::db_connect().await?;
 
-    let claims = ClaimRepository::list_undecomposed(&pool, cli.limit, 0).await?;
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("decompose_claims").await?;
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
+        .await?;
+    let viewer = session.viewer();
+    let pool = maint.pool();
+
+    let claims = ClaimRepository::list_undecomposed(pool, viewer, cli.limit, 0).await?;
     eprintln!("found {} undecomposed claims", claims.len());
     if cli.dry_run || claims.is_empty() {
         for c in &claims {
@@ -212,7 +226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let totals = run_decomposition_batches(
-        &pool,
+        pool,
+        viewer,
         &batch_claims,
         llm.as_ref(),
         cli.batch_size,

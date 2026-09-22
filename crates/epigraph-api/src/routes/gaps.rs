@@ -144,8 +144,19 @@ pub async fn surface_gaps(
 /// Analyzes a question against the knowledge graph to identify gaps.
 /// Compares graph-constrained claims with the question to find
 /// structural absences, blind spots, and confidence divergences.
+///
+/// # Viewer
+///
+/// PR-07 fixed the caller-supplied-probe-vector-over-the-whole-corpus leak in
+/// `search.rs::semantic_search` and left it standing in this sibling, which ran
+/// the same statement shape and returned up to 200 characters of each matching
+/// claim in `nearest_graph_claim`. The handler took no auth argument at all, so
+/// the only gate was the router's `bearer_auth_middleware`. Adding the
+/// `ViewerExtractor` is a deliberate behaviour change: a bearer token that
+/// resolves to no `agents.id` now 401s here.
 #[cfg(feature = "db")]
 pub async fn gap_analysis(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<GapAnalysisRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -164,18 +175,19 @@ pub async fn gap_analysis(
                 message: format!("Failed to embed question: {e}"),
             })?;
 
-    // Find relevant claims in the graph
-    let graph_claims: Vec<GraphClaimRow> = sqlx::query_as(
-        "SELECT id, content, truth_value, belief, plausibility, \
-                1 - (embedding <=> $1::vector) AS similarity \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND 1 - (embedding <=> $1::vector) >= 0.3 \
-         ORDER BY similarity DESC \
-         LIMIT 20",
+    // Find relevant VISIBLE claims in the graph. Same predicate, threshold,
+    // ordering and limit as the inline statement this replaces.
+    let graph_claims = epigraph_db::ClaimRepository::semantic_search_flat(
+        &state.db_pool,
+        &viewer,
+        &format_embedding(&query_vec),
+        GAP_RELEVANCE_FLOOR,
+        None,
+        None,
+        None,
+        None,
+        20,
     )
-    .bind(format_embedding(&query_vec))
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to search graph claims: {e}"),
@@ -185,11 +197,11 @@ pub async fn gap_analysis(
     let mut gap_records = Vec::new();
 
     for claim in &graph_claims {
-        let truth = claim.truth_value.unwrap_or(0.5);
+        let truth = claim.truth_value;
         let belief = claim.belief.unwrap_or(truth);
         let plausibility = claim.plausibility.unwrap_or(truth);
         let ignorance = plausibility - belief;
-        let similarity = claim.similarity.unwrap_or(0.0);
+        let similarity = claim.similarity;
 
         // High ignorance = knowledge void
         if ignorance > 0.4 && similarity > 0.5 {
@@ -201,9 +213,9 @@ pub async fn gap_analysis(
                     unconstrained_claim: format!(
                         "High ignorance ({:.2}) on: {}",
                         ignorance,
-                        claim.content.chars().take(100).collect::<String>()
+                        claim.statement.chars().take(100).collect::<String>()
                     ),
-                    nearest_graph_claim: Some(claim.content.chars().take(200).collect()),
+                    nearest_graph_claim: Some(claim.statement.chars().take(200).collect()),
                     nearest_similarity: similarity,
                     graph_inference_path: None,
                     recommendation: "Gather more evidence to reduce ignorance".into(),
@@ -221,9 +233,9 @@ pub async fn gap_analysis(
                     unconstrained_claim: format!(
                         "Low truth ({:.2}) on relevant claim: {}",
                         truth,
-                        claim.content.chars().take(100).collect::<String>()
+                        claim.statement.chars().take(100).collect::<String>()
                     ),
-                    nearest_graph_claim: Some(claim.content.chars().take(200).collect()),
+                    nearest_graph_claim: Some(claim.statement.chars().take(200).collect()),
                     nearest_similarity: similarity,
                     graph_inference_path: None,
                     recommendation: "Investigate low-truth claim for missing evidence".into(),
@@ -244,11 +256,8 @@ pub async fn gap_analysis(
             ),
             nearest_graph_claim: graph_claims
                 .first()
-                .map(|c| c.content.chars().take(200).collect()),
-            nearest_similarity: graph_claims
-                .first()
-                .and_then(|c| c.similarity)
-                .unwrap_or(0.0),
+                .map(|c| c.statement.chars().take(200).collect()),
+            nearest_similarity: graph_claims.first().map_or(0.0, |c| c.similarity),
             graph_inference_path: None,
             recommendation: "This area lacks coverage — consider ingesting relevant sources".into(),
         });
@@ -295,6 +304,11 @@ pub async fn gap_analysis(
 
 // ── Internal helpers ──
 
+/// The similarity floor `gap_analysis` has always used, previously written as a
+/// bare `0.3` inside the SQL literal.
+#[cfg(feature = "db")]
+const GAP_RELEVANCE_FLOOR: f64 = 0.3;
+
 #[cfg(feature = "db")]
 fn format_embedding(embedding: &[f32]) -> String {
     format!(
@@ -308,15 +322,7 @@ fn format_embedding(embedding: &[f32]) -> String {
 }
 
 // ── Internal types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct GraphClaimRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    content: String,
-    truth_value: Option<f64>,
-    belief: Option<f64>,
-    plausibility: Option<f64>,
-    similarity: Option<f64>,
-}
+//
+// `GraphClaimRow` was deleted with the inline corpus scan it decoded. Its
+// replacement is `epigraph_db::SemanticFlatHit`, returned by the
+// viewer-spliced `ClaimRepository::semantic_search_flat`.

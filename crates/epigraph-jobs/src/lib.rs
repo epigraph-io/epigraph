@@ -62,6 +62,7 @@ pub use db_reputation_service::DbReputationService;
 
 pub mod cluster_graph;
 pub mod coordination;
+pub mod privatization;
 pub mod theme_cluster_rebuild;
 
 pub use coordination::{
@@ -746,6 +747,66 @@ pub enum EpiGraphJob {
         /// to `true` to avoid redoing work on idle days.
         skip_if_unchanged: bool,
     },
+
+    /// Apply a D4 privatization plan (FINAL-PLAN §6.5.5).
+    ///
+    /// **The three fields are not the authorization and must not be read as
+    /// it.** They are the claim the enqueuer makes about itself; the handler
+    /// re-derives every one of them from the database before it touches a row,
+    /// and refuses the whole plan when they disagree. See
+    /// `crate::privatization` for the six conditions.
+    ///
+    /// `correlation_id` ties this job to the `security_events` row the HTTP
+    /// layer wrote for the same request. `privatization_plans` has no
+    /// `correlation_id` column — migration 080 is applied and frozen — so the
+    /// value rides in the payload, and the handler's check is that a
+    /// `privatization_dispatch` event with this correlation id is attributed to
+    /// `dispatched_by`.
+    PrivatizationApply {
+        /// The plan to apply.
+        plan_id: Uuid,
+        /// The agent whose `POST …/apply` this is.
+        dispatched_by: Uuid,
+        /// Matches `security_events.correlation_id` for the dispatching request.
+        correlation_id: String,
+    },
+
+    /// Un-apply a D4 privatization plan, restoring each item's captured
+    /// `before_visibility` / `before_owner_group_id`.
+    ///
+    /// The mirror of [`Self::PrivatizationApply`] in every respect including the
+    /// warning above: the handler re-validates.
+    PrivatizationRevert {
+        /// The plan to revert.
+        plan_id: Uuid,
+        /// The agent whose `POST …/revert` this is.
+        dispatched_by: Uuid,
+        /// Matches `security_events.correlation_id` for the dispatching request.
+        correlation_id: String,
+    },
+
+    /// Finish a group's re-seal: clear `groups.reseal_required_at` once no
+    /// ciphertext row is still bound to a retired key epoch (§6.7 point 3).
+    ///
+    /// **It is keyed on a GROUP, not on a plan, and that is a correction to the
+    /// plan text.** FINAL-PLAN §6.7 describes reseal as `mode='reseal'`, and
+    /// migration 080's applied, frozen `pp_mode_check` admits only `restrict`
+    /// and `seal` — so a reseal plan is not representable without DDL, and
+    /// PR-21 is assigned no migration.
+    ///
+    /// It also does no crypto, which §6.7's own closing paragraph requires:
+    /// "re-sealing requires the group key, which by §6.5.6 the server does not
+    /// have. The server can mark, measure and prepare the manifest; only a
+    /// key-holding admin can complete it." The admin completes it through the
+    /// seal/unseal ceremony; this job is what OBSERVES completion.
+    PrivatizationReseal {
+        /// The group whose re-seal is being checked.
+        group_id: Uuid,
+        /// The agent whose commit triggered the check.
+        dispatched_by: Uuid,
+        /// Matches `security_events.correlation_id` for the triggering request.
+        correlation_id: String,
+    },
 }
 
 impl EpiGraphJob {
@@ -760,6 +821,12 @@ impl EpiGraphJob {
             Self::DataCleanup { .. } => "data_cleanup",
             Self::ClusterGraph { .. } => "cluster_graph",
             Self::ThemeClusterRebuild { .. } => "theme_cluster_rebuild",
+            // The three names migration 077's `jobs_app` WITH CHECK already
+            // spells. They must agree EXACTLY or the policy arm that refuses an
+            // app-role enqueue of privatization work stops matching.
+            Self::PrivatizationApply { .. } => crate::privatization::APPLY_JOB_TYPE,
+            Self::PrivatizationRevert { .. } => crate::privatization::REVERT_JOB_TYPE,
+            Self::PrivatizationReseal { .. } => crate::privatization::RESEAL_JOB_TYPE,
         }
     }
 

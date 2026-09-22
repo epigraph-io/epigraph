@@ -9,6 +9,51 @@ use uuid::Uuid;
 /// Repository for Evidence operations
 pub struct EvidenceRepository;
 
+/// Result row for [`EvidenceRepository::provided_for_claim_as_of`].
+///
+/// `evidence_type` and `created_at` are projected even though today's only
+/// caller replays `properties` alone: a row type that silently drops columns
+/// invites the next caller to add an inline statement beside this one rather
+/// than extending it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EvidenceAtTimeRow {
+    pub id: Uuid,
+    pub evidence_type: String,
+    pub properties: Option<serde_json::Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result row for [`EvidenceRepository::detail_by_id`].
+///
+/// The flattened projection `GET /api/v1/evidence/:id` returns. It lived as an
+/// inline `sqlx::query_as` in `epigraph-api/src/routes/edges.rs::get_evidence`
+/// until PR-14; that statement had no `Viewer` and its only control was a
+/// post-fetch `check_content_access` pass on the *linked claim*, which PR-14
+/// deletes. Moving it here puts the predicate on the row itself.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EvidenceDetailRow {
+    pub id: Uuid,
+    pub raw_content: Option<String>,
+    pub content_hash: Vec<u8>,
+    pub source_url: Option<String>,
+    pub properties: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result row for [`EvidenceRepository::by_relationship_for_claim`].
+///
+/// Was an inline `sqlx::query_as` in
+/// `epigraph-api/src/routes/edges.rs::evidence_by_relationship`, projecting
+/// `ev.raw_content` — a full second copy of the claim body — with no `Viewer`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct EvidenceEdgeRow {
+    pub edge_id: Uuid,
+    pub evidence_id: Uuid,
+    pub raw_content: Option<String>,
+    pub strength: Option<f64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Build Evidence from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -122,20 +167,29 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: EvidenceId) -> Result<Option<Evidence>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+    ) -> Result<Option<Evidence>, DbError> {
         let uuid: Uuid = id.into();
 
+        // MACRO SITE — static three-bind spelling. `evidence` carries its own
+        // tenancy columns (migration 062), so the predicate is on the row.
         let row = sqlx::query!(
             r#"
             SELECT id, content_hash, evidence_type, raw_content, claim_id,
                    signature, signer_id, properties, created_at
             FROM evidence
             WHERE id = $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             "#,
-            uuid
+            uuid,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -184,21 +238,32 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_claim(pool: &PgPool, claim_id: ClaimId) -> Result<Vec<Evidence>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: ClaimId,
+    ) -> Result<Vec<Evidence>, DbError> {
         let uuid: Uuid = claim_id.into();
 
+        // MACRO SITE — static three-bind spelling. The change inventory
+        // expected a joined `claims` alias here; the query reads `evidence`
+        // alone, and the claim-side check belongs to the caller that already
+        // resolved the claim id.
         let rows = sqlx::query!(
             r#"
             SELECT id, content_hash, evidence_type, raw_content, claim_id,
                    signature, signer_id, properties, created_at
             FROM evidence
             WHERE claim_id = $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             ORDER BY created_at DESC
             "#,
-            uuid
+            uuid,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         let mut evidence_list = Vec::with_capacity(rows.len());
@@ -244,6 +309,222 @@ impl EvidenceRepository {
         Ok(evidence_list)
     }
 
+    /// Evidence linked to a claim by a `provides_evidence`-shaped edge, as of a
+    /// point in time — viewer-filtered on BOTH `evidence` and `edges`.
+    ///
+    /// # Why this exists
+    ///
+    /// `routes/computation.rs::belief_at_time` held a `ViewerExtractor`, spent
+    /// it on an existence check (`ClaimRepository::get_by_id`), and then read
+    /// the evidence it actually replays with an inline unfiltered statement.
+    /// Both `evidence` and `edges` are `tier_a` in migration 062 and both carry
+    /// `visibility`/`owner_group_id`, so both were filterable and neither was
+    /// filtered. The handler returns `evidence_count` plus a truth value
+    /// replayed from `properties->confidence`, i.e. an inference oracle over
+    /// evidence rows the viewer may not own, gated only by the visibility of the
+    /// parent claim.
+    ///
+    /// It was also invisible to `viewer_route_table_lint.rs` as that lint was
+    /// originally written: `reads_claim_content` required `from claims` /
+    /// `join claims`, and this statement names neither. PR-07's follow-up
+    /// widened the predicate to the `tier_a` projections for exactly this
+    /// reason.
+    ///
+    /// The `edges` marker sits in the JOIN's ON clause, matching
+    /// [`crate::ClaimRepository::count_all_evidence_for_claim`]. It is the
+    /// `/* {EDGE_VISIBILITY:ed} */` spelling (PR-13) while `e` — `evidence`, not
+    /// `edges` — keeps the plain one. This statement is the reason the edge
+    /// fragment needs its own marker rather than an alias-keyed dispatch: `e`
+    /// names `evidence` here and `edges` in `repos/structural.rs`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn provided_for_claim_as_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        as_of: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<EvidenceAtTimeRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.evidence_type, e.properties, e.created_at \
+             FROM evidence e \
+             JOIN edges ed ON ed.source_id = e.id \
+                AND ed.target_type = 'claim' \
+                AND ed.target_id = $1 \
+                /* {EDGE_VISIBILITY:ed} */ \
+             WHERE e.created_at <= $2 \
+               /* {VISIBILITY:e} */ \
+             ORDER BY e.created_at ASC",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceAtTimeRow>(&sql)
+            .bind(claim_id)
+            .bind(as_of);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Fetch the flattened detail projection for a single evidence row.
+    ///
+    /// Returns `None` both when the row does not exist and when it exists but
+    /// this `Viewer` may not read it — the two are deliberately the same value,
+    /// so `GET /api/v1/evidence/:id` cannot be used to confirm the existence of
+    /// evidence attached to a claim the caller cannot see (§8.5).
+    ///
+    /// `evidence` carries its own `visibility`/`owner_group_id`, kept in step
+    /// with its parent claim by `epigraph_propagate_tenancy` (migration 070/071
+    /// lists `evidence` among the claim_id-derived tables), so the predicate is
+    /// on the row and no join to `claims` is needed.
+    ///
+    /// # The SUBJECT of the gate moved, not just its location
+    ///
+    /// Said plainly because "moved into the repo layer" would otherwise imply a
+    /// pure relocation. The deleted control was
+    /// `check_content_access(pool, claim_edge.source_id, requester)`, where
+    /// `claim_edge` came from `SELECT source_id FROM edges WHERE target_id = $1
+    /// AND target_type = 'evidence' AND source_type = 'claim' LIMIT 1` — the
+    /// claim reached through an EDGE. The new control is the row's own tenancy,
+    /// which 070 derives from `evidence.claim_id`. Those are the same claim at
+    /// every production write site (`routes/crud.rs`, `mcp/tools/claims.rs::submit_claim`
+    /// both create the `DERIVED_FROM` edge from the owning claim), but nothing
+    /// in the schema requires it: `POST /api/v1/claims/:id/relate` and MCP
+    /// `link_epistemic` let any writer add a claim→evidence edge from an
+    /// arbitrary claim.
+    ///
+    /// The move is a TIGHTENING rather than a swap, and the old form's
+    /// unordered `LIMIT 1` is why. With several claims linked to one evidence
+    /// row, the old gate picked an arbitrary one — so evidence belonging to a
+    /// private claim could be waved through on a public sibling, nondeterministically.
+    /// The row's own `claim_id`-derived tenancy has no such choice to make. In
+    /// the reverse case (evidence private under a public claim) the old form
+    /// disclosed and this one does not.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn detail_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<EvidenceDetailRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.raw_content, e.content_hash, e.source_url, \
+                    e.properties, e.created_at \
+             FROM evidence e \
+             WHERE e.id = $1 \
+               /* {VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceDetailRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// Evidence linked to `claim_id` by an edge with the given `relationship`.
+    ///
+    /// Backs `GET /api/v1/claims/:id/supporting-evidence` and
+    /// `…/contradicting-evidence`. Both the edge and the evidence row are
+    /// filtered: an edge the viewer cannot see must not surface its endpoint,
+    /// and evidence the viewer cannot see must not surface its `raw_content`
+    /// even if the edge is visible. `ed` takes the `EDGE_VISIBILITY` spelling
+    /// and `ev` the plain one; both resolve to the same `$V`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn by_relationship_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        relationship: &str,
+    ) -> Result<Vec<EvidenceEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT ed.id as edge_id, ev.id as evidence_id, \
+                    ev.raw_content, (ed.properties->>'strength')::float8 as strength, \
+                    ev.created_at \
+             FROM edges ed \
+             JOIN evidence ev ON ev.id = ed.source_id \
+                /* {VISIBILITY:ev} */ \
+             WHERE ed.target_id = $1 \
+               AND ed.target_type = 'claim' \
+               AND ed.source_type = 'evidence' \
+               AND ed.relationship = $2 \
+               /* {EDGE_VISIBILITY:ed} */ \
+             ORDER BY ev.created_at DESC \
+             LIMIT 100",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceEdgeRow>(&sql)
+            .bind(claim_id)
+            .bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Backfill `raw_content` on an evidence row the viewer may WRITE.
+    ///
+    /// **The first production call site of the write-side predicate** (PR-16,
+    /// delivered as 16b). The statement carries `/* {WRITABLE:e} */`, spliced by
+    /// [`crate::visibility::Viewer::splice_write`], which renders
+    /// `AND e.owner_group_id = ANY($3::uuid[])` and takes its array from
+    /// [`crate::visibility::Viewer::writable_bind`] — the `admin`/`writer`
+    /// subset — **not** from `group_bind()`.
+    ///
+    /// That distinction is the whole control, and it is invisible at a glance:
+    /// binding `group_bind()` here would compile, keep the fragment and the
+    /// bind arity identical, refuse every stranger exactly as it should, and
+    /// silently let a principal who can only READ a group rewrite that group's
+    /// evidence. `write_gate_evidence_update.rs` exists to fail in precisely
+    /// that case.
+    ///
+    /// # What this does NOT constrain
+    ///
+    /// A `WHERE` predicate decides which ROW a statement may touch. It says
+    /// nothing about the VALUES the `SET` clause assigns. This function only
+    /// ever assigns `raw_content`, so the gap is not reachable here — but a
+    /// future write fn that lets a caller assign `owner_group_id` is not made
+    /// safe by carrying this marker.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated. `false` when no row matched — which is
+    /// **either** "no such evidence" **or** "you may not write it", deliberately
+    /// indistinguishable: the caller maps it to 404, because a 403 would confirm
+    /// the existence of evidence in a group the caller cannot write to.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, raw_content))]
+    pub async fn update_raw_content<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+        raw_content: &str,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE evidence AS e SET raw_content = $2 \
+             WHERE e.id = $1 \
+               /* {WRITABLE:e} */",
+            3,
+        );
+        let uuid: Uuid = id.into();
+        let mut q = sqlx::query(&sql).bind(uuid).bind(raw_content);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "` and
+        // the statement therefore has no `$3` to fill. Binding unconditionally
+        // would over-supply the maintenance path by one parameter.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(executor).await?.rows_affected() > 0)
+    }
+
     /// Delete evidence by ID
     ///
     /// # Returns
@@ -251,8 +532,20 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn delete(pool: &PgPool, id: EvidenceId) -> Result<bool, DbError> {
+    /// Takes a viewer it does not yet use: WRITE path, PR-16 owns the
+    /// write-side predicate. The parameter exists so the hook is already at
+    /// every call site.
+    #[instrument(skip(executor, _viewer))]
+    pub async fn delete<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        _viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+    ) -> Result<bool, DbError> {
+        // VISIBILITY-EXEMPT: PR-16 owns the write-side predicate.
+        // Recognised by `crates/epigraph-db/tests/visibility_lint.rs`, which
+        // otherwise fails any fn taking a `&Viewer` and running SQL without
+        // splicing or binding it. The exemption count is itself a ratchet
+        // there, so adding a third one is a visible diff.
         let uuid: Uuid = id.into();
 
         let result = sqlx::query!(
@@ -262,7 +555,7 @@ impl EvidenceRepository {
             "#,
             uuid
         )
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -316,18 +609,20 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, query_embedding_pgvector))]
-    pub async fn search_by_embedding(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<EvidenceSearchResult>, DbError> {
-        let rows = sqlx::query_as::<_, EvidenceSearchResult>(
+        let sql = viewer.splice(
             r#"
             SELECT
                 e.id,
                 e.claim_id,
                 e.raw_content,
+                e.evidence_type,
                 1 - (e.embedding <=> $1::vector) AS similarity
             FROM evidence e
             WHERE e.embedding IS NOT NULL
@@ -335,15 +630,21 @@ impl EvidenceRepository {
                   SELECT 1 FROM claims c
                   WHERE c.id = e.claim_id
                     AND COALESCE(c.is_current, true) = true
+                    /* {VISIBILITY:c} */
               )
+              /* {VISIBILITY:e} */
             ORDER BY e.embedding <=> $1::vector
             LIMIT $2
             "#,
-        )
-        .bind(query_embedding_pgvector)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceSearchResult>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -501,6 +802,10 @@ pub struct EvidenceSearchResult {
     pub id: Uuid,
     pub claim_id: Uuid,
     pub raw_content: Option<String>,
+    /// Carried so `GET /api/v1/search/evidence` can render its result rows from
+    /// this (viewer-filtered) repo read instead of the unfiltered inline query
+    /// it used before PR-07.
+    pub evidence_type: String,
     pub similarity: f64,
 }
 

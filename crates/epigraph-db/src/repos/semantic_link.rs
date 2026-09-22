@@ -165,26 +165,35 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         id: SemanticLinkId,
     ) -> Result<Option<SemanticLink>, DbError> {
         let uuid: Uuid = id.into();
 
-        // Use runtime query with FromRow derive
-        let row: Option<EdgeRow> = sqlx::query_as(
+        // `edges` takes `edge_predicate_fragment` via the
+        // `/* {EDGE_VISIBILITY:...} */` spelling (PR-13): the co-ownership
+        // INTERSECTION over `edges.co_owner_group_id` (migration 072), not the
+        // plain single-owner predicate. A cross-group link is visible only to a
+        // principal in both endpoint groups.
+        let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
             WHERE id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<EdgeRow> = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => Ok(Some(semantic_link_from_row(row)?)),
@@ -196,26 +205,31 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_source(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_source<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         source_claim_id: ClaimId,
     ) -> Result<Vec<SemanticLink>, DbError> {
         let uuid: Uuid = source_claim_id.into();
 
-        let rows: Vec<EdgeRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
             WHERE source_id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -229,26 +243,31 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_target(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_target<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         target_claim_id: ClaimId,
     ) -> Result<Vec<SemanticLink>, DbError> {
         let uuid: Uuid = target_claim_id.into();
 
-        let rows: Vec<EdgeRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
             WHERE target_id = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -264,16 +283,17 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_between(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_between<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_a: ClaimId,
         claim_b: ClaimId,
     ) -> Result<Vec<SemanticLink>, DbError> {
         let uuid_a: Uuid = claim_a.into();
         let uuid_b: Uuid = claim_b.into();
 
-        let rows: Vec<EdgeRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
@@ -281,13 +301,16 @@ impl SemanticLinkRepository {
                 OR (source_id = $2 AND target_id = $1))
               AND source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
-        )
-        .bind(uuid_a)
-        .bind(uuid_b)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(uuid_a).bind(uuid_b);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -301,26 +324,31 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_type(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_type<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         link_type: SemanticLinkType,
     ) -> Result<Vec<SemanticLink>, DbError> {
         let relationship = link_type_to_str(link_type);
 
-        let rows: Vec<EdgeRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
             WHERE relationship = $1
               AND source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             "#,
-        )
-        .bind(relationship)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -342,8 +370,23 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn retract(pool: &PgPool, id: SemanticLinkId) -> Result<bool, DbError> {
+    /// Renamed from `delete` when edge removal became retraction: the body is
+    /// an `UPDATE ... SET valid_to = now()`, so the old name described an
+    /// operation this no longer performs.
+    ///
+    /// Takes a viewer it does not yet use in SQL: this is a WRITE path, and
+    /// PR-16 owns the write-side predicate. The parameter is here so the hook
+    /// exists at every call site before then, and so a reviewer can see which
+    /// writes are still unfiltered.
+    #[instrument(skip(executor, _viewer))]
+    pub async fn retract<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        _viewer: &crate::visibility::Viewer,
+        id: SemanticLinkId,
+    ) -> Result<bool, DbError> {
+        // VISIBILITY-EXEMPT: PR-16 owns the write-side predicate.
+        // Recognised by `crates/epigraph-db/tests/visibility_lint.rs`; see the
+        // matching note in `EvidenceRepository::delete`.
         let uuid: Uuid = id.into();
 
         let result = sqlx::query(
@@ -357,7 +400,7 @@ impl SemanticLinkRepository {
             "#,
         )
         .bind(uuid)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected() > 0)
@@ -367,26 +410,30 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SemanticLink>, DbError> {
-        let rows: Vec<EdgeRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT id, source_id, target_id, relationship, properties
             FROM edges
             WHERE source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EdgeRow>(&sql).bind(limit).bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<EdgeRow> = q.fetch_all(executor).await?;
 
         let mut links = Vec::with_capacity(rows.len());
         for row in rows {
@@ -400,18 +447,26 @@ impl SemanticLinkRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn count(pool: &PgPool) -> Result<i64, DbError> {
-        let row = sqlx::query(
+    #[instrument(skip(executor, viewer))]
+    pub async fn count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT COUNT(*) as count
             FROM edges
             WHERE source_type = 'claim'
               AND target_type = 'claim'
+              /* {EDGE_VISIBILITY:edges} */
             "#,
-        )
-        .fetch_one(pool)
-        .await?;
+            1,
+        );
+        let mut q = sqlx::query(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_one(executor).await?;
 
         let count: Option<i64> = row.try_get("count")?;
         Ok(count.unwrap_or(0))

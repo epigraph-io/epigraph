@@ -150,10 +150,59 @@ name = "retire_match_candidates"
 path = "src/bin/retire_match_candidates.rs"
 required-features = ["db"]
 
+# PR-12's tenancy backfill. A [[bin]] here rather than a new
+# `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
+# names the binary with no path, the PR's own title is `feat(cli)`, every
+# comparable maintenance tool in this tree is a [[bin]] in this crate, and a new
+# workspace member would need its own `.github/workflows/ci.yml` `--exclude` +
+# serialized step (ci.yml is on PR-16's Files line, not PR-12's). The binary
+# NAME is what migration 066's header and plan §9.2 invoke, and it is preserved
+# exactly.
+[[bin]]
+name = "epigraph-tenancy-backfill"
+path = "src/bin/tenancy_backfill.rs"
+required-features = ["db"]
+
+# `epigraph-instance-admin` (PR-18a). The only writer of `instance_admins`.
+#
+# The plan's Files line spells the SOURCE FILE `epigraph-instance-admin.rs`.
+# That is against this crate's convention, which every other entry here follows:
+# a snake_case path with a kebab-case `name`. The BINARY name is what plan 6.6
+# and migration 083's header invoke and it is preserved exactly.
+#
+# `required-features = ["db"]` matches its sibling. `db` IS in this crate's
+# default feature set, so `--workspace --all-targets` builds this target; the
+# `genai`-gated targets are the ones the four gates miss, and this is not one.
+[[bin]]
+name = "epigraph-instance-admin"
+path = "src/bin/instance_admin.rs"
+required-features = ["db"]
+
+# `epigraph-group` (PR-19): the client-side group key ceremony.
+#
+# The plan's Files line spells the SOURCE FILE `epigraph-group.rs`; as with
+# `epigraph-instance-admin` above, this crate's convention is a snake_case path
+# with a kebab-case `name`, and the BINARY name — which the group routes'
+# documentation invokes as `--init-group` — is preserved exactly.
+#
+# NO `required-features`, and that is deliberate rather than an omission: this
+# binary constructs no pool, names no database type, and must build with the
+# `db` feature off. Note what that does and does not buy. The SOURCE is DB-free,
+# which is why `no_unmaintained_dsn.rs` passes it without an exemption row. The
+# CRATE is not: `default = ["db"]` links epigraph-db and sqlx, and Cargo
+# dependencies are per-crate, not per-target, so the compiled artifact carries
+# them. "Never linked into the server" is a property of where the key material
+# goes, not something this manifest can enforce.
+[[bin]]
+name = "epigraph-group"
+path = "src/bin/group.rs"
+
 [dependencies]
 epigraph-core = { workspace = true }
 epigraph-engine = { workspace = true }
 epigraph-crypto = { workspace = true }
+epigraph-privacy = { workspace = true }  # epigraph-group's ceremony types
+ed25519-dalek = { workspace = true }
 epigraph-embeddings = { workspace = true }
 epigraph-interfaces = { workspace = true }
 epigraph-ds = { workspace = true }
@@ -195,3 +244,21 @@ http-body-util = "0.1"
 
 [lints]
 workspace = true
+
+# `epigraph-privatize` (PR-21): the client half of the D4 seal ceremony.
+#
+# Same naming convention as its two siblings above: a snake_case path with a
+# kebab-case `name`. FINAL-PLAN §6.5.7 spells the source file
+# `epigraph-privatize.rs`; the BINARY name is what the plan invokes and it is
+# preserved exactly.
+#
+# NO `required-features`, for the same reason `epigraph-group` has none and with
+# the same caveat: the SOURCE opens no pool, names no database type and reads no
+# `DATABASE_URL` — which is why `no_unmaintained_dsn.rs` passes it without an
+# exemption row — while the CRATE still links epigraph-db through
+# `default = ["db"]`, because Cargo dependencies are per-crate and not
+# per-target. "The key never reaches a process the operator controls" is a
+# property of where this binary is RUN, not something this manifest enforces.
+[[bin]]
+name = "epigraph-privatize"
+path = "src/bin/privatize.rs"

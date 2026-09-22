@@ -60,6 +60,18 @@ async fn second_run_is_idempotent(pool: PgPool) {
             matches!(o, ClientOutcome::Existing { .. }),
             "second run must report Existing, got {o:?}"
         );
+        // Nothing drifted, so nothing was rewritten — the reconcile is a no-op
+        // on an already-current row and must not churn `updated_at`.
+        assert!(
+            matches!(
+                o,
+                ClientOutcome::Existing {
+                    scopes_reconciled: false,
+                    ..
+                }
+            ),
+            "an unchanged row must not report a reconcile, got {o:?}"
+        );
     }
 
     // Still exactly three rows.
@@ -109,4 +121,79 @@ async fn scope_invariants_hold_in_db(pool: PgPool) {
         !ro.contains("claims:write"),
         "ro must NOT include claims:write"
     );
+}
+
+/// Bootstrap must be CONVERGENT, not merely idempotent.
+///
+/// It used to look a canonical client up by name and `continue` on a hit,
+/// never touching scopes. PR-02 adds `groups:write` to the write roles and
+/// `groups:admin` to admin, and `POST /api/v1/groups` and both member routes now
+/// REQUIRE them — so on any already-bootstrapped instance the canonical clients
+/// keep their old arrays and 403, including `epigraph-admin`, with no migration
+/// or backfill in the release able to fix it. Re-running this binary is the
+/// operator-facing repair, so it has to converge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drifted_canonical_client_is_reconciled(pool: PgPool) {
+    bootstrap_canonical_clients(&pool, LEGAL_NAME, LEGAL_EMAIL, None)
+        .await
+        .expect("bootstrap 1");
+
+    // Simulate the pre-PR-02 instance: the row exists, but without the scopes
+    // this release started requiring.
+    let narrowed = vec!["claims:read".to_string()];
+    sqlx::query(
+        "UPDATE oauth_clients SET allowed_scopes = $1, granted_scopes = $1 \
+         WHERE client_name = 'epigraph-admin'",
+    )
+    .bind(&narrowed)
+    .execute(&pool)
+    .await
+    .expect("narrow scopes");
+
+    let outcomes = bootstrap_canonical_clients(&pool, LEGAL_NAME, LEGAL_EMAIL, None)
+        .await
+        .expect("bootstrap 2");
+
+    let admin = outcomes
+        .iter()
+        .find(|o| match o {
+            ClientOutcome::Existing { name, .. } | ClientOutcome::Created { name, .. } => {
+                *name == "epigraph-admin"
+            }
+        })
+        .expect("epigraph-admin in outcomes");
+    assert!(
+        matches!(
+            admin,
+            ClientOutcome::Existing {
+                scopes_reconciled: true,
+                ..
+            }
+        ),
+        "the drifted row must report a reconcile, got {admin:?}"
+    );
+
+    let (allowed, granted): (Vec<String>, Vec<String>) = sqlx::query_as(
+        "SELECT allowed_scopes, granted_scopes FROM oauth_clients \
+         WHERE client_name = 'epigraph-admin'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let canonical = epigraph_core::canonical_scopes::scopes_for("epigraph-admin")
+        .expect("canonical name resolves");
+    let expected: HashSet<&str> = canonical.iter().map(String::as_str).collect();
+    assert_eq!(
+        allowed.iter().map(String::as_str).collect::<HashSet<_>>(),
+        expected
+    );
+    assert_eq!(
+        granted.iter().map(String::as_str).collect::<HashSet<_>>(),
+        expected
+    );
+
+    // The routes PR-02 gated are specifically reachable again.
+    assert!(granted.iter().any(|s| s == "groups:write"));
+    assert!(granted.iter().any(|s| s == "groups:admin"));
 }

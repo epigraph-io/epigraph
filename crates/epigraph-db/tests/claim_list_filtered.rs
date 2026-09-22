@@ -23,6 +23,8 @@
 //! * Predicates must run before `LIMIT`, the property that makes an old
 //!   matching row reachable at all.
 
+mod viewer_fixture;
+
 use chrono::{DateTime, TimeZone, Utc};
 use epigraph_db::{ClaimListFilter, ClaimRepository, ClaimSortField, ClaimSortOrder};
 use sqlx::PgPool;
@@ -30,6 +32,7 @@ use uuid::Uuid;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn predicates_run_before_limit(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
     let needle_agent = seed_agent(&pool, "a1").await;
     let noise_agent = seed_agent(&pool, "a2").await;
 
@@ -54,7 +57,7 @@ async fn predicates_run_before_limit(pool: PgPool) {
         agent_id: Some(needle_agent),
         ..Default::default()
     };
-    let rows = ClaimRepository::list_filtered(&pool, &filter, 3, 0)
+    let rows = ClaimRepository::list_filtered(&pool, &viewer, &filter, 3, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -67,13 +70,13 @@ async fn predicates_run_before_limit(pool: PgPool) {
 
     // And `total` is a count over the whole table, not over the page.
     assert_eq!(
-        ClaimRepository::count_filtered(&pool, &filter)
+        ClaimRepository::count_filtered(&pool, &viewer, &filter)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        ClaimRepository::count_filtered(&pool, &ClaimListFilter::default())
+        ClaimRepository::count_filtered(&pool, &viewer, &ClaimListFilter::default())
             .await
             .unwrap(),
         31,
@@ -83,6 +86,7 @@ async fn predicates_run_before_limit(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn count_and_list_agree_across_every_predicate(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
     let kept = seed_agent(&pool, "b1").await;
     let excluded = seed_agent(&pool, "b2").await;
 
@@ -149,10 +153,10 @@ async fn count_and_list_agree_across_every_predicate(pool: PgPool) {
         sort_order: ClaimSortOrder::Asc,
     };
 
-    let count = ClaimRepository::count_filtered(&pool, &filter)
+    let count = ClaimRepository::count_filtered(&pool, &viewer, &filter)
         .await
         .unwrap();
-    let rows = ClaimRepository::list_filtered(&pool, &filter, 1000, 0)
+    let rows = ClaimRepository::list_filtered(&pool, &viewer, &filter, 1000, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -190,6 +194,7 @@ async fn count_and_list_agree_across_every_predicate(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_empty_id_set_selects_nothing(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool, "c1").await;
     for i in 0..5 {
         seed_claim(&pool, agent, &format!("row {i}"), 0.5, true, ts(2026, 2, 1)).await;
@@ -201,22 +206,24 @@ async fn an_empty_id_set_selects_nothing(pool: PgPool) {
         ..Default::default()
     };
     assert_eq!(
-        ClaimRepository::count_filtered(&pool, &filter)
+        ClaimRepository::count_filtered(&pool, &viewer, &filter)
             .await
             .unwrap(),
         0,
         "Some(&[]) means 'no claim matches'; treating it as 'no filter' would \
          return all 5 rows"
     );
-    assert!(ClaimRepository::list_filtered(&pool, &filter, 100, 0)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(
+        ClaimRepository::list_filtered(&pool, &viewer, &filter, 100, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     // …and `None` in the same slot really is "no filter".
     let unfiltered = ClaimListFilter::default();
     assert_eq!(
-        ClaimRepository::count_filtered(&pool, &unfiltered)
+        ClaimRepository::count_filtered(&pool, &viewer, &unfiltered)
             .await
             .unwrap(),
         5
@@ -225,6 +232,7 @@ async fn an_empty_id_set_selects_nothing(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn is_current_partitions_the_table(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool, "d1").await;
     let live = seed_claim(&pool, agent, "live", 0.5, true, ts(2026, 3, 1)).await;
     let dead = seed_claim(&pool, agent, "dead", 0.5, false, ts(2026, 3, 2)).await;
@@ -241,7 +249,7 @@ async fn is_current_partitions_the_table(pool: PgPool) {
         is_current: Some(true),
         ..Default::default()
     };
-    let rows = ClaimRepository::list_filtered(&pool, &current_only, 100, 0)
+    let rows = ClaimRepository::list_filtered(&pool, &viewer, &current_only, 100, 0)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -251,7 +259,7 @@ async fn is_current_partitions_the_table(pool: PgPool) {
         is_current: Some(false),
         ..Default::default()
     };
-    let rows = ClaimRepository::list_filtered(&pool, &superseded_only, 100, 0)
+    let rows = ClaimRepository::list_filtered(&pool, &viewer, &superseded_only, 100, 0)
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
@@ -268,7 +276,7 @@ async fn is_current_partitions_the_table(pool: PgPool) {
 
     // None returns both halves — the two filters partition the table.
     assert_eq!(
-        ClaimRepository::count_filtered(&pool, &ClaimListFilter::default())
+        ClaimRepository::count_filtered(&pool, &viewer, &ClaimListFilter::default())
             .await
             .unwrap(),
         2

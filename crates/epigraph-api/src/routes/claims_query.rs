@@ -19,6 +19,7 @@ use crate::state::AppState;
 #[cfg(feature = "db")]
 use epigraph_db::ClaimRepository;
 
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use std::collections::HashSet;
 
@@ -175,8 +176,59 @@ pub struct ClaimListResponse {
 /// `GET /api/v1/claims`
 ///
 /// Queries the claims table with filtering, sorting, and pagination.
+///
+/// # Tenancy: ONE viewer-stamped connection for the whole request
+///
+/// PR-28 is conversion shard 2 against
+/// `D-PR17-request-path-never-stamps-session-gucs`. It moves this handler's five
+/// raw-pool reads onto [`AppState::read_as`]. The connection is acquired ONCE,
+/// below, and threaded into every statement on both paths.
+///
+/// `read_as` and not `acquire_as`: the latter hard-refuses
+/// `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback `bin/server.rs`
+/// advertises to operators, so a site converted that way is unservable in a
+/// configuration this project supports.
+///
+/// Every one of them is a READ. `ClaimRepository::{claim_ids_by_methodology,
+/// claim_ids_by_evidence_type}` were widened to `<'e, E: sqlx::PgExecutor<'e>>`
+/// by PR-27; `{count_filtered, list_filtered}` are written to the same bound,
+/// so every call site simply passes `&mut *read`. The reborrow is explicit at
+/// each site on purpose: deref coercion does not fire against a generic `E`, so
+/// `&mut read` would infer `E = &mut ScopedRead<'_>` and fail the bound.
+///
+/// # The fast/slow split is GONE, and the footprint shrank with it
+///
+/// PR-28 described a `count` + `list` fast path and a 10_000-row in-memory slow
+/// path. Backlog `2265a67b` deleted both in favour of one path over
+/// `ClaimRepository::{count_filtered, list_filtered}`, because the slow path's
+/// `total` was the length of a filtered slice of a capped, most-recent-first
+/// window — it understated the count, and it returned empty (indistinguishable
+/// from a true zero) for any filter matching only older claims.
+///
+/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` is owed before the
+/// next WALK-shaped handler. This one is not walk-shaped and does not multiply
+/// it: the handle spans at most FOUR statements — zero to two prefetches, then
+/// `count_filtered` and `list_filtered` — with no per-node loop and no unbounded
+/// `N`. Nothing is held after `finish_scoped_read`.
+///
+/// # The prefetch sets NARROW, and that is load-bearing
+///
+/// `methodology_ids` and `evidence_type_ids` are intersected into the single
+/// `ids` field of [`epigraph_db::ClaimListFilter`], which becomes
+/// `id = ANY($9)` — an INTERSECTION with the viewer predicate the same two
+/// statements splice, not a substitute for it. The result's visibility rests on
+/// `count_filtered` / `list_filtered`; the prefetch predicates are defence in
+/// depth. **Do not turn either application into a union or an `OR`.** That would
+/// promote a prefetch predicate to load-bearing, and neither prefetch predicate
+/// is equivalent to the filtered pair's.
+///
+/// `Some(empty)` is also load-bearing in the other direction: a
+/// methodology/evidence_type that matched nothing must select zero claims, so it
+/// stays `Some(&[])`. Collapsing it to `None` inverts the filter into "return
+/// every claim".
 #[cfg(feature = "db")]
 pub async fn list_claims_query(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ClaimQueryParams>,
 ) -> Result<Json<ClaimListResponse>, ApiError> {
@@ -268,14 +320,46 @@ pub async fn list_claims_query(
         }
     }
 
+    // ---- The one viewer-stamped connection every read below runs on ----
+    //
+    // Acquired HERE and not at the top of the function: the seven validation
+    // early-returns above answer without touching the database, and hoisting the
+    // acquire over them would hold a pooled connection across every 400.
+    //
+    // READ THAT AS AN OBSERVATION, NOT AN ENFORCED INVARIANT. Nothing in the
+    // gate catches a hoist: this file's only unit-test module is gated
+    // `#[cfg(all(test, not(feature = "db")))]` while the crate's `default` is
+    // `["db"]`, so those ~20 validation tests never compile in the shipping
+    // configuration, and neither scoped-read test file drives an invalid
+    // parameter and asserts a 400. A future author who hoists the acquire — a
+    // natural-looking simplification, since it removes the two-return-path
+    // awkwardness `finish_scoped_read` exists to absorb — gets a green run. The
+    // placement is correct today and is a connection-footprint choice, not a
+    // correctness one.
+    //
+    // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/lineage.rs::get_lineage`).
+    // `read_as`'s refusal reason is a paragraph of internal design prose aimed at
+    // whoever mis-built the `AppState`; `errors.rs` serialises
+    // `ApiError::InternalError { message }` verbatim into the response body, so
+    // it is logged in full and answered with an opaque message.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claims_query",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // ---- Pre-fetch methodology / evidence_type claim ID sets ----
     let methodology_ids: Option<HashSet<uuid::Uuid>> = match params.methodology {
         Some(ref m) => {
-            let ids = ClaimRepository::claim_ids_by_methodology(&state.db_pool, m)
+            let ids = ClaimRepository::claim_ids_by_methodology(&mut *read, &viewer, m)
                 .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Methodology filter query failed: {}", e),
-                })?;
+                .map_err(|e| scoped_read_failure(&e, "Methodology filter query failed"))?;
             Some(ids.into_iter().collect())
         }
         None => None,
@@ -283,11 +367,9 @@ pub async fn list_claims_query(
 
     let evidence_type_ids: Option<HashSet<uuid::Uuid>> = match params.evidence_type {
         Some(ref et) => {
-            let ids = ClaimRepository::claim_ids_by_evidence_type(&state.db_pool, et)
+            let ids = ClaimRepository::claim_ids_by_evidence_type(&mut *read, &viewer, et)
                 .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Evidence type filter query failed: {}", e),
-                })?;
+                .map_err(|e| scoped_read_failure(&e, "Evidence type filter query failed"))?;
             Some(ids.into_iter().collect())
         }
         None => None,
@@ -334,17 +416,23 @@ pub async fn list_claims_query(
         },
     };
 
-    let total = ClaimRepository::count_filtered(&state.db_pool, &filter)
+    // `count_filtered` and `list_filtered` are two statements, and `total` is
+    // only a truthful description of `claims` if BOTH saw the same corpus.
+    // Running them on the one stamped handle — `&mut *read`, never
+    // `&state.db_pool` — is what makes that so: under
+    // `SessionGucMode::Transaction` they are also the same transaction, and an
+    // unstamped connection would carry the `$V` bind without the
+    // `epigraph.group_ids` GUC that migration 077's policies read.
+    let total = ClaimRepository::count_filtered(&mut *read, &viewer, &filter)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Database count failed: {}", e),
-        })? as usize;
+        .map_err(|e| scoped_read_failure(&e, "Database count failed"))? as usize;
 
-    let rows = ClaimRepository::list_filtered(&state.db_pool, &filter, limit as i64, offset as i64)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Database query failed: {}", e),
-        })?;
+    let rows =
+        ClaimRepository::list_filtered(&mut *read, &viewer, &filter, limit as i64, offset as i64)
+            .await
+            .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
+
+    crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
     let paginated: Vec<ClaimSummary> = rows
         .into_iter()
@@ -368,14 +456,78 @@ pub async fn list_claims_query(
     }))
 }
 
+/// Log a failed statement on the viewer-stamped connection in full, and answer
+/// with an opaque `500`.
+///
+/// # Why this exists, and why it is not a nicer error message
+///
+/// The two branches PR-28 ADDED to [`list_claims_query`] — `read_as`'s refusal
+/// and `finish_scoped_read`'s — already follow one rule: emit
+/// `tracing::error!(target: "tenancy.scoped_read", error = %e, handler = …)` and
+/// return an `ApiError::InternalError` whose `message` is a FIXED literal.
+/// `errors.rs` serialises that `message` verbatim into the response body, so the
+/// literal is the whole of what a 500 discloses.
+///
+/// The five statement branches did not follow it: each built its body with
+/// `format!("… : {e}")` and logged nothing, so the driver's error went to the
+/// caller instead of to the operator. That is the opposite of the rule's intent
+/// in both directions at once — a driver error belongs in the log, not in the
+/// response body.
+///
+/// It was not fixed merely because it is untidy: [`list_claims_query`] is
+/// explicitly the template the remaining conversion shards copy, so a shard
+/// reading it would otherwise have found the rule stated in the `read_as`
+/// comment and five live counter-examples immediately below it.
+///
+/// `message` is `&'static str` rather than a `String` so this cannot be called
+/// with an interpolated argument.
+///
+/// `handler` is a literal because this helper is private and has exactly one
+/// caller. A shard that copies it into another route file must take the handler
+/// name as a parameter rather than inherit this one.
+#[cfg(feature = "db")]
+fn scoped_read_failure(e: &epigraph_db::DbError, message: &'static str) -> ApiError {
+    tracing::error!(
+        target: "tenancy.scoped_read",
+        error = %e,
+        handler = "list_claims_query",
+        "a statement failed on the viewer-stamped connection"
+    );
+    ApiError::InternalError {
+        message: message.to_string(),
+    }
+}
+
 /// List and filter claims from the in-memory claim store (no database)
 ///
 /// `GET /api/v1/claims`
+///
+/// # The same authentication precondition as the `db` arm
+///
+/// This arm takes a [`ViewerExtractor`](crate::middleware::bearer::ViewerExtractor)
+/// for the same reason `routes/events.rs::list_events` does, and the precedent
+/// there is the authority: `ViewerExtractor` is defined under BOTH features —
+/// over `epigraph_db::Viewer` under `db`, over `NoDbViewer` under `not(db)`,
+/// with the same rejection branches in the same order — precisely so that the
+/// two builds of one route cannot acquire different authentication
+/// preconditions. `bearer.rs`'s own doc says `NoDbViewer` exists to prevent
+/// exactly that divergence, and `list_events` records a revision that produced
+/// it here once already and had to be reverted.
+///
+/// The extracted value is unused: under `not(db)` it is a unit and there is no
+/// corpus to filter. It is bound anyway so the extractor RUNS, which is the
+/// whole point — an extractor that is not named in the signature does not
+/// execute.
 #[cfg(not(feature = "db"))]
 pub async fn list_claims_query(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ClaimQueryParams>,
 ) -> Result<Json<ClaimListResponse>, ApiError> {
+    // Bound, not consumed: see this function's doc comment. Under `not(db)` the
+    // viewer is a unit and nothing reads it.
+    let _ = &viewer;
+
     // ---- Validate and normalize pagination ----
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
@@ -600,9 +752,27 @@ mod tests {
     use tower::ServiceExt;
 
     /// Create a test router with the claims query endpoint
+    ///
+    /// The `Extension` layer is not decoration. `list_claims_query` now takes a
+    /// `ViewerExtractor` under `not(db)` as well as under `db`, and that
+    /// extractor rejects a request carrying no `AuthContext`. In production the
+    /// bearer middleware installs one; a bare test router carries none, so every
+    /// request below would answer 401 before reaching the handler and all ~20
+    /// validation assertions would be vacuous. This mirrors the fixture
+    /// `crates/epigraph-cli/tests/pr_hierarchical_ingest_test.rs::app` uses for
+    /// the same reason.
     fn test_router(state: AppState) -> Router {
+        let principal = uuid::Uuid::new_v4();
         Router::new()
             .route("/api/v1/claims", get(list_claims_query))
+            .layer(axum::Extension(crate::middleware::bearer::AuthContext {
+                client_id: principal,
+                agent_id: Some(principal),
+                owner_id: Some(principal),
+                client_type: crate::middleware::bearer::ClientType::Service,
+                scopes: vec!["claims:read".to_string()],
+                jti: uuid::Uuid::new_v4(),
+            }))
             .with_state(state)
     }
 

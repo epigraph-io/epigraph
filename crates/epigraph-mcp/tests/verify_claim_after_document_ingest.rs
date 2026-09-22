@@ -22,6 +22,9 @@
 //! to satisfy that constraint — keeping it in force is part of what makes these
 //! fixtures realistic.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
@@ -80,8 +83,9 @@ fn extraction() -> DocumentExtraction {
 /// thesis reports a mismatch — which is exactly what it did before this fix.
 #[sqlx::test(migrations = "../../migrations")]
 async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
-    do_ingest_document(&server, &extraction())
+    do_ingest_document(&server, &viewer, &extraction())
         .await
         .expect("document ingests");
 
@@ -91,7 +95,7 @@ async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) 
         ("paragraph (level 2)", PARAGRAPH),
     ] {
         let id = only_claim_with_content(&pool, content).await;
-        let resp = run_verify(&server, id).await;
+        let resp = run_verify(&server, &viewer, id).await;
         assert_eq!(
             resp["hash_check"],
             Value::String("not_applicable".to_string()),
@@ -109,7 +113,7 @@ async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) 
     // the writer's output must verify positively. Without this the test would be
     // satisfied by a classifier that answers not_applicable for everything.
     let atom_id = only_claim_with_content(&pool, ATOM).await;
-    let resp = run_verify(&server, atom_id).await;
+    let resp = run_verify(&server, &viewer, atom_id).await;
     assert_eq!(
         resp["hash_check"],
         Value::String("match".to_string()),
@@ -125,6 +129,7 @@ async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) 
 /// would leave the other's rows accused. Spine writes levels 0-2 and no atoms.
 #[sqlx::test(migrations = "../../migrations")]
 async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     do_ingest_document_spine(&server, &extraction())
         .await
@@ -136,7 +141,7 @@ async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
         ("paragraph (level 2)", PARAGRAPH),
     ] {
         let id = only_claim_with_content(&pool, content).await;
-        let resp = run_verify(&server, id).await;
+        let resp = run_verify(&server, &viewer, id).await;
         assert_eq!(
             resp["hash_check"],
             Value::String("not_applicable".to_string()),
@@ -156,6 +161,7 @@ async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
 /// from the document's own provenance.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_tampered_spine_row_is_reported_undecided_not_clean(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     do_ingest_document_spine(&server, &extraction())
         .await
@@ -169,7 +175,7 @@ async fn a_tampered_spine_row_is_reported_undecided_not_clean(pool: PgPool) {
         .await
         .expect("tamper");
 
-    let resp = run_verify(&server, id).await;
+    let resp = run_verify(&server, &viewer, id).await;
     assert_eq!(
         resp["hash_check"],
         Value::String("not_applicable".to_string()),
@@ -199,9 +205,14 @@ async fn only_claim_with_content(pool: &PgPool, content: &str) -> Uuid {
     ids[0]
 }
 
-async fn run_verify(server: &EpiGraphMcpFull, claim_id: Uuid) -> Value {
+async fn run_verify(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Value {
     let result = verify_claim(
         server,
+        viewer,
         VerifyClaimParams {
             claim_id: claim_id.to_string(),
         },
