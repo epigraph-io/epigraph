@@ -1223,6 +1223,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
+ "axum 0.8.8",
  "axum-server",
  "axum-test",
  "base64 0.22.1",

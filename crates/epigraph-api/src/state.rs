@@ -2,7 +2,7 @@
 // the entity-type cache load, the tenancy-trigger and RLS-posture assertions and the
 // maintenance-viewer path all run at startup or on the maintenance connection. Scoping the probe
 // to a Viewer would make it prove a property of that viewer instead of the pool.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -386,11 +386,14 @@ pub struct AppState {
     ///
     /// Stored once at startup via `Arc` to avoid recreating per request.
     pub jwt_config: Arc<crate::oauth::JwtConfig>,
-    /// In-memory set of revoked access tokens (JWTs)
+    /// Revoked access tokens (JWTs), keyed by verified `jti`.
     ///
-    /// Bounded by token TTL — entries auto-expire when the token would have expired.
-    /// Used by the /oauth/revoke and bearer middleware.
-    revoked_tokens: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Process-local by default. `bin/server.rs` adds the shared
+    /// `revoked_access_tokens` list via [`Self::with_shared_token_revocation`]
+    /// once its boot probe finds the table, and the MCP server reads that same
+    /// list. Written by `/oauth/revoke`; read by both bearer middlewares and
+    /// `/oauth/introspect`. See [`crate::oauth::revocation`].
+    token_revocation: crate::oauth::AccessTokenRevocation,
 
     /// Write-authorization gate.
     ///
@@ -411,8 +414,8 @@ pub struct AppState {
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
     /// validity (`is_valid_entity_type` = `contains_key`) and existence
-    /// checking (`entity_exists`). Uses a `std::sync::RwLock` (like
-    /// `revoked_tokens`) so reads stay synchronous on the hot path.
+    /// checking (`entity_exists`). Uses a `std::sync::RwLock` so reads stay
+    /// synchronous on the hot path.
     ///
     /// Primed by [`AppState::load_entity_type_cache`] at startup (the sync
     /// `with_db` constructors can't `SELECT`, so it starts empty and is loaded
@@ -981,7 +984,7 @@ impl AppState {
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            token_revocation: crate::oauth::AccessTokenRevocation::new(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1025,7 +1028,7 @@ impl AppState {
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            token_revocation: crate::oauth::AccessTokenRevocation::new(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -1054,7 +1057,7 @@ impl AppState {
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            token_revocation: crate::oauth::AccessTokenRevocation::new(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1206,7 +1209,7 @@ impl AppState {
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            token_revocation: crate::oauth::AccessTokenRevocation::new(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -1237,7 +1240,7 @@ impl AppState {
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            token_revocation: crate::oauth::AccessTokenRevocation::new(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
         }
@@ -1270,7 +1273,7 @@ impl AppState {
             webhook_store: Arc::new(RwLock::new(HashMap::new())),
             harvester_client: None,
             jwt_config: Self::default_jwt_config(),
-            revoked_tokens: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            token_revocation: crate::oauth::AccessTokenRevocation::new(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -1289,19 +1292,46 @@ impl AppState {
         Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
     }
 
-    /// Add a JWT token to the revocation set.
-    pub fn revoke_access_token(&self, token: &str) {
-        if let Ok(mut set) = self.revoked_tokens.write() {
-            set.insert(token.to_string());
-        }
+    /// Record a VERIFIED access token as revoked. Pass the claims
+    /// `jwt_config.validate_token` returned. An unverified token must never
+    /// reach this, because `/oauth/revoke` is anonymous.
+    ///
+    /// # Errors
+    /// `503` when the shared list is enabled and could not be written.
+    pub async fn revoke_access_token(
+        &self,
+        claims: &crate::oauth::EpiGraphClaims,
+    ) -> Result<(), crate::errors::ApiError> {
+        Ok(self.token_revocation.revoke(claims).await?)
     }
 
-    /// Check if a JWT token has been revoked.
-    pub fn is_token_revoked(&self, token: &str) -> bool {
-        self.revoked_tokens
-            .read()
-            .map(|set| set.contains(token))
-            .unwrap_or(false)
+    /// Whether a VERIFIED access token has been revoked.
+    ///
+    /// # Errors
+    /// `503` when the shared list is enabled and could not be read. This fails
+    /// closed: the caller must refuse the request, never admit it.
+    pub async fn is_access_token_revoked(
+        &self,
+        claims: &crate::oauth::EpiGraphClaims,
+    ) -> Result<bool, crate::errors::ApiError> {
+        Ok(self.token_revocation.is_revoked(claims).await?)
+    }
+
+    /// Record revocations to the shared `revoked_access_tokens` list, and read
+    /// them from it. MCP reads the same list, and it survives a restart.
+    ///
+    /// `pool` must be one on which
+    /// [`epigraph_db::RevokedAccessTokenRepository::probe`] returned `Ready`.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_shared_token_revocation(mut self, pool: PgPool) -> Self {
+        self.token_revocation = self.token_revocation.with_shared_store(pool);
+        self
+    }
+
+    /// Whether access-token revocation uses the shared list.
+    pub fn shares_token_revocation(&self) -> bool {
+        self.token_revocation.is_shared()
     }
 
     /// Get a reference to the audit log for logging security events

@@ -110,6 +110,11 @@ wiremock = "0.6"  # HTTP fixture for OAuth provider integration tests
 rsa = "0.9"  # RSA keypair fixture for OAuth tests
 pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
 toml = "0.8"  # provider config TOML parsing in tests
+# The MCP server's HTTP layer is axum 0.8 (rmcp pins it) while this crate is on
+# 0.7. tests/access_token_revocation.rs builds MCP's real bearer middleware in
+# front of a probe route to prove a token revoked here is rejected there, and
+# needs 0.8's Router to do it. Already in Cargo.lock via epigraph-mcp.
+axum-mcp = { package = "axum", version = "0.8" }
 # `tests/privatization_seal.rs` only. The seal ceremony is client-driven, so an
 # end-to-end route test has to play the client — pad, derive an epoch key, and
 # produce a field-tagged ciphertext exactly as `epigraph-privatize` does.

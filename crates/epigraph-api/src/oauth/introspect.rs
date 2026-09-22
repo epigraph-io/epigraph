@@ -32,21 +32,22 @@ pub async fn introspect_endpoint(
     State(state): State<AppState>,
     Json(req): Json<IntrospectRequest>,
 ) -> Result<Json<IntrospectResponse>, ApiError> {
-    // Check revocation set first
-    if state.is_token_revoked(&req.token) {
-        return Ok(Json(IntrospectResponse {
-            active: false,
-            sub: None,
-            client_id: None,
-            scope: None,
-            exp: None,
-            iat: None,
-            token_type: None,
-        }));
-    }
-
-    // Try to validate as JWT
+    // Validate first: the revocation list is keyed on the verified jti. A
+    // revoked token is inactive; a failed revocation lookup is a 503, because
+    // answering `active: true` for a token that may be revoked is the one
+    // wrong answer an introspection endpoint can give.
     match state.jwt_config.validate_token(&req.token) {
+        Ok(claims) if state.is_access_token_revoked(&claims).await? => {
+            Ok(Json(IntrospectResponse {
+                active: false,
+                sub: None,
+                client_id: None,
+                scope: None,
+                exp: None,
+                iat: None,
+                token_type: None,
+            }))
+        }
         Ok(claims) => Ok(Json(IntrospectResponse {
             active: true,
             sub: Some(claims.sub.to_string()),

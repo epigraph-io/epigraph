@@ -35,13 +35,6 @@ pub async fn bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Check revocation set
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
             // Validate JWT
             let claims =
                 state
@@ -50,6 +43,14 @@ pub async fn bearer_auth_middleware(
                     .map_err(|e| ApiError::Unauthorized {
                         reason: format!("Invalid token: {e}"),
                     })?;
+
+            // Check revocation AFTER validation: the list is keyed on the
+            // verified jti. A lookup failure is a 503, never an admit.
+            if state.is_access_token_revoked(&claims).await? {
+                return Err(ApiError::Unauthorized {
+                    reason: "Token has been revoked".to_string(),
+                });
+            }
 
             // Build AuthContext
             let auth_ctx: AuthContext = claims.into();
@@ -95,13 +96,6 @@ pub async fn optional_bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Present token must be valid: revoked → 401.
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
             // Present token must validate: invalid/expired → 401.
             let claims =
                 state
@@ -110,6 +104,14 @@ pub async fn optional_bearer_auth_middleware(
                     .map_err(|e| ApiError::Unauthorized {
                         reason: format!("Invalid token: {e}"),
                     })?;
+
+            // Present token must not be revoked: revoked → 401, never a
+            // fall-through to anonymous. Lookup failure → 503.
+            if state.is_access_token_revoked(&claims).await? {
+                return Err(ApiError::Unauthorized {
+                    reason: "Token has been revoked".to_string(),
+                });
+            }
 
             let auth_ctx: AuthContext = claims.into();
             request.extensions_mut().insert(auth_ctx);

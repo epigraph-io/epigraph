@@ -520,6 +520,11 @@ async fn main() {
         // not drop the pool or uninstall the hook.
         let scoped = scoped.with_maintenance_pool(maintenance_pool.inner().clone());
 
+        // The shared access-token revocation list is read by the bearer
+        // middleware on the application pool, handed over once here (see
+        // `epigraph_api::oauth::revocation` for why it is its own handle).
+        let revocation_pool = scoped.inner().clone();
+
         let state =
             AppState::with_scoped_pool(scoped, config).with_embedding_service(embedding_service);
 
@@ -569,6 +574,34 @@ async fn main() {
             .assert_rls_posture()
             .await
             .expect("refusing to serve: RLS posture assertion failed");
+
+        // Shared access-token revocation: the list `/oauth/revoke` writes and
+        // both this server's and MCP's bearer middleware read. The probe
+        // distinguishes three states on purpose:
+        // * Ready: use it.
+        // * Absent: the table's migration has not run. Log, and keep revocation
+        //   process-local, which is the pre-existing behaviour. MCP does not
+        //   see those revocations, and a restart forgets them.
+        // * Error (no grant, row security enabled): REFUSE. The alternatives
+        //   are a 503 on every authenticated request, or a check that silently
+        //   admits revoked tokens.
+        let state = match epigraph_db::RevokedAccessTokenRepository::probe(&revocation_pool).await {
+            Ok(epigraph_db::RevocationStoreStatus::Ready) => {
+                tracing::info!("access-token revocation: shared list enabled");
+                state.with_shared_token_revocation(revocation_pool)
+            }
+            Ok(epigraph_db::RevocationStoreStatus::Absent) => {
+                tracing::error!(
+                    "access-token revocation is PROCESS-LOCAL: table revoked_access_tokens does \
+                     not exist (its migration has not run). A token revoked via /oauth/revoke is \
+                     still accepted by MCP and by other API instances, and is forgotten on restart."
+                );
+                state
+            }
+            Err(e) => panic!(
+                "refusing to serve: the access-token revocation list exists but cannot be used: {e}"
+            ),
+        };
 
         (state, job_pool, job_scoped)
     };

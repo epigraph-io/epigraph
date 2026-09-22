@@ -367,6 +367,18 @@
 //!   owns the stamping and that it cannot verify it, which is documentation
 //!   standing in for a control — the same follow-up lint named above is what
 //!   would replace it.
+//!
+//!   **The access-token revocation list is a third shape this needle cannot
+//!   see. It is recorded here rather than counted.**
+//!   `oauth/revocation.rs::AccessTokenRevocation` holds the application pool as
+//!   a FIELD. `bin/server.rs` hands it over once, from `ScopedPool::inner()`,
+//!   rather than reading it off `AppState.db_pool`. It is unscoped by design,
+//!   not by omission: `revoked_access_tokens` has no tenancy columns and row
+//!   security is deliberately off on it. The lookup also runs in the bearer
+//!   middleware before any principal exists, which is the argument this
+//!   register's own `middleware/bearer.rs` entry makes. It adds no `EXEMPT` row
+//!   because there is no `.db_pool` site to count, and it must stay confined to
+//!   that one table.
 //! * **Sibling crates are also invisible, for the same parameter reason** —
 //!   `epigraph-engine`, `epigraph-jobs` and `epigraph-ingest-executor` (12, 12
 //!   and 7 viewer-less SQL functions respectively), and **`epigraph-mcp`**,

@@ -49,8 +49,20 @@ pub async fn revoke_endpoint(
             }
         }
         "access_token" => {
-            // Access tokens are JWTs — add to in-memory revocation set
-            state.revoke_access_token(&req.token);
+            // Access tokens are JWTs. Only one whose SIGNATURE VERIFIES is
+            // recorded: this endpoint is anonymous, and recording unverified
+            // input would let anyone grow the list without bound (the shared
+            // one is a table). A token that fails validation, expired
+            // included, is already rejected everywhere, so there is nothing
+            // to revoke. That is a 200 no-op under RFC 7009 §2.2.
+            //
+            // The record lands in the shared `revoked_access_tokens` list when
+            // this process has it, so MCP and every other API replica reject
+            // the token too. If that write fails the answer is 503 (RFC 7009
+            // §2.2.1), not a 200 claiming a revocation other processes never saw.
+            if let Ok(claims) = state.jwt_config.validate_token(&req.token) {
+                state.revoke_access_token(&claims).await?;
+            }
         }
         _ => {
             return Err(ApiError::BadRequest {
