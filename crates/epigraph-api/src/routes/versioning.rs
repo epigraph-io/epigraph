@@ -22,10 +22,14 @@
 //! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
 //! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
 //!
-//! `supersede_claim` additionally carries an open entry whose owner is the
-//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
-//! This shard does not touch it and it stays open. Nothing further about it is
-//! recorded here — see `docs/tenancy/progress.json`.
+//! `supersede_claim`'s half of `F-write-authz-reads-unfiltered` is DISCHARGED:
+//! the ownership lookup is `ClaimRepository::get_agent_id`, which splices
+//! `{VISIBILITY:claims}`, so a claim the caller cannot read is 404 before the
+//! owner gate runs (it was 403, and 201 for `claims:admin`). Pinned by
+//! `tests/supersede_scope_check_test.rs`. The raw-pool site count is unchanged
+//! — the read moved to the repo layer, not onto a stamped connection — and the
+//! write itself is still ungated (`claim.rs::supersede` in
+//! `write_gate_lint.rs::UNGATED_REPO_WRITES`).
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -261,10 +265,24 @@ pub async fn supersede_claim(
             reason: "Truth value must be between 0.0 and 1.0".to_string(),
         })?;
 
-    // 6. Fetch agent_id for event emission before supersession
-    let agent_uuid: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-        .bind(claim_id)
-        .fetch_optional(&state.db_pool)
+    // 6. The claim's author, read THROUGH THE VIEWER. It feeds the ownership
+    // gate below and the event emitted afterwards.
+    //
+    // F-write-authz-reads-unfiltered: this was an inline, unfiltered
+    // `SELECT agent_id FROM claims WHERE id = $1` on the raw pool, so a caller
+    // who cannot READ the claim still got an answer from it — 403 for a
+    // non-owner (confirming the id exists) and a successful supersede for a
+    // `claims:admin` token. A claim outside the viewer's visibility is now
+    // absent: 404, before the owner gate is consulted. Same order as the MCP
+    // twin, `tools/supersede.rs::supersede_claim` (viewer-filtered `get_by_id`,
+    // then `require_owner_or_admin`).
+    //
+    // The WRITE below (`ClaimRepository::supersede`) still constrains by id
+    // alone; it is registered as `claim.rs::supersede` in
+    // `epigraph-db/tests/write_gate_lint.rs::UNGATED_REPO_WRITES`, and it stays
+    // on the raw pool beside this read so the two cannot disagree about the
+    // connection's session GUCs.
+    let agent_uuid: Uuid = ClaimRepository::get_agent_id(&state.db_pool, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("DB error: {e}"),
@@ -274,7 +292,7 @@ pub async fn supersede_claim(
             id: claim_id.to_string(),
         })?;
 
-    // 6b. Ownership / admin gate
+    // 6b. Ownership / admin gate — only reached for a claim the caller can read.
     crate::middleware::scopes::require_owner_or_admin(&auth, agent_uuid)?;
 
     // 7. Perform supersession in the database (atomic transaction)

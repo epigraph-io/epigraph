@@ -225,6 +225,34 @@ pub fn test_bearer_token_with_scopes(scopes: &[&str]) -> String {
     token
 }
 
+/// [`test_bearer_token_with_scopes`] for a principal the CALLER chooses.
+///
+/// The token's `owner_id` and `agent_id` are both `principal`, so it is the
+/// one fixture shape that satisfies a handler's owner gate
+/// (`require_owner_or_admin` reads `owner_id`) AND resolves a `Viewer` for the
+/// same identity (`ViewerExtractor` reads `agent_id`). `mint_token_with_agent`
+/// sets `agent_id` only, so its bearer is never the owner of anything.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub fn test_bearer_token_for_principal(principal: Uuid, scopes: &[&str]) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (token, _jti) = cfg
+        .issue_access_token(
+            principal,
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "service",
+            Some(principal),
+            Some(principal),
+            chrono::Duration::minutes(60),
+        )
+        .expect("test JWT issued");
+    token
+}
+
 /// Insert a system agent with a unique 32-byte public_key.
 #[allow(
     dead_code,

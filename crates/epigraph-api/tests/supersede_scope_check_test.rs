@@ -175,3 +175,148 @@ async fn supersede_nonexistent_claim_returns_404() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+// ── F-write-authz-reads-unfiltered: the owner lookup is viewer-filtered ─────
+//
+// `supersede_claim` decides ownership from the claim's `agent_id`. That read
+// used to run on the raw pool with no visibility predicate, so a caller who
+// cannot READ a claim still got an answer from it: 403 for a non-owner (which
+// confirms the id exists) and, for a `claims:admin` token, a successful
+// supersede of a claim it cannot see. The read now goes through
+// `ClaimRepository::get_agent_id`, which splices `{VISIBILITY:claims}`.
+//
+// Each refusal is asserted on the ROW as well as the status: an unreadable
+// claim must still be current and must have no successor.
+
+/// Seed a claim authored by a fresh agent and make it private to that agent's
+/// personal group. Returns `(owner, claim_id)`.
+async fn seed_private_claim(pool: &sqlx::PgPool, content: &str) -> (uuid::Uuid, uuid::Uuid) {
+    let owner = uuid::Uuid::new_v4();
+    let claim_id = common::seed_claim_with_agent(pool, content, owner).await;
+    common::seed_private_ownership(pool, claim_id, owner).await;
+    (owner, claim_id)
+}
+
+/// `(is_current, successor_count)` for `claim_id`.
+async fn supersede_state(pool: &sqlx::PgPool, claim_id: uuid::Uuid) -> (bool, i64) {
+    sqlx::query_as(
+        "SELECT c.is_current, \
+                (SELECT COUNT(*) FROM claims s WHERE s.supersedes = c.id) \
+           FROM claims c WHERE c.id = $1",
+    )
+    .bind(claim_id)
+    .fetch_one(pool)
+    .await
+    .expect("read supersede state")
+}
+
+async fn post_supersede(
+    addr: std::net::SocketAddr,
+    token: &str,
+    claim_id: uuid::Uuid,
+) -> (reqwest::StatusCode, String) {
+    let body = serde_json::json!({
+        "content": "a successor the caller should not be able to write",
+        "truth_value": 0.7,
+        "reason": "write-authz read filter",
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/claims/{claim_id}/supersede"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.text().await.unwrap_or_default())
+}
+
+/// A non-owner who cannot read the claim gets 404, not 403.
+///
+/// 403 was the owner gate answering from an unfiltered read: it told a stranger
+/// that a claim with this id exists and belongs to someone else.
+#[tokio::test(flavor = "multi_thread")]
+async fn supersede_of_an_unreadable_claim_is_404_not_403() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (_owner, claim_id) = seed_private_claim(&pool, "supersede unreadable 404").await;
+    let stranger = common::test_bearer_token_for_principal(uuid::Uuid::new_v4(), &["claims:write"]);
+
+    let (status, body) = post_supersede(addr, &stranger, claim_id).await;
+    assert_eq!(
+        status, 404,
+        "a claim the caller cannot read must be absent (404), not forbidden (403); body={body}"
+    );
+    assert_eq!(
+        supersede_state(&pool, claim_id).await,
+        (true, 0),
+        "the refused claim must stay current with no successor"
+    );
+}
+
+/// `claims:admin` does not reach a claim the admin cannot read.
+///
+/// Before the fix this returned 201: the admin arm of the owner gate passed on
+/// an unfiltered read, and the supersede went through on a claim private to a
+/// group the admin is not in.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_admin_cannot_supersede_a_claim_it_cannot_read() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (_owner, claim_id) = seed_private_claim(&pool, "supersede unreadable admin").await;
+    let admin = common::test_bearer_token_for_principal(
+        uuid::Uuid::new_v4(),
+        &["claims:write", "claims:admin"],
+    );
+
+    let (status, body) = post_supersede(addr, &admin, claim_id).await;
+    assert_eq!(
+        status, 404,
+        "claims:admin must not supersede a claim outside its visibility; body={body}"
+    );
+    assert_eq!(
+        supersede_state(&pool, claim_id).await,
+        (true, 0),
+        "the refused claim must stay current with no successor"
+    );
+}
+
+/// Over-suppression guard: the OWNER of the same private claim can still
+/// supersede it. Without this leg, a filter that hid every private claim from
+/// everyone would pass both tests above.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_of_a_private_claim_can_still_supersede_it() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (owner, claim_id) = seed_private_claim(&pool, "supersede private owner").await;
+    let token = common::test_bearer_token_for_principal(owner, &["claims:write"]);
+
+    let (status, body) = post_supersede(addr, &token, claim_id).await;
+    assert_eq!(
+        status, 201,
+        "the owner reads its own private claim and must be able to supersede it; body={body}"
+    );
+    assert_eq!(
+        supersede_state(&pool, claim_id).await,
+        (false, 1),
+        "the owner's supersede must retire the claim and create one successor"
+    );
+}
