@@ -48,8 +48,12 @@ pub struct CreateClaimRequest {
     #[serde(default)]
     pub trace_id: Option<Uuid>,
     pub initial_truth: Option<f64>,
-    /// Optional hex-encoded BLAKE3 content hash (64 chars). When provided, overrides
-    /// the server-computed hash. Used by migration scripts that pre-compute hashes.
+    /// Optional hex-encoded BLAKE3 content hash (64 chars). When provided, it is
+    /// verified to equal BLAKE3(content) for non-compound claims; a mismatch is
+    /// rejected with a 400 ValidationError rather than applied. It can no longer
+    /// be used to set an arbitrary/incorrect digest — it is now only useful as a
+    /// defensive re-assertion of the hash the server would compute anyway (e.g.
+    /// for migration scripts that pre-compute and want to confirm agreement).
     #[serde(default)]
     pub content_hash: Option<String>,
     /// Optional JSONB properties (methodology, section, source_doi, etc.)
@@ -486,12 +490,23 @@ pub async fn create_claim(
     // docs/architecture/noun-claims-and-verb-edges.md §"if_not_exists semantics".
     if was_created && (request.content_hash.is_some() || request.properties.is_some()) {
         let content_hash_bytes: Option<Vec<u8>> = if let Some(ref hex_hash) = request.content_hash {
-            Some(
-                hex::decode(hex_hash).map_err(|_| ApiError::ValidationError {
+            let decoded = hex::decode(hex_hash).map_err(|_| ApiError::ValidationError {
+                field: "content_hash".to_string(),
+                reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
+            })?;
+            // A freshly-created claim can never already be a compound/parent in a
+            // decomposes_to edge at insert time, so this handler always operates
+            // on a non-compound claim: the override must equal BLAKE3(content).
+            let expected_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
+            if decoded.as_slice() != expected_hash.as_slice() {
+                return Err(ApiError::ValidationError {
                     field: "content_hash".to_string(),
-                    reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
-                })?,
-            )
+                    reason: "content_hash override does not match BLAKE3(content); for non-compound claims the override must equal the server-computed hash of the claim content".to_string(),
+                });
+            }
+            // Verified equal to the server-computed hash — a no-op for the
+            // UPDATE's COALESCE below either way, so just skip setting it.
+            None
         } else {
             None
         };
