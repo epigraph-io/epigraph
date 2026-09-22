@@ -432,6 +432,38 @@ async fn deliver_to_subscription(
                         error: None,
                     };
                 }
+
+                // A 3xx is a redirect the client refused to follow (see
+                // `dispatcher_client_builder`). Surface it as its own terminal
+                // failure rather than a generic `HTTP 307` that retries: the
+                // hop target was never classified by the guard, retrying just
+                // re-asks the same attacker-controlled endpoint, and naming it
+                // is what makes the attempt visible in the logs at all.
+                if response.status().is_redirection() {
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<none>")
+                        .to_string();
+                    tracing::warn!(
+                        subscription_id = %subscription.id,
+                        status,
+                        location = %location,
+                        "Refusing to follow webhook redirect; target was never validated"
+                    );
+                    return WebhookDeliveryResult {
+                        subscription_id: subscription.id,
+                        success: false,
+                        status_code: Some(status),
+                        attempts: attempt + 1,
+                        error: Some(format!(
+                            "refused to follow redirect (HTTP {status}) to `{location}`: \
+                             only the registered URL is SSRF-validated"
+                        )),
+                    };
+                }
+
                 last_error = Some(format!("HTTP {status}"));
             }
             Err(e) => {
@@ -468,15 +500,42 @@ async fn deliver_to_subscription(
 ///
 /// # Returns
 /// The subscription ID for the webhook dispatcher (can be used to unsubscribe)
+/// Build the HTTP client the dispatcher delivers with.
+///
+/// Single construction site on purpose: the SSRF guard is a property of this
+/// client as much as of `validate_webhook_url`, so a second ad-hoc
+/// `reqwest::Client::new()` on the delivery path would silently reinstate the
+/// default redirect policy. Tests build through this function for the same
+/// reason — a test that configured its own client would prove nothing about
+/// what the server actually dials with.
+///
+/// `Policy::none()` is the load-bearing setting: `validate_webhook_url` only
+/// ever classifies `subscription.url`, so with reqwest's default policy (follow
+/// up to 10 hops) a registered public endpoint can answer `307 Location:
+/// http://169.254.169.254/…` and the signed payload is delivered to a host the
+/// guard had just rejected by name. A webhook receiver has no legitimate reason
+/// to redirect, so refusing outright is preferred over a `Policy::custom` that
+/// re-runs the guard per hop.
+fn dispatcher_client_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
 pub fn start_webhook_dispatcher(
     event_bus: &crate::state::SharedEventBus,
     webhook_store: crate::state::WebhookStore,
     config: WebhookDeliveryConfig,
 ) -> epigraph_events::SubscriptionId {
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
+    // Deliberately NOT `unwrap_or_default()`: `reqwest::Client::default()`
+    // carries reqwest's default redirect policy, so a build failure would hand
+    // the dispatcher a client that follows hops into the internal network —
+    // the exact bypass `Policy::none()` above exists to close, reinstated
+    // silently and only on the unhappy path. Failing loudly at startup is the
+    // safe direction.
+    let client = dispatcher_client_builder(config.timeout)
         .build()
-        .unwrap_or_default();
+        .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
 
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
@@ -935,11 +994,244 @@ mod tests {
         );
     }
 
+    /// The fully-qualified spelling of loopback must not be dialled either.
+    ///
+    /// `localhost.` resolves to 127.0.0.1 exactly like `localhost`, but it
+    /// survives WHATWG normalisation as a domain, so before the trailing-dot
+    /// strip in `epigraph_jobs::is_internal_ip` the guard allowed it and this
+    /// harness recorded one real TCP connection to loopback — the very outcome
+    /// `test_deliver_event_does_not_dial_internal_target` asserts is
+    /// impossible, defeated by appending one character.
+    #[tokio::test]
+    async fn test_deliver_event_does_not_dial_trailing_dot_localhost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&connections);
+        let accept_task = tokio::spawn(async move {
+            while let Ok((_stream, _peer)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let store: crate::state::WebhookStore =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let sub_id = Uuid::new_v4();
+        {
+            let mut s = store.write().await;
+            s.insert(
+                sub_id,
+                WebhookSubscription {
+                    id: sub_id,
+                    url: format!("http://localhost.:{port}/hook"),
+                    event_types: vec![],
+                    created_at: Utc::now(),
+                    active: true,
+                    secret: "x".repeat(32),
+                    owner_id: None,
+                },
+            );
+        }
+
+        let event = epigraph_events::EpiGraphEvent::ClaimSubmitted {
+            claim_id: epigraph_core::ClaimId::new(),
+            agent_id: epigraph_core::AgentId::new(),
+            initial_truth: epigraph_core::TruthValue::new(0.5).unwrap(),
+        };
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(500),
+            max_retries: 0,
+        };
+
+        let results = deliver_event(&client, &store, &event, &config).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        accept_task.abort();
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            0,
+            "`localhost.` must not be dialled any more than `localhost`"
+        );
+        assert_eq!(results.len(), 1, "subscription should still yield a result");
+        assert_eq!(
+            results[0].attempts, 0,
+            "guard must refuse before any HTTP attempt is counted"
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("SSRF guard"),
+            "failure must be attributed to the guard: {:?}",
+            results[0].error
+        );
+    }
+
+    /// A registered target must not be able to *redirect* the dispatcher onto
+    /// an internal host.
+    ///
+    /// `validate_webhook_url` only ever sees `subscription.url`. If the client
+    /// follows redirects, an attacker registers a perfectly legitimate public
+    /// endpoint — one that passes both gates — and answers the delivery with
+    /// `307 Location: http://169.254.169.254/…`; the HMAC-signed payload then
+    /// reaches a host the guard had just rejected by name, reported as a
+    /// success. This test is that attack, with the metadata endpoint stood in
+    /// for by a loopback listener that counts connections.
+    ///
+    /// The entry host is a *domain* the guard allows, resolved to the local
+    /// entry listener with reqwest's DNS override, so the request genuinely
+    /// leaves the dispatcher (asserted) and the hop is refused by the redirect
+    /// policy rather than by the URL guard or by DNS failure.
+    #[tokio::test]
+    async fn test_delivery_does_not_follow_redirect_to_internal_target() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // --- hop listener: the internal target the redirect points at. It
+        // answers 200 OK, so a dispatcher that follows the hop reports
+        // `success: true` and only the connection counter reveals the breach.
+        let hop = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hop listener");
+        let hop_addr = hop.local_addr().expect("hop addr");
+        let hop_connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let hop_counter = std::sync::Arc::clone(&hop_connections);
+        let hop_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = hop.accept().await {
+                hop_counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        // --- entry listener: the attacker's "public" endpoint, which 307s to
+        // the hop.
+        let entry = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind entry listener");
+        let entry_addr = entry.local_addr().expect("entry addr");
+        let entry_connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let entry_counter = std::sync::Arc::clone(&entry_connections);
+        let redirect_to = format!("http://{hop_addr}/latest/meta-data/");
+        let entry_task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = entry.accept().await {
+                entry_counter.fetch_add(1, Ordering::SeqCst);
+                // Drain the request before answering; writing a response over
+                // an unread request can surface as a connection reset.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: {redirect_to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        // The dispatcher's own client, with DNS for the entry domain pointed
+        // at the local entry listener. `resolve` ignores the port in the
+        // SocketAddr, so the URL carries it.
+        let entry_host = "webhook-entry.example.com";
+        let config = WebhookDeliveryConfig {
+            timeout: std::time::Duration::from_millis(1000),
+            max_retries: 0,
+        };
+        let client = super::dispatcher_client_builder(config.timeout)
+            .resolve(entry_host, entry_addr)
+            .build()
+            .expect("dispatcher client must build");
+
+        let store: crate::state::WebhookStore =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let sub_id = Uuid::new_v4();
+        {
+            let mut s = store.write().await;
+            s.insert(
+                sub_id,
+                WebhookSubscription {
+                    id: sub_id,
+                    url: format!("http://{entry_host}:{}/hook", entry_addr.port()),
+                    event_types: vec![],
+                    created_at: Utc::now(),
+                    active: true,
+                    secret: "x".repeat(32),
+                    owner_id: None,
+                },
+            );
+        }
+
+        let event = epigraph_events::EpiGraphEvent::ClaimSubmitted {
+            claim_id: epigraph_core::ClaimId::new(),
+            agent_id: epigraph_core::AgentId::new(),
+            initial_truth: epigraph_core::TruthValue::new(0.5).unwrap(),
+        };
+
+        let results = deliver_event(&client, &store, &event, &config).await;
+
+        // Give a followed redirect time to land before reading the counter, so
+        // an unguarded run is definitely observed.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        entry_task.abort();
+        hop_task.abort();
+
+        assert_eq!(
+            hop_connections.load(Ordering::SeqCst),
+            0,
+            "no TCP connection may reach the redirect's internal target"
+        );
+        assert_eq!(
+            entry_connections.load(Ordering::SeqCst),
+            1,
+            "the registered entry host must actually have been dialled — \
+             otherwise this test proves nothing about redirects"
+        );
+        assert_eq!(results.len(), 1, "subscription should yield a result");
+        assert!(
+            !results[0].success,
+            "a 3xx must not be reported as a successful delivery"
+        );
+        assert_eq!(
+            results[0].status_code,
+            Some(307),
+            "the redirect status itself must be recorded"
+        );
+        assert_eq!(
+            results[0].attempts, 1,
+            "the entry attempt counts; the hop must not be retried"
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("redirect"),
+            "failure must be attributed to the refused redirect: {:?}",
+            results[0].error
+        );
+    }
+
     #[test]
     fn test_validate_webhook_url_accepts_public_https() {
         assert!(validate_webhook_url("https://example.com/webhook").is_ok());
         assert!(validate_webhook_url("http://93.184.216.34:8080/hook").is_ok());
         assert!(validate_webhook_url("  https://hooks.example.org/x  ").is_ok());
+        // Positive control for the trailing-dot strip: a fully-qualified
+        // PUBLIC name must stay deliverable, so the strip is a classifier and
+        // not a blanket deny on FQDNs.
+        assert!(validate_webhook_url("https://hooks.example.org./x").is_ok());
     }
 
     #[test]
