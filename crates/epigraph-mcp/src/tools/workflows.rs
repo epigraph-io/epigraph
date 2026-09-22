@@ -524,7 +524,7 @@ async fn find_workflow_post_embed(
     // surfaced hollow.
     let hierarchical_ids: Vec<uuid::Uuid> = hierarchical_hits.iter().map(|r| r.id).collect();
     let mut hierarchical_steps =
-        WorkflowRepository::step_texts_for_hierarchical(&server.pool, &hierarchical_ids)
+        WorkflowRepository::step_texts_for_hierarchical(&server.pool, viewer, &hierarchical_ids)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("hierarchical step resolution failed: {e}");
@@ -671,7 +671,7 @@ async fn find_workflow_post_embed(
             .map(|r| r.id)
             .collect();
         let mut text_steps =
-            WorkflowRepository::step_texts_for_hierarchical(&server.pool, &text_ids)
+            WorkflowRepository::step_texts_for_hierarchical(&server.pool, viewer, &text_ids)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!("hierarchical step resolution failed: {e}");

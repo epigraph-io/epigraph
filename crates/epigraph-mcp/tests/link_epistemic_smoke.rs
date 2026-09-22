@@ -717,6 +717,7 @@ async fn symmetric_edge_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &st
 /// counts rows, so one dispute read as two.
 #[sqlx::test(migrations = "../../migrations")]
 async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "the disputed claim", 0.5).await;
@@ -724,6 +725,7 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     let forward = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: a.to_string(),
                 target_claim_id: b.to_string(),
@@ -745,6 +747,7 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     let reverse = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: b.to_string(),
                 target_claim_id: a.to_string(),
@@ -783,6 +786,7 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
 /// entirely — asserted below so the limit of this fix is pinned, not implied.
 #[sqlx::test(migrations = "../../migrations")]
 async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "the corroborated claim", 0.5).await;
@@ -790,6 +794,7 @@ async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     for (src, tgt) in [(a, b), (b, a)] {
         do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: src.to_string(),
                 target_claim_id: tgt.to_string(),
@@ -823,6 +828,7 @@ async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
 /// fails the moment someone does.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
@@ -831,6 +837,7 @@ async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool)
         let resp = parse_response(
             &do_link_epistemic(
                 &server,
+                &viewer,
                 LinkEpistemicParams {
                     source_claim_id: src.to_string(),
                     target_claim_id: tgt.to_string(),
@@ -873,6 +880,7 @@ async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool)
 /// this caller named A as its target.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
     let a = seed_claim(&pool, "stored source, factorless at first", 0.5).await;
     let b = seed_claim(&pool, "stored target", 0.5).await;
@@ -881,6 +889,7 @@ async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
     let first = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: a.to_string(),
                 target_claim_id: b.to_string(),
@@ -914,6 +923,7 @@ async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
     let reverse = parse_response(
         &do_link_epistemic(
             &server,
+            &viewer,
             LinkEpistemicParams {
                 source_claim_id: b.to_string(),
                 target_claim_id: a.to_string(),

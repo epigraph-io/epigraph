@@ -21,6 +21,9 @@ use uuid::Uuid;
 mod common;
 use common::*;
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 /// A 1536-d pgvector literal with all weight on one component, so two such
 /// vectors on different components are orthogonal (cosine similarity 0) and
 /// one on the same component is identical (similarity 1).
@@ -30,9 +33,15 @@ fn axis_pgvec_1536(axis: usize) -> String {
     format!("[{}]", v.join(","))
 }
 
-async fn store(server: &epigraph_mcp::EpiGraphMcpFull, goal: &str, steps: &[&str]) -> Uuid {
+async fn store(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    goal: &str,
+    steps: &[&str],
+) -> Uuid {
     let result = epigraph_mcp::tools::workflows::store_workflow(
         server,
+        viewer,
         StoreWorkflowParams {
             goal: goal.to_string(),
             steps: steps.iter().map(|s| (*s).to_string()).collect(),
@@ -58,16 +67,18 @@ async fn store(server: &epigraph_mcp::EpiGraphMcpFull, goal: &str, steps: &[&str
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_returns_a_workflow_that_store_workflow_created(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
     let goal = format!("cumulative theme maintenance probe {}", Uuid::new_v4());
     let steps = [
         "recall recent theme claims",
         "cluster without wipe_first",
         "record the outcome",
     ];
-    let workflow_id = store(&server, &goal, &steps).await;
+    let workflow_id = store(&server, &viewer, &goal, &steps).await;
 
     let result = epigraph_mcp::tools::workflows::find_workflow(
         &server,
+        &viewer,
         FindWorkflowParams {
             goal: goal.clone(),
             limit: Some(5),
@@ -119,13 +130,14 @@ async fn find_workflow_returns_a_workflow_that_store_workflow_created(pool: PgPo
 #[sqlx::test(migrations = "../../migrations")]
 async fn hierarchical_workflow_with_no_steps_is_withheld(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
     let goal = format!("stepless hierarchical probe {}", Uuid::new_v4());
-    let workflow_id = store(&server, &goal, &[]).await;
+    let workflow_id = store(&server, &viewer, &goal, &[]).await;
 
     // Precondition: the row really exists and really has no step claims, so a
     // "not returned" result below cannot be explained by the row being absent.
     let steps_map =
-        epigraph_db::WorkflowRepository::step_texts_for_hierarchical(&pool, &[workflow_id])
+        epigraph_db::WorkflowRepository::step_texts_for_hierarchical(&pool, &viewer, &[workflow_id])
             .await
             .expect("step lookup");
     assert!(
@@ -141,6 +153,7 @@ async fn hierarchical_workflow_with_no_steps_is_withheld(pool: PgPool) {
 
     let result = epigraph_mcp::tools::workflows::find_workflow(
         &server,
+        &viewer,
         FindWorkflowParams {
             goal: goal.clone(),
             limit: Some(5),
@@ -180,6 +193,7 @@ async fn hierarchical_workflow_with_no_steps_is_withheld(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn closer_hierarchical_workflow_outranks_a_distant_flat_claim(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
     let query_pgvec = axis_pgvec_1536(0);
 
     // Flat workflow claim, embedded ORTHOGONALLY to the query.
@@ -217,6 +231,7 @@ async fn closer_hierarchical_workflow_outranks_a_distant_flat_claim(pool: PgPool
     let hier_goal = format!("nightly cumulative theme maintenance {}", Uuid::new_v4());
     let hier_id = store(
         &server,
+        &viewer,
         &hier_goal,
         &["recall theme claims", "cluster incrementally"],
     )
@@ -230,6 +245,7 @@ async fn closer_hierarchical_workflow_outranks_a_distant_flat_claim(pool: PgPool
     // arrived through the vector path rather than either ILIKE leg.
     let result = find_workflow_with_pgvec(
         &server,
+        &viewer,
         FindWorkflowParams {
             goal: "qqzzx_union_rank_probe".to_string(),
             limit: Some(5),

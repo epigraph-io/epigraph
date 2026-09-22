@@ -682,6 +682,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgPool) {
     let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
     let b = insert_claim(&pool, agent).await;
@@ -689,6 +690,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -704,6 +706,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
 
     let err = tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "reject".into(),
@@ -749,6 +752,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
     let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
     let b = insert_claim(&pool, agent).await;
@@ -756,6 +760,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -778,6 +783,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
 
     tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "promote".into(),
@@ -805,6 +811,7 @@ async fn decide_match_candidate_promote_refuses_a_retired_row(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: PgPool) {
     let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = insert_agent(&pool).await;
     let a = insert_claim(&pool, agent).await;
     let b = insert_claim(&pool, agent).await;
@@ -812,6 +819,7 @@ async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: 
 
     let err = tools::matching::decide_match_candidate(
         &server,
+        &viewer,
         DecideMatchCandidateParams {
             candidate_id: cand.to_string(),
             verdict: "retire".into(),

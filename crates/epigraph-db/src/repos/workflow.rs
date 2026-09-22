@@ -1000,6 +1000,17 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
+    ///
+    /// Takes NO `&Viewer`, and no lint sees it either — it takes a `&PgPool`,
+    /// which is neither of the two spellings `visibility_lint.rs` scans. The
+    /// reason is recorded here so the next reader does not have to re-derive
+    /// it: the statement's `FROM` is `workflows` alone and it joins no other
+    /// relation, and `workflows` carries neither a `visibility` nor an
+    /// `owner_group_id` column, so there is no predicate to write. This is the
+    /// scored sibling of `find_hierarchical_by_embedding`, whose identical
+    /// posture is registered in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    /// Contrast `step_texts_for_hierarchical` below, which joins `claims` and
+    /// therefore DOES take a viewer.
     pub async fn search_hierarchical_by_embedding_scored(
         pool: &PgPool,
         query_embedding_pgvector: &str,
@@ -1046,23 +1057,36 @@ impl WorkflowRepository {
     /// Returns `sqlx::Error` if the database query fails.
     pub async fn step_texts_for_hierarchical(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         workflow_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<String>>, sqlx::Error> {
         if workflow_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        // This projects `c.content` — claim TEXT, not a scalar — so it is a
+        // first-class claim read and carries the viewer predicate on `c`.
+        // `$1` is the id array, so the viewer bind is `$2`.
+        //
+        // No `/* {EDGE_VISIBILITY:e} */`: the `edges` leg here has never
+        // carried a predicate, and PR-13 deliberately converted only the reads
+        // that already had one. Adding an edge filter needs its own
+        // JOIN-vs-WHERE reasoning and belongs to the tracked open finding
+        // `F-edges-unfiltered`, not to this merge.
+        let sql = viewer.splice(
             "SELECT e.source_id, c.content \
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = ANY($1) \
                AND e.relationship = 'executes' \
-               AND (c.properties->>'level')::int = 2 \
+               AND (c.properties->>'level')::int = 2 /* {VISIBILITY:c} */ \
              ORDER BY e.source_id, e.created_at ASC, c.id ASC",
-        )
-        .bind(workflow_ids)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(workflow_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, String)> = q.fetch_all(pool).await?;
 
         let mut out: HashMap<Uuid, Vec<String>> = HashMap::new();
         for (workflow_id, content) in rows {
