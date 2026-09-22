@@ -406,6 +406,40 @@ impl ClaimRepository {
         Ok(())
     }
 
+    /// Read a claim's whole `properties` JSONB.
+    ///
+    /// `Ok(None)` means there is no such claim; a claim with a NULL column reads
+    /// back as `Ok(Some(json!({})))` so callers can treat "no properties" and
+    /// "empty properties" alike.
+    ///
+    /// Exists for readers that must classify a row by its ingest provenance
+    /// rather than act on one key — MCP `verify_claim` needs `level` and
+    /// `source_type` together to tell a document-scoped compound digest (which
+    /// is NOT `blake3(content)` by construction) from a body/digest
+    /// disagreement. Deliberately the whole object and not a `->>` projection:
+    /// the predicate lives next to the writer in
+    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`, so the
+    /// repo layer must not re-encode which keys matter.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn get_properties(
+        pool: &PgPool,
+        claim_id: ClaimId,
+    ) -> Result<Option<serde_json::Value>, DbError> {
+        let id: Uuid = claim_id.into();
+        // Runtime `query_scalar`, not the `query!` macro: adding a macro call
+        // would require regenerating `.sqlx`.
+        let props: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT COALESCE(properties, '{}'::jsonb) FROM claims WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(props)
+    }
+
     /// Read a claim's workflow-promotion flag
     /// (`properties->'promotion'->>'promotable'`). `None` when the claim was
     /// never evaluated (or does not exist); `Some(bool)` otherwise. Used by

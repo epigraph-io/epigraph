@@ -583,12 +583,33 @@ pub async fn get_claim(
     })
 }
 
+/// Report the crypto state of a claim: does the body still match its stored
+/// digest, and did a known key sign that digest.
+///
+/// # The integrity answer is three-valued, deliberately
+///
+/// `claims.content_hash` is not `blake3(content)` on every row. The canonical
+/// Tier-1 document pipeline binds
+/// `compound_content_hash(blake3(text), artifact_seed)` on every thesis,
+/// section and paragraph node so that migration 013's
+/// `UNIQUE (content_hash, agent_id)` cannot collapse two papers' "Introduction"
+/// rows (`epigraph_ingest::common::plan::PlannedClaim::content_hash` is the
+/// contract; `epigraph_mcp::tools::ingestion` binds it verbatim). For that class
+/// `blake3(content) != stored` holds on *untampered* rows, and the seed is not
+/// carried on the claim, so the comparison decides nothing — reported as
+/// [`HashCheck::NotApplicable`] rather than as a mismatch.
+///
+/// The seed is deliberately NOT guessed back. `verify_claim` was filed as
+/// theatre (backlog `49c17386`) for asserting certainty it did not have;
+/// recomputing a compound digest from an inferred seed would reintroduce
+/// exactly that, one level deeper.
 pub async fn verify_claim(
     server: &EpiGraphMcpFull,
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(id))
+    let claim_id = ClaimId::from_uuid(id);
+    let claim = ClaimRepository::get_by_id(&server.pool, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
@@ -597,11 +618,29 @@ pub async fn verify_claim(
     //
     // `ClaimRepository::get_by_id` projects `claims.content_hash` (backlog
     // `49c17386`). It used to inherit `claim_from_row`'s placeholder, which was
-    // itself `ContentHasher::hash(content)` — so this line compared a value
-    // against itself, `hash_matches` was unconditionally true, and a claim
+    // itself `ContentHasher::hash(content)` — so this comparison ran a value
+    // against itself, the answer was unconditionally "matches", and a claim
     // whose body had been mutated without rewriting its digest verified clean.
     let computed_hash = ContentHasher::hash(claim.content.as_bytes());
-    let hash_matches = computed_hash == claim.content_hash;
+    let hash_check = if computed_hash == claim.content_hash {
+        HashCheck::Match
+    } else {
+        // The digest is not blake3(body). Two very different causes, and only
+        // one of them is tampering. Classify by how the row was WRITTEN — the
+        // predicate lives next to the writer that creates the class.
+        //
+        // Second query, on this branch only: the matching case needs no
+        // `properties` read at all, so the common path is unchanged.
+        let properties = ClaimRepository::get_properties(&server.pool, claim_id)
+            .await
+            .map_err(internal_error)?
+            .unwrap_or(serde_json::Value::Null);
+        if epigraph_ingest::document::stored_content_hash_is_seed_scoped(&properties) {
+            HashCheck::NotApplicable
+        } else {
+            HashCheck::Mismatch
+        }
+    };
 
     // Authenticity: the stored Ed25519 signature over the stored digest,
     // checked against the SIGNER's public key (resolved by `get_by_id` through
@@ -624,7 +663,13 @@ pub async fn verify_claim(
         claim_id: id.to_string(),
         signature_valid,
         signed,
-        hash_matches,
+        hash_check,
+        hash_matches: match hash_check {
+            HashCheck::Match => Some(true),
+            HashCheck::Mismatch => Some(false),
+            // `null`, never `false`: see `VerifyResponse::hash_matches`.
+            HashCheck::NotApplicable => None,
+        },
         truth_value: claim.truth_value.value(),
     })
 }

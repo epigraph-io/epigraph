@@ -17,6 +17,13 @@
 //! derives `content_hash = BLAKE3(content)` itself, so a fixture written
 //! through it can never exhibit a stored/computed mismatch and the tampering
 //! test would pass over the unmodified code.
+//!
+//! The `hash_check` cases at the bottom cover the *third* state. Making
+//! `hash_matches` falsifiable is not enough on its own: the canonical Tier-1
+//! document pipeline deliberately stores a digest that is NOT `blake3(content)`
+//! on every thesis/section/paragraph row, so a two-valued answer turns those
+//! rows into a confident false accusation. Those tests pin `not_applicable` to
+//! exactly that class and `mismatch` to everything else.
 
 use epigraph_crypto::{AgentSigner, ContentHasher};
 use epigraph_mcp::tools::claims::verify_claim;
@@ -58,6 +65,11 @@ async fn tampered_body_fails_the_hash_check(pool: PgPool) {
          integrity check; `true` here means the reader recomputed the digest \
          from the tampered body and compared it against itself: {resp}"
     );
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("mismatch".to_string()),
+        "and the tri-state must name it as a mismatch, not as undecided: {resp}"
+    );
 }
 
 /// The converse, so the fix cannot be "return false": an untampered claim whose
@@ -81,6 +93,11 @@ async fn intact_body_passes_the_hash_check(pool: PgPool) {
         resp["hash_matches"],
         Value::Bool(true),
         "an untampered claim must pass the integrity check: {resp}"
+    );
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("match".to_string()),
+        "and the tri-state must name it a match: {resp}"
     );
 }
 
@@ -221,6 +238,173 @@ async fn unsigned_claim_reports_signed_false(pool: PgPool) {
     );
 }
 
+/// A document-scoped COMPOUND node, seeded byte-for-byte the way
+/// `epigraph_ingest::document::builder` writes a thesis, must report
+/// `hash_check: "not_applicable"` — NOT a mismatch.
+///
+/// This is the class the two-valued answer got confidently wrong. The builder
+/// binds `compound_content_hash(blake3(text), artifact_seed)` at levels 0/1/2
+/// (`plan.rs`: "the value a writer must store in `claims.content_hash` — NOT
+/// necessarily `blake3(content)` ... writers must bind this value rather than
+/// re-deriving from content") so that migration 013's
+/// `UNIQUE (content_hash, agent_id)` cannot collapse paper A's and paper B's
+/// "Introduction" rows. `blake3(content)` therefore never equals the stored
+/// digest on an *untampered* structural row, and the artifact seed is not
+/// recoverable from the claim, so the only honest answer is "this digest is not
+/// derivable from the body — content-hash verification does not apply here".
+///
+/// Fixture is built with the production helpers (`content_hash`,
+/// `compound_content_hash`, `compound_claim_id`) rather than hand-rolled bytes,
+/// so it tracks the writer instead of a snapshot of it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compound_document_hash_reports_not_applicable(pool: PgPool) {
+    use epigraph_ingest::common::ids::{compound_claim_id, compound_content_hash, content_hash};
+
+    let agent = seed_agent(&pool, &[0x44u8; 32]).await;
+
+    // Exactly `document::builder`'s thesis branch: seed = "{title}\u{1f}thesis".
+    let doc_title = "Positional Assembly of Diamondoid Structures";
+    let thesis_text = "Mechanosynthesis can be made reliable at cryogenic temperatures.";
+    let plain = content_hash(thesis_text);
+    let seed = format!("{doc_title}\u{1f}thesis");
+    let stored_hash = compound_content_hash(&plain, &seed);
+    let claim_id = compound_claim_id(&plain, &seed);
+
+    assert_ne!(
+        stored_hash, plain,
+        "fixture precondition: a compound row's stored digest is not blake3(content)"
+    );
+
+    insert_claim_with_properties(
+        &pool,
+        claim_id,
+        agent,
+        thesis_text,
+        &stored_hash,
+        None,
+        None,
+        // `document::builder`'s level-0 properties, verbatim.
+        serde_json::json!({
+            "level": 0,
+            "source_type": "Paper",
+            "thesis_derivation": "TopDown",
+        }),
+    )
+    .await;
+
+    let resp = run_verify(&pool, claim_id).await;
+
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("not_applicable".to_string()),
+        "an UNTAMPERED thesis node of an ingested document must report \
+         not_applicable; `mismatch` here is a false tampering alarm over every \
+         thesis/section/paragraph row written by ingest_document: {resp}"
+    );
+    assert_eq!(
+        resp["hash_matches"],
+        Value::Null,
+        "hash_matches must be null (undecided), never `false`, for a digest \
+         that is not blake3(content) by construction: {resp}"
+    );
+}
+
+/// The converse that keeps the new state from becoming a blanket excuse: a
+/// CONTENT-ADDRESSED row (level-3 atom, plain digest) whose body was mutated
+/// must still report `mismatch`.
+///
+/// Without this, "return not_applicable" would satisfy the test above and the
+/// tampering signal would be gone again — the opposite-sign version of the
+/// always-true theatre this whole item exists to remove.
+#[sqlx::test(migrations = "../../migrations")]
+async fn tampered_atom_still_reports_mismatch(pool: PgPool) {
+    use epigraph_ingest::common::ids::content_hash;
+
+    let agent = seed_agent(&pool, &[0x55u8; 32]).await;
+
+    let original = "Tip functionalization proceeds by hydrogen abstraction.";
+    let tampered = "Tip functionalization proceeds by fluorine abstraction.";
+    let stored_hash = content_hash(original);
+    let claim_id = Uuid::new_v4();
+
+    insert_claim_with_properties(
+        &pool,
+        claim_id,
+        agent,
+        tampered,
+        &stored_hash,
+        None,
+        None,
+        // `document::builder`'s level-3 (atom) properties: SAME source_type,
+        // different level — so the classifier cannot key on source_type alone.
+        serde_json::json!({
+            "level": 3,
+            "source_type": "Paper",
+            "section": "Methods",
+        }),
+    )
+    .await;
+
+    let resp = run_verify(&pool, claim_id).await;
+
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("mismatch".to_string()),
+        "an atom binds the PLAIN content hash, so a body that does not hash to \
+         it is genuine tampering and must be reported as mismatch: {resp}"
+    );
+    assert_eq!(
+        resp["hash_matches"],
+        Value::Bool(false),
+        "mismatch must still surface as hash_matches: false: {resp}"
+    );
+}
+
+/// A level-2 row that is NOT document ingest output (no `source_type`) must
+/// still report `mismatch` when its body disagrees with its digest.
+///
+/// `ClaimRepository::evolve_step` writes `properties = {"level": <n>,
+/// "step_lineage_id": …}` with `content_hash = blake3(content)`, and the
+/// workflow builder writes `source_type: "workflow"` with the plain hash too.
+/// Both are level < 3, so a classifier keyed on `level` alone would excuse a
+/// tampered body on either. This pins the predicate to the document-compound
+/// class specifically.
+#[sqlx::test(migrations = "../../migrations")]
+async fn tampered_non_document_level_two_reports_mismatch(pool: PgPool) {
+    use epigraph_ingest::common::ids::content_hash;
+
+    let agent = seed_agent(&pool, &[0x66u8; 32]).await;
+
+    let original = "Acquire the admin token from the canonical client secret.";
+    let tampered = "Acquire the admin token from the attacker's client secret.";
+    let stored_hash = content_hash(original);
+    let claim_id = Uuid::new_v4();
+
+    insert_claim_with_properties(
+        &pool,
+        claim_id,
+        agent,
+        tampered,
+        &stored_hash,
+        None,
+        None,
+        serde_json::json!({
+            "level": 2,
+            "step_lineage_id": Uuid::new_v4().to_string(),
+        }),
+    )
+    .await;
+
+    let resp = run_verify(&pool, claim_id).await;
+
+    assert_eq!(
+        resp["hash_check"],
+        Value::String("mismatch".to_string()),
+        "a level-2 step claim stores the plain content hash, so `level < 3` \
+         alone must not excuse a body/digest disagreement: {resp}"
+    );
+}
+
 async fn run_verify(pool: &PgPool, claim_id: Uuid) -> Value {
     let server = build_test_server(pool.clone());
     let result = verify_claim(
@@ -273,10 +457,41 @@ async fn insert_claim(
     signer_id: Option<Uuid>,
 ) -> Uuid {
     let id = Uuid::new_v4();
+    insert_claim_with_properties(
+        pool,
+        id,
+        agent_id,
+        content,
+        content_hash,
+        signature,
+        signer_id,
+        serde_json::json!({}),
+    )
+    .await;
+    id
+}
+
+/// [`insert_claim`] plus control over the row `id` and `properties`.
+///
+/// The `hash_check` fixtures need both: a document-compound row is identified by
+/// `claims.properties` (`level` + `source_type`), and its `id` is
+/// `compound_claim_id(...)` over the same material as its stored digest, so
+/// seeding a random id would make the fixture unlike anything ingest writes.
+#[allow(clippy::too_many_arguments)]
+async fn insert_claim_with_properties(
+    pool: &PgPool,
+    id: Uuid,
+    agent_id: Uuid,
+    content: &str,
+    content_hash: &[u8],
+    signature: Option<&[u8]>,
+    signer_id: Option<Uuid>,
+    properties: Value,
+) {
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
-                             signature, signer_id, labels, is_current) \
-         VALUES ($1, $2, $3, 0.5, $4, $5, $6, ARRAY[]::text[], true)",
+                             signature, signer_id, labels, is_current, properties) \
+         VALUES ($1, $2, $3, 0.5, $4, $5, $6, ARRAY[]::text[], true, $7)",
     )
     .bind(id)
     .bind(content)
@@ -284,8 +499,8 @@ async fn insert_claim(
     .bind(agent_id)
     .bind(signature)
     .bind(signer_id)
+    .bind(properties)
     .execute(pool)
     .await
     .expect("seed claim");
-    id
 }
