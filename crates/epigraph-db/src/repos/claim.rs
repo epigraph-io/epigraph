@@ -153,13 +153,35 @@ pub struct PatchClaimDiff {
 /// tampered body verified clean.
 ///
 /// Callers that expose or verify crypto state MUST extend their `SELECT` and
-/// post-fix the returned `Claim` via [`post_fix_crypto_columns`] —
-/// [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
-/// [`ClaimRepository::get_by_id_with_labels`] do. The bulk list/search readers
-/// deliberately do not: they feed summary projections that never read
-/// `signature`/`public_key`, and joining `agents` per row to hydrate a field
-/// nobody reads would cost a join on every page. Anything promoted to a
-/// crypto-reading path must move to the post-fix pattern first.
+/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly three
+/// do: [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
+/// [`ClaimRepository::get_by_id_with_labels`].
+///
+/// # The residual set is NOT just the bulk readers
+///
+/// Every other call site still returns fabricated crypto, and that includes
+/// single-claim paths, not only list/search:
+///
+/// * single-claim reads — `find_by_content_hash_and_agent`, `get_by_agent`
+/// * create paths that return the row they wrote — `create`, `create_with_tx`,
+///   `create_strict`, `batch_create`
+/// * single-claim updates that return the updated row — `update_truth_value`,
+///   `update_truth_value_conn`, `update_trace_id`, `update_trace_id_conn`
+/// * the bulk list/search readers (`list`, `list_by_labels`, `search_*`, …)
+///
+/// The create paths are the sharpest case: `create` INSERTs the caller's
+/// `claim.content_hash` — which on the ingest path is a seed-scoped compound
+/// digest, deliberately not `blake3(content)` — and then hands back a `Claim`
+/// whose `content_hash` is `claim_from_row`'s recomputed `blake3(content)`, so
+/// the read-back disagrees with the row just written. No current caller reads
+/// that field off a create/update return, which is the only reason this is
+/// latent rather than a live bug; anything promoted to a crypto-reading path
+/// must move to the post-fix pattern first.
+///
+/// The bulk readers are left alone on cost grounds (a per-row `agents` join to
+/// hydrate a field no summary projection reads). The single-claim ones above are
+/// left alone only because nothing reads them — a weaker justification, recorded
+/// here rather than glossed.
 ///
 /// Its signature stays fixed (~20 call sites) per `CLAUDE.md`.
 fn claim_from_row(
@@ -216,7 +238,10 @@ struct RowCryptoColumns {
 ///
 /// - `content_hash` is the **stored** digest, so a hash check against a
 ///   freshly computed digest is falsifiable: if the body was mutated without
-///   rewriting the column, they differ.
+///   rewriting the column, they differ. Note that "they differ" is not the same
+///   as "the body was mutated" — the ingest writer stores a seed-scoped digest
+///   on document-scoped compound rows, so a reader must classify before it
+///   accuses (see `epigraph_mcp::tools::claims::verify_claim`).
 /// - `signature` is `None` unless the column holds exactly
 ///   [`SIGNATURE_SIZE`](epigraph_crypto::SIGNATURE_SIZE) bytes. A wrong-length
 ///   blob is a corrupt signature, and `None` ("unsigned") is the only safe
@@ -227,6 +252,13 @@ struct RowCryptoColumns {
 ///   substituting `agents.public_key` for `claims.agent_id` would re-introduce
 ///   a fabricated value (and verify a signature against the wrong key if one
 ///   were ever present without a signer).
+///
+/// Both length checks are DEFENSIVE ONLY and unreachable through Postgres:
+/// `001_initial_schema.sql` carries `CONSTRAINT claims_content_hash_length CHECK
+/// (octet_length(content_hash) = 32)` and `CONSTRAINT claims_signature_length
+/// CHECK (signature IS NULL OR octet_length(signature) = 64)`. They exist so the
+/// `Vec<u8>` → fixed-array conversion has a defined answer rather than a panic,
+/// not because a wrong-length row is an anticipated state.
 ///
 /// # Errors
 /// [`DbError::InvalidData`] if `content_hash` is not 32 bytes. Unlike the
