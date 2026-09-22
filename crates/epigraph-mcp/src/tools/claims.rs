@@ -1080,14 +1080,104 @@ fn extract_submit_claim_id(result: &CallToolResult) -> Result<String, McpError> 
         .ok_or_else(|| internal_error("submit_claim response missing claim_id"))
 }
 
+/// The one label that carries RETIREMENT semantics.
+///
+/// Exact byte string on purpose: it must be the same literal the canonical
+/// open-backlog query filters on
+/// (`query_claims_by_label(labels=["backlog"], exclude_labels=["resolved"])`,
+/// `CLAUDE.md`). A case variant such as `Resolved` is deliberately NOT gated,
+/// because it does not retire anything either — `exclude_labels` would not
+/// match it, so the claim stays visible in every backlog query.
+pub(crate) const RETIREMENT_LABEL: &str = "resolved";
+
+/// Apply `resolve_backlog_item`'s ownership gate to a free-form label mutation,
+/// but ONLY when it touches [`RETIREMENT_LABEL`] and ONLY on a transport that
+/// carries an `AuthContext` (issue #374).
+///
+/// ## The asymmetry this closes
+///
+/// `resolve_backlog_item`, `supersede_claim` and `mark_duplicate` all call
+/// [`require_owner_or_admin`]; `update_labels` and `patch_claim` called nothing,
+/// while being able to achieve the same *observable* effect — adding `resolved`
+/// to a claim removes it from every open-backlog query, without the resolution
+/// claim or the `Resolves <id>: ` trail the gated verb exists to create. A
+/// caller refused by the gated path was nudged toward the unaudited one. The
+/// reporter's own session relabelled 161 claims it did not own over the same
+/// token that `resolve_backlog_item` then refused.
+///
+/// ## Why only the `resolved` label
+///
+/// A blanket `require_owner_or_admin` on these two tools would gate cross-agent
+/// taxonomy maintenance, which is legitimate and high-volume. `resolved` is the
+/// one label with retirement semantics; the rest are free-form vocabulary.
+/// Both directions are gated: *removing* `resolved` un-retires a claim, which is
+/// the same authority as retiring it.
+///
+/// ## Why only the authenticated transport — and what stays open
+///
+/// `auth = None` means stdio, and stdio is NOT a trust boundary here: the
+/// process that spawned the server handed it `--database-url`, so it already
+/// holds unmediated write access to every row this gate protects (the same
+/// argument [`require_owner_or_admin`]'s doc comment makes for its own stdio
+/// arm). Gating it would also break a live, documented workflow rather than an
+/// abuse: `epiclaw-host`'s baked `release/epiclaw/CLAUDE.md` instructs every
+/// scheduled agent to retire cross-agent backlog items with exactly
+/// `update_labels(original_id, add=["resolved"])`, because `resolve_backlog_item`
+/// refuses them.
+///
+/// That refusal is real and was **re-measured, not assumed**: the epiclaw
+/// agent-runner exports `EPIGRAPH_AGENT_MODEL` /
+/// `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` (`agent-runner/src/index.ts`,
+/// `agentIdentityEnv`), so `main::select_signer` takes rung 1 and
+/// `signer_identity_declared` is **true** for the fleet — the
+/// warn-and-allow `!signer_identity_declared` arm does not cover them. Gating
+/// stdio here would therefore leave those agents with no way to retire a
+/// backlog item at all.
+///
+/// So this closes the remotely-reachable half and leaves the local half as it
+/// was. The stdio bypass remains open by design until the sanctioned path is
+/// reachable for the fleet; issue #374 stays open for that half.
+async fn gate_retirement_label(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    claim_id: Uuid,
+    add: &[String],
+    remove: &[String],
+) -> Result<(), McpError> {
+    let touches_retirement = add
+        .iter()
+        .chain(remove.iter())
+        .any(|l| l == RETIREMENT_LABEL);
+    if !touches_retirement {
+        return Ok(());
+    }
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+
+    // Only fetched on the gated path, so the common label mutation keeps its
+    // single round-trip. This also means a `resolved` mutation now reports
+    // "claim not found" for a missing id where it previously fell through to a
+    // repo-layer no-op — deliberate: the gate cannot decide ownership of a row
+    // it cannot read.
+    let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+
+    require_owner_or_admin(server, Some(auth), claim.agent_id.as_uuid()).await
+}
+
 pub async fn update_labels(
     server: &EpiGraphMcpFull,
     params: crate::types::UpdateLabelsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     if params.add.is_empty() && params.remove.is_empty() {
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
+    gate_retirement_label(server, auth, id, &params.add, &params.remove).await?;
     // `db_caller_error`, not `internal_error`: a label refused by
     // `reject_unexpanded_labels` is the caller's input, not a server fault. The
     // repo layer refuses it inside the same statement that would have written
@@ -1101,6 +1191,7 @@ pub async fn update_labels(
 pub async fn patch_claim(
     server: &EpiGraphMcpFull,
     params: crate::types::PatchClaimParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let trace = match &params.trace_id {
@@ -1116,6 +1207,10 @@ pub async fn patch_claim(
             "at least one of trace_id/properties/add_labels/remove_labels required",
         ));
     }
+    // Same gate as `update_labels`: `patch_claim` also accepts
+    // `add_labels`/`remove_labels`, so leaving it ungated would just move the
+    // bypass one tool over (issue #374).
+    gate_retirement_label(server, auth, id, &params.add_labels, &params.remove_labels).await?;
     let mut tx = server.pool.begin().await.map_err(internal_error)?;
     let diff = ClaimRepository::patch_claim_atomic_conn(
         &mut tx,

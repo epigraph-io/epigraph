@@ -41,6 +41,18 @@ Do NOT:
 - Reach for raw `update_labels` to add `["resolved"]` to a backlog item —
   that bypasses the canonical resolution-claim trail.
 
+**Enforcement (issue #374).** `resolved` is the one label with retirement
+semantics, so `update_labels` and `patch_claim` now apply
+`resolve_backlog_item`'s `require_owner_or_admin` check when a call adds or
+removes it — but only when the caller is authenticated (HTTP). Every other
+label stays ungated, and the unauthenticated **stdio** path stays ungated too:
+epiclaw's scheduled agents run with a declared signer identity
+(`EPIGRAPH_AGENT_MODEL`), cannot satisfy `resolve_backlog_item` for a
+cross-agent claim, and `release/epiclaw/CLAUDE.md` documents this call as their
+retirement procedure. Closing that half requires making the sanctioned path
+reachable for them first; until then the guidance above is a convention on
+stdio and an enforced rule over HTTP.
+
 **Querying open backlog:**
 
 ```python

@@ -29,6 +29,7 @@ async fn patch_claim_applies_trace_props_labels_atomically(pool: PgPool) {
             add_labels: vec!["beta".into()],
             remove_labels: vec!["alpha".into()],
         },
+        None,
     )
     .await
     .unwrap();

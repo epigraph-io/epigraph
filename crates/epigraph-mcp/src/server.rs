@@ -544,13 +544,19 @@ impl EpiGraphMcpFull {
         crate::tools::supersede::mark_duplicate(self, params, auth).await
     }
 
-    #[tool(description = "Atomically add and/or remove labels on an existing claim. Idempotent.")]
+    #[tool(
+        description = "Atomically add and/or remove labels on an existing claim. Idempotent. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP)."
+    )]
     async fn update_labels(
         &self,
         Parameters(params): Parameters<crate::types::UpdateLabelsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::claims::update_labels(self, params).await
+        // Needed only for the `resolved`-label gate (issue #374); every other
+        // label mutation ignores it. Same propagation as `resolve_backlog_item`.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::claims::update_labels(self, params, auth).await
     }
 
     #[tool(
@@ -572,14 +578,17 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required."
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP)."
     )]
     async fn patch_claim(
         &self,
         Parameters(params): Parameters<crate::types::PatchClaimParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::claims::patch_claim(self, params).await
+        // See `update_labels` — `add_labels`/`remove_labels` reach the same gate.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::claims::patch_claim(self, params, auth).await
     }
 
     // ── Provenance (1 tool) ──
