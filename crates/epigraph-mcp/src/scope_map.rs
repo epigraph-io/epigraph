@@ -41,6 +41,12 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_provenance", "claims:read"),
     ("get_provenance_chain", "claims:read"),
     ("get_recall_events", "claims:read"),
+    // The theme READ path. `claims:read`, deliberately NOT the `claims:write`
+    // its sibling `theme_cluster` carries: these two issue only SELECTs, and
+    // gating them at write level would preserve exactly the gap they close —
+    // a read-only principal unable to see what topics the corpus holds.
+    ("get_theme", "claims:read"),
+    ("list_themes", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("sweep_semantic_duplicates", "claims:write"),
     ("get_workflow_executions", "claims:read"),
@@ -190,6 +196,24 @@ mod tests {
             stale.is_empty(),
             "scope_map entries reference tools not registered on EpiGraphMcpFull: {stale:?}"
         );
+    }
+
+    /// The theme READ tools must sit at `claims:read`, not inherit
+    /// `theme_cluster`'s `claims:write`.
+    ///
+    /// Backlog `ac4d02b9`: the whole point of adding them is that a
+    /// read-scoped principal (pre-access sensitivity screening, partition
+    /// design) could not learn what topics the corpus covers without invoking
+    /// the destructive clusterer. Mapping them to `claims:write` would compile,
+    /// pass `every_registered_tool_has_a_scope`, and silently preserve that
+    /// gap — so it is asserted explicitly rather than left to the coverage
+    /// test.
+    #[test]
+    fn theme_read_tools_are_read_scoped() {
+        assert_eq!(required_scope("list_themes"), Some("claims:read"));
+        assert_eq!(required_scope("get_theme"), Some("claims:read"));
+        // And the writer is still a writer.
+        assert_eq!(required_scope("theme_cluster"), Some("claims:write"));
     }
 
     /// Sanity-check the three known mutation tools cited in issue #122 are
