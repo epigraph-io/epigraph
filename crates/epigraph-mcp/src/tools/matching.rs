@@ -8,13 +8,16 @@
 //!   edges for a claim. Read-only.
 //! - `list_match_candidates`: list the queue, sorted by score desc, optionally
 //!   filtered by status.
-//! - `decide_match_candidate`: promote, reject, or retire a row. Promotion
+//! - `decide_match_candidate`: promote or reject a `pending` row. Promotion
 //!   writes the edge the row's `verifier_verdict` calls for — `CORROBORATES`
 //!   for same/paraphrase/overlapping, `contradicts` for contradicts — and
-//!   refuses outright for `distinct`. Retirement is the undo of a promotion:
-//!   it deletes the matcher edge together with the `factors` / `bp_messages`
-//!   the `edges_auto_factor` trigger derived from it and flips the row to
-//!   `stale`. Honours `reject_if_read_only` like other write tools.
+//!   refuses outright for `distinct`. Both arms refuse a row that is already
+//!   decided, matching the HTTP route's 409. Honours `reject_if_read_only`
+//!   like other write tools.
+//! - `retire_match_candidate`: the undo of a promotion, and a SEPARATE tool
+//!   because it carries `claims:admin`. It retracts the matcher edge together
+//!   with the `factors` / `bp_messages` the `edges_auto_factor` trigger
+//!   derived from it and flips the row to `stale`.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -141,8 +144,31 @@ pub async fn decide_match_candidate(
 
     let acting_agent = server.agent_id().await?;
 
+    // Already-decided gate — transport parity with
+    // `routes/cross_source.rs::decide_candidate`'s `reject_if_decided`
+    // (409 Conflict, pinned by
+    // `cross_source_route_tests::promote_and_reject_still_refuse_an_already_decided_candidate`).
+    // Both decide arms are guarded because both corrupt the edge/row pairing
+    // when replayed on a decided row: `reject` on a `promoted` row flips the
+    // status while leaving the matcher edge live (an edge with no owning
+    // candidate), and `promote` on a `stale` row re-creates the very edge a
+    // `retire_match_candidate` just retracted. The undo is
+    // `retire_match_candidate`, which deliberately carries NO such gate —
+    // retirement is only ever applied to an already-`promoted` row.
+    let reject_if_decided = || -> Result<(), McpError> {
+        if row.status == "pending" {
+            return Ok(());
+        }
+        Err(invalid_params(format!(
+            "candidate {candidate_id} already decided (status={}); use \
+             retire_match_candidate to undo a promotion",
+            row.status
+        )))
+    };
+
     match decision.as_str() {
         "promote" => {
+            reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
             // before `set_status`. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes from
@@ -211,13 +237,19 @@ pub async fn decide_match_candidate(
             .map_err(internal_error)?;
         }
         "reject" => {
+            reject_if_decided()?;
             repo.set_status(candidate_id, "rejected", Some(acting_agent))
                 .await
                 .map_err(internal_error)?;
         }
         other => {
+            // `retire` is NOT handled here — it is its own tool because it
+            // carries `claims:admin` rather than `claims:write` (see
+            // `retire_match_candidate`'s doc comment). The old message listed
+            // it as a valid verdict while rejecting it, which read as a bug.
             return Err(invalid_params(format!(
-                "verdict must be 'promote', 'reject' or 'retire', got {other}"
+                "verdict must be 'promote' or 'reject', got {other}. To undo a \
+                 promotion, call the separate `retire_match_candidate` tool."
             )));
         }
     }
