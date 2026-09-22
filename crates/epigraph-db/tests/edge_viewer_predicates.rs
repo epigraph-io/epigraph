@@ -561,3 +561,139 @@ async fn neighborhood_compound_nodes_atom_count_excludes_unreadable_atoms(pool: 
         "a stranger must not learn that P decomposes into an atom it cannot read"
     );
 }
+
+// ── ClaimRepository::semantic_graph_neighbors / rag_hybrid_context ─────────
+
+/// A 1536-d pgvector literal with every component `v` (the `embedding` column's
+/// dimension; `embedding_3072` is not touched by these reads' default path).
+fn unit_ish(v: f32) -> String {
+    let body: Vec<String> = (0..1536).map(|_| v.to_string()).collect();
+    format!("[{}]", body.join(","))
+}
+
+/// The strongest member of the finding: this projects `e.source_id`,
+/// `e.target_id` and `e.relationship`, so a private `contradicts` between two
+/// public claims reached a stranger as a fully-labelled, directed edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_graph_neighbors_hides_a_private_edge_between_public_claims(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let ids = public_claims(
+        &pool,
+        t.agent,
+        &["seed S", "private-out N1", "public-out N2", "private-in N3"],
+    )
+    .await;
+    let (s, n1, n2, n3) = (ids[0], ids[1], ids[2], ids[3]);
+    let v = unit_ish(0.5);
+    for c in &ids {
+        fixture::set_claim_embedding(&pool, *c, &v).await;
+    }
+    private_edge(&pool, s, n1, "contradicts", t.group).await;
+    edge(&pool, s, n2, "supports").await;
+    private_edge(&pool, n3, s, "refines", t.group).await;
+
+    let seen = |rows: Vec<epigraph_db::repos::claim::SemanticNeighborHit>| {
+        let mut v: Vec<(Uuid, String, String)> = rows
+            .into_iter()
+            .map(|r| (r.neighbor_id, r.relationship, r.direction))
+            .collect();
+        v.sort();
+        v
+    };
+
+    let owner = seen(
+        epigraph_db::ClaimRepository::semantic_graph_neighbors(
+            &pool,
+            &t.owner,
+            "embedding",
+            &v,
+            &[s],
+        )
+        .await
+        .expect("owner neighbours"),
+    );
+    let mut want_owner = vec![
+        (n1, "contradicts".to_string(), "outbound".to_string()),
+        (n2, "supports".to_string(), "outbound".to_string()),
+        (n3, "refines".to_string(), "inbound".to_string()),
+    ];
+    want_owner.sort();
+    assert_eq!(owner, want_owner, "the owner reads all three edges");
+
+    let stranger = seen(
+        epigraph_db::ClaimRepository::semantic_graph_neighbors(
+            &pool,
+            &t.stranger,
+            "embedding",
+            &v,
+            &[s],
+        )
+        .await
+        .expect("stranger neighbours"),
+    );
+    assert_eq!(
+        stranger,
+        vec![(n2, "supports".to_string(), "outbound".to_string())],
+        "every endpoint is public; only the edge predicate can withhold the private \
+         `contradicts` (outbound) and `refines` (inbound) edges"
+    );
+}
+
+/// `edge_count` is a returned scalar AND a ranking input. The fixture puts
+/// private edges on BOTH sides of the claim, because the statement's
+/// `source_id = c.id OR target_id = c.id` needs parenthesising for the spliced
+/// `AND (...)` to govern both arms — `AND` binds tighter than `OR`, and a
+/// one-sided fixture would pass the unparenthesised fail-open.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rag_hybrid_context_edge_count_counts_only_readable_edges(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let ids = public_claims(&pool, t.agent, &["R", "A", "B", "C"]).await;
+    let (r, a, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+    let private_claim = fixture::seed_group_claim(&pool, t.agent, t.group, "P").await;
+    let v = unit_ish(0.5);
+    fixture::set_claim_embedding(&pool, r, &v).await;
+    sqlx::query("UPDATE claims SET truth_value = 0.9 WHERE id = $1")
+        .bind(r)
+        .execute(&pool)
+        .await
+        .expect("truth");
+
+    edge(&pool, r, a, "supports").await; // public
+    private_edge(&pool, r, b, "contradicts", t.group).await; // declared private, source side
+    private_edge(&pool, c, r, "refines", t.group).await; // declared private, target side
+    edge(&pool, r, private_claim, "supports").await; // private by the meet (070 arm (b))
+
+    let count_for = |hits: Vec<epigraph_db::repos::claim::RagContextHit>| {
+        hits.into_iter()
+            .find(|h| h.claim_id == r)
+            .map(|h| h.edge_count)
+            .expect("R is retrieved")
+    };
+
+    let owner = count_for(
+        epigraph_db::ClaimRepository::rag_hybrid_context(&pool, &t.owner, &v, 0.0, None, 10)
+            .await
+            .expect("owner rag"),
+    );
+    assert_eq!(owner, 4, "the owner reads all four edges");
+
+    let stranger = count_for(
+        epigraph_db::ClaimRepository::rag_hybrid_context(&pool, &t.stranger, &v, 0.0, None, 10)
+            .await
+            .expect("stranger rag"),
+    );
+    assert_eq!(
+        stranger, 1,
+        "a stranger's degree for R must count only the one public edge — not the \
+         two declared-private ones (one per side) nor the one to a claim it \
+         cannot read"
+    );
+
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let sys = count_for(
+        epigraph_db::ClaimRepository::rag_hybrid_context(&pool, &bypass, &v, 0.0, None, 10)
+            .await
+            .expect("bypass rag"),
+    );
+    assert_eq!(sys, 4, "the bypass viewer counts every edge");
+}
