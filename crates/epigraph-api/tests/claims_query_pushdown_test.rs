@@ -19,12 +19,33 @@
 //! small-fixture test in this crate. `#[sqlx::test]` gives each run its own
 //! ephemeral database, so the bulk insert neither sees nor pollutes any shared
 //! test data.
+//!
+//! # Tenancy, added when the PR #485 series merged
+//!
+//! `GET /api/v1/claims` is behind `ViewerExtractor` and runs on
+//! `AppState::read_as`, so the local `AppState::with_db` + bare-GET wiring this
+//! file shipped with answers 401 (no bearer) and would answer 500 if it got past
+//! that (`read_as` REFUSES when `AppState.scoped` is `None` — it does not fall
+//! back to the raw pool). Both are now fixed the way
+//! `claims_query_is_current_filter.rs` fixes them: `common::spawn_app` over the
+//! ephemeral database's own URL, and a real bearer from
+//! `common::test_bearer_token_with_seeded_client`.
+//!
+//! The fixtures seed `visibility = 'public'` EXPLICITLY. Without it the rows are
+//! invisible to the token's viewer and every assertion below fails on an empty
+//! `claims` array — i.e. on exactly the symptom `2265a67b` produces, for a
+//! completely different reason. That is the failure mode this comment exists to
+//! stop the next reader misdiagnosing.
 #![cfg(feature = "db")]
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+mod common;
 
 use serde_json::Value;
 use sqlx::PgPool;
 use std::net::SocketAddr;
-use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// The cap the old in-memory slow path applied to its working set.
@@ -64,13 +85,16 @@ async fn filtered_queries_count_and_reach_past_the_old_10k_window(pool: PgPool) 
 
     let total_rows = filler_total + 2; // fillers + needle + superseded filler
 
-    let (addr, _shutdown) = spawn_app(pool.clone()).await;
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:read"]).await;
 
     // ---- (1) The needle is reachable through a filter, not buried ----
     let body = get(
         &client,
         addr,
+        &token,
         &format!("/api/v1/claims?agent_id={needle_agent}&limit=50"),
     )
     .await;
@@ -90,7 +114,13 @@ async fn filtered_queries_count_and_reach_past_the_old_10k_window(pool: PgPool) 
     );
 
     // ---- (2) `total` on a filtered query is a count, not a capped slice ----
-    let body = get(&client, addr, "/api/v1/claims?is_current=true&limit=5").await;
+    let body = get(
+        &client,
+        addr,
+        &token,
+        "/api/v1/claims?is_current=true&limit=5",
+    )
+    .await;
     let expected_current = total_rows - 1; // everything but the superseded filler
     assert_eq!(
         body["total"],
@@ -105,7 +135,13 @@ async fn filtered_queries_count_and_reach_past_the_old_10k_window(pool: PgPool) 
     );
 
     // ---- (3) The complement partitions the table exactly ----
-    let body = get(&client, addr, "/api/v1/claims?is_current=false&limit=50").await;
+    let body = get(
+        &client,
+        addr,
+        &token,
+        "/api/v1/claims?is_current=false&limit=50",
+    )
+    .await;
     assert_eq!(body["total"], Value::from(1));
     let rows = body["claims"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
@@ -119,6 +155,7 @@ async fn filtered_queries_count_and_reach_past_the_old_10k_window(pool: PgPool) 
     let body = get(
         &client,
         addr,
+        &token,
         "/api/v1/claims?sort_by=created_at&sort_order=asc&limit=1",
     )
     .await;
@@ -131,7 +168,7 @@ async fn filtered_queries_count_and_reach_past_the_old_10k_window(pool: PgPool) 
     assert_eq!(body["total"], Value::from(total_rows));
 
     // ---- (5) An unfiltered query still reports the whole table ----
-    let body = get(&client, addr, "/api/v1/claims?limit=1").await;
+    let body = get(&client, addr, &token, "/api/v1/claims?limit=1").await;
     assert_eq!(body["total"], Value::from(total_rows));
 }
 
@@ -155,12 +192,15 @@ async fn a_filter_that_matches_nothing_returns_nothing(pool: PgPool) {
         .await;
     }
 
-    let (addr, _shutdown) = spawn_app(pool.clone()).await;
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:read"]).await;
 
     let body = get(
         &client,
         addr,
+        &token,
         "/api/v1/claims?methodology=deductive&limit=50",
     )
     .await;
@@ -172,34 +212,16 @@ async fn a_filter_that_matches_nothing_returns_nothing(pool: PgPool) {
     assert!(body["claims"].as_array().unwrap().is_empty());
 }
 
-async fn get(client: &reqwest::Client, addr: SocketAddr, path: &str) -> Value {
+async fn get(client: &reqwest::Client, addr: SocketAddr, token: &str, path: &str) -> Value {
     client
         .get(format!("http://{addr}{path}"))
+        .bearer_auth(token)
         .send()
         .await
         .expect("request")
         .json()
         .await
         .expect("json body")
-}
-
-/// Same wiring as `epigraph_api::build_app_for_tests`, but from an existing
-/// pool so the ephemeral `#[sqlx::test]` database is the one under test.
-async fn spawn_app(pool: PgPool) -> (SocketAddr, oneshot::Sender<()>) {
-    let state = epigraph_api::AppState::with_db(pool, epigraph_api::ApiConfig::default());
-    let app = epigraph_api::routes::create_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
-            .with_graceful_shutdown(async {
-                let _ = rx.await;
-            })
-            .await
-            .unwrap();
-    });
-    (addr, tx)
 }
 
 async fn seed_agent(pool: &PgPool, tag: u8) -> Uuid {
@@ -235,8 +257,8 @@ async fn seed_claim(
         .collect();
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
-                             is_current, supersedes, created_at) \
-         VALUES ($1, $2, $3, 0.5, $4, $5, $6, $7::timestamptz)",
+                             is_current, supersedes, created_at, visibility) \
+         VALUES ($1, $2, $3, 0.5, $4, $5, $6, $7::timestamptz, 'public')",
     )
     .bind(id)
     .bind(content)
@@ -255,10 +277,11 @@ async fn seed_claim(
 async fn bulk_seed(pool: &PgPool, agent_id: Uuid, n: i64) {
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
-                             is_current, created_at) \
+                             is_current, created_at, visibility) \
          SELECT gen_random_uuid(), 'filler ' || g, \
                 sha256(g::text::bytea), 0.5, $1, true, \
-                TIMESTAMPTZ '2026-01-01 00:00:00Z' + (g * INTERVAL '1 second') \
+                TIMESTAMPTZ '2026-01-01 00:00:00Z' + (g * INTERVAL '1 second'), \
+                'public' \
            FROM generate_series(1, $2) AS g",
     )
     .bind(agent_id)

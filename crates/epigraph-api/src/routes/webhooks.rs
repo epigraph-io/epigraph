@@ -2916,7 +2916,6 @@ mod ssrf_registration_tests {
     use crate::middleware::bearer::{AuthContext, ClientType, RequireScopeWebhooksWrite};
     use crate::state::{ApiConfig, AppState};
     use axum::extract::State;
-    use axum::http::StatusCode;
     use axum::Json;
     use sqlx::postgres::PgPoolOptions;
     use uuid::Uuid;
@@ -2949,7 +2948,32 @@ mod ssrf_registration_tests {
         }
     }
 
-    /// Positive control: the gate must not reject legitimate public targets.
+    /// Positive control: a legitimate public target gets PAST the URL gate.
+    ///
+    /// # It used to assert 201 + stored, and cannot any more
+    ///
+    /// PR-10 gave `register_webhook` two steps this fixture cannot satisfy: it
+    /// refuses a token carrying no `agents.id` (step 3) and it INSERTs into
+    /// `webhook_subscriptions` before caching (step 5). The fixture's auth has
+    /// `agent_id: None` and its pool is a lazy handle to `127.0.0.1:1` that
+    /// never connects, so the old assertion now fails on the principal check —
+    /// a failure that says nothing about SSRF.
+    ///
+    /// Satisfying it would mean seeding an agent and a real database, which is
+    /// a different test in a different file, and it already exists:
+    /// `tests/webhook_url_policy_test.rs::a_conventional_https_target_is_still_accepted`
+    /// asserts 201 AND that the row stores the target verbatim, over HTTP,
+    /// against a migrated database. That is a STRONGER control than this one
+    /// ever was.
+    ///
+    /// What is left here is the non-vacuity this module needs and that one
+    /// cannot give it: the three cases below assert `BadRequest`, and without a
+    /// positive arm a gate that refused EVERY url would pass all of them. The
+    /// assertion is therefore `Unauthorized`, NOT `BadRequest` — the URL gate at
+    /// step 1b runs BEFORE the principal check at step 3, so reaching step 3 is
+    /// proof the url was accepted. An `Err(BadRequest)` here would mean the gate
+    /// rejected a public https target; an `Ok` would mean the fixture had
+    /// silently acquired a principal and this arm had stopped discriminating.
     #[tokio::test]
     async fn register_webhook_accepts_public_https_target() {
         let state = test_state();
@@ -2960,13 +2984,23 @@ mod ssrf_registration_tests {
         )
         .await;
 
-        let (status, Json(sub)) = result.expect("public https target must be accepted");
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(sub.url, "https://example.com/webhook");
-        assert_eq!(
-            state.webhook_store.read().await.len(),
-            1,
-            "accepted subscription must be stored"
+        match result {
+            Err(ApiError::Unauthorized { .. }) => {}
+            Err(ApiError::BadRequest { message }) => {
+                panic!("the URL gate must not refuse a public https target: {message}")
+            }
+            Err(other) => {
+                panic!("expected the principal check to be the first refusal, got {other:?}")
+            }
+            Ok(_) => panic!(
+                "the fixture carries no agent_id, so a 201 here means the principal \
+                 check stopped running and this arm no longer discriminates"
+            ),
+        }
+
+        assert!(
+            state.webhook_store.read().await.is_empty(),
+            "nothing is cached before the principal check passes"
         );
     }
 
