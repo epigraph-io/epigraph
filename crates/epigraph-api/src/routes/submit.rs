@@ -416,6 +416,25 @@ async fn validate_packet(
         ));
     }
 
+    // 1b-ii. Reject labels carrying an unexpanded shell variable.
+    // `packet.claim.labels` is caller-supplied and is written by a raw
+    // `UPDATE claims SET labels` in `submit_packet`, NOT through
+    // `ClaimRepository`, so it does not inherit the repo-layer guard.
+    if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
+        let reason = match e {
+            epigraph_db::DbError::InvalidData { reason } => reason,
+            other => other.to_string(),
+        };
+        return Err((
+            StatusCode::BAD_REQUEST,
+            ErrorResponse::with_details(
+                "ValidationError",
+                reason,
+                serde_json::json!({ "field": "claim.labels" }),
+            ),
+        ));
+    }
+
     // 1c. Validate idempotency key length (DoS prevention)
     if let Some(ref key) = packet.claim.idempotency_key {
         if key.len() > MAX_IDEMPOTENCY_KEY_LENGTH {
@@ -2398,6 +2417,54 @@ mod signature_verification_tests {
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Submission for an unregistered agent must be rejected"
+        );
+    }
+
+    /// `packet.claim.labels` is caller-supplied and is applied by a raw
+    /// `UPDATE claims SET labels` in `submit_packet`, bypassing the
+    /// `ClaimRepository` chokepoint — so this path needs (and now has) its own
+    /// unexpanded-shell-variable rejection. Backlog f6310444.
+    ///
+    /// The packet is otherwise fully valid and correctly signed, so a 400 here
+    /// can only come from the label check; and the claim must not be written.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn submit_packet_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool) {
+        let signer = epigraph_crypto::AgentSigner::generate();
+        let agent_id = seed_agent_with_pubkey(&pool, signer.public_key()).await;
+        let state = test_state_with_required_signatures(pool.clone());
+
+        let content = "Packet whose label array was never interpolated.";
+        let mut claim = build_test_claim_submission(agent_id, content);
+        claim.labels = vec![
+            "fine-label".to_string(),
+            "group:$EPICLAW_GROUP_ID".to_string(),
+        ];
+
+        let mut packet = EpistemicPacket {
+            claim,
+            evidence: vec![],
+            reasoning_trace: build_test_trace(),
+            signature: String::new(),
+        };
+        let canonical = packet.signable_bytes().unwrap();
+        packet.signature = hex::encode(signer.sign(&canonical));
+
+        let response = submit_packet_endpoint(state, packet).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an unexpanded shell variable in packet.claim.labels must be a 400"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "the packet was persisted despite the 400 — validate_packet runs before \
+             the write, so a non-zero count means the check is in the wrong place"
         );
     }
 }

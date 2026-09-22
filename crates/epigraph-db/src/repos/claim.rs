@@ -3036,7 +3036,8 @@ impl ClaimRepository {
     /// generate deterministic UUIDs and rely on idempotent re-runs.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` for non-conflict failures.
+    /// Returns `DbError::QueryFailed` for non-conflict failures, or
+    /// `DbError::InvalidData` if a label carries unexpanded shell syntax.
     #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
@@ -3047,6 +3048,11 @@ impl ClaimRepository {
         truth: TruthValue,
         labels: &[String],
     ) -> Result<bool, DbError> {
+        // Labels-at-creation is the second caller-supplied label surface (the
+        // ingest paths); same predicate, refused before the INSERT so a bad
+        // label never reaches a row.
+        crate::label_validation::reject_unexpanded_labels(labels)?;
+
         let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels) \
              VALUES ($1, $2, $3, $4, $5, $6) \
@@ -4654,8 +4660,16 @@ impl ClaimRepository {
     /// Uses PostgreSQL array functions. Idempotent: adding a duplicate is a no-op,
     /// removing a nonexistent label is a no-op. Returns the updated labels array.
     ///
+    /// This is the chokepoint for caller-supplied labels: the HTTP
+    /// `PATCH /api/v1/claims/:id/labels` handler and the MCP `submit_claim`,
+    /// `update_labels` and `resolve_backlog_item` tools all route their label
+    /// writes through here, so the `add`-side validation below covers every one.
+    /// `remove` is deliberately NOT validated — it is the remediation path for
+    /// labels already corrupted in the graph.
+    ///
     /// # Errors
-    /// Returns `DbError::NotFound` if the claim doesn't exist.
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if an added label carries unexpanded shell syntax.
     #[instrument(skip(pool))]
     pub async fn update_labels(
         pool: &PgPool,
@@ -4663,6 +4677,8 @@ impl ClaimRepository {
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add)?;
+
         let row: Option<(Vec<String>,)> = sqlx::query_as(
             r#"
             WITH current AS (
@@ -4701,12 +4717,22 @@ impl ClaimRepository {
     }
 
     /// Update labels using an existing connection (e.g. inside a transaction).
+    ///
+    /// Same `add`-only validation contract as [`Self::update_labels`]; this is
+    /// the variant `patch_claim_atomic_conn` (HTTP `PATCH /api/v1/claims/:id`
+    /// and MCP `patch_claim`) calls, so the rejection reaches those too.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if an added label carries unexpanded shell syntax.
     pub async fn update_labels_conn(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add)?;
+
         use sqlx::Row;
         let row: Option<sqlx::postgres::PgRow> = sqlx::query(
             r#"WITH current AS (
@@ -5010,6 +5036,12 @@ mod label_tests {
             other => panic!("Expected NotFound, got: {other:?}"),
         }
     }
+
+    // The two unexpanded-shell-variable regression tests that used to live here
+    // moved to `crates/epigraph-db/tests/label_shell_variable_repo.rs`. Reason:
+    // every test in this module is `#[ignore]` (live-DB convention), so
+    // `cargo test -p epigraph-db` skipped the headline regression test for
+    // backlog f6310444. The new file uses `#[sqlx::test]` and runs in the gate.
 
     /// Verify `pairwise_cosine_distance` enforces the `MAX_PAIRWISE_IDS` cap.
     /// No DB required: the size guard fires before the query is issued.
