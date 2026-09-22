@@ -343,7 +343,10 @@ async fn recall_post_embed(
 
     // Resolve the optional (frame, perspective) lens up front (both-or-neither,
     // parse, existence) so the bulk retrieval / ranking / min_truth path — all
-    // unchanged on the global truth_value — is never entered with a bad lens,
+    // unchanged by the lens (retrieval and ranking stay on similarity/RRF, and
+    // min_truth stays on the UNLENSED belief; backlog 14b98adc moved it from
+    // `truth_value` to the global DS cache, not to a per-perspective value) —
+    // is never entered with a bad lens,
     // and the existence round-trips run ONCE, not per claim.
     let lens = crate::tools::lens::resolve_lens(
         params.frame_id.as_deref(),
@@ -461,6 +464,34 @@ async fn recall_post_embed(
     merged.sort_by(|a, b| b.0.total_cmp(&a.0));
     merged.truncate(limit as usize);
 
+    // Backlog 14b98adc: `min_truth` gates on the DS pignistic probability, not
+    // on `claims.truth_value` — which no DS write path refreshes, so a claim
+    // refuted by epistemic edges kept passing a gate set against its pre-edge
+    // authored value. Resolved in ONE round-trip for the page, BEFORE the loop;
+    // a per-hit read would add an N+1 on top of the `get_by_id` below. Only
+    // claim hits are looked up: workflows are a different id-space with no DS
+    // cache. Degrade-not-fail — a failed lookup yields an empty map, and every
+    // hit then falls back to the `truth_value` already in hand.
+    let belief_by_claim = {
+        let ids: Vec<uuid::Uuid> = merged
+            .iter()
+            .filter_map(|(_, h)| match h {
+                MergedHit::Claim(c) => Some(c.claim_id),
+                MergedHit::Workflow(_) => None,
+            })
+            .collect();
+        match ClaimRepository::effective_belief_batch(&server.pool, viewer, &ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
+                );
+                std::collections::HashMap::new()
+            }
+        }
+    };
+
     let mut results = Vec::new();
     for (merged_rrf_score, merged_hit) in merged {
         match merged_hit {
@@ -473,7 +504,12 @@ async fn recall_post_embed(
                 .await
                 {
                     let tv = claim.truth_value.value();
-                    if tv >= min_truth {
+                    // Absent key == invisible to this viewer / deleted between
+                    // the ANN page and this read. Falling back to the `tv`
+                    // already in hand keeps a claim with no DS state
+                    // byte-identical to pre-fix behaviour.
+                    let score = belief_by_claim.get(&hit.claim_id).copied().unwrap_or(tv);
+                    if score >= min_truth {
                         let mut matched_via = Vec::new();
                         if hit.dense_similarity.is_some() {
                             matched_via.push("dense".to_string());
@@ -494,6 +530,7 @@ async fn recall_post_embed(
                             claim_id: hit.claim_id.to_string(),
                             content: claim.content,
                             truth_value: tv,
+                            belief_score: score,
                             similarity: hit.dense_similarity.unwrap_or(0.0),
                             rrf_score: hit.rrf_score,
                             matched_via,
@@ -522,6 +559,11 @@ async fn recall_post_embed(
                         claim_id: hit.workflow_id.to_string(),
                         content: hit.content,
                         truth_value: hit.truth_value,
+                        // A workflow row is not a claim: it has no DS cache to
+                        // read, so the gate value IS its truth_value. Reported
+                        // rather than omitted so the field means the same thing
+                        // ("what min_truth compared against") on every row.
+                        belief_score: hit.truth_value,
                         similarity: hit.similarity,
                         rrf_score: merged_rrf_score,
                         // Workflows aren't claims, so the batch lens post-pass's
@@ -557,7 +599,8 @@ async fn recall_post_embed(
     // result keyed by claim_id. Per-claim degrade-not-fail is preserved: each
     // claim carries its own `Result`, so one malformed claim warns + serves a
     // null lens without aborting the page (spec §8). min_truth/ranking stayed
-    // on the global `tv` above and are untouched here.
+    // on the UNLENSED `score` above (the global DS cache, backlog 14b98adc) and
+    // are untouched here: a lens annotates, it does not gate.
     if let Some((frame_id, perspective_id)) = lens {
         let claim_ids: Vec<uuid::Uuid> = results
             .iter()

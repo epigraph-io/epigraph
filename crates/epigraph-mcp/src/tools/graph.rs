@@ -116,9 +116,38 @@ pub async fn traverse(
                 _ => (None, None),
             };
 
-        // Filter by min_truth
-        if let Some(tv) = truth {
-            if tv < min_truth {
+        // Filter by min_truth — on the Dempster-Shafer pignistic probability,
+        // NOT on `claims.truth_value` (backlog 14b98adc). No DS write path
+        // refreshes `truth_value`, so a node thoroughly refuted by epistemic
+        // edges kept clearing a caller's gate at its pre-edge authored value.
+        //
+        // Resolved per node rather than batched because the walk is a BFS: the
+        // frontier is not known until the node ahead of it has been expanded.
+        // This is the same shape as the `get_by_id` above, so it adds at most
+        // one query per visited node (capped at `node_limit` = 100) — and it is
+        // skipped entirely on the DEFAULT path, where `min_truth` is 0.0 and
+        // the comparison cannot drop anything whichever column it reads.
+        let belief_score = match truth {
+            Some(tv) if min_truth > 0.0 => {
+                let resolved = ClaimRepository::effective_belief_batch(
+                    &server.pool,
+                    viewer,
+                    std::slice::from_ref(&current_id),
+                )
+                .await
+                .unwrap_or_default()
+                .get(&current_id)
+                .copied()
+                // Absent key (or a failed lookup) == invisible / deleted
+                // mid-walk. Fall back to the truth_value already in hand,
+                // matching pre-fix behaviour.
+                .unwrap_or(tv);
+                Some(resolved)
+            }
+            other => other,
+        };
+        if let Some(score) = belief_score {
+            if score < min_truth {
                 continue;
             }
         }
@@ -132,6 +161,11 @@ pub async fn traverse(
             },
             label,
             truth_value: truth,
+            // What `min_truth` was compared against: the DS pignistic
+            // probability, or `truth_value` when the node carries no DS cache
+            // (and always, on the default `min_truth = 0.0` path, where the
+            // lookup is skipped because it could not change the outcome).
+            belief_score,
             depth,
         });
 

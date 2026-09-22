@@ -1056,6 +1056,117 @@ impl ClaimRepository {
         Ok(row)
     }
 
+    /// The scalar an epistemic quality gate (`min_truth`) should compare
+    /// against, for a whole page of claims in ONE round-trip.
+    ///
+    /// Backlog `14b98adc`. `claims.truth_value` is an **independently authored**
+    /// scalar: `submit_claim` and `update_with_evidence` seed it from BetP, but
+    /// `patch_claim`, `POST /api/v1/claims`, `routes/conventions.rs` and
+    /// `tools/workflows.rs` all set it directly, and NO Dempster–Shafer write
+    /// path ever refreshes it — `auto_wire_ds_for_edge` →
+    /// `recompute_combined_belief` and `recompute_beliefs` both write
+    /// `claims.{belief, plausibility, pignistic_prob, …}` and leave
+    /// `truth_value` alone. So the two columns agree only until the first
+    /// epistemic edge is wired, after which a thoroughly refuted claim still
+    /// carries its pre-edge `truth_value` (production 2026-09-07: claim
+    /// `8f192373` at `truth_value` 1.0000 against BetP 0.1797).
+    ///
+    /// Because `truth_value` has independent authorship, syncing it FROM the DS
+    /// state is the wrong repair — a third party's `refutes` edge would silently
+    /// overwrite an operator-set value. The repair is that the *gate* reads the
+    /// DS state, which is what this method returns.
+    ///
+    /// The selection is the exact SQL twin of `belief_query::get_belief`'s
+    /// unframed branch, deliberately including its both-of-`(belief,
+    /// plausibility)` guard: a bare `COALESCE(pignistic_prob, belief,
+    /// truth_value)` would report a half-written DS row as authoritative, which
+    /// is precisely what that guard exists to prevent. `truth_value` is
+    /// `NOT NULL` (migration 001), so the `ELSE` arm always yields a value and
+    /// the returned `f64` is never null.
+    ///
+    /// Claims absent from the returned map are absent because the **viewer
+    /// cannot see them** (or they were deleted mid-page). Callers must fall back
+    /// to the `truth_value` they already hydrated rather than treating absence
+    /// as pass-or-drop — see the four `min_truth` call sites.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn effective_belief_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, f64>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, \
+             (CASE WHEN belief IS NOT NULL AND plausibility IS NOT NULL \
+                   THEN COALESCE(pignistic_prob, belief) \
+                   ELSE truth_value END)::float8 AS score \
+             FROM claims WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
+    /// The subset of `claim_ids` that occupy the **paragraph** role —
+    /// `(properties->>'level')::int = 2` — as the viewer sees them.
+    ///
+    /// Backlog `4e856a99`. `recall_with_context` is paragraph-primary on every
+    /// ANN surface it has: the flat kNN is level=2 only and the diverse path
+    /// coerces to level=2. Its graph-expansion pool
+    /// ([`Self::graph_expand_seeds_since`]) had no level predicate at all, so a
+    /// level-3 atom reached over a `supports`/`elaborates` edge could be folded
+    /// straight into the top-level hit list beside paragraphs — and
+    /// `ingest_document` writes a `paper -asserts-> claim` edge for EVERY
+    /// planned claim including atoms, so the paper-attribution drop downstream
+    /// does not catch it. This is the predicate that does.
+    ///
+    /// The spelling is deliberately IDENTICAL to the one the seed surfaces use
+    /// (`recall.rs`'s flat kNN and sibling queries, `Self::nearest_by_embedding`
+    /// and friends), so the two candidate-producing surfaces cannot drift into
+    /// disagreeing about what a paragraph is.
+    ///
+    /// A claim with NO `level` property is therefore also excluded — `NULL` is
+    /// not `2`. That is the `decompose_claims` population, which carries no
+    /// level property at all and was never reachable as a top-level
+    /// `recall_with_context` hit on any path, so excluding it here changes
+    /// nothing; it is stated because the arm is silent in the SQL.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn paragraph_level_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id FROM claims \
+             WHERE id = ANY($1) AND (properties->>'level')::int = 2 \
+             /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect())
+    }
+
     /// Walk a claim's supersession chain and return every version the viewer
     /// may see, oldest first (`depth` 0 = root).
     ///

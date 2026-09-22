@@ -409,3 +409,163 @@ async fn graph_expansion_depth_1_does_not_reach_two_hop_claim(pool: PgPool) {
         "paragraph B is 2 hops from A; depth=1 must not reach it; got {returned:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Backlog 4e856a99: the expansion pool must not promote a non-paragraph.
+// ---------------------------------------------------------------------------
+
+/// Seed a level=**3** atom with an embedding and a paper attribution edge.
+///
+/// Both halves are load-bearing and neither is incidental:
+///
+/// * **`asserts` from a paper.** `ingest_document` writes one for EVERY
+///   planned claim, atoms included, so this reproduces production. Without it
+///   the atom would be dropped by `recall_with_context`'s paper-attribution
+///   filter instead of by the level predicate under test — and the assertion
+///   would pass over unmodified code, which is the tautology this fixture
+///   exists to avoid.
+/// * **An embedding in the QUERY's own bucket.** Maximally cosine-similar, so
+///   the atom's absence cannot be explained by distance. The flat kNN
+///   (`search_by_embedding_since`) is level=2-only, so a maximally-similar
+///   atom is *still* not an ANN seed — which leaves graph expansion as the one
+///   and only route by which it could reach `results`.
+async fn seed_atom(
+    pool: &PgPool,
+    agent_id: Uuid,
+    paper_id: Uuid,
+    content: &str,
+    embedding_pgvec: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut hash = vec![0u8; 32];
+    hash[..16].copy_from_slice(id.as_bytes());
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, properties, \
+                             embedding) \
+         VALUES ($1, $2, $3, $4, 0.7, jsonb_build_object('level', 3::int), $5::vector)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(hash)
+    .bind(agent_id)
+    .bind(embedding_pgvec)
+    .execute(pool)
+    .await
+    .expect("seed atom");
+
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+    )
+    .bind(paper_id)
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("seed atom paper-attribution edge");
+
+    id
+}
+
+/// A level-3 atom one `supports` hop from an ANN seed must NOT be promoted
+/// into the top-level hit list, while a level-2 paragraph at the same hop
+/// distance must be.
+///
+/// The paragraph is the calibration: without it, "the atom is absent" is
+/// equally satisfied by an expansion path that surfaces nothing at all, and
+/// the test would stay green with `graph_expansion_depth` broken outright.
+///
+/// Pre-fix both are promoted — `graph_expand_seeds_since` walks
+/// `EXPANSION_RELATIONSHIPS` with no level predicate, and
+/// `apply_graph_expansion` folds everything it returns straight into
+/// `raw_hits`. The atom then comes back as a top-level hit with an empty
+/// `atoms` list and no `section`, beside paragraphs that have both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    let agent = fixture::seed_agent(&pool).await;
+    let paper = fixture::seed_paper(&pool, "10.1/atom-promotion", "Atom promotion test").await;
+
+    let query_pgvec = fixture::cluster_pgvec(0, 1.0);
+
+    // A: the ANN seed, same bucket as the query.
+    let a =
+        fixture::seed_paragraph(&pool, agent, paper, "paragraph A: ANN seed", &query_pgvec).await;
+    // PARA: a level=2 paragraph 1 hop from A, orthogonal to the query so it
+    // cannot enter the seed pool on similarity. This is the positive control.
+    let para = fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "paragraph PARA: 1-hop expansion target",
+        &fixture::cluster_pgvec(3, 1.0),
+    )
+    .await;
+    // ATOM: a level=3 atom 1 hop from A, embedded in the query's OWN bucket.
+    let atom = seed_atom(
+        &pool,
+        agent,
+        paper,
+        "atom ATOM: 1-hop expansion target, level 3",
+        &query_pgvec,
+    )
+    .await;
+
+    // Two decoys, for the same reason `build_two_hop_fixture` needs them: flat
+    // ANN is pure top-K with no similarity cutoff, so at limit=3 they pin the
+    // seed pool to {A, decoy, decoy} and keep PARA out of it.
+    for i in 0..2 {
+        fixture::seed_paragraph(
+            &pool,
+            agent,
+            paper,
+            &format!("decoy paragraph {i}"),
+            &fixture::decoy_pgvec(0.05),
+        )
+        .await;
+    }
+
+    let server = build_test_server(pool.clone());
+    for target in [para, atom] {
+        do_link_epistemic(
+            &server,
+            &viewer,
+            LinkEpistemicParams {
+                source_claim_id: a.to_string(),
+                target_claim_id: target.to_string(),
+                relationship: "supports".to_string(),
+                properties: None,
+            },
+        )
+        .await
+        .expect("A supports target");
+    }
+
+    let params = base_params(Some(1), 3);
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
+        .await
+        .expect("recall with graph_expansion_depth=1 succeeds");
+    let resp = parse_response(result);
+
+    let returned: std::collections::HashSet<Uuid> =
+        resp.results.iter().map(|r| r.paragraph_id).collect();
+
+    assert!(
+        returned.contains(&a),
+        "ANN seed A must be present; got {returned:?}"
+    );
+    assert!(
+        returned.contains(&para),
+        "the level=2 paragraph one hop from A must be promoted by expansion — \
+         without it this test's negative assertion would be satisfied by an \
+         expansion path that surfaces nothing at all; got {returned:?}"
+    );
+    assert!(
+        !returned.contains(&atom),
+        "a level=3 atom was promoted into the top-level hit list by graph \
+         expansion (backlog 4e856a99). Both ANN seed surfaces are level=2-only, \
+         and this atom carries a paper `asserts` edge exactly as ingest_document \
+         writes one, so the paper-attribution filter does not catch it. It comes \
+         back with empty atoms and no section beside paragraphs that have both. \
+         Got {returned:?}"
+    );
+}
