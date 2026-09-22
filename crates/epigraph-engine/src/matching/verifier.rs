@@ -93,6 +93,25 @@ impl MatchVerdict {
     }
 }
 
+/// [`Verdict::relationship`] for an EXPLICIT model rejection (`valid: false`).
+///
+/// Not an edge relationship and not a member of the reranker vocabulary — it is
+/// the one string a rejection is allowed to carry, precisely so a rejection is
+/// never confusable with an endorsement.
+///
+/// Before this existed, `epigraph_cli::matching_client::align_verdicts` stamped
+/// `valid: false` with the literal `"derives_from"`, which worked only because
+/// `derives_from` had no [`map_relationship`] arm and fell to
+/// [`MatchVerdict::Distinct`] alongside it. That coupling is what made issue
+/// #388 unfixable in isolation: giving `derives_from` its own arm would have
+/// dragged every explicit rejection along with it.
+///
+/// It must stay OUT of `epigraph_cli::rerank::candidates::VALID_RELATIONSHIPS`
+/// — asserted by
+/// `epigraph-cli/tests/reranker_vocabulary_coverage.rs`, which cannot live here
+/// because `epigraph-cli` depends on this crate and not the reverse.
+pub const REJECTED_RELATIONSHIP: &str = "llm_rejected";
+
 /// Edge relationship for a corroborating promotion.
 pub const CORROBORATES_RELATIONSHIP: &str = "CORROBORATES";
 
