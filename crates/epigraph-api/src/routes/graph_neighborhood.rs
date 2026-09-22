@@ -125,10 +125,11 @@ pub struct CompoundGroup {
 
 /// Expand a precomputed neighborhood.
 ///
-/// Atomic mode's node projection is read as the caller's `Viewer` — its
-/// `label` is `claims.content`. The neighborhood/run metadata and the `edges`
-/// traversals are not viewer-filtered; see `GraphViewRepository`'s module docs
-/// for why, and the PR-07 report for the residual that leaves.
+/// Every node and edge projection is read as the caller's `Viewer`: node
+/// `label`s are `claims.content`, and every `edges` traversal carries the
+/// edge's own predicate (`F-edges-unfiltered`, discharged). The
+/// neighborhood/run metadata is not viewer-filtered — those tables carry no
+/// tenancy columns; see `GraphViewRepository`'s module docs.
 pub async fn expand(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -211,160 +212,73 @@ async fn compound_response(
     })
     .collect();
 
-    let induced_edges: Vec<InducedEdge> = sqlx::query_as::<_, (Uuid, Uuid, String, f64, i32)>(
-        r#"
-        WITH atoms AS (
-            SELECT m.claim_id FROM claim_neighborhood_membership m WHERE m.neighborhood_id = $1
-        ),
-        atom_to_compound AS (
-            SELECT e.target_id AS atom_id, e.source_id AS compound_id
-            FROM edges e JOIN atoms a ON a.claim_id = e.target_id
-            WHERE e.relationship = 'decomposes_to'
+    let induced_edges: Vec<InducedEdge> =
+        epigraph_db::GraphViewRepository::neighborhood_induced_edges(
+            &mut *conn,
+            viewer,
+            neighborhood_id,
         )
-        SELECT a2c_s.compound_id AS source,
-               a2c_t.compound_id AS target,
-               e.relationship,
-               SUM(ft.forward_strength)::double precision AS strength,
-               COUNT(*)::int AS atom_edge_count
-        FROM edges e
-        JOIN atoms a_s ON a_s.claim_id = e.source_id
-        JOIN atoms a_t ON a_t.claim_id = e.target_id
-        JOIN atom_to_compound a2c_s ON a2c_s.atom_id = e.source_id
-        JOIN atom_to_compound a2c_t ON a2c_t.atom_id = e.target_id
-        LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
-        WHERE a2c_s.compound_id <> a2c_t.compound_id
-          AND e.relationship <> 'decomposes_to'
-          AND ft.forward_strength > 0
-        GROUP BY 1, 2, 3
-        "#,
-    )
-    .bind(neighborhood_id)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .into_iter()
-    .map(
-        |(source, target, relationship, strength, atom_edge_count)| InducedEdge {
-            source,
-            target,
-            relationship,
-            strength,
-            atom_edge_count,
-        },
-    )
-    .collect();
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|r| InducedEdge {
+            source: r.source,
+            target: r.target,
+            relationship: r.relationship,
+            strength: r.strength,
+            atom_edge_count: r.atom_edge_count,
+        })
+        .collect();
 
-    let direct_edges: Vec<DirectEdge> = sqlx::query_as::<_, (Uuid, Uuid, String)>(
-        r#"
-        WITH neighborhood_compounds AS (
-            SELECT DISTINCT e.source_id AS id
-            FROM edges e
-            JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id
-            WHERE m.neighborhood_id = $1 AND e.relationship = 'decomposes_to'
-        ),
-        neighborhood_standalones AS (
-            SELECT m.claim_id AS id
-            FROM claim_neighborhood_membership m
-            WHERE m.neighborhood_id = $1
-              AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = m.claim_id AND e.relationship = 'decomposes_to')
-              AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = m.claim_id AND e.relationship = 'decomposes_to')
-        ),
-        compound_universe AS (
-            SELECT id FROM neighborhood_compounds UNION SELECT id FROM neighborhood_standalones
+    let direct_edges: Vec<DirectEdge> =
+        epigraph_db::GraphViewRepository::neighborhood_direct_edges(
+            &mut *conn,
+            viewer,
+            neighborhood_id,
         )
-        SELECT e.source_id, e.target_id, e.relationship
-        FROM edges e
-        JOIN compound_universe a ON a.id = e.source_id
-        JOIN compound_universe b ON b.id = e.target_id
-        -- No relationship filter: if both endpoints are displayed, the edge
-        -- is displayed. Users hide unwanted types via GraphControls toggles.
-        "#,
-    )
-    .bind(neighborhood_id)
-    .fetch_all(&mut *conn).await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .into_iter()
-    .map(|(source, target, relationship)| DirectEdge { source, target, relationship })
-    .collect();
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|r| DirectEdge {
+            source: r.source_id,
+            target: r.target_id,
+            relationship: r.relationship,
+        })
+        .collect();
 
     // Structural edges: surface decomposes_to-chain connections between
     // compound nodes that lack direct/induced epistemic edges. Two compounds
     // are connected if they parent the same atom (multi-parent atoms exist
     // in this data) OR if they share a common decomposes_to ancestor.
-    let structural_edges: Vec<StructuralEdge> = sqlx::query_as::<_, (Uuid, Uuid, String, i64)>(
-        r#"
-        WITH nbhd_atoms AS (
-            SELECT m.claim_id FROM claim_neighborhood_membership m
-            WHERE m.neighborhood_id = $1
-        ),
-        parent_of_atom AS (
-            -- For each atom in the neighborhood: its parent compounds
-            SELECT e.source_id AS parent_id, e.target_id AS atom_id
-            FROM edges e
-            JOIN nbhd_atoms a ON a.claim_id = e.target_id
-            WHERE e.relationship = 'decomposes_to'
-        ),
-        nbhd_compounds AS (
-            SELECT DISTINCT parent_id AS id FROM parent_of_atom
-        ),
-        shared_atom_pairs AS (
-            -- Compounds A,B that both parent the same atom in this neighborhood
-            SELECT
-                LEAST(p1.parent_id, p2.parent_id)    AS source,
-                GREATEST(p1.parent_id, p2.parent_id) AS target,
-                'shared_atom'::text                  AS kind,
-                COUNT(*)::bigint                     AS atom_count
-            FROM parent_of_atom p1
-            JOIN parent_of_atom p2
-              ON p1.atom_id = p2.atom_id AND p1.parent_id < p2.parent_id
-            GROUP BY 1, 2, 3
-        ),
-        shared_ancestor_pairs AS (
-            -- Compounds A,B in the neighborhood with a common decomposes_to ancestor
-            SELECT
-                LEAST(c1.id, c2.id)    AS source,
-                GREATEST(c1.id, c2.id) AS target,
-                'shared_ancestor'::text AS kind,
-                COUNT(DISTINCT pa1.source_id)::bigint AS atom_count
-            FROM nbhd_compounds c1
-            JOIN nbhd_compounds c2 ON c1.id < c2.id
-            JOIN edges pa1 ON pa1.target_id = c1.id AND pa1.relationship = 'decomposes_to'
-            JOIN edges pa2 ON pa2.target_id = c2.id AND pa2.relationship = 'decomposes_to'
-                          AND pa1.source_id = pa2.source_id
-            GROUP BY 1, 2, 3
+    let structural_edges: Vec<StructuralEdge> =
+        epigraph_db::GraphViewRepository::neighborhood_structural_edges(
+            &mut *conn,
+            viewer,
+            neighborhood_id,
         )
-        SELECT * FROM shared_atom_pairs
-        UNION ALL
-        SELECT * FROM shared_ancestor_pairs
-        "#,
-    )
-    .bind(neighborhood_id)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .into_iter()
-    .map(|(source, target, kind, atom_count)| StructuralEdge {
-        source,
-        target,
-        kind,
-        atom_count: atom_count as i32,
-    })
-    .collect();
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|r| StructuralEdge {
+            source: r.source,
+            target: r.target,
+            kind: r.kind,
+            atom_count: r.atom_count as i32,
+        })
+        .collect();
 
-    // PR-07: `nodes` is viewer-filtered; the three edge projections above are
-    // not. Before PR-07 nodes and edges were drawn from the same unfiltered
-    // set, so the payload was at least internally consistent. Filtering only
-    // the nodes broke that: the edge arrays would still name the ids of
-    // compounds that were never viewer-checked, which is an id-enumeration
-    // oracle feeding every other by-id endpoint, and a graph client indexing
-    // edges against the node map would synthesize phantom label-less nodes.
+    // PR-07: every `edges[].source/target` must appear in `nodes[].id`. Before
+    // PR-07 nodes and edges were drawn from the same unfiltered set; filtering
+    // only the nodes broke that, leaving edge arrays that named never-checked
+    // compound ids (an id-enumeration oracle) and phantom label-less nodes.
     //
-    // Constraining each edge to endpoints that survived the node filter
-    // restores the invariant "every edges[].source/target appears in
-    // nodes[].id" and removes the oracle. This mirrors what `graph.rs::expand`
-    // already does by deriving its edge query's id set from the filtered nodes;
-    // it is done in Rust here because these three statements are structural
-    // aggregates whose endpoints are computed, not selected.
+    // Since the `F-edges-unfiltered` pass the three edge statements carry
+    // their OWN edge predicate (`GraphViewRepository::neighborhood_*_edges`),
+    // which this endpoint filter could never supply: an edge declared private
+    // between two VISIBLE compounds survives any endpoint check. This filter
+    // is kept for the invariant above — the edge statements compute their
+    // endpoints (induced/structural aggregates), so nothing in SQL ties them
+    // to the node projection's exact row set.
     let visible: std::collections::HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
     let induced_edges: Vec<InducedEdge> = induced_edges
         .into_iter()
@@ -414,21 +328,19 @@ async fn atomic_response(
     })
     .collect();
 
-    let edges: Vec<AtomicEdge> = sqlx::query_as::<_, (Uuid, Uuid, String)>(
-        r#"
-        SELECT e.source_id, e.target_id, e.relationship
-        FROM edges e
-        JOIN claim_neighborhood_membership ms ON ms.claim_id = e.source_id AND ms.neighborhood_id = $1
-        JOIN claim_neighborhood_membership mt ON mt.claim_id = e.target_id AND mt.neighborhood_id = $1
-        LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
-        WHERE e.relationship <> 'decomposes_to'
-          AND ft.forward_strength > 0
-        "#,
+    let edges: Vec<AtomicEdge> = epigraph_db::GraphViewRepository::neighborhood_atomic_edges(
+        &mut *conn,
+        viewer,
+        neighborhood_id,
     )
-    .bind(neighborhood_id).fetch_all(&mut *conn).await
+    .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
-    .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
+    .map(|r| AtomicEdge {
+        source: r.source_id,
+        target: r.target_id,
+        relationship: r.relationship,
+    })
     .collect();
 
     let compound_groups: Vec<CompoundGroup> =
@@ -448,9 +360,10 @@ async fn atomic_response(
         .collect();
 
     // PR-07: same node/edge consistency fix as `compound_response`. `edges`
-    // and each group's `member_atom_ids` are aggregated from unfiltered
-    // `edges`/membership rows, so both are constrained to the ids that
-    // survived the viewer-filtered node projection. A group left with no
+    // and each group's `member_atom_ids` are now aggregated from viewer-
+    // filtered `edges` and membership rows (the `F-edges-unfiltered` pass),
+    // and are still constrained to the ids that survived the node projection,
+    // for the invariant `compound_response` states. A group left with no
     // visible members is dropped rather than returned empty — an empty group
     // still discloses that a compound exists and parents something here.
     let visible: std::collections::HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
@@ -588,23 +501,12 @@ pub async fn claim_compound_neighborhood(
     let kept = rows.into_iter().take(budget as usize);
 
     // Determine the kind of the center: compound if it has children;
-    // standalone if no decomposes_to in either direction; else atom.
-    let has_children: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
-    )
-    .bind(claim_id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(internal)?
-        > 0;
-    let has_parent: bool = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::bigint FROM edges WHERE target_id = $1 AND relationship = 'decomposes_to'",
-    )
-    .bind(claim_id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(internal)?
-        > 0;
+    // standalone if no decomposes_to in either direction; else atom. Over
+    // edges the VIEWER may read — see `GraphViewRepository::decomposition_flags`.
+    let (has_children, has_parent) =
+        epigraph_db::GraphViewRepository::decomposition_flags(&mut *read, &viewer, claim_id)
+            .await
+            .map_err(internal)?;
     let center_kind = match (has_children, has_parent) {
         (true, _) => "compound",
         (false, true) => "atom",

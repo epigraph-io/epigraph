@@ -766,3 +766,213 @@ async fn cluster_subgraph_edges_withholds_a_private_edge_between_visible_nodes(p
          still withheld: {stranger_all:?}"
     );
 }
+
+// ── neighborhood edge projections (were inline in routes/graph_neighborhood.rs) ─
+
+/// Compounds P and Q (public), each decomposing (publicly) into two
+/// neighborhood atoms: P→{a1,a2}, Q→{b1,b2}. Between the atoms: a1→b1 public
+/// `supports`, a2→b2 PRIVATE `supports`. Between the compounds: P→Q public
+/// `refines` and P→Q PRIVATE `contradicts`.
+struct Nbhd {
+    id: Uuid,
+    p: Uuid,
+    q: Uuid,
+    a1: Uuid,
+    b1: Uuid,
+}
+
+async fn two_compound_neighborhood(pool: &PgPool, t: &Tenants) -> Nbhd {
+    let ids = public_claims(pool, t.agent, &["P", "Q", "a1", "a2", "b1", "b2"]).await;
+    let (p, q, a1, a2, b1, b2) = (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+    for (parent, atom) in [(p, a1), (p, a2), (q, b1), (q, b2)] {
+        edge(pool, parent, atom, "decomposes_to").await;
+    }
+    edge(pool, a1, b1, "supports").await;
+    private_edge(pool, a2, b2, "supports", t.group).await;
+    edge(pool, p, q, "refines").await;
+    private_edge(pool, p, q, "contradicts", t.group).await;
+    let id = neighborhood(pool, &[a1, a2, b1, b2]).await;
+    Nbhd { id, p, q, a1, b1 }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_induced_edges_aggregate_only_readable_atom_edges(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let n = two_compound_neighborhood(&pool, &t).await;
+
+    let shape = |rows: Vec<epigraph_db::InducedEdgeRow>| {
+        rows.into_iter()
+            .map(|r| (r.source, r.target, r.relationship, r.atom_edge_count))
+            .collect::<Vec<_>>()
+    };
+
+    let owner = shape(
+        GraphViewRepository::neighborhood_induced_edges(&pool, &t.owner, n.id)
+            .await
+            .expect("owner induced"),
+    );
+    assert_eq!(
+        owner,
+        vec![(n.p, n.q, "supports".to_string(), 2)],
+        "the owner's P→Q induced edge aggregates both atom edges"
+    );
+
+    let stranger = shape(
+        GraphViewRepository::neighborhood_induced_edges(&pool, &t.stranger, n.id)
+            .await
+            .expect("stranger induced"),
+    );
+    assert_eq!(
+        stranger,
+        vec![(n.p, n.q, "supports".to_string(), 1)],
+        "the private a2→b2 edge must not add to the stranger's atom_edge_count \
+         (or its strength) — the filter must run before the GROUP BY"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_direct_edges_withhold_a_private_edge_between_displayed_compounds(
+    pool: PgPool,
+) {
+    let t = tenants(&pool).await;
+    let n = two_compound_neighborhood(&pool, &t).await;
+
+    let rels = |rows: Vec<epigraph_db::NeighborhoodEdgeRow>| {
+        let mut v: Vec<(Uuid, Uuid, String)> = rows
+            .into_iter()
+            .map(|r| (r.source_id, r.target_id, r.relationship))
+            .collect();
+        v.sort();
+        v
+    };
+
+    let owner = rels(
+        GraphViewRepository::neighborhood_direct_edges(&pool, &t.owner, n.id)
+            .await
+            .expect("owner direct"),
+    );
+    let mut want_owner = vec![
+        (n.p, n.q, "contradicts".to_string()),
+        (n.p, n.q, "refines".to_string()),
+    ];
+    want_owner.sort();
+    assert_eq!(
+        owner, want_owner,
+        "the owner sees both compound→compound edges"
+    );
+
+    let stranger = rels(
+        GraphViewRepository::neighborhood_direct_edges(&pool, &t.stranger, n.id)
+            .await
+            .expect("stranger direct"),
+    );
+    assert_eq!(
+        stranger,
+        vec![(n.p, n.q, "refines".to_string())],
+        "P and Q are both displayed to the stranger; the private `contradicts` \
+         between them must still be withheld"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_atomic_edges_withhold_a_private_edge_between_visible_members(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let n = two_compound_neighborhood(&pool, &t).await;
+
+    let count = |rows: &[epigraph_db::NeighborhoodEdgeRow]| rows.len();
+    let owner = GraphViewRepository::neighborhood_atomic_edges(&pool, &t.owner, n.id)
+        .await
+        .expect("owner atomic edges");
+    assert_eq!(count(&owner), 2, "the owner sees both atom edges");
+
+    let stranger = GraphViewRepository::neighborhood_atomic_edges(&pool, &t.stranger, n.id)
+        .await
+        .expect("stranger atomic edges");
+    let got: Vec<(Uuid, Uuid)> = stranger
+        .iter()
+        .map(|r| (r.source_id, r.target_id))
+        .collect();
+    assert_eq!(
+        got,
+        vec![(n.a1, n.b1)],
+        "only the public a1→b1 edge reaches the stranger"
+    );
+}
+
+/// Structural links are DERIVED from `decomposes_to` edges; a private one must
+/// not manufacture a link the stranger can read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhood_structural_edges_are_derived_only_from_readable_edges(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let ids = public_claims(
+        &pool,
+        t.agent,
+        &["P", "Q", "shared atom s", "p-atom", "q-atom", "R"],
+    )
+    .await;
+    let (p, q, s, pa, qa, r) = (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+    // Both compounds are in the neighborhood through a public child each.
+    edge(&pool, p, pa, "decomposes_to").await;
+    edge(&pool, q, qa, "decomposes_to").await;
+    // shared_atom: P publicly, Q privately, parent s.
+    edge(&pool, p, s, "decomposes_to").await;
+    private_edge(&pool, q, s, "decomposes_to", t.group).await;
+    // shared_ancestor: R publicly parents P, privately parents Q.
+    edge(&pool, r, p, "decomposes_to").await;
+    private_edge(&pool, r, q, "decomposes_to", t.group).await;
+    let nbhd = neighborhood(&pool, &[s, pa, qa]).await;
+
+    let kinds = |rows: Vec<epigraph_db::StructuralEdgeRow>| {
+        let mut v: Vec<(String, i64)> = rows.into_iter().map(|r| (r.kind, r.atom_count)).collect();
+        v.sort();
+        v
+    };
+
+    let owner = kinds(
+        GraphViewRepository::neighborhood_structural_edges(&pool, &t.owner, nbhd)
+            .await
+            .expect("owner structural"),
+    );
+    assert_eq!(
+        owner,
+        vec![
+            ("shared_ancestor".to_string(), 1),
+            ("shared_atom".to_string(), 1)
+        ],
+        "the owner reads both private decomposes_to edges, so both links exist"
+    );
+
+    let stranger = GraphViewRepository::neighborhood_structural_edges(&pool, &t.stranger, nbhd)
+        .await
+        .expect("stranger structural");
+    assert!(
+        stranger.is_empty(),
+        "each link rests on one private decomposes_to edge; a stranger must get \
+         neither. Got {stranger:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn decomposition_flags_ignore_edges_the_viewer_cannot_read(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let ids = public_claims(&pool, t.agent, &["centre", "child", "parent"]).await;
+    let (c, child, parent) = (ids[0], ids[1], ids[2]);
+    private_edge(&pool, c, child, "decomposes_to", t.group).await;
+    private_edge(&pool, parent, c, "decomposes_to", t.group).await;
+
+    assert_eq!(
+        GraphViewRepository::decomposition_flags(&pool, &t.owner, c)
+            .await
+            .expect("owner flags"),
+        (true, true),
+        "the owner reads both edges"
+    );
+    assert_eq!(
+        GraphViewRepository::decomposition_flags(&pool, &t.stranger, c)
+            .await
+            .expect("stranger flags"),
+        (false, false),
+        "a stranger must see a standalone: reporting `compound`/`atom` would \
+         confirm a decomposition edge it cannot read"
+    );
+}

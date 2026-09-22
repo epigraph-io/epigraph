@@ -122,7 +122,8 @@ pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::graph_view::{
     AtomicNodeRow, ClusterSubgraphEdgeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow,
-    GraphNodeRow, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+    GraphNodeRow, InducedEdgeRow, NeighborhoodEdgeRow, StructuralEdgeRow, SubgraphClaimRow,
+    SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use repos::mass_function::{CachedBelief, MassFunctionRow};
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy
