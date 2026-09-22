@@ -78,6 +78,11 @@ axum = "0.8"
 http = "1"
 
 [dev-dependencies]
+# Self dev-dependency: turns on `test-support` for this crate's OWN test
+# targets (tests/*.rs) without turning it on for the library a deploy build
+# links. Integration tests cannot see `cfg(test)` items, and the one item they
+# need — `McpEmbedder::with_provider` — must not be reachable from a binary.
+epigraph-mcp = { path = ".", features = ["test-support"] }
 epigraph-ingest = { workspace = true }
 reqwest = { workspace = true }
 blake3 = { workspace = true }
@@ -96,6 +101,12 @@ vendored-openssl = ["dep:openssl"]
 # operator can name the capability explicitly and so a future `default-features
 # = false` build can re-enable it without editing the dep line.
 rerank = ["epigraph-engine/rerank"]
+# Test/development only: exposes `McpEmbedder::with_provider`, which lets an
+# `EpiGraphMcpFull` embed through an injected `EmbeddingService` (e.g.
+# `epigraph_embeddings::MockProvider`) instead of the OpenAI endpoint. Enabled
+# for this crate's own tests by the self dev-dependency above. NEVER enable it
+# in a deploy build: `claims.embedding` has one owning vector space.
+test-support = []
 
 [[bin]]
 name = "epigraph-mcp-full"
