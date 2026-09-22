@@ -3,24 +3,43 @@
 //! # Security Properties Validated
 //!
 //! 1. **DoS Prevention**: Excessive requests are rejected with 429
-//! 2. **Fair Quota**: Each agent gets their configured rate limit
+//! 2. **Fair Quota**: Each client gets their configured rate limit
 //! 3. **Bypass Routes**: Health checks are exempt from rate limiting
 //! 4. **Retry Guidance**: 429 responses include Retry-After header
-//! 5. **IP Fallback**: Unauthenticated requests are rate-limited by IP
+//! 5. **IP Fallback**: Unauthenticated requests are rate-limited by the TCP
+//!    peer, and by `X-Forwarded-For` only behind a trusted proxy
+//! 6. **No shared bucket**: a request with no identifiable client is never
+//!    pooled with other such requests
+//!
+//! # These tests now run
+//!
+//! Every test in this file used to be `#[cfg(not(feature = "db"))]`.
+//! `epigraph-api`'s default features include `db` and every CI job builds with
+//! defaults, so the binary compiled to zero tests and nothing here ever ran.
+//! The state is now built the way `webhook_tenancy.rs` builds one under `db`:
+//! a lazy pool at an unroutable address. The middleware touches the pool only
+//! to persist a 429's security event, fire-and-forget, and that write failing
+//! is logged and ignored.
+//!
+//! # Every request carries a peer address
+//!
+//! The middleware keys an anonymous request on `ConnectInfo<SocketAddr>`,
+//! which the production listener supplies. `tower::oneshot` does not, so each
+//! request here inserts one by hand ([`from_peer`]).
 
-use axum::{response::IntoResponse, Json};
-
-#[cfg(not(feature = "db"))]
 use axum::{
     body::Body,
+    extract::ConnectInfo,
     http::{Method, Request, StatusCode},
     middleware,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
-#[cfg(not(feature = "db"))]
+use epigraph_api::middleware::rate_limit_middleware;
+use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_api::{AgentRateLimiter, RateLimitConfig};
-#[cfg(not(feature = "db"))]
+use std::net::SocketAddr;
 use tower::ServiceExt;
 
 // ============================================================================
@@ -28,15 +47,74 @@ use tower::ServiceExt;
 // ============================================================================
 
 /// Simple test handler
-#[allow(dead_code)]
 async fn test_handler() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
 /// Health check handler
-#[allow(dead_code)]
 async fn health_handler() -> impl IntoResponse {
     Json(serde_json::json!({"status": "healthy"}))
+}
+
+/// An `AppState` carrying `limiter`, buildable under either feature set.
+fn state_with(limiter: AgentRateLimiter) -> AppState {
+    #[cfg(feature = "db")]
+    let state = {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nobody")
+            .expect("lazy pool");
+        AppState::with_db(pool, ApiConfig::default())
+    };
+    #[cfg(not(feature = "db"))]
+    let state = AppState::new(ApiConfig::default());
+    state.with_rate_limiter(limiter)
+}
+
+fn config(default_rpm: u32, global_rpm: u32, enable_global_limit: bool) -> RateLimitConfig {
+    RateLimitConfig {
+        default_rpm,
+        global_rpm,
+        replenish_interval_secs: 60,
+        enable_global_limit,
+    }
+}
+
+fn router(state: &AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/api/test", post(test_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .with_state(state.clone())
+}
+
+/// `POST /api/test` arriving over a TCP connection from `peer`.
+fn from_peer(peer: &str) -> Request<Body> {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/test")
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(peer.parse::<SocketAddr>().expect("peer addr")));
+    request
+}
+
+/// `from_peer` plus an `X-Forwarded-For` header.
+fn from_peer_forwarded(peer: &str, forwarded_for: &str) -> Request<Body> {
+    let mut request = from_peer(peer);
+    request
+        .headers_mut()
+        .insert("X-Forwarded-For", forwarded_for.parse().unwrap());
+    request
+}
+
+async fn send(state: &AppState, request: Request<Body>) -> Response {
+    router(state).oneshot(request).await.unwrap()
 }
 
 // ============================================================================
@@ -46,40 +124,11 @@ async fn health_handler() -> impl IntoResponse {
 /// Validates: The first request from any client always succeeds
 ///
 /// Security Invariant: Rate limiting should not block legitimate initial requests.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_first_request_always_succeeds() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
+    let state = state_with(AgentRateLimiter::new(config(5, 100, true)));
 
-    let config = RateLimitConfig {
-        default_rpm: 5, // 5 requests per minute
-        global_rpm: 100,
-        replenish_interval_secs: 1,
-        enable_global_limit: true,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
-
-    let router = Router::new()
-        .route("/api/test", post(test_handler))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
-        .with_state(state);
-
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/test")
-        .header("X-Forwarded-For", "192.168.1.1")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
+    let response = send(&state, from_peer("192.168.1.1:50000")).await;
 
     assert_eq!(
         response.status(),
@@ -95,43 +144,13 @@ async fn test_first_request_always_succeeds() {
 /// Validates: Exceeding rate limit returns 429 Too Many Requests
 ///
 /// Security Invariant: DoS protection must reject excessive requests.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_exceeding_rate_limit_returns_429() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
-
-    // Very restrictive limit for testing
-    let config = RateLimitConfig {
-        default_rpm: 2, // Only 2 requests per minute
-        global_rpm: 100,
-        replenish_interval_secs: 60, // Slow replenishment for test
-        enable_global_limit: false,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
+    let state = state_with(AgentRateLimiter::new(config(2, 100, false)));
 
     // Make 3 requests (limit is 2)
     for i in 0..3 {
-        let router = Router::new()
-            .route("/api/test", post(test_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                rate_limit_middleware,
-            ))
-            .with_state(state.clone());
-
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/test")
-            .header("X-Forwarded-For", "192.168.1.100")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = router.oneshot(request).await.unwrap();
+        let response = send(&state, from_peer("192.168.1.100:50000")).await;
 
         if i < 2 {
             assert_eq!(
@@ -166,44 +185,22 @@ async fn test_exceeding_rate_limit_returns_429() {
 ///
 /// Security Invariant: Monitoring endpoints must always be accessible
 /// for operational visibility, even during rate limit events.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_health_endpoint_bypasses_rate_limiting() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
-
-    // Very restrictive limit
-    let config = RateLimitConfig {
-        default_rpm: 1, // Only 1 request per minute
-        global_rpm: 1,
-        replenish_interval_secs: 60,
-        enable_global_limit: true,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
+    let state = state_with(AgentRateLimiter::new(config(1, 1, true)));
 
     // Make many health check requests - all should succeed
     for i in 0..10 {
-        let router = Router::new()
-            .route("/health", get(health_handler))
-            .route("/api/test", post(test_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                rate_limit_middleware,
-            ))
-            .with_state(state.clone());
-
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(Method::GET)
             .uri("/health")
-            .header("X-Forwarded-For", "192.168.1.200")
             .body(Body::empty())
             .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "192.168.1.200:50000".parse::<SocketAddr>().unwrap(),
+        ));
 
-        let response = router.oneshot(request).await.unwrap();
+        let response = send(&state, request).await;
 
         assert_eq!(
             response.status(),
@@ -222,61 +219,17 @@ async fn test_health_endpoint_bypasses_rate_limiting() {
 ///
 /// Security Invariant: One client's rate limit exhaustion should not
 /// affect other legitimate clients.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_different_ips_have_separate_quotas() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
-
-    let config = RateLimitConfig {
-        default_rpm: 2,
-        global_rpm: 100, // High global limit
-        replenish_interval_secs: 60,
-        enable_global_limit: false,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
+    let state = state_with(AgentRateLimiter::new(config(2, 100, false)));
 
     // Exhaust quota for IP1
     for _ in 0..3 {
-        let router = Router::new()
-            .route("/api/test", post(test_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                rate_limit_middleware,
-            ))
-            .with_state(state.clone());
-
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/test")
-            .header("X-Forwarded-For", "10.0.0.1")
-            .body(Body::empty())
-            .unwrap();
-
-        let _ = router.oneshot(request).await.unwrap();
+        let _ = send(&state, from_peer("10.0.0.1:50000")).await;
     }
 
     // IP2 should still have full quota
-    let router = Router::new()
-        .route("/api/test", post(test_handler))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
-        .with_state(state.clone());
-
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/test")
-        .header("X-Forwarded-For", "10.0.0.2")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
+    let response = send(&state, from_peer("10.0.0.2:50000")).await;
 
     assert_eq!(
         response.status(),
@@ -293,42 +246,13 @@ async fn test_different_ips_have_separate_quotas() {
 ///
 /// Security Invariant: Clients should receive enough information to
 /// implement proper backoff without leaking system internals.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_429_response_contains_error_details() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
-
-    let config = RateLimitConfig {
-        default_rpm: 1,
-        global_rpm: 100,
-        replenish_interval_secs: 60,
-        enable_global_limit: false,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
+    let state = state_with(AgentRateLimiter::new(config(1, 100, false)));
 
     // Make 2 requests to trigger rate limit
     for i in 0..2 {
-        let router = Router::new()
-            .route("/api/test", post(test_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                rate_limit_middleware,
-            ))
-            .with_state(state.clone());
-
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/test")
-            .header("X-Forwarded-For", "192.168.1.150")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = router.oneshot(request).await.unwrap();
+        let response = send(&state, from_peer("192.168.1.150:50000")).await;
 
         if i == 1 {
             assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -372,44 +296,15 @@ async fn test_429_response_contains_error_details() {
 ///
 /// Security Invariant: Even distributed requests from many IPs
 /// cannot exceed the global system capacity.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_global_rate_limit_protection() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
-
-    let config = RateLimitConfig {
-        default_rpm: 100, // High per-IP limit
-        global_rpm: 3,    // Low global limit
-        replenish_interval_secs: 60,
-        enable_global_limit: true,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
+    let state = state_with(AgentRateLimiter::new(config(100, 3, true)));
 
     // Make requests from different IPs
     let mut hit_global_limit = false;
 
     for i in 0..5 {
-        let router = Router::new()
-            .route("/api/test", post(test_handler))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                rate_limit_middleware,
-            ))
-            .with_state(state.clone());
-
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri("/api/test")
-            .header("X-Forwarded-For", format!("192.168.{}.1", i))
-            .body(Body::empty())
-            .unwrap();
-
-        let response = router.oneshot(request).await.unwrap();
+        let response = send(&state, from_peer(&format!("192.168.{i}.1:50000"))).await;
 
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             hit_global_limit = true;
@@ -430,40 +325,11 @@ async fn test_global_rate_limit_protection() {
 /// Validates: Successful responses include rate limit headers
 ///
 /// UX Invariant: Clients should be able to track their quota usage.
-#[cfg(not(feature = "db"))]
 #[tokio::test]
 async fn test_rate_limit_headers_on_success() {
-    use epigraph_api::middleware::rate_limit_middleware;
-    use epigraph_api::state::{ApiConfig, AppState};
+    let state = state_with(AgentRateLimiter::new(config(60, 1000, true)));
 
-    let config = RateLimitConfig {
-        default_rpm: 60,
-        global_rpm: 1000,
-        replenish_interval_secs: 1,
-        enable_global_limit: true,
-    };
-
-    let rate_limiter = AgentRateLimiter::new(config);
-
-    #[cfg(not(feature = "db"))]
-    let state = AppState::new(ApiConfig::default()).with_rate_limiter(rate_limiter);
-
-    let router = Router::new()
-        .route("/api/test", post(test_handler))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
-        .with_state(state);
-
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/test")
-        .header("X-Forwarded-For", "192.168.1.50")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.oneshot(request).await.unwrap();
+    let response = send(&state, from_peer("192.168.1.50:50000")).await;
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -479,4 +345,154 @@ async fn test_rate_limit_headers_on_success() {
         limit.is_some(),
         "Response should include X-RateLimit-Limit header"
     );
+}
+
+// ============================================================================
+// Client identity: forwarding headers, peers, and the removed shared bucket
+// ============================================================================
+
+/// A client that is not a trusted proxy cannot pick its own bucket by writing
+/// `X-Forwarded-For`. The middleware used to key on the header's first entry
+/// from any sender, so rotating it bought a fresh quota per request.
+#[tokio::test]
+async fn a_spoofed_forwarded_for_from_an_untrusted_peer_is_ignored() {
+    let state = state_with(AgentRateLimiter::new(config(2, 1000, false)));
+    let peer = "203.0.113.7:40000";
+
+    for (i, spoofed) in ["198.51.100.1", "198.51.100.2"].iter().enumerate() {
+        let response = send(&state, from_peer_forwarded(peer, spoofed)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "request {} in quota",
+            i + 1
+        );
+    }
+
+    let response = send(&state, from_peer_forwarded(peer, "198.51.100.3")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "three different X-Forwarded-For values from ONE untrusted peer must share \
+         that peer's quota of 2"
+    );
+}
+
+/// Behind a trusted proxy (loopback, the default) `X-Forwarded-For` IS the
+/// client, so two clients behind the same proxy get separate quotas instead of
+/// sharing the proxy's.
+#[tokio::test]
+async fn forwarded_for_is_honoured_behind_a_trusted_proxy() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let proxy = "127.0.0.1:50000";
+
+    let first = send(&state, from_peer_forwarded(proxy, "198.51.100.10")).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let again = send(&state, from_peer_forwarded(proxy, "198.51.100.10")).await;
+    assert_eq!(
+        again.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the forwarded client's quota of 1 is spent"
+    );
+
+    let other = send(&state, from_peer_forwarded(proxy, "198.51.100.11")).await;
+    assert_eq!(
+        other.status(),
+        StatusCode::OK,
+        "a different client behind the same trusted proxy has its own quota"
+    );
+}
+
+/// Through a proxy that APPENDS to `X-Forwarded-For`, a client can prepend
+/// whatever it likes. The right-most untrusted entry is the address the proxy
+/// saw, and that is the one the quota follows; the old "first entry" rule
+/// keyed on the client's own invention.
+#[tokio::test]
+async fn a_client_prepended_forwarded_for_entry_does_not_escape_its_quota() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let proxy = "127.0.0.1:50000";
+
+    let first = send(&state, from_peer_forwarded(proxy, "1.1.1.1, 198.51.100.20")).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let second = send(&state, from_peer_forwarded(proxy, "2.2.2.2, 198.51.100.20")).await;
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "rotating the client-written left-hand entry must not buy a new bucket"
+    );
+}
+
+/// Loopback is trusted only because a limiter defaults to it. A limiter told
+/// to trust no one keys the proxy hop on the proxy, headers or not.
+#[tokio::test]
+async fn an_empty_trusted_set_keys_every_request_on_its_tcp_peer() {
+    let limiter = AgentRateLimiter::new(config(1, 1000, false)).with_trusted_proxies(vec![]);
+    let state = state_with(limiter);
+    let proxy = "127.0.0.1:50000";
+
+    assert_eq!(
+        send(&state, from_peer_forwarded(proxy, "198.51.100.30"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&state, from_peer_forwarded(proxy, "198.51.100.31"))
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "with no trusted proxies, X-Forwarded-For is ignored even from loopback"
+    );
+}
+
+/// One IPv6 end site holds a whole /64 and can source from any address in it.
+#[tokio::test]
+async fn ipv6_clients_share_a_quota_across_their_64() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+
+    assert_eq!(
+        send(&state, from_peer("[2001:db8:1:2::1]:50000"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&state, from_peer("[2001:db8:1:2::ffff]:50000"))
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a second address in the same /64 is the same client"
+    );
+    assert_eq!(
+        send(&state, from_peer("[2001:db8:1:3::1]:50000"))
+            .await
+            .status(),
+        StatusCode::OK,
+        "a different /64 is a different client"
+    );
+}
+
+/// The shared nil-UUID bucket is gone. A request the middleware cannot
+/// attribute used to land in ONE bucket with every other such request, so a
+/// single client could spend it and 429 all the rest. Two unattributable
+/// requests past a quota of 1 must both go through.
+#[tokio::test]
+async fn requests_with_no_identifiable_client_are_never_pooled_into_one_bucket() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+
+    for i in 0..2 {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/test")
+            .body(Body::empty())
+            .unwrap();
+        let response = send(&state, request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "unattributable request {} must not share a bucket with the other",
+            i + 1
+        );
+    }
 }

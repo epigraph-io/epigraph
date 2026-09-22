@@ -10,7 +10,13 @@
 //! # Rate Limiting Strategy
 //!
 //! - **Authenticated requests**: Rate limited by agent ID
-//! - **Unauthenticated requests**: Rate limited by client IP
+//! - **Unauthenticated requests**: Rate limited by client IP, where the client
+//!   IP is the TCP peer (`ConnectInfo<SocketAddr>`) unless that peer is a
+//!   trusted proxy (`AgentRateLimiter::trusted_proxies`), in which case it is
+//!   the right-most `X-Forwarded-For` entry that is not itself a trusted proxy.
+//!   IPv6 clients are keyed by their /64.
+//! - **No identifiable client**: NOT rate limited, and never pooled into one
+//!   shared bucket (see [`rate_limit_middleware`]).
 //! - **Health endpoints**: Exempt from rate limiting
 
 // UNSCOPED-POOL-EXEMPT: One `db_pool.clone()` handed to a detached task that records security
@@ -19,18 +25,19 @@
 
 use axum::{
     body::Body,
-    extract::State,
-    http::{Method, Request, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use epigraph_core::domain::AgentId;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 use crate::security::audit::SecurityAuditLog;
-use crate::security::{RateLimitError, SecurityEvent};
+use crate::security::{AgentRateLimiter, RateLimitError, SecurityEvent};
 use crate::state::AppState;
 
 // ============================================================================
@@ -55,6 +62,9 @@ const X_REAL_IP: &str = "X-Real-IP";
 /// The three that remain are liveness probes: a rate-limited health check turns
 /// a traffic spike into a false unhealthy verdict and then into a restart loop.
 const BYPASS_ROUTES: &[&str] = &["/health", "/readiness", "/liveness"];
+
+/// Set once the "no identifiable client" warning has been logged.
+static NO_PEER_WARNED: AtomicBool = AtomicBool::new(false);
 
 // ============================================================================
 // Rate Limit Response
@@ -96,43 +106,102 @@ impl IntoResponse for RateLimitResponse {
 // Helper Functions
 // ============================================================================
 
-/// Extract client IP from request headers or connection info
+/// The client address an anonymous request is rate limited under, or `None`
+/// when the request carries no peer address at all.
 ///
-/// Priority:
-/// 1. X-Forwarded-For (first IP in chain)
-/// 2. X-Real-IP
-/// 3. Connected peer address (fallback)
+/// The peer comes from `ConnectInfo<SocketAddr>`, which `bin/server.rs`
+/// supplies by serving with `into_make_service_with_connect_info`. It is
+/// absent only when a router is driven without it — `tower::oneshot` in tests,
+/// or an embedder that serves with plain `into_make_service`.
+fn client_ip(request: &Request<Body>, limiter: &AgentRateLimiter) -> Option<IpAddr> {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()?
+        .0
+        .ip();
+    Some(resolve_client_ip(request.headers(), peer, |ip| {
+        limiter.is_trusted_proxy(ip)
+    }))
+}
+
+/// Resolve the originating client of a request that arrived from `peer`.
 ///
-/// # Security Note
+/// # Only a trusted peer's headers are believed
 ///
-/// X-Forwarded-For can be spoofed by clients. In production, ensure
-/// your reverse proxy overwrites this header with the actual client IP.
-fn extract_client_ip(request: &Request<Body>) -> Option<IpAddr> {
-    // Try X-Forwarded-For first
-    if let Some(forwarded) = request.headers().get(X_FORWARDED_FOR) {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            // X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
-            // The first one is the original client
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse() {
-                    return Some(ip);
-                }
-            }
-        }
+/// This used to return the FIRST `X-Forwarded-For` entry, then `X-Real-IP`,
+/// from any peer at all. Both headers are written by whoever sends the
+/// request, so a client chose its own bucket per request and no per-client
+/// quota could hold. Now:
+///
+/// 1. A peer that is not a trusted proxy IS the client. Its headers are
+///    ignored.
+/// 2. Behind a trusted proxy, walk `X-Forwarded-For` from the RIGHT, skipping
+///    entries that are themselves trusted proxies, and take the first that is
+///    not. Every entry to the right of it was appended by a proxy we trust;
+///    every entry to its left came from the client and is ignored. That is
+///    the difference from "first entry": a client that sends
+///    `X-Forwarded-For: <anything>` through a proxy that appends gets
+///    `<anything>, <its real address>`, and the real address is what is used.
+///    If every entry is trusted, the left-most one is the client (a
+///    same-host caller that went through the proxy). A malformed entry stops
+///    the walk at the last well-formed trusted hop.
+/// 3. No usable `X-Forwarded-For`: `X-Real-IP`, then the peer itself.
+fn resolve_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    is_trusted: impl Fn(IpAddr) -> bool,
+) -> IpAddr {
+    let peer = peer.to_canonical();
+    if !is_trusted(peer) {
+        return peer;
     }
 
-    // Try X-Real-IP
-    if let Some(real_ip) = request.headers().get(X_REAL_IP) {
-        if let Ok(ip_str) = real_ip.to_str() {
-            if let Ok(ip) = ip_str.trim().parse() {
-                return Some(ip);
-            }
+    let chain: Vec<&str> = headers
+        .get_all(X_FORWARDED_FOR)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    let mut nearest_untrusted_or_leftmost = None;
+    for entry in chain.iter().rev() {
+        let Some(ip) = parse_forwarded_ip(entry) else {
+            break;
+        };
+        nearest_untrusted_or_leftmost = Some(ip);
+        if !is_trusted(ip) {
+            break;
         }
     }
+    if let Some(ip) = nearest_untrusted_or_leftmost {
+        return ip;
+    }
 
-    // No header found - connection info would need ConnectInfo extractor
-    // which requires additional setup. Return None for now.
-    None
+    headers
+        .get(X_REAL_IP)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_forwarded_ip)
+        .unwrap_or(peer)
+}
+
+/// Parse one forwarding-header entry: a bare address, or an address with a
+/// port (`203.0.113.9:4711`, `[2001:db8::1]:443`), or a bracketed IPv6
+/// address. IPv4-mapped IPv6 is reduced to the IPv4 address it carries.
+fn parse_forwarded_ip(entry: &str) -> Option<IpAddr> {
+    let entry = entry.trim().trim_matches('"');
+    let ip = entry
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| entry.parse::<SocketAddr>().ok().map(|sa| sa.ip()))
+        .or_else(|| {
+            entry
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+                .and_then(|inner| inner.parse::<IpAddr>().ok())
+        })?;
+    Some(ip.to_canonical())
 }
 
 /// Check if a route should bypass rate limiting
@@ -146,6 +215,19 @@ fn should_bypass_rate_limit(path: &str, method: &Method) -> bool {
     BYPASS_ROUTES.iter().any(|route| path.starts_with(route))
 }
 
+/// The address a client is bucketed under: IPv4 as-is, IPv6 by its /64.
+///
+/// A single IPv6 subscriber is routinely delegated a whole /64 and can source
+/// from any address in it, so a per-address IPv6 key would let one client
+/// choose among 2^64 buckets — the same escape the forwarding headers used to
+/// offer. /64 is the smallest prefix one end site is expected to hold.
+fn rate_limit_subject(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        v4 => v4,
+    }
+}
+
 /// Generate a rate limit key from client IP
 fn ip_to_agent_id(ip: IpAddr) -> AgentId {
     // Convert IP to a deterministic AgentId for rate limiting purposes
@@ -154,7 +236,7 @@ fn ip_to_agent_id(ip: IpAddr) -> AgentId {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
-    ip.hash(&mut hasher);
+    rate_limit_subject(ip).hash(&mut hasher);
     let hash = hasher.finish();
 
     // Create a UUID v4-like ID from the hash (not a real UUID, but deterministic)
@@ -225,20 +307,35 @@ pub async fn rate_limit_middleware(
     // PR-07 will replace it with the `ViewerExtractor` principal — which is a
     // strictly better rate-limit key than the client IP and restores the
     // intent of this branch.
-    let agent_id = request
+    let identified = request
         .extensions()
         .get::<crate::middleware::VerifiedAgent>()
         .map(|agent| agent.agent_id)
-        .or_else(|| extract_client_ip(&request).map(ip_to_agent_id))
-        .unwrap_or_else(|| {
-            // Fallback: use a fixed ID for requests without identifiable source
-            // This is a security concern - should be logged
+        .or_else(|| client_ip(&request, rate_limiter).map(ip_to_agent_id));
+
+    // No identifiable client: let it through UNLIMITED rather than into a
+    // shared bucket.
+    //
+    // This used to be `AgentId::from_uuid(Uuid::nil())` — one bucket for every
+    // request that carried no forwarding header, so any one such client could
+    // spend it and 429 all the others. There is no correct shared key: the
+    // global bucket already exists for aggregate load, and a per-client key is
+    // exactly what is missing. It cannot happen on the production listener,
+    // which serves with `ConnectInfo`; it happens under `tower::oneshot` and
+    // under an embedder that serves without it, and the first such request
+    // warns once so the second case is visible in the log.
+    let Some(agent_id) = identified else {
+        if !NO_PEER_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 path = %path,
-                "Rate limiting request without identifiable client - using fallback ID"
+                "rate limiting skipped: request carries no ConnectInfo peer address \
+                 and no principal. Serve the router with \
+                 `into_make_service_with_connect_info::<SocketAddr>()` for \
+                 anonymous traffic to be rate limited. Logged once per process."
             );
-            AgentId::from_uuid(uuid::Uuid::nil())
-        });
+        }
+        return Ok(next.run(request).await);
+    };
 
     // Check rate limit
     if let Err(err) = rate_limiter.check(&agent_id) {
@@ -395,6 +492,144 @@ mod tests {
 
         // Just verify it doesn't panic and produces an ID
         assert!(!id.to_string().is_empty());
+    }
+
+    fn loopback_only(ip: IpAddr) -> bool {
+        ip.is_loopback()
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn an_untrusted_peer_is_the_client_whatever_its_headers_say() {
+        let h = headers(&[
+            (X_FORWARDED_FOR, "198.51.100.1"),
+            (X_REAL_IP, "198.51.100.2"),
+        ]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("203.0.113.9"), loopback_only),
+            ip("203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn behind_a_trusted_peer_the_rightmost_untrusted_hop_is_the_client() {
+        // client-written junk, then the real client, then a second trusted hop
+        let h = headers(&[(X_FORWARDED_FOR, "6.6.6.6, 198.51.100.7, 127.0.0.2")]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("127.0.0.1"), loopback_only),
+            ip("198.51.100.7")
+        );
+    }
+
+    #[test]
+    fn repeated_forwarded_for_lines_are_read_as_one_list_in_order() {
+        let h = headers(&[
+            (X_FORWARDED_FOR, "6.6.6.6"),
+            (X_FORWARDED_FOR, "198.51.100.8"),
+        ]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("127.0.0.1"), loopback_only),
+            ip("198.51.100.8")
+        );
+    }
+
+    #[test]
+    fn an_all_trusted_chain_resolves_to_its_leftmost_hop() {
+        let h = headers(&[(X_FORWARDED_FOR, "127.0.0.5, 127.0.0.6")]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("127.0.0.1"), loopback_only),
+            ip("127.0.0.5")
+        );
+    }
+
+    #[test]
+    fn a_malformed_entry_stops_the_walk_at_the_last_trusted_hop() {
+        let h = headers(&[(X_FORWARDED_FOR, "198.51.100.1, unknown, 127.0.0.9")]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("127.0.0.1"), loopback_only),
+            ip("127.0.0.9"),
+            "an entry left of garbage cannot be attributed to a trusted hop"
+        );
+    }
+
+    #[test]
+    fn x_real_ip_then_the_peer_when_forwarded_for_is_unusable() {
+        let h = headers(&[(X_REAL_IP, "198.51.100.3")]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("127.0.0.1"), loopback_only),
+            ip("198.51.100.3")
+        );
+        let h = headers(&[(X_FORWARDED_FOR, "garbage")]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("127.0.0.1"), loopback_only),
+            ip("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_is_judged_as_the_ipv4_address_it_carries() {
+        let h = headers(&[(X_FORWARDED_FOR, "198.51.100.4")]);
+        assert_eq!(
+            resolve_client_ip(&h, ip("::ffff:127.0.0.1"), loopback_only),
+            ip("198.51.100.4"),
+            "a dual-stack listener reports loopback IPv4 as ::ffff:127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn forwarded_entries_with_ports_and_brackets_parse() {
+        assert_eq!(
+            parse_forwarded_ip("203.0.113.9:4711"),
+            Some(ip("203.0.113.9"))
+        );
+        assert_eq!(
+            parse_forwarded_ip("[2001:db8::1]:443"),
+            Some(ip("2001:db8::1"))
+        );
+        assert_eq!(parse_forwarded_ip("[2001:db8::1]"), Some(ip("2001:db8::1")));
+        assert_eq!(
+            parse_forwarded_ip("\"2001:db8::1\""),
+            Some(ip("2001:db8::1"))
+        );
+        assert_eq!(
+            parse_forwarded_ip("::ffff:198.51.100.5"),
+            Some(ip("198.51.100.5"))
+        );
+        assert_eq!(parse_forwarded_ip("unknown"), None);
+    }
+
+    #[test]
+    fn ipv6_keys_are_per_64_and_ipv4_keys_are_per_address() {
+        assert_eq!(
+            ip_to_agent_id(ip("2001:db8:1:2::1")),
+            ip_to_agent_id(ip("2001:db8:1:2:ffff:ffff:ffff:ffff"))
+        );
+        assert_ne!(
+            ip_to_agent_id(ip("2001:db8:1:2::1")),
+            ip_to_agent_id(ip("2001:db8:1:3::1"))
+        );
+        assert_ne!(
+            ip_to_agent_id(ip("192.0.2.1")),
+            ip_to_agent_id(ip("192.0.2.2"))
+        );
+        assert_eq!(
+            ip_to_agent_id(ip("::ffff:192.0.2.1")),
+            ip_to_agent_id(ip("192.0.2.1"))
+        );
     }
 
     #[test]

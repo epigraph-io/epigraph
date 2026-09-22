@@ -14,8 +14,10 @@
 
 use chrono::{DateTime, Utc};
 use epigraph_core::domain::AgentId;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
 
@@ -164,6 +166,26 @@ pub struct AgentRateLimiter {
     /// on its own; neither holds it while taking another lock, so no
     /// lock-order cycle exists.
     last_sweep: Arc<Mutex<DateTime<Utc>>>,
+    /// Peers whose `X-Forwarded-For` / `X-Real-IP` the middleware may believe.
+    /// See [`Self::with_trusted_proxies`].
+    trusted_proxies: Arc<Vec<IpNet>>,
+}
+
+/// The trusted-proxy set a limiter starts with: loopback only.
+///
+/// The supported deployment fronts the API with Caddy on the same host
+/// (`docs/deploy.md`), so its hop arrives from loopback. Anything that can
+/// open a loopback connection is already on the host.
+#[must_use]
+pub fn default_trusted_proxies() -> Vec<IpNet> {
+    vec![
+        IpNet::V4(
+            Ipv4Net::new(Ipv4Addr::LOCALHOST, 8)
+                .expect("8 is a valid IPv4 prefix")
+                .trunc(),
+        ),
+        IpNet::V6(Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).expect("128 is a valid IPv6 prefix")),
+    ]
 }
 
 impl AgentRateLimiter {
@@ -181,7 +203,40 @@ impl AgentRateLimiter {
             global_bucket: Arc::new(RwLock::new(global_bucket)),
             agent_limits: Arc::new(RwLock::new(HashMap::new())),
             last_sweep: Arc::new(Mutex::new(Utc::now())),
+            trusted_proxies: Arc::new(default_trusted_proxies()),
         }
+    }
+
+    /// Replace the set of peers whose forwarding headers are believed.
+    ///
+    /// The rate-limit middleware keys an anonymous request on the TCP peer
+    /// address. Only when that peer is in this set does it consult
+    /// `X-Forwarded-For` (right-most entry that is not itself a trusted
+    /// proxy) and then `X-Real-IP`. A peer outside the set is keyed on its own
+    /// address and its headers are ignored, because anyone can write them.
+    ///
+    /// An empty set trusts no one: every request is keyed on its TCP peer.
+    /// Behind a reverse proxy that puts every client in the proxy's bucket,
+    /// so do not pass an empty set unless the API is exposed directly.
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, proxies: Vec<IpNet>) -> Self {
+        self.trusted_proxies = Arc::new(proxies);
+        self
+    }
+
+    /// The peers whose forwarding headers are believed.
+    #[must_use]
+    pub fn trusted_proxies(&self) -> &[IpNet] {
+        &self.trusted_proxies
+    }
+
+    /// Whether `ip` is a trusted proxy. IPv4-mapped IPv6 addresses
+    /// (`::ffff:a.b.c.d`) are compared as the IPv4 address they carry, which
+    /// is how a dual-stack listener reports an IPv4 peer.
+    #[must_use]
+    pub fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.trusted_proxies.iter().any(|net| net.contains(&ip))
     }
 
     /// Create a rate limiter with default configuration
@@ -462,6 +517,7 @@ impl std::fmt::Debug for AgentRateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentRateLimiter")
             .field("config", &self.config)
+            .field("trusted_proxies", &self.trusted_proxies)
             .field(
                 "agent_buckets_count",
                 &self

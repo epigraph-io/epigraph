@@ -953,8 +953,10 @@ async fn main() {
             .await
             .expect("Failed to load TLS certificate/key");
 
+        // With connect info, like the plain listener below: the rate limiter
+        // keys anonymous traffic on the TCP peer (see the note there).
         axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("TLS server error");
         return;
@@ -976,5 +978,17 @@ async fn main() {
 
     tracing::info!("Server listening on {}", addr);
 
-    axum::serve(listener, app).await.expect("Server error");
+    // `into_make_service_with_connect_info` puts the TCP peer address into
+    // every request's extensions as `ConnectInfo<SocketAddr>`. The rate-limit
+    // middleware keys anonymous traffic on it (resolving through
+    // `X-Forwarded-For` only when the peer is a trusted proxy); served without
+    // it, anonymous requests have no identifiable client and are not rate
+    // limited at all. `tests/rate_limit_wiring.rs` pins both call
+    // sites.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .expect("Server error");
 }
