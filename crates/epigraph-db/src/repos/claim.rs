@@ -4503,83 +4503,11 @@ mod label_tests {
         }
     }
 
-    /// An unexpanded shell variable in `add` must be refused AND must leave the
-    /// stored label array untouched.
-    ///
-    /// Load-bearing: against the pre-fix `update_labels` (no
-    /// `reject_unexpanded_labels` call) the UPDATE runs, `result` is `Ok`, and
-    /// the re-read finds `group:$EPICLAW_GROUP_ID` in `claims.labels` — exactly
-    /// the corruption observed on claim 2a0125e2. Both assertions fail there.
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn update_labels_refuses_unexpanded_shell_variable_and_writes_nothing() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
-        ClaimRepository::update_labels(&pool, claim_id, &["keeper".into()], &[])
-            .await
-            .unwrap();
-
-        let result = ClaimRepository::update_labels(
-            &pool,
-            claim_id,
-            &["good-label".into(), "group:$EPICLAW_GROUP_ID".into()],
-            &[],
-        )
-        .await;
-
-        assert!(
-            matches!(result, Err(DbError::InvalidData { .. })),
-            "expected InvalidData, got: {result:?}"
-        );
-
-        // The write must not have happened AT ALL — neither the bad label nor
-        // its well-formed sibling from the same array.
-        let stored: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            stored,
-            vec!["keeper".to_string()],
-            "a refused label array must leave claims.labels byte-for-byte unchanged"
-        );
-
-        cleanup(&pool, claim_id, agent_id).await;
-    }
-
-    /// The `remove` side must NOT be validated: removal is the only remediation
-    /// path for the rows already carrying `group:$EPICLAW_GROUP_ID`.
-    ///
-    /// Load-bearing in the other direction: this fails against the plausible
-    /// over-broad fix that validates both `add` and `remove`, which would make
-    /// the existing corruption permanently unfixable through the API.
-    #[tokio::test]
-    #[ignore] // Requires live database
-    async fn update_labels_still_removes_an_already_corrupted_label() {
-        let (pool, claim_id, agent_id) = setup_test_claim().await;
-
-        // Seed the corruption the way it actually got there — a direct write,
-        // bypassing the new guard (the guard is what stops NEW ones).
-        sqlx::query(
-            "UPDATE claims SET labels = ARRAY['backlog','group:$EPICLAW_GROUP_ID'] WHERE id = $1",
-        )
-        .bind(claim_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let after = ClaimRepository::update_labels(
-            &pool,
-            claim_id,
-            &[],
-            &["group:$EPICLAW_GROUP_ID".into()],
-        )
-        .await
-        .expect("removing an already-corrupted label must remain possible");
-
-        assert_eq!(after, vec!["backlog".to_string()]);
-        cleanup(&pool, claim_id, agent_id).await;
-    }
+    // The two unexpanded-shell-variable regression tests that used to live here
+    // moved to `crates/epigraph-db/tests/label_shell_variable_repo.rs`. Reason:
+    // every test in this module is `#[ignore]` (live-DB convention), so
+    // `cargo test -p epigraph-db` skipped the headline regression test for
+    // backlog f6310444. The new file uses `#[sqlx::test]` and runs in the gate.
 
     /// Verify `pairwise_cosine_distance` enforces the `MAX_PAIRWISE_IDS` cap.
     /// No DB required: the size guard fires before the query is issued.
