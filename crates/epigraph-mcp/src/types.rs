@@ -2177,6 +2177,37 @@ pub struct ResolveBacklogItemParams {
         description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
     )]
     pub methodology: Option<String>,
+
+    /// The CLOSURE BASIS: the claims whose content justified closing the item.
+    ///
+    /// Without it a closure records no basis at all, so nothing can even
+    /// identify a reopen candidate when later evidence contradicts whatever the
+    /// resolution rested on. Each id becomes a
+    /// `basis -justifies-> resolution` edge.
+    ///
+    /// WHAT THIS DOES AND DOES NOT BUY, measured rather than assumed — the
+    /// backlog item that requested this asserted the stronger claim, and it is
+    /// false on two independent counts today:
+    ///   * `sheaf::restriction_kind_with_profile` does not name `"justifies"`,
+    ///     so it takes the `_ => RestrictionKind::Neutral` arm;
+    ///     `auto_wire_edge_if_epistemic` short-circuits on Neutral, so the edge
+    ///     carries no BBA. `invalidate_and_rewire`'s own doc says "Only edges
+    ///     that actually carried a BBA become targets", so `retraction_cascade`
+    ///     skips it.
+    ///   * `semantic_graph_neighbors` hard-codes its relationship set and does
+    ///     not include `justifies`, so no existing traversal consumes it.
+    /// What it DOES buy: the basis is recorded durably and is reverse-queryable
+    /// — given a retracted basis, a query on `edges.source_id` finds every
+    /// closure that rested on it. Making the cascade act on that automatically
+    /// is a separate change (it requires giving `justifies` a non-Neutral
+    /// restriction kind, which is a belief-semantics decision).
+    ///
+    /// Optional and defaulted so every existing caller stays wire-compatible.
+    #[schemars(
+        description = "UUIDs of the claims that justified this resolution (the closure basis). Each becomes a `basis -justifies-> resolution` edge, recording WHY the item was closed so that a later retraction of a basis can be reverse-queried to find the closures resting on it. It does NOT by itself reopen anything: `justifies` carries no belief mass today, so retraction_cascade and recompute_beliefs do not act on it. Must be visible to the caller."
+    )]
+    #[serde(default)]
+    pub basis_claim_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
