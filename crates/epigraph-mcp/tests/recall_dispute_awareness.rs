@@ -87,6 +87,7 @@ fn params(query: &str, exclude_contested: bool) -> RecallParams {
         theme_id: None,
         theme_label: None,
         offset: None,
+        epistemic_partition: false,
     }
 }
 

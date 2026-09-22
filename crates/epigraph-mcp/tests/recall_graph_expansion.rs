@@ -186,6 +186,7 @@ fn base_params(depth: Option<u32>, limit: u32) -> RecallWithContextParams {
         graph_expansion_depth: depth,
         exclude_contested: false,
         since: None,
+        epistemic_partition: false,
     }
 }
 

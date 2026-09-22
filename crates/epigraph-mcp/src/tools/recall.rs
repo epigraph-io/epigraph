@@ -226,6 +226,24 @@ pub struct RecallWithContextParams {
     /// and no window is ever applied implicitly.
     #[serde(default)]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// When `true`, REPLACE the flat `results` array with an
+    /// `epistemic_partition` object grouping the same hits into `confirmed`
+    /// (`truth_value >= 0.75` and not contested), `open_question`
+    /// (`is_contested` — any live `contradicts`/`refutes`), and `uncertain`
+    /// (everything else). Contest is checked FIRST, so a high-truth paragraph
+    /// carrying a live refutation is reported as an open question rather than
+    /// as confirmed.
+    ///
+    /// Ranking is UNCHANGED: each bucket keeps the order the flat list would
+    /// have had, and the union of the three buckets is exactly the flat list.
+    /// This regroups the page; it does not filter or re-rank it, and it runs
+    /// after every other post-filter (`min_truth`, `exclude_contested`), so
+    /// the returned SET is identical with and without it.
+    ///
+    /// `results` is OMITTED when this is true. Default `false`: output is
+    /// byte-identical to `recall_with_context` without this parameter.
+    #[serde(default)]
+    pub epistemic_partition: bool,
 }
 
 /// Why a recall audit row has no owner — and therefore must not be written.
@@ -344,7 +362,16 @@ fn spawn_recall_audit(
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallWithContextResponse {
-    pub results: Vec<RecallHit>,
+    /// The flat ranked page. `None` — and therefore absent from the JSON —
+    /// exactly when `epistemic_partition=true` replaced it with the bucketed
+    /// shape below. `Some(vec![])` still serializes as `"results": []`, so a
+    /// zero-hit recall is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<RecallHit>>,
+    /// The same page regrouped by epistemic status (backlog e7736ff6).
+    /// Present only when the caller asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epistemic_partition: Option<crate::types::EpistemicPartition<RecallHit>>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
     /// Id of the audit row logged for this retrieval (backlog 8cbffa0e), so a
@@ -857,8 +884,18 @@ async fn recall_with_context_post_embed(
             }),
             vec![],
         );
+        // The empty page honours `epistemic_partition` too: a caller that
+        // asked for the bucketed shape must get three empty buckets, not a
+        // silently different shape on the zero-hit path. Getting `results: []`
+        // back from a partitioned request would look like the flag was ignored.
+        let (results, epistemic_partition) = crate::types::split_epistemic(
+            Vec::new(),
+            params.epistemic_partition,
+            |_: &RecallHit| (0.0, false),
+        );
         return success_json(&RecallWithContextResponse {
-            results: vec![],
+            results,
+            epistemic_partition,
             corpus_scope,
             centroid_dim_used: centroid_dim,
             recall_event_id: Some(event_id.to_string()),
@@ -1221,8 +1258,24 @@ async fn recall_with_context_post_embed(
         results.iter().map(|h| h.paragraph_id).collect(),
     );
 
+    // Epistemic partitioning (backlog e7736ff6), in the same position as
+    // `tools::memory::recall`'s: after the dispute post-pass (nothing is
+    // `is_contested` before it, so bucketing earlier would leave
+    // `open_question` permanently empty), after `exclude_contested`'s retain,
+    // and after the audit spawn, which derives `returned_claim_ids` from
+    // `results` and must name exactly the hits that were served.
+    //
+    // The score is the SAME `truth_value` `min_truth` gates on, read back off
+    // the built hit rather than recomputed, so the bucket threshold and the
+    // gate cannot drift apart.
+    let (results, epistemic_partition) =
+        crate::types::split_epistemic(results, params.epistemic_partition, |h: &RecallHit| {
+            (h.truth_value, h.is_contested)
+        });
+
     success_json(&RecallWithContextResponse {
         results,
+        epistemic_partition,
         corpus_scope,
         centroid_dim_used: centroid_dim,
         recall_event_id: Some(event_id.to_string()),

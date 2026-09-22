@@ -581,6 +581,22 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
+                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       not contested), `open_question` (is_contested — any live \
+                       contradicts/refutes), and `uncertain` (everything else). Contest is \
+                       checked FIRST, so a high-truth claim carrying a live refutation is \
+                       reported as an open question rather than as confirmed. Ranking is \
+                       UNCHANGED: each bucket keeps the RRF order the flat list would have had, \
+                       and the union of the three buckets is exactly the flat list — this \
+                       regroups the page, it does not filter or re-rank it. `results` is OMITTED \
+                       when this is true, so a caller opts into the new shape explicitly. \
+                       Default false: output is byte-identical to recall without this parameter."
+    )]
+    #[serde(default)]
+    pub epistemic_partition: bool,
 }
 
 // ── Ingestion ──
@@ -1337,6 +1353,101 @@ pub(crate) fn is_zero_u32(v: &u32) -> bool {
 /// `skip_serializing_if` helper — see [`is_zero_u32`].
 pub(crate) fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// Score at or above which a NON-contested result is reported as `confirmed`
+/// by [`EpistemicPartition`] (backlog e7736ff6).
+///
+/// One constant, shared by `recall` and `recall_with_context`, so "confirmed"
+/// cannot come to mean two different things on the two recall surfaces.
+pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
+
+/// A post-RRF recall page grouped by the epistemic status of each hit, rather
+/// than returned as one flat ranked list (backlog e7736ff6).
+///
+/// The three buckets are exhaustive and mutually exclusive, and the rule is
+/// deliberately contest-first:
+///
+/// * `open_question` — `is_contested` (any live `contradicts`/`refutes`).
+///   Checked FIRST, so a high-scoring claim that is actively disputed is
+///   reported as unsettled rather than as `confirmed`. Score and dispute are
+///   independent signals; a corpus can hold a 0.9 claim and a live refutation
+///   of it at the same time, and that pair is precisely what the caller must
+///   not be told is settled.
+/// * `confirmed` — not contested AND score `>= `[`CONFIRMED_SCORE`].
+/// * `uncertain` — everything else.
+///
+/// Within each bucket the caller's ranking order is PRESERVED (items are
+/// pushed in the order they were given), so bucketing re-groups the page
+/// without re-ranking it.
+///
+/// # The partition never changes which hits are returned
+///
+/// It is a regrouping of a list already fully filtered by `min_truth`,
+/// `exclude_contested` and every other post-filter. That is why `recall`'s
+/// audit row does not record the flag: the returned SET is identical with and
+/// without it, and only the JSON shape differs.
+#[derive(Debug, Clone, Serialize)]
+pub struct EpistemicPartition<T> {
+    /// Uncontested and scoring at or above [`CONFIRMED_SCORE`].
+    pub confirmed: Vec<T>,
+    /// Neither confirmed nor contested — believed, but not settled.
+    pub uncertain: Vec<T>,
+    /// Actively contested: `dispute_count >= 1`.
+    pub open_question: Vec<T>,
+}
+
+impl<T> EpistemicPartition<T> {
+    /// Bucket `items` by `(score, is_contested)`, as read out of each item by
+    /// `signals`.
+    ///
+    /// `signals` is a closure rather than a trait bound because the two recall
+    /// surfaces carry the same two numbers under different field names
+    /// (`RecallResult::truth_value` / `RecallHit::truth_value`) on types that
+    /// live in different modules — and because the score this partitions on
+    /// must stay the SAME score `min_truth` gates on, which is a decision the
+    /// call site owns, not this type.
+    pub fn from_ranked<I>(items: I, signals: impl Fn(&T) -> (f64, bool)) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut out = Self {
+            confirmed: Vec::new(),
+            uncertain: Vec::new(),
+            open_question: Vec::new(),
+        };
+        for item in items {
+            let (score, is_contested) = signals(&item);
+            if is_contested {
+                out.open_question.push(item);
+            } else if score >= CONFIRMED_SCORE {
+                out.confirmed.push(item);
+            } else {
+                out.uncertain.push(item);
+            }
+        }
+        out
+    }
+}
+
+/// Split a ranked page into the two mutually-exclusive response shapes the
+/// `epistemic_partition` flag selects between.
+///
+/// Returns `(flat, partitioned)` where exactly one side is `Some`. Both
+/// envelope fields carry `skip_serializing_if = "Option::is_none"`, so with
+/// the flag off the response is byte-identical to what it was before this
+/// parameter existed — `Some(vec![])` still serializes as `"results": []`,
+/// which an empty-page caller relies on.
+pub(crate) fn split_epistemic<T>(
+    items: Vec<T>,
+    partition: bool,
+    signals: impl Fn(&T) -> (f64, bool),
+) -> (Option<Vec<T>>, Option<EpistemicPartition<T>>) {
+    if partition {
+        (None, Some(EpistemicPartition::from_ranked(items, signals)))
+    } else {
+        (Some(items), None)
+    }
 }
 
 #[derive(Debug, Serialize)]

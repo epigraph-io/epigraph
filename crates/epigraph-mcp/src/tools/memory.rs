@@ -738,8 +738,29 @@ async fn recall_post_embed(
         });
     }
 
+    // Epistemic partitioning (backlog e7736ff6). Runs LAST, on the page every
+    // other stage has already settled:
+    //
+    //  * AFTER the dispute post-pass — `is_contested` is `false` on every
+    //    result until that pass runs, so bucketing any earlier would leave
+    //    `open_question` permanently empty while every happy-path test still
+    //    passed.
+    //  * AFTER `exclude_contested`'s retain — partitioning rows that are about
+    //    to be dropped would be both wasted and misleading.
+    //  * AFTER the audit block — that block derives `returned_claim_ids` from
+    //    `results`, and this consumes `results` by value.
+    //
+    // The score is the SAME `truth_value` `min_truth` gates on above, read out
+    // of the already-built result rather than recomputed, so the threshold and
+    // the gate cannot come to disagree about what a claim's belief is.
+    let (results, epistemic_partition) =
+        crate::types::split_epistemic(results, params.epistemic_partition, |r| {
+            (r.truth_value, r.is_contested)
+        });
+
     success_json(&RecallEnvelope {
         results,
+        epistemic_partition,
         recall_event_id: Some(event_id.to_string()),
         // Echoed only when a theme scope or a page offset was actually
         // requested, so an unscoped recall's response stays byte-identical to
@@ -793,7 +814,16 @@ struct RecallPaging {
 /// PROV-O layer from PR #334).
 #[derive(serde::Serialize)]
 struct RecallEnvelope {
-    results: Vec<RecallResult>,
+    /// The flat RRF-ranked page. `None` — and therefore absent from the JSON —
+    /// exactly when `epistemic_partition=true` replaced it with the bucketed
+    /// shape below. `Some(vec![])` still serializes as `"results": []`, so a
+    /// zero-hit recall is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<RecallResult>>,
+    /// The same page regrouped by epistemic status (backlog e7736ff6).
+    /// Present only when the caller asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epistemic_partition: Option<crate::types::EpistemicPartition<RecallResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
