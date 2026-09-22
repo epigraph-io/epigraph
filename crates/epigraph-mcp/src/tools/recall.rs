@@ -229,6 +229,53 @@ pub struct RecallWithContextParams {
     /// and no window is ever applied implicitly.
     #[serde(default)]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+    /// When `true`, REPLACE the flat `results` array with an
+    /// `epistemic_partition` object grouping the same hits into `confirmed`
+    /// (`truth_value >= 0.75` and not contested), `open_question`
+    /// (`is_contested` — any live `contradicts`/`refutes`), and `uncertain`
+    /// (everything else). Contest is checked FIRST, so a high-truth paragraph
+    /// carrying a live refutation is reported as an open question rather than
+    /// as confirmed.
+    ///
+    /// Ranking is UNCHANGED: each bucket keeps the order the flat list would
+    /// have had, and the union of the three buckets is exactly the flat list.
+    /// This regroups the page; it does not filter or re-rank it, and it runs
+    /// after every other post-filter (`min_truth`, `exclude_contested`), so
+    /// the returned SET is identical with and without it.
+    ///
+    /// `results` is OMITTED when this is true. Default `false`: output is
+    /// byte-identical to `recall_with_context` without this parameter.
+    #[serde(default)]
+    pub epistemic_partition: bool,
+    /// Optional intra-result diversity constraint, as a COSINE DISTANCE in
+    /// `(0.0, 2.0]`. When set, a greedy MMR pass walks the ranked page
+    /// top-down and DROPS any hit sitting closer than this to a hit already
+    /// kept above it, so a query cannot come back as ten paraphrases of one
+    /// paragraph. `0.15` is a reasonable starting value.
+    ///
+    /// Measured in the SAME vector space the retrieval used — whichever of
+    /// `claims.embedding` / `claims.embedding_3072` `centroid_dim_used` names.
+    /// Comparing a 3072-retrieved page against the 1536 column would measure
+    /// vectors that were never comparable.
+    ///
+    /// SHRINKS the page rather than back-filling: with `rerank=false` the
+    /// candidate pool is exactly `limit`, so there is nothing below to promote.
+    /// Same contract as `min_truth` / `exclude_contested`.
+    ///
+    /// Hits whose distance cannot be MEASURED are always KEPT — a paragraph
+    /// with no vector in the searched column is not known to be near anything.
+    ///
+    /// Runs LAST, after `min_truth`, `exclude_contested` and the
+    /// missing-paper-attribution drop, so only a hit that is ITSELF being
+    /// returned can suppress another. Ordering it earlier would let a paragraph
+    /// those filters are about to discard evict its surviving near-duplicate on
+    /// the way out — which makes switching on a de-duplication filter DELETE a
+    /// hit rather than merely de-duplicate.
+    ///
+    /// A value outside the range is REJECTED, not clamped. Default: no
+    /// diversity filtering.
+    #[serde(default)]
+    pub diversity_radius: Option<f64>,
 }
 
 /// Why a recall audit row has no owner — and therefore must not be written.
@@ -347,7 +394,16 @@ fn spawn_recall_audit(
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RecallWithContextResponse {
-    pub results: Vec<RecallHit>,
+    /// The flat ranked page. `None` — and therefore absent from the JSON —
+    /// exactly when `epistemic_partition=true` replaced it with the bucketed
+    /// shape below. `Some(vec![])` still serializes as `"results": []`, so a
+    /// zero-hit recall is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<Vec<RecallHit>>,
+    /// The same page regrouped by epistemic status (backlog e7736ff6).
+    /// Present only when the caller asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epistemic_partition: Option<crate::types::EpistemicPartition<RecallHit>>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
     /// Id of the audit row logged for this retrieval (backlog 8cbffa0e), so a
@@ -770,6 +826,17 @@ async fn recall_with_context_post_embed(
     neighbor_paragraphs_limit: u32,
     lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
+    // Validated before any retrieval runs, so a mistyped radius is reported
+    // instead of being paid for and then discarded. Checked here rather than in
+    // the wrapper because `__test_only::recall_with_context_with_pgvec` enters
+    // at this function, and a validation the test path skips is a validation
+    // the tests cannot pin.
+    let diversity_radius = params
+        .diversity_radius
+        .map(crate::types::validate_diversity_radius)
+        .transpose()
+        .map_err(invalid_params)?;
+
     // Stage 3: candidate retrieval. Two paths:
     //
     //  - `diverse=true`: run the shared diverse-retrieval pipeline
@@ -904,8 +971,18 @@ async fn recall_with_context_post_embed(
             }),
             vec![],
         );
+        // The empty page honours `epistemic_partition` too: a caller that
+        // asked for the bucketed shape must get three empty buckets, not a
+        // silently different shape on the zero-hit path. Getting `results: []`
+        // back from a partitioned request would look like the flag was ignored.
+        let (results, epistemic_partition) = crate::types::split_epistemic(
+            Vec::new(),
+            params.epistemic_partition,
+            |_: &RecallHit| (0.0, false),
+        );
         return success_json(&RecallWithContextResponse {
-            results: vec![],
+            results,
+            epistemic_partition,
             corpus_scope,
             centroid_dim_used: centroid_dim,
             recall_event_id: Some(event_id.to_string()),
@@ -1271,6 +1348,78 @@ async fn recall_with_context_post_embed(
         }
     }
 
+    // Diversity post-filter (backlog a9397e8a): greedy MMR over the ranked
+    // page, dropping any hit within `diversity_radius` cosine distance of a hit
+    // already kept above it.
+    //
+    // # Why this runs LAST, not on the seed set
+    //
+    // An earlier revision ran it right after `raw_hits.truncate(want)`, which
+    // is cheaper — a dropped paragraph never pays for its siblings, atoms,
+    // corroborates and neighbour fan-out in `fetch_batched_context`. It is also
+    // WRONG, and the test
+    // `a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one` pins the
+    // exact failure: on this surface `min_truth` is applied AFTER context
+    // assembly, so a low-truth paragraph ranked first could evict its
+    // high-truth near-duplicate and then be dropped itself by `min_truth`. The
+    // measured result was a page that returned the 0.9 paragraph WITHOUT the
+    // radius and nothing at all WITH it — switching on a de-duplication filter
+    // deleted the good hit. `exclude_contested` and the missing-paper drop have
+    // the same shape.
+    //
+    // Running last makes the rule "a hit may only be suppressed by a hit that
+    // is itself being returned", and makes this surface agree with
+    // `tools::memory::recall`, where `min_truth` and `exclude_contested`
+    // already ran first. The lost saving is bounded and buys correctness.
+    //
+    // Still ahead of `spawn_recall_audit` below, which derives
+    // `returned_claim_ids` from `results`: an audit row naming paragraphs the
+    // caller never received would be a false disclosure record.
+    //
+    // `centroid_dim` — NOT a hardcoded 1536. This tool auto-detects its vector
+    // space, and measuring a 3072-retrieved page against `claims.embedding`
+    // would compare vectors that were never comparable, or find no pairs at all
+    // on a corpus embedded only at 3072 and silently report a perfectly diverse
+    // page.
+    if let Some(radius) = diversity_radius {
+        let ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_db::ClaimRepository::pairwise_cosine_distance_at_dim(
+            &server.pool,
+            viewer,
+            &ids,
+            radius,
+            centroid_dim,
+        )
+        .await
+        {
+            Ok(pairs) => {
+                // The repo applied the `< radius` cut in SQL, so every returned
+                // pair IS a too-similar pair. A pair that is ABSENT is kept —
+                // see `greedy_diversity_keep`; a paragraph with no vector in
+                // the searched column is not known to be near anything.
+                let too_similar: std::collections::HashSet<(Uuid, Uuid)> = pairs
+                    .iter()
+                    .map(|p| crate::types::unordered_pair(p.claim_a, p.claim_b))
+                    .collect();
+                let keep: std::collections::HashSet<Uuid> =
+                    crate::types::greedy_diversity_keep(&ids, &too_similar)
+                        .into_iter()
+                        .collect();
+                results.retain(|h| keep.contains(&h.paragraph_id));
+            }
+            Err(e) => {
+                // Degrade-not-fail, matching the lens and dispute post-passes:
+                // serve the undiversified page rather than lose hits already
+                // retrieved, and say so in the log so an unfiltered page is
+                // distinguishable from one with nothing to filter.
+                tracing::warn!(
+                    error = %e,
+                    "diversity filter failed; serving the page without it"
+                );
+            }
+        }
+    }
+
     let corpus_scope = compute_corpus_scope(&server.pool, viewer)
         .await
         .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
@@ -1297,12 +1446,34 @@ async fn recall_with_context_post_embed(
             // See the empty-path literal above: the window is part of the
             // question, so it has to survive into the audit row.
             "since": params.since,
+            // Same argument: the radius changes WHICH paragraphs came back, so
+            // a retrieval whose diversity cut cannot be reconstructed from its
+            // audit row is an unauditable retrieval. `epistemic_partition` is
+            // deliberately absent — it regroups the response without changing
+            // the set.
+            "diversity_radius": params.diversity_radius,
         }),
         results.iter().map(|h| h.paragraph_id).collect(),
     );
 
+    // Epistemic partitioning (backlog e7736ff6), in the same position as
+    // `tools::memory::recall`'s: after the dispute post-pass (nothing is
+    // `is_contested` before it, so bucketing earlier would leave
+    // `open_question` permanently empty), after `exclude_contested`'s retain,
+    // and after the audit spawn, which derives `returned_claim_ids` from
+    // `results` and must name exactly the hits that were served.
+    //
+    // The score is the SAME `truth_value` `min_truth` gates on, read back off
+    // the built hit rather than recomputed, so the bucket threshold and the
+    // gate cannot drift apart.
+    let (results, epistemic_partition) =
+        crate::types::split_epistemic(results, params.epistemic_partition, |h: &RecallHit| {
+            (h.truth_value, h.is_contested)
+        });
+
     success_json(&RecallWithContextResponse {
         results,
+        epistemic_partition,
         corpus_scope,
         centroid_dim_used: centroid_dim,
         recall_event_id: Some(event_id.to_string()),

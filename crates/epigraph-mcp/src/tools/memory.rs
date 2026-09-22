@@ -348,6 +348,15 @@ async fn recall_post_embed(
     // `truth_value` to the global DS cache, not to a per-perspective value) —
     // is never entered with a bad lens,
     // and the existence round-trips run ONCE, not per claim.
+    // Same up-front-validation rule as the lens below: a malformed
+    // `diversity_radius` is rejected BEFORE any retrieval runs, so a caller who
+    // mistyped it gets told instead of paying for a page and then losing it.
+    let diversity_radius = params
+        .diversity_radius
+        .map(crate::types::validate_diversity_radius)
+        .transpose()
+        .map_err(invalid_params)?;
+
     let lens = crate::tools::lens::resolve_lens(
         params.frame_id.as_deref(),
         params.perspective_id.as_deref(),
@@ -698,6 +707,76 @@ async fn recall_post_embed(
         }
     }
 
+    // Diversity post-filter (backlog a9397e8a): greedy MMR over the ranked
+    // page, dropping any hit within `diversity_radius` cosine distance of a
+    // hit already kept above it.
+    //
+    // Runs BEFORE the audit block below, which derives `returned_claim_ids`
+    // from `results`. An audit row naming claims the caller never received
+    // would be a false disclosure record, and this is the only post-filter on
+    // this surface that runs late enough to create one.
+    //
+    // Claim ids only. A workflow hit (`result_type = Some("workflow")`) carries
+    // a `workflows.id` in `claim_id` and has no row in `claims`, so it can
+    // neither be measured nor suppress anything — `greedy_diversity_keep`'s
+    // keep-on-unmeasurable rule covers it, and the filter below re-admits it
+    // explicitly rather than relying on a uuid from a foreign id-space failing
+    // to collide.
+    if let Some(radius) = diversity_radius {
+        let claim_ids: Vec<uuid::Uuid> = results
+            .iter()
+            .filter(|r| r.result_type.is_none())
+            .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
+            .collect();
+        // `recall`'s claims legs search `claims.embedding`, the 1536d column,
+        // on both the hybrid and the lexical-fallback path — there is no
+        // runtime dim choice here, unlike `recall_with_context`.
+        match ClaimRepository::pairwise_cosine_distance_at_dim(
+            &server.pool,
+            viewer,
+            &claim_ids,
+            radius,
+            1536,
+        )
+        .await
+        {
+            Ok(pairs) => {
+                // The repo already applied the `< radius` cut in SQL, so every
+                // returned pair IS a too-similar pair.
+                let too_similar: std::collections::HashSet<(uuid::Uuid, uuid::Uuid)> = pairs
+                    .iter()
+                    .map(|p| crate::types::unordered_pair(p.claim_a, p.claim_b))
+                    .collect();
+                let keep: std::collections::HashSet<uuid::Uuid> =
+                    crate::types::greedy_diversity_keep(&claim_ids, &too_similar)
+                        .into_iter()
+                        .collect();
+                results.retain(|r| {
+                    // Workflow hits, and any row whose id will not parse, are
+                    // outside the measured id-space entirely.
+                    if r.result_type.is_some() {
+                        return true;
+                    }
+                    match uuid::Uuid::parse_str(&r.claim_id) {
+                        Ok(id) => keep.contains(&id),
+                        Err(_) => true,
+                    }
+                });
+            }
+            Err(e) => {
+                // Degrade-not-fail, matching the lens and dispute post-passes
+                // above: serve the undiversified page rather than lose results
+                // already retrieved. Deliberately NOT a silent success — a
+                // caller reading the log can tell a page that was not filtered
+                // from one that had nothing to filter.
+                tracing::warn!(
+                    error = %e,
+                    "diversity filter failed; serving the page without it"
+                );
+            }
+        }
+    }
+
     // Id is minted HERE, not read back from the insert: the write is spawned,
     // so the response must be able to cite the event without awaiting it.
     let event_id = uuid::Uuid::new_v4();
@@ -750,6 +829,12 @@ async fn recall_post_embed(
             // after the label is renamed.
             "theme_id": theme_filter,
             "offset": offset,
+            // Recorded for the same reason as `since` and `theme_id`: it
+            // changes WHICH claims came back, so a retrieval whose diversity
+            // cut cannot be reconstructed from its audit row is an unauditable
+            // retrieval. `epistemic_partition` is deliberately NOT recorded —
+            // it regroups the response without changing the set.
+            "diversity_radius": params.diversity_radius,
         });
         let pool = server.pool.clone();
         tokio::spawn(async move {
@@ -781,8 +866,29 @@ async fn recall_post_embed(
         });
     }
 
+    // Epistemic partitioning (backlog e7736ff6). Runs LAST, on the page every
+    // other stage has already settled:
+    //
+    //  * AFTER the dispute post-pass — `is_contested` is `false` on every
+    //    result until that pass runs, so bucketing any earlier would leave
+    //    `open_question` permanently empty while every happy-path test still
+    //    passed.
+    //  * AFTER `exclude_contested`'s retain — partitioning rows that are about
+    //    to be dropped would be both wasted and misleading.
+    //  * AFTER the audit block — that block derives `returned_claim_ids` from
+    //    `results`, and this consumes `results` by value.
+    //
+    // The score is the SAME `truth_value` `min_truth` gates on above, read out
+    // of the already-built result rather than recomputed, so the threshold and
+    // the gate cannot come to disagree about what a claim's belief is.
+    let (results, epistemic_partition) =
+        crate::types::split_epistemic(results, params.epistemic_partition, |r| {
+            (r.truth_value, r.is_contested)
+        });
+
     success_json(&RecallEnvelope {
         results,
+        epistemic_partition,
         recall_event_id: Some(event_id.to_string()),
         // Echoed only when a theme scope or a page offset was actually
         // requested, so an unscoped recall's response stays byte-identical to
@@ -836,7 +942,16 @@ struct RecallPaging {
 /// PROV-O layer from PR #334).
 #[derive(serde::Serialize)]
 struct RecallEnvelope {
-    results: Vec<RecallResult>,
+    /// The flat RRF-ranked page. `None` — and therefore absent from the JSON —
+    /// exactly when `epistemic_partition=true` replaced it with the bucketed
+    /// shape below. `Some(vec![])` still serializes as `"results": []`, so a
+    /// zero-hit recall is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    results: Option<Vec<RecallResult>>,
+    /// The same page regrouped by epistemic status (backlog e7736ff6).
+    /// Present only when the caller asked for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epistemic_partition: Option<crate::types::EpistemicPartition<RecallResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

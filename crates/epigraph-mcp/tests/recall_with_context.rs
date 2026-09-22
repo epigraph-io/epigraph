@@ -589,6 +589,8 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
         graph_expansion_depth: None,
         exclude_contested: false,
         since: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     };
 
     let result = recall_with_context(&server, &viewer, params).await;
@@ -1013,6 +1015,8 @@ fn diverse_params_with_pool(
         graph_expansion_depth: None,
         exclude_contested: false,
         since: None,
+        epistemic_partition: false,
+        diversity_radius: None,
     }
 }
 
