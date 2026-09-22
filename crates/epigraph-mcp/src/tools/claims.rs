@@ -662,7 +662,7 @@ pub async fn verify_claim(
         //
         // Second query, on this branch only: the matching case needs no
         // `properties` read at all, so the common path is unchanged.
-        let properties = ClaimRepository::get_properties(&server.pool, claim_id)
+        let properties = ClaimRepository::get_properties(&server.pool, viewer, claim_id)
             .await
             .map_err(internal_error)?
             .unwrap_or(serde_json::Value::Null);

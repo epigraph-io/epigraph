@@ -956,20 +956,36 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, viewer))]
     pub async fn get_properties(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Option<serde_json::Value>, DbError> {
         let id: Uuid = claim_id.into();
         // Runtime `query_scalar`, not the `query!` macro: adding a macro call
         // would require regenerating `.sqlx`.
-        let props: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT COALESCE(properties, '{}'::jsonb) FROM claims WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+        //
+        // Viewer-scoped like every other claim read. This one took `&PgPool`
+        // rather than `PgConnection`/`PgExecutor` and never called `splice`, so
+        // it sat in the one gap none of the four ratchets cover:
+        // `every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt` selects on
+        // `PgConnection`, `every_executor_taking_repo_fn_...` on `PgExecutor`,
+        // `every_spliced_statement_carries_the_canonical_marker_spelling` on
+        // `.splice(`, and `no_unscoped_pool` scans handler call sites for
+        // `state.db_pool` (this caller is MCP, on `server.pool`). A passing test
+        // suite was no evidence either way: `splice` panics on a missing marker,
+        // but only for statements that call it at all.
+        let sql = viewer.splice(
+            "SELECT COALESCE(properties, '{}'::jsonb) FROM claims \
+             WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let props: Option<serde_json::Value> = q.fetch_optional(pool).await?;
         Ok(props)
     }
 
