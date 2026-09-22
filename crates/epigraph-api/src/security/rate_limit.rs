@@ -16,8 +16,17 @@ use chrono::{DateTime, Utc};
 use epigraph_core::domain::AgentId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use thiserror::Error;
+
+/// How often, at most, [`AgentRateLimiter`] sweeps idle per-key buckets.
+///
+/// The sweep is amortised onto the request path (the first check after the
+/// interval elapses pays an O(keys) pass), so there is no background task to
+/// own or shut down. Ten seconds keeps the table near the working set: a
+/// bucket touched once refills in `60 / rpm` seconds, and a fully drained one
+/// in at most 60 seconds whatever its rpm.
+const IDLE_SWEEP_INTERVAL_SECS: i64 = 10;
 
 /// Error returned when rate limit is exceeded
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -150,6 +159,11 @@ pub struct AgentRateLimiter {
     global_bucket: Arc<RwLock<TokenBucket>>,
     /// Custom limits per agent (requests per minute)
     agent_limits: Arc<RwLock<HashMap<AgentId, u32>>>,
+    /// When `agent_buckets` was last swept of idle entries. Locked inside
+    /// `check_agent` under `agent_buckets`' write lock, and by `advance_time`
+    /// on its own; neither holds it while taking another lock, so no
+    /// lock-order cycle exists.
+    last_sweep: Arc<Mutex<DateTime<Utc>>>,
 }
 
 impl AgentRateLimiter {
@@ -166,6 +180,7 @@ impl AgentRateLimiter {
             agent_buckets: Arc::new(RwLock::new(HashMap::new())),
             global_bucket: Arc::new(RwLock::new(global_bucket)),
             agent_limits: Arc::new(RwLock::new(HashMap::new())),
+            last_sweep: Arc::new(Mutex::new(Utc::now())),
         }
     }
 
@@ -247,6 +262,7 @@ impl AgentRateLimiter {
             .agent_buckets
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.sweep_idle_if_due(&mut buckets);
         let limit = self.get_agent_limit(agent_id);
 
         let bucket = buckets
@@ -263,6 +279,53 @@ impl AgentRateLimiter {
                 limit,
             }
         })
+    }
+
+    /// Drop every bucket that has refilled to capacity, at most once per
+    /// [`IDLE_SWEEP_INTERVAL_SECS`].
+    ///
+    /// # Why this exists
+    ///
+    /// Buckets were created per key on first sight and removed only by
+    /// [`Self::reset_agent`], so the table grew by one entry for every distinct
+    /// key the limiter was ever asked about. Keyed by client address, that is
+    /// memory an unauthenticated caller can grow without bound just by
+    /// arriving from new addresses.
+    ///
+    /// # Why evicting a FULL bucket is exact, not approximate
+    ///
+    /// A bucket is created full. A bucket that has refilled to capacity is
+    /// therefore indistinguishable from the one `check_agent` would create for
+    /// that key on its next request, so dropping it changes no decision the
+    /// limiter makes. A bucket that is still below capacity is kept: evicting
+    /// it would hand a throttled caller a fresh quota, which is a bypass.
+    fn sweep_idle_if_due(&self, buckets: &mut HashMap<AgentId, TokenBucket>) {
+        let now = Utc::now();
+        {
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if now.signed_duration_since(*last)
+                < chrono::Duration::seconds(IDLE_SWEEP_INTERVAL_SECS)
+            {
+                return;
+            }
+            *last = now;
+        }
+        buckets.retain(|_, bucket| {
+            bucket.refill();
+            bucket.tokens < bucket.max_tokens
+        });
+    }
+
+    /// Number of keys that currently hold a bucket (for monitoring and tests).
+    #[must_use]
+    pub fn tracked_keys(&self) -> usize {
+        self.agent_buckets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     /// Get the rate limit for a specific agent
@@ -365,7 +428,16 @@ impl AgentRateLimiter {
     /// This method is intended for testing only. Do not use in production code.
     pub fn advance_time(&self, duration: chrono::Duration) {
         // For testing, we manually adjust the last_refill time backwards
-        // to simulate time passing
+        // to simulate time passing. The idle-sweep clock moves with them, so
+        // a simulated interval makes a sweep due exactly as real time would.
+        {
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *last -= duration;
+        }
+
         {
             let mut bucket = self
                 .global_bucket
@@ -463,6 +535,58 @@ mod tests {
             Ok(()),
             "a bystander's first request must not be refused because another \
              caller's rejected requests spent the shared quota"
+        );
+    }
+
+    /// Churning through keys must not grow the table without bound: once the
+    /// sweep interval has passed and the buckets have refilled, they go.
+    #[test]
+    fn idle_buckets_are_evicted_once_they_have_refilled() {
+        let limiter = AgentRateLimiter::new(RateLimitConfig {
+            default_rpm: 60,
+            global_rpm: 1000,
+            replenish_interval_secs: 1,
+            enable_global_limit: false,
+        });
+        for _ in 0..1000 {
+            assert!(limiter.check(&AgentId::new()).is_ok());
+        }
+        assert_eq!(limiter.tracked_keys(), 1000);
+
+        limiter.advance_time(chrono::Duration::seconds(61));
+        assert!(limiter.check(&AgentId::new()).is_ok());
+
+        assert_eq!(
+            limiter.tracked_keys(),
+            1,
+            "every refilled bucket must be swept; only the key just checked remains"
+        );
+    }
+
+    /// The converse, and the one that matters for correctness: a bucket that
+    /// is still below capacity survives the sweep, so eviction can never hand
+    /// a throttled caller a fresh quota.
+    #[test]
+    fn a_drained_bucket_survives_the_sweep_and_stays_throttled() {
+        let limiter = AgentRateLimiter::new(RateLimitConfig {
+            default_rpm: 2,
+            global_rpm: 1000,
+            replenish_interval_secs: 60,
+            enable_global_limit: false,
+        });
+        let throttled = AgentId::new();
+        assert!(limiter.check(&throttled).is_ok());
+        assert!(limiter.check(&throttled).is_ok());
+        assert!(limiter.check(&throttled).is_err(), "quota of 2 is spent");
+
+        // Due for a sweep, but 10s at 2 rpm refills only a third of a token.
+        limiter.advance_time(chrono::Duration::seconds(IDLE_SWEEP_INTERVAL_SECS));
+        assert!(limiter.check(&AgentId::new()).is_ok(), "triggers the sweep");
+
+        assert_eq!(limiter.tracked_keys(), 2, "the drained bucket is kept");
+        assert!(
+            limiter.check(&throttled).is_err(),
+            "a sweep must not reset a throttled caller's quota"
         );
     }
 
