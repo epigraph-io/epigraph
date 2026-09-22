@@ -51,12 +51,42 @@
 -- 056-059 plus 091 and 093 are already taken on main. 094 is the first free
 -- version.
 --
--- IDEMPOTENT
--- `ON CONFLICT (type_name) DO NOTHING`: a no-op on any database that already
--- acquired the row from the episcience stopgap (that row would be is_core=false,
--- and this migration deliberately does NOT promote it — flipping is_core under a
--- live downstream registrar is a separate decision, and edge writability, the
--- thing this migration exists to restore, holds either way).
+-- IDEMPOTENT — AND IT ASSERTS ITS END STATE, NOT MERELY THE ROW'S PRESENCE
+-- This migration originally used `ON CONFLICT (type_name) DO NOTHING`. That was
+-- wrong, and MEASURED to be wrong, not hypothetically: on the local `epigraph`
+-- database (at migration 59),
+--   SELECT type_name, schema_name, table_name, id_column, is_optional, is_core
+--     FROM entity_types WHERE type_name='method';
+-- returns `method|public|methods|id|f|f` — the row ALREADY EXISTS with
+-- is_core = FALSE, acquired from episcience's downstream stopgap
+-- (episcience `migrations/5000_register_entity_types.sql`, which registers
+-- ('method','public','methods','id',false,false)). On any such database
+-- DO NOTHING makes this migration a silent no-op and leaves is_core = false —
+-- while the DECISION section above claims the row is API-immutable because
+-- `EntityTypeRepository::register` carries `WHERE entity_types.is_core = false`.
+-- With DO NOTHING that hijack guard does not exist there: any client holding the
+-- registry scope can re-point a kernel-owned table's type.
+--
+-- `ON CONFLICT (type_name) DO UPDATE` fixes that by asserting the END STATE,
+-- which is correct whether or not the row pre-exists. Every column is set from
+-- EXCLUDED rather than only is_core, because ownership of the type name is what
+-- transfers: schema/table/id_column are what `validate_edge_reference`
+-- interpolates, and a downstream row pointing them elsewhere is exactly the
+-- ownership smell this seed resolves. In the one pre-existing shape actually
+-- observed (episcience's) those three columns already match, so the update
+-- narrows to is_core plus the description/registered_by provenance.
+--
+-- Deliberately NOT guarded on `WHERE is_core = false`: the statement must be
+-- re-runnable to the same end state, and there is no state in which the kernel
+-- wants its own `method` row left non-core.
+--
+-- PROD IS UNVERIFIED FROM THE DEV HOST. Do not assume either shape there. After
+-- deploying, confirm the end state directly:
+--   SELECT type_name, schema_name, table_name, id_column, is_optional, is_core
+--     FROM entity_types WHERE type_name = 'method';   -- expect: … |f|t
+-- and confirm `SELECT version FROM _sqlx_migrations WHERE version = 94` is
+-- absent BEFORE migrating (the deprecating internal-main carries a DIFFERENT
+-- 094_stop_truth_value_overwrite.sql; a checksum collision crash-loops the API).
 --
 -- The `validate_edge_reference` trigger needs no change: 'method' is absent from
 -- its hardcoded fast-path arms and therefore resolves through the
@@ -66,6 +96,23 @@
 -- method->claim edge end-to-end (so both gates are exercised, not just the row's
 -- presence) and includes a delete-the-row control that reproduces the refusal.
 
-INSERT INTO entity_types (type_name, schema_name, table_name, id_column, is_optional, is_core)
-VALUES ('method', 'public', 'methods', 'id', false, true)
-ON CONFLICT (type_name) DO NOTHING;
+INSERT INTO entity_types (
+    type_name, schema_name, table_name, id_column,
+    is_optional, is_core, registered_by, description
+)
+VALUES (
+    'method', 'public', 'methods', 'id',
+    false, true, NULL,
+    'Research method entity; kernel-owned public.methods (migration 001). '
+    'Seeded core by kernel migration 094, superseding episcience''s '
+    'non-core downstream stopgap registration.'
+)
+ON CONFLICT (type_name) DO UPDATE SET
+    schema_name   = EXCLUDED.schema_name,
+    table_name    = EXCLUDED.table_name,
+    id_column     = EXCLUDED.id_column,
+    is_optional   = EXCLUDED.is_optional,
+    is_core       = EXCLUDED.is_core,
+    registered_by = EXCLUDED.registered_by,
+    description   = EXCLUDED.description,
+    updated_at    = now();
