@@ -372,18 +372,32 @@ async fn seed_paragraph_3072(
     content: &str,
     pgvec_3072: &str,
 ) -> Uuid {
+    seed_paragraph_3072_at_truth(pool, agent, paper, content, 0.8, pgvec_3072).await
+}
+
+/// [`seed_paragraph_3072`] with a caller-chosen `truth_value`, so a fixture can
+/// straddle a `min_truth` threshold.
+async fn seed_paragraph_3072_at_truth(
+    pool: &PgPool,
+    agent: Uuid,
+    paper: Uuid,
+    content: &str,
+    truth: f64,
+    pgvec_3072: &str,
+) -> Uuid {
     let id = Uuid::new_v4();
     let mut hash = vec![0u8; 32];
     hash[..16].copy_from_slice(id.as_bytes());
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, properties, embedding_3072) \
-         VALUES ($1, $2, $3, $4, 0.8, jsonb_build_object('level', 2::int), $5::vector)",
+         VALUES ($1, $2, $3, $4, $6, jsonb_build_object('level', 2::int), $5::vector)",
     )
     .bind(id)
     .bind(content)
     .bind(hash)
     .bind(agent)
     .bind(pgvec_3072)
+    .bind(truth)
     .execute(pool)
     .await
     .expect("seed paragraph");
@@ -519,5 +533,172 @@ async fn recall_with_context_measures_diversity_in_the_retrieved_dim(pool: PgPoo
     assert!(
         filtered.contains(&distinct.to_string()),
         "the orthogonal paragraph survives; got {filtered:?}"
+    );
+}
+
+/// A hit that another filter is about to drop must not be allowed to SUPPRESS
+/// one that would have survived.
+///
+/// `recall_with_context` applies `min_truth` after context assembly, while the
+/// diversity pass runs on the seed set. Order them naively and a low-truth
+/// paragraph ranked first can evict its high-truth near-duplicate, and then be
+/// dropped itself by `min_truth` — so switching on a DE-DUPLICATION filter
+/// deletes the good paragraph and returns an empty page, when the same query
+/// without it returns the good one.
+///
+/// `near_low` is embedded exactly on the query vector so it ranks first;
+/// `near_high` is its near-duplicate one rank down. `min_truth=0.5` sits
+/// between their truth values.
+///
+/// `recall`'s twin below pins the same property on the other surface, where
+/// `min_truth` and `exclude_contested` already run before the diversity pass.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let paper = seed_paper(&pool, "10.9999/diversity.2").await;
+    let query_vec = cluster_pgvec(3072, 0, 1.0);
+
+    let near_low = seed_paragraph_3072_at_truth(
+        &pool,
+        agent,
+        paper,
+        "low-confidence paragraph on the coefficient",
+        0.2,
+        &cluster_pgvec(3072, 0, 1.0),
+    )
+    .await;
+    let near_high = seed_paragraph_3072_at_truth(
+        &pool,
+        agent,
+        paper,
+        "high-confidence paragraph on the coefficient",
+        0.9,
+        &cluster_pgvec(3072, 0, 0.98),
+    )
+    .await;
+
+    let server = build_test_server(pool);
+    let ids = |env: &Value| -> Vec<String> {
+        env["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .map(|h| {
+                h["paragraph_id"]
+                    .as_str()
+                    .expect("paragraph_id")
+                    .to_string()
+            })
+            .collect()
+    };
+    let with_min_truth = |radius: Option<f64>| {
+        let mut p = ctx_params(radius);
+        p.min_truth = Some(0.5);
+        p
+    };
+
+    // Baseline: `min_truth` alone drops the 0.2 paragraph and keeps the 0.9 one.
+    let base = ids(&envelope(
+        recall_with_context_with_pgvec(&server, &viewer, with_min_truth(None), 3072, &query_vec)
+            .await
+            .expect("baseline ok"),
+    ));
+    assert_eq!(
+        base,
+        vec![near_high.to_string()],
+        "precondition: without the radius, min_truth leaves exactly the 0.9 paragraph"
+    );
+    assert!(!base.contains(&near_low.to_string()));
+
+    // Adding a de-duplication filter must not take the survivor with it.
+    let filtered = ids(&envelope(
+        recall_with_context_with_pgvec(
+            &server,
+            &viewer,
+            with_min_truth(Some(RADIUS)),
+            3072,
+            &query_vec,
+        )
+        .await
+        .expect("filtered ok"),
+    ));
+    assert!(
+        filtered.contains(&near_high.to_string()),
+        "switching on diversity_radius must not delete a hit that survives every \
+         other filter, by letting a min_truth-doomed duplicate evict it first. \
+         base={base:?} filtered={filtered:?}"
+    );
+}
+
+/// The `recall` twin: a contested hit that `exclude_contested` is about to drop
+/// must not evict its clean near-duplicate first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_recall_a_contested_hit_cannot_suppress_its_clean_duplicate(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let query_vec = cluster_pgvec(1536, 0, 1.0);
+
+    let contested = seed_claim(
+        &pool,
+        agent,
+        "vantril throughput ceiling reported at ambient",
+        Some(&cluster_pgvec(1536, 0, 1.0)),
+    )
+    .await;
+    let clean = seed_claim(
+        &pool,
+        agent,
+        "vantril throughput ceiling reported under ambient",
+        Some(&cluster_pgvec(1536, 0, 0.98)),
+    )
+    .await;
+    let rebuttal = seed_claim(&pool, agent, "vantril ceiling rebuttal", None).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
+         VALUES ($1, $2, 'claim', 'claim', 'contradicts')",
+    )
+    .bind(rebuttal)
+    .bind(contested)
+    .execute(&pool)
+    .await
+    .expect("seed dispute edge");
+
+    let server = build_test_server(pool);
+    let with_exclude = |radius: Option<f64>| {
+        let mut p = params("vantril throughput ceiling", radius, false);
+        p.exclude_contested = true;
+        p
+    };
+
+    let base = result_ids(&envelope(
+        recall_with_pgvec(
+            &server,
+            &viewer,
+            with_exclude(None),
+            Some(query_vec.clone()),
+        )
+        .await
+        .expect("baseline ok"),
+    ));
+    assert!(
+        base.contains(&clean.to_string()) && !base.contains(&contested.to_string()),
+        "precondition: exclude_contested alone leaves the clean duplicate. got {base:?}"
+    );
+
+    let filtered = result_ids(&envelope(
+        recall_with_pgvec(
+            &server,
+            &viewer,
+            with_exclude(Some(RADIUS)),
+            Some(query_vec),
+        )
+        .await
+        .expect("filtered ok"),
+    ));
+    assert!(
+        filtered.contains(&clean.to_string()),
+        "a contested hit that exclude_contested drops must not evict its clean \
+         near-duplicate on the way out. base={base:?} filtered={filtered:?}"
     );
 }

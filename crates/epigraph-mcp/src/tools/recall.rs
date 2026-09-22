@@ -262,10 +262,15 @@ pub struct RecallWithContextParams {
     /// Hits whose distance cannot be MEASURED are always KEPT — a paragraph
     /// with no vector in the searched column is not known to be near anything.
     ///
-    /// Runs BEFORE structural context is compared but AFTER ranking, rerank and
-    /// graph expansion, so it de-duplicates whatever seed set those stages
-    /// produced. A value outside the range is REJECTED, not clamped. Default:
-    /// no diversity filtering.
+    /// Runs LAST, after `min_truth`, `exclude_contested` and the
+    /// missing-paper-attribution drop, so only a hit that is ITSELF being
+    /// returned can suppress another. Ordering it earlier would let a paragraph
+    /// those filters are about to discard evict its surviving near-duplicate on
+    /// the way out — which makes switching on a de-duplication filter DELETE a
+    /// hit rather than merely de-duplicate.
+    ///
+    /// A value outside the range is REJECTED, not clamped. Default: no
+    /// diversity filtering.
     #[serde(default)]
     pub diversity_radius: Option<f64>,
 }
@@ -1050,63 +1055,6 @@ async fn recall_with_context_post_embed(
     // may have been widened above.
     raw_hits.truncate(want);
 
-    // Stage 4.6: diversity post-filter (backlog a9397e8a). Greedy MMR over the
-    // ranked seed set, dropping any hit within `diversity_radius` cosine
-    // distance of a hit already kept above it.
-    //
-    // Placed HERE, after truncation and before `fetch_batched_context`, for two
-    // reasons. It de-duplicates whatever seed set the diverse / rerank / graph-
-    // expansion stages actually produced, rather than the raw ANN order; and
-    // context enrichment is the expensive stage on this tool (siblings, atoms,
-    // corroborates, neighbour paragraphs, all fanned out per hit), so dropping
-    // a redundant paragraph before it runs is strictly cheaper than dropping it
-    // after. It is also comfortably ahead of `spawn_recall_audit`, which
-    // derives its `returned_claim_ids` from the final `results`.
-    //
-    // `centroid_dim` — NOT a hardcoded 1536. This tool auto-detects its vector
-    // space, and measuring a 3072-retrieved page against `claims.embedding`
-    // would compare vectors that were never comparable, or find no pairs at all
-    // on a corpus embedded only at 3072 and silently report a perfectly diverse
-    // page.
-    if let Some(radius) = diversity_radius {
-        let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
-        match epigraph_db::ClaimRepository::pairwise_cosine_distance_at_dim(
-            &server.pool,
-            viewer,
-            &ids,
-            radius,
-            centroid_dim,
-        )
-        .await
-        {
-            Ok(pairs) => {
-                // The repo applied the `< radius` cut in SQL, so every returned
-                // pair IS a too-similar pair. A pair that is ABSENT is kept —
-                // see `greedy_diversity_keep`; a paragraph with no vector in
-                // the searched column is not known to be near anything.
-                let too_similar: std::collections::HashSet<(Uuid, Uuid)> = pairs
-                    .iter()
-                    .map(|p| crate::types::unordered_pair(p.claim_a, p.claim_b))
-                    .collect();
-                let keep: std::collections::HashSet<Uuid> =
-                    crate::types::greedy_diversity_keep(&ids, &too_similar)
-                        .into_iter()
-                        .collect();
-                raw_hits.retain(|h| keep.contains(&h.claim_id));
-            }
-            Err(e) => {
-                // Degrade-not-fail, matching the lens and dispute post-passes:
-                // serve the undiversified page rather than lose hits already
-                // retrieved, and say so in the log so an unfiltered page is
-                // distinguishable from one with nothing to filter.
-                tracing::warn!(
-                    error = %e,
-                    "diversity filter failed; serving the page without it"
-                );
-            }
-        }
-    }
-
     // Stage 5: batch context fetches.
     let paragraph_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
     let ctx = fetch_batched_context(
@@ -1317,6 +1265,78 @@ async fn recall_with_context_post_embed(
         // `min_truth`).
         if params.exclude_contested {
             results.retain(|h| !h.is_contested);
+        }
+    }
+
+    // Diversity post-filter (backlog a9397e8a): greedy MMR over the ranked
+    // page, dropping any hit within `diversity_radius` cosine distance of a hit
+    // already kept above it.
+    //
+    // # Why this runs LAST, not on the seed set
+    //
+    // An earlier revision ran it right after `raw_hits.truncate(want)`, which
+    // is cheaper — a dropped paragraph never pays for its siblings, atoms,
+    // corroborates and neighbour fan-out in `fetch_batched_context`. It is also
+    // WRONG, and the test
+    // `a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one` pins the
+    // exact failure: on this surface `min_truth` is applied AFTER context
+    // assembly, so a low-truth paragraph ranked first could evict its
+    // high-truth near-duplicate and then be dropped itself by `min_truth`. The
+    // measured result was a page that returned the 0.9 paragraph WITHOUT the
+    // radius and nothing at all WITH it — switching on a de-duplication filter
+    // deleted the good hit. `exclude_contested` and the missing-paper drop have
+    // the same shape.
+    //
+    // Running last makes the rule "a hit may only be suppressed by a hit that
+    // is itself being returned", and makes this surface agree with
+    // `tools::memory::recall`, where `min_truth` and `exclude_contested`
+    // already ran first. The lost saving is bounded and buys correctness.
+    //
+    // Still ahead of `spawn_recall_audit` below, which derives
+    // `returned_claim_ids` from `results`: an audit row naming paragraphs the
+    // caller never received would be a false disclosure record.
+    //
+    // `centroid_dim` — NOT a hardcoded 1536. This tool auto-detects its vector
+    // space, and measuring a 3072-retrieved page against `claims.embedding`
+    // would compare vectors that were never comparable, or find no pairs at all
+    // on a corpus embedded only at 3072 and silently report a perfectly diverse
+    // page.
+    if let Some(radius) = diversity_radius {
+        let ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
+        match epigraph_db::ClaimRepository::pairwise_cosine_distance_at_dim(
+            &server.pool,
+            viewer,
+            &ids,
+            radius,
+            centroid_dim,
+        )
+        .await
+        {
+            Ok(pairs) => {
+                // The repo applied the `< radius` cut in SQL, so every returned
+                // pair IS a too-similar pair. A pair that is ABSENT is kept —
+                // see `greedy_diversity_keep`; a paragraph with no vector in
+                // the searched column is not known to be near anything.
+                let too_similar: std::collections::HashSet<(Uuid, Uuid)> = pairs
+                    .iter()
+                    .map(|p| crate::types::unordered_pair(p.claim_a, p.claim_b))
+                    .collect();
+                let keep: std::collections::HashSet<Uuid> =
+                    crate::types::greedy_diversity_keep(&ids, &too_similar)
+                        .into_iter()
+                        .collect();
+                results.retain(|h| keep.contains(&h.paragraph_id));
+            }
+            Err(e) => {
+                // Degrade-not-fail, matching the lens and dispute post-passes:
+                // serve the undiversified page rather than lose hits already
+                // retrieved, and say so in the log so an unfiltered page is
+                // distinguishable from one with nothing to filter.
+                tracing::warn!(
+                    error = %e,
+                    "diversity filter failed; serving the page without it"
+                );
+            }
         }
     }
 
