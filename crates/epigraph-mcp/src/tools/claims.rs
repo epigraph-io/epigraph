@@ -664,6 +664,13 @@ pub async fn update_with_evidence(
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
 
+    // Same placement rule as `submit_claim`: validate the caller's labels
+    // before anything is written. The additive label merge at the bottom of
+    // this function runs AFTER the Evidence insert, the DS/BBA wiring and the
+    // truth_value update, so a rejection there would move the claim's belief
+    // on the strength of a submission the caller was told had failed.
+    epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
+
     let claim = ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
@@ -742,7 +749,7 @@ pub async fn update_with_evidence(
     if !params.labels.is_empty() {
         ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
             .await
-            .map_err(internal_error)?;
+            .map_err(db_caller_error)?;
     }
 
     // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
@@ -1009,9 +1016,13 @@ pub async fn update_labels(
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
+    // `db_caller_error`, not `internal_error`: a label refused by
+    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
+    // repo layer refuses it inside the same statement that would have written
+    // it, so nothing is persisted — only the reported code was wrong here.
     let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
         .await
-        .map_err(internal_error)?;
+        .map_err(db_caller_error)?;
     success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
 }
 
@@ -1045,7 +1056,7 @@ pub async fn patch_claim(
         },
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(db_caller_error)?;
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "claim_id": id,

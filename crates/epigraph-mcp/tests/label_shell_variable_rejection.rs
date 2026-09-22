@@ -212,3 +212,97 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
         "the refused entry must leave no orphan claim"
     );
 }
+
+/// The `update_labels` tool: the repo layer refuses the value inside the same
+/// statement that would have written it, so the write half was already safe —
+/// what this pins is that the caller is TOLD it is a caller error
+/// (INVALID_PARAMS), and that the well-formed sibling in the same `add` array
+/// does not land either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_labels_tool_rejects_unexpanded_add_and_changes_nothing(pool: PgPool) {
+    let claim_id =
+        seed_claim_with_labels(&pool, "update_labels tool guard subject", &["keeper"]).await;
+    let server = build_test_server(pool.clone());
+
+    let err = epigraph_mcp::tools::claims::update_labels(
+        &server,
+        epigraph_mcp::types::UpdateLabelsParams {
+            claim_id: claim_id.to_string(),
+            add: vec!["good-label".into(), BAD_LABEL.into()],
+            remove: vec![],
+        },
+    )
+    .await
+    .expect_err("an unexpanded shell variable must be refused");
+
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "got {err:?}"
+    );
+
+    let (labels,): (Vec<String>,) = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("claim row");
+    assert_eq!(
+        labels,
+        vec!["keeper".to_string()],
+        "a refused add array must leave claims.labels byte-for-byte unchanged"
+    );
+}
+
+/// `update_with_evidence` applies its label merge only AFTER inserting the
+/// Evidence row, wiring the DS/BBA state and rewriting `truth_value`. A
+/// rejection at that point would move a claim's belief on the strength of a
+/// call the caller was told had failed, so the guard must run first: no
+/// evidence row may exist for the claim afterwards.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_rejects_unexpanded_label_before_writing_evidence(pool: PgPool) {
+    let claim_id =
+        seed_claim_with_labels(&pool, "update_with_evidence guard subject", &["keeper"]).await;
+    let server = build_test_server(pool.clone());
+
+    let err = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        epigraph_mcp::types::UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
+            claim_id: claim_id.to_string(),
+            evidence_type: "empirical".into(),
+            evidence_data: "re-confirmed".into(),
+            source_url: None,
+            supports: true,
+            strength: 0.7,
+            labels: vec![BAD_LABEL.into()],
+        },
+    )
+    .await
+    .expect_err("an unexpanded shell variable must be refused");
+
+    // Ordering half first, so the pre-fix failure this reproduces is the
+    // partial write itself rather than the reported error code.
+    let evidence_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM evidence WHERE claim_id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count evidence");
+    assert_eq!(
+        evidence_rows, 0,
+        "a refused update_with_evidence must not have inserted evidence first"
+    );
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "got {err:?}"
+    );
+
+    let (labels,): (Vec<String>,) = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("claim row");
+    assert_eq!(labels, vec!["keeper".to_string()]);
+}
