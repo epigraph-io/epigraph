@@ -372,6 +372,115 @@ impl WorkflowRepository {
         }
     }
 
+    /// The author (`claims.agent_id`) of the FLAT workflow claim `workflow_id`,
+    /// when the viewer can read it. `None` when there is no such claim, when it
+    /// is not labelled `'workflow'`, or when it is outside the viewer's
+    /// visibility. Those three cases are deliberately indistinguishable.
+    ///
+    /// This is `DELETE /api/v1/workflows/:id`'s authorization read
+    /// (F-write-authz-reads-unfiltered). The route used to answer
+    /// "does this workflow exist" with an inline, UNFILTERED
+    /// `SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)` and
+    /// then write. That let a caller act on a claim it cannot read, and the
+    /// 404-vs-200 difference told it whether a private workflow existed. The
+    /// route answers 404 on `None` and passes `Some(author)` to its owner gate.
+    ///
+    /// It is a READ, and it carries the READ marker on purpose. Whether the
+    /// caller may WRITE the row is decided by the `{WRITABLE:c}` predicate on
+    /// the `UPDATE` itself ([`Self::deprecate_flat_workflow`]). Folding write
+    /// intent into this probe would turn "readable but not writable" into a
+    /// 404, a false statement about a row the caller can see.
+    /// `Viewer::splice_write` also refuses a statement that carries a read
+    /// marker.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn flat_workflow_author<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let sql = viewer.splice(
+            "SELECT c.agent_id FROM claims c \
+             WHERE c.id = $1 AND 'workflow' = ANY(c.labels) \
+               /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(executor).await
+    }
+
+    /// Deprecate the flat workflow claim `workflow_id`, but only if the viewer
+    /// may WRITE it. Mirror the deprecation onto the hierarchical `workflows`
+    /// row with the same id, when one exists.
+    ///
+    /// The write half of `DELETE /api/v1/workflows/:id`
+    /// (F-write-authz-reads-unfiltered). The route previously called
+    /// [`ClaimRepository::deprecate_claim`], which constrains by id alone, and
+    /// then [`Self::set_truth_value`] as a second, independent statement. It
+    /// discarded both results. This function makes three changes:
+    ///
+    /// * **The `claims` `UPDATE` carries `/* {WRITABLE:c} */`**, spliced by
+    ///   [`crate::visibility::Viewer::splice_write`] and bound from
+    ///   `writable_bind()`, the `admin`/`writer` subset. It is the same
+    ///   predicate migration 077's `claims_tenancy` `WITH CHECK` applies to an
+    ///   application role. Without it, the in-query gate and the policy would
+    ///   disagree once the request path connects as one. Before this, the only
+    ///   gate was a read the route ran first, and a read followed by an
+    ///   id-only `UPDATE` does not check the row that actually gets written.
+    /// * **The `workflows` mirror is gated by the same predicate.** It runs in a
+    ///   data-modifying CTE that consumes the `claims` `UPDATE`'s `RETURNING`,
+    ///   so it touches nothing when the claim write was refused. `workflows`
+    ///   has no tenancy of its own (measured at migration head 100:
+    ///   `information_schema.columns` has neither `visibility` nor
+    ///   `owner_group_id`, and `relrowsecurity` is false), so gating it through
+    ///   the claim that shares its id is the only gate it can have.
+    /// * **The embedding is nulled in the same statement**, as
+    ///   [`ClaimRepository::deprecate_claim`] does (CLAUDE.md "Embedding
+    ///   policy → Cleanup paths"): the row leaves `is_current`.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the claim was written. `false` when no row matched: no such
+    /// claim, or a claim the viewer may not write. The caller has already
+    /// established that the claim exists and is readable, so for that caller
+    /// `false` means "not writable".
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn deprecate_flat_workflow<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = viewer.splice_write(
+            "WITH deprecated AS ( \
+                 UPDATE claims AS c \
+                    SET truth_value = 0.05, is_current = false, embedding = NULL, \
+                        updated_at = NOW() \
+                  WHERE c.id = $1 \
+                    /* {WRITABLE:c} */ \
+                 RETURNING c.id \
+             ), mirrored AS ( \
+                 UPDATE workflows AS w SET truth_value = 0.05 \
+                  WHERE w.id IN (SELECT id FROM deprecated) \
+                 RETURNING w.id \
+             ) \
+             SELECT COUNT(*) FROM deprecated",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(workflow_id);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$2` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.fetch_one(executor).await? > 0)
+    }
+
     /// Find all descendants of a workflow via `variant_of` or `supersedes` edges
     /// (for cascade deprecation).
     pub async fn find_descendants<'e, E: sqlx::PgExecutor<'e>>(

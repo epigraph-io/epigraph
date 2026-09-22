@@ -25,7 +25,14 @@ async fn deprecate_workflow_cascade_walks_supersedes_edges() {
 
     // Seed: a workflow root + a variant linked via 'supersedes' edge (the
     // post-PR shape produced by improve_workflow). Both labeled 'workflow'.
+    //
+    // Both are declared public on the author's personal group, and the request
+    // is made AS that author: the route now requires `claims:write`, ownership
+    // (or `claims:admin`) and a writable owning group for every claim it
+    // deprecates (F-write-authz-reads-unfiltered). An undeclared insert would
+    // land in the seed group, which nobody can write.
     let agent = common::seed_system_agent(&pool).await;
+    let agent_group = common::personal_group_of(&pool, agent).await;
     let root = Uuid::new_v4();
     let variant = Uuid::new_v4();
     let root_hash: Vec<u8> = root.as_bytes().iter().copied().cycle().take(32).collect();
@@ -38,15 +45,17 @@ async fn deprecate_workflow_cascade_walks_supersedes_edges() {
         .collect();
 
     sqlx::query(
-        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels) \
-         VALUES ($1, 'root', $2, 0.5, $3, true, ARRAY['workflow']::text[]), \
-                ($4, 'variant', $5, 0.5, $3, true, ARRAY['workflow']::text[])",
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'root', $2, 0.5, $3, true, ARRAY['workflow']::text[], 'public', $6), \
+                ($4, 'variant', $5, 0.5, $3, true, ARRAY['workflow']::text[], 'public', $6)",
     )
     .bind(root)
     .bind(&root_hash)
     .bind(agent)
     .bind(variant)
     .bind(&var_hash)
+    .bind(agent_group)
     .execute(&pool)
     .await
     .unwrap();
@@ -64,7 +73,7 @@ async fn deprecate_workflow_cascade_walks_supersedes_edges() {
     .unwrap();
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
+    let token = common::test_bearer_token_for_principal(agent, &["claims:write"]);
 
     let resp = reqwest::Client::new()
         .delete(format!(

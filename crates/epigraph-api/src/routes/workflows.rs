@@ -12,7 +12,7 @@
 //! - `DELETE /api/v1/workflows/:id`            - Deprecate workflow
 //! - `POST   /api/v1/workflows/:id/behavioral-executions` - Record behavioral execution
 //!
-//! # Tenancy: 10 of this file's 40 raw-pool sites are converted
+//! # Tenancy: 14 of this file's 40 raw-pool sites are converted
 //!
 //! Conversion shard 7 — the last read shard. `search_workflows` (6 sites),
 //! `find_workflow_hierarchical` (3) and `list_workflows` (1) each assemble their
@@ -82,8 +82,15 @@
 //! still interpolate their `DbError` and are left alone, because that class
 //! belongs to `F-route-error-text-remainder` and not to a read shard.
 //!
-//! The other 30 sites are NOT converted. 28 sit in WRITE handlers
-//! (`store_workflow`, `report_outcome`, `deprecate_workflow`,
+//! Four more are `deprecate_workflow`'s, and they are the first WRITE-handler
+//! sites in this file on `ScopedPool::begin_as`: its authorization read,
+//! cascade walk and writes share one viewer-stamped transaction. Its fifth
+//! site, the best-effort `workflow.deprecated` event after commit, still reads
+//! the raw pool. See the handler doc and `F-write-authz-reads-unfiltered`
+//! below.
+//!
+//! The other 26 sites are NOT converted. 24 sit in WRITE handlers
+//! (`store_workflow`, `report_outcome`, `deprecate_workflow`'s event,
 //! `report_hierarchical_outcome`, `ingest_workflow`,
 //! `record_behavioral_execution`, `evolve_step`, `add_step`, `delete_step`):
 //! [`AppState::read_as`] is documented read-only, and a write routed through a
@@ -98,15 +105,23 @@
 //! `("workflows.rs", 4)` accordingly. Nothing further about it is recorded
 //! here — see `docs/tenancy/progress.json`.
 //!
-//! `deprecate_workflow` additionally carries an open entry whose owner is the
-//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
-//! This shard does not touch it and it stays open. Nothing further about it is
-//! recorded here — see `docs/tenancy/progress.json`.
+//! `deprecate_workflow`'s half of `F-write-authz-reads-unfiltered` is
+//! DISCHARGED. The handler checks `claims:write`, answers 404 for a workflow
+//! the caller cannot read
+//! (`WorkflowRepository::flat_workflow_author`, `{VISIBILITY:c}`), and
+//! applies the owner-or-`claims:admin` gate. It writes through
+//! `WorkflowRepository::deprecate_flat_workflow`, whose `UPDATE` carries
+//! `{WRITABLE:c}`. Pinned by `tests/workflow_deprecate_test.rs` and
+//! `epigraph-db/tests/deprecate_flat_workflow.rs`. The MCP twin
+//! (`epigraph-mcp/src/tools/workflows.rs::deprecate_workflow`) is NOT changed
+//! here — see the closed entry in `docs/tenancy/progress.json`.
 //!
 //! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
 //! `("workflows.rs", 4)` and `ROUTE_LAYER_WRITES` still carries
 //! `("workflows.rs", 4)`; all eight sit in unconverted handlers and no inline
-//! statement was relocated.
+//! statement was relocated. (`deprecate_workflow`'s inline `SELECT id` existence
+//! probe has since moved into the repo layer. It projected no content column
+//! and wrote nothing, so it was in neither count and neither moves.)
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -1361,6 +1376,51 @@ pub async fn evolve_step(
 }
 
 /// DELETE /api/v1/workflows/:id - Deprecate a workflow.
+///
+/// # Authorization (F-write-authz-reads-unfiltered)
+///
+/// This handler used to take no `AuthContext`, check no scope and no owner,
+/// and gate only on an UNFILTERED existence read. Any bearer token could
+/// deprecate any workflow claim, including one private to a group it is not
+/// in. That was a cross-tenant write, and the 404-vs-200 split was an
+/// existence oracle. The gate is now, in order:
+///
+/// 1. **`claims:write`**, with an absent `AuthContext` refused rather than
+///    passed. This is the scope `SCOPE_MAP` already gives the MCP twin.
+/// 2. **Readable**: [`epigraph_db::WorkflowRepository::flat_workflow_author`]
+///    splices `{VISIBILITY:c}`. A workflow the caller cannot read is 404, as
+///    absent as one that does not exist.
+/// 3. **Owner or `claims:admin`**: the same `require_owner_or_admin`
+///    `supersede_claim` uses, and 403 when it fails. The row is readable, so
+///    refusing it discloses nothing.
+/// 4. **Writable**: the `UPDATE` itself carries `{WRITABLE:c}`
+///    ([`epigraph_db::WorkflowRepository::deprecate_flat_workflow`]). A caller
+///    that passes 3 but cannot write the owning group, e.g. a `claims:admin`
+///    token outside it, is 403. Migration 077's `claims_tenancy` `WITH CHECK`
+///    is the same predicate, so this refuses today what the policy will refuse
+///    once the request path connects as an application role.
+///
+/// # Cascade
+///
+/// `find_descendants` walks `variant_of`/`supersedes` edges under the EDGE
+/// predicate. Every descendant then goes through the same readable-workflow
+/// read:
+///
+/// * one the caller cannot read, or that is not a `'workflow'` claim, is
+///   **skipped**. Refusing would disclose a private row, and the MCP twin
+///   skips an unreadable child the same way. Whether an unreadable child
+///   should instead refuse the whole write is the open
+///   `D-PR16-per-id-claim-oracles-write-half`, and this does not decide it.
+/// * one the caller can read but does not own (and holds no `claims:admin`)
+///   **refuses the whole request** with 403, before anything is written. A
+///   silently partial cascade would half-deprecate a lineage and return 200.
+///
+/// Every read and write runs on ONE transaction from `ScopedPool::begin_as`.
+/// The cascade is therefore atomic, and a refusal part-way leaves nothing
+/// deprecated. The session GUCs the `claims` policy reads are stamped from the
+/// same `Viewer` that built the in-query predicates. Write failures propagate;
+/// the old handler discarded every write result with `let _ =`. Only the
+/// `workflow.deprecated` event stays best-effort, after commit.
 #[cfg(feature = "db")]
 #[utoipa::path(
     delete,
@@ -1372,6 +1432,8 @@ pub async fn evolve_step(
     ),
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 401),
+        (status = 403),
         (status = 404),
         (status = 500),
     ),
@@ -1381,34 +1443,94 @@ pub async fn evolve_step(
 pub async fn deprecate_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(workflow_id): Path<Uuid>,
     Query(params): Query<DeprecateQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    use epigraph_db::WorkflowRepository;
+
+    // An ABSENT auth context is a refusal, not a pass.
+    let Some(axum::Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
     let cascade = params.cascade.unwrap_or(false);
 
-    // Verify workflow exists
-    let _exists = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to check workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
+    let db_error = |e: sqlx::Error| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "workflows::deprecate_workflow",
+            "workflow deprecation statement failed"
+        );
+        ApiError::InternalError {
+            message: "Failed to deprecate workflow".to_string(),
+        }
+    };
+
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            handler = "workflows::deprecate_workflow",
+            "deprecation refused: this process was not built from a ScopedPool"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+    let mut tx = scoped.begin_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "workflows::deprecate_workflow",
+            "could not begin a viewer-stamped transaction"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
     })?;
 
-    // Collect IDs to deprecate
+    // Readable (else 404), then owner or claims:admin (else 403).
+    let author = WorkflowRepository::flat_workflow_author(&mut *tx, &viewer, workflow_id)
+        .await
+        .map_err(db_error)?
+        .ok_or(ApiError::NotFound {
+            entity: "workflow".into(),
+            id: workflow_id.to_string(),
+        })?;
+    crate::middleware::scopes::require_owner_or_admin(&auth, author)?;
+
+    // Collect IDs to deprecate. Every descendant passes the same two gates;
+    // see the handler doc for why unreadable ones are skipped and unowned
+    // readable ones refuse the request.
     let mut ids_to_deprecate = vec![workflow_id];
     if cascade {
-        let descendants =
-            epigraph_db::WorkflowRepository::find_descendants(&state.db_pool, &viewer, workflow_id)
-                .await
-                .unwrap_or_default();
-        ids_to_deprecate.extend(descendants);
+        let descendants = WorkflowRepository::find_descendants(&mut *tx, &viewer, workflow_id)
+            .await
+            .map_err(db_error)?;
+        for id in descendants {
+            if ids_to_deprecate.contains(&id) {
+                continue;
+            }
+            let Some(descendant_author) =
+                WorkflowRepository::flat_workflow_author(&mut *tx, &viewer, id)
+                    .await
+                    .map_err(db_error)?
+            else {
+                continue;
+            };
+            crate::middleware::scopes::require_owner_or_admin(&auth, descendant_author).map_err(
+                |_| ApiError::Forbidden {
+                    reason: format!(
+                        "cascade reaches workflow {id}, which is owned by another principal; \
+                         deprecate without cascade, or with claims:admin"
+                    ),
+                },
+            )?;
+            ids_to_deprecate.push(id);
+        }
     }
 
     // Set truth to near-zero AND mark not-current for all.
@@ -1417,27 +1539,36 @@ pub async fn deprecate_workflow(
     // from `WorkflowRepository::list` regardless of the caller's `min_truth`
     // parameter. Before this fix, callers passing `min_truth = 0.0` (the
     // common default) still saw deprecated workflows because 0.05 > 0.0.
-    // See epigraph-io/epigraph#36.
+    // See epigraph-io/epigraph#36. The same statement nulls the embedding
+    // (CLAUDE.md "Embedding policy → Cleanup paths") and mirrors the truth
+    // onto the hierarchical `workflows` row with the same id, if any, so a
+    // deprecated hierarchical workflow stops surfacing in
+    // `GET /api/v1/workflows/hierarchical/search`.
     for id in &ids_to_deprecate {
-        // deprecate_claim also nulls the embedding (CLAUDE.md "Embedding
-        // policy → Cleanup paths"); the prior bare UPDATE left a non-NULL
-        // embedding on an is_current=false row, inflating `stale_present`.
-        // (It additionally sets `updated_at = NOW()`, which the prior bare
-        // UPDATE here omitted — a benign, more-correct side effect of
-        // unifying on the repo method.)
-        let _ = epigraph_db::ClaimRepository::deprecate_claim(
-            &state.db_pool,
-            epigraph_core::ClaimId::from_uuid(*id),
-        )
-        .await;
-        // Mirror onto the hierarchical `workflows` row when one exists
-        // (no-op for flat-only workflows). Without this, deprecated
-        // hierarchical workflows keep surfacing in
-        // `GET /api/v1/workflows/hierarchical/search`.
-        let _ = epigraph_db::WorkflowRepository::set_truth_value(&state.db_pool, *id, 0.05).await;
+        let written = WorkflowRepository::deprecate_flat_workflow(&mut *tx, &viewer, *id)
+            .await
+            .map_err(db_error)?;
+        if !written {
+            // Readable (established above) but not writable. Returning here
+            // drops `tx` uncommitted, so nothing in this request is written.
+            return Err(ApiError::Forbidden {
+                reason: format!("workflow {id} is owned by a group this principal cannot write"),
+            });
+        }
     }
+    tx.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "workflows::deprecate_workflow",
+            "commit failed"
+        );
+        ApiError::InternalError {
+            message: "Failed to deprecate workflow".to_string(),
+        }
+    })?;
 
-    // Emit event
+    // Emit event (best-effort, after the write is durable).
     let _ = epigraph_db::EventRepository::insert(
         &state.db_pool,
         "workflow.deprecated",

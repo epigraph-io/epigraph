@@ -6368,6 +6368,14 @@ impl ClaimRepository {
     /// plus a no-op NULL — safe to call twice (used as the post-deploy
     /// remediation path for claims deprecated by the pre-fix binary).
     ///
+    /// **Constrains by id alone — it has no write predicate.** The HTTP route
+    /// `DELETE /api/v1/workflows/:id` no longer calls it: it uses
+    /// `WorkflowRepository::deprecate_flat_workflow`, which carries
+    /// `{WRITABLE:c}` (F-write-authz-reads-unfiltered). The remaining request
+    /// caller is the MCP `deprecate_workflow` tool. It has no per-id gate on its
+    /// root, and the policy for its cascade children is the open
+    /// `D-PR16-per-id-claim-oracles-write-half`.
+    ///
     /// Uses the runtime `sqlx::query` (string) form — NOT the compile-time
     /// `query!` macro — to match the existing deprecation call-sites and to
     /// avoid touching `.sqlx/` (no `cargo sqlx prepare` required).
