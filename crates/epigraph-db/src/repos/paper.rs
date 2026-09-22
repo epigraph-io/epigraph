@@ -88,12 +88,15 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn has_processed_by_edge(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn has_processed_by_edge<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
         pipeline_version: &str,
     ) -> Result<bool, DbError> {
+        // MACRO SITE — the static three-bind spelling; `sqlx::query!` cannot be
+        // spliced. See `ClaimRepository::get_by_id`.
         let row = sqlx::query!(
             r#"
             SELECT 1 AS exists_marker
@@ -102,12 +105,18 @@ impl PaperRepository {
               AND source_type = 'paper'
               AND relationship = 'processed_by'
               AND properties ->> 'pipeline' = $2
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             LIMIT 1
             "#,
             paper_id,
             pipeline_version,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row.is_some())
     }
@@ -129,8 +138,13 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn count_asserted_claims(pool: &PgPool, paper_id: Uuid) -> Result<i64, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_asserted_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+    ) -> Result<i64, DbError> {
+        // MACRO SITE — static three-bind spelling.
         let row = sqlx::query!(
             r#"
             SELECT COUNT(*) AS "count!"
@@ -139,10 +153,16 @@ impl PaperRepository {
               AND source_type = 'paper'
               AND target_type = 'claim'
               AND relationship = 'asserts'
+              AND ($2::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($3::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($3::uuid[]))))
             "#,
             paper_id,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(row.count)
     }
@@ -160,19 +180,29 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn count_claims_by_doi_label(pool: &PgPool, doi: &str) -> Result<i64, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_claims_by_doi_label<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        doi: &str,
+    ) -> Result<i64, DbError> {
         let label = format!("doi:{doi}");
+        // MACRO SITE — static three-bind spelling. A count is still a
+        // disclosure: it says how much of a DOI landed in a tenant the caller
+        // cannot read.
         let row = sqlx::query!(
             r#"
             SELECT COUNT(*) AS "count!"
             FROM claims
             WHERE is_current
               AND labels @> ARRAY[$1]::text[]
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             "#,
             label,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
         Ok(row.count)
     }
@@ -182,11 +212,13 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list_authors(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_authors<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
     ) -> Result<Vec<(Uuid, Option<String>)>, DbError> {
+        // MACRO SITE — static three-bind spelling.
         let rows = sqlx::query!(
             r#"
             SELECT a.id AS "id!", a.display_name
@@ -196,11 +228,17 @@ impl PaperRepository {
               AND e.target_type = 'paper'
               AND e.source_type = 'agent'
               AND e.relationship = 'authored'
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
             ORDER BY a.display_name NULLS LAST, a.id
             "#,
             paper_id,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
     }
@@ -214,9 +252,10 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list_asserted_claims(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_asserted_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
         limit: i64,
     ) -> Result<Vec<AssertedClaimRow>, DbError> {
@@ -235,13 +274,20 @@ impl PaperRepository {
               AND e.source_type = 'paper'
               AND e.target_type = 'claim'
               AND e.relationship = 'asserts'
+              AND ($3::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($4::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($4::uuid[]))))
+              AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))
             ORDER BY c.created_at ASC, c.id
             LIMIT $2
             "#,
             paper_id,
             limit,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         rows.into_iter()
             .map(|r| {

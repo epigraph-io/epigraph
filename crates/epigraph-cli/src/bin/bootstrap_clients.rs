@@ -20,7 +20,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use epigraph_cli::bootstrap::{bootstrap_canonical_clients, ClientOutcome};
-use sqlx::postgres::PgPoolOptions;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,11 +58,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&args.database_url)
+    // Provisions the canonical OAuth clients: an operator-run, instance-wide
+    // write with no requesting tenant. See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect_to(&args.database_url, "bootstrap_clients")
         .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
         .context("connect to database")?;
+    let pool = maint.pool().clone();
 
     let outcomes = bootstrap_canonical_clients(
         &pool,
@@ -76,8 +77,17 @@ async fn main() -> Result<()> {
     let mut created_count = 0usize;
     for o in &outcomes {
         match o {
-            ClientOutcome::Existing { name, client_id } => {
-                println!("EXISTS:  name={name:<16} client_id={client_id}");
+            ClientOutcome::Existing {
+                name,
+                client_id,
+                scopes_reconciled,
+            } => {
+                let note = if *scopes_reconciled {
+                    " scopes=RECONCILED"
+                } else {
+                    ""
+                };
+                println!("EXISTS:  name={name:<16} client_id={client_id}{note}");
             }
             ClientOutcome::Created {
                 name,

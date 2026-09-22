@@ -7,8 +7,32 @@
 //! - `POST /api/v1/clusters` — Upsert cluster assignment
 //! - `POST /api/v1/frames/:id/assign-claim` — Assign claim to frame
 //! - `POST /api/v1/edges-staging/promote` — Promote approved staged edges
+//!
+//! # Tenancy: 4 of this file's 40 raw-pool sites are converted
+//!
+//! Conversion shard 7. The four read-only `ClaimThemeRepository` handlers —
+//! `get_boundary_claims`, `get_split_candidates`, `get_distant_claims` and
+//! `get_theme_embeddings` — each run their single read on a viewer-stamped
+//! connection from [`AppState::read_as`].
+//!
+//! **What that suppression is and is not, stated rather than implied.** Each of
+//! those four statements joins `claim_themes` to `claims`, and the viewer
+//! predicate is over `claims`. `claim_themes` is derived clustering output that
+//! carries no tenancy columns and no RLS at migration head 92, so the filtering
+//! these handlers gain is over the CLAIMS in a theme, never over the themes
+//! themselves. Stamping the connection does not change that and is not claimed
+//! to.
+//!
+//! The other 36 sites all sit in WRITE handlers — the densest write-blocked file
+//! in the series. [`AppState::read_as`] is documented read-only and a write
+//! routed through a `ScopedRead` is rolled back on drop under
+//! `SessionGucMode::Transaction` while still type-checking; their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
@@ -198,40 +222,74 @@ pub struct UpdateEvidenceRequest {
 /// PUT /api/v1/evidence/:id
 ///
 /// Currently supports backfilling raw_content on existing evidence.
+///
+/// # The write-side tenancy gate (PR-16, delivered as 16b)
+///
+/// This is the first handler behind the write-side predicate. Three things
+/// changed and each is load-bearing:
+///
+/// * The `UPDATE` moved out of this file into
+///   `EvidenceRepository::update_raw_content`, which carries a
+///   `/* {WRITABLE:e} */` marker. A route handler cannot carry a marker — it
+///   does not own the SQL — so a gate that lives here can only ever be a
+///   second, separately-forgettable check. This is the same structural argument
+///   `viewer_route_table_lint.rs` makes for reads.
+/// * The scope check is unconditional. It was `if let Some(..) = auth_ctx { .. }`
+///   with no `else`, which authorized nothing at all when the extension was
+///   absent.
+/// * A row the caller may not write is a **404, not a 403**. A 403 would confirm
+///   that evidence with this id exists inside a group the caller cannot write
+///   to, which is a disclosure the predicate was added to prevent.
+///
+/// The `record_provenance` block below deliberately keeps its
+/// `if let Some(..) = auth_ctx` shape. It is auth-OPTIONAL audit, not
+/// authorization, and it is counted by a different register.
 #[cfg(feature = "db")]
 pub async fn update_evidence(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateEvidenceRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        // Accept either evidence:write or evidence:submit (naming inconsistency)
-        if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
-            return Err(crate::errors::ApiError::Forbidden {
-                reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
-            });
-        }
+    // An ABSENT auth context is a refusal, not a pass — the shape PR-18a
+    // prescribes. This route is on the `protected` chain, so the branch is
+    // unreachable today; writing it as a refusal is what stops the handler's
+    // correctness from depending on which router chain it is registered on.
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    // Accept either evidence:write or evidence:submit (naming inconsistency)
+    if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
+        return Err(crate::errors::ApiError::Forbidden {
+            reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
+        });
     }
 
-    if request.raw_content.is_none() {
+    let Some(ref content) = request.raw_content else {
         return Err(ApiError::ValidationError {
             field: "raw_content".to_string(),
             reason: "At least one field must be provided for update".to_string(),
         });
-    }
+    };
 
-    // Update raw_content via direct SQL (no repo method exists yet)
-    if let Some(ref content) = request.raw_content {
-        sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
-            .bind(id)
-            .bind(content)
-            .execute(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to update evidence: {e}"),
-            })?;
+    let updated = epigraph_db::repos::EvidenceRepository::update_raw_content(
+        &state.db_pool,
+        &viewer,
+        id.into(),
+        content,
+    )
+    .await?;
+
+    if !updated {
+        // Indistinguishable by design: "no such evidence" and "you may not write
+        // this evidence" are the same answer.
+        return Err(ApiError::NotFound {
+            entity: "evidence".to_string(),
+            id: id.to_string(),
+        });
     }
 
     // Record provenance
@@ -596,6 +654,7 @@ pub struct UpsertClusterRequest {
 /// named after the cluster. If no frame exists for the cluster, creates one.
 #[cfg(feature = "db")]
 pub async fn upsert_cluster(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<UpsertClusterRequest>,
@@ -612,7 +671,7 @@ pub async fn upsert_cluster(
     let frame_name = format!("cluster:{}", request.cluster_label);
 
     // Find or create the frame for this cluster
-    let frame = FrameRepository::get_by_name(&state.db_pool, &frame_name).await?;
+    let frame = FrameRepository::get_by_name(&state.db_pool, &viewer, &frame_name).await?;
     let frame_id = match frame {
         Some(f) => f.id,
         None => {
@@ -694,6 +753,7 @@ pub struct AssignClaimToFrameRequest {
 /// POST /api/v1/frames/:id/assign-claim
 #[cfg(feature = "db")]
 pub async fn assign_claim_to_frame(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(frame_id): Path<Uuid>,
@@ -709,7 +769,7 @@ pub async fn assign_claim_to_frame(
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Verify frame exists
-    FrameRepository::get_by_id(&state.db_pool, frame_id)
+    FrameRepository::get_by_id(&state.db_pool, &viewer, frame_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Frame".to_string(),
@@ -903,6 +963,7 @@ pub struct BoundaryClaimsQuery {
 /// assigned centroid — candidates for theme reassignment.
 #[cfg(feature = "db")]
 pub async fn get_boundary_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<BoundaryClaimsQuery>,
@@ -917,8 +978,21 @@ pub async fn get_boundary_claims(
     let min_cd = params.min_centroid_distance.unwrap_or(0.45);
     let limit = params.limit.unwrap_or(500).min(500);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_boundary_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows =
-        ClaimThemeRepository::find_boundary_claims(&state.db_pool, min_br, min_cd, limit).await?;
+        ClaimThemeRepository::find_boundary_claims(&mut *read, &viewer, min_br, min_cd, limit)
+            .await?;
 
     let results: Vec<serde_json::Value> = rows
         .iter()
@@ -979,6 +1053,7 @@ pub struct ReassignClaimRequest {
 /// unthemes if claim is an outlier everywhere, or leaves in place.
 #[cfg(feature = "db")]
 pub async fn reassign_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     _scope: crate::middleware::bearer::RequireScopeAdmin,
     Json(request): Json<ReassignClaimRequest>,
@@ -994,7 +1069,8 @@ pub async fn reassign_claim(
 
     // Get claim's embedding as pgvector string
     let emb_str =
-        ClaimThemeRepository::get_claim_embedding_str(&state.db_pool, request.claim_id).await?;
+        ClaimThemeRepository::get_claim_embedding_str(&state.db_pool, &viewer, request.claim_id)
+            .await?;
 
     let emb_str = match emb_str {
         Some(e) => e,
@@ -1010,7 +1086,8 @@ pub async fn reassign_claim(
 
     // Get current theme distance
     let current_distance =
-        ClaimThemeRepository::get_claim_theme_distance(&state.db_pool, request.claim_id).await?;
+        ClaimThemeRepository::get_claim_theme_distance(&state.db_pool, &viewer, request.claim_id)
+            .await?;
 
     // Get current theme_id and label
     let current_theme = sqlx::query(
@@ -1302,6 +1379,7 @@ pub struct AssignUnthemedRequest {
 /// Returns total count of newly assigned claims.
 #[cfg(feature = "db")]
 pub async fn assign_unthemed(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AssignUnthemedRequest>,
@@ -1320,7 +1398,8 @@ pub async fn assign_unthemed(
 
     loop {
         let assigned =
-            ClaimThemeRepository::assign_unthemed_batch(&state.db_pool, batch_size).await?;
+            ClaimThemeRepository::assign_unthemed_batch(&state.db_pool, &viewer, batch_size)
+                .await?;
 
         if assigned == 0 {
             break;
@@ -1362,6 +1441,7 @@ pub struct RecomputeCentroidsRequest {
 /// If theme_ids provided, only recompute those. Otherwise recompute all.
 #[cfg(feature = "db")]
 pub async fn recompute_centroids(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<RecomputeCentroidsRequest>,
@@ -1380,7 +1460,8 @@ pub async fn recompute_centroids(
             let mut results = Vec::new();
             for id in &ids {
                 if let Some((label, count)) =
-                    ClaimThemeRepository::recompute_centroid_for_theme(&state.db_pool, *id).await?
+                    ClaimThemeRepository::recompute_centroid_for_theme(&state.db_pool, &viewer, *id)
+                        .await?
                 {
                     results.push(serde_json::json!({
                         "id": id,
@@ -1392,7 +1473,8 @@ pub async fn recompute_centroids(
             results
         }
         None => {
-            let rows = ClaimThemeRepository::recompute_all_centroids(&state.db_pool).await?;
+            let rows =
+                ClaimThemeRepository::recompute_all_centroids(&state.db_pool, &viewer).await?;
             rows.iter()
                 .map(|r| {
                     serde_json::json!({
@@ -1439,6 +1521,7 @@ pub struct SplitCandidatesQuery {
 /// GET /api/v1/themes/split-candidates
 #[cfg(feature = "db")]
 pub async fn get_split_candidates(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<SplitCandidatesQuery>,
@@ -1449,8 +1532,21 @@ pub async fn get_split_candidates(
 
     use epigraph_db::ClaimThemeRepository;
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_split_candidates",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = ClaimThemeRepository::find_split_candidates(
-        &state.db_pool,
+        &mut *read,
+        &viewer,
         params.variance_threshold.unwrap_or(0.35),
         params.min_claims.unwrap_or(500),
         params.limit.unwrap_or(20),
@@ -1497,6 +1593,7 @@ pub struct DistantClaimsQuery {
 /// GET /api/v1/themes/distant-claims
 #[cfg(feature = "db")]
 pub async fn get_distant_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<DistantClaimsQuery>,
@@ -1507,8 +1604,21 @@ pub async fn get_distant_claims(
 
     use epigraph_db::ClaimThemeRepository;
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_distant_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = ClaimThemeRepository::find_distant_claims(
-        &state.db_pool,
+        &mut *read,
+        &viewer,
         params.distance_threshold.unwrap_or(0.45),
         params.min_cluster_size.unwrap_or(20),
         params.limit.unwrap_or(20),
@@ -1546,44 +1656,105 @@ pub struct ThemeEmbeddingsQuery {
     pub limit: Option<i64>,
 }
 
-/// Get claim IDs and embeddings for a theme (for client-side k-means).
+/// Get claim IDs and a 2-D projection of their embeddings for a theme.
 ///
 /// GET /api/v1/themes/:id/embeddings
+///
+/// # Why this returns a projection and not the vectors (plan §4.9 row 4)
+///
+/// This handler used to serialise the complete raw 1536-d `claims.embedding`
+/// for up to 5000 claims, gated on `claims:read`. `PENDING_SERVICE_SCOPES`
+/// grants `claims:read`, so every registrant could bulk-download the embedding
+/// corpus — and embeddings are approximately invertible to the content they
+/// encode. Tenancy filtering (`ClaimThemeRepository::get_theme_embeddings`
+/// takes a `&Viewer`) bounds that to *within* a tenant; it does not make bulk
+/// embedding export acceptable, which is why the plan rates it a blocker in all
+/// three columns and assigns the fix here.
+///
+/// Two changes discharge it:
+///
+/// * The response carries `projection: [x, y]` — two floats — instead of
+///   `embedding: [...1536 floats...]`. The projection is a deterministic 2-D
+///   PCA (see [`crate::routes::projection`]) that preserves the dominant
+///   separating axis k-means needs to split an oversized theme.
+/// * The gate moves from `claims:read` to `claims:admin`, matching its sibling
+///   `create_theme_with_centroid`. Theme maintenance is an operator activity.
+///
+/// The one real consumer, `scripts/maintain_themes.py::split_oversized_theme`,
+/// used the raw vectors for two things: k-means labels (served by the
+/// projection) and the resulting sub-theme centroids (now computed server-side
+/// — `CreateThemeWithCentroidRequest::centroid` is optional, and omitting it
+/// averages the claims' real embeddings in the database).
+///
+/// The scope check is deliberately **not** written as
+/// `if let Some(auth) = auth_ctx { check_scopes(...) }`. That idiom performs no
+/// authorization at all when `AuthContext` is absent, and is neutralized only
+/// by `ViewerExtractor` running first and 401-ing — which makes an authz
+/// control load-bearing on axum parameter order. It is `ok_or` here so the
+/// control stands on its own.
 #[cfg(feature = "db")]
 pub async fn get_theme_embeddings(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(theme_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<ThemeEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "theme embeddings require authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
     let limit = params.limit.unwrap_or(5000).min(5000);
-    let rows = ClaimThemeRepository::get_theme_embeddings(&state.db_pool, theme_id, limit).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_theme_embeddings",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    let claims: Vec<serde_json::Value> = rows
+    let rows =
+        ClaimThemeRepository::get_theme_embeddings(&mut *read, &viewer, theme_id, limit).await?;
+
+    // Parse pgvector text "[0.1,0.2,...]" into vectors for the projection.
+    // These never leave this function: only the 2-D result is serialised.
+    let vectors: Vec<Vec<f64>> = rows
         .iter()
-        .map(|(id, emb_str)| {
-            // Parse pgvector text "[0.1,0.2,...]" to JSON array
-            let nums: Vec<f64> = emb_str
+        .map(|(_, emb_str)| {
+            emb_str
                 .trim_start_matches('[')
                 .trim_end_matches(']')
                 .split(',')
                 .filter_map(|s| s.trim().parse::<f64>().ok())
-                .collect();
+                .collect()
+        })
+        .collect();
+
+    let projected = crate::routes::projection::project_to_2d(&vectors);
+
+    let claims: Vec<serde_json::Value> = rows
+        .iter()
+        .zip(projected.iter())
+        .map(|((id, _), xy)| {
             serde_json::json!({
                 "id": id,
-                "embedding": nums,
+                "projection": [xy[0], xy[1]],
             })
         })
         .collect();
 
     Ok(Json(serde_json::json!({
         "count": claims.len(),
+        "dimensions": 2,
         "claims": claims,
     })))
 }
@@ -1609,7 +1780,15 @@ pub async fn get_theme_embeddings(
 pub struct CreateThemeWithCentroidRequest {
     pub label: String,
     pub description: String,
-    pub centroid: Vec<f64>,
+    /// Optional explicit centroid.
+    ///
+    /// Omit it (or send an empty array) to have the server average the
+    /// `claim_ids`' own embeddings instead. That is now the preferred form:
+    /// PR-07 stopped `GET /themes/:id/embeddings` returning raw vectors, so a
+    /// theme-splitting client has nothing to average client-side, and the
+    /// server has the real vectors anyway.
+    #[serde(default)]
+    pub centroid: Option<Vec<f64>>,
     pub claim_ids: Vec<Uuid>,
 }
 
@@ -1620,6 +1799,7 @@ pub struct CreateThemeWithCentroidRequest {
 /// Used by auto-split to persist k-means results.
 #[cfg(feature = "db")]
 pub async fn create_theme_with_centroid(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateThemeWithCentroidRequest>,
@@ -1637,17 +1817,32 @@ pub async fn create_theme_with_centroid(
     let theme =
         ClaimThemeRepository::create(&state.db_pool, &request.label, &request.description).await?;
 
-    // Set centroid (convert Vec<f64> to pgvector string)
-    let centroid_str = format!(
-        "[{}]",
-        request
-            .centroid
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str).await?;
+    // Centroid: use the caller's vector when supplied, otherwise average the
+    // claims' own embeddings server-side. The latter is the path a theme-split
+    // client takes now that `/themes/:id/embeddings` no longer returns raw
+    // vectors for it to average itself.
+    match request.centroid.as_ref().filter(|c| !c.is_empty()) {
+        Some(centroid) => {
+            let centroid_str = format!(
+                "[{}]",
+                centroid
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str).await?;
+        }
+        None => {
+            ClaimThemeRepository::set_centroid_from_claims(
+                &state.db_pool,
+                &viewer,
+                theme.id,
+                &request.claim_ids,
+            )
+            .await?;
+        }
+    }
 
     // Bulk assign claims
     let assigned =

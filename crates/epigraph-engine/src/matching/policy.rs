@@ -167,9 +167,15 @@ impl Policy {
     /// Insert a claim→claim edge, skipping if the same relationship already
     /// connects the two claims in either direction. Delegates the dedup SQL to
     /// [`EdgeRepository::create_symmetric_if_absent`] so the bidirectional
-    /// `WHERE NOT EXISTS` form lives in one place. Migrations 017/018 dropped
-    /// the unique triple index, so the explicit existence check (not
-    /// `ON CONFLICT`) is what prevents duplicates on re-run.
+    /// `WHERE NOT EXISTS` form lives in one place. The explicit existence check
+    /// is the FAST PATH, not the guarantee: migrations 017/018 dropped the
+    /// unique triple index, and migration 090's
+    /// `edges_symmetric_relationship_uniq` is what replaces it. That index is
+    /// keyed on the `"source": "cross_source_matcher"` marker this function's
+    /// `properties` payload stamps, so a duplicate this guard cannot see — a
+    /// concurrent re-run, or an edge whose ownership no longer follows its
+    /// endpoints' — is refused by the constraint and resolved to "already
+    /// linked" by the `ON CONFLICT DO NOTHING` behind the guard.
     async fn write_edge(
         &self,
         a: Uuid,

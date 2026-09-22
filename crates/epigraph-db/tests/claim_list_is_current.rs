@@ -9,12 +9,16 @@
 //! one without — so both are exercised here: a fix applied to only one of them
 //! would leave half the read path lying.
 
+mod viewer_fixture;
+use viewer_fixture as fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_reports_real_is_current_on_both_query_paths(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // Distinctive marker so the ILIKE variant selects exactly these two rows.
@@ -30,7 +34,9 @@ async fn list_reports_real_is_current_on_both_query_paths(pool: PgPool) {
     .await;
 
     // ---- Path 1: no search → the plain `SELECT ... FROM claims` variant ----
-    let rows = ClaimRepository::list(&pool, 50, 0, None).await.unwrap();
+    let rows = ClaimRepository::list(&pool, &viewer, 50, 0, None)
+        .await
+        .unwrap();
     let current_of = |id: Uuid| {
         rows.iter()
             .find(|c| c.id.as_uuid() == id)
@@ -45,7 +51,7 @@ async fn list_reports_real_is_current_on_both_query_paths(pool: PgPool) {
     );
 
     // ---- Path 2: search → the `WHERE content ILIKE $3` variant ----
-    let searched = ClaimRepository::list(&pool, 50, 0, Some(MARKER))
+    let searched = ClaimRepository::list(&pool, &viewer, 50, 0, Some(MARKER))
         .await
         .unwrap();
     assert_eq!(

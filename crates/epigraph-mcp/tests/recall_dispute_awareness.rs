@@ -14,6 +14,9 @@
 //! is available in CI, and dispute annotation is orthogonal to which retrieval
 //! leg produced the page.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::memory::recall;
 use epigraph_mcp::types::RecallParams;
 use sqlx::PgPool;
@@ -96,6 +99,7 @@ fn parse_results(result: rmcp::model::CallToolResult) -> serde_json::Value {
 /// pre-F3 callers see byte-identical output for uncontested results.
 #[sqlx::test(migrations = "../../migrations")]
 async fn contested_hit_annotated_uncontested_hit_unchanged(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let contested = seed_claim(&pool, agent, "quorbulator alpha routing", 0.8).await;
     let clean = seed_claim(&pool, agent, "quorbulator beta routing", 0.8).await;
@@ -106,7 +110,7 @@ async fn contested_hit_annotated_uncontested_hit_unchanged(pool: PgPool) {
     seed_edge(&pool, weak, contested, "refutes").await;
 
     let server = build_test_server(pool);
-    let out = recall(&server, params("quorbulator routing", false))
+    let out = recall(&server, &viewer, params("quorbulator routing", false))
         .await
         .expect("recall ok");
     let arr = parse_results(out);
@@ -150,6 +154,7 @@ async fn contested_hit_annotated_uncontested_hit_unchanged(pool: PgPool) {
 /// `min_truth` already behaves (truncate-then-drop).
 #[sqlx::test(migrations = "../../migrations")]
 async fn exclude_contested_drops_hit_without_backfilling(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let contested = seed_claim(&pool, agent, "zarnthex primary finding", 0.9).await;
     let clean = seed_claim(&pool, agent, "zarnthex secondary finding", 0.8).await;
@@ -161,7 +166,7 @@ async fn exclude_contested_drops_hit_without_backfilling(pool: PgPool) {
 
     // Baseline: without the flag, both fixtures come back.
     let before = parse_results(
-        recall(&server, params("zarnthex finding", false))
+        recall(&server, &viewer, params("zarnthex finding", false))
             .await
             .expect("recall ok"),
     );
@@ -176,7 +181,7 @@ async fn exclude_contested_drops_hit_without_backfilling(pool: PgPool) {
 
     // With the flag: the contested one is gone, the clean one survives.
     let after = parse_results(
-        recall(&server, params("zarnthex finding", true))
+        recall(&server, &viewer, params("zarnthex finding", true))
             .await
             .expect("recall ok"),
     );
@@ -206,6 +211,7 @@ async fn exclude_contested_drops_hit_without_backfilling(pool: PgPool) {
 /// query in the tool layer cannot silently lose the filter.
 #[sqlx::test(migrations = "../../migrations")]
 async fn retracted_contester_leaves_hit_uncontested(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let target = seed_claim(&pool, agent, "vothrium stability claim", 0.8).await;
     let retracted = seed_claim(&pool, agent, "vothrium stability rebuttal", 0.7).await;
@@ -219,7 +225,7 @@ async fn retracted_contester_leaves_hit_uncontested(pool: PgPool) {
         .expect("retract contester");
 
     let server = build_test_server(pool);
-    let out = recall(&server, params("vothrium stability", false))
+    let out = recall(&server, &viewer, params("vothrium stability", false))
         .await
         .expect("recall ok");
     let arr = parse_results(out);

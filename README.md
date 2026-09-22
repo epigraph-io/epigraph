@@ -29,7 +29,10 @@ git clone https://github.com/epigraph-io/epigraph.git && cd epigraph
 cargo build --release -p epigraph-api -p epigraph-mcp
 
 # 3. Migrate + start API
-cargo run --release --bin epigraph-migrate
+#    epigraph-migrate reads MIGRATION_DATABASE_URL and falls back to
+#    DATABASE_URL with a warning. Applying migrations needs DDL privilege,
+#    which the serving process must not have — see docs/deploy.md.
+MIGRATION_DATABASE_URL="$DATABASE_URL" cargo run --release --bin epigraph-migrate
 cargo run --release -p epigraph-api --bin server &
 
 # 4. Install MCP server

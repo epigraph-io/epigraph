@@ -447,7 +447,15 @@ async fn boot_unauth_router() -> axum::Router {
 
     axum::Router::new()
         .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn(
+        // PR-09: the middleware takes the server's own agents.id as state, now
+        // wrapped in `UnauthenticatedPrincipal` so an unresolved id is retried
+        // per request rather than being a process-lifetime verdict. This router's
+        // pool points at an unreachable database on purpose (the test asserts the
+        // SCOPE gate, not a DB read), so there is nothing to resolve and nothing
+        // to resolve it with — `unresolvable()` is the honest value, and it
+        // injects the same principal-less context the old `None` did.
+        .layer(axum::middleware::from_fn_with_state(
+            epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable(),
             epigraph_mcp::auth::inject_unauthenticated_context,
         ))
 }

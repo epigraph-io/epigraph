@@ -33,10 +33,15 @@ async fn list_events_returns_in_memory_events_via_http() {
         .await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
+    // PR-03: this route moved to the protected router. The token must carry a
+    // non-null `agent_id`; `mint_token_with_agent` is the only tests/common
+    // helper that sets one.
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
     let resp = reqwest::Client::new()
         .get(format!(
             "http://{addr}/api/v1/events?event_type={unique_type}"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();
@@ -94,10 +99,15 @@ async fn list_events_dedupes_by_id_when_event_in_both_stores() {
     .unwrap();
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
+    // PR-03: this route moved to the protected router. The token must carry a
+    // non-null `agent_id`; `mint_token_with_agent` is the only tests/common
+    // helper that sets one.
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
     let resp = reqwest::Client::new()
         .get(format!(
             "http://{addr}/api/v1/events?event_type={unique_type}"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();
@@ -149,10 +159,15 @@ async fn list_events_returns_persisted_only_when_in_memory_empty() {
     .unwrap();
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
+    // PR-03: this route moved to the protected router. The token must carry a
+    // non-null `agent_id`; `mint_token_with_agent` is the only tests/common
+    // helper that sets one.
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
     let resp = reqwest::Client::new()
         .get(format!(
             "http://{addr}/api/v1/events?event_type={unique_type}"
         ))
+        .bearer_auth(&token)
         .send()
         .await
         .unwrap();

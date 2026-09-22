@@ -33,6 +33,9 @@
 //! denial is asserted alongside the undeclared-signer grant: without it, this
 //! file could not tell a narrow fix from a blanket "stdio may do anything".
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::tools::claims::resolve_backlog_item;
@@ -57,6 +60,7 @@ async fn generated_signer_permits_cross_agent_supersede_without_auth(pool: PgPoo
 
     supersede_claim(
         &server,
+        &fixture::public_viewer(&pool).await,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "replacement authored on an unauthenticated transport".to_string(),
@@ -93,6 +97,7 @@ async fn generated_signer_permits_cross_agent_mark_duplicate_without_auth(pool: 
 
     mark_duplicate(
         &server,
+        &fixture::public_viewer(&pool).await,
         MarkDuplicateParams {
             claim_id: duplicate.as_uuid().to_string(),
             canonical_id: canonical.as_uuid().to_string(),
@@ -126,6 +131,7 @@ async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(po
 
     resolve_backlog_item(
         &server,
+        &fixture::public_viewer(&pool).await,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by a stdio agent with no declared signer".to_string(),
@@ -138,9 +144,10 @@ async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(po
 
     // Assert against the DB, not the response body: retirement is label-side,
     // and the point is that the ORIGINAL row was actually patched.
-    let labels = ClaimRepository::get_labels(&pool, foreign_claim)
-        .await
-        .expect("get_labels");
+    let labels =
+        ClaimRepository::get_labels(&pool, &fixture::public_viewer(&pool).await, foreign_claim)
+            .await
+            .expect("get_labels");
     assert!(
         labels.contains(&"resolved".to_string()),
         "the original backlog claim must carry 'resolved' after retirement: {labels:?}"
@@ -160,6 +167,7 @@ async fn declared_signer_still_denies_cross_agent_supersede_without_auth(pool: P
 
     let err = supersede_claim(
         &server,
+        &fixture::public_viewer(&pool).await,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "must not be written".to_string(),
@@ -215,6 +223,7 @@ async fn generated_signer_does_not_relax_the_authenticated_path(pool: PgPool) {
 
     let err = supersede_claim(
         &server,
+        &fixture::public_viewer(&pool).await,
         SupersedeClaimParams {
             claim_id: foreign_claim.as_uuid().to_string(),
             content: "must not be written".to_string(),

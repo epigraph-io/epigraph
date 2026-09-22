@@ -6,6 +6,7 @@
 pub mod activity;
 pub mod agent;
 pub mod agent_key;
+pub mod alternative_set;
 pub mod analysis;
 pub mod authorization_code;
 pub mod authorize_session;
@@ -17,11 +18,11 @@ pub mod claim_theme;
 pub mod claim_version;
 pub mod community;
 pub mod context;
+pub mod corpus_stats;
 pub mod counterfactual;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
-pub mod embedding_share;
 pub mod entity;
 pub mod entity_type;
 pub mod event;
@@ -31,23 +32,24 @@ pub mod experiment;
 pub mod factor;
 pub mod frame;
 pub mod gap;
+pub mod graph_view;
 pub mod group;
 pub mod group_key_epoch;
 pub mod group_membership;
+pub mod instance_admin;
 pub mod learning_event;
 pub mod lineage;
 pub mod mass_function;
 pub mod match_candidate;
 pub mod method;
 pub mod oauth_client;
-pub mod ownership;
 pub mod paper;
 pub mod pattern_template;
 pub mod perspective;
 pub mod political;
+pub mod privatization;
 pub mod provenance;
 pub mod provenance_chain;
-pub mod re_encryption_key;
 pub mod recall_event;
 pub mod refresh_token;
 pub mod scoped_belief;
@@ -55,44 +57,58 @@ pub mod security_event;
 pub mod semantic_link;
 pub mod sheaf;
 pub mod span;
+pub mod structural;
 pub mod task;
 pub mod trace;
 pub mod triple;
+pub mod webhook;
 pub mod workflow;
 pub mod workflow_execution;
 
 // Re-export all repositories for convenience
 pub use activity::ActivityRepository;
-pub use agent::{AgentCapabilitiesRow, AgentIdentityRow, AgentRepository, CapabilityFilter};
+pub use agent::{
+    AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, CapabilityFilter,
+};
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
+pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimNeighbor, ClaimPairDistance,
-    ClaimRepository, ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult,
-    GraphExpansionHit, HybridHit, LineageHead, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
+    ClaimNeighbor, ClaimPairDistance, ClaimRepository, ConsolidateMode, ConsolidateResult,
+    DedupRepair, EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
+    HybridHit, LabelQuery, LevelAndSourceType, LineageHead, NearestClaimHit, PatchClaimDiff,
+    PatchClaimInput, SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
     DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
-pub use community::CommunityRepository;
+pub use community::{CommunityRepository, MembershipOutcome};
 pub use context::ContextRepository;
+pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
 pub use divergence::DivergenceRepository;
 pub use edge::EdgeRepository;
 pub use entity::{EntityRepository, EntityRow};
-pub use entity_type::{EntityTypeEntry, EntityTypeRepository};
+pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
-pub use evidence::{EvidenceRepository, EvidenceSearchResult};
+pub use evidence::{
+    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceRepository, EvidenceSearchResult,
+};
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
 };
 pub use factor::FactorRepository;
 pub use frame::FrameRepository;
 pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
+pub use graph_view::{
+    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
+    GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+};
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
 pub use mass_function::MassFunctionRepository;
@@ -101,7 +117,6 @@ pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
-pub use ownership::OwnershipRepository;
 pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
 pub use perspective::PerspectiveRepository;
 pub use political::{
@@ -119,8 +134,10 @@ pub use recall_event::{
 pub use scoped_belief::ScopedBeliefRepository;
 pub use semantic_link::SemanticLinkRepository;
 pub use sheaf::{ClaimNeighborBetpRow, EpistemicEdgePairRow, SheafRepository};
-pub use trace::ReasoningTraceRepository;
+pub use structural::{BeliefIntervalRow, StructuralRepository};
+pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
+pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
     HierarchicalWorkflowRow, ResolvedStep, WorkflowGoalEmbeddingHit, WorkflowListRow,
     WorkflowRecallResult, WorkflowRepository,
@@ -130,15 +147,14 @@ pub use workflow::{
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
-pub use embedding_share::{EmbeddingShareRepository, EmbeddingShareRow};
 pub use evidence_encryption::{EvidenceEncryptionRepository, EvidenceEncryptionRow};
 pub use group::{GroupRepository, GroupRow};
-pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow};
-pub use group_membership::{GroupMembershipRepository, MembershipRow};
+pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
+pub use group_membership::{GroupMembershipRepository, MembershipRow, RevokeOutcome};
+pub use instance_admin::{InstanceAdminRepository, InstanceAdminRow};
 pub use oauth_client::{OAuthClientRepository, OAuthClientRow};
 pub use pattern_template::{PatternTemplateRepository, PatternTemplateRow};
 pub use provenance::{ProvenanceLogRow, ProvenanceRepository, AUTO_POLICY_AUTHORIZER_ID};
-pub use re_encryption_key::{ReEncryptionKeyRepository, ReEncryptionKeyRow};
 pub use refresh_token::{RefreshTokenRepository, RefreshTokenRow};
 pub use security_event::{SecurityEventFilter, SecurityEventRepository, SecurityEventRow};
 pub use span::{SpanRepository, SpanRow};

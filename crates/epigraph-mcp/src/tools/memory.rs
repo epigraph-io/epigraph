@@ -26,6 +26,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 pub async fn memorize(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: MemorizeParams,
 ) -> Result<CallToolResult, McpError> {
     let agent_id = server.agent_id().await?;
@@ -48,7 +49,7 @@ pub async fn memorize(
     // exact resubmit is unaffected; gate only runs on genuinely new content).
     let is_exact_resubmit = {
         let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-        ClaimRepository::find_by_content_hash_and_agent(&mut conn, &content_hash, agent_id)
+        ClaimRepository::find_by_content_hash_and_agent(&mut conn, viewer, &content_hash, agent_id)
             .await
             .map_err(internal_error)?
             .is_some()
@@ -60,6 +61,7 @@ pub async fn memorize(
             .unwrap_or(crate::tools::novelty_gate::DEFAULT_NOVELTY_THRESHOLD);
         if let Some((decision, pgvec)) = crate::tools::novelty_gate::decide(
             &server.pool,
+            viewer,
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
@@ -74,15 +76,18 @@ pub async fn memorize(
                 // — with the same epistemic-corroboration-loss consequence
                 // for memorize's caller — and this submission's `tags`
                 // being dropped since nothing is inserted.
-                let existing =
-                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(existing_id))
-                        .await
-                        .map_err(internal_error)?
-                        .ok_or_else(|| {
-                            internal_error(format!(
-                            "novelty gate: nearest claim {existing_id} vanished before read-back"
-                        ))
-                        })?;
+                let existing = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    ClaimId::from_uuid(existing_id),
+                )
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    internal_error(format!(
+                        "novelty gate: nearest claim {existing_id} vanished before read-back"
+                    ))
+                })?;
                 return success_json(&MemorizeResponse {
                     claim_id: existing_id.to_string(),
                     truth_value: existing.truth_value.value(),
@@ -106,7 +111,8 @@ pub async fn memorize(
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, &claim, "memorize").await?;
+        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "memorize")
+            .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
@@ -160,12 +166,15 @@ pub async fn memorize(
 
         let ds = match ds_auto::auto_wire_ds_for_claim(
             &server.pool,
+            viewer,
             claim_uuid,
             agent_id,
-            confidence,
-            0.6,
-            true,
-            None,
+            ds_auto::DsAutoInput {
+                confidence,
+                weight: 0.6,
+                supports: true,
+                evidence_type: None,
+            },
         )
         .await
         {
@@ -226,6 +235,7 @@ fn parse_agent_filter(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
 
 pub async fn recall(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecallParams,
 ) -> Result<CallToolResult, McpError> {
     // Generate the query embedding ONCE up front. Reused for both the claims
@@ -246,7 +256,7 @@ pub async fn recall(
         }
     };
 
-    recall_post_embed(server, params, pgvec_opt).await
+    recall_post_embed(server, viewer, params, pgvec_opt).await
 }
 
 /// Post-embedding pipeline: shared by `recall` and the
@@ -258,6 +268,7 @@ pub async fn recall(
 /// extraction sites cannot drift.
 async fn recall_post_embed(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecallParams,
     pgvec_opt: Option<String>,
 ) -> Result<CallToolResult, McpError> {
@@ -276,7 +287,8 @@ async fn recall_post_embed(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+            .await?;
     }
 
     // Hybrid retrieval: dense (claims.embedding) + lexical (content_tsv), RRF-fused.
@@ -289,6 +301,7 @@ async fn recall_post_embed(
     let hits: Vec<HybridHit> = match pgvec_opt.as_deref() {
         Some(pgvec) => ClaimRepository::search_hybrid_scoped_since(
             &server.pool,
+            viewer,
             pgvec,
             &params.query,
             HYBRID_CANDIDATE_POOL,
@@ -302,6 +315,7 @@ async fn recall_post_embed(
         .map_err(internal_error)?,
         None => ClaimRepository::search_lexical_scoped_since(
             &server.pool,
+            viewer,
             &params.query,
             HYBRID_RRF_K,
             limit,
@@ -373,8 +387,12 @@ async fn recall_post_embed(
     for (merged_rrf_score, merged_hit) in merged {
         match merged_hit {
             MergedHit::Claim(hit) => {
-                if let Ok(Some(claim)) =
-                    ClaimRepository::get_by_id(&server.pool, ClaimId::from_uuid(hit.claim_id)).await
+                if let Ok(Some(claim)) = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    ClaimId::from_uuid(hit.claim_id),
+                )
+                .await
                 {
                     let tv = claim.truth_value.value();
                     if tv >= min_truth {
@@ -469,6 +487,7 @@ async fn recall_post_embed(
             .collect();
         match epigraph_engine::belief_query::get_perspective_belief_batch(
             &server.pool,
+            viewer,
             &claim_ids,
             frame_id,
             perspective_id,
@@ -526,7 +545,7 @@ async fn recall_post_embed(
             .filter(|r| r.result_type.is_none()) // workflows aren't claims
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match ClaimRepository::dispute_batch(&server.pool, &claim_ids).await {
+        match ClaimRepository::dispute_batch(&server.pool, viewer, &claim_ids).await {
             Ok(mut by_claim) => {
                 for r in &mut results {
                     let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -572,34 +591,62 @@ async fn recall_post_embed(
             .filter(|r| r.result_type.is_none()) // claims only; workflows are a different id-space
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        // Resolved before the spawn: agent identity comes from the request's
-        // auth context, which does not outlive this call.
-        let agent_id = server.agent_id().await.ok();
-        let event = epigraph_db::NewRecallEvent {
-            id: event_id,
-            agent_id,
-            tool: "recall".to_string(),
-            query_text: params.query.clone(),
-            query_pgvector: pgvec_opt.clone(),
-            params: serde_json::json!({
-                "limit": limit,
-                "min_truth": min_truth,
-                "tags": tags,
-                "agent_filter": agent_filter,
-                "include_workflows": params.include_workflows,
-                "exclude_contested": params.exclude_contested,
-                // A retrieval whose temporal window cannot be reconstructed
-                // from its audit row is an unauditable retrieval: the same
-                // query with and without a window returns different sets, so
-                // the window is part of what was asked.
-                "since": params.since,
-            }),
-            returned_claim_ids,
-        };
+        // THE AUDIT ROW'S IDENTITY IS THE REQUEST PRINCIPAL, NOT THE PROCESS.
+        // This was `server.agent_id()`, which resolves the agent for the
+        // SIGNER'S PUBLIC KEY — one agent per process — while
+        // `get_recall_events` filters with the viewer built from the
+        // per-request `AuthContext`. On stdio the two are the same value and
+        // nothing moves. On the HTTP transport they are not, and owning the row
+        // from the process identity would misattribute it AND suppress it from
+        // the agent that authored it.
+        //
+        // Nothing here borrows the request, so everything the write needs is
+        // assembled as owned values and the group lookup happens INSIDE the
+        // spawn — `058_recall_events.sql`'s table comment is the contract
+        // ("never blocks a recall"), and resolving a personal group is a pool
+        // acquire plus a SELECT plus, on an agent's first recall, a mint.
+        let principal = viewer.principal();
+        let query_text = params.query.clone();
+        let query_pgvector = pgvec_opt.clone();
+        let params_json = serde_json::json!({
+            "limit": limit,
+            "min_truth": min_truth,
+            "tags": tags,
+            "agent_filter": agent_filter,
+            "include_workflows": params.include_workflows,
+            "exclude_contested": params.exclude_contested,
+            // A retrieval whose temporal window cannot be reconstructed from
+            // its audit row is an unauditable retrieval: the same query with
+            // and without a window returns different sets, so the window is
+            // part of what was asked.
+            "since": params.since,
+        });
         let pool = server.pool.clone();
         tokio::spawn(async move {
+            // Unresolvable ⇒ DROP, never widen. See `recall_audit_owner_group`.
+            let owner_group_id =
+                match super::recall::recall_audit_owner_group(&pool, principal).await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        tracing::warn!(reason = %e, "recall audit skipped rather than widened");
+                        return;
+                    }
+                };
+            let event = epigraph_db::NewRecallEvent {
+                id: event_id,
+                agent_id: principal,
+                tool: "recall".to_string(),
+                query_text,
+                query_pgvector,
+                params: params_json,
+                returned_claim_ids,
+                owner_group_id: Some(owner_group_id),
+            };
             if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
-                tracing::warn!(error = %e, "recall audit log failed; recall itself unaffected");
+                tracing::warn!(
+                    error = %e,
+                    "recall audit log failed; recall itself unaffected"
+                );
             }
         });
     }
@@ -634,10 +681,11 @@ pub mod __test_only {
     /// `__test_only::find_workflow_with_pgvec`.
     pub async fn recall_with_pgvec(
         server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
         params: RecallParams,
         pgvec: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        recall_post_embed(server, params, pgvec).await
+        recall_post_embed(server, viewer, params, pgvec).await
     }
 }
 

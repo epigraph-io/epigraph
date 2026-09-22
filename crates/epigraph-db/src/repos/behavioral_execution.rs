@@ -157,9 +157,14 @@ impl BehavioralExecutionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn rolling_success_rate(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so `routes/workflows.rs::search_workflows` can
+    /// run it on the stamped connection it already holds for
+    /// `find_by_embedding`/`find_by_text`. It takes NO `&Viewer`; the reason is
+    /// recorded in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    #[instrument(skip(executor))]
+    pub async fn rolling_success_rate<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         workflow_id: Uuid,
         window: i64,
     ) -> Result<f64, DbError> {
@@ -178,7 +183,7 @@ impl BehavioralExecutionRepository {
         )
         .bind(workflow_id)
         .bind(window)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(rate.unwrap_or(0.0))
@@ -333,9 +338,11 @@ impl BehavioralExecutionRepository {
     /// aggregation.
     ///
     /// Returns `(lineage_root, avg_similarity, execution_count)`.
-    #[instrument(skip(pool, goal_embedding_pgvec))]
-    pub async fn behavioral_affinity_lineage(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, goal_embedding_pgvec))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn behavioral_affinity_lineage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         goal_embedding_pgvec: &str,
         min_similarity: f64,
         min_executions: i64,
@@ -348,7 +355,11 @@ impl BehavioralExecutionRepository {
             execution_count: i64,
         }
 
-        let rows: Vec<AffinityRow> = sqlx::query_as(
+        // RECURSIVE CTE. The `edges` predicate goes on the RECURSIVE term (the
+        // walk-up arm), not only on a base term: an edge the viewer cannot read
+        // must not be able to re-admit an ancestor into the lineage. The
+        // `live_roots` join over `claims` is marked separately.
+        let sql = viewer.splice(
             r#"
             WITH RECURSIVE lineage AS (
                 -- Base: every successful execution with an embedding
@@ -363,6 +374,7 @@ impl BehavioralExecutionRepository {
                 JOIN edges e ON e.source_id = l.root_id
                     AND e.relationship IN ('variant_of', 'supersedes')
                     AND e.source_type = 'claim' AND e.target_type = 'claim'
+                WHERE true /* {EDGE_VISIBILITY:e} */
             ),
             -- The true root per execution: the ancestor with no outgoing variant_of or supersedes
             roots AS (
@@ -373,6 +385,7 @@ impl BehavioralExecutionRepository {
                     WHERE e.source_id = l.root_id
                       AND e.relationship IN ('variant_of', 'supersedes')
                       AND e.source_type = 'claim' AND e.target_type = 'claim'
+                      /* {EDGE_VISIBILITY:e} */
                 )
             ),
             -- Filter out deprecated lineage roots
@@ -381,6 +394,7 @@ impl BehavioralExecutionRepository {
                 FROM roots r
                 JOIN claims c ON c.id = r.root_id
                 WHERE c.truth_value > 0.1
+                  /* {VISIBILITY:c} */
             ),
             query_vec AS (SELECT $1::vector AS vec)
             SELECT
@@ -396,13 +410,17 @@ impl BehavioralExecutionRepository {
             ORDER BY avg_similarity DESC
             LIMIT $4
             "#,
-        )
-        .bind(goal_embedding_pgvec)
-        .bind(min_similarity)
-        .bind(min_executions)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            5,
+        );
+        let mut q = sqlx::query_as::<_, AffinityRow>(&sql)
+            .bind(goal_embedding_pgvec)
+            .bind(min_similarity)
+            .bind(min_executions)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<AffinityRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()

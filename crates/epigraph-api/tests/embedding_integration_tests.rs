@@ -220,15 +220,16 @@ fn test_builder_pattern_preserves_state() {
     });
 
     let state = AppState::new(ApiConfig {
-        require_signatures: true,
+        require_packet_signatures: true,
         max_request_size: 2048,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     })
     .with_embedding_service(service)
     .with_rate_limiter(rate_limiter);
 
     // All settings should be preserved
-    assert!(state.config.require_signatures);
+    assert!(state.config.require_packet_signatures);
     assert_eq!(state.config.max_request_size, 2048);
     assert!(state.embedding_service.is_some());
     assert!(state.rate_limiter.is_some());

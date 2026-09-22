@@ -6,6 +6,9 @@
 //! restores it (the 50ea636e ingest-initial-asymmetry use case), plus check
 //! the target-selection, truncation, and no-BBA-skip reporting.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::types::RecomputeBeliefsParams;
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
@@ -67,8 +70,10 @@ async fn insert_claim_with_label(pool: &PgPool, agent: Uuid, content: &str, labe
 
 /// Give `claim_id` a real binary-frame BBA + cached belief.
 async fn wire_bba(pool: &PgPool, claim_id: Uuid, agent_id: Uuid) {
+    let viewer = fixture::public_viewer(pool).await;
     tools::ds_auto::auto_wire_ds_update(
         pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,  // confidence
@@ -93,6 +98,10 @@ async fn pignistic(pool: &PgPool, claim_id: Uuid) -> f64 {
 /// correct combine result and reports accurate counts.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-stale").await;
     let claim = insert_claim(&pool, agent, &format!("recompute-stale-{}", Uuid::new_v4())).await;
@@ -109,6 +118,7 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -140,12 +150,17 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 /// A claim with no BBAs is counted as skipped, not recomputed, and is not an error.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_skips_claim_without_bbas(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-nobba").await;
     let bare = insert_claim(&pool, agent, &format!("recompute-nobba-{}", Uuid::new_v4())).await;
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![bare.to_string()]),
             labels: None,
@@ -168,6 +183,10 @@ async fn recompute_skips_claim_without_bbas(pool: PgPool) {
 /// `truncated=true` when `limit` is smaller than the population.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-bulk").await;
     // Two claims with BBAs; ephemeral DB so the bulk population is exactly 2.
@@ -183,6 +202,7 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -201,6 +221,7 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     // Page 2 picks up the remaining claim and is not truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -220,6 +241,10 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 /// claims exist and none remain (the bug the limit+1 fetch fixes).
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_labels_truncation_is_exact(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-lbl").await;
     let label = format!("rb-lbl-{}", Uuid::new_v4());
@@ -237,6 +262,7 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // limit=1 over 2 labeled claims → one remains → truncated.
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label.clone()]),
@@ -254,6 +280,7 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // limit=2 over exactly 2 labeled claims → none remain → NOT truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label]),
@@ -293,6 +320,10 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
 /// every run.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool: PgPool) {
+    // Same reason as the sibling tests: recompute_beliefs enumerates via
+    // `list_claim_ids`, whose debug_assert requires a Bypass viewer. Hold the
+    // ScopedPool for the duration.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "696d3a1c-multiframe").await;
     let claim = insert_claim(&pool, agent, &format!("696d3a1c-{}", Uuid::new_v4())).await;
@@ -342,6 +373,7 @@ async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool:
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -382,7 +414,7 @@ async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool:
             .fetch_one(&pool)
             .await
             .expect("belief_frame_id");
-    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&pool)
+    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
         .await
         .expect("ensure_binary_frame");
     assert_eq!(

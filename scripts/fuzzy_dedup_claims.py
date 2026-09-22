@@ -24,7 +24,7 @@ Limitations (scope-deferred — see docs/architecture/noun-claims-and-verb-edges
   behavioral_executions.step_claim_id, challenges, claim_clusters,
   claim_encryption, claim_frames, claim_neighborhood_membership,
   claim_signature_revocations, counterfactual_scenarios, countersignatures,
-  ds_bayesian_divergence, embedding_shares, entity_mentions, evidence_diversity,
+  ds_bayesian_divergence, entity_mentions, evidence_diversity,
   experiments.hypothesis_id, learning_events, praxis_access_log.justification_claim_id,
   praxis_claims, praxis_compliance_requirements, sample_claims, triples,
   claims.supersedes. Soft-mark + label-aware reads cover these for now.
@@ -42,13 +42,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import uuid
 from dataclasses import dataclass, field
 
 import psycopg2
 import psycopg2.extras
+
+from maintenance_dsn import maintenance_dsn
 
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
@@ -286,7 +287,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
         help="Postgres connection string (env DATABASE_URL overrides default)",
     )
     parser.add_argument(

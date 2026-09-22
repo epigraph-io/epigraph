@@ -6,6 +6,9 @@
 //! the edge, destroying `properties.decided_by` along with it. These pin the
 //! property that lets retirement stop deleting.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::repos::edge::EdgeRepository;
 use epigraph_db::repos::sheaf::SheafRepository;
 use sqlx::PgPool;
@@ -73,9 +76,13 @@ async fn retracting_an_edge_removes_it_from_the_sheaf_scan_but_keeps_the_row(poo
         pairs.iter().any(|p| p.source_id == a && p.target_id == b)
     };
 
-    let before = SheafRepository::get_epistemic_edge_pairs(&pool, None)
-        .await
-        .expect("scan before");
+    let before = SheafRepository::get_epistemic_edge_pairs(
+        &pool,
+        &fixture::public_viewer(&pool).await,
+        None,
+    )
+    .await
+    .expect("scan before");
     assert!(
         seen(&before),
         "precondition: an in-force supports edge must appear in the epistemic scan, \
@@ -87,9 +94,13 @@ async fn retracting_an_edge_removes_it_from_the_sheaf_scan_but_keeps_the_row(poo
         .expect("retract");
     assert_eq!(closed, vec![edge], "retract must report the edge it closed");
 
-    let after = SheafRepository::get_epistemic_edge_pairs(&pool, None)
-        .await
-        .expect("scan after");
+    let after = SheafRepository::get_epistemic_edge_pairs(
+        &pool,
+        &fixture::public_viewer(&pool).await,
+        None,
+    )
+    .await
+    .expect("scan after");
     assert!(
         !seen(&after),
         "a retracted edge must not appear in the epistemic scan — if it does, \
@@ -193,9 +204,13 @@ async fn a_future_dated_valid_to_is_still_in_force(pool: PgPool) {
         EdgeRepository::is_in_force(&pool, edge).await.unwrap(),
         "an edge valid until next year is in force now"
     );
-    let pairs = SheafRepository::get_epistemic_edge_pairs(&pool, None)
-        .await
-        .expect("scan");
+    let pairs = SheafRepository::get_epistemic_edge_pairs(
+        &pool,
+        &fixture::public_viewer(&pool).await,
+        None,
+    )
+    .await
+    .expect("scan");
     assert!(
         pairs.iter().any(|p| p.source_id == a && p.target_id == b),
         "a future-dated edge must still participate in the epistemic scan"

@@ -171,10 +171,14 @@ impl CascadeReport {
 /// [`EdgeRepository::list_current_claim_targets`]).
 ///
 /// Never fails: see the module docs on best-effort semantics.
-pub async fn cascade_after_supersede(pool: &PgPool, new_claim_id: Uuid) -> CascadeReport {
+pub async fn cascade_after_supersede(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    new_claim_id: Uuid,
+) -> CascadeReport {
     let mut report = CascadeReport::default();
 
-    let frame_id = match ensure_binary_frame(pool).await {
+    let frame_id = match ensure_binary_frame(pool, viewer).await {
         Ok(id) => id,
         Err(e) => {
             report.note_error("ensure_binary_frame", e);
@@ -182,7 +186,7 @@ pub async fn cascade_after_supersede(pool: &PgPool, new_claim_id: Uuid) -> Casca
         }
     };
 
-    let edges = match EdgeRepository::list_current_claim_targets(pool, new_claim_id).await {
+    let edges = match EdgeRepository::list_current_claim_targets(pool, viewer, new_claim_id).await {
         Ok(rows) => rows,
         Err(e) => {
             report.note_error("enumerate downstream targets", e);
@@ -193,9 +197,16 @@ pub async fn cascade_after_supersede(pool: &PgPool, new_claim_id: Uuid) -> Casca
     // Seeded with the origin so a cycle (`A supports B`, `B supports A`)
     // cannot pull the retraction's own replacement back into the walk.
     let mut visited: HashSet<Uuid> = HashSet::from([new_claim_id]);
-    let targets =
-        invalidate_and_rewire(pool, new_claim_id, &edges, &mut visited, &mut report).await;
-    repair_targets(pool, frame_id, &targets, &mut report).await;
+    let targets = invalidate_and_rewire(
+        pool,
+        viewer,
+        new_claim_id,
+        &edges,
+        &mut visited,
+        &mut report,
+    )
+    .await;
+    repair_targets(pool, viewer, frame_id, &targets, &mut report).await;
 
     tracing::info!(
         replacement = %new_claim_id,
@@ -217,13 +228,14 @@ pub async fn cascade_after_supersede(pool: &PgPool, new_claim_id: Uuid) -> Casca
 /// Never fails: see the module docs on best-effort semantics.
 pub async fn cascade_after_dedup(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     canonical_id: Uuid,
     repair: &DedupRepair,
 ) -> CascadeReport {
     let mut report = CascadeReport::default();
     report.invalidated_bbas += repair.deleted_bbas;
 
-    let frame_id = match ensure_binary_frame(pool).await {
+    let frame_id = match ensure_binary_frame(pool, viewer).await {
         Ok(id) => id,
         Err(e) => {
             report.note_error("ensure_binary_frame", e);
@@ -241,7 +253,7 @@ pub async fn cascade_after_dedup(
     // decision) belongs to phase 3, once every row-level mutation is done;
     // deciding `canonical` is unbacked here would also NULL the very interval
     // phase 2 is about to read.
-    if let Err(e) = recompute_claim_belief_on_frame(pool, canonical_id, frame_id).await {
+    if let Err(e) = recompute_claim_belief_on_frame(pool, viewer, canonical_id, frame_id).await {
         report.note_error(
             &format!("pre-refresh canonical {canonical_id} before re-deriving its edges"),
             e,
@@ -260,6 +272,7 @@ pub async fn cascade_after_dedup(
     let mut visited: HashSet<Uuid> = HashSet::from([canonical_id]);
     let resourced = invalidate_and_rewire(
         pool,
+        viewer,
         canonical_id,
         &repair.resourced_edges,
         &mut visited,
@@ -279,7 +292,7 @@ pub async fn cascade_after_dedup(
         .copied()
         .filter(|id| seen.insert(*id))
         .collect();
-    repair_targets(pool, frame_id, &to_repair, &mut report).await;
+    repair_targets(pool, viewer, frame_id, &to_repair, &mut report).await;
 
     tracing::info!(
         canonical = %canonical_id,
@@ -302,6 +315,7 @@ pub async fn cascade_after_dedup(
 /// its target would be a write with no cause — the cascade stays surgical.
 async fn invalidate_and_rewire(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     source_id: Uuid,
     edges: &[(Uuid, Uuid, String)],
     visited: &mut HashSet<Uuid>,
@@ -321,7 +335,7 @@ async fn invalidate_and_rewire(
     // supporter back, so proceeding without an agent id would delete every
     // BBA in the list and re-derive none of them — bulk, permanent evidence
     // loss reported as a single line.
-    let source_agent_id = match ClaimRepository::get_agent_id(pool, source_id).await {
+    let source_agent_id = match ClaimRepository::get_agent_id(pool, viewer, source_id).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             report.note_error(
@@ -370,6 +384,7 @@ async fn invalidate_and_rewire(
         // precisely the state C1(b) promises the caller can rule out.
         if auto_wire_edge_if_epistemic(
             pool,
+            viewer,
             /* was_created */ false,
             *edge_id,
             source_id,
@@ -408,25 +423,28 @@ async fn invalidate_and_rewire(
 /// that did not happen.
 async fn repair_targets(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     frame_id: Uuid,
     targets: &[Uuid],
     report: &mut CascadeReport,
 ) {
     for target_id in targets {
         let target_id = *target_id;
-        match recompute_claim_belief_on_frame(pool, target_id, frame_id).await {
+        match recompute_claim_belief_on_frame(pool, viewer, target_id, frame_id).await {
             Ok(true) => {
                 report.targets.push(target_id);
                 report.recomputed.push(target_id);
             }
-            Ok(false) => match mark_unbacked_if_evidence_free(pool, target_id, report).await {
-                UnbackedOutcome::Cleared => {
-                    report.targets.push(target_id);
-                    report.unbacked.push(target_id);
+            Ok(false) => {
+                match mark_unbacked_if_evidence_free(pool, viewer, target_id, report).await {
+                    UnbackedOutcome::Cleared => {
+                        report.targets.push(target_id);
+                        report.unbacked.push(target_id);
+                    }
+                    UnbackedOutcome::Failed => report.targets.push(target_id),
+                    UnbackedOutcome::NothingToClear => {}
                 }
-                UnbackedOutcome::Failed => report.targets.push(target_id),
-                UnbackedOutcome::NothingToClear => {}
-            },
+            }
             Err(e) => {
                 report.targets.push(target_id);
                 report.note_error(&format!("recompute claim {target_id}"), e);
@@ -447,10 +465,11 @@ async fn repair_targets(
 /// degenerating into "never had one".
 async fn mark_unbacked_if_evidence_free(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     report: &mut CascadeReport,
 ) -> UnbackedOutcome {
-    match MassFunctionRepository::get_for_claim(pool, claim_id).await {
+    match MassFunctionRepository::get_for_claim(pool, viewer, claim_id).await {
         Ok(rows) if !rows.is_empty() => UnbackedOutcome::NothingToClear,
         Ok(_) => match MassFunctionRepository::clear_claim_belief(pool, claim_id).await {
             Ok(0) => UnbackedOutcome::NothingToClear,
@@ -489,6 +508,7 @@ enum UnbackedOutcome {
 /// [`CascadeReport::errors`], never as `Err`.
 pub async fn mark_duplicate_with_cascade(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     dup_id: Uuid,
     canonical_id: Uuid,
 ) -> Result<CascadeReport, epigraph_db::DbError> {
@@ -500,5 +520,5 @@ pub async fn mark_duplicate_with_cascade(
         ClaimId::from_uuid(canonical_id),
     )
     .await?;
-    Ok(cascade_after_dedup(pool, canonical_id, &repair).await)
+    Ok(cascade_after_dedup(pool, viewer, canonical_id, &repair).await)
 }

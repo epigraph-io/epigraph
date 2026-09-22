@@ -7,6 +7,27 @@
 //! mutating a claim in-place (which would break cryptographic integrity), a new
 //! claim is created that explicitly supersedes the old one. This preserves the
 //! full epistemic history: every version of a belief is recorded and traceable.
+//!
+//! # Tenancy: 1 of this file's 9 raw-pool sites is converted
+//!
+//! Conversion shard 7. `claim_history` runs
+//! `ClaimRepository::version_history` on a viewer-stamped connection from
+//! [`AppState::read_as`]; the statement already spliced the viewer, and what
+//! changed is which connection carries the session GUCs the `claims` policy
+//! reads.
+//!
+//! The other 8 sites WRITE — six in `supersede_claim`, two in `mark_duplicate`.
+//! One of the six is blocked a second time at SITE level:
+//! `let pool = state.db_pool.clone()` is moved into a detached `tokio::spawn`,
+//! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
+//! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! `supersede_claim` additionally carries an open entry whose owner is the
+//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
+//! This shard does not touch it and it stays open. Nothing further about it is
+//! recorded here — see `docs/tenancy/progress.json`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
     extract::{Path, State},
@@ -20,6 +41,7 @@ use sqlx;
 use uuid::Uuid;
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use epigraph_core::{AgentId, ClaimId, TruthValue};
 #[cfg(feature = "db")]
@@ -172,6 +194,7 @@ pub struct VersionHistoryResponse {
     tag = "claims"
 )]
 pub async fn supersede_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
@@ -292,7 +315,7 @@ pub async fn supersede_claim(
 
         // Get the next version number for the old claim chain, then +1 for new claim
         let version_number: i32 =
-            ClaimVersionRepository::latest_version_number(&state.db_pool, claim_id)
+            ClaimVersionRepository::latest_version_number(&state.db_pool, &viewer, claim_id)
                 .await
                 .unwrap_or(0)
                 + 1;
@@ -330,9 +353,12 @@ pub async fn supersede_claim(
     // inside the transaction. Best-effort: the transaction has already
     // committed, so a cascade failure must not turn a successful write into a
     // reported error (the retry would hit "already been superseded").
-    let belief_cascade =
-        epigraph_engine::retraction_cascade::cascade_after_supersede(&state.db_pool, new_uuid)
-            .await;
+    let belief_cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
+        &state.db_pool,
+        &viewer,
+        new_uuid,
+    )
+    .await;
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
     //
@@ -432,6 +458,7 @@ pub async fn supersede_claim(
     tag = "claims"
 )]
 pub async fn mark_duplicate(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(dup_id): Path<Uuid>,
@@ -464,6 +491,7 @@ pub async fn mark_duplicate(
     // Only the dedup's own failure is an error; the cascade's is reported.
     let belief_cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
         &state.db_pool,
+        &viewer,
         dup_id,
         req.canonical_id,
     )
@@ -525,84 +553,72 @@ pub async fn mark_duplicate(
 ///
 /// - 404 Not Found: Claim does not exist
 /// - 200 OK: Version history returned
+///
+/// The whole chain is read as the caller's `Viewer`
+/// (`ClaimRepository::version_history`). A claim the viewer cannot see is
+/// reported as 404, identically to one that does not exist: before PR-07 this
+/// handler walked `claims` with three unfiltered inline statements and returned
+/// every revision's `content`, so it disclosed not only other tenants' claim
+/// text but the full edit history behind it.
 #[cfg(feature = "db")]
 pub async fn claim_history(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<VersionHistoryResponse>, ApiError> {
-    // Walk the supersession chain using database queries
-    // First, walk backwards to find the root
-    let mut root_id = claim_id;
-    loop {
-        let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1")
-                .bind(root_id)
-                .fetch_optional(&state.db_pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("DB error: {e}"),
-                })?;
-
-        match row {
-            None => {
-                return Err(ApiError::NotFound {
-                    entity: "Claim".to_string(),
-                    id: claim_id.to_string(),
-                });
-            }
-            Some((Some(prev_id),)) => root_id = prev_id,
-            Some((None,)) => break,
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_history",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
         }
-    }
+    })?;
 
-    // Walk forward from root to build version list
-    let mut versions = Vec::new();
-    let mut current_id = Some(root_id);
-    let mut version_number: u32 = 1;
-    let mut current_version: u32 = 1;
-
-    while let Some(id) = current_id {
-        let row: Option<(Uuid, String, f64, bool, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT id, content, truth_value, COALESCE(is_current, true), created_at FROM claims WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&state.db_pool)
+    let hits = epigraph_db::ClaimRepository::version_history(&mut *read, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("DB error: {e}"),
         })?;
 
-        if let Some((cid, content, truth_value, is_current, created_at)) = row {
-            // Find forward link: which claim supersedes this one?
-            let superseded_by: Option<Uuid> =
-                sqlx::query_scalar("SELECT id FROM claims WHERE supersedes = $1")
-                    .bind(cid)
-                    .fetch_optional(&state.db_pool)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("DB error: {e}"),
-                    })?;
-
-            versions.push(ClaimVersion {
-                claim_id: cid,
-                content,
-                truth_value,
-                version: version_number,
-                is_current,
-                created_at,
-                superseded_by,
-            });
-
-            if is_current {
-                current_version = version_number;
-            }
-
-            current_id = superseded_by;
-            version_number += 1;
-        } else {
-            break;
-        }
+    if hits.is_empty() {
+        return Err(ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: claim_id.to_string(),
+        });
     }
+
+    // `superseded_by` comes from `claims.supersedes` (see
+    // `ClaimVersionHit::superseded_by`), NOT from the position of the next row.
+    // Positional inference is wrong on a forked chain — `mark_duplicate` points
+    // every duplicate at the same canonical claim, so a claim with two marked
+    // duplicates has two successors and "the next row" names an arbitrary one
+    // of them. `version` is still positional, but the repo's
+    // `ORDER BY depth, id` is a total order, so it is at least stable across
+    // identical requests.
+    let mut current_version: u32 = 1;
+    let versions: Vec<ClaimVersion> = hits
+        .iter()
+        .enumerate()
+        .map(|(idx, hit)| {
+            let version = (idx as u32) + 1;
+            if hit.is_current {
+                current_version = version;
+            }
+            ClaimVersion {
+                claim_id: hit.id,
+                content: hit.content.clone(),
+                truth_value: hit.truth_value,
+                version,
+                is_current: hit.is_current,
+                created_at: hit.created_at,
+                superseded_by: hit.superseded_by,
+            }
+        })
+        .collect();
 
     let total_versions = versions.len();
 
@@ -645,6 +661,12 @@ mod tests {
     // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
     // These need to be rewritten as proper DB integration tests.
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests_placeholder {
         use super::super::*;
@@ -667,7 +689,7 @@ mod tests {
         /// Helper to create a state with a claim pre-populated in the store
         async fn state_with_claim(claim_id: Uuid) -> (AppState, Uuid) {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 
@@ -764,7 +786,7 @@ mod tests {
         #[tokio::test]
         async fn test_supersede_nonexistent_claim_returns_404() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router(state);
@@ -1031,7 +1053,7 @@ mod tests {
         #[tokio::test]
         async fn test_history_nonexistent_claim_returns_404() {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
             let router = test_router(state);
@@ -1116,13 +1138,13 @@ mod tests {
         /// when the request goes through the full create_router middleware stack.
         ///
         /// This is a true integration test: it uses the production router
-        /// (including the require_signature middleware layer) rather than a
+        /// (including the bearer_auth_middleware layer) rather than a
         /// bare handler router, proving that unauthenticated writes are rejected.
         #[tokio::test]
         async fn test_supersede_without_signature_returns_401() {
             let claim_id = Uuid::new_v4();
             let state = AppState::new(ApiConfig {
-                require_signatures: false, // irrelevant; middleware always checks headers
+                require_packet_signatures: false, // irrelevant; middleware always checks headers
                 ..ApiConfig::default()
             });
 
@@ -1245,10 +1267,13 @@ mod tests {
             assert!(history.versions[2].is_current);
         }
 
-        /// Test that the GET /history endpoint is publicly accessible
-        /// (no signature headers required) through the full router.
+        /// PR-03 INVERSION. This asserted that `GET /api/v1/claims/:id/history`
+        /// answered 200 with no credential, "because the history endpoint is on
+        /// the public router". It is not on the public router any more: version
+        /// history is claim content over time, which is strictly more than
+        /// `GET /api/v1/claims/:id` exposes.
         #[tokio::test]
-        async fn test_history_accessible_without_signature() {
+        async fn test_history_is_401_without_a_token() {
             let claim_id = Uuid::new_v4();
             let state = AppState::new(ApiConfig::default());
 
@@ -1271,8 +1296,10 @@ mod tests {
             // Use the full production router (with middleware)
             let router = crate::routes::create_router(state);
 
-            // GET without any signature headers -> should succeed (200) because
-            // the history endpoint is on the public router
+            // GET with no Authorization header -> 401 with the RFC 6750
+            // challenge. The handler's own behaviour (that it returns one
+            // version for a freshly-inserted claim) is covered by the
+            // handler-level tests above, which call it directly.
             let request = Request::builder()
                 .method("GET")
                 .uri(format!("/api/v1/claims/{claim_id}/history"))
@@ -1282,15 +1309,28 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "History endpoint should be publicly accessible without signature"
+                StatusCode::UNAUTHORIZED,
+                "claim version history is no longer anonymously readable"
             );
-
-            let history: VersionHistoryResponse = parse_body(response).await;
-            assert_eq!(history.total_versions, 1);
+            let challenge = response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .expect("401 carries an RFC 6750 challenge")
+                .to_str()
+                .unwrap();
+            assert!(
+                challenge.contains(r#"error="invalid_token""#),
+                "got: {challenge}"
+            );
         }
     } // end mod handler_tests
 
+    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
+    // and the `not(feature = "db")` configuration has pre-existing compile
+    // errors, so no CI job or local run builds this module. PR-03's
+    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
+    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
+    // probing every route on the buildable variant's `protected` chain.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;
@@ -1313,7 +1353,7 @@ mod tests {
         /// Helper to create a state with a claim pre-populated in the store
         async fn state_with_claim(claim_id: Uuid) -> AppState {
             let state = AppState::new(ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..ApiConfig::default()
             });
 

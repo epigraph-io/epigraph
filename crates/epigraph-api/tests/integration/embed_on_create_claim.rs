@@ -16,7 +16,12 @@ use uuid::Uuid;
 /// fallback used by `default_jwt_config()` in state.rs when
 /// `EPIGRAPH_JWT_SECRET` is not set). Same pattern as
 /// `integration/submit_persistence_tests.rs::test_bearer_token`.
-fn test_bearer_token() -> String {
+///
+/// PR-03: `agent_id` is now REQUIRED rather than `None`. `create_claim` used to
+/// resolve the author's public key through a fallback chain ending in
+/// `[0u8; 32]`, so a token with no principal produced a claim signed with a key
+/// no private key can ever match. That chain is gone: no `agent_id` is 401.
+fn test_bearer_token(agent_id: Uuid) -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
     let (token, _) = jwt_config
@@ -25,7 +30,7 @@ fn test_bearer_token() -> String {
             vec!["claims:write".to_string(), "epigraph:write".to_string()],
             "service",
             None,
-            None,
+            Some(agent_id),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");
@@ -62,7 +67,7 @@ async fn create_claim_embeds_inline(pool: PgPool) {
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::AUTHORIZATION,
-            format!("Bearer {}", test_bearer_token()),
+            format!("Bearer {}", test_bearer_token(agent_id)),
         )
         .body(Body::from(body.to_string()))
         .unwrap();

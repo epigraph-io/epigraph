@@ -71,16 +71,32 @@ impl ExperimentRepository {
         Ok(row)
     }
 
-    #[instrument(skip(pool))]
-    pub async fn get_for_hypothesis(
-        pool: &PgPool,
+    /// Every experiment recorded against a hypothesis, newest first.
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so `routes/hypothesis.rs::hypothesis_status`
+    /// can run it on the SAME viewer-stamped connection as the four tenancy-carrying
+    /// reads that surround it, instead of checking a second connection out of the
+    /// pool mid-handler. Conversion shard 6 widened the executor ONLY: the SQL, its
+    /// single bind and the projected row shape are byte-identical and were not
+    /// re-derived.
+    ///
+    /// It takes no `Viewer` because there is nothing on `experiments` for one to
+    /// filter — see this function's row in
+    /// `epigraph-db/tests/visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER` for the
+    /// measurement. Every pre-existing caller passes `&PgPool`, which satisfies
+    /// `E: PgExecutor<'e>`, so none was edited.
+    #[instrument(skip(executor))]
+    pub async fn get_for_hypothesis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         hypothesis_id: Uuid,
     ) -> Result<Vec<ExperimentRow>, DbError> {
         let rows = sqlx::query_as::<_, ExperimentRow>(
             "SELECT * FROM experiments WHERE hypothesis_id = $1 ORDER BY created_at DESC",
         )
         .bind(hypothesis_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows)
     }
@@ -117,12 +133,13 @@ impl ExperimentRepository {
     }
 
     /// Count completed experiments for a hypothesis that have analysis nodes.
-    #[instrument(skip(pool))]
-    pub async fn count_completed_with_analysis(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_completed_with_analysis<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         hypothesis_id: Uuid,
     ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT COUNT(DISTINCT e.id)
             FROM experiments e
@@ -133,11 +150,15 @@ impl ExperimentRepository {
                          AND ed.relationship = 'analyzes'
             WHERE e.hypothesis_id = $1
               AND e.status = 'complete'
+              /* {EDGE_VISIBILITY:ed} */
             "#,
-        )
-        .bind(hypothesis_id)
-        .fetch_one(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql).bind(hypothesis_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (i64,) = q.fetch_one(executor).await?;
         Ok(row.0)
     }
 }

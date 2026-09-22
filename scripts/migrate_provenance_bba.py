@@ -79,6 +79,9 @@ from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from maintenance_dsn import maintenance_dsn  # noqa: E402
+
 MARKER = "provenance_migration_v1"
 
 # Claims that are operational exhaust rather than semantic content. Mirrors the
@@ -431,7 +434,13 @@ def rollback(cur, args, manifest_path: str) -> int:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    p.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
+    # Corpus-wide script: it must connect on the MAINTENANCE DSN, not an ordinary
+    # application connection. Once RLS is active an application role makes every
+    # statement match a subset — the SELECTs see less, the INSERTs touch nothing,
+    # and the script exits 0. A silently partial provenance migration is worse than
+    # a refused one. `maintenance_dsn` also refuses when MAINTENANCE_DATABASE_URL
+    # and DATABASE_URL name different databases.
+    p.add_argument("--database-url", default=None)
     p.add_argument(
         "--frame-ids",
         nargs="+",
@@ -459,7 +468,12 @@ def main() -> None:
     args = p.parse_args()
 
     if not args.database_url:
-        sys.exit("FATAL: set DATABASE_URL or pass --database-url")
+        args.database_url = maintenance_dsn()
+    if not args.database_url:
+        sys.exit(
+            "FATAL: set MAINTENANCE_DATABASE_URL (preferred) or DATABASE_URL, "
+            "or pass --database-url"
+        )
     if args.execute and not args.manifest:
         sys.exit("FATAL: --execute requires --manifest. An unjournalled write is not reversible.")
     if not args.rollback and not (args.frame_ids and args.perspective_id and args.source_agent_id):

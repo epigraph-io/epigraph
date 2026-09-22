@@ -4,6 +4,9 @@
 //! over a window, so a variant promoted today can regress tomorrow. The pass
 //! must overwrite the verdict each run — never leave a stale `promotable:true`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_crypto::AgentSigner;
 use epigraph_db::{BehavioralExecutionRepository, BehavioralExecutionRow, ClaimRepository};
@@ -96,6 +99,7 @@ async fn link_variant(pool: &PgPool, variant: Uuid, parent: Uuid) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_sets_then_clears_promotable(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "rwp-agent").await;
     let parent = insert_claim(&pool, agent, "rwp-parent").await;
@@ -108,6 +112,7 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
     let j1 = result_json(
         tools::workflows::refresh_workflow_promotion(
             &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: Some(50),
@@ -119,7 +124,7 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
     assert_eq!(j1["refreshed"], true);
     assert_eq!(j1["promotable"], true);
     assert_eq!(
-        ClaimRepository::promotion_flag(&pool, ClaimId::from_uuid(variant))
+        ClaimRepository::promotion_flag(&pool, &viewer, ClaimId::from_uuid(variant))
             .await
             .unwrap(),
         Some(true),
@@ -132,6 +137,7 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
     let j2 = result_json(
         tools::workflows::refresh_workflow_promotion(
             &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: variant.to_string(),
                 window: Some(50),
@@ -145,7 +151,7 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
         "regressed variant is demoted on re-run"
     );
     assert_eq!(
-        ClaimRepository::promotion_flag(&pool, ClaimId::from_uuid(variant))
+        ClaimRepository::promotion_flag(&pool, &viewer, ClaimId::from_uuid(variant))
             .await
             .unwrap(),
         Some(false),
@@ -155,6 +161,7 @@ async fn refresh_sets_then_clears_promotable(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn refresh_skips_lineage_root(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "rwp-agent2").await;
     let root = insert_claim(&pool, agent, "rwp-root").await; // no variant_of edge
@@ -162,6 +169,7 @@ async fn refresh_skips_lineage_root(pool: PgPool) {
     let j = result_json(
         tools::workflows::refresh_workflow_promotion(
             &server,
+            &viewer,
             EvaluateWorkflowPromotionParams {
                 workflow_id: root.to_string(),
                 window: None,
@@ -172,7 +180,7 @@ async fn refresh_skips_lineage_root(pool: PgPool) {
     );
     assert_eq!(j["refreshed"], false, "a lineage root is left untouched");
     assert_eq!(
-        ClaimRepository::promotion_flag(&pool, ClaimId::from_uuid(root))
+        ClaimRepository::promotion_flag(&pool, &viewer, ClaimId::from_uuid(root))
             .await
             .unwrap(),
         None,

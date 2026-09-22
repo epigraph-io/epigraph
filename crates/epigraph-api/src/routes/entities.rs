@@ -1,13 +1,53 @@
 //! Entity and triple REST endpoints for NER/RDF knowledge graph operations
 //!
-//! ## Write endpoints (protected, require auth)
+//! Every endpoint below is on the `protected` router and requires a Bearer
+//! token. The reads were anonymous until PR-03's router inversion.
+//!
+//! ## Write endpoints
 //! - `POST /api/v1/entities` — Upsert a named entity
 //! - `POST /api/v1/entity-mentions/batch` — Batch insert entity mentions
 //! - `POST /api/v1/triples/batch` — Batch insert RDF-style triples
 //!
-//! ## Read endpoints (public)
+//! ## Read endpoints
 //! - `POST /api/v1/triples/query` — Query triples with optional filters
 //! - `GET /api/v1/entities/:id/neighborhood` — Get all triples for an entity
+//!
+//! # Tenancy: 5 of this file's 8 raw-pool sites are converted
+//!
+//! Conversion shard 7, and the largest single-file drop in it.
+//! `entity_neighborhood` (2 sites) and `query_triples` (3) each resolve their
+//! entity ids and read their assertions on ONE viewer-stamped connection from
+//! [`AppState::read_as`].
+//!
+//! **`query_triples` was classified as unconvertible and is not.** PR #460's
+//! tail-RLS classification computes its blocked category from the HANDLER —
+//! `write verb OR no Viewer OR unrouted` — and the verb is a property of the
+//! route table rather than of the statement. Measured against this tree:
+//! `query_triples` is registered POST, holds a `ViewerExtractor`, runs three
+//! SELECTs, opens no transaction and writes nothing. It is the same "true of the
+//! rule, false of the reachability" shape shard 6 found in
+//! `edges.rs::evidence_by_relationship`, and converting it is that
+//! classification's own conclusion applied rather than scope invented.
+//!
+//! **Where the suppression comes from.** `EntityRepository::get` and
+//! `::find_by_name_and_type` read `entities`, which carries no tenancy columns
+//! and no RLS at migration head 92 — they are name-and-type resolution over a
+//! dictionary and have nothing to filter; their viewer-less signatures are
+//! recorded in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`. The assertions
+//! those ids are spent on are read through `TripleRepository::{query,
+//! entity_neighborhood}`, which splice the viewer over `triples` (RLS and FORCE,
+//! with a narrowing policy). So the filtering is real and it is entirely on the
+//! triple side.
+//!
+//! This file also carries the open entry `F-PR28-route-arm-extractor-parity`,
+//! whose disposition is unchanged by this shard. Nothing further about it is
+//! recorded here — see `docs/tenancy/progress.json`.
+//!
+//! The other 3 sites are `create_entity`, `batch_create_mentions` and
+//! `batch_create_triples` — all writes, owned by `ScopedPool::begin_as` plus
+//! `Viewer::splice_write`.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -15,6 +55,7 @@ use uuid::Uuid;
 
 use crate::{errors::ApiError, state::AppState};
 
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use axum::extract::Path;
 #[cfg(feature = "db")]
@@ -235,14 +276,27 @@ pub async fn batch_create_triples(
 /// callers can distinguish "no entity found" from "entity found but no triples."
 #[cfg(feature = "db")]
 pub async fn query_triples(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<QueryTriplesRequest>,
 ) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
     // Resolve optional subject name → UUID
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "query_triples",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let subject_id = if let (Some(name), Some(type_top)) =
         (req.subject_name.as_deref(), req.subject_type.as_deref())
     {
-        EntityRepository::find_by_name_and_type(&state.db_pool, name, type_top)
+        EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
             .await?
             .map(|e| e.id)
     } else {
@@ -253,7 +307,7 @@ pub async fn query_triples(
     let object_id = if let (Some(name), Some(type_top)) =
         (req.object_name.as_deref(), req.object_type.as_deref())
     {
-        EntityRepository::find_by_name_and_type(&state.db_pool, name, type_top)
+        EntityRepository::find_by_name_and_type(&mut *read, name, type_top)
             .await?
             .map(|e| e.id)
     } else {
@@ -264,7 +318,8 @@ pub async fn query_triples(
     let limit = req.limit.unwrap_or(50).min(500);
 
     let rows = TripleRepository::query(
-        &state.db_pool,
+        &mut *read,
+        &viewer,
         subject_id,
         req.predicate.as_deref(),
         object_id,
@@ -290,11 +345,24 @@ pub async fn query_triples(
 /// another entity, this endpoint returns the neighborhood of the survivor.
 #[cfg(feature = "db")]
 pub async fn entity_neighborhood(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(entity_id): Path<Uuid>,
 ) -> Result<Json<Vec<epigraph_db::TripleRow>>, ApiError> {
     // Resolve to canonical entity (follow merged_into chain one hop)
-    let entity = EntityRepository::get(&state.db_pool, entity_id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "entity_neighborhood",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let entity = EntityRepository::get(&mut *read, entity_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Entity".to_string(),
@@ -304,7 +372,8 @@ pub async fn entity_neighborhood(
     // If this entity has been merged into another, use the survivor's ID
     let canonical_id = entity.merged_into.unwrap_or(entity.id);
 
-    let rows = TripleRepository::entity_neighborhood(&state.db_pool, canonical_id, 200).await?;
+    let rows =
+        TripleRepository::entity_neighborhood(&mut *read, &viewer, canonical_id, 200).await?;
     Ok(Json(rows))
 }
 

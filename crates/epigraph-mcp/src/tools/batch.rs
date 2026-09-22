@@ -9,6 +9,7 @@ use crate::types::*;
 /// Batch submit multiple claims (max 100).
 pub async fn batch_submit_claims(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: BatchSubmitClaimsParams,
 ) -> Result<CallToolResult, McpError> {
     if params.claims.is_empty() {
@@ -35,7 +36,7 @@ pub async fn batch_submit_claims(
             novelty_threshold: None,
         };
 
-        match crate::tools::claims::submit_claim(server, claim_params).await {
+        match crate::tools::claims::submit_claim(server, viewer, claim_params).await {
             Ok(result) => {
                 // Extract claim_id from the JSON text content returned by submit_claim
                 let claim_id = result
@@ -119,74 +120,57 @@ pub async fn stage_claims(
 }
 
 /// Get system statistics.
+///
+/// # Tenancy (PR-09)
+///
+/// Every cardinality except `agents` is now **viewer-scoped**: the numbers are
+/// "rows this viewer can read", not "rows that exist". Before PR-09 this
+/// function took a `&Viewer` and spent it on exactly one call
+/// (`TripleRepository::index_counts`) while issuing eight raw `SELECT COUNT(*)`
+/// statements of its own, so any principal — including the nil principal of an
+/// unauthenticated HTTP call — learned the exact global corpus size. That is a
+/// membership oracle, and it was invisible to a lint keyed on the presence of
+/// the parameter.
+///
+/// `agents` and the triple/entity index counts stay corpus-wide and are
+/// annotated `VISIBILITY-EXEMPT:` at their repo functions
+/// (`corpus_stats.rs::agent_count`, `triple.rs::index_counts`): neither table
+/// carries migration 062's tenancy columns, and both numbers exist to tell
+/// "the index is empty" apart from "your query matched nothing".
 pub async fn system_stats(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SystemStatsParams,
 ) -> Result<CallToolResult, McpError> {
     let detailed = params.detailed.unwrap_or(false);
 
-    let claim_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM claims")
-        .fetch_one(&server.pool)
+    let counts = epigraph_db::CorpusStatsRepository::tenant_counts(&server.pool, viewer, detailed)
         .await
         .map_err(internal_error)?;
-
-    let evidence_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM evidence")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let edge_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM edges")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let agent_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents")
-        .fetch_one(&server.pool)
-        .await
-        .map_err(internal_error)?;
-
-    let frame_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM frames")
-        .fetch_one(&server.pool)
+    let agent_count = epigraph_db::CorpusStatsRepository::agent_count(&server.pool, viewer)
         .await
         .map_err(internal_error)?;
 
     let mut stats = serde_json::json!({
-        "claims": claim_count.0,
-        "evidence": evidence_count.0,
-        "edges": edge_count.0,
-        "agents": agent_count.0,
-        "frames": frame_count.0,
+        "claims": counts.claims,
+        "evidence": counts.evidence,
+        "edges": counts.edges,
+        "agents": agent_count,
+        "frames": counts.frames,
     });
 
     if detailed {
-        let workflow_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM claims WHERE 'workflow' = ANY(labels)")
-                .fetch_one(&server.pool)
-                .await
-                .map_err(internal_error)?;
-
-        let challenge_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM challenges")
-            .fetch_one(&server.pool)
-            .await
-            .map_err(internal_error)?;
-
-        let embedding_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM claims WHERE embedding IS NOT NULL")
-                .fetch_one(&server.pool)
-                .await
-                .map_err(internal_error)?;
-
         // Structured triple/entity index health. Surfaced here so an empty /
         // unpopulated RDF layer is observable, rather than silently reported as
         // count=0 / entity-not-found by query_triples/search_triples/
         // entity_neighborhood (backlog ae2784a9).
-        let index = epigraph_db::TripleRepository::index_counts(&server.pool)
+        let index = epigraph_db::TripleRepository::index_counts(&server.pool, viewer)
             .await
             .map_err(internal_error)?;
 
-        stats["workflows"] = serde_json::json!(workflow_count.0);
-        stats["challenges"] = serde_json::json!(challenge_count.0);
-        stats["embeddings"] = serde_json::json!(embedding_count.0);
+        stats["workflows"] = serde_json::json!(counts.workflow_claims.unwrap_or(0));
+        stats["challenges"] = serde_json::json!(counts.challenges.unwrap_or(0));
+        stats["embeddings"] = serde_json::json!(counts.embedded_claims.unwrap_or(0));
         stats["triples"] = serde_json::json!(index.triples);
         stats["entities"] = serde_json::json!(index.entities);
         stats["entity_mentions"] = serde_json::json!(index.entity_mentions);

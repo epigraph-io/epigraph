@@ -20,6 +20,7 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// GET-equivalent: compute CDST sheaf sections for all claims.
 pub async fn check_sheaf_consistency(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CheckSheafConsistencyParams,
 ) -> Result<CallToolResult, McpError> {
     let min_radius = params.min_radius.unwrap_or(0.1);
@@ -27,6 +28,7 @@ pub async fn check_sheaf_consistency(
 
     let rows = SheafRepository::get_claim_neighbor_betp_pairs(
         &server.pool,
+        viewer,
         None,
         limit * 10, // fetch more rows since multiple neighbors per claim
     )
@@ -132,11 +134,12 @@ pub async fn check_sheaf_consistency(
 /// Compute sheaf cohomology — global inconsistency measure with decomposed H¹.
 pub async fn sheaf_cohomology(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: SheafCohomologyParams,
 ) -> Result<CallToolResult, McpError> {
     let threshold = params.threshold.unwrap_or(0.05);
 
-    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&server.pool, None)
+    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&server.pool, viewer, None)
         .await
         .map_err(internal_error)?;
 
@@ -223,9 +226,10 @@ pub async fn sheaf_cohomology(
 /// Phase 2: reconcile sheaf obstructions via interval belief propagation.
 pub async fn reconcile_sheaf(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ReconcileSheafParams,
 ) -> Result<CallToolResult, McpError> {
-    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&server.pool, None)
+    let edge_pairs = SheafRepository::get_epistemic_edge_pairs(&server.pool, viewer, None)
         .await
         .map_err(internal_error)?;
 
