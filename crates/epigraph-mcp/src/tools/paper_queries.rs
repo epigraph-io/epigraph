@@ -16,8 +16,23 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-/// Look up a paper by DOI and return its title, authors, claim count, and up
-/// to 100 asserted-claim summaries.
+/// Default page size for asserted claims when the caller supplies no `limit`.
+///
+/// Was a hardcoded 100 with no caller override, which produced ~62K-character
+/// single-shot responses on densely-decomposed papers (arXiv:2607.05794's
+/// paragraph/atom claims) and blew the MCP tool output token limit, erroring
+/// the call out entirely rather than returning a first page (backlog
+/// `0e6ec456`). 25 claims is a quarter of that worst case; callers who want
+/// the old behaviour pass `limit: 100`, and `claim_count` still reports the
+/// full total so a pager knows where it is.
+const DEFAULT_PAPER_CLAIM_LIMIT: i64 = 25;
+
+/// Hard ceiling on `limit`, so a caller cannot re-create the unbounded case.
+const MAX_PAPER_CLAIM_LIMIT: i64 = 200;
+
+/// Look up a paper by DOI and return its title, authors, claim count, and one
+/// page of asserted-claim summaries (`limit`/`offset`, default
+/// [`DEFAULT_PAPER_CLAIM_LIMIT`]).
 ///
 /// The earlier implementation searched claim *content* for the DOI substring
 /// via `ClaimRepository::list(.., Some(doi))` — that almost never matched, so
@@ -54,6 +69,12 @@ pub async fn query_paper(
     params: QueryPaperParams,
     requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAPER_CLAIM_LIMIT)
+        .clamp(1, MAX_PAPER_CLAIM_LIMIT);
+    let offset = params.offset.unwrap_or(0).max(0);
+
     let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
         .await
         .map_err(internal_error)?;
@@ -64,6 +85,10 @@ pub async fn query_paper(
             title: String::new(),
             authors: vec![],
             claim_count: 0,
+            returned: 0,
+            offset,
+            limit,
+            has_more: false,
             claims: vec![],
         });
     };
@@ -89,7 +114,7 @@ pub async fn query_paper(
         })
         .collect();
 
-    let claim_rows = PaperRepository::list_asserted_claims(&server.pool, paper.id, 100)
+    let claim_rows = PaperRepository::list_asserted_claims(&server.pool, paper.id, limit, offset)
         .await
         .map_err(internal_error)?;
 
@@ -111,11 +136,33 @@ pub async fn query_paper(
         });
     }
 
+    // `has_more` must TERMINATE, which rules out comparing against
+    // `claim_count` alone.
+    //
+    // `claim_count` is `max(asserted_count, labeled_count)`, but this page can
+    // only ever contain `asserts`-edge rows. A partially-ingested paper — 60
+    // claims labelled `doi:<doi>`, zero edges linked yet, the exact state
+    // `query_paper_duplicate_gate.rs` fixtures — would give `returned = 0`
+    // against `claim_count = 60` and advertise another page forever, sending
+    // any pager into an infinite loop over empty results.
+    //
+    // A SHORT PAGE IS THE END OF THE SET: the repo query asked for `limit` rows
+    // and PostgreSQL returned fewer, so there are none left. The `claim_count`
+    // comparison is kept as a second conjunct only so a page that lands exactly
+    // on the boundary (`offset + returned == claim_count`) stops immediately
+    // instead of costing one extra empty round-trip.
+    let returned = claims.len();
+    let has_more = returned as i64 == limit && offset.saturating_add(returned as i64) < claim_count;
+
     success_json(&PaperResponse {
         doi: paper.doi,
         title: paper.title.unwrap_or_default(),
         authors,
         claim_count,
+        returned,
+        offset,
+        limit,
+        has_more,
         claims,
     })
 }

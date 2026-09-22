@@ -205,12 +205,24 @@ impl PaperRepository {
         Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
     }
 
-    /// List claim summaries asserted by this paper, up to `limit` rows,
-    /// reached via `paper -asserts-> claim` edges. Ordered by claim
-    /// `created_at` ascending (ingest order) for stable pagination.
+    /// List claim summaries asserted by this paper — one page of `limit` rows
+    /// starting at `offset` — reached via `paper -asserts-> claim` edges.
+    /// Ordered by claim `created_at` ascending (ingest order), with an `id`
+    /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across the many claims
+    /// a single ingestion writes with an identical timestamp.
     ///
     /// Returns `(id, content, truth_value, agent_id, content_hash, created_at)`
     /// per claim — the shape `query_paper` needs for `ClaimResponse`.
+    ///
+    /// `offset` exists because `query_paper` previously hardcoded
+    /// `limit = 100` with no way to reach claim 101, and the resulting
+    /// single-shot response exceeded the MCP tool output token limit on dense
+    /// paper subgraphs (backlog `0e6ec456`). Pair it with
+    /// [`Self::count_asserted_claims`] so a caller can tell a full page from
+    /// the end of the set.
+    ///
+    /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry),
+    /// so adding `OFFSET` needs no `cargo sqlx prepare`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -219,16 +231,27 @@ impl PaperRepository {
         pool: &PgPool,
         paper_id: Uuid,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<AssertedClaimRow>, DbError> {
-        let rows = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            content_hash: Vec<u8>,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let rows: Vec<Row> = sqlx::query_as(
             r#"
             SELECT
-                c.id          AS "id!",
-                c.content     AS "content!",
-                c.truth_value AS "truth_value!",
-                c.agent_id    AS "agent_id!",
-                c.content_hash AS "content_hash!",
-                c.created_at  AS "created_at!"
+                c.id,
+                c.content,
+                c.truth_value,
+                c.agent_id,
+                c.content_hash,
+                c.created_at
             FROM edges e
             JOIN claims c ON c.id = e.target_id
             WHERE e.source_id = $1
@@ -236,11 +259,12 @@ impl PaperRepository {
               AND e.target_type = 'claim'
               AND e.relationship = 'asserts'
             ORDER BY c.created_at ASC, c.id
-            LIMIT $2
+            LIMIT $2 OFFSET $3
             "#,
-            paper_id,
-            limit,
         )
+        .bind(paper_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(pool)
         .await?;
         rows.into_iter()
