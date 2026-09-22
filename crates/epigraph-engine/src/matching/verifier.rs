@@ -193,12 +193,37 @@ pub fn promotion_disposition_for_column(
 /// (`supports | contradicts | derives_from | refines | analogous`).
 /// `elaborates` is also accepted here for forward-compatibility — the spec
 /// lists it even though the current prompt does not emit it. Unknown strings
-/// default to [`MatchVerdict::Distinct`] (conservative: do not corroborate).
+/// default to [`MatchVerdict::Distinct`] (conservative: do not corroborate),
+/// and that is also where [`REJECTED_RELATIONSHIP`] lands.
+///
+/// # `derives_from` → `Overlapping` (issue #388)
+///
+/// Every member of the reranker vocabulary is offered to the model as a legal
+/// answer *when it endorses the pair*, so none of them may reach the `_` arm.
+/// `derives_from` did, and the prompt's own gloss — "A is a logical consequence
+/// or application of B" — describes a real relationship, not a non-match. It
+/// takes the same verdict as `refines`, which glosses the same way.
+///
+/// Both map to `Overlapping`, which routes to `PolicyAction::Reject` exactly as
+/// `Distinct` does (`matching::pipeline`), so no edge is written automatically
+/// and no existing edge changes. What moves is the persisted
+/// `match_candidates.verifier_verdict`: `'overlapping'` instead of `'distinct'`,
+/// and hence `PromotionDisposition::Corroborate` instead of `Drop` when a human
+/// later promotes the row — which is the point. A `distinct` row is permanently
+/// un-promotable, so an endorsed pair was being retired.
+///
+/// This is safe ONLY because explicit rejections no longer borrow the string:
+/// see [`REJECTED_RELATIONSHIP`]. Reversing that commit while keeping this arm
+/// would turn every `valid: false` answer into a promotable corroboration.
+///
+/// Already-stored rows are NOT rewritten by this change; re-verifying them needs
+/// a fresh reranker run, and `#384`'s `decided_at IS NOT NULL` freeze means
+/// human-decided rows will not move even then.
 pub fn map_relationship(rel: &str, _strength: f32) -> MatchVerdict {
     match rel {
         "supports" | "elaborates" => MatchVerdict::Same,
         "analogous" => MatchVerdict::Paraphrase,
-        "refines" => MatchVerdict::Overlapping,
+        "refines" | "derives_from" => MatchVerdict::Overlapping,
         "contradicts" => MatchVerdict::Contradicts,
         _ => MatchVerdict::Distinct,
     }
