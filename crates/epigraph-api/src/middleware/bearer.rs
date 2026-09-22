@@ -17,6 +17,34 @@ use crate::state::AppState;
 
 pub use epigraph_auth::{AuthContext, ClientType};
 
+/// The one definition of "this bearer token names a principal": refuse a
+/// revoked token, then verify the JWT.
+///
+/// Shared by [`bearer_auth_middleware`], [`optional_bearer_auth_middleware`]
+/// and the rate limiter (`middleware::rate_limit`), which runs OUTSIDE both
+/// and derives its key from the same answer. Keeping it in one place is what
+/// guarantees the limiter never grants a principal's quota to a token that
+/// authentication would refuse.
+pub(crate) fn authenticate_bearer_token(
+    state: &AppState,
+    token: &str,
+) -> Result<AuthContext, ApiError> {
+    if state.is_token_revoked(token) {
+        return Err(ApiError::Unauthorized {
+            reason: "Token has been revoked".to_string(),
+        });
+    }
+
+    let claims = state
+        .jwt_config
+        .validate_token(token)
+        .map_err(|e| ApiError::Unauthorized {
+            reason: format!("Invalid token: {e}"),
+        })?;
+
+    Ok(claims.into())
+}
+
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
 /// Requests without a valid Bearer token are rejected with 401 Unauthorized.
@@ -35,24 +63,8 @@ pub async fn bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Check revocation set
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
-            // Validate JWT
-            let claims =
-                state
-                    .jwt_config
-                    .validate_token(token)
-                    .map_err(|e| ApiError::Unauthorized {
-                        reason: format!("Invalid token: {e}"),
-                    })?;
-
-            // Build AuthContext
-            let auth_ctx: AuthContext = claims.into();
+            // Revocation, then JWT validation.
+            let auth_ctx = authenticate_bearer_token(&state, token)?;
 
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
@@ -95,23 +107,8 @@ pub async fn optional_bearer_auth_middleware(
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
 
-            // Present token must be valid: revoked → 401.
-            if state.is_token_revoked(token) {
-                return Err(ApiError::Unauthorized {
-                    reason: "Token has been revoked".to_string(),
-                });
-            }
-
-            // Present token must validate: invalid/expired → 401.
-            let claims =
-                state
-                    .jwt_config
-                    .validate_token(token)
-                    .map_err(|e| ApiError::Unauthorized {
-                        reason: format!("Invalid token: {e}"),
-                    })?;
-
-            let auth_ctx: AuthContext = claims.into();
+            // Present token must be valid: revoked, invalid or expired → 401.
+            let auth_ctx = authenticate_bearer_token(&state, token)?;
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
         }

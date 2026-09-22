@@ -496,3 +496,165 @@ async fn requests_with_no_identifiable_client_are_never_pooled_into_one_bucket()
         );
     }
 }
+
+// ============================================================================
+// Authenticated requests: keyed on the bearer principal
+// ============================================================================
+
+/// A bearer token minted by `state`'s own JWT config for `agent_id`, under a
+/// fresh OAuth client each call.
+fn token_for(state: &AppState, agent_id: uuid::Uuid) -> String {
+    let (token, _jti) = state
+        .jwt_config
+        .issue_access_token(
+            uuid::Uuid::new_v4(),
+            vec!["claims:read".to_string()],
+            "agent",
+            None,
+            Some(agent_id),
+            chrono::Duration::minutes(5),
+        )
+        .expect("test token");
+    token
+}
+
+fn with_bearer(mut request: Request<Body>, token: &str) -> Request<Body> {
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
+    request
+}
+
+/// The point of the item: two principals behind ONE address (a NAT, or
+/// everything arriving through one proxy hop) each get their own quota.
+/// Keyed on the address, the second principal was refused because of the
+/// first one's traffic.
+#[tokio::test]
+async fn two_principals_behind_one_address_have_separate_quotas() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let alice = token_for(&state, uuid::Uuid::new_v4());
+    let bob = token_for(&state, uuid::Uuid::new_v4());
+    let shared = "203.0.113.50:40000";
+
+    assert_eq!(
+        send(&state, with_bearer(from_peer(shared), &alice))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&state, with_bearer(from_peer(shared), &alice))
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "alice's quota of 1 is spent"
+    );
+    assert_eq!(
+        send(&state, with_bearer(from_peer(shared), &bob))
+            .await
+            .status(),
+        StatusCode::OK,
+        "bob shares alice's address but not her quota"
+    );
+}
+
+/// The converse: a principal's quota follows the principal, so hopping
+/// addresses does not buy a fresh one.
+#[tokio::test]
+async fn a_principal_keeps_its_quota_across_addresses() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let alice = token_for(&state, uuid::Uuid::new_v4());
+
+    assert_eq!(
+        send(&state, with_bearer(from_peer("203.0.113.60:40000"), &alice))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &state,
+            with_bearer(from_peer("198.51.100.60:40000"), &alice)
+        )
+        .await
+        .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the same principal from a second address is the same bucket"
+    );
+}
+
+/// The principal is the AGENT, not the OAuth client: two tokens for one
+/// agent, minted under different clients, share one quota.
+#[tokio::test]
+async fn tokens_for_one_agent_under_different_clients_share_a_quota() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let agent = uuid::Uuid::new_v4();
+    let (first, second) = (token_for(&state, agent), token_for(&state, agent));
+
+    assert_eq!(
+        send(&state, with_bearer(from_peer("203.0.113.70:40000"), &first))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &state,
+            with_bearer(from_peer("203.0.113.71:40000"), &second)
+        )
+        .await
+        .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}
+
+/// A token that authentication would refuse earns no principal bucket: it is
+/// keyed on its address, so rotating junk tokens cannot escape the address
+/// quota. Covers a malformed token and a correctly signed but revoked one.
+#[tokio::test]
+async fn a_token_auth_would_refuse_is_keyed_on_its_address() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let peer = "203.0.113.80:40000";
+
+    let revoked = token_for(&state, uuid::Uuid::new_v4());
+    state.revoke_access_token(&revoked);
+
+    assert_eq!(
+        send(&state, with_bearer(from_peer(peer), "not-a-jwt"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&state, with_bearer(from_peer(peer), &revoked))
+            .await
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a revoked token must not buy its principal's bucket; both requests \
+         share the address quota of 1"
+    );
+}
+
+/// A principal is identifiable without a peer address, so it is limited even
+/// where `ConnectInfo` is absent.
+#[tokio::test]
+async fn a_principal_is_limited_even_without_a_peer_address() {
+    let state = state_with(AgentRateLimiter::new(config(1, 1000, false)));
+    let alice = token_for(&state, uuid::Uuid::new_v4());
+
+    let no_peer = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/test")
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        send(&state, with_bearer(no_peer(), &alice)).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&state, with_bearer(no_peer(), &alice)).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+}

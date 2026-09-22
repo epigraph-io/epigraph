@@ -52,8 +52,10 @@ pub use auth::signature_verification_layer;
 //     unreachable — but a dashboard reading them will read empty forever.
 //   * It was the only production caller of `signature_verification_middleware`,
 //     which is what inserts `VerifiedAgent` into request extensions. The
-//     `VerifiedAgent` branch in `rate_limit.rs` is consequently dead; see the
-//     note there.
+//     `VerifiedAgent` branch in `rate_limit.rs` was consequently dead.
+//     DISCHARGED: that branch is deleted and the limiter now keys on the bearer
+//     principal (`rate_limit::bearer_principal`, via the same
+//     `bearer::authenticate_bearer_token` both auth middlewares call).
 //
 // `signature_verification_middleware`, `VerifiedAgent` and the header
 // constants remain exported above: the middleware tests build their own

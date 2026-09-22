@@ -9,7 +9,8 @@
 //!
 //! # Rate Limiting Strategy
 //!
-//! - **Authenticated requests**: Rate limited by agent ID
+//! - **Authenticated requests**: Rate limited by the bearer principal
+//!   (`AuthContext.agent_id`, else `client_id`), wherever they connect from
 //! - **Unauthenticated requests**: Rate limited by client IP, where the client
 //!   IP is the TCP peer (`ConnectInfo<SocketAddr>`) unless that peer is a
 //!   trusted proxy (`AgentRateLimiter::trusted_proxies`), in which case it is
@@ -36,6 +37,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
+use crate::middleware::bearer::authenticate_bearer_token;
 use crate::security::audit::SecurityAuditLog;
 use crate::security::{AgentRateLimiter, RateLimitError, SecurityEvent};
 use crate::state::AppState;
@@ -105,6 +107,44 @@ impl IntoResponse for RateLimitResponse {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// The principal an authenticated request is rate limited under:
+/// `AuthContext.agent_id`, else `client_id`.
+///
+/// # Why the limiter validates the token itself
+///
+/// This middleware is the OUTERMOST layer (`routes/mod.rs`), wrapping the
+/// `protected` router's `bearer_auth_middleware`, so no `AuthContext` is in
+/// the request's extensions yet when it runs. Moving it inside auth instead
+/// would leave the anonymous and OAuth routers, and every request auth
+/// rejects, with no limiter at all; running a second, principal-keyed limiter
+/// inside auth on top of the outer address-keyed one would make the address
+/// bucket the binding limit for every principal behind a shared egress (a
+/// NAT, or everything arriving through one proxy hop), which is precisely
+/// what keying on the principal is for.
+///
+/// Validation is cheap — a revocation-set lookup and an HMAC check, no
+/// database — and it is the SAME function authentication calls
+/// ([`authenticate_bearer_token`]), so a token earns a principal's bucket
+/// here exactly when auth would admit it. A present-but-invalid token earns
+/// nothing and is keyed on its address, so junk tokens cannot be rotated to
+/// escape the address quota.
+///
+/// This replaces the `VerifiedAgent` arm, which read an extension inserted
+/// only by the request-signing middleware deleted in PR-03 and was therefore
+/// always `None`. PR-07 was to substitute the `ViewerExtractor` principal and
+/// did not; resolving a full `Viewer` would add a database round trip per
+/// request to answer a question the token already answers.
+fn bearer_principal(state: &AppState, request: &Request<Body>) -> Option<Uuid> {
+    let header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = header.strip_prefix("Bearer ")?;
+    let auth = authenticate_bearer_token(state, token).ok()?;
+    Some(auth.agent_id.unwrap_or(auth.client_id))
+}
 
 /// The client address an anonymous request is rate limited under, or `None`
 /// when the request carries no peer address at all.
@@ -257,7 +297,8 @@ fn ip_to_agent_id(ip: IpAddr) -> AgentId {
 /// # Rate Limiting Strategy
 ///
 /// 1. Check if route bypasses rate limiting (health endpoints)
-/// 2. Extract client identifier (agent ID or IP)
+/// 2. Extract client identifier: the bearer principal when the request carries
+///    a token authentication would accept, else the client address
 /// 3. Check rate limit against token bucket
 /// 4. If exceeded, return 429 with Retry-After header
 /// 5. If allowed, add rate limit headers to response
@@ -295,22 +336,15 @@ pub async fn rate_limit_middleware(
         }
     };
 
-    // Extract client identifier
-    // Priority: VerifiedAgent (if present) > IP address > fallback
+    // Extract client identifier. Priority: bearer principal > client address.
     //
-    // PR-03 note: the `VerifiedAgent` arm is now permanently `None` in
-    // production. `VerifiedAgent` is inserted only by
-    // `middleware::auth::signature_verification_middleware`, whose sole
-    // production caller (`middleware::require_signature`) was deleted with the
-    // router inversion. It is kept rather than collapsed to IP-only because the
-    // middleware integration tests still exercise this precedence, and because
-    // PR-07 will replace it with the `ViewerExtractor` principal — which is a
-    // strictly better rate-limit key than the client IP and restores the
-    // intent of this branch.
-    let identified = request
-        .extensions()
-        .get::<crate::middleware::VerifiedAgent>()
-        .map(|agent| agent.agent_id)
+    // DISCHARGED (deferred-commitment `rate-limiter-principal-key`): this was a
+    // `VerifiedAgent` arm that PR-03 left permanently `None` and that PR-07
+    // was to replace with the request principal. It now keys on the principal
+    // — see `bearer_principal` for why it validates the token itself rather
+    // than reading an `AuthContext` that does not exist yet at this layer.
+    let identified = bearer_principal(&state, &request)
+        .map(AgentId::from_uuid)
         .or_else(|| client_ip(&request, rate_limiter).map(ip_to_agent_id));
 
     // No identifiable client: let it through UNLIMITED rather than into a

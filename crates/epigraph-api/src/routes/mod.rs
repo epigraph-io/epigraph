@@ -1024,7 +1024,10 @@ pub fn create_router(state: AppState) -> Router {
         );
 
     // Apply rate limiting and body limit as outermost layers
-    // Rate limiting bypasses health endpoints internally
+    // Rate limiting bypasses health endpoints internally. Outermost means it
+    // runs BEFORE `bearer_auth_middleware`, so it keys an authenticated
+    // request by validating the bearer token itself (same function as auth),
+    // and everything else by client address; see `middleware/rate_limit.rs`.
     Router::new()
         .merge(protected)
         .merge(public)
@@ -1506,7 +1509,10 @@ pub fn create_router(state: AppState) -> Router {
         );
 
     // Apply rate limiting and body limit as outermost layers
-    // Rate limiting bypasses health endpoints internally
+    // Rate limiting bypasses health endpoints internally. Outermost means it
+    // runs BEFORE `bearer_auth_middleware`, so it keys an authenticated
+    // request by validating the bearer token itself (same function as auth),
+    // and everything else by client address; see `middleware/rate_limit.rs`.
     Router::new()
         .merge(protected)
         .merge(public)
