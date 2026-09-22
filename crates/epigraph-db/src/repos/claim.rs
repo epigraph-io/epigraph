@@ -1632,9 +1632,16 @@ impl ClaimRepository {
     /// entry) to keep `cargo sqlx prepare` out of this change's footprint —
     /// same rationale as [`Self::contents_by_ids`] and [`Self::labels_by_ids`].
     ///
+    /// The tracing span skips `filter` and records only `id_count`: `filter`
+    /// carries an unbounded `ids` slice (the `methodology` / `evidence_type`
+    /// pre-resolution has no `LIMIT`) and the raw caller-supplied `search`
+    /// string, and `#[instrument]` records fields eagerly at INFO — which the
+    /// deployed `EnvFilter` admits. See [`Self::list_filtered`] for the same
+    /// treatment.
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] if the database query fails.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, filter), fields(id_count = filter.ids.map(|ids| ids.len())))]
     pub async fn count_filtered(
         pool: &PgPool,
         filter: &ClaimListFilter<'_>,
@@ -1668,10 +1675,14 @@ impl ClaimRepository {
     /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across rows sharing a
     /// `created_at` or `truth_value`.
     ///
+    /// The tracing span skips `filter` for the reason given on
+    /// [`Self::count_filtered`]; `limit`/`offset` are still recorded, and
+    /// `id_count` keeps the cardinality without the payload.
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] if the database query fails, or
     /// [`DbError`] from [`TruthValue::new`] on an out-of-range stored value.
-    #[instrument(skip(pool))]
+    #[instrument(skip(pool, filter), fields(id_count = filter.ids.map(|ids| ids.len())))]
     pub async fn list_filtered(
         pool: &PgPool,
         filter: &ClaimListFilter<'_>,
