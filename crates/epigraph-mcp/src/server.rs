@@ -398,6 +398,54 @@ impl EpiGraphMcpFull {
         Ok(())
     }
 
+    /// Error for a tool name that **no route owns**: neither the static
+    /// `tool_router` nor any mounted federation route.
+    ///
+    /// # Why this is not `enforce_tool_scope`'s job
+    ///
+    /// Before this existed, such a name fell through to
+    /// [`enforce_tool_scope`](Self::enforce_tool_scope), whose deny-by-default
+    /// arm answered `"Forbidden: tool 'X' is not authorized (no scope
+    /// mapping)"`. That message describes the caller's credentials, and the
+    /// caller's credentials were never consulted — the name simply does not
+    /// route. Backlog ee50d10d is that misattribution reported as an
+    /// authorization regression: `attach_blob` is a FEDERATED episcience tool
+    /// with zero occurrences in this crate, so every call for it while the
+    /// extension was unmounted produced an authz-shaped 403 and read as "the
+    /// tool lost its authorization mid-session".
+    ///
+    /// `enforce_tool_scope` KEEPS its deny-by-default arm: it is the
+    /// fail-closed gate for any name absent from `SCOPE_MAP`, and narrowing it
+    /// to "known tools only" would be a fail-open. This function runs earlier
+    /// and only for names that provably route nowhere, so the gate's behaviour
+    /// is unchanged for every name it still sees.
+    ///
+    /// `unhealthy_extensions` comes from
+    /// [`SharedFederation::unhealthy_extension_candidates`](crate::federation::SharedFederation::unhealthy_extension_candidates)
+    /// — names only, never addresses. A configured-but-unreachable extension is
+    /// the single most likely reason a name that *should* route does not, and
+    /// saying so converts a dead end into a diagnosis.
+    #[must_use]
+    pub fn unknown_tool_error(tool_name: &str, unhealthy_extensions: &[String]) -> McpError {
+        let mut message = format!(
+            "Unknown or unavailable tool '{tool_name}': it is not a kernel tool and no mounted \
+             extension provides it. This is a ROUTING failure, not an authorization failure — \
+             your token's scopes were never consulted."
+        );
+        if !unhealthy_extensions.is_empty() {
+            message.push_str(&format!(
+                " Configured extension(s) currently unreachable: {}. If one of them owns this \
+                 tool, it will route again once the gateway reconnects.",
+                unhealthy_extensions.join(", ")
+            ));
+        }
+        McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::Owned(message),
+            data: None,
+        }
+    }
+
     /// Scope gate for FEDERATED tools, kept deliberately separate from
     /// [`enforce_tool_scope`](Self::enforce_tool_scope).
     ///
@@ -1724,7 +1772,7 @@ impl EpiGraphMcpFull {
     // ── Cross-source matching (3 tools) ──
 
     #[tool(
-        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status) plus any CORROBORATES edges already written. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
+        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status), any CORROBORATES edges already written, and sweep coverage for the claim: `never_swept: true` means the matcher has not scanned it yet (an empty candidate list says nothing), `last_swept_at` is when it last did. Both coverage fields are omitted entirely for a claim you cannot read. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
     )]
     async fn find_cross_source_matches(
         &self,
@@ -1881,8 +1929,9 @@ impl ServerHandler for EpiGraphMcpFull {
         // so a stdio federated call reaches `enforce_federated_scope` and fails
         // closed there (no `AuthContext`) rather than falling through to a bare
         // "unknown tool" from the router. A genuinely-unknown name (neither
-        // static nor federated) still falls through to the static path and its
-        // fail-closed gate, exactly as before.
+        // static nor federated) is reported as a ROUTING failure at the bottom
+        // of this block — see `unknown_tool_error` — rather than borrowing the
+        // static gate's authz-shaped "no scope mapping" (backlog ee50d10d).
         if self.tool_router.get(&request.name).is_none() {
             // `route_config` returns an OWNED config and releases the registry
             // lock before returning, so nothing below holds a guard across the
@@ -1920,6 +1969,35 @@ impl ServerHandler for EpiGraphMcpFull {
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map_err(crate::errors::internal_error);
+            }
+
+            // Neither a kernel tool nor a federated route: a ROUTING failure.
+            //
+            // GATED ON THE CALLER ALREADY BEING AUTHENTICATED ON THE HTTP PATH,
+            // and that is not decoration. `main.rs` has a router arm that
+            // layers NEITHER auth middleware (given neither `--jwt-secret` nor
+            // `--allow-unauthenticated-http` the `/mcp` service is nested
+            // bare), so an unauthenticated HTTP call does reach here, and
+            // `enforce_tool_scope`'s no-auth branch below is the only thing
+            // refusing it — the property
+            // `http_calls_cannot_reach_a_tool_without_an_auth_context.rs`
+            // locks. Answering "unknown tool" ahead of that branch would turn
+            // this into a PRE-AUTH tool-name oracle on exactly that arm. For a
+            // caller who IS authenticated nothing new is disclosed: the old
+            // "no scope mapping" answer already meant "absent from SCOPE_MAP",
+            // and `scope_map_coverage` makes SCOPE_MAP total over kernel tools,
+            // so the same name/no-name bit was already readable.
+            //
+            // stdio (`!is_http_call`) takes this arm too. It previously fell
+            // through to the macro dispatcher's bare "unknown tool", so the
+            // two transports now give the same, more useful answer.
+            if !is_http_call || auth_owned.is_some() {
+                return Err(Self::unknown_tool_error(
+                    &request.name,
+                    &self
+                        .federation
+                        .unhealthy_extension_candidates(&request.name),
+                ));
             }
         }
 
