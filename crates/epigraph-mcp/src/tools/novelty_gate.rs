@@ -83,11 +83,13 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// vector, and carrying a dead 1536-element `Vec<f32>` through every
 /// caller's match arm would be pure waste.)
 ///
-/// Takes `&dyn EmbeddingService` (not the concrete `McpEmbedder`) purely so
-/// this function is unit-testable against `epigraph_embeddings::MockProvider`
-/// — `EpiGraphMcpFull` itself still only ever constructs this with its one
-/// concrete `McpEmbedder` (hardcoded to the OpenAI endpoint); this is not a
-/// server-wide trait-object refactor.
+/// Takes `&dyn EmbeddingService` (not the concrete `McpEmbedder`) so this
+/// function is unit-testable against `epigraph_embeddings::MockProvider`. The
+/// callers in `submit_claim`/`memorize` pass the server's `McpEmbedder`, which
+/// in tests can itself wrap an injected provider
+/// (`McpEmbedder::with_provider`, `test-support` feature) — that is how
+/// `tests/novelty_gate_test.rs` drives this gate end-to-end through
+/// `EpiGraphMcpFull`.
 pub async fn decide(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -213,16 +215,14 @@ mod tests {
 
     // ── decide() end-to-end: real embed -> ANN -> classify, real DB ──
     //
-    // `EpiGraphMcpFull` only ever constructs `decide()`'s caller with a
-    // concrete `McpEmbedder` pointed at the (hardcoded) OpenAI endpoint, so
-    // there is no live-embedder path through submit_claim/memorize in this
-    // test process (see novelty_gate_test.rs in tests/ for that documented
-    // boundary). But `decide()` itself takes `&dyn EmbeddingService`
-    // specifically so ITS embed -> nearest_by_embedding -> classify pipeline
-    // can be exercised here with `epigraph_embeddings::MockProvider`, which
-    // generates a REAL (deterministic, hash-derived, non-mocked-away)
-    // 1536-dim vector from text — no network call, but not a stub of
-    // `classify` either: distances are computed genuinely by Postgres/pgvector.
+    // `decide()` takes `&dyn EmbeddingService`, so ITS embed ->
+    // nearest_by_embedding -> classify pipeline is exercised here directly
+    // with `epigraph_embeddings::MockProvider`, which generates a REAL
+    // (deterministic, hash-derived, non-mocked-away) 1536-dim vector from
+    // text — no network call, but not a stub of `classify` either: distances
+    // are computed genuinely by Postgres/pgvector. The glue in
+    // submit_claim/memorize that ACTS on a decision is driven through the
+    // real server in tests/novelty_gate_test.rs.
 
     use epigraph_embeddings::{config::EmbeddingConfig, EmbeddingService, MockProvider};
 

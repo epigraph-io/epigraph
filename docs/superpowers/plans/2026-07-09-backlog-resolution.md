@@ -1287,7 +1287,12 @@ threshold). — DONE. Wire-compatible via `#[serde(default)]`; note concern #2 a
 threshold returns the existing ID; at `novelty_threshold=0.0` it always inserts (escape hatch). —
 DONE at the `decide()` layer (real DB + `MockProvider`); the MCP-tool-boundary firing is
 inspection-verified only (test server's embedder is mock-only, can't fire the gate in-process) —
-disclosed limitation, reviewed and accepted.
+disclosed limitation, reviewed and accepted. **DISCHARGED 2026-09-22** (deferred-commitment screen
+key `mcp-trait-object-embedder`; "accepted" was never a substitute for the owed test):
+`McpEmbedder::with_provider` (`test-support` feature, test builds only) injects a
+`dyn EmbeddingService`, and `crates/epigraph-mcp/tests/novelty_gate_test.rs` now fires the gate
+through `EpiGraphMcpFull` for both tools — `ReturnExisting` response, `near-duplicate` label,
+pending-vector reuse, the 0.0 escape hatch, viewer scoping, and the hash-pre-check ordering.
 - [x] **Step 6: Verify, commit, resolve** — verify + commit + PR #324 DONE, merged to main. Retired
 2026-07-11 via the HTTP admin-token path (`1bcaed94` now carries `resolved`). Jeremy's merge of
 PR #324 constitutes confirmation of concern #1 (corpus-wide cross-agent suppression at the 0.05
