@@ -4,13 +4,24 @@
 //! validation via `epigraph-auth` so a single token works against both
 //! servers.
 //!
-//! ## Deferred: revocation
+//! ## Revocation (was deferred; see below for what is still owed)
 //!
-//! The HTTP API consults `AppState::is_token_revoked` here. MCP has no
-//! equivalent state and v1 relies on short JWT TTLs. When MCP grows shared
-//! state, plumb the revocation set through and call it before
-//! `validate_token`. Tracked separately — do not silently skip when adding
-//! state.
+//! A token revoked through the API's `POST /oauth/revoke` is rejected here
+//! too. Both processes read the shared, `jti`-keyed list in
+//! `revoked_access_tokens` through
+//! [`epigraph_db::RevokedAccessTokenRepository`]; before that the list was a
+//! per-process set inside the API and MCP honoured a revoked token until its
+//! `exp` (up to an hour).
+//!
+//! The check runs AFTER `validate_token`, because the list is keyed on the
+//! verified `jti`, and it fails CLOSED: a lookup error is a 503, never an
+//! admit.
+//!
+//! **Still owed:** the table's migration. Until it is promoted from
+//! `crates/epigraph-db/tests/fixtures/pending_migration_revoked_access_tokens.sql`,
+//! `main.rs` finds it absent at boot, logs an ERROR, and runs with
+//! [`McpAuthState::revocation`] = `None` — the pre-existing, no-revocation
+//! behaviour, stated loudly rather than skipped silently.
 
 use std::sync::Arc;
 
@@ -71,6 +82,27 @@ pub struct McpAuthState {
     pub jwt_config: Arc<JwtConfig>,
     /// Absolute URL of the protected-resource metadata doc, advertised in 401s.
     pub resource_metadata_url: Option<String>,
+    /// Pool on which to consult the shared access-token revocation list.
+    ///
+    /// `Some` only when [`epigraph_db::RevokedAccessTokenRepository::probe`]
+    /// reported the store `Ready` at boot. `None` means the table does not
+    /// exist on this database yet, and revoked tokens are admitted until their
+    /// `exp` — `main.rs` logs that at ERROR when it happens. It is never `None`
+    /// because a lookup failed: a failing lookup is a per-request 503.
+    pub revocation: Option<sqlx::PgPool>,
+}
+
+/// 503 for a revocation lookup that could not be answered.
+///
+/// Distinct from the 401: the token may well be good, and a client that
+/// re-authenticates on 401 would only mint another token the same outage
+/// cannot check. No `WWW-Authenticate` — this is not a credential problem.
+fn revocation_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Token revocation status unavailable",
+    )
+        .into_response()
 }
 
 pub async fn bearer_auth_middleware(
@@ -89,6 +121,39 @@ pub async fn bearer_auth_middleware(
             let token = &h[7..];
             match state.jwt_config.validate_token(token) {
                 Ok(claims) => {
+                    // After validation, not before: the list is keyed on the
+                    // VERIFIED jti, and an unverified token is rejected above
+                    // without a database round trip.
+                    if let Some(pool) = state.revocation.as_ref() {
+                        match epigraph_db::RevokedAccessTokenRepository::is_revoked(
+                            pool, claims.jti,
+                        )
+                        .await
+                        {
+                            Ok(false) => {}
+                            Ok(true) => {
+                                // Routine (the holder or an operator revoked
+                                // it), so debug — like expiry. Same uniform
+                                // `invalid_token` on the wire as every other
+                                // rejection: the 401 is not an oracle.
+                                tracing::debug!(reason = "revoked", "MCP bearer token rejected");
+                                return unauthorized(
+                                    state.resource_metadata_url.as_deref(),
+                                    INVALID_TOKEN,
+                                );
+                            }
+                            Err(e) => {
+                                // Fail CLOSED. Admitting on a lookup error would
+                                // make revocation exactly as strong as the
+                                // database's uptime.
+                                tracing::warn!(
+                                    error = %e,
+                                    "MCP bearer token revocation lookup failed; refusing"
+                                );
+                                return revocation_unavailable();
+                            }
+                        }
+                    }
                     let auth: AuthContext = claims.into();
                     req.extensions_mut().insert(auth);
                     // Stash the raw, still-signed token so the federation gateway

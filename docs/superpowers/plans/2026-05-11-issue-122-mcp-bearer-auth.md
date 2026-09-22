@@ -20,6 +20,7 @@ These decisions came out of advisor review on 2026-05-11. Subagents must NOT rel
 - **JWT lives in a new shared crate `epigraph-auth`**, not duplicated and not by adding `epigraph-mcp → epigraph-api` dep. Both processes must move in lockstep on audience/algorithm/claims changes.
 - **Audience stays `epigraph-api`.** MCP accepts the same tokens the API mints — no separate audience, no double minting. Documented in the new crate's module docstring.
 - **Token revocation is deferred.** The API middleware calls `state.is_token_revoked(token)`; MCP has no equivalent state and v1 relies on short JWT TTLs. This is called out in `bearer_auth_middleware` in `epigraph-mcp` AND in the PR body. Do not silently skip it.
+  - **UPDATE 2026-09-22 (deferred-commitment screen, key `mcp-token-revocation`): DISCHARGED in code, migration still owed.** MCP's `bearer_auth_middleware` now consults the shared, `jti`-keyed `revoked_access_tokens` list via `epigraph_db::RevokedAccessTokenRepository` after `validate_token`, failing closed (503) on a lookup error. The table's DDL is pending promotion from `crates/epigraph-db/tests/fixtures/pending_migration_revoked_access_tokens.sql` to a numbered migration; until then the boot probe finds it absent and logs an ERROR.
 - **Deny-by-default scope map.** Coverage test loops `EpiGraphMcpFull::tool_router().list_all()` and asserts every tool name maps to a scope. Unmapped tools fail closed (`403 Forbidden`), so a future PR that adds a tool without updating the map cannot become a covert auth bypass.
 - **Gate placement:** Bearer extraction at axum middleware (request boundary). Scope check inside `call_tool` (rmcp tower.rs:326/384/463 confirms `parts` propagation). The middleware can't see the tool name without parsing the JSON-RPC body, so scope enforcement must live at dispatch time.
 - **`--listen` requires exactly one of:** `--jwt-secret <SECRET>` (production path) OR `--allow-unauthenticated-http` (dev / unix-socket-behind-trust-boundary). Both present → error. Neither → error. Check fires before `create_pool` to mirror the existing stopgap gate at `main.rs:82`.
@@ -1385,6 +1386,9 @@ MCP HTTP transport.
 2. **Token revocation deferred.** MCP has no equivalent of
    `AppState::is_token_revoked`. v1 relies on short JWT TTLs; doc-comment in
    `bearer_auth_middleware` flags this for follow-up.
+   *Superseded 2026-09-22 (`mcp-token-revocation`): MCP checks the shared
+   `revoked_access_tokens` list; the table's migration is still pending — see
+   the update under "Design notes" above.*
 3. **Deny-by-default scope map** with coverage test — unmapped tools fail
    closed.
 4. **Gate placement.** Bearer at axum middleware; scope check inside
@@ -1395,7 +1399,8 @@ MCP HTTP transport.
 
 ## What's NOT in
 
-- Token revocation for MCP (tracked separately).
+- Token revocation for MCP (tracked separately). *Landed 2026-09-22 except the
+  table's migration; see the update under "Design notes".*
 - A separate `epigraph-mcp` audience.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)

@@ -87,6 +87,9 @@ async fn boot_router() -> axum::Router {
     let state = McpAuthState {
         jwt_config: Arc::new(JwtConfig::from_secret(SECRET)),
         resource_metadata_url: None,
+        // The pool above is deliberately unreachable; revocation has its own
+        // DB-backed tests in `http_auth_revocation.rs`.
+        revocation: None,
     };
 
     axum::Router::new()

@@ -538,6 +538,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
 
+        // The service factory below takes `pool` by move; the bearer layer's
+        // revocation check needs its own handle.
+        let revocation_pool = pool.clone();
+
         let service = StreamableHttpService::new(
             move || {
                 let srv = EpiGraphMcpFull::new_shared_with_federation(
@@ -564,9 +568,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             use epigraph_auth::JwtConfig;
             use epigraph_mcp::auth::{bearer_auth_middleware, McpAuthState};
 
+            // Shared access-token revocation (tokens revoked via the API's
+            // POST /oauth/revoke). Absent table = the migration has not run:
+            // loud, and the pre-existing no-revocation behaviour. Present but
+            // unusable (no grant, row security on) = refuse to serve, rather
+            // than 503 every request or silently admit revoked tokens.
+            let revocation =
+                match epigraph_db::RevokedAccessTokenRepository::probe(&revocation_pool).await {
+                    Ok(epigraph_db::RevocationStoreStatus::Ready) => {
+                        tracing::info!("access-token revocation: shared list enforced");
+                        Some(revocation_pool)
+                    }
+                    Ok(epigraph_db::RevocationStoreStatus::Absent) => {
+                        tracing::error!(
+                            "access-token revocation is NOT enforced on this listener: table \
+                             revoked_access_tokens does not exist (its migration has not run). \
+                             A token revoked via POST /oauth/revoke stays valid here until its \
+                             exp."
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "refusing to serve: the access-token revocation list exists but \
+                             cannot be used: {e}"
+                        )
+                        .into());
+                    }
+                };
+
             let state = McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
                 resource_metadata_url: cli.resource_metadata_url.clone(),
+                revocation,
             };
             router.layer(axum::middleware::from_fn_with_state(
                 state,
