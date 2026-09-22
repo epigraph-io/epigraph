@@ -1,5 +1,6 @@
 //! CRUD endpoints for entities missing create/update routes.
 //!
+//! - `GET  /api/v1/evidence` — List evidence (paged, filtered, redacted)
 //! - `POST /api/v1/evidence` — Create evidence record
 //! - `PUT /api/v1/evidence/:id` — Update evidence (raw_content backfill)
 //! - `POST /api/v1/reasoning-traces` — Create reasoning trace
@@ -35,12 +36,195 @@ use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// =============================================================================
+// LIST EVIDENCE
+// =============================================================================
+
+/// Query parameters for `GET /api/v1/evidence`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListEvidenceQuery {
+    /// Restrict to evidence attached to this claim.
+    pub claim_id: Option<Uuid>,
+    /// Exact match on the stored `evidence_type` column. Vocabulary:
+    /// `document`, `observation`, `testimony`, `computation`, `reference`,
+    /// `figure`, `conversational` (the `evidence_type_valid` CHECK
+    /// constraint). Note `Literature` is stored as `reference` and
+    /// `Consensus` as `computation`.
+    pub evidence_type: Option<String>,
+    /// Case-insensitive substring match on `raw_content`. Rows with a NULL
+    /// `raw_content` never match this predicate.
+    pub content_contains: Option<String>,
+    /// Page size; clamped to `[MIN_PAGE_LIMIT, MAX_PAGE_LIMIT]`.
+    pub limit: Option<i64>,
+    /// Rows to skip; negative values are clamped to 0.
+    pub offset: Option<i64>,
+}
+
+/// One row of `GET /api/v1/evidence`.
+///
+/// Field set mirrors [`super::edges::get_evidence`]'s single-row response.
+///
+/// There is no `redacted` flag and no blanked `content`. A row the viewer
+/// cannot see is ABSENT from this list, not present-and-emptied: the
+/// visibility predicate runs inside the SQL, above `LIMIT`/`OFFSET`, so a
+/// withheld row never reaches this struct. A per-row "you may not see this"
+/// marker would reintroduce exactly the existence oracle the tenancy series
+/// removed when it deleted the post-fetch redaction pass.
+#[derive(Debug, Serialize)]
+pub struct EvidenceListItem {
+    pub id: Uuid,
+    pub claim_id: Uuid,
+    pub evidence_type: String,
+    pub content: Option<String>,
+    pub content_hash: String,
+    pub source_url: Option<String>,
+    pub caption: Option<String>,
+    /// `evidence.signer_id`; NULL for unsigned evidence.
+    pub agent_id: Option<Uuid>,
+    pub created_at: String,
+}
+
+/// Response body for `GET /api/v1/evidence`.
+#[derive(Debug, Serialize)]
+pub struct ListEvidenceResponse {
+    pub evidence: Vec<EvidenceListItem>,
+    /// Exact `COUNT(*)` over the same predicates, evaluated by PostgreSQL —
+    /// NOT `evidence.len()`.
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// List evidence rows, paged and filtered.
+///
+/// `GET /api/v1/evidence?claim_id=…&evidence_type=…&content_contains=…&limit=…&offset=…`
+///
+/// Before this route existed the collection path carried only `post`, so a
+/// `GET` fell through to axum's 405 and the 123k-row `evidence` table could
+/// only be read one row at a time through `GET /api/v1/evidence/:id` (backlog
+/// `d7aab418`). An export or redaction sweep had to either join from a claim
+/// keep-set — which misses evidence whose claim is gone — or go around the API
+/// with raw SQL, which the no-raw-SQL convention forbids.
+///
+/// # Tenancy
+///
+/// This is a BRAND-NEW public read route over `evidence`, a table that had no
+/// collection reader at all before it. Evidence rows hold verbatim tool/API
+/// transcripts and routinely name people the claim text never mentions, so an
+/// unscoped version of this handler would expose the whole 123k-row table
+/// corpus-wide in one request.
+///
+/// It is scoped the way every other read on this branch is: `ViewerExtractor`
+/// supplies the viewer (and 401s an unauthenticated caller — there is no
+/// anonymous `Viewer`), and BOTH the page and its `total` run through
+/// `EvidenceRepository`'s shared `FILTER_WHERE`, which carries the visibility
+/// marker. `evidence` is a migration-062 `tier_a` root, so it has real
+/// `visibility` / `owner_group_id` columns to filter on.
+///
+/// The predicate is on the evidence row ITSELF, not on its linked claim. The
+/// pre-tenancy draft of this handler gated on `evidence.claim_id` via the
+/// now-deleted `check_content_access`; filtering the row directly is strictly
+/// tighter and does not depend on the FK being populated.
+///
+/// Both statements run on ONE viewer-stamped connection from
+/// [`AppState::read_as`] rather than the raw pool, so the in-query `$n`
+/// predicate and the connection's tenancy GUCs agree under FORCEd RLS.
+#[cfg(feature = "db")]
+pub async fn list_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    Query(params): Query<ListEvidenceQuery>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<ListEvidenceResponse>, ApiError> {
+    if let Some(axum::Extension(ref auth)) = auth_ctx {
+        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
+    }
+
+    use epigraph_db::{EvidenceListFilter, EvidenceRepository};
+
+    let limit = params
+        .limit
+        .unwrap_or(super::claims::DEFAULT_PAGE_LIMIT)
+        .clamp(super::claims::MIN_PAGE_LIMIT, super::claims::MAX_PAGE_LIMIT);
+    let offset = params.offset.unwrap_or(0).max(0);
+
+    let filter = EvidenceListFilter {
+        claim_id: params.claim_id,
+        evidence_type: params.evidence_type.as_deref(),
+        content_contains: params.content_contains.as_deref(),
+    };
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_evidence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    // Page and total run on the SAME connection and the SAME `FILTER_WHERE`,
+    // so `total` describes exactly the population the page is drawn from —
+    // including its visibility predicate.
+    let rows =
+        EvidenceRepository::list_filtered(&mut *read, &viewer, &filter, limit, offset).await?;
+    let total = EvidenceRepository::count_filtered(&mut *read, &viewer, &filter).await?;
+
+    let evidence: Vec<EvidenceListItem> = rows
+        .into_iter()
+        .map(|row| {
+            let caption = row
+                .properties
+                .get("caption")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+
+            EvidenceListItem {
+                id: row.id,
+                claim_id: row.claim_id,
+                evidence_type: row.evidence_type,
+                content: row.raw_content,
+                content_hash: hex::encode(&row.content_hash),
+                source_url: row.source_url,
+                caption,
+                agent_id: row.signer_id,
+                created_at: row.created_at.to_rfc3339(),
+            }
+        })
+        .collect();
+
+    Ok(Json(ListEvidenceResponse {
+        evidence,
+        total,
+        limit,
+        offset,
+    }))
+}
+
+/// List evidence rows (no-database build).
+///
+/// Mirrors [`super::edges::get_evidence`]'s `cfg(not(feature = "db"))` twin:
+/// the route stays registered so the path reports "no backing store" rather
+/// than reverting to the 405 this change removed.
+#[cfg(not(feature = "db"))]
+pub async fn list_evidence(
+    State(_state): State<AppState>,
+    Query(_params): Query<ListEvidenceQuery>,
+) -> Result<Json<ListEvidenceResponse>, ApiError> {
+    Err(ApiError::ServiceUnavailable {
+        service: "database".to_string(),
+    })
+}
 
 // =============================================================================
 // CREATE EVIDENCE

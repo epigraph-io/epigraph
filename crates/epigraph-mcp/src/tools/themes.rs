@@ -381,11 +381,12 @@ pub async fn get_theme(
     // Re-read the full summary: `resolve_theme_selector` keeps only the three
     // fields the recall path needs, and duplicating the projection there would
     // let the two diverge.
-    let summary: ThemeSummaryOut = ClaimThemeRepository::get_summary(&server.pool, viewer, resolved.id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("no theme with id {}", resolved.id)))?
-        .into();
+    let summary: ThemeSummaryOut =
+        ClaimThemeRepository::get_summary(&server.pool, viewer, resolved.id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| invalid_params(format!("no theme with id {}", resolved.id)))?
+            .into();
 
     let members = if members_limit == 0 {
         Vec::new()

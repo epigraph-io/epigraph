@@ -343,33 +343,32 @@ pub async fn do_link_epistemic(
     // on a reverse symmetric dedup hit is the caller's SOURCE. The response
     // echoes it as `belief_target_claim_id` so the caller never has to guess
     // which claim the interval belongs to.
-    let target_belief = match ClaimRepository::get_belief_columns(
-        pool,
-        viewer,
-        ClaimId::from_uuid(wire_target),
-    )
-    .await
-    {
-        Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
-            (Some(belief), Some(plausibility), Some(pignistic_prob)) => Some(LinkEpistemicBelief {
-                belief,
-                plausibility,
-                pignistic_prob,
-            }),
-            // Claim with no BBA yet → NULL DS columns → belief not reportable.
-            _ => None,
-        },
-        // Missing row: belief not reportable.
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(
-                target = %wire_target,
-                error = ?e,
-                "link_epistemic: target belief readback failed (non-fatal)"
-            );
-            None
-        }
-    };
+    let target_belief =
+        match ClaimRepository::get_belief_columns(pool, viewer, ClaimId::from_uuid(wire_target))
+            .await
+        {
+            Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
+                (Some(belief), Some(plausibility), Some(pignistic_prob)) => {
+                    Some(LinkEpistemicBelief {
+                        belief,
+                        plausibility,
+                        pignistic_prob,
+                    })
+                }
+                // Claim with no BBA yet → NULL DS columns → belief not reportable.
+                _ => None,
+            },
+            // Missing row: belief not reportable.
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target = %wire_target,
+                    error = ?e,
+                    "link_epistemic: target belief readback failed (non-fatal)"
+                );
+                None
+            }
+        };
 
     success_json(&LinkEpistemicResponse {
         edge_id: edge_id.to_string(),

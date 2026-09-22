@@ -81,6 +81,11 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
         &viewer,
         QueryPaperParams {
             doi: doi.to_string(),
+            // Paging defaults; this test is about `claim_count`, which is a
+            // COUNT over the whole paper and is deliberately independent of the
+            // page (backlog `0e6ec456`).
+            limit: None,
+            offset: None,
         },
     )
     .await
@@ -106,6 +111,8 @@ async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
         &viewer,
         QueryPaperParams {
             doi: "10.9999/never-ingested".to_string(),
+            limit: None,
+            offset: None,
         },
     )
     .await

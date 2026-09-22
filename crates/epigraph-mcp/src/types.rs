@@ -310,6 +310,26 @@ pub struct UpdateWithEvidenceParams {
 pub struct GetProvenanceParams {
     #[schemars(description = "The UUID of the claim to get provenance for")]
     pub claim_id: String,
+
+    #[schemars(
+        description = "Maximum ancestor depth to walk. Default 5, clamped to 1..=20. \
+                       The bundle reports `truncated: true` when the walk stopped early."
+    )]
+    pub max_depth: Option<i32>,
+
+    #[schemars(
+        description = "Maximum number of claim nodes kept in the bundle. Default 50, \
+                       clamped to 1..=500. The target claim plus its nearest ancestors \
+                       are kept; `truncated: true` when the cap bit."
+    )]
+    pub max_nodes: Option<usize>,
+
+    #[schemars(
+        description = "Per-claim content character budget. Default 500, clamped to \
+                       50..=20000. Entities whose content was cut carry \
+                       `content_truncated: true` and the original `content_chars`."
+    )]
+    pub max_content_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -571,6 +591,16 @@ pub struct RecallParams {
 pub struct QueryPaperParams {
     #[schemars(description = "DOI of the paper (e.g. '10.48550/arXiv.2508.16798')")]
     pub doi: String,
+
+    #[schemars(
+        description = "Maximum asserted claims to return in this page. Default 25, \
+                       clamped to 1..=200. `claim_count` remains the full total, so \
+                       `claim_count > offset + returned` means there are more pages."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Asserted claims to skip (paging). Default 0.")]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1667,7 +1697,17 @@ pub struct PaperResponse {
     pub doi: String,
     pub title: String,
     pub authors: Vec<AuthorResponse>,
+    /// Total asserted claims for the paper, independent of paging. Compare
+    /// against `offset + returned` to decide whether another page exists.
     pub claim_count: i64,
+    /// `claims.len()` — the size of THIS page, not the total.
+    pub returned: usize,
+    /// Echo of the applied `offset` (after clamping).
+    pub offset: i64,
+    /// Echo of the applied `limit` (after clamping).
+    pub limit: i64,
+    /// `true` when `offset + returned < claim_count`, i.e. another page exists.
+    pub has_more: bool,
     pub claims: Vec<ClaimResponse>,
 }
 

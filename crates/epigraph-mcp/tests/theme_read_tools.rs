@@ -128,7 +128,11 @@ async fn list_themes_reports_live_membership_and_pages_deterministically() {
 
     let params: ListThemesParams =
         serde_json::from_value(json!({ "label_prefix": prefix })).expect("params");
-    let body = common::first_text(&list_themes(&server, &viewer, params).await.expect("list_themes"));
+    let body = common::first_text(
+        &list_themes(&server, &viewer, params)
+            .await
+            .expect("list_themes"),
+    );
 
     let themes = themes_of(&body);
     assert_eq!(
@@ -210,7 +214,11 @@ async fn get_theme_returns_member_ids_without_content() {
 
     let params: GetThemeParams =
         serde_json::from_value(json!({ "theme_id": theme.to_string() })).expect("params");
-    let body = common::first_text(&get_theme(&server, &viewer, params).await.expect("get_theme"));
+    let body = common::first_text(
+        &get_theme(&server, &viewer, params)
+            .await
+            .expect("get_theme"),
+    );
 
     let members = body
         .get("members")

@@ -585,7 +585,8 @@ async fn find_workflow_post_embed(
             Candidate::Hierarchical(row) => {
                 let steps = hierarchical_steps.remove(&row.id).unwrap_or_default();
                 if let Some(r) =
-                    hierarchical_workflow_result(&server.pool, viewer, &row, steps, &affinity_map).await
+                    hierarchical_workflow_result(&server.pool, viewer, &row, steps, &affinity_map)
+                        .await
                 {
                     results.push(r);
                 }
@@ -698,7 +699,8 @@ async fn find_workflow_post_embed(
             };
             let steps = text_steps.remove(&scored.id).unwrap_or_default();
             if let Some(r) =
-                hierarchical_workflow_result(&server.pool, viewer, &scored, steps, &affinity_map).await
+                hierarchical_workflow_result(&server.pool, viewer, &scored, steps, &affinity_map)
+                    .await
             {
                 results.push(r);
             }
