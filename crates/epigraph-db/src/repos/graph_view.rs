@@ -190,6 +190,20 @@ pub struct CompoundGroupRow {
     pub member_atom_ids: Vec<Uuid>,
 }
 
+/// An edge between two nodes of a cluster expansion.
+/// Result row for [`GraphViewRepository::cluster_subgraph_edges`].
+///
+/// `is_allowed` is whether `relationship` is in the caller's allowlist (always
+/// `true` when no allowlist was given); the handler returns the allowed rows
+/// and reports the rest only as a count.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ClusterSubgraphEdgeRow {
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relationship: String,
+    pub is_allowed: bool,
+}
+
 /// A neighbouring compound in the compound-neighborhood projection.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CompoundNeighborRow {
@@ -260,6 +274,55 @@ impl GraphViewRepository {
             .bind(run_id)
             .bind(degree_relationships)
             .bind(budget);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Edges wholly inside a cluster expansion's node set, tagged with whether
+    /// each relationship is in `allowlist` (`None` = every relationship).
+    ///
+    /// Backs the `edges` / `filtered_edge_count` half of
+    /// `GET /api/v1/graph/clusters/:id/expand`. It was inline route SQL
+    /// (`routes/graph.rs::fetch_subgraph_edges`) with NO predicate, defended by
+    /// a module doc arguing that "both endpoints are already restricted to the
+    /// visible node set, so the statement needs no predicate of its own". That
+    /// argument is refuted by migration 070 arm (b), which KEEPS an edge
+    /// declared `('group', G)` between two PUBLIC endpoints: both endpoints
+    /// survive the node projection and the edge still must not. Moved here so
+    /// it can carry `/* {EDGE_VISIBILITY:e} */` (in `WHERE`; `e` is the only
+    /// table) and fall under `visibility_lint.rs`.
+    ///
+    /// The two statements the handler used to choose between are one here:
+    /// `$2::text[] IS NULL` stands for "no allowlist". `filtered_edge_count` is
+    /// therefore also a count over edges the viewer may read — it is returned
+    /// to the caller, so an unfiltered count was itself a disclosure.
+    ///
+    /// Pass the ids that SURVIVED the node projection, as
+    /// [`Self::subgraph_edges`] requires; the edge predicate does not replace
+    /// that precondition, it adds the edge's own tenancy to it.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, node_ids, allowlist))]
+    pub async fn cluster_subgraph_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        node_ids: &[Uuid],
+        allowlist: Option<&[String]>,
+    ) -> Result<Vec<ClusterSubgraphEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.source_id, e.target_id, e.relationship, \
+                    ($2::text[] IS NULL OR e.relationship = ANY($2::text[])) AS is_allowed \
+             FROM edges e \
+             WHERE e.source_id = ANY($1) AND e.target_id = ANY($1) \
+               /* {EDGE_VISIBILITY:e} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, ClusterSubgraphEdgeRow>(&sql)
+            .bind(node_ids)
+            .bind(allowlist);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

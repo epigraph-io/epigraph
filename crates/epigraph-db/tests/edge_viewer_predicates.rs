@@ -697,3 +697,72 @@ async fn rag_hybrid_context_edge_count_counts_only_readable_edges(pool: PgPool) 
     );
     assert_eq!(sys, 4, "the bypass viewer counts every edge");
 }
+
+// ── cluster_subgraph_edges (was routes/graph.rs::fetch_subgraph_edges) ─────
+
+/// The route's module doc argued this read "needs no predicate of its own"
+/// because both endpoints come from the viewer-filtered node set. The fixture
+/// is the counterexample: every node is public, and the `contradicts` edge
+/// between two of them is not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cluster_subgraph_edges_withholds_a_private_edge_between_visible_nodes(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let ids = public_claims(&pool, t.agent, &["A", "B", "C"]).await;
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    edge(&pool, a, b, "supports").await;
+    private_edge(&pool, a, c, "contradicts", t.group).await;
+    edge(&pool, b, c, "same_source").await; // outside the allowlist
+    let allow = vec!["supports".to_string(), "contradicts".to_string()];
+
+    let shape = |rows: Vec<epigraph_db::ClusterSubgraphEdgeRow>| {
+        let mut v: Vec<(Uuid, Uuid, String, bool)> = rows
+            .into_iter()
+            .map(|r| (r.source_id, r.target_id, r.relationship, r.is_allowed))
+            .collect();
+        v.sort();
+        v
+    };
+
+    let owner = shape(
+        GraphViewRepository::cluster_subgraph_edges(&pool, &t.owner, &ids, Some(&allow))
+            .await
+            .expect("owner edges"),
+    );
+    let mut want_owner = vec![
+        (a, b, "supports".to_string(), true),
+        (a, c, "contradicts".to_string(), true),
+        (b, c, "same_source".to_string(), false),
+    ];
+    want_owner.sort();
+    assert_eq!(owner, want_owner, "the owner reads all three edges");
+
+    let stranger = shape(
+        GraphViewRepository::cluster_subgraph_edges(&pool, &t.stranger, &ids, Some(&allow))
+            .await
+            .expect("stranger edges"),
+    );
+    let mut want_stranger = vec![
+        (a, b, "supports".to_string(), true),
+        (b, c, "same_source".to_string(), false),
+    ];
+    want_stranger.sort();
+    assert_eq!(
+        stranger, want_stranger,
+        "all three endpoints are visible to the stranger, and the private \
+         `contradicts` edge between two of them must still be withheld — from \
+         edges[] AND from filtered_edge_count"
+    );
+
+    // `None` = no allowlist: every readable edge is allowed, the private one
+    // still absent.
+    let stranger_all = shape(
+        GraphViewRepository::cluster_subgraph_edges(&pool, &t.stranger, &ids, None)
+            .await
+            .expect("stranger edges, no allowlist"),
+    );
+    assert!(
+        stranger_all.iter().all(|r| r.3) && stranger_all.len() == 2,
+        "with no allowlist every returned edge is allowed and the private one is \
+         still withheld: {stranger_all:?}"
+    );
+}

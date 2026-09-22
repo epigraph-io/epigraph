@@ -16,22 +16,23 @@
 //! have zero call sites, and a new route-layer primitive that no register
 //! watches is a worse thing to create than a signature to change.
 //!
-//! **Only ONE of the four statements narrows, and that is stated rather than
-//! implied.** `graph_cluster_runs`, `graph_clusters` and the `edges` read carry
-//! no viewer predicate OF THEIR OWN; the first two carry no tenancy columns and
-//! no RLS at migration head 92. The `edges` case is different in kind and the
-//! difference matters: `fetch_subgraph_edges` runs
-//! `WHERE source_id = ANY($1) AND target_id = ANY($1)` over `node_ids` produced
-//! by the viewer-spliced `GraphViewRepository::expand_cluster_nodes`, so BOTH
-//! endpoints are already restricted to the visible node set and the statement
-//! needs no predicate of its own. A reader should not take the sentence above as
-//! naming an unowned route-layer gap to re-file or to "fix". The suppression
-//! `expand` offers comes from the node projection alone. In particular this
-//! shard does NOT discharge
-//! `F-edges-unfiltered` (`epigraph-db/src/repos/graph_view.rs`, owner: the
-//! conversion tail). Converting an executor is not that entry's remedy, it
-//! stays open, and nothing further about it is recorded here — see
-//! `docs/tenancy/progress.json`.
+//! **TWO of the four statements narrow — CORRECTED.** `graph_cluster_runs` and
+//! `graph_clusters` carry no tenancy columns and no RLS at migration head 92, so
+//! the two metadata probes carry no viewer predicate. The `edges` read DOES,
+//! since the `F-edges-unfiltered` pass: it is now
+//! `GraphViewRepository::cluster_subgraph_edges`, spliced with
+//! `/* {EDGE_VISIBILITY:e} */`.
+//!
+//! This paragraph used to argue the opposite — that because `node_ids` come
+//! from the viewer-spliced `expand_cluster_nodes`, "BOTH endpoints are already
+//! restricted to the visible node set and the statement needs no predicate of
+//! its own", and it told readers not to re-file or fix it. **That argument was
+//! wrong.** Migration 070 arm (b) KEEPS an edge declared `('group', G)` between
+//! two PUBLIC endpoints ("the meet would WIDEN it"), and
+//! `structural_features_authz.rs` asserts such an edge must be invisible to a
+//! stranger. Both endpoints survive the node projection; the edge must not. So
+//! endpoint filtering never implied edge filtering, and `edges[]` plus
+//! `filtered_edge_count` reached a stranger with the private edge in them.
 //!
 //! The other 3 sites — `overview`, `themes_overview`, `themes_expand` — are
 //! routed GETs that hold no `Viewer` at all. Their owner is
@@ -296,12 +297,13 @@ pub async fn expand(
     use axum::http::StatusCode;
     // ONE viewer-stamped connection for all four statements this handler runs:
     // the two run/cluster metadata probes below, `expand_cluster_nodes`, and
-    // `fetch_subgraph_edges`. Only the node projection is viewer-filtered —
-    // `graph_cluster_runs`, `graph_clusters` and the `edges` read carry no
-    // predicate here, and stamping the connection does not give them one. What
-    // the shared connection buys is that the filtered read runs under the same
-    // tenancy context as the unfiltered metadata it is joined to in the
-    // response, rather than under a different one.
+    // `fetch_subgraph_edges`. The node projection and the edge read are
+    // viewer-filtered (the latter on the EDGE's own tenancy, not only through
+    // its endpoints — see the module doc); `graph_cluster_runs` and
+    // `graph_clusters` carry no tenancy columns and no predicate, and stamping
+    // the connection does not give them one. What the shared connection buys
+    // is that the filtered reads run under the same tenancy context as the
+    // unfiltered metadata they are joined to in the response.
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
@@ -369,7 +371,7 @@ pub async fn expand(
 
     let node_ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
     let (edges, filtered_edge_count) =
-        fetch_subgraph_edges(&mut read, &node_ids, allowlist.as_deref()).await?;
+        fetch_subgraph_edges(&mut read, &viewer, &node_ids, allowlist.as_deref()).await?;
 
     // PR-07: `truncated` means "the budget cut this response short", so it is
     // derived from the budget, not from `graph_clusters.size`.
@@ -400,56 +402,39 @@ pub async fn neighborhood(
     ))
 }
 
-/// Fetch edges *between* the given node ids, partitioned into:
+/// Fetch the edges *between* the given node ids that `viewer` may read,
+/// partitioned into:
 /// - edges whose `relationship` is in `rel_list` (returned as `edges`)
 /// - edges whose `relationship` is *not* in `rel_list` (returned as count)
 ///
-/// Single round-trip: tags each row with an `is_allowed` flag computed in
-/// the SELECT list, then partitions in Rust.
-///
-/// Takes a `&mut PgConnection` rather than a `&PgPool` so that its statement
-/// runs on the same viewer-stamped connection as the rest of [`expand`], its
-/// ONLY caller workspace-wide. Changed in place rather than split into a
-/// `_conn` primitive beside a pool-shaped wrapper: with one caller a wrapper
-/// would have zero call sites, and a route-layer helper that no register
-/// watches is a worse thing to create than a signature to change.
+/// The SQL is `GraphViewRepository::cluster_subgraph_edges`, which tags each
+/// row with `is_allowed` and carries the edge's own viewer predicate; this
+/// helper only partitions. It runs on [`expand`]'s one viewer-stamped
+/// connection, its ONLY caller workspace-wide.
 async fn fetch_subgraph_edges(
     conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
     node_ids: &[Uuid],
     rel_list: Option<&[String]>,
 ) -> Result<(Vec<EdgeOut>, i64), (axum::http::StatusCode, String)> {
     if node_ids.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let rows: Vec<(Uuid, Uuid, String, bool)> = match rel_list {
-        Some(allowlist) => {
-            sqlx::query_as(
-                "SELECT source_id, target_id, relationship, \
-                    (relationship = ANY($2)) AS is_allowed \
-             FROM edges \
-             WHERE source_id = ANY($1) AND target_id = ANY($1)",
-            )
-            .bind(node_ids)
-            .bind(allowlist)
-            .fetch_all(&mut *conn)
-            .await
-        }
-        None => {
-            sqlx::query_as(
-                "SELECT source_id, target_id, relationship, true AS is_allowed \
-             FROM edges \
-             WHERE source_id = ANY($1) AND target_id = ANY($1)",
-            )
-            .bind(node_ids)
-            .fetch_all(&mut *conn)
-            .await
-        }
-    }
-    .map_err(internal)?;
+    let rows = epigraph_db::GraphViewRepository::cluster_subgraph_edges(
+        &mut *conn, viewer, node_ids, rel_list,
+    )
+    .await
+    .map_err(internal_db)?;
 
     let mut edges = Vec::new();
     let mut filtered: i64 = 0;
-    for (source, target, relationship, is_allowed) in rows {
+    for epigraph_db::ClusterSubgraphEdgeRow {
+        source_id: source,
+        target_id: target,
+        relationship,
+        is_allowed,
+    } in rows
+    {
         if is_allowed {
             edges.push(EdgeOut {
                 source,
