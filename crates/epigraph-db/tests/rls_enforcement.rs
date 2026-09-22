@@ -2626,3 +2626,271 @@ async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
          passed on the unfixed tree."
     );
 }
+
+// ===========================================================================
+// R4 (2026-09-22) — the WRITE half of the unstamped-negative class.
+//
+// Everything above this header that asserts a refusal asserts either a READ
+// refusal or a write refusal on `agents` — a tenancy-EXEMPT relation with a
+// bespoke policy. Nothing asserted what a tier-A `WITH CHECK` does to an
+// unstamped connection.
+//
+// That gap is reachable, and it is the shape §9.2 step 11d produces if it runs
+// before the conversion tail of §2.1 is drained: once the application DSN is a
+// role without BYPASSRLS, and while the request path still stamps nothing,
+// `submit_claim` and `memorize` fail with
+//
+//     new row violates row-level security policy for table "reasoning_traces"
+//
+// AFTER the claim row has already committed, so each failure leaves a claim with
+// no trace and no evidence. Deployment-state detail for the 2026-09-22 instance
+// of this is held outside this public repository, in
+// ~/ops-private/tenancy-regressions-2026-09-22.md (R4); nothing below depends on
+// it, because every assertion here is measured on the throwaway.
+// ===========================================================================
+
+/// SQLSTATE for an RLS `WITH CHECK` violation.
+///
+/// Asserted on the CODE and never on the message. PostgreSQL's wording for this
+/// condition is not a stable interface, and a substring match on it would also
+/// match `42501 permission denied for table …` — the missing-GRANT error this
+/// file's `grant_app_privileges` calls exist to keep out of the assertion.
+const INSUFFICIENT_PRIVILEGE: &str = "42501";
+
+/// A 32-byte `content_hash`, which is what `claims_content_hash_length` requires.
+/// Derived from a UUID so each seeded row is distinct without a hash dependency.
+fn hash32(id: Uuid) -> Vec<u8> {
+    id.as_bytes().iter().copied().cycle().take(32).collect()
+}
+
+/// `('public', <a real personal group>)` — the shape
+/// `ClaimRepository::default_decl_for_author` produces, and therefore the shape
+/// every MCP- and API-authored claim in production carries.
+///
+/// Neither fixture helper produces it: `seed_public_claim` owns the row to the
+/// WORLD group (memberless by design, so in nobody's writable set) and
+/// `seed_group_claim` sets `visibility = 'group'`. The row under test has to be
+/// public AND owned by a group with live writable members, because that is the
+/// only combination in which "the author may read it" and "the author may write
+/// into it" are different questions — which is the whole of the asymmetry R4
+/// turned on.
+async fn insert_public_claim_owned_by(
+    conn: &mut sqlx::PgConnection,
+    agent: Uuid,
+    group: Uuid,
+    content: &str,
+) -> Result<(), sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(content)
+    // `claims_content_hash_length` requires exactly 32 bytes; a UUID is 16.
+    .bind(hash32(id))
+    .bind(agent)
+    .bind(group)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+}
+
+/// One `reasoning_traces` row for `claim`, naming NEITHER tenancy column.
+///
+/// The omission is the production shape, not a shortcut:
+/// `ReasoningTraceRepository::create`'s `INSERT` lists seven columns and neither
+/// `visibility` nor `owner_group_id` is among them, because
+/// `epigraph_derived_require_tenancy` (a `BEFORE INSERT` row trigger) and
+/// migration 070 arm (c) derive both from the parent claim. So the values
+/// `WITH CHECK` sees are the PARENT's, and the writer never gets to choose them
+/// — which is why the repair has to be the session's GUCs and cannot be a
+/// different bind at this call site.
+async fn insert_trace_for(conn: &mut sqlx::PgConnection, claim: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, confidence, explanation) \
+         VALUES ($1, 'deductive', 0.9, 'R4 regression probe')",
+    )
+    .bind(claim)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+}
+
+fn is_rls_refusal(r: &Result<(), sqlx::Error>) -> bool {
+    r.as_ref()
+        .err()
+        .and_then(sqlx::Error::as_database_error)
+        .and_then(sqlx::error::DatabaseError::code)
+        .as_deref()
+        == Some(INSUFFICIENT_PRIVILEGE)
+}
+
+/// **R4.** A claim-derived write is refused on an UNSTAMPED app connection,
+/// admitted on one stamped with the AUTHOR's groups, and refused again when the
+/// writable set names a group that does not own the parent.
+///
+/// # This test asserts that the POLICY IS RIGHT and the WRITER IS WRONG
+///
+/// `reasoning_traces_tenancy`'s `USING` carries a `visibility = 'public'` arm and
+/// its `WITH CHECK` does not. Read in isolation that asymmetry looks like the
+/// defect, and "add the arm to `WITH CHECK`" looks like the fix. It is not.
+/// Migration 077 §2 states the rule it is implementing — *"a public claim is
+/// owned by its author's group, so publishing publicly is an ORDINARY write into
+/// a group you can write to"* — and the same comment block names this exact
+/// failure mode in the opposite direction: *"`FOR ALL USING (…)` alone silently
+/// reuses USING as WITH CHECK, which is how the enterprise policy set
+/// degenerated to a no-op for INSERT."* Widening `WITH CHECK` to match `USING`
+/// would make every tier-A write policy in the series a no-op for INSERT, which
+/// is the state 077 was written to leave behind.
+///
+/// So arm 1 below is a POSITIVE statement about the policy, not a
+/// characterisation of a bug: a session that has proved no write authority must
+/// not write. Anyone "repairing" R4 by relaxing the policy fails it.
+///
+/// # What actually has to change, and why it is not in this file
+///
+/// The session. `D-PR17-request-path-never-stamps-session-gucs` — see
+/// `no_unscoped_pool.rs`, which counts the unconverted `state.db_pool` sites —
+/// records that `ScopedPool::acquire_as` / `::begin_as` have no production caller
+/// on the request path, so `epigraph_writable_groups()` is `{}` for every
+/// statement the API and MCP servers issue. `epigraph-mcp` is not even in that
+/// ratchet's scan root. Arm 3 is what the conversion has to make true; arm 4 is
+/// what it must not break on the way.
+///
+/// # All four arms on ONE connection, deliberately
+///
+/// Same `session_user`, same GRANTs, same seeded rows, same instant. The only
+/// variable across the arms is the GUC triple, so no arm can pass for an
+/// unrelated reason — a missing privilege or an absent policy would fail arm 3 as
+/// loudly as it would satisfy arm 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unstamped_app_connection_cannot_write_a_claim_derived_row(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "r4author").await;
+    let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "r4stranger").await;
+    // The parent claim, seeded on the superuser harness connection so the arms
+    // below start from a row that exists. `('public', author_group)` for the
+    // reason `insert_public_claim_owned_by`'s doc gives.
+    let claim = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, 'R4 parent claim', $2, 0.8, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(hash32(claim))
+    .bind(author)
+    .bind(author_group)
+    .execute(&pool)
+    .await
+    .expect("seed the parent claim on the superuser harness connection");
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    // NON-VACUITY. Every assertion below is vacuous if the role under test
+    // bypasses RLS; `privatization_authz.rs` makes the same check for the same
+    // reason. It is not hypothetical here: a process pointed at a superuser DSN
+    // holds BYPASSRLS, so the SAME build writes successfully on one transport and
+    // is refused on another purely because the two transports were given
+    // different DSNs. That looks exactly like a policy or an identity problem and
+    // is neither, which is how this defect was first misdiagnosed.
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(&pool)
+            .await
+            .expect("read epigraph_app's rolbypassrls");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS, so no policy filters it and all four arms below are \
+         vacuous. Fix the role, not this test."
+    );
+
+    let (unstamped_trace, unstamped_claim, stamped_trace, stamped_claim, foreign_trace) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            // ARMS 1 and 2 — the deployed request path's steady state.
+            set_gucs(&mut conn, "", "", "").await;
+            let unstamped_trace = insert_trace_for(&mut conn, claim).await;
+            let unstamped_claim =
+                insert_public_claim_owned_by(&mut conn, author, author_group, "R4 unstamped").await;
+
+            // ARM 3 — what a ScopedPool connection stamped from the AUTHOR's
+            // viewer looks like. The AUTHOR's viewer, not the HTTP caller's:
+            // `submit_claim` authors as `server.agent_id()`, so the row is owned
+            // by the server agent's personal group and the caller's group set is
+            // irrelevant to WITH CHECK.
+            set_gucs(
+                &mut conn,
+                &author_group.to_string(),
+                &author_group.to_string(),
+                &author.to_string(),
+            )
+            .await;
+            let stamped_trace = insert_trace_for(&mut conn, claim).await;
+            let stamped_claim =
+                insert_public_claim_owned_by(&mut conn, author, author_group, "R4 stamped").await;
+
+            // ARM 4 — a real group, with a live writable member, that does not
+            // own the parent claim.
+            set_gucs(
+                &mut conn,
+                &author_group.to_string(),
+                &stranger_group.to_string(),
+                &author.to_string(),
+            )
+            .await;
+            let foreign_trace = insert_trace_for(&mut conn, claim).await;
+
+            (
+                conn,
+                (
+                    unstamped_trace,
+                    unstamped_claim,
+                    stamped_trace,
+                    stamped_claim,
+                    foreign_trace,
+                ),
+            )
+        })
+        .await;
+
+    assert!(
+        is_rls_refusal(&unstamped_trace),
+        "an app session with an EMPTY writable set inserted a reasoning_traces row. \
+         `reasoning_traces_tenancy`'s WITH CHECK is the only thing standing between a \
+         no-authority session and a write into somebody's group, and 077 §2 says in as many \
+         words that publishing publicly is still an ordinary write into a group you can write \
+         to. If this arm fails because WITH CHECK was widened to match USING, that is the \
+         defect and not the repair. Got: {unstamped_trace:?}"
+    );
+    assert!(
+        is_rls_refusal(&unstamped_claim),
+        "THE SAME REFUSAL APPLIES TO `claims`, which is why a deployment in this state sees the \
+         failure on the SECOND statement of the write sequence rather than the first. A \
+         deployment can carry orphan PERMISSIVE `claims_privacy` / `evidence_privacy` / \
+         `edges_privacy` policies that exist in no migration of this series; each is `FOR ALL \
+         USING (…)` with no explicit WITH CHECK, so PostgreSQL reuses USING as the check, and \
+         their USING is unconditionally true while the encryption tables are empty. Where they \
+         are present they are the ONLY reason an unstamped claim INSERT succeeds — so dropping \
+         them before the writer is converted widens the outage from one table to the whole \
+         claims/evidence/edges write surface. Measured both ways on the throwaway; mutation (D) \
+         in this commit's body is that replay. Got: {unstamped_claim:?}"
+    );
+    stamped_trace.expect(
+        "CALIBRATION, and the acceptance line for the conversion: a session stamped with the \
+         AUTHOR's own writable group must be able to write the trace of a claim that group \
+         owns. A failure here means arms 1 and 2 are satisfied by a policy that refuses \
+         everyone, which would prove nothing about tenancy at all.",
+    );
+    stamped_claim.expect(
+        "CALIBRATION: the same stamped session must also write the claim itself, with no orphan \
+         policy present. This is what makes the claims_privacy argument above a statement about \
+         the SESSION rather than about the policy set.",
+    );
+    assert!(
+        is_rls_refusal(&foreign_trace),
+        "a session whose writable set names a real group that does NOT own the parent claim \
+         still wrote into that claim's group. This is the half a repair must not trade away: \
+         stamping the session must carry the author's authority, never confer authority the \
+         author does not have. Got: {foreign_trace:?}"
+    );
+}
