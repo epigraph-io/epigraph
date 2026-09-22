@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (303 today; the assertions below measure the tree and
+//! deletes in week two. (300 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 303 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 300 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,18 +120,21 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 303 is not 0 — and no shard in the series may be
+//!      discharged the gate — 300 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 113 of the 416 sites the series began with are converted, and
-//!      303 are not.
+//!      decision: 116 of the 416 sites the series began with are gone — 113
+//!      converted by the shards, and 3 REMOVED outright when `routes/claims.rs`'s
+//!      `group_id` membership gates stopped reading `group_memberships` through
+//!      the raw pool — and 300 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
 //!      exhausted the sites PR #460 classified `A` that any shard may take: of
 //!      the 26 it was sized for, 24 landed, 2 were declined at SITE level (an
-//!      authorization read in `routes/claims.rs`, argued at the site), and 3
-//!      more landed that the classification filed `C` on a rule that does not
-//!      match reachability. The residue is ~39 category `B`, behind an open
+//!      authorization read in `routes/claims.rs` — since DISCHARGED: the gate
+//!      answers from the request's `Viewer` and no longer reads the raw pool at
+//!      all), and 3 more landed that the classification filed `C` on a rule that
+//!      does not match reachability. The residue is ~39 category `B`, behind an open
 //!      operator decision, and ~265 category `C`, every one blocked by its
 //!      HANDLER — overwhelmingly because the handler WRITES, which
 //!      `AppState::read_as` is documented not to serve.
@@ -553,7 +556,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 303;
+const HIGH_WATER: usize = 300;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -579,11 +582,19 @@ const HIGH_WATER: usize = 303;
 /// temporarily set to 1 — never by subtracting the count the shard believed it
 /// had converted, which is the method every shard since 5 has used and the one
 /// that catches a miscount.
+///
+/// The deferred-commitment fix for the `routes/claims.rs` membership gate did
+/// not move it either: that file keeps 18 write-handler sites. It REMOVED three
+/// sites rather than converting them — `create_claim`'s, `get_claim`'s and
+/// `list_claims`' `GroupMembershipRepository::is_member(&state.db_pool, ..)`
+/// gates now answer from the request's `Viewer` and need no connection — so
+/// `HIGH_WATER` went 303 -> 300, read off `measure()`'s own failure output with
+/// this constant temporarily set to 1, by the same method.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 303 sites across 44 files as of this commit. Lower an entry when a shard
+/// 300 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -610,16 +621,21 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 25 before conversion shard 7, which moved `get_claim`, `list_claims`,
     // `list_claim_evidence` and `list_by_labels` onto
     // `AppState::read_as`. FOUR, not six: `get_claim` and `list_claims` each
-    // hold a SECOND site that is declined at SITE level rather than handler
+    // held a SECOND site that shard 7 declined at SITE level rather than handler
     // level — a `GroupMembershipRepository::is_member` authorization gate that
-    // completes before any content read begins. The argument is written at the
-    // site in that file, and it is the first decline in this series whose
-    // blocker is the site and not the handler. The remaining NINETEEN sit in
-    // write handlers — `create_claim` (9), `update_claim` (6), `patch_claim`
-    // (2), `update_labels` (2) — which with those two gates is 21, the row
-    // below. (An earlier draft of this comment said "seventeen" and did not
-    // close the arithmetic against the row it annotates.)
-    ("routes/claims.rs", 21),
+    // completes before any content read begins — and recorded that the decline
+    // expired at step 11d, when the unstamped raw read would 403 every member.
+    // (An earlier draft of this comment said "seventeen" and did not close the
+    // arithmetic against the row it annotates.)
+    //
+    // 21 -> 18 when that decline was DISCHARGED: those two gates, and the same
+    // gate on `create_claim`'s encrypted path, now answer from the request's
+    // `Viewer` and read no pool at all, so three sites were removed rather than
+    // converted. All EIGHTEEN that remain sit in write handlers —
+    // `create_claim` (8), `update_claim` (6), `patch_claim` (2),
+    // `update_labels` (2) — whose owner is `ScopedPool::begin_as` plus
+    // `Viewer::splice_write`.
+    ("routes/claims.rs", 18),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,

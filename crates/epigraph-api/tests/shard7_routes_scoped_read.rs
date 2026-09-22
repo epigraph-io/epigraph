@@ -122,6 +122,23 @@
 //!   anything. `graph_routes_test.rs` drives the endpoint through `spawn_app`
 //!   and is its counterfactual.
 //!
+//! # The `group_id` membership gate, added after the shard
+//!
+//! Three more arms — [`get_claim_group_gate_admits_live_members_on_an_rls_subject_raw_pool`],
+//! [`list_claims_group_gate_admits_live_members_on_an_rls_subject_raw_pool`] and
+//! [`create_claim_group_gate_admits_live_members_on_an_rls_subject_raw_pool`] —
+//! discharge the SITE-level decline this shard recorded in `routes/claims.rs`.
+//! They are not stranger-row arms and drive no converted read: they drive the
+//! `group_id` membership assertion, which used to be
+//! `GroupMembershipRepository::is_member(&state.db_pool, ..)` and now answers
+//! from the request's `Viewer`. [`split_state`]'s raw pool is exactly the pool
+//! that read would have run on after §9.2 step 11d, so each arm CALIBRATES that
+//! `is_member` on it sees none of the seeded memberships before asserting that
+//! a live admin and a live reader are admitted and a revoked member and a
+//! non-member are refused with 403. Adjudicated both ways: re-pointing the
+//! three gates at the raw-pool `is_member` failed every arm on the live-admin
+//! case, and forcing the helper to admit failed every arm on the revoked case.
+//!
 //! # What is still NOT proven here
 //!
 //! `ScopedPoolOptions` exposes no `after_connect`, so the SCOPED arm is still a
@@ -183,17 +200,20 @@
 mod viewer_fixture;
 
 use axum::extract::{Path, Query, State};
-use epigraph_api::middleware::bearer::ViewerExtractor;
+use axum::{Extension, Json};
+use epigraph_api::errors::ApiError;
+use epigraph_api::middleware::bearer::{AuthContext, ClientType, ViewerExtractor};
 use epigraph_api::routes::challenge::list_challenges;
 use epigraph_api::routes::claims::{
-    get_claim, list_by_labels, list_claim_evidence, list_claims, ClaimsByLabelsQuery,
-    GetClaimQuery, PaginationParams,
+    create_claim, get_claim, list_by_labels, list_claim_evidence, list_claims, ClaimsByLabelsQuery,
+    CreateClaimRequest, GetClaimQuery, PaginationParams,
 };
 use epigraph_api::routes::conventions::{list_skills, ListSkillsQuery};
 use epigraph_api::routes::entities::{entity_neighborhood, query_triples, QueryTriplesRequest};
 use epigraph_api::routes::versioning::claim_history;
 use epigraph_api::routes::workflows::{list_workflows, ListWorkflowsQuery};
 use epigraph_api::state::{ApiConfig, AppState};
+use epigraph_db::GroupMembershipRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 use viewer_fixture::{
@@ -441,7 +461,6 @@ async fn list_claims_counts_the_viewers_own_group_private_claim(pool: PgPool) {
             agent_id: None,
             group_id: None,
         }),
-        None,
     )
     .await
     .expect("list_claims");
@@ -500,7 +519,6 @@ async fn get_claim_serves_the_viewers_own_group_private_claim(pool: PgPool) {
             agent_id: None,
             group_id: None,
         }),
-        None,
     )
     .await;
 
@@ -531,7 +549,6 @@ async fn get_claim_serves_the_viewers_own_group_private_claim(pool: PgPool) {
             agent_id: None,
             group_id: None,
         }),
-        None,
     )
     .await;
     assert!(
@@ -641,6 +658,238 @@ async fn list_claim_evidence_serves_the_viewers_own_group_private_evidence(pool:
         "the STRANGER's evidence must be absent even though its parent claim is public \
          — the widening direction. Got {ids:?}"
     );
+}
+
+// ── routes/claims.rs: the `group_id` membership gate ──
+//
+// `create_claim`, `get_claim` and `list_claims` used to answer their `group_id`
+// membership assertion with `GroupMembershipRepository::is_member(&state.db_pool,
+// ..)`. On `split_state`'s raw pool — `epigraph_app`, unstamped, which is what
+// `AppState.db_pool` becomes at §9.2 step 11d — migration 077's
+// `group_memberships_tenancy` policy hides EVERY membership row, so that gate
+// answered 403 to a legitimate member. Each arm below first CALIBRATES that
+// fact on the very pool the handler is handed (the gate it replaced would have
+// refused), then drives the handler and asserts the viewer-answered gate
+// admits live members and refuses the rest.
+
+/// One principal with four relationships to four groups, so a single arm can
+/// assert both directions of the gate.
+struct GateFixture {
+    viewer: Uuid,
+    /// The viewer's personal group: a live `admin` membership.
+    own: Uuid,
+    /// Another principal's group in which the viewer is a live `reader`. The
+    /// gate ignores role, exactly as `is_member` did.
+    reader: Uuid,
+    /// Another principal's group in which the viewer's only membership has
+    /// `revoked_at` set.
+    revoked: Uuid,
+    /// A group the viewer never joined.
+    stranger: Uuid,
+    /// A claim group-private to `own`, which the viewer is entitled to read.
+    claim: Uuid,
+}
+
+impl GateFixture {
+    /// `(group, admitted, label)` for every relationship above.
+    fn cases(&self) -> [(Uuid, bool, &'static str); 4] {
+        [
+            (self.own, true, "live admin"),
+            (self.reader, true, "live reader"),
+            (self.revoked, false, "revoked"),
+            (self.stranger, false, "never a member"),
+        ]
+    }
+}
+
+async fn add_membership(pool: &PgPool, group: Uuid, agent: Uuid, role: &str, revoked: bool) {
+    sqlx::query(
+        "INSERT INTO group_memberships \
+             (group_id, agent_id, wrapped_key_share, epoch, role, revoked_at) \
+         VALUES ($1, $2, ''::bytea, 0, $3, CASE WHEN $4 THEN now() END)",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .bind(revoked)
+    .execute(pool)
+    .await
+    .expect("seed membership");
+}
+
+async fn seed_gate_fixture(pool: &PgPool, label: &str) -> GateFixture {
+    let (viewer, own) = seed_agent_with_group(pool, &format!("{label}-viewer")).await;
+    let (_, reader) = seed_agent_with_group(pool, &format!("{label}-reader-host")).await;
+    let (_, revoked) = seed_agent_with_group(pool, &format!("{label}-revoked-host")).await;
+    let (_, stranger) = seed_agent_with_group(pool, &format!("{label}-stranger")).await;
+    add_membership(pool, reader, viewer, "reader", false).await;
+    add_membership(pool, revoked, viewer, "reader", true).await;
+    let claim = seed_group_claim(pool, viewer, own, &format!("{label} own claim")).await;
+    GateFixture {
+        viewer,
+        own,
+        reader,
+        revoked,
+        stranger,
+        claim,
+    }
+}
+
+/// CALIBRATION, on the pool the handler will be handed: the superuser sees
+/// every live membership the fixture seeded, and the RLS-subject raw pool sees
+/// NONE of them — so a gate that still read `group_memberships` through
+/// `state.db_pool` would refuse even the viewer's own personal group, and an
+/// arm below that is admitted cannot be passing through that read.
+async fn calibrate_raw_pool_hides_memberships(pool: &PgPool, state: &AppState, fx: &GateFixture) {
+    for (group, admitted, label) in fx.cases() {
+        let superuser = GroupMembershipRepository::is_member(pool, group, fx.viewer)
+            .await
+            .expect("is_member on the superuser pool");
+        assert_eq!(
+            superuser, admitted,
+            "CALIBRATION: the fixture's {label} membership is not what it claims to be"
+        );
+        let raw = GroupMembershipRepository::is_member(&state.db_pool, group, fx.viewer)
+            .await
+            .expect("is_member on the raw pool");
+        assert!(
+            !raw,
+            "CALIBRATION: the RLS-subject raw pool must NOT see the viewer's {label} \
+             membership. If it can, the raw pool is not filtering, and these arms cannot \
+             tell the viewer-answered gate from the raw-pool read it replaced"
+        );
+    }
+}
+
+/// `GET /claims/:id?group_id=G`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_claim_group_gate_admits_live_members_on_an_rls_subject_raw_pool(pool: PgPool) {
+    let fx = seed_gate_fixture(&pool, "shard7-gate-get").await;
+    let state = split_state(&pool).await;
+    calibrate_raw_pool_hides_memberships(&pool, &state, &fx).await;
+
+    for (group, admitted, label) in fx.cases() {
+        let result = get_claim(
+            ViewerExtractor(viewer_for(&pool, fx.viewer).await),
+            State(state.clone()),
+            Path(fx.claim),
+            Query(GetClaimQuery {
+                agent_id: None,
+                group_id: Some(group),
+            }),
+        )
+        .await;
+        if admitted {
+            let body = result
+                .unwrap_or_else(|e| panic!("a {label} member must pass the gate; got {e:?}"))
+                .0;
+            assert_eq!(body.id, fx.claim, "the {label} arm served the wrong claim");
+        } else {
+            assert!(
+                matches!(result, Err(ApiError::Forbidden { .. })),
+                "a {label} principal must be refused with 403; got {:?}",
+                result.map(|j| j.0.id)
+            );
+        }
+    }
+}
+
+/// `GET /claims?group_id=G`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_claims_group_gate_admits_live_members_on_an_rls_subject_raw_pool(pool: PgPool) {
+    let fx = seed_gate_fixture(&pool, "shard7-gate-list").await;
+    let state = split_state(&pool).await;
+    calibrate_raw_pool_hides_memberships(&pool, &state, &fx).await;
+
+    for (group, admitted, label) in fx.cases() {
+        let result = list_claims(
+            ViewerExtractor(viewer_for(&pool, fx.viewer).await),
+            State(state.clone()),
+            Query(PaginationParams {
+                limit: 100,
+                offset: 0,
+                search: None,
+                agent_id: None,
+                group_id: Some(group),
+            }),
+        )
+        .await;
+        if admitted {
+            let page = result
+                .unwrap_or_else(|e| panic!("a {label} member must pass the gate; got {e:?}"))
+                .0;
+            let ids: Vec<Uuid> = page.items.iter().map(|c| c.id).collect();
+            assert!(
+                ids.contains(&fx.claim),
+                "the {label} arm must serve the viewer's own claim. Got {ids:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ApiError::Forbidden { .. })),
+                "a {label} principal must be refused with 403; got {:?}",
+                result.map(|j| j.0.total)
+            );
+        }
+    }
+}
+
+/// `POST /api/v1/claims` with `privacy_tier = fully_private` — the write-side
+/// twin of the same gate.
+///
+/// The rest of the encrypted-create path is an UNCONVERTED write handler (its
+/// epoch read and inserts still run on `state.db_pool`, owned by
+/// `ScopedPool::begin_as`), so an admitted request cannot succeed here and is
+/// not asked to. It is asserted to fail at the NEXT step — the epoch check,
+/// `ValidationError { field: "encryption_epoch" }` — which is only reachable once
+/// the membership gate has passed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_claim_group_gate_admits_live_members_on_an_rls_subject_raw_pool(pool: PgPool) {
+    let fx = seed_gate_fixture(&pool, "shard7-gate-create").await;
+    let state = split_state(&pool).await;
+    calibrate_raw_pool_hides_memberships(&pool, &state, &fx).await;
+
+    for (group, admitted, label) in fx.cases() {
+        let auth = AuthContext {
+            client_id: fx.viewer,
+            agent_id: Some(fx.viewer),
+            owner_id: Some(fx.viewer),
+            client_type: ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: Uuid::new_v4(),
+        };
+        let request: CreateClaimRequest = serde_json::from_value(serde_json::json!({
+            "content": "",
+            "agent_id": fx.viewer,
+            "privacy_tier": "fully_private",
+            "group_id": group,
+            "encrypted_content": "AAAA",
+            "encryption_epoch": 0,
+        }))
+        .expect("request body");
+        let result = create_claim(
+            ViewerExtractor(viewer_for(&pool, fx.viewer).await),
+            State(state.clone()),
+            Some(Extension(auth)),
+            Json(request),
+        )
+        .await;
+        if admitted {
+            assert!(
+                matches!(
+                    &result,
+                    Err(ApiError::ValidationError { field, .. }) if field == "encryption_epoch"
+                ),
+                "a {label} member must pass the gate and reach the epoch check; got {:?}",
+                result.map(|j| j.0.id)
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ApiError::Forbidden { .. })),
+                "a {label} principal must be refused with 403; got {:?}",
+                result.map(|j| j.0.id)
+            );
+        }
+    }
 }
 
 // ── routes/versioning.rs ──
