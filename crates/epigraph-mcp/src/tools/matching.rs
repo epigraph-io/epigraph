@@ -5,7 +5,9 @@
 //! review surface:
 //!
 //! - `find_cross_source_matches`: return existing match_candidates + CORROBORATES
-//!   edges for a claim. Read-only.
+//!   edges for a claim, plus the claim's sweep coverage
+//!   (`last_swept_at` / `never_swept`) so an empty result is interpretable.
+//!   Read-only.
 //! - `list_match_candidates`: list the queue, sorted by score desc, optionally
 //!   filtered by status.
 //! - `decide_match_candidate`: promote or reject a `pending` row. Promotion
@@ -100,11 +102,39 @@ pub async fn find_cross_source_matches(
         })
         .collect();
 
-    success_json(&serde_json::json!({
+    // Sweep coverage (backlog 4194b4a7 ask 3 / 9a513d47). Without it, an empty
+    // `candidates` array is ambiguous between "the matcher scanned this claim
+    // and found nothing" and "the matcher has never looked at this claim" —
+    // and only the second is actionable (run the sweep). The per-claim marker
+    // already existed (`claims.last_match_scan_at`, migration 037, stamped by
+    // the `cross_source_sweep` CLI); nothing read it back out.
+    //
+    // The three-state return of `last_match_scan_at` is load-bearing: for a
+    // claim this viewer cannot read we emit NEITHER field, keeping the
+    // existing non-leaking shape (unreadable claim -> empty arrays, no 404).
+    // Emitting `never_swept: true` there would answer a question about a row
+    // the caller has no right to, and would answer it wrongly.
+    let mut out = serde_json::json!({
         "claim_id":     claim_id.to_string(),
         "candidates":   candidates_out,
         "corroborates": corroborates,
-    }))
+    });
+    match repo
+        .last_match_scan_at(viewer, claim_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(Some(ts)) => {
+            out["last_swept_at"] = serde_json::json!(ts.to_rfc3339());
+            out["never_swept"] = serde_json::json!(false);
+        }
+        Some(None) => {
+            out["last_swept_at"] = serde_json::Value::Null;
+            out["never_swept"] = serde_json::json!(true);
+        }
+        None => {}
+    }
+    success_json(&out)
 }
 
 pub async fn list_match_candidates(

@@ -1724,7 +1724,7 @@ impl EpiGraphMcpFull {
     // ── Cross-source matching (3 tools) ──
 
     #[tool(
-        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status) plus any CORROBORATES edges already written. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
+        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status), any CORROBORATES edges already written, and sweep coverage for the claim: `never_swept: true` means the matcher has not scanned it yet (an empty candidate list says nothing), `last_swept_at` is when it last did. Both coverage fields are omitted entirely for a claim you cannot read. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
     )]
     async fn find_cross_source_matches(
         &self,
