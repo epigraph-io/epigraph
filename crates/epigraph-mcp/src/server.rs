@@ -723,7 +723,14 @@ impl EpiGraphMcpFull {
         // Needed only for the `resolved`-label gate (issue #374); every other
         // label mutation ignores it. Same propagation as `resolve_backlog_item`.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::claims::update_labels(self, params, auth).await
+        // Viewer acquired HERE, not inside the tool module. `tool_viewer_coverage`'s
+        // `viewer_acquisition_lives_in_server_rs_not_in_the_tool_modules` asserts
+        // `request_viewer(` appears under src/tools/ only in viewer.rs, and the
+        // sibling partition test reads THIS file to decide which tools derive a
+        // viewer — so acquiring it in the tool body would make that register
+        // silently wrong about this tool rather than merely unscoped.
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::claims::update_labels(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -754,9 +761,11 @@ impl EpiGraphMcpFull {
         extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        // See `update_labels` — `add_labels`/`remove_labels` reach the same gate.
+        // See `update_labels` — `add_labels`/`remove_labels` reach the same gate,
+        // and the viewer is acquired here for the same register reason.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::claims::patch_claim(self, params, auth).await
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::claims::patch_claim(self, viewer, params, auth).await
     }
 
     // ── Provenance (1 tool) ──

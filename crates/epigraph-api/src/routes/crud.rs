@@ -143,9 +143,27 @@ pub async fn list_evidence(
     Query(params): Query<ListEvidenceQuery>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<ListEvidenceResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    // `else return Unauthorized` rather than `if let Some(..)`, deliberately.
+    // The conditional form is a FAIL-OPEN scope site: absent an `AuthContext`
+    // the check silently no-ops. `viewer_route_table_lint`'s
+    // `fail_open_scope_check_sites_do_not_increase` ratchets the count of those
+    // per file precisely so a new one cannot appear unnoticed, and crud.rs is
+    // registered at 6.
+    //
+    // It is true that the conditional form would be unreachable here —
+    // `ViewerExtractor` is this handler's FIRST extractor and
+    // `ViewerExtractor::from_request_parts` returns `ApiError::Unauthorized`
+    // when no `AuthContext` is present, so the body cannot run with
+    // `auth_ctx == None`. Registering a 7th fail-open site on that reasoning
+    // would make the guard's safety depend on extractor ORDERING, which is
+    // invisible at the check itself and one reorder away from being false.
+    // This form is safe on its own terms and keeps the register at 6.
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::{EvidenceListFilter, EvidenceRepository};
 

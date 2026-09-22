@@ -1142,6 +1142,7 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 /// reachable for the fleet; issue #374 stays open for that half.
 async fn gate_retirement_label(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     claim_id: Uuid,
     add: &[String],
@@ -1168,8 +1169,10 @@ async fn gate_retirement_label(
     // an ownership gate, and a principal who cannot see the row cannot own it.
     // A viewer-invisible claim therefore takes the same "not found" branch as a
     // nonexistent one, which is the behaviour the paragraph above describes.
-    let viewer = crate::tools::viewer::request_viewer(server, Some(auth)).await?;
-    let claim = ClaimRepository::get_by_id(&server.pool, &viewer, ClaimId::from_uuid(claim_id))
+    // Viewer is supplied by the caller (acquired in server.rs). Acquiring it
+    // here instead would break `tool_viewer_coverage`'s location ratchet, which
+    // asserts `request_viewer(` appears under src/tools/ only in viewer.rs.
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
@@ -1179,6 +1182,7 @@ async fn gate_retirement_label(
 
 pub async fn update_labels(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::UpdateLabelsParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -1186,7 +1190,7 @@ pub async fn update_labels(
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
-    gate_retirement_label(server, auth, id, &params.add, &params.remove).await?;
+    gate_retirement_label(server, viewer, auth, id, &params.add, &params.remove).await?;
     // `db_caller_error`, not `internal_error`: a label refused by
     // `reject_unexpanded_labels` is the caller's input, not a server fault. The
     // repo layer refuses it inside the same statement that would have written
@@ -1199,6 +1203,7 @@ pub async fn update_labels(
 
 pub async fn patch_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::PatchClaimParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
@@ -1219,7 +1224,15 @@ pub async fn patch_claim(
     // Same gate as `update_labels`: `patch_claim` also accepts
     // `add_labels`/`remove_labels`, so leaving it ungated would just move the
     // bypass one tool over (issue #374).
-    gate_retirement_label(server, auth, id, &params.add_labels, &params.remove_labels).await?;
+    gate_retirement_label(
+        server,
+        viewer,
+        auth,
+        id,
+        &params.add_labels,
+        &params.remove_labels,
+    )
+    .await?;
     let mut tx = server.pool.begin().await.map_err(internal_error)?;
     let diff = ClaimRepository::patch_claim_atomic_conn(
         &mut tx,

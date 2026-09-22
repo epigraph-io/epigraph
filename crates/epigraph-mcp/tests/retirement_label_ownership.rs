@@ -24,6 +24,9 @@
 //!   `resolve_backlog_item` for a cross-agent claim; gating stdio would leave
 //!   those agents no way to retire a backlog item at all.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_mcp::types::{PatchClaimParams, UpdateLabelsParams};
 use sqlx::PgPool;
@@ -69,10 +72,12 @@ async fn labels_of(pool: &PgPool, claim_id: Uuid) -> Vec<String> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_labels_adding_resolved_to_a_foreign_claim_is_refused(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "someone else's backlog item", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let err = epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
             add: vec!["resolved".into()],
@@ -106,10 +111,12 @@ async fn update_labels_removing_resolved_from_a_foreign_claim_is_refused(pool: P
         &["backlog", "resolved"],
     )
     .await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
             add: vec![],
@@ -133,10 +140,12 @@ async fn update_labels_removing_resolved_from_a_foreign_claim_is_refused(pool: P
 #[sqlx::test(migrations = "../../migrations")]
 async fn patch_claim_adding_resolved_to_a_foreign_claim_is_refused(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "patch_claim bypass subject", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::claims::patch_claim(
         &server,
+        &viewer,
         PatchClaimParams {
             claim_id: claim.to_string(),
             trace_id: None,
@@ -171,10 +180,12 @@ async fn patch_claim_adding_resolved_to_a_foreign_claim_is_refused(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_labels_admin_scope_may_retire_a_foreign_claim(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "admin-retired item", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
             add: vec!["resolved".into()],
@@ -196,10 +207,12 @@ async fn update_labels_admin_scope_may_retire_a_foreign_claim(pool: PgPool) {
 async fn update_labels_leaves_non_retirement_labels_ungated_for_a_foreign_principal(pool: PgPool) {
     let claim =
         seed_claim_with_labels(&pool, "cross-agent taxonomy maintenance", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
             add: vec!["telemetry".into()],
@@ -223,10 +236,12 @@ async fn update_labels_leaves_non_retirement_labels_ungated_for_a_foreign_princi
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_labels_still_permits_resolved_on_the_unauthenticated_stdio_path(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "epiclaw-retired item", &["backlog"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         UpdateLabelsParams {
             claim_id: claim.to_string(),
             add: vec!["resolved".into()],

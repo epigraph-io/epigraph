@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
@@ -5,10 +8,12 @@ use common::*;
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_labels_adds_and_removes(pool: PgPool) {
     let id = seed_claim_with_labels(&pool, "x", &["existing"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         epigraph_mcp::types::UpdateLabelsParams {
             claim_id: id.to_string(),
             add: vec!["new1".into(), "new2".into()],
