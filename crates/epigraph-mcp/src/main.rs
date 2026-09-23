@@ -34,7 +34,6 @@ use clap::Parser;
 use rmcp::ServiceExt;
 
 use epigraph_crypto::AgentSigner;
-use epigraph_db::create_pool;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::EpiGraphMcpFull;
 
@@ -289,6 +288,22 @@ fn check_listen_auth_mode(
     }
 }
 
+/// Attach the vetted maintenance `ScopedPool` to one server, when boot built one.
+///
+/// Every server this process serves from — the stdio one and each per-session
+/// HTTP one — goes through here, so the three maintenance tools behave the same
+/// on both transports. `None` leaves the server unscoped, and its maintenance
+/// tools fail closed.
+fn with_maintenance(
+    server: EpiGraphMcpFull,
+    scoped: Option<&epigraph_db::ScopedPool>,
+) -> EpiGraphMcpFull {
+    match scoped {
+        Some(s) => server.with_scoped_pool(s.clone()),
+        None => server,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode)
@@ -327,24 +342,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Connect to database.
+    // Connect to database: TWO pools, on two DSNs, and the difference is the
+    // point.
     //
-    // MAINTENANCE-DSN-EXEMPT: this process serves callers, so its pool is
-    // deliberately the application pool. Its three genuine maintenance tools
-    // (dedup sweep, embedding backfill, belief recompute) reach a bypass
-    // through `crate::maintenance::maintenance_viewer`, which today fails
-    // CLOSED because `EpiGraphMcpFull::with_scoped_pool` has no caller.
+    // The APPLICATION pool is what every caller-serving tool queries
+    // (`server.pool`). It is built through `ScopedPool` rather than
+    // `create_pool` so it has an `inner` to be the application side of the
+    // `ScopedPool` the maintenance tools need — sized exactly as `create_pool`
+    // sized it (10 connections, 5 s acquire timeout), so request-path capacity
+    // does not move. It also gains the `after_release` GUC scrub, one statement
+    // per release, which is the same cost the api pays and a no-op until
+    // something on this pool stamps session GUCs.
     //
-    // PR-15 left that closed rather than half-opening it: those three tools run
-    // their queries on `self.pool`, so attaching a `ScopedPool` here would let
-    // them mint a privileged viewer and spend it on an unprivileged connection
-    // — the privileged-viewer/ordinary-pool hybrid PR-15 deleted from eleven
-    // CLI binaries — trading a hard error for a silent no-op under FORCE.
-    // Closing it properly is a change to the three tools' query plumbing and
-    // belongs with PR-17. See `crates/epigraph-mcp/src/maintenance.rs`.
+    // The MAINTENANCE pool is built by `maintenance::attach_maintenance_pool` on
+    // `MAINTENANCE_DATABASE_URL` (falling back to `DATABASE_URL` with a WARN),
+    // probed with `assert_maintenance_privilege`, and only then attached. The
+    // three maintenance tools run every statement on a session drawn from it,
+    // never on `server.pool` — which is what made attaching it safe; before
+    // that change it would have been the privileged-viewer/ordinary-pool hybrid.
+    //
+    // A REFUSAL DOES NOT STOP THE PROCESS, and that is the deliberate opposite
+    // of the api's choice. There a bad maintenance DSN blocks boot, because a
+    // healthy-looking api whose background writes land nowhere is the worse
+    // outage. Here the only consumers are three operator-invoked tools out of
+    // eighty-three, and each one already FAILS CLOSED, with an error naming the
+    // boot log, when nothing is attached — so taking the other eighty down with
+    // them would trade a loud, narrow failure for a broad one. The refusal is
+    // logged at ERROR with its reason.
     tracing::info!("Connecting to database...");
-    let pool = create_pool(&cli.database_url).await?;
+    let guc_mode = epigraph_db::SessionGucMode::from_env(
+        std::env::var("EPIGRAPH_SESSION_GUC_MODE")
+            .unwrap_or_default()
+            .as_str(),
+    );
+    let app_scoped = epigraph_db::ScopedPool::connect_with_options(
+        &cli.database_url,
+        guc_mode,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 10,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            statement_timeout: None,
+        },
+    )
+    .await?;
+    let pool = app_scoped.inner().clone();
     tracing::info!("Database connected");
+
+    let maintenance_scoped = match epigraph_mcp::maintenance::attach_maintenance_pool(
+        &app_scoped,
+        &cli.database_url,
+        std::env::var(epigraph_db::MAINTENANCE_DATABASE_URL)
+            .ok()
+            .as_deref(),
+        guc_mode,
+    )
+    .await
+    {
+        Ok(scoped) => Some(scoped),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "no maintenance pool attached: sweep_semantic_duplicates, recompute_beliefs \
+                 and backfill_embeddings will refuse every call until MAINTENANCE_DATABASE_URL \
+                 names a role that is a member of epigraph_maintenance (docs/deploy.md \
+                 §1c-bis). Every other tool is unaffected."
+            );
+            None
+        }
+    };
 
     // Create or restore agent signer. Precedence lives in `select_signer`
     // (unit-tested); here we only handle the side effects (secret-key print for
@@ -540,13 +605,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let service = StreamableHttpService::new(
             move || {
-                let srv = EpiGraphMcpFull::new_shared_with_federation(
-                    pool.clone(),
-                    signer.clone(),
-                    embedder.clone(),
-                    read_only,
-                    federation.clone(),
-                    llm_identity.clone(),
+                let srv = with_maintenance(
+                    EpiGraphMcpFull::new_shared_with_federation(
+                        pool.clone(),
+                        signer.clone(),
+                        embedder.clone(),
+                        read_only,
+                        federation.clone(),
+                        llm_identity.clone(),
+                    ),
+                    maintenance_scoped.as_ref(),
                 );
                 Ok(if identity_declared {
                     srv
@@ -630,13 +698,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bearer, so a federated `tools/call` will fail closed in
         // `enforce_federated_scope` (no AuthContext) — listing works, invoking
         // does not, which is the intended v1 behavior.
-        let server = EpiGraphMcpFull::new_with_federation(
-            pool,
-            signer,
-            embedder,
-            cli.read_only,
-            federation,
-            llm_identity,
+        let server = with_maintenance(
+            EpiGraphMcpFull::new_with_federation(
+                pool,
+                signer,
+                embedder,
+                cli.read_only,
+                federation,
+                llm_identity,
+            ),
+            maintenance_scoped.as_ref(),
         );
         // Rung-4 signer: the owner-equality fallback in
         // `require_owner_or_admin` has no stable identity to compare against.

@@ -47,7 +47,7 @@
 use std::ops::{Deref, DerefMut};
 
 use epigraph_db::visibility::SystemReason;
-use epigraph_db::MaintenanceSession;
+use epigraph_db::{DbError, MaintenanceSession, ScopedPool, ScopedPoolOptions, SessionGucMode};
 use rmcp::model::ErrorData as McpError;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -87,6 +87,67 @@ pub const MAINTENANCE_POOL_CONNECTIONS: u32 = MAINTENANCE_TOOL_CONCURRENCY as u3
 /// per-server gate would bound nothing.
 static MAINTENANCE_GATE: Semaphore = Semaphore::const_new(MAINTENANCE_TOOL_CONCURRENCY);
 
+/// Build `epigraph-mcp-full`'s maintenance pool and attach it to `app`.
+///
+/// The only production caller of `EpiGraphMcpFull::with_scoped_pool` receives
+/// what this returns, so this is where "a maintenance session is privileged" is
+/// decided for the MCP process. The order is the one that cannot produce the
+/// silent no-op:
+///
+/// 1. resolve the DSN with [`epigraph_db::resolve_maintenance_url`] —
+///    `configured` (the caller's read of `MAINTENANCE_DATABASE_URL`) if set,
+///    otherwise `app_url` with a WARN, and a hard error if the two name
+///    different databases;
+/// 2. build a SEPARATE pool on it, sized [`MAINTENANCE_POOL_CONNECTIONS`];
+/// 3. probe it with [`epigraph_db::assert_maintenance_privilege`], which
+///    refuses when row security is on a protected table and this connection
+///    cannot bypass;
+/// 4. only then attach it, to a clone of `app`.
+///
+/// Never attaches a `ScopedPool` whose maintenance side is the application
+/// pool: `ScopedPool::maintenance_inner` falls back to `inner` when nothing is
+/// attached, and on an unprivileged `inner` that fallback is exactly the hybrid
+/// this module exists to prevent. On any `Err` the caller must leave the server
+/// unscoped, which keeps the three tools fail-CLOSED.
+///
+/// `configured` is a parameter rather than an environment read so the rule is
+/// testable without mutating a process-global, the same reason
+/// `resolve_maintenance_url` is split from `maintenance_database_url`.
+///
+/// # Errors
+/// `DbError::InvalidData` if the DSN is unparseable, names another database, or
+/// is unprivileged under active row security; `DbError::ConnectionFailed` /
+/// `DbError::QueryFailed` if the pool cannot be built or probed.
+pub async fn attach_maintenance_pool(
+    app: &ScopedPool,
+    app_url: &str,
+    configured: Option<&str>,
+    guc_mode: SessionGucMode,
+) -> Result<ScopedPool, DbError> {
+    let (url, source) = epigraph_db::resolve_maintenance_url(app_url, configured)?;
+    let maintenance = ScopedPool::connect_with_options(
+        &url,
+        guc_mode,
+        ScopedPoolOptions {
+            max_connections: MAINTENANCE_POOL_CONNECTIONS,
+            ..Default::default()
+        },
+    )
+    .await?;
+    epigraph_db::assert_maintenance_privilege(maintenance.inner(), source, "epigraph-mcp").await?;
+    tracing::info!(
+        dsn_source = source.as_str(),
+        max_connections = MAINTENANCE_POOL_CONNECTIONS,
+        "maintenance pool attached; sweep_semantic_duplicates, recompute_beliefs and \
+         backfill_embeddings will run on it"
+    );
+    // A clone of a `ScopedPool`-built pool keeps its `after_release` scrub: the
+    // `PgPool` handle shares one pool whose options were fixed at build time.
+    Ok(app
+        .clone()
+        .with_maintenance_pool(maintenance.inner().clone()))
+}
+
 /// A [`MaintenanceSession`] plus the gate permit that admitted it.
 ///
 /// Derefs to the session, so a dispatch body passes `&mut session` straight to
@@ -123,7 +184,8 @@ impl DerefMut for GatedMaintenanceSession<'_> {
 /// `&PgPool` on [`MaintenanceSession::pool`] — the pool that connection came
 /// from. None of them names `server.pool`.
 ///
-/// That is what makes attaching a `ScopedPool` safe. Before it, the tools took
+/// That is what makes attaching a `ScopedPool` safe, and `epigraph-mcp-full`
+/// now does, through [`attach_maintenance_pool`]. Before it, the tools took
 /// `&self` and a `&Viewer` and queried `self.pool`, the ordinary application
 /// pool, so attaching one would have let them mint a privileged viewer and
 /// spend it on an unprivileged connection — the privileged-viewer/ordinary-pool
@@ -158,8 +220,11 @@ pub(crate) async fn maintenance_viewer(
 ) -> Result<GatedMaintenanceSession<'_>, McpError> {
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         McpError::internal_error(
-            "this MCP server was not built from a ScopedPool, so no maintenance \
-             lease can be minted; construct it with EpiGraphMcpFull::with_scoped_pool",
+            "this MCP server holds no ScopedPool with a vetted maintenance pool, so no \
+             maintenance lease can be minted. epigraph-mcp-full attaches one at boot only \
+             when MAINTENANCE_DATABASE_URL (or DATABASE_URL, its fallback) passes the \
+             maintenance-privilege check -- the boot log says why it did not; an embedding \
+             caller must construct the server with EpiGraphMcpFull::with_scoped_pool",
             None,
         )
     })?;

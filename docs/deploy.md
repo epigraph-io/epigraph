@@ -673,6 +673,41 @@ read the job pool's 45-minute `statement_timeout`. Every consumer runs its
 statement *on the connection it leases from the pool*, which is what makes the
 pool load-bearing rather than decorative.
 
+**`epigraph-mcp-full` reads it too, and refuses DIFFERENTLY.** Its three
+maintenance tools — `sweep_semantic_duplicates`, `recompute_beliefs` and
+`backfill_embeddings` — run every statement on a maintenance pool built on this
+DSN, with the same fallback, the same database-name guard and the same
+`assert_maintenance_privilege` probe
+(`epigraph_mcp::maintenance::attach_maintenance_pool`). Unlike the api, **a
+refusal does not stop the process**: the MCP server boots, logs an ERROR naming
+the reason, and those three tools refuse every call with an error pointing at
+that log line. The other tools are unaffected — taking eighty caller-facing
+tools down because three operator-invoked ones cannot run would widen a loud,
+narrow failure into a broad one. So after deploying, **check the boot log for
+`maintenance pool attached`** rather than inferring it from the process being
+up, and run `recompute_beliefs(limit=5)` once to confirm.
+
+* **Budget:** app(10) + maintenance(4) = **14** connections per MCP process.
+  At most three maintenance calls run at once; each pins one connection for its
+  run, and the fourth is the slot the dedup cascade and the belief recompute
+  borrow one statement at a time. A fourth concurrent call waits its turn
+  rather than starving the pool (`MAINTENANCE_TOOL_CONCURRENCY` /
+  `MAINTENANCE_POOL_CONNECTIONS`).
+* **Grants — measured, and a gap in the schema's own grants:**
+  `epigraph_maintenance` holds SELECT/INSERT/UPDATE and no DELETE (migration
+  070). `sweep_semantic_duplicates` with `dry_run=false` needs DELETE on
+  **`factors`** — every collapse flips `is_current`, which fires
+  `claims_deactivate_factors` (migration 001), whose trigger function deletes
+  from `factors` as the invoking role — and on **`mass_functions`**, for the
+  edge-factor BBAs the dedup cascade drops or re-wires. With stock grants EVERY
+  collapse fails `permission denied for table factors`; the sweep reports each
+  pair in `failures` and changes nothing, so it is loud, not silent. Until a
+  migration grants those two (or makes the trigger function `SECURITY
+  DEFINER`), the role this DSN names must hold them directly.
+  `recompute_beliefs` and `backfill_embeddings` need no DELETE.
+  (`crates/epigraph-mcp/tests/maintenance_tools_under_force.rs::stock_epigraph_maintenance_cannot_yet_retire_a_claim`
+  pins the gap; it fails the day it closes.)
+
 **Why the maintenance pool went from 2 to 4, in PR-18's apply slice.** It was
 sized at 2 when it had one consumer — `GET /api/v1/claims/needing-embeddings`,
 an occasional operator-triggered read. It now also serves the whole D4 admin

@@ -142,15 +142,6 @@ const EXEMPT: &[(&str, &str)] = &[
          deliberate.",
     ),
     (
-        "crates/epigraph-mcp/src/main.rs",
-        "Serves callers, and its three maintenance tools are DEFERRED to PR-17 rather than \
-         half-wired here. EpiGraphMcpFull::with_scoped_pool has no callers, so those tools \
-         currently fail CLOSED with a clear error. Attaching a ScopedPool without also moving \
-         the three tools' queries onto the maintenance connection would trade that hard error \
-         for a silent no-op under FORCE — the exact hybrid this lint exists to catch. See \
-         crates/epigraph-mcp/src/maintenance.rs.",
-    ),
-    (
         "scripts/subcluster_outliers.py",
         "Read-only by design on the epigraph_ro role; its docstring states 'script never \
          writes' as a property callers rely on. Threading MAINTENANCE_DATABASE_URL in would \
