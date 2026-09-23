@@ -264,7 +264,8 @@ RETURNS TABLE (operator_group_id uuid,
                group_created boolean,
                membership_created boolean,
                membership_live boolean,
-               edge_created boolean)
+               edge_created boolean,
+               link_live boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
@@ -381,6 +382,12 @@ BEGIN
                           AND e.relationship = 'OPERATED_BY');
     GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
 
+    -- `link_live` is computed by the SAME read the authoring and ownership
+    -- paths use, not re-derived here. `membership_live` alone over-reports: a
+    -- live membership whose role is no longer writer/admin (review probe: role
+    -- set to 'reader', then re-link) returned membership_live=t while
+    -- `epigraph_operator_of` returned nothing, and the startup log said the
+    -- agent authored into the operator's group when it did not.
     RETURN QUERY
     SELECT v_group,
            v_new_group IS NOT NULL,
@@ -388,7 +395,9 @@ BEGIN
            EXISTS (SELECT 1 FROM public.group_memberships m
                     WHERE m.group_id = v_group AND m.agent_id = p_agent
                       AND m.revoked_at IS NULL),
-           v_edge_rows > 0;
+           v_edge_rows > 0,
+           EXISTS (SELECT 1 FROM public.epigraph_operator_of(p_agent) o
+                    WHERE o.operator_id = p_operator);
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_link_operator(uuid, uuid) FROM PUBLIC;
 

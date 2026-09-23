@@ -58,7 +58,7 @@ async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
     let out = AgentRepository::link_operator(&mut conn, agent, operator)
         .await
         .expect("link on the privileged harness connection");
-    assert!(out.membership_live);
+    assert!(out.membership_live && out.link_live);
 }
 
 async fn personal_group(pool: &PgPool, agent: Uuid) -> Uuid {

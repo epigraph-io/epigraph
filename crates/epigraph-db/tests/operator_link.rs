@@ -155,7 +155,7 @@ async fn epigraph_app_cannot_execute_link_operator(pool: PgPool) {
     })
     .await
     .expect("epigraph_maintenance must be able to link — else the refusal above proves nothing");
-    assert!(ok.membership_created && ok.membership_live && ok.edge_created);
+    assert!(ok.membership_created && ok.membership_live && ok.edge_created && ok.link_live);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,7 +197,7 @@ async fn link_creates_a_writer_membership_in_a_group_the_operator_created(pool: 
 
     let again = link(&pool, agent, operator).await;
     assert!(!again.group_created && !again.membership_created && !again.edge_created);
-    assert!(again.membership_live);
+    assert!(again.membership_live && again.link_live);
     let edges: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
             AND relationship = 'OPERATED_BY'",
@@ -277,6 +277,49 @@ async fn link_revoke_relink_stays_revoked(pool: PgPool) {
         vec![("writer".to_string(), true, 3)],
         "ARM B: a re-link inserted a FRESH live row beside the revoked history. ON CONFLICT alone \
          cannot stop this (no constraint fires across epochs); the no-history check must"
+    );
+}
+
+/// `link_live` reports what the authoring and ownership paths will actually
+/// read, not merely that a membership row is live.
+///
+/// The review's probe: link `Y`, change its membership role to `reader`,
+/// re-link. The membership is still live, so the old `membership_live` said
+/// "linked" and the startup log said the agent authored into the operator's
+/// group — while `epigraph_operator_of` returned nothing and it did not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_live_reports_the_link_the_authoring_path_reads(pool: PgPool) {
+    let operator = seed_bare_agent(&pool).await;
+    let y = seed_bare_agent(&pool).await;
+    let first = link(&pool, y, operator).await;
+    assert!(first.link_live, "a fresh link is live: {first:?}");
+
+    let group = operator_group(&pool, operator).await;
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(y)
+    .execute(&pool)
+    .await
+    .expect("demote the membership to reader");
+
+    let relinked = link(&pool, y, operator).await;
+    assert!(
+        relinked.membership_live,
+        "PREMISE: the membership row is still live: {relinked:?}"
+    );
+    assert!(
+        !relinked.link_live,
+        "a reader membership is not a link; link_live must say so: {relinked:?}"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    assert_eq!(
+        AgentRepository::operator_of(&mut conn, y)
+            .await
+            .expect("operator_of"),
+        None,
+        "and the authoring path agrees"
     );
 }
 

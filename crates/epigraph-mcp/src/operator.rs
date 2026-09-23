@@ -162,8 +162,8 @@ pub async fn self_link(
                  instead): {e}"
             )
         })?;
-    if outcome.membership_live {
-        tracing::info!(
+    match LinkStatus::of(&outcome) {
+        LinkStatus::Live => tracing::info!(
             agent = %agent,
             operator = %operator,
             operator_group = %outcome.operator_group_id,
@@ -171,23 +171,84 @@ pub async fn self_link(
             membership_created = outcome.membership_created,
             edge_created = outcome.edge_created,
             "operator link recorded: this agent authors into the operator's personal group"
-        );
-    } else {
-        tracing::warn!(
+        ),
+        LinkStatus::Revoked => tracing::warn!(
             agent = %agent,
             operator = %operator,
             operator_group = %outcome.operator_group_id,
             "operator link is REVOKED for this agent and was deliberately NOT restored; this \
              process authors into its own personal group and holds no operator ownership"
-        );
+        ),
+        LinkStatus::NotLive => tracing::warn!(
+            agent = %agent,
+            operator = %operator,
+            operator_group = %outcome.operator_group_id,
+            "operator link is NOT LIVE for this agent although its membership in the operator's \
+             group is: the membership's role is no longer writer/admin. This process authors \
+             into its own personal group and holds no operator ownership"
+        ),
     }
     Ok(outcome)
 }
 
+/// What a [`self_link`] outcome means for this process, as the startup log
+/// states it.
+///
+/// Keyed on [`OperatorLinkOutcome::link_live`] — the answer of the same
+/// `epigraph_operator_of` read the authoring and ownership paths use — and NOT
+/// on `membership_live`. A live membership is necessary, not sufficient: with
+/// its role changed to `reader` the membership is live and the link is not,
+/// and logging "authors into the operator's group" then would be false.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStatus {
+    /// The link is live: this agent authors into the operator's group.
+    Live,
+    /// The agent's membership was revoked and deliberately not restored.
+    Revoked,
+    /// The membership is live but the link is not (its role is no longer
+    /// `writer`/`admin`).
+    NotLive,
+}
+
+impl LinkStatus {
+    /// Classify one outcome. Pure, so every arm is unit-testable.
+    #[must_use]
+    pub fn of(outcome: &OperatorLinkOutcome) -> Self {
+        if outcome.link_live {
+            Self::Live
+        } else if !outcome.membership_live {
+            Self::Revoked
+        } else {
+            Self::NotLive
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::check_operator_transport;
+    use super::{check_operator_transport, LinkStatus};
+    use epigraph_db::OperatorLinkOutcome;
     use uuid::Uuid;
+
+    fn outcome(membership_live: bool, link_live: bool) -> OperatorLinkOutcome {
+        OperatorLinkOutcome {
+            operator_group_id: Uuid::nil(),
+            group_created: false,
+            membership_created: false,
+            membership_live,
+            edge_created: false,
+            link_live,
+        }
+    }
+
+    #[test]
+    fn a_live_membership_that_is_not_a_live_link_is_not_reported_as_live() {
+        // The review's probe: role set to 'reader', then re-link. The
+        // membership is live, the link is not, and the log must say so.
+        assert_eq!(LinkStatus::of(&outcome(true, false)), LinkStatus::NotLive);
+        assert_eq!(LinkStatus::of(&outcome(true, true)), LinkStatus::Live);
+        assert_eq!(LinkStatus::of(&outcome(false, false)), LinkStatus::Revoked);
+    }
 
     #[test]
     fn no_operator_is_always_accepted() {

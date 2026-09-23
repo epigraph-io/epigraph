@@ -20,7 +20,7 @@ pub struct OperatorLink {
 }
 
 /// What one [`AgentRepository::link_operator`] call did, for the startup log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct OperatorLinkOutcome {
     /// The operator's personal group.
     pub operator_group_id: Uuid,
@@ -34,6 +34,12 @@ pub struct OperatorLinkOutcome {
     pub membership_live: bool,
     /// This call inserted the `OPERATED_BY` edge.
     pub edge_created: bool,
+    /// The link is LIVE after the call, as the authoring and ownership paths
+    /// read it (`epigraph_operator_of` names this operator). This, not
+    /// [`Self::membership_live`], is what decides whether the agent authors into
+    /// the operator's group: a live membership whose role is no longer
+    /// `writer`/`admin` is not a link.
+    pub link_live: bool,
 }
 
 /// A database row combining agent identity fields with capability flags.
@@ -1439,8 +1445,9 @@ impl AgentRepository {
     ///
     /// Recorded once: an existing membership row of any state for the pair is
     /// left untouched, so a link an operator revoked stays revoked
-    /// ([`OperatorLinkOutcome::membership_live`] reports `false`). See the
-    /// migration's section 3.
+    /// ([`OperatorLinkOutcome::membership_live`] and
+    /// [`OperatorLinkOutcome::link_live`] report `false`). See the migration's
+    /// section 3.
     ///
     /// # Errors
     /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
@@ -1451,28 +1458,15 @@ impl AgentRepository {
         agent_id: Uuid,
         operator_id: Uuid,
     ) -> Result<OperatorLinkOutcome, DbError> {
-        let (operator_group_id, group_created, membership_created, membership_live, edge_created): (
-            Uuid,
-            bool,
-            bool,
-            bool,
-            bool,
-        ) = sqlx::query_as(
+        Ok(sqlx::query_as::<_, OperatorLinkOutcome>(
             "SELECT operator_group_id, group_created, membership_created, membership_live, \
-                    edge_created \
+                    edge_created, link_live \
                FROM public.epigraph_link_operator($1, $2)",
         )
         .bind(agent_id)
         .bind(operator_id)
         .fetch_one(&mut *conn)
-        .await?;
-        Ok(OperatorLinkOutcome {
-            operator_group_id,
-            group_created,
-            membership_created,
-            membership_live,
-            edge_created,
-        })
+        .await?)
     }
 
     /// Tier-B projection of one agent, filtered by what `viewer` may see.
