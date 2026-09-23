@@ -846,3 +846,79 @@ async fn removing_the_last_member_does_not_reopen_bootstrap_to_a_stranger(pool: 
     assert_eq!(live_membership(&pool, row.id, stranger).await, 0);
     assert!(!in_community(&pool, row.id, strangers).await);
 }
+
+/// Two removals of one agent's two perspectives cannot BOTH skip the
+/// revocation.
+///
+/// The revoke `UPDATE` keeps the membership when a `NOT EXISTS` over
+/// `community_members` finds another perspective of the same agent. Without a
+/// shared lock, two removals running together each saw the other's
+/// perspective still present, neither revoked, and the agent kept a live
+/// membership with no perspective left in the community. The roster lock
+/// serialises them. Here a separate transaction does the first removal's work
+/// under that lock and holds it. The second removal must wait, and then see
+/// that the first perspective is gone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_removals_of_one_agents_perspectives_cannot_both_skip_the_revocation(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
+    let row = CommunityRepository::create(&pool, "paired", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let p1 = seed_perspective(&pool, Some(member), "p1").await;
+    let p2 = seed_perspective(&pool, Some(member), "p2").await;
+    for p in [p1, p2] {
+        CommunityRepository::add_member(&pool, Some(creator), row.id, p)
+            .await
+            .expect("add member");
+    }
+
+    let url = fixture::database_url_for(&pool).await;
+    let mut own = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("open a connection outside the test pool");
+    let mut first = sqlx::Connection::begin(&mut own)
+        .await
+        .expect("first removal tx");
+    sqlx::query(
+        "SELECT agent_id FROM group_memberships \
+          WHERE group_id = $1 AND revoked_at IS NULL ORDER BY agent_id FOR UPDATE",
+    )
+    .bind(row.id)
+    .fetch_all(&mut *first)
+    .await
+    .expect("take the roster lock");
+    sqlx::query("DELETE FROM community_members WHERE community_id = $1 AND perspective_id = $2")
+        .bind(row.id)
+        .bind(p1)
+        .execute(&mut *first)
+        .await
+        .expect("remove p1, uncommitted");
+
+    let second = tokio::spawn({
+        let pool = pool.clone();
+        async move { CommunityRepository::remove_member(&pool, Some(member), row.id, p2).await }
+    });
+
+    if !a_backend_is_blocked_on_a_lock(&pool, &second).await {
+        let early = second.await.expect("removal task panicked");
+        panic!(
+            "the second removal decided whether p1 still justifies the membership \
+             while p1's removal was in flight; it returned {early:?}"
+        );
+    }
+
+    first.commit().await.expect("commit the first removal");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+        .await
+        .expect("the second removal never unblocked")
+        .expect("removal task panicked")
+        .expect("remove p2");
+    assert_eq!(outcome, MembershipOutcome::Applied);
+    assert_eq!(
+        live_membership(&pool, row.id, member).await,
+        0,
+        "no perspective of the member is left, so the membership must be revoked"
+    );
+}
