@@ -204,10 +204,14 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     // still listed — converting it is conversion-tail work, not this register's
     // business — but the enclosing "unreachable from a request" sentence was
     // never true of this entry, and a register that overstates its own contents
-    // is the thing this file exists to prevent.
+    // is the thing this file exists to prevent. Deferred-commitment key
+    // embed-on-write-helper added the HTTP write-on-create callers
+    // (`create_claim`, `submit_packet`, workflow ingest) through
+    // `store_embedding_vec`, which only formats and delegates here. Each of
+    // them embeds a row its own request just inserted.
     (
         "claim.rs::store_embedding",
-        "embedding backfill corpus-wide AND PUT /claims/:id; statement refuses sealed rows",
+        "embedding backfill corpus-wide, PUT /claims/:id, HTTP write-on-create; statement refuses sealed rows",
     ),
     ("claim_theme.rs::assign_claim", "clustering, corpus-wide"),
     (

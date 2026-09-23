@@ -345,15 +345,23 @@ pub async fn store_workflow(
         for (claim_id, content) in &result.inserted {
             match embedder.generate(content).await {
                 Ok(embedding) => {
-                    let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(*claim_id)
-                            .execute(&state.db_pool)
-                            .await
+                    // Seal-guarded repo write (deferred-commitment key
+                    // embed-on-write-helper). Unviewered is correct: `inserted`
+                    // is exactly the rows the executor just created.
+                    match epigraph_db::ClaimRepository::store_embedding_vec(
+                        &state.db_pool,
+                        *claim_id,
+                        &embedding,
+                    )
+                    .await
                     {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(claim_id = %claim_id, "Embedding not stored for ingested workflow claim: row absent or sealed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                        }
                     }
                 }
                 Err(e) => {
@@ -1568,15 +1576,23 @@ pub async fn ingest_workflow(
         for (claim_id, content) in &result.inserted {
             match embedder.generate(content).await {
                 Ok(embedding) => {
-                    let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(*claim_id)
-                            .execute(&state.db_pool)
-                            .await
+                    // Seal-guarded repo write (deferred-commitment key
+                    // embed-on-write-helper). Unviewered is correct: `inserted`
+                    // is exactly the rows the executor just created.
+                    match epigraph_db::ClaimRepository::store_embedding_vec(
+                        &state.db_pool,
+                        *claim_id,
+                        &embedding,
+                    )
+                    .await
                     {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(claim_id = %claim_id, "Embedding not stored for ingested workflow claim: row absent or sealed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
+                        }
                     }
                 }
                 Err(e) => {

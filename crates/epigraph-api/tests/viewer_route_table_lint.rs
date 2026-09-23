@@ -455,8 +455,9 @@ const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 ///
 /// [`sqlx_call_offsets`] requires INVOCATION syntax — `sqlx::query(` — so
 /// `sqlx::query!` MACRO writes are not counted. `submit.rs` has one
-/// (`UPDATE claims SET trace_id = …`), which is why its count here is 4 and a
-/// plain grep of the file finds 5. The exclusion is inherited from the read-side
+/// (`UPDATE claims SET trace_id = …`), which is why its count here is 2 and a
+/// plain grep of the file finds 3 (4 and 5 before deferred-commitment key
+/// embed-on-write-helper moved its two embedding writes to the repo layer). The exclusion is inherited from the read-side
 /// scan, where it is what keeps prose out of the count, and it is left in place
 /// rather than special-cased: a macro write is unspliceable by construction and
 /// belongs in `write_gate_lint.rs::MACRO_WRITE_SITES`, whose remedy is a
@@ -472,7 +473,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // viewer (deferred-commitment key embed-on-write-helper). Removed, not
     // zeroed.
     ("belief.rs", 1),
-    ("claims.rs", 4),
+    // 4 -> 3: `create_claim`'s write-on-create `UPDATE claims SET embedding`
+    // moved to `ClaimRepository::store_embedding_vec` (deferred-commitment key
+    // embed-on-write-helper). `update_claim`'s embedding write already went
+    // through the repo and was never one of the 4.
+    ("claims.rs", 3),
     ("computation.rs", 2),
     // `conventions.rs` was 2 -- `learn_convention`'s and `share_skill`'s inline
     // `UPDATE claims SET labels`. Both moved to `ClaimRepository::update_labels`
@@ -489,9 +494,15 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // key embed-on-write-helper. Removed, not zeroed.
     ("reasoning.rs", 2),
     ("revoke_signature.rs", 1),
-    // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
-    ("submit.rs", 4),
-    ("workflows.rs", 4),
+    // 2, not 3: the third is a `sqlx::query!` macro — see the note above.
+    // 4 -> 2: `submit_packet`'s claim and figure-evidence embedding writes
+    // moved to `ClaimRepository::store_embedding_vec` and
+    // `EvidenceRepository::store_embedding_vec` (embed-on-write-helper).
+    ("submit.rs", 2),
+    // 4 -> 2: the identical write-on-create embedding loops in
+    // `store_workflow` and `ingest_workflow` moved to
+    // `ClaimRepository::store_embedding_vec` (embed-on-write-helper).
+    ("workflows.rs", 2),
 ];
 
 /// Tenancy-scoped tables whose route-layer writes this lint counts.
@@ -1411,7 +1422,7 @@ fn the_route_write_scanner_is_not_vacuous() {
         sqlx_call_offsets(macro_write).is_empty(),
         "`sqlx::query!` is deliberately outside this scan — see the \
          ROUTE_LAYER_WRITES doc comment. If this now returns a site, the \
-         register is under-stated and submit.rs must go 4 → 5."
+         register is under-stated and submit.rs must go 2 → 3."
     );
 }
 

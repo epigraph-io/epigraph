@@ -1768,33 +1768,32 @@ pub async fn submit_packet(
             } else {
                 match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
-                        // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
-                        let pgvector_str = format!(
-                            "[{}]",
-                            embedding
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        );
-                        if let Err(e) =
-                            sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                                .bind(&pgvector_str)
-                                .bind(claim_id)
-                                .execute(&state.db_pool)
-                                .await
+                        // Provider-agnostic: the repo helper formats and writes
+                        // whatever vector the configured service returned, through
+                        // the seal-guarded statement (deferred-commitment key
+                        // embed-on-write-helper). Unviewered is correct: on a
+                        // non-duplicate submit this request inserted `claim_id`.
+                        match epigraph_db::ClaimRepository::store_embedding_vec(
+                            &state.db_pool,
+                            claim_id,
+                            &embedding,
+                        )
+                        .await
                         {
-                            tracing::warn!(
-                                claim_id = %claim_id,
-                                error = %e,
-                                "Failed to store claim embedding"
-                            );
-                        } else {
-                            tracing::debug!(
+                            Ok(true) => tracing::debug!(
                                 claim_id = %claim_id,
                                 embedding_dim = embedding.len(),
                                 "Generated and stored embedding for claim"
-                            );
+                            ),
+                            Ok(false) => tracing::warn!(
+                                claim_id = %claim_id,
+                                "Claim embedding not stored: row absent or sealed"
+                            ),
+                            Err(e) => tracing::warn!(
+                                claim_id = %claim_id,
+                                error = %e,
+                                "Failed to store claim embedding"
+                            ),
                         }
                     }
                     Err(e) => {
@@ -1871,39 +1870,38 @@ pub async fn submit_packet(
 
                     match embedding_result {
                         Ok(embedding) => {
-                            let pgvector_str = format!(
-                                "[{}]",
-                                embedding
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            );
-                            if let Err(e) = sqlx::query(
-                                "UPDATE evidence SET embedding = $1::vector WHERE id = $2",
+                            // Seal-guarded repo write (deferred-commitment key
+                            // embed-on-write-helper); unviewered because this
+                            // request inserted `evidence_id` above.
+                            match epigraph_db::repos::EvidenceRepository::store_embedding_vec(
+                                &state.db_pool,
+                                evidence_id.into(),
+                                &embedding,
                             )
-                            .bind(&pgvector_str)
-                            .bind(evidence_id)
-                            .execute(&state.db_pool)
                             .await
                             {
-                                tracing::warn!(
+                                Ok(true) => {
+                                    let mode = if embedding_service.as_multimodal().is_some() {
+                                        "image"
+                                    } else {
+                                        "caption"
+                                    };
+                                    tracing::debug!(
+                                        evidence_id = %evidence_id,
+                                        embedding_dim = embedding.len(),
+                                        mode,
+                                        "Generated and stored figure evidence embedding"
+                                    );
+                                }
+                                Ok(false) => tracing::warn!(
+                                    evidence_id = %evidence_id,
+                                    "Figure evidence embedding not stored: row absent or sealed"
+                                ),
+                                Err(e) => tracing::warn!(
                                     evidence_id = %evidence_id,
                                     error = %e,
                                     "Failed to store figure evidence embedding"
-                                );
-                            } else {
-                                let mode = if embedding_service.as_multimodal().is_some() {
-                                    "image"
-                                } else {
-                                    "caption"
-                                };
-                                tracing::debug!(
-                                    evidence_id = %evidence_id,
-                                    embedding_dim = embedding.len(),
-                                    mode,
-                                    "Generated and stored figure evidence embedding"
-                                );
+                                ),
                             }
                         }
                         Err(e) => {

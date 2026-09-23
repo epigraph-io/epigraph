@@ -4372,11 +4372,26 @@ impl ClaimRepository {
     ///
     /// # Why the seal predicate is in THIS statement
     ///
-    /// This is the shared write every embedding producer goes through — the MCP
-    /// submit/memorize/ingest paths, the backfill tool, `embed_backfill`, and
-    /// `PUT /api/v1/claims/:id`, whose caller supplies the vector itself. The
-    /// enumerators those callers select from already exclude sealed rows, so
-    /// the predicate is a no-op for every one of them; the by-id caller has no
+    /// This is the shared write the workspace's embedding producers go through
+    /// — the MCP submit/memorize/ingest paths, the backfill tool,
+    /// `embed_backfill`, `PUT /api/v1/claims/:id` (whose caller supplies the
+    /// vector itself), and, via [`store_embedding_vec`](Self::store_embedding_vec),
+    /// the HTTP write-on-create paths in `create_claim`, `submit_packet` and
+    /// both workflow-ingest routes. Producers acting on an id someone ELSE
+    /// supplied go through [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed)
+    /// instead, which carries the same predicate plus the write gate.
+    ///
+    /// AN EARLIER REVISION OF THIS PARAGRAPH SAID "every embedding producer",
+    /// and it was false: until deferred-commitment key `embed-on-write-helper`,
+    /// six `epigraph-api` route handlers issued their own
+    /// `UPDATE claims SET embedding` with no seal predicate, two of them for a
+    /// caller-supplied id. `crates/epigraph-api/tests/embedding_write_path_lint.rs`
+    /// now fails if a route assigns the column again. Writers OUTSIDE the
+    /// repo layer and `epigraph-api` are not covered by that lint; see
+    /// `docs/tenancy/progress.json::D-SEAL-vector-column-row-guard`.
+    ///
+    /// The enumerators the backfill callers select from already exclude sealed
+    /// rows, so the predicate is a no-op for them; a by-id caller has no
     /// enumerator at all, and for it the predicate is the only thing standing
     /// between a caller who still holds plaintext and a plaintext-derived
     /// vector on a row whose whole point is that no such derivative survives.
