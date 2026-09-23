@@ -127,6 +127,7 @@ pub use repos::graph_view::{
 pub use repos::mass_function::{
     CachedBelief, FrameConflictDensityRow, HighConflictClaimRow, MassFunctionRow,
 };
+pub use repos::{ClaimListFilter, ClaimListSort};
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy
 // `ownership` table on this line. The export came in from main, which still
 // carries the module, and is dropped rather than resurrected.

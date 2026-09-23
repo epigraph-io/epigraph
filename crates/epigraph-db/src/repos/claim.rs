@@ -261,6 +261,199 @@ impl SortDirection {
     }
 }
 
+/// Sort key for [`ClaimRepository::list_filtered`].
+///
+/// An enum for the same reason as [`BeliefSort`]: the `ORDER BY` column is
+/// interpolated into the statement text, so it has to be unreachable from user
+/// input by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimListSort {
+    /// `created_at`, the listing's default.
+    #[default]
+    CreatedAt,
+    /// `truth_value`.
+    TruthValue,
+}
+
+impl ClaimListSort {
+    /// The column to sort on. Always a compile-time literal.
+    #[must_use]
+    pub const fn sql_column(self) -> &'static str {
+        match self {
+            ClaimListSort::CreatedAt => "c.created_at",
+            ClaimListSort::TruthValue => "c.truth_value",
+        }
+    }
+
+    /// Parse the wire value. `None` for anything else; callers turn that into
+    /// a 400 rather than silently falling back to the default.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "created_at" => Some(ClaimListSort::CreatedAt),
+            "truth_value" => Some(ClaimListSort::TruthValue),
+            _ => None,
+        }
+    }
+}
+
+/// Filters for [`ClaimRepository::list_filtered`] and
+/// [`ClaimRepository::count_filtered`].
+///
+/// Every field is optional and the set fields combine with AND. [`Default`] is
+/// "no filter": the whole corpus the viewer can read.
+///
+/// Each field becomes a predicate in the statement's `WHERE` clause, which is
+/// evaluated BEFORE `LIMIT`. This type exists because `GET /api/v1/claims` used
+/// to fetch the newest 10,000 rows and filter them in memory (backlog
+/// `2265a67b`). A match older than that window was silently missing, and
+/// `total` counted only the matches inside it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClaimListFilter<'a> {
+    /// Case-insensitive LITERAL substring of `content`. `%`, `_` and `\` in the
+    /// input are escaped, so they match themselves rather than acting as
+    /// `LIKE` wildcards.
+    pub search: Option<&'a str>,
+    /// `truth_value >= truth_min`.
+    pub truth_min: Option<f64>,
+    /// `truth_value <= truth_max`.
+    pub truth_max: Option<f64>,
+    /// Only claims made by this agent.
+    pub agent_id: Option<Uuid>,
+    /// No claims made by this agent. Composes with `agent_id`.
+    pub exclude_agent_id: Option<Uuid>,
+    /// Only current (`true`) or only superseded (`false`) claims.
+    pub is_current: Option<bool>,
+    /// `created_at >= created_after`.
+    pub created_after: Option<DateTime<Utc>>,
+    /// `created_at <= created_before`.
+    pub created_before: Option<DateTime<Utc>>,
+    /// Only claims whose reasoning trace (`claims.trace_id`) has this
+    /// `reasoning_type`, AND which the viewer can read.
+    pub methodology: Option<&'a str>,
+    /// Only claims with at least one evidence row of this `evidence_type`
+    /// that the viewer can read.
+    pub evidence_type: Option<&'a str>,
+}
+
+/// One positional value for the statement [`ClaimListFilter::render`] builds.
+enum ClaimListBind {
+    Text(String),
+    F64(f64),
+    Uuid(Uuid),
+    Bool(bool),
+    Time(DateTime<Utc>),
+}
+
+impl ClaimListFilter<'_> {
+    /// This filter's predicates over `claims c`, each prefixed with ` AND `,
+    /// with binds numbered from `$1`, plus the values to bind in that order.
+    ///
+    /// The caller appends its own trailing binds (`LIMIT`/`OFFSET`, then the
+    /// viewer's group array) starting at `$<binds.len() + 1>`.
+    ///
+    /// # The two EXISTS subqueries carry their OWN visibility markers
+    ///
+    /// `reasoning_traces rt` and `evidence e` are separate tenancy-owned
+    /// tables. Without a predicate on them, a claim the viewer can read would
+    /// match a filter because of a trace or evidence row the viewer cannot
+    /// read. Its presence in the response would then reveal that the hidden
+    /// row exists and what type it has. The helpers this replaced,
+    /// [`ClaimRepository::claim_ids_by_methodology`] (`/* {VISIBILITY:c} */
+    /// /* {VISIBILITY:rt} */`) and
+    /// [`ClaimRepository::claim_ids_by_evidence_type`]
+    /// (`/* {VISIBILITY:e} */`), filtered both tables. So do these subqueries.
+    /// `Viewer::splice` renders every marker at the same bind index, so the
+    /// extra markers still cost one group bind.
+    fn render(&self) -> (String, Vec<ClaimListBind>) {
+        let mut sql = String::new();
+        let mut binds: Vec<ClaimListBind> = Vec::new();
+        // Each template is a literal holding exactly one `$N`, which becomes
+        // the value's own positional index.
+        let mut add = |template: &'static str, value: ClaimListBind| {
+            binds.push(value);
+            sql.push_str(" AND ");
+            sql.push_str(&template.replace("$N", &format!("${}", binds.len())));
+        };
+
+        if let Some(s) = self.search {
+            add(
+                "c.content ILIKE $N ESCAPE '\\'",
+                ClaimListBind::Text(format!("%{}%", escape_like(s))),
+            );
+        }
+        if let Some(v) = self.truth_min {
+            add("c.truth_value >= $N", ClaimListBind::F64(v));
+        }
+        if let Some(v) = self.truth_max {
+            add("c.truth_value <= $N", ClaimListBind::F64(v));
+        }
+        if let Some(v) = self.agent_id {
+            add("c.agent_id = $N", ClaimListBind::Uuid(v));
+        }
+        if let Some(v) = self.exclude_agent_id {
+            add("c.agent_id <> $N", ClaimListBind::Uuid(v));
+        }
+        if let Some(v) = self.is_current {
+            add("c.is_current = $N", ClaimListBind::Bool(v));
+        }
+        if let Some(v) = self.created_after {
+            add("c.created_at >= $N", ClaimListBind::Time(v));
+        }
+        if let Some(v) = self.created_before {
+            add("c.created_at <= $N", ClaimListBind::Time(v));
+        }
+        if let Some(m) = self.methodology {
+            add(
+                "EXISTS (SELECT 1 FROM reasoning_traces rt \
+                 WHERE rt.id = c.trace_id AND rt.reasoning_type = $N \
+                 /* {VISIBILITY:rt} */)",
+                ClaimListBind::Text(m.to_owned()),
+            );
+        }
+        if let Some(t) = self.evidence_type {
+            add(
+                "EXISTS (SELECT 1 FROM evidence e \
+                 WHERE e.claim_id = c.id AND e.evidence_type = $N \
+                 /* {VISIBILITY:e} */)",
+                ClaimListBind::Text(t.to_owned()),
+            );
+        }
+
+        (sql, binds)
+    }
+}
+
+/// Escape `LIKE` metacharacters so `s` matches only itself. The statement
+/// declares `ESCAPE '\'`.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Bind [`ClaimListFilter::render`]'s values onto `q`, in order.
+fn bind_claim_list_filter<'q, O>(
+    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+    binds: Vec<ClaimListBind>,
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+    for b in binds {
+        q = match b {
+            ClaimListBind::Text(v) => q.bind(v),
+            ClaimListBind::F64(v) => q.bind(v),
+            ClaimListBind::Uuid(v) => q.bind(v),
+            ClaimListBind::Bool(v) => q.bind(v),
+            ClaimListBind::Time(v) => q.bind(v),
+        };
+    }
+    q
+}
+
 /// Result row for [`ClaimRepository::rag_hybrid_context`].
 ///
 /// Mirrors the projection `GET /api/v1/query/rag` serialises. It lives here
@@ -2937,6 +3130,138 @@ impl ClaimRepository {
         }
 
         Ok(claims)
+    }
+
+    /// One page of the claims matching `filter` that `viewer` can read,
+    /// ordered by `sort` then `id` in `direction`.
+    ///
+    /// Every predicate is in SQL before `LIMIT`/`OFFSET`, so a match is
+    /// reachable however old it is, and [`Self::count_filtered`] over the same
+    /// `filter` gives the true number of matches. This replaces the
+    /// `list(10_000, 0)` + in-memory filter that `GET /api/v1/claims` used
+    /// (backlog `2265a67b`).
+    ///
+    /// The `id` tiebreak makes the order total, so pages do not overlap or
+    /// skip rows when many claims share a `created_at` or `truth_value`.
+    ///
+    /// Projects and post-fixes `is_current` and `supersedes` the way
+    /// [`Self::list`] does, through a local `Row` so `claim_from_row` keeps its
+    /// signature (see `CLAUDE.md`).
+    ///
+    /// # Bind order
+    ///
+    /// Filter values take `$1..$n`, `LIMIT` is `$n+1`, `OFFSET` is `$n+2`, and
+    /// the viewer's group array is `$n+3`. The group array goes LAST because a
+    /// `Bypass` viewer renders no placeholder and binds nothing, so the
+    /// indices before it must not depend on it.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_filtered<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        filter: &ClaimListFilter<'_>,
+        sort: ClaimListSort,
+        direction: SortDirection,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
+        let (conds, binds) = filter.render();
+        let limit_bind = binds.len() + 1;
+        let offset_bind = binds.len() + 2;
+        let order_col = sort.sql_column();
+        let order_dir = direction.sql_keyword();
+        let sql = viewer.splice(
+            &format!(
+                r#"
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes
+            FROM claims c
+            WHERE true{conds}
+              /* {{VISIBILITY:c}} */
+            ORDER BY {order_col} {order_dir}, c.id {order_dir}
+            LIMIT ${limit_bind} OFFSET ${offset_bind}
+            "#
+            ),
+            binds.len() + 3,
+        );
+
+        let mut q = bind_claim_list_filter(sqlx::query_as::<_, Row>(&sql), binds)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+
+        let rows = q.fetch_all(executor).await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            let mut claim = claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            );
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
+        }
+        Ok(claims)
+    }
+
+    /// The number of claims matching `filter` that `viewer` can read, which
+    /// is the `total` for [`Self::list_filtered`] over the same `filter`.
+    ///
+    /// Filter values take `$1..$n` and the viewer's group array is `$n+1`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_filtered<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        filter: &ClaimListFilter<'_>,
+    ) -> Result<i64, DbError> {
+        let (conds, binds) = filter.render();
+        let sql = viewer.splice(
+            &format!(
+                r#"
+            SELECT COUNT(*)
+            FROM claims c
+            WHERE true{conds}
+              /* {{VISIBILITY:c}} */
+            "#
+            ),
+            binds.len() + 1,
+        );
+
+        let mut q = bind_claim_list_filter(sqlx::query_as::<_, (i64,)>(&sql), binds);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+
+        let (n,) = q.fetch_one(executor).await?;
+        Ok(n)
     }
 
     /// List claims whose `truth_value` falls within `[min_truth, max_truth]`,

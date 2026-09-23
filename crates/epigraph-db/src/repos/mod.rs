@@ -83,6 +83,7 @@ pub use claim::{
     PatchClaimInput, SortDirection, SweepCandidate, CONSOLIDATE_MAX_SOURCES,
     CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
 };
+pub use claim::{ClaimListFilter, ClaimListSort};
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
     DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
