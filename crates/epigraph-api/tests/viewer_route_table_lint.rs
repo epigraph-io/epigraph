@@ -129,10 +129,15 @@ use std::path::{Path, PathBuf};
 ///
 /// Read "4 → 0" as **all four COUNTED statements**, which is the only thing
 /// this lint measures. `measure_inline_claim_content_reads` matches the
-/// `tier_a` *claim-content* column set and nothing else, so inline reads survive
-/// in `edges.rs::claim_provenance` that it has never counted and still does not:
-/// two `SELECT target_id FROM edges …` projections, which are edge columns and
-/// no content.
+/// `tier_a` *claim-content* column set and nothing else. So it never counted
+/// the two `SELECT target_id FROM edges …` projections that survived in
+/// `edges.rs::claim_provenance`, which were edge columns and no content.
+/// **Those two are gone too, and again no number here moved.** `F-SEC14-A`'s
+/// fix replaced both with one repo-layer read,
+/// `EvidenceRepository::linked_from_claim`, which carries
+/// `/* {EDGE_VISIBILITY:ed} */` and `/* {VISIBILITY:e} */`. Its arms are in
+/// `shard6_routes_scoped_read.rs`, not here, because this register could not
+/// see the statements before or after.
 ///
 /// **A fourth statement in the same file, enumerated so this paragraph does not
 /// under-count its own subject.** `edges.rs::propagate_to_dependents` runs

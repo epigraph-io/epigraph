@@ -42,8 +42,10 @@
 //! (the `&PgPool` spelling stays, so `routes/graph_query.rs` and
 //! `tests/tenant_isolation_http.rs` compile unedited and `graph_query.rs`
 //! remains counted unconverted), and the nested `build_evidence_chains` here
-//! takes `&mut PgConnection`. Both take a connection whose stamping they cannot
-//! verify, and both say so.
+//! took `&mut PgConnection`. `load_subgraph_conn` takes a connection whose
+//! stamping it cannot verify, and says so. `build_evidence_chains` is gone.
+//! The `F-SEC14-A` fix replaced it with the pure `evidence_chains`, which
+//! takes rows and no connection.
 //!
 //! NOT converted (10 sites), blocker named per handler:
 //! * `create_edge`, `create_hierarchical_edge`, `patch_edge`, `relate_claims`,
@@ -58,10 +60,12 @@
 //! `AUTH_OPTIONAL_PROVENANCE_SITES` rows for this file all sit in those write
 //! handlers and are unchanged.
 //!
-//! `claim_provenance` carries an open finding, `F-SEC14-A`. Converting its
-//! executor does NOT discharge it — that entry's remedy is a different change to
-//! a different layer — and it stays open. Nothing further about it is recorded
-//! here; see `docs/tenancy/progress.json`.
+//! `claim_provenance`'s finding `F-SEC14-A` is CLOSED. Converting its executor
+//! did not discharge it. What did was moving its two inline
+//! `SELECT target_id FROM edges …` scans into
+//! `EvidenceRepository::linked_from_claim`, which filters the edge and the
+//! evidence row for the viewer in one statement, and choosing the response
+//! shape from the rows that read returns. See `docs/tenancy/progress.json`.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -2059,25 +2063,13 @@ pub struct EvidenceDetailResponse {
     pub created_at: String,
 }
 
-// Row types for evidence and provenance queries
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct TargetIdRow {
-    target_id: Uuid,
-}
+// Row type for the provenance query
 #[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
 struct ClaimProvRow {
     id: Uuid,
     content: String,
     trace_id: Option<Uuid>,
-}
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct EvidenceProvRow {
-    id: Uuid,
-    source_url: Option<String>,
-    properties: serde_json::Value,
 }
 
 /// Get a single evidence item by ID with all details flattened
@@ -2249,6 +2241,66 @@ pub struct ProvenanceResponse {
     pub chains: Vec<ProvenanceChain>,
 }
 
+/// One provenance chain per evidence row: `claim [-> trace] -> evidence`.
+///
+/// Pure. The rows arrive already filtered for the viewer by
+/// `EvidenceRepository::linked_from_claim`, so nothing here decides who may
+/// read what. This helper used to take a connection and a `Viewer` and hydrate
+/// one id per statement, because its input was an unfiltered id list.
+#[cfg(feature = "db")]
+fn evidence_chains(
+    claim_step: &ProvenanceStep,
+    trace_step: Option<&ProvenanceStep>,
+    evidence: &[epigraph_db::EvidenceDetailRow],
+) -> Vec<ProvenanceChain> {
+    evidence
+        .iter()
+        .map(|ev| {
+            let props = &ev.properties;
+            let doi = props
+                .get("doi")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let caption = props.get("caption").and_then(|v| v.as_str()).unwrap_or("");
+            let ev_type = props
+                .get("evidence_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("evidence");
+
+            let label = if let Some(ref d) = doi {
+                format!("{ev_type}: {d}")
+            } else if !caption.is_empty() {
+                caption.to_string()
+            } else {
+                format!("Evidence {}", &ev.id.to_string()[..8])
+            };
+
+            let evidence_step = ProvenanceStep {
+                id: ev.id,
+                entity_type: "evidence".to_string(),
+                label,
+            };
+
+            let source_url = doi
+                .as_ref()
+                .map(|d| format!("https://doi.org/{d}"))
+                .or_else(|| ev.source_url.clone());
+
+            let mut path = vec![claim_step.clone()];
+            if let Some(ts) = trace_step {
+                path.push(ts.clone());
+            }
+            path.push(evidence_step);
+
+            ProvenanceChain {
+                path,
+                source_doi: doi,
+                source_url,
+            }
+        })
+        .collect()
+}
+
 /// Trace provenance from a claim back to source papers/DOIs.
 ///
 /// `GET /api/v1/claims/:id/provenance`
@@ -2313,94 +2365,41 @@ pub async fn claim_provenance(
         label: claim_label,
     };
 
+    // 2. The evidence this claim links to, read ONCE and filtered for the
+    //    viewer. Both the edge and the evidence row are filtered, in one
+    //    statement.
+    //
+    // This used to be two inline, viewer-less `SELECT target_id FROM edges …`
+    // scans in this handler, with each id then hydrated through the filtered
+    // `EvidenceRepository::detail_by_id`. The handler chose between a
+    // trace-only chain and evidence chains from the RAW edge count, while only
+    // the hydration was filtered. So a claim whose evidence edges all led to
+    // evidence this viewer could not read answered with no chains at all,
+    // where a claim with no evidence edges answered with a trace-only chain.
+    // That difference was `F-SEC14-A`. Every decision below is now made from
+    // rows the viewer can read, so hidden evidence and absent evidence render
+    // identically.
+    //
+    // The filter is not redundant with the claim check above. An edge from a
+    // readable claim may lead to evidence owned by another group, since any
+    // writer can add a claim→evidence edge from an arbitrary claim (see
+    // `EvidenceRepository::detail_by_id`). So "the caller may read the claim
+    // this chain starts from" does not imply "the caller may read every piece
+    // of evidence the chain passes through". The projected `properties`
+    // carries a free-form `caption`, which is content.
+    let evidence =
+        epigraph_db::EvidenceRepository::linked_from_claim(&mut *read, &viewer, claim_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error: {e}"),
+            })?;
+
     let mut chains = Vec::new();
 
-    // Helper: build evidence chains from target_ids
-    //
-    // The evidence read here is VIEWER-FILTERED, and that is not redundant with
-    // the claim check at the top of `claim_provenance`. These ids come from
-    // `DERIVED_FROM` edges off the claim's reasoning TRACE, and a trace may cite
-    // evidence belonging to other claims — so "the caller may read the claim
-    // this chain starts from" does not imply "the caller may read every piece
-    // of evidence the chain passes through". The projected `properties` carries
-    // a free-form `caption`, which is content.
-    //
-    // `&mut sqlx::PgConnection` and not a by-value `E: PgExecutor`: the loop
-    // below issues one statement per evidence id, and a by-value executor is
-    // moved by the first of them. The connection is the caller's, and the
-    // caller is responsible for its stamping — nothing here can check that.
-    async fn build_evidence_chains(
-        conn: &mut sqlx::PgConnection,
-        viewer: &epigraph_db::visibility::Viewer,
-        claim_step: &ProvenanceStep,
-        trace_step: Option<&ProvenanceStep>,
-        evidence_target_ids: Vec<Uuid>,
-    ) -> Result<Vec<ProvenanceChain>, ApiError> {
-        let mut chains = Vec::new();
-        for target_id in evidence_target_ids {
-            let ev: Option<EvidenceProvRow> =
-                epigraph_db::EvidenceRepository::detail_by_id(&mut *conn, viewer, target_id)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("DB error: {e}"),
-                    })?
-                    .map(|r| EvidenceProvRow {
-                        id: r.id,
-                        source_url: r.source_url,
-                        properties: r.properties,
-                    });
-
-            if let Some(ev) = ev {
-                let props = &ev.properties;
-                let doi = props
-                    .get("doi")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let caption = props.get("caption").and_then(|v| v.as_str()).unwrap_or("");
-                let ev_type = props
-                    .get("evidence_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("evidence");
-
-                let label = if let Some(ref d) = doi {
-                    format!("{ev_type}: {d}")
-                } else if !caption.is_empty() {
-                    caption.to_string()
-                } else {
-                    format!("Evidence {}", &ev.id.to_string()[..8])
-                };
-
-                let evidence_step = ProvenanceStep {
-                    id: ev.id,
-                    entity_type: "evidence".to_string(),
-                    label,
-                };
-
-                let source_url = doi
-                    .as_ref()
-                    .map(|d| format!("https://doi.org/{d}"))
-                    .or_else(|| ev.source_url.clone());
-
-                let mut path = vec![claim_step.clone()];
-                if let Some(ts) = trace_step {
-                    path.push(ts.clone());
-                }
-                path.push(evidence_step);
-
-                chains.push(ProvenanceChain {
-                    path,
-                    source_doi: doi,
-                    source_url,
-                });
-            }
-        }
-        Ok(chains)
-    }
-
-    // 2. If claim has a trace, follow it
+    // 3. If claim has a trace, follow it
     if let Some(trace_id) = claim_row.trace_id {
         // READ THROUGH THE VIEWER, and not redundant with the claim check
-        // above for the same reason the evidence read below is not: `claims`
+        // above for the same reason the evidence read above is not: `claims`
         // and `reasoning_traces` carry their own tenancy, and `claims.trace_id`
         // is a plain column — the trace a claim names need not be a trace that
         // claim owns. This was an inline, viewer-less `SELECT` against a tier-A
@@ -2428,52 +2427,24 @@ pub async fn claim_provenance(
                 label: format!("{} ({:.2})", trace.reasoning_type, trace.confidence),
             };
 
-            // 3. Find evidence linked to this claim via edges
-            let evidence_edges: Vec<TargetIdRow> = sqlx::query_as(
-                "SELECT target_id FROM edges WHERE source_id = $1 AND source_type = 'claim' AND target_type = 'evidence'"
-            )
-            .bind(claim_id)
-            .fetch_all(&mut *read)
-            .await
-            .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?;
-
-            if evidence_edges.is_empty() {
+            // Decided from the VISIBLE evidence rows, not from the edges. A
+            // readable trace therefore always yields at least one chain, and
+            // the fallback below never runs behind it.
+            if evidence.is_empty() {
                 chains.push(ProvenanceChain {
                     path: vec![claim_step.clone(), trace_step],
                     source_doi: None,
                     source_url: None,
                 });
             } else {
-                let target_ids: Vec<Uuid> =
-                    evidence_edges.into_iter().map(|e| e.target_id).collect();
-                chains.extend(
-                    build_evidence_chains(
-                        &mut read,
-                        &viewer,
-                        &claim_step,
-                        Some(&trace_step),
-                        target_ids,
-                    )
-                    .await?,
-                );
+                chains.extend(evidence_chains(&claim_step, Some(&trace_step), &evidence));
             }
         }
     }
 
-    // If no chains were found via trace, try direct evidence edges
+    // No trace, or none this viewer may read: chain straight to the evidence.
     if chains.is_empty() {
-        let evidence_edges: Vec<TargetIdRow> = sqlx::query_as(
-            "SELECT target_id FROM edges WHERE source_id = $1 AND source_type = 'claim' AND target_type = 'evidence'"
-        )
-        .bind(claim_id)
-        .fetch_all(&mut *read)
-        .await
-        .map_err(|e| ApiError::InternalError { message: format!("DB error: {e}") })?;
-
-        let target_ids: Vec<Uuid> = evidence_edges.into_iter().map(|e| e.target_id).collect();
-        chains.extend(
-            build_evidence_chains(&mut read, &viewer, &claim_step, None, target_ids).await?,
-        );
+        chains.extend(evidence_chains(&claim_step, None, &evidence));
     }
 
     Ok(Json(ProvenanceResponse { claim_id, chains }))

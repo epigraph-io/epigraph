@@ -23,7 +23,8 @@ pub struct EvidenceAtTimeRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Result row for [`EvidenceRepository::detail_by_id`].
+/// Result row for [`EvidenceRepository::detail_by_id`] and
+/// [`EvidenceRepository::linked_from_claim`].
 ///
 /// The flattened projection `GET /api/v1/evidence/:id` returns. It lived as an
 /// inline `sqlx::query_as` in `epigraph-api/src/routes/edges.rs::get_evidence`
@@ -462,6 +463,73 @@ impl EvidenceRepository {
         let mut q = sqlx::query_as::<_, EvidenceEdgeRow>(&sql)
             .bind(claim_id)
             .bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Evidence linked FROM `claim_id` by a claim→evidence edge of any
+    /// relationship. The edge and the evidence row are both filtered for
+    /// `viewer`, in one statement.
+    ///
+    /// Backs `GET /api/v1/claims/:id/provenance`. The direction is the reverse
+    /// of [`Self::by_relationship_for_claim`]: here the claim is the edge's
+    /// SOURCE and the evidence is its TARGET. There is no relationship filter
+    /// and no `LIMIT`, because the two inline route statements this replaces
+    /// had neither. The row type is [`EvidenceDetailRow`], the projection the
+    /// route used to fetch one id at a time through [`Self::detail_by_id`].
+    ///
+    /// # Why the edge and the evidence are filtered in the SAME statement
+    ///
+    /// The route used to run `SELECT target_id FROM edges …` with no `Viewer`,
+    /// then hydrate each id through `detail_by_id`. Only the hydration was
+    /// filtered, but the route chose its response shape from the unfiltered
+    /// scan. So a claim whose evidence edges all led to evidence the caller
+    /// could not read got a different response from a claim with no evidence
+    /// edges at all (`F-SEC14-A`). Here the caller only ever sees rows it can
+    /// read, so a hidden row and a missing row look the same.
+    ///
+    /// Marker placement copies [`Self::by_relationship_for_claim`]: `e` goes in
+    /// the JOIN's ON clause and `ed` in WHERE, both at `$2`.
+    ///
+    /// Two behaviour changes compared with the old scan:
+    /// * `{EDGE_VISIBILITY:ed}` narrows the result, because the old scan took
+    ///   every edge. An edge the viewer may not see no longer reaches its
+    ///   endpoint, even when the evidence row itself is readable.
+    /// * A dangling edge, whose target is not an evidence row, now drops out
+    ///   at the JOIN. The old scan returned its id, and the hydration then
+    ///   found no row.
+    ///
+    /// Retracted edges (`valid_to` in the past) are still returned, as the old
+    /// scan returned them. Whether a retracted link belongs in a provenance
+    /// chain is a separate question from who may see it.
+    ///
+    /// Rows are ordered by the edge's `created_at`, then the edge's id. The old
+    /// scan had no `ORDER BY`, so its order was undefined.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn linked_from_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<EvidenceDetailRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id, e.raw_content, e.content_hash, e.source_url, \
+                    e.properties, e.created_at \
+             FROM edges ed \
+             JOIN evidence e ON e.id = ed.target_id \
+                /* {VISIBILITY:e} */ \
+             WHERE ed.source_id = $1 \
+               AND ed.source_type = 'claim' \
+               AND ed.target_type = 'evidence' \
+               /* {EDGE_VISIBILITY:ed} */ \
+             ORDER BY ed.created_at ASC, ed.id ASC",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, EvidenceDetailRow>(&sql).bind(claim_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

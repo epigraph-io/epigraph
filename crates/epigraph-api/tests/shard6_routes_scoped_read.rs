@@ -145,6 +145,19 @@
 //! | [`get_evidence_withholds_links_the_viewer_may_not_read`] | a link private to another group from a PUBLIC claim; a PUBLIC link from another group's private claim; a private agent link | the edge and claim markers in `EdgeRepository::first_{claim,agent}_linked_to_evidence` |
 //! | [`hypothesis_status_ignores_scope_evidence_the_viewer_may_not_read`] | a `provides_evidence` link private to another group | the edge marker in `AnalysisRepository::has_scope_limited_evidence_for` |
 //!
+//! The two `F-SEC14-A` arms drive `claim_provenance` and compare the SHAPE of
+//! the chains (step types in order), because the defect was a difference in
+//! shape. Each plants the same pair of hidden rows from
+//! [`plant_evidence_hidden_from_outsiders`] and runs the outsider/member pair:
+//!
+//! | arm | stranger row | the control it observes |
+//! |---|---|---|
+//! | [`claim_provenance_hidden_evidence_is_indistinguishable_from_absent`] | evidence private to another group behind a PUBLIC edge; PUBLIC evidence behind an edge private to another group | both markers in `EvidenceRepository::linked_from_claim`, AND that the handler chooses its shape from the rows that read returns rather than from the edges |
+//! | [`claim_provenance_chains_exactly_the_evidence_the_viewer_may_read`] | the same pair, beside one readable row | both markers, and that a hidden row neither adds a chain nor suppresses the readable one |
+//!
+//! The coverage table above still counts this site once. These arms add
+//! controls observed, not sites driven.
+//!
 //! # What is still NOT proven here
 //!
 //! `ScopedPoolOptions` exposes no `after_connect`, so the SCOPED arm is still a
@@ -669,6 +682,10 @@ async fn graph_full_serves_the_viewers_own_group_private_claim(pool: PgPool) {
 /// `GET /api/v1/claims/:id/provenance` — the arm over the nested
 /// `build_evidence_chains`, which this shard moved from `&PgPool` to
 /// `&mut PgConnection` so its per-evidence loop runs on the caller's connection.
+/// The `F-SEC14-A` fix later replaced that loop with one read,
+/// `EvidenceRepository::linked_from_claim`, on the same connection. This arm
+/// still covers the site: reverting that read to `&state.db_pool` drops the
+/// group-private evidence.
 ///
 /// The subject claim and its trace are PUBLIC, so the handler still answers `Ok`
 /// on a reverted tree and the assertion below is a cardinality rather than a
@@ -738,6 +755,325 @@ async fn claim_provenance_chains_through_the_viewers_own_group_private_evidence(
             .any(|c| c.path.iter().any(|s| s.id == private_ev)),
         "over-suppression check: the group-private evidence must appear in a chain by \
          id, not merely be counted"
+    );
+}
+
+/// Drive `claim_provenance` as `agent` and return the response.
+///
+/// The viewer is resolved inside, per call, because `Viewer` is not `Clone`.
+async fn provenance_as(
+    pool: &PgPool,
+    state: &AppState,
+    agent: Uuid,
+    claim: Uuid,
+) -> epigraph_api::routes::edges::ProvenanceResponse {
+    claim_provenance(
+        State(state.clone()),
+        Path(claim),
+        Query(EvidenceAccessParams { agent_id: None }),
+        ViewerExtractor(viewer_for(pool, agent).await),
+    )
+    .await
+    .expect(
+        "every subject claim in these arms is PUBLIC, so this must SERVE for every \
+         viewer. What an arm asserts is the SHAPE of the chains, not whether they come back",
+    )
+    .0
+}
+
+/// The response's shape: for each chain, its step types in order, and whether
+/// it carries a DOI and a source URL. Ids and labels are left out on purpose.
+/// Two different subject claims can never agree on those, and the question
+/// these arms ask is whether a caller can tell two claims apart by STRUCTURE.
+fn chain_shapes(
+    out: &epigraph_api::routes::edges::ProvenanceResponse,
+) -> Vec<(Vec<String>, bool, bool)> {
+    out.chains
+        .iter()
+        .map(|c| {
+            (
+                c.path.iter().map(|s| s.entity_type.clone()).collect(),
+                c.source_doi.is_some(),
+                c.source_url.is_some(),
+            )
+        })
+        .collect()
+}
+
+/// Every step id in the response, in chain order.
+fn step_ids(out: &epigraph_api::routes::edges::ProvenanceResponse) -> Vec<Uuid> {
+    out.chains
+        .iter()
+        .flat_map(|c| c.path.iter().map(|s| s.id))
+        .collect()
+}
+
+/// Two evidence edges from `subject`, each seeded so that ONE marker alone can
+/// withhold it from a viewer outside `member_group`:
+///
+/// * `ev_hidden`: evidence on a claim private to `member_group`, so the evidence
+///   inherits that group's tenancy, reached by an edge forced PUBLIC. Only
+///   `{VISIBILITY:e}` can withhold it.
+/// * `edge_hidden`: PUBLIC evidence reached by an edge forced private to
+///   `member_group`. Only `{EDGE_VISIBILITY:ed}` can withhold it.
+///
+/// Returns `(ev_hidden, edge_hidden)`.
+async fn plant_evidence_hidden_from_outsiders(
+    pool: &PgPool,
+    subject: Uuid,
+    member: Uuid,
+    member_group: Uuid,
+    world: Uuid,
+    label: &str,
+) -> (Uuid, Uuid) {
+    let private_host = seed_group_claim(
+        pool,
+        member,
+        member_group,
+        &format!("{label}: private host"),
+    )
+    .await;
+    let ev_hidden = seed_evidence(pool, private_host, "figure").await;
+    seed_typed_edge(
+        pool,
+        subject,
+        "claim",
+        ev_hidden,
+        "evidence",
+        "derived_from",
+        "public",
+        world,
+    )
+    .await;
+
+    let public_host = seed_public_claim(pool, member, &format!("{label}: public host")).await;
+    let edge_hidden = seed_evidence(pool, public_host, "document").await;
+    seed_typed_edge(
+        pool,
+        subject,
+        "claim",
+        edge_hidden,
+        "evidence",
+        "derived_from",
+        "group",
+        member_group,
+    )
+    .await;
+
+    (ev_hidden, edge_hidden)
+}
+
+/// `GET /api/v1/claims/:id/provenance`, `F-SEC14-A`: a claim whose evidence
+/// the caller cannot read must answer in the same shape as a claim with no
+/// evidence at all.
+///
+/// Before the fix the handler chose its shape from an unfiltered edge scan and
+/// filtered only the evidence it then hydrated. A readable trace with no
+/// evidence edges gave one `claim -> trace` chain. A readable trace whose
+/// evidence edges all led to rows the caller could not read gave NO chains.
+/// So the response told the caller that hidden evidence existed. The handler
+/// now decides from the rows `EvidenceRepository::linked_from_claim` returns,
+/// and those are filtered for the viewer on both the edge and the evidence.
+///
+/// Four PUBLIC subject claims, so every call serves:
+///
+/// * `linked` and `unlinked` each have a PUBLIC reasoning trace, so the trace
+///   branch runs. `linked` carries the two plants from
+///   [`plant_evidence_hidden_from_outsiders`]. `unlinked` has no evidence
+///   edge.
+/// * `linked_bare` and `unlinked_bare` are the same pair with NO trace, so the
+///   handler's no-trace path runs. Both paths answered `[]` before the fix,
+///   and both must still answer the same.
+///
+/// The outsider half is the fix. Its first `assert_eq!` compares `linked`
+/// with `unlinked` directly, so restoring the raw-edge-count branch fails
+/// there, on its own assertion. The `CALIBRATION` assertion that follows pins
+/// the shape both must share, so the equality cannot pass by both collapsing
+/// to nothing. The member half is the over-suppression direction: a viewer in
+/// `member_group` must get both evidence rows back, on both paths.
+///
+/// Every row is in place before any call. The scoped arm of [`split_state`]
+/// is a `BYPASSRLS` session, so what this arm proves is the in-query `$V`
+/// predicate, which is the control the fix adds. See the module doc.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_provenance_hidden_evidence_is_indistinguishable_from_absent(pool: PgPool) {
+    let (outsider, _outsider_group) = seed_agent_with_group(&pool, "s6-pvh-outsider").await;
+    let (member, member_group) = seed_agent_with_group(&pool, "s6-pvh-member").await;
+    let world = world_group(&pool).await;
+
+    let linked = seed_public_claim(&pool, member, "s6 pvh: linked, traced").await;
+    seed_reasoning_trace(&pool, linked, "deductive").await;
+    let (ev_hidden, edge_hidden) =
+        plant_evidence_hidden_from_outsiders(&pool, linked, member, member_group, world, "s6 pvh")
+            .await;
+
+    let unlinked = seed_public_claim(&pool, member, "s6 pvh: unlinked, traced").await;
+    seed_reasoning_trace(&pool, unlinked, "deductive").await;
+
+    let linked_bare = seed_public_claim(&pool, member, "s6 pvh: linked, no trace").await;
+    let (bare_ev_hidden, bare_edge_hidden) = plant_evidence_hidden_from_outsiders(
+        &pool,
+        linked_bare,
+        member,
+        member_group,
+        world,
+        "s6 pvh bare",
+    )
+    .await;
+
+    let unlinked_bare = seed_public_claim(&pool, member, "s6 pvh: unlinked, no trace").await;
+
+    let state = split_state(&pool).await;
+
+    // ── the outsider: not in `member_group` ──
+    let out_linked = provenance_as(&pool, &state, outsider, linked).await;
+    let out_unlinked = provenance_as(&pool, &state, outsider, unlinked).await;
+    assert_eq!(
+        chain_shapes(&out_linked),
+        chain_shapes(&out_unlinked),
+        "F-SEC14-A: a traced claim whose only evidence the outsider cannot read \
+         ({linked}) must answer in the same shape as a traced claim with no evidence \
+         ({unlinked}). A difference tells the caller that hidden evidence exists"
+    );
+    let trace_only = vec![(vec!["claim".to_string(), "trace".to_string()], false, false)];
+    assert_eq!(
+        chain_shapes(&out_unlinked),
+        trace_only,
+        "CALIBRATION: a readable trace with no evidence answers one claim -> trace \
+         chain. Without this, the equality above could pass with both sides empty"
+    );
+    let ids = step_ids(&out_linked);
+    assert!(
+        !ids.contains(&ev_hidden) && !ids.contains(&edge_hidden),
+        "UNDER-suppression check: neither {ev_hidden} (hidden evidence behind a public \
+         edge) nor {edge_hidden} (public evidence behind a hidden edge) may appear. \
+         Got {ids:?}"
+    );
+
+    let out_linked_bare = provenance_as(&pool, &state, outsider, linked_bare).await;
+    let out_unlinked_bare = provenance_as(&pool, &state, outsider, unlinked_bare).await;
+    assert_eq!(
+        chain_shapes(&out_linked_bare),
+        chain_shapes(&out_unlinked_bare),
+        "the no-trace path: a claim whose only evidence the outsider cannot read \
+         ({linked_bare}) must answer in the same shape as a claim with no evidence \
+         ({unlinked_bare})"
+    );
+    assert!(
+        out_unlinked_bare.chains.is_empty(),
+        "CALIBRATION: no trace and no evidence answers no chains"
+    );
+
+    // ── the member: in `member_group`, so entitled to both rows ──
+    let out = provenance_as(&pool, &state, member, linked).await;
+    let with_trace = (
+        vec![
+            "claim".to_string(),
+            "trace".to_string(),
+            "evidence".to_string(),
+        ],
+        false,
+        false,
+    );
+    assert_eq!(
+        chain_shapes(&out),
+        vec![with_trace.clone(), with_trace],
+        "over-suppression check: the member may read both edges and both evidence \
+         rows, so the traced claim chains through each"
+    );
+    let ids = step_ids(&out);
+    assert!(
+        ids.contains(&ev_hidden) && ids.contains(&edge_hidden),
+        "over-suppression check: both {ev_hidden} and {edge_hidden} must appear by id. \
+         Got {ids:?}"
+    );
+
+    let out = provenance_as(&pool, &state, member, linked_bare).await;
+    let bare = (
+        vec!["claim".to_string(), "evidence".to_string()],
+        false,
+        false,
+    );
+    assert_eq!(
+        chain_shapes(&out),
+        vec![bare.clone(), bare],
+        "over-suppression check on the no-trace path"
+    );
+    let ids = step_ids(&out);
+    assert!(
+        ids.contains(&bare_ev_hidden) && ids.contains(&bare_edge_hidden),
+        "over-suppression check: both {bare_ev_hidden} and {bare_edge_hidden} must \
+         appear by id on the no-trace path. Got {ids:?}"
+    );
+}
+
+/// `GET /api/v1/claims/:id/provenance`, `F-SEC14-A`, mixed case: a traced claim
+/// with one readable evidence row and two hidden ones chains through exactly
+/// the readable one.
+///
+/// This guards the other side of the fix. The handler now emits the
+/// `claim -> trace` chain only when the viewer can read NO evidence. A
+/// regression that decided "no evidence" from any hidden row would drop the
+/// readable chain. A regression that dropped a marker would add a hidden one.
+/// Either way the count below changes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_provenance_chains_exactly_the_evidence_the_viewer_may_read(pool: PgPool) {
+    let (outsider, _outsider_group) = seed_agent_with_group(&pool, "s6-pvm-outsider").await;
+    let (member, member_group) = seed_agent_with_group(&pool, "s6-pvm-member").await;
+    let world = world_group(&pool).await;
+
+    let subject = seed_public_claim(&pool, member, "s6 pvm: subject").await;
+    seed_reasoning_trace(&pool, subject, "deductive").await;
+
+    let visible_host = seed_public_claim(&pool, member, "s6 pvm: visible host").await;
+    let visible = seed_evidence(&pool, visible_host, "observation").await;
+    seed_typed_edge(
+        &pool,
+        subject,
+        "claim",
+        visible,
+        "evidence",
+        "derived_from",
+        "public",
+        world,
+    )
+    .await;
+    let (ev_hidden, edge_hidden) =
+        plant_evidence_hidden_from_outsiders(&pool, subject, member, member_group, world, "s6 pvm")
+            .await;
+
+    let state = split_state(&pool).await;
+
+    let out = provenance_as(&pool, &state, outsider, subject).await;
+    let with_trace = (
+        vec![
+            "claim".to_string(),
+            "trace".to_string(),
+            "evidence".to_string(),
+        ],
+        false,
+        false,
+    );
+    assert_eq!(
+        chain_shapes(&out),
+        vec![with_trace],
+        "the outsider may read exactly one of the three evidence rows ({visible}), so \
+         exactly one claim -> trace -> evidence chain comes back. Two or three means \
+         a hidden row leaked; a bare claim -> trace chain means the readable row was \
+         dropped"
+    );
+    let ids = step_ids(&out);
+    assert!(
+        ids.contains(&visible) && !ids.contains(&ev_hidden) && !ids.contains(&edge_hidden),
+        "the one chain must end at {visible}, and neither {ev_hidden} nor {edge_hidden} \
+         may appear. Got {ids:?}"
+    );
+
+    let out = provenance_as(&pool, &state, member, subject).await;
+    assert_eq!(
+        chain_shapes(&out).len(),
+        3,
+        "over-suppression check: the member may read all three evidence rows"
     );
 }
 
