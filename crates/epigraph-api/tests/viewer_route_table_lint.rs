@@ -522,7 +522,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("claims.rs", 4),
     ("computation.rs", 2),
     ("conventions.rs", 2),
-    ("hypothesis.rs", 2),
+    // 2 before the `F-SBC-A2` fix. `promote_hypothesis`'s
+    // `UPDATE claims SET properties = … 'promoted'` moved to
+    // `ClaimRepository::mark_hypothesis_promoted` behind `{WRITABLE:c}`. The one
+    // left is `create_hypothesis`'s VOI cache write.
+    ("hypothesis.rs", 1),
     ("policies.rs", 4),
     ("rag.rs", 2),
     ("reasoning.rs", 2),

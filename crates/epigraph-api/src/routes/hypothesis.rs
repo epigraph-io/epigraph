@@ -4,7 +4,7 @@
 //! - GET  /api/v1/hypothesis/:id/status — Belief, evidence chains, promotion readiness
 //! - POST /api/v1/hypothesis/:id/promote — Promote to research_validity
 //!
-//! # Tenancy: 6 of this file's 17 raw-pool sites are converted
+//! # Tenancy: 10 of this file's 17 raw-pool sites are converted
 //!
 //! Conversion shard 6. `hypothesis_status` is the only wholly-convertible
 //! handler here and it is the shard's densest: all six of its sites — two
@@ -20,11 +20,19 @@
 //! uniformly restrictive. The `frames` lookup is the site; the same shape is
 //! already on record as `F-SHARD4-A5`.
 //!
-//! NOT converted: `create_hypothesis` and `promote_hypothesis` (11 sites) both
-//! WRITE, so [`AppState::read_as`] — which is read-only, and whose `ScopedRead`
-//! is rolled back on drop under `SessionGucMode::Transaction` — is the wrong
-//! instrument. `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
-//! `("hypothesis.rs", 2)` for them, unchanged by this shard.
+//! NOT converted by that shard: `create_hypothesis` and `promote_hypothesis`
+//! (11 sites) both WRITE, so [`AppState::read_as`] — which is read-only, and
+//! whose `ScopedRead` is rolled back on drop under
+//! `SessionGucMode::Transaction` — is the wrong instrument.
+//!
+//! `promote_hypothesis`'s four sites have since moved onto ONE
+//! `ScopedPool::begin_as` transaction, reached through `AppState.scoped`,
+//! which is the write-side target. That came with the handler's authorization
+//! gate (`F-SBC-A2`; see the handler doc). Its `claims` status write moved into
+//! `ClaimRepository::mark_hypothesis_promoted` behind `{WRITABLE:c}`, so
+//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` carries
+//! `("hypothesis.rs", 1)`. The one left is `create_hypothesis`'s VOI cache
+//! write. `create_hypothesis`'s seven raw-pool sites are unchanged.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -428,30 +436,83 @@ pub async fn hypothesis_status(
 }
 
 /// POST /api/v1/hypothesis/:id/promote — Promote hypothesis to research_validity.
+///
+/// # The authorization gate (`F-SBC-A2`)
+///
+/// This handler used to take only a `ViewerExtractor`. It checked no scope and
+/// no owner, and after the read-only readiness re-check it ran every write on
+/// the raw pool, constrained by id alone. So any authenticated principal that
+/// could READ a promotion-ready hypothesis could promote it. That includes a
+/// token without `claims:write` and a principal that neither owns the claim nor
+/// can write the group that owns it.
+///
+/// The gate now runs in this order, and each layer refuses before anything is
+/// written:
+///
+/// 1. **An `AuthContext` and `claims:write`.** An absent context is 401, not a
+///    pass. A token without the scope is 403.
+/// 2. **Readable and ready.** The readiness re-check below reads through the
+///    caller's viewer, so a hypothesis the caller cannot read is 404, as absent
+///    as one that does not exist. A readable one that fails the promotion
+///    criteria is 400, as before. The criteria are the same facts
+///    `GET /api/v1/hypothesis/:id/status` already returns to any reader, so
+///    answering them before the ownership check discloses nothing.
+/// 3. **Owner or `claims:admin`.** `require_owner_or_admin` against the claim's
+///    `agent_id`, read again through the viewer inside the transaction; 403
+///    when it fails. The same gate `update_claim`, `supersede_claim` and
+///    `deprecate_workflow` use. The row is readable, so refusing it discloses
+///    nothing.
+/// 4. **Writable.** The first write, `ClaimRepository::mark_hypothesis_promoted`,
+///    carries `{WRITABLE:c}`. A caller that passes 3 but cannot write the owning
+///    group, e.g. a `claims:admin` token outside it, is 403. Migration 077's
+///    `claims_tenancy` `WITH CHECK` is the same predicate, so this refuses today
+///    what the policy will refuse once the request path connects as an
+///    application role. It refuses it as a 403, where RLS alone would raise
+///    `42501` on the child `INSERT`s and surface as a 500.
+///
+/// The rest of the promotion happens only after 4 succeeds:
+///
+/// * the latest `hypothesis_assessment` mass function is copied into
+///   `research_validity`, read through the viewer;
+/// * the claim joins the `research_validity` frame;
+/// * the factors naming the claim move from `hypothesis_assessment` to
+///   `research_validity`.
+///
+/// Every read and write after the readiness re-check runs on ONE
+/// `ScopedPool::begin_as(&viewer)` transaction. A refusal part-way through
+/// writes nothing, and the session GUCs the policies read are stamped from the
+/// same `Viewer` that built the in-query predicates.
 #[cfg(feature = "db")]
 pub async fn promote_hypothesis(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Re-check promotion gate. `hypothesis_status` is an axum handler, so its
+    // 1. An ABSENT auth context is a refusal, not a pass.
+    let Some(axum::Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    // 2. Re-check promotion gate. `hypothesis_status` is an axum handler, so its
     // viewer arrives BY VALUE through the extractor and this call needs a
-    // second owned one while `viewer` is still live for the mass-function read
-    // inside the promotion transaction below. `epigraph_db::Viewer` is no
-    // longer `Clone` — see its type doc — so the second one comes from
-    // `detach_scoped`, which hands back only the caller's own scoped read
-    // authority, so this re-check reads exactly what the extractor's viewer
-    // reads and nothing more. `ViewerExtractor` 401s a principal-less token and
-    // resolves an `agents.id`, so it never produces anything else and the
-    // refusal arm is not reachable; it is written as a refusal rather than an
-    // `expect` because the state it would represent is a widening of the
-    // caller's authority, and those fail closed.
+    // second owned one while `viewer` is still live for the promotion
+    // transaction below. `epigraph_db::Viewer` is no longer `Clone` — see its
+    // type doc — so the second one comes from `detach_scoped`, which hands back
+    // only the caller's own scoped read authority, so this re-check reads
+    // exactly what the extractor's viewer reads and nothing more.
+    // `ViewerExtractor` 401s a principal-less token and resolves an
+    // `agents.id`, so it never produces anything else and the refusal arm is
+    // not reachable; it is written as a refusal rather than an `expect` because
+    // the state it would represent is a widening of the caller's authority, and
+    // those fail closed.
     //
-    // SCOPE, so the paragraph above is not over-read: it is about the VIEWER
-    // this call is given, and it changes nothing else about this handler. A
-    // separate question concerning this handler is filed as `F-SBC-A2` in
-    // `docs/tenancy/progress.json`, with an owner; the analysis is held outside
-    // this repository.
+    // It runs BEFORE the transaction opens, not inside it: `hypothesis_status`
+    // takes its own connection from `AppState::read_as`, and holding a
+    // transaction across it would pin two connections per request.
     let status_viewer = viewer.detach_scoped().ok_or_else(|| ApiError::Forbidden {
         reason: "promotion re-check requires the caller's own read authority".to_string(),
     })?;
@@ -473,10 +534,69 @@ pub async fn promote_hypothesis(
         });
     }
 
+    let db_error = |e: epigraph_db::DbError| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "hypothesis::promote_hypothesis",
+            "hypothesis promotion statement failed"
+        );
+        ApiError::InternalError {
+            message: "Failed to promote hypothesis".to_string(),
+        }
+    };
+
+    // Execute promotion as a transaction — all-or-nothing — on a connection
+    // stamped from the caller's viewer.
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            handler = "hypothesis::promote_hypothesis",
+            "promotion refused: this process was not built from a ScopedPool"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+    let mut tx = scoped.begin_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "hypothesis::promote_hypothesis",
+            "could not begin a viewer-stamped transaction"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+
+    // 3. Readable (else 404), then owner or claims:admin (else 403). Read again
+    // inside the transaction rather than trusted from the re-check above, so the
+    // row the ownership decision rests on is read on the connection that writes.
+    let author = epigraph_db::ClaimRepository::get_agent_id(&mut *tx, &viewer, id)
+        .await
+        .map_err(db_error)?
+        .ok_or(ApiError::NotFound {
+            entity: "hypothesis".into(),
+            id: id.to_string(),
+        })?;
+    crate::middleware::scopes::require_owner_or_admin(&auth, author)?;
+
+    // 4. Writable (else 403). The FIRST write, so a refusal here leaves nothing
+    // else to undo; returning drops `tx` uncommitted.
+    let written = epigraph_db::ClaimRepository::mark_hypothesis_promoted(&mut *tx, &viewer, id)
+        .await
+        .map_err(db_error)?;
+    if !written {
+        return Err(ApiError::Forbidden {
+            reason: format!("hypothesis {id} is owned by a group this principal cannot write"),
+        });
+    }
+
     // Get frame IDs
     let hyp_frame: (Uuid,) =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("hypothesis_assessment frame not found: {e}"),
@@ -484,32 +604,24 @@ pub async fn promote_hypothesis(
 
     let rv_frame: (Uuid,) =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'research_validity'")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("research_validity frame not found: {e}"),
             })?;
 
-    // Execute promotion as a transaction — all-or-nothing
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
-
-    // 1. Copy the most recent mass function from hypothesis_assessment to research_validity
+    // Copy the most recent mass function from hypothesis_assessment to
+    // research_validity. The new row inherits the claim's tenancy (migration
+    // 074), and the claim was just shown writable, so `mass_functions`' own
+    // `WITH CHECK` admits it.
     let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
-        &state.db_pool,
+        &mut *tx,
         &viewer,
         id,
         hyp_frame.0,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("{e}"),
-    })?;
+    .map_err(db_error)?;
 
     if let Some(latest) = mass_rows.last() {
         sqlx::query(
@@ -531,7 +643,7 @@ pub async fn promote_hypothesis(
         .map_err(|e| ApiError::InternalError { message: format!("Failed to copy mass function: {e}") })?;
     }
 
-    // 2. Add to research_validity frame
+    // Add to research_validity frame
     sqlx::query(
         "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0) ON CONFLICT DO NOTHING"
     )
@@ -541,7 +653,7 @@ pub async fn promote_hypothesis(
     .await
     .map_err(|e| ApiError::InternalError { message: format!("Failed to add to frame: {e}") })?;
 
-    // 3. Update factors: move from hypothesis_assessment to research_validity
+    // Update factors: move from hypothesis_assessment to research_validity
     sqlx::query(
         r#"
         UPDATE factors
@@ -559,17 +671,16 @@ pub async fn promote_hypothesis(
         message: format!("Failed to update factors: {e}"),
     })?;
 
-    // 4. Update hypothesis status
-    sqlx::query(
-        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' WHERE id = $1"
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError { message: format!("Failed to update status: {e}") })?;
-
-    tx.commit().await.map_err(|e| ApiError::InternalError {
-        message: format!("Promotion transaction failed: {e}"),
+    tx.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "hypothesis::promote_hypothesis",
+            "commit failed"
+        );
+        ApiError::InternalError {
+            message: "Promotion transaction failed".to_string(),
+        }
     })?;
 
     Ok(Json(serde_json::json!({

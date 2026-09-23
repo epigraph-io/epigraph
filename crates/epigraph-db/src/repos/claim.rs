@@ -1281,6 +1281,56 @@ impl ClaimRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
+    /// Set `properties.hypothesis_status = "promoted"` on claim `id`, but only
+    /// if the viewer may WRITE it.
+    ///
+    /// The status write of `POST /api/v1/hypothesis/:id/promote`
+    /// (`routes/hypothesis.rs::promote_hypothesis`, `F-SBC-A2`). The route ran
+    /// this `UPDATE` inline on the raw pool, constrained by id alone. It now
+    /// carries `/* {WRITABLE:c} */`, spliced by
+    /// [`crate::visibility::Viewer::splice_write`] and bound from
+    /// `writable_bind()`, the `admin`/`writer` subset. That is the predicate
+    /// migration 077's `claims_tenancy` `WITH CHECK` applies, so this refuses
+    /// today what the policy will refuse once the request path connects as an
+    /// application role. It refuses with a `false` that the route turns into a
+    /// 403, not with a `42501` that would surface as a 500.
+    ///
+    /// The route issues it as the FIRST write of the promotion transaction. The
+    /// mass-function copy, the frame membership and the factor re-frame that
+    /// follow are all consequences of this row changing, so none of them runs
+    /// when it is refused.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the row was written. `false` when no row matched: no such
+    /// claim, or a claim the viewer may not write. The route has already
+    /// established that the claim is readable, so for it `false` means "not
+    /// writable".
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn mark_hypothesis_promoted<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c \
+                SET properties = c.properties || '{\"hypothesis_status\": \"promoted\"}'::jsonb \
+              WHERE c.id = $1 \
+                /* {WRITABLE:c} */",
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(id);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$2` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(executor).await?.rows_affected() > 0)
+    }
+
     /// Corpus-wide embedding-neighbourhood cardinality and mean similarity.
     ///
     /// Backs `GET /api/v1/voids/density`, which ran this aggregate inline and

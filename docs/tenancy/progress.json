@@ -1606,7 +1606,7 @@
           "remaining": 11,
           "outcome": "OPEN -- partially converted; classified A met exactly",
           "evidence": "All six sites are in `hypothesis_status`, the shard's densest handler. One of the six WIDENS rather than narrows (the `frames` lookup) and the diff says so at the site. NO BEHAVIOURAL ARM: the handler reads `frames`, `experiments`, `mass_functions` and `analyses`, none of which the canonical fixture seeds and three of which have no inline precedent in the workspace -- recorded as a FIXTURE gap under `F-SHARD4-A4`, not as a judgement. `tenant_isolation_http.rs::hypothesis_status_http_hides_a_group_private_claim_from_a_stranger` exercises it end to end through `spawn_app` and is a counterfactual, not coverage. Three swallowed errors on the now-shared connection were converted to `?` at land phase; the unspliced `has_scope` read is registered as `F-SHARD6-A1`.",
-          "blocker": "HANDLER for all 11: create_hypothesis 7 and promote_hypothesis 4 both WRITE, and `read_as` is read-only."
+          "blocker": "HANDLER for all 11: create_hypothesis 7 and promote_hypothesis 4 both WRITE, and `read_as` is read-only. [ANNOTATED 2026-09-22: promote_hypothesis's 4 sites have since moved onto one ScopedPool::begin_as(&viewer) transaction, with its authorization gate (F-SBC-A2, fix/deferred-2026-09-22-lane-a). no_unscoped_pool.rs now counts routes/hypothesis.rs at 7, all of them create_hypothesis's, and HIGH_WATER went 282 -> 278. The shard's own counts above are left as it measured them.]"
         },
         "routes/agents.rs": {
           "sites": 15,
