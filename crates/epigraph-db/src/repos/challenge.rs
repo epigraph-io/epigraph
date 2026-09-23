@@ -38,8 +38,36 @@ pub struct ChallengeRepository;
 
 impl ChallengeRepository {
     /// Insert a new challenge against a claim.
-    pub async fn create(
-        pool: &PgPool,
+    ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `challenges` is in migration 062's tier-A array and 077 gives it the
+    /// strict `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,
+    /// which no unstamped application session can satisfy — its writable set is
+    /// `{}`. The only connection that CAN satisfy it comes from
+    /// `ScopedPool::begin_as`, and that hands back a transaction rather than a
+    /// pool, so a `&PgPool` parameter made this function unreachable from the one
+    /// connection shape that works. `&PgPool` and `&mut PgConnection` both
+    /// satisfy [`sqlx::PgExecutor`], so the three `epigraph-api` callers compile
+    /// unchanged. Same change and same reasoning as
+    /// [`crate::repos::ReasoningTraceRepository::create`].
+    ///
+    /// # Whose group the row lands in is NOT the caller's choice
+    ///
+    /// `challenges` is claim-derived, so migration 074's
+    /// `epigraph_derived_require_tenancy` (BEFORE INSERT) fills
+    /// `(visibility, owner_group_id)` from the PARENT CLAIM, and 070 arm (c)
+    /// (AFTER INSERT STATEMENT) re-stamps it unconditionally — its own comment
+    /// says a BEFORE-row guard the statement trigger then overwrites would be a
+    /// control that reads green and does nothing. So the `WITH CHECK` this
+    /// INSERT must satisfy is about the CLAIM's owning group, not the
+    /// challenger's, and declaring the columns here would change nothing.
+    /// A challenger stamped with its own writable set can therefore write a
+    /// challenge against a claim in a group it can write, and is refused for one
+    /// it cannot. That refusal is a policy question about who may object to
+    /// whose claim; it is recorded rather than worked around here.
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         challenger_id: Option<Uuid>,
         challenge_type: &str,
@@ -55,7 +83,7 @@ impl ChallengeRepository {
         .bind(challenger_id)
         .bind(challenge_type)
         .bind(explanation)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(id)
     }
