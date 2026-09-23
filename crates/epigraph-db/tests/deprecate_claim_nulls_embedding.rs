@@ -4,7 +4,6 @@
 //! row leaves semantic recall and does not inflate the `stale_present`
 //! audit count. Mirrors mark_duplicate_nulls_embedding.rs.
 
-use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -46,7 +45,7 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
         .unwrap();
     }
 
-    let affected = ClaimRepository::deprecate_claim(&pool, ClaimId::from_uuid(target_id))
+    let affected = ClaimRepository::deprecate_claim(&pool, &[target_id])
         .await
         .unwrap();
     assert_eq!(
@@ -91,7 +90,7 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
 
     // Idempotency: a second call (the post-deploy remediation path for claims
     // the pre-fix binary deprecated) must remain a safe no-op flip.
-    let affected2 = ClaimRepository::deprecate_claim(&pool, ClaimId::from_uuid(target_id))
+    let affected2 = ClaimRepository::deprecate_claim(&pool, &[target_id])
         .await
         .unwrap();
     assert_eq!(

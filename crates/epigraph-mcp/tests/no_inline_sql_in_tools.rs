@@ -76,8 +76,12 @@ use std::path::{Path, PathBuf};
 ///   `pool.rs::apply_session_gucs`; what is missing is the SQL half — the
 ///   write-side predicate and `WITH CHECK` — and PR-16a does not add it.)
 /// * **One-line read-backs (`ds.rs`, `ds_auto.rs`, `link_epistemic.rs`,
-///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
-///   caller just wrote, or probes existence by id. Not content reads.
+///   `workflows.rs` — 4 production).** Each re-reads a scalar of a row the
+///   caller just wrote, or probes existence by id. Not content reads. (5 when
+///   measured. `workflows.rs::deprecate_workflow`'s per-child label probe
+///   moved into `WorkflowRepository::find_workflow_descendants` when the
+///   cascade became one read and one write, deferred-commitment screen key
+///   deprecate-workflow-atomic.)
 /// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
 ///   `workflow_hierarchical.rs` 3).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
@@ -101,7 +105,7 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("recall.rs", 13, 0),
     ("workflow_hierarchical.rs", 3, 3),
     ("workflow_ingest.rs", 0, 10),
-    ("workflows.rs", 2, 0),
+    ("workflows.rs", 1, 0),
 ];
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,

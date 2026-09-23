@@ -10,8 +10,7 @@ use crate::types::*;
 use epigraph_core::{AgentId, Claim, ClaimId, Evidence, EvidenceType, TruthValue};
 use epigraph_crypto::ContentHasher;
 use epigraph_db::{
-    BehavioralExecutionRepository, ClaimRepository, EdgeRepository, EvidenceRepository,
-    WorkflowRepository,
+    BehavioralExecutionRepository, ClaimRepository, EvidenceRepository, WorkflowRepository,
 };
 
 use crate::embed::format_pgvector;
@@ -897,90 +896,34 @@ pub async fn deprecate_workflow(
     let workflow_id = parse_uuid(&params.workflow_id)?;
     let cascade = params.cascade.unwrap_or(false);
 
-    let mut deprecated_ids = Vec::new();
-
     // Register (docs/tenancy/progress.json): this root is the open finding
     // F-DEFERRED-0922-A1, and the cascade's handling of an unreadable child
-    // below is the open D-PR16-per-id-claim-oracles-write-half.
-    //
-    // Deprecate the target workflow (A4: also set is_current = false).
-    // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
-    // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
-    // so the deprecated workflow drops out of semantic recall and does not
-    // inflate the `stale_present` audit count.
-    ClaimRepository::deprecate_claim(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
-        .await
-        .map_err(internal_error)?;
-    // Cascade onto the hierarchical `workflows` row (no-op when this
-    // workflow has only a flat-claim representation). Without this,
-    // `find_workflow_hierarchical` keeps returning the deprecated row.
-    epigraph_db::WorkflowRepository::set_truth_value(&server.pool, workflow_id, 0.05)
-        .await
-        .map_err(internal_error)?;
-    deprecated_ids.push(workflow_id.to_string());
-
+    // (find_workflow_descendants skips it) is the open
+    // D-PR16-per-id-claim-oracles-write-half. Making the cascade atomic
+    // changed neither: the root and the children are chosen exactly as before.
+    let mut ids = vec![workflow_id];
     if cascade {
-        // A5: Walk both 'supersedes' and 'variant_of' edges, but only
-        // deprecate workflow-labeled claims to avoid corrupting regular
-        // claim-version supersedes chains.
-        const DESCENDANT_REL: &[&str] = &["variant_of", "supersedes"];
-
-        let mut visited: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-        visited.insert(workflow_id);
-        let mut queue = vec![workflow_id];
-        while let Some(current) = queue.pop() {
-            let edges = EdgeRepository::get_by_target(&server.pool, viewer, current, "claim")
+        // A5: walk both 'supersedes' and 'variant_of' edges, but only through
+        // workflow-labelled claims, so regular claim-version supersedes chains
+        // are not corrupted. ONE statement: a failed read is an error here,
+        // not an empty child list that ends the cascade early and still
+        // reports success, and it comes before any write.
+        ids.extend(
+            WorkflowRepository::find_workflow_descendants(&server.pool, viewer, workflow_id)
                 .await
-                .unwrap_or_default();
-
-            for edge in edges {
-                if !DESCENDANT_REL.contains(&edge.relationship.as_str()) {
-                    continue;
-                }
-                let child_id = edge.source_id;
-                // Filter to workflow-labeled claims only.
-                let is_workflow: bool = {
-                    // PR-09: a label-membership oracle over an id reached by
-                    // graph traversal. Filtered rather than exempted — a child
-                    // the viewer cannot read must not be cascaded into, and
-                    // `unwrap_or(false)` already means "not a workflow, skip".
-                    let sql = viewer.splice(
-                        "SELECT 'workflow' = ANY(c.labels) FROM claims c \
-                         WHERE c.id = $1 /* {VISIBILITY:c} */",
-                        2,
-                    );
-                    let mut q = sqlx::query_scalar(&sql).bind(child_id);
-                    if let Some(g) = viewer.group_bind() {
-                        q = q.bind(g);
-                    }
-                    q.fetch_optional(&server.pool)
-                        .await
-                        .map_err(internal_error)?
-                        .unwrap_or(false)
-                };
-                if !is_workflow {
-                    continue;
-                }
-
-                if !visited.insert(child_id) {
-                    continue;
-                }
-
-                ClaimRepository::deprecate_claim(
-                    &server.pool,
-                    epigraph_core::ClaimId::from_uuid(child_id),
-                )
-                .await
-                .map_err(internal_error)?;
-                // Mirror onto the hierarchical row, if any.
-                epigraph_db::WorkflowRepository::set_truth_value(&server.pool, child_id, 0.05)
-                    .await
-                    .map_err(internal_error)?;
-                deprecated_ids.push(child_id.to_string());
-                queue.push(child_id);
-            }
-        }
+                .map_err(internal_error)?,
+        );
     }
+
+    // ONE statement for the root and every descendant: is_current = false
+    // (A4), truth 0.05, embedding NULL (CLAUDE.md "Embedding policy → Cleanup
+    // paths"), and the mirror onto each hierarchical `workflows` row so
+    // `find_workflow_hierarchical` stops returning it. Either the whole
+    // lineage is deprecated or none of it is.
+    ClaimRepository::deprecate_claim(&server.pool, &ids)
+        .await
+        .map_err(internal_error)?;
+    let deprecated_ids = ids.iter().map(ToString::to_string).collect();
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,

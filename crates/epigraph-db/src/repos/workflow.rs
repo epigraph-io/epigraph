@@ -466,8 +466,10 @@ impl WorkflowRepository {
     /// The write half of `DELETE /api/v1/workflows/:id`
     /// (F-write-authz-reads-unfiltered). The route previously called
     /// [`ClaimRepository::deprecate_claim`], which constrains by id alone, and
-    /// then [`Self::set_truth_value`] as a second, independent statement. It
-    /// discarded both results. This function makes three changes:
+    /// then `set_truth_value` as a second, independent statement. It
+    /// discarded both results. (`set_truth_value` has since been removed. The
+    /// MCP twin now mirrors inside `ClaimRepository::deprecate_claim`'s one
+    /// statement.) This function makes three changes:
     ///
     /// * **The `claims` `UPDATE` carries `/* {WRITABLE:c} */`**, spliced by
     ///   [`crate::visibility::Viewer::splice_write`] and bound from
@@ -556,6 +558,75 @@ impl WorkflowRepository {
         let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// The workflow claims the MCP `deprecate_workflow` cascade reaches from
+    /// `root`, in ONE statement. `root` itself is not in the result.
+    ///
+    /// A child is an edge's `source_id` where the edge targets the current
+    /// node as a `'claim'` and its relationship is `variant_of` or
+    /// `supersedes`. The walk goes only THROUGH a child that is a
+    /// `'workflow'`-labelled claim the viewer can read, reached over an edge
+    /// the viewer can read. Any other child is neither returned nor walked
+    /// through, so the walk stops there.
+    ///
+    /// This is the per-hop walk the MCP tool used to run in Rust: an
+    /// [`crate::EdgeRepository::get_by_target`] read per node (the same edge
+    /// predicate as `{EDGE_VISIBILITY:e}` here), then a per-child
+    /// `{VISIBILITY:c}` label probe. It moved here for two reasons:
+    ///
+    /// * **One statement cannot fail half-way.** The loop read edges with
+    ///   `.unwrap_or_default()`, so a failed edge read looked the same as "no
+    ///   children". The cascade then stopped early and the tool still reported
+    ///   success. Here a failure is an `Err`, and the caller writes nothing.
+    /// * **All SQL stays in `src/repos/`** (CLAUDE.md). The per-child label
+    ///   probe was inline SQL in the tool.
+    ///
+    /// **Why this is not [`Self::find_descendants`].** That walk, used by
+    /// `DELETE /api/v1/workflows/:id`, goes through EVERY claim an edge
+    /// reaches, and the route filters afterwards. This walk stops at the first
+    /// non-workflow or unreadable claim, which is what the MCP loop did.
+    /// Merging the two would change which workflows one of the transports
+    /// deprecates.
+    ///
+    /// **An unreadable child is SKIPPED, not refused.** The loop skipped it
+    /// too. Whether it should refuse instead is the open
+    /// `D-PR16-per-id-claim-oracles-write-half`
+    /// (`docs/tenancy/progress.json`). This function does not decide it.
+    ///
+    /// `UNION`, not `UNION ALL`, so a cycle terminates. `UNION` discards a row
+    /// that is already in the result. The loop got the same guarantee from its
+    /// visited set, which started with `root`.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn find_workflow_descendants<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        root: Uuid,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        // Only the RECURSIVE term is marked. The anchor is the caller's root
+        // id, not a row read from a table.
+        let sql = viewer.splice(
+            "WITH RECURSIVE lineage(id) AS ( \
+                 SELECT $1::uuid \
+                 UNION \
+                 SELECT c.id FROM lineage l \
+                 JOIN edges e ON e.target_id = l.id AND e.target_type = 'claim' \
+                             AND e.relationship IN ('variant_of', 'supersedes') \
+                 JOIN claims c ON c.id = e.source_id \
+                 WHERE 'workflow' = ANY(c.labels) \
+                   /* {EDGE_VISIBILITY:e} */ \
+                   /* {VISIBILITY:c} */ \
+             ) \
+             SELECT id FROM lineage WHERE id <> $1",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(root);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
     }
 
     /// Walk up `variant_of` or `supersedes` edges to find the lineage root ancestor.
@@ -1164,29 +1235,6 @@ impl WorkflowRepository {
             .execute(pool)
             .await?;
         Ok(r.rows_affected())
-    }
-
-    /// Set `workflows.truth_value` for the given workflow id. Used by
-    /// `deprecate_workflow` to cascade truth=0.05 from the flat-claim row
-    /// onto the hierarchical-table row so `find_workflow_hierarchical`
-    /// respects the deprecation signal.
-    ///
-    /// Returns the number of rows affected (0 if `workflow_id` is a
-    /// flat-only workflow with no `workflows` row).
-    ///
-    /// # Errors
-    /// Returns `sqlx::Error` if the database query fails.
-    pub async fn set_truth_value(
-        pool: &PgPool,
-        workflow_id: Uuid,
-        truth_value: f64,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query("UPDATE workflows SET truth_value = $1 WHERE id = $2")
-            .bind(truth_value)
-            .bind(workflow_id)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected())
     }
 }
 

@@ -1626,8 +1626,10 @@ fn every_spliced_statement_carries_the_canonical_marker_spelling() {
 ///
 /// **1. Directory.** It reads [`repo_files`], i.e. `crates/epigraph-db/src/repos`
 /// only. The other `.splice(` call sites in the workspace —
-/// `epigraph-mcp/src/tools/{ds_auto,workflows,ds,link_epistemic}.rs` and
-/// `epigraph-api/src/routes/cross_source.rs` — are outside it. Every one of
+/// `epigraph-mcp/src/tools/{ds_auto,ds,link_epistemic}.rs` and
+/// `epigraph-api/src/routes/cross_source.rs` — are outside it. (The
+/// `workflows.rs` site moved into `WorkflowRepository::find_workflow_descendants`,
+/// inside this test's reach.) Every one of
 /// those filters `claims` today, so this is a reach limit and not a live leak;
 /// an `edges` read added to a route handler or an MCP tool would evade it in
 /// both directions. `epigraph-mcp/tests/tool_viewer_is_spent.rs` and

@@ -6834,8 +6834,11 @@ mod tests {
 // ── Label Mutation ──
 
 impl ClaimRepository {
-    /// Deprecate a single claim: drop its truth to the 0.05 sentinel, flip
-    /// `is_current = false`, and NULL its embedding in one statement.
+    /// Deprecate every claim in `ids`: drop its truth to the 0.05 sentinel,
+    /// flip `is_current = false`, and NULL its embedding. Mirror the 0.05 onto
+    /// the hierarchical `workflows` row with the same id, where one exists.
+    /// **All of it is ONE statement**, so either every row is written or none
+    /// is.
     ///
     /// This is the canonical deprecation primitive for workflow claims. It is
     /// the THIRD `is_current = false` cleanup path (alongside `supersede` and
@@ -6844,10 +6847,25 @@ impl ClaimRepository {
     /// same statement so the row drops out of semantic recall and does not
     /// inflate the `stale_present` audit count.
     ///
-    /// Returns the number of rows affected (0 when `id` does not exist).
-    /// Idempotent: re-running on an already-deprecated claim is a no-op flip
-    /// plus a no-op NULL — safe to call twice (used as the post-deploy
-    /// remediation path for claims deprecated by the pre-fix binary).
+    /// **Why one statement over a slice, and not one call per id.** The MCP
+    /// `deprecate_workflow` cascade used to call this once per id, then call
+    /// `WorkflowRepository::set_truth_value` once per id. Each call was its own
+    /// autocommit statement, so a failure part-way through left the lineage
+    /// half deprecated. The failure could even fall between a claim's `claims`
+    /// row and its `workflows` row. Here both `UPDATE`s are data-modifying
+    /// CTEs of one statement, so they commit or abort together. Postgres runs a
+    /// data-modifying CTE to completion even when the outer query does not read
+    /// it. The slice also keeps the signature on `&PgPool`. A
+    /// connection-taking form with no `Viewer` would need a new row in
+    /// `visibility_lint.rs`'s `CONN_WITHOUT_VIEWER` or `EXECUTOR_WITHOUT_VIEWER`
+    /// register.
+    ///
+    /// Returns the number of `claims` rows affected. An id with no claim row
+    /// adds nothing to that count, and its `workflows` row, if any, is still
+    /// mirrored. Idempotent: re-running on an already-deprecated claim is a
+    /// no-op flip plus a no-op NULL — safe to call twice (used as the
+    /// post-deploy remediation path for claims deprecated by the pre-fix
+    /// binary).
     ///
     /// **Constrains by id alone — it has no write predicate.** The HTTP route
     /// `DELETE /api/v1/workflows/:id` no longer calls it: it uses
@@ -6856,25 +6874,37 @@ impl ClaimRepository {
     /// caller is the MCP `deprecate_workflow` tool. Its root is the open finding
     /// `F-DEFERRED-0922-A1`, and its cascade children are the open
     /// `D-PR16-per-id-claim-oracles-write-half` (both in
-    /// `docs/tenancy/progress.json`).
+    /// `docs/tenancy/progress.json`). Batching the ids changed neither of them.
+    /// The rows written are the rows the per-id calls wrote. This function is
+    /// still one of the four that `F-write-gate-lint-stops-at-first-cfg-test`
+    /// names, because it still sits after `claim.rs`'s first `#[cfg(test)]`.
     ///
     /// Uses the runtime `sqlx::query` (string) form — NOT the compile-time
     /// `query!` macro — to match the existing deprecation call-sites and to
     /// avoid touching `.sqlx/` (no `cargo sqlx prepare` required).
     ///
     /// # Errors
-    /// Returns `DbError` if the database query fails.
-    pub async fn deprecate_claim(pool: &PgPool, id: ClaimId) -> Result<u64, DbError> {
-        let uuid: Uuid = id.into();
-        let result = sqlx::query(
-            "UPDATE claims \
-             SET truth_value = 0.05, is_current = false, embedding = NULL, updated_at = NOW() \
-             WHERE id = $1",
+    /// Returns `DbError` if the database query fails. Nothing has been written
+    /// when it does.
+    pub async fn deprecate_claim(pool: &PgPool, ids: &[Uuid]) -> Result<u64, DbError> {
+        let deprecated: i64 = sqlx::query_scalar(
+            "WITH deprecated AS ( \
+                 UPDATE claims \
+                    SET truth_value = 0.05, is_current = false, embedding = NULL, \
+                        updated_at = NOW() \
+                  WHERE id = ANY($1) \
+                 RETURNING id \
+             ), mirrored AS ( \
+                 UPDATE workflows SET truth_value = 0.05 \
+                  WHERE id = ANY($1) \
+                 RETURNING id \
+             ) \
+             SELECT COUNT(*) FROM deprecated",
         )
-        .bind(uuid)
-        .execute(pool)
+        .bind(ids)
+        .fetch_one(pool)
         .await?;
-        Ok(result.rows_affected())
+        Ok(u64::try_from(deprecated).unwrap_or_default())
     }
 
     /// Update labels on a claim by adding and/or removing labels atomically.
