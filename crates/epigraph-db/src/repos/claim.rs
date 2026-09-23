@@ -1488,6 +1488,55 @@ impl ClaimRepository {
         Ok(agent_id)
     }
 
+    /// Whether `viewer` may PUBLISH claim `id`'s content: `true` when the claim
+    /// is already `visibility = 'public'`, or when its `owner_group_id` is one
+    /// the viewer may WRITE (role `admin`/`writer`).
+    ///
+    /// The gate for any surface that copies a claim's content into a new,
+    /// world-readable row -- `POST /api/v1/skills/share` makes a public,
+    /// system-authored copy. READ authority is not enough for that: a `reader`
+    /// member of a group can see its private claims, and letting them publish
+    /// one is a declassification the group never granted. So the group half is
+    /// the WRITE predicate (`/* {WRITABLE:c} */`, bound from
+    /// [`crate::visibility::Viewer::writable_bind`]), never the read one.
+    ///
+    /// The `visibility = 'public'` half is not a write grant: republishing
+    /// content that is already world-readable discloses nothing.
+    ///
+    /// # Returns
+    ///
+    /// `false` covers "no such claim" and "you may not publish it" alike. A
+    /// caller that has to tell them apart reads the row with the read predicate
+    /// first (`get_by_id`), so this answer never discloses the existence of a
+    /// row the viewer cannot already read.
+    ///
+    /// A `Bypass` viewer renders the write marker as `" "`, so every existing
+    /// row answers `true`: maintenance, not a request principal.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn is_public_or_writable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "SELECT EXISTS (SELECT 1 FROM claims AS p \
+                             WHERE p.id = $1 AND p.visibility = 'public') \
+                 OR EXISTS (SELECT 1 FROM claims AS c \
+                             WHERE c.id = $1 /* {WRITABLE:c} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`,
+        // so the statement has no `$2` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
     /// Get a claim by ID
     ///
     /// # Errors

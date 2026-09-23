@@ -476,11 +476,33 @@ pub async fn list_skills(
 /// `201` when a new system-authored copy is made, `200` with the SAME
 /// `shared_claim_id` and `edge_id` on a re-share, `409` when the named claim is
 /// itself system-authored (already a shared copy).
+///
+/// # Authorization
+///
+/// The copy is `visibility = 'public'` (the system agent's default
+/// declaration), so sharing PUBLISHES the original's content. Two gates, both
+/// before anything is written:
+///
+/// * **`claims:write` scope** (`RequireScopeWrite`, so a read-only token is
+///   `403` before the body is parsed). Sharing inserts a claim and an edge.
+/// * **Publish authority over the original**
+///   (`ClaimRepository::is_public_or_writable`): the original must already be
+///   public, or owned by a group the caller may WRITE (`admin`/`writer`).
+///   Otherwise `403`. Reading it is not enough: a `reader` member can see a
+///   group-private claim, and a public copy of it would be a declassification
+///   the group never granted.
+///
+/// A claim the caller cannot read at all is `404`, from the read-predicated
+/// `get_by_id` that runs first, so the `403` discloses nothing the caller
+/// could not already read.
 pub async fn share_skill(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<ShareSkillRequest>,
 ) -> Result<(StatusCode, Json<ShareSkillResponse>), ApiError> {
+    // Scope gate ran in the extractor; if we reach the body, the caller has
+    // `claims:write`. See `RequireScopeWrite` in `middleware::bearer`.
     let pool = &state.db_pool;
     let claim_id_typed = epigraph_core::ClaimId::from_uuid(request.workflow_id);
 
@@ -490,6 +512,24 @@ pub async fn share_skill(
             entity: "workflow".to_string(),
             id: request.workflow_id.to_string(),
         })?;
+
+    // The copy below is world-readable, so making it is a publication of the
+    // original's content, and needs the authority to publish: the original is
+    // already public, or its owning group is one the caller may WRITE. The
+    // viewer's READ set is the wrong one -- it includes groups where the caller
+    // is only a `reader`.
+    if !epigraph_db::ClaimRepository::is_public_or_writable(pool, &viewer, request.workflow_id)
+        .await?
+    {
+        return Err(ApiError::Forbidden {
+            reason: format!(
+                "claim {} is group-private and you are not a writer or admin of its \
+                 owning group; sharing makes a public copy, which requires write \
+                 authority over the original",
+                request.workflow_id
+            ),
+        });
+    }
 
     // Create a copy with global labels using system agent
     let pub_key = [0u8; 32];
@@ -514,9 +554,11 @@ pub async fn share_skill(
         epigraph_core::Claim::new(claim.content.clone(), agent_id, pub_key, claim.truth_value);
     shared_claim.content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
 
-    // Same as `record_convention` above: the system agent's personal group.
-    // A "shared" workflow claim is explicitly instance-wide; making it
-    // group-private would defeat the sharing this endpoint exists to do.
+    // Same as `learn_convention` above: `('public', <the system agent's
+    // personal group>)`. A "shared" workflow claim is explicitly
+    // instance-wide; making it group-private would defeat the sharing this
+    // endpoint exists to do -- and is exactly why the publish check above
+    // runs before this point.
     let decl =
         epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
 

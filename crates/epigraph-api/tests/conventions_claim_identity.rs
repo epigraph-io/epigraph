@@ -17,9 +17,13 @@
 //!   named a source claim that did not exist, which
 //!   `trigger_validate_edge_refs` (migration 001) refuses.
 //!
-//! Measured on the pre-fix handlers: all four arms below fail, each with a 400
-//! "request references a row that does not exist" (the 23503 mapping in
+//! Measured on the pre-fix handlers: the first four arms below fail, each with
+//! a 400 "request references a row that does not exist" (the 23503 mapping in
 //! `errors.rs`) where the arm expects 2xx.
+//!
+//! The last three pin `share_skill`'s publish authority (the copy is PUBLIC):
+//! a `claims:write` scope, and an original that is already public or owned by
+//! a group the caller may WRITE. See the section header above them.
 //!
 //! Both now dedup on the noun-claim key `(content_hash, agent_id)` through
 //! `ClaimRepository::create_or_get` and use the returned id. Every arm seeds the
@@ -276,4 +280,188 @@ async fn sharing_a_shared_copy_is_refused(pool: PgPool) {
             .await
             .expect("self-loop count");
     assert_eq!(loops, 0, "no self-referencing SHARED_BY edge");
+}
+
+// =============================================================================
+// Publish authority: the shared copy is PUBLIC, so sharing is a publication
+// =============================================================================
+//
+// The copy `share_skill` makes carries the system agent's default declaration,
+// `('public', <its personal group>)`: sharing publishes the original's content.
+// Before the gate, the handler read the original with the caller's READ viewer
+// (every group the caller is a member of, `reader` role included), required no
+// write scope, and wrote the public copy. Measured on that handler: the reader
+// arm and the read-only-token arm below both got 201 and a world-readable copy
+// of a group-private claim.
+
+/// Add `agent` to `group` with `role`, beside whatever memberships it has.
+async fn add_member(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, $3)",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("seed membership");
+}
+
+/// How many claims carry `content`, and how many `SHARED_BY` edges name
+/// `original` as their target. A refused share must leave both unchanged.
+async fn copies_of(pool: &PgPool, content: &str, original: Uuid) -> (i64, i64) {
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(pool)
+        .await
+        .expect("claim count");
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'SHARED_BY'",
+    )
+    .bind(original)
+    .fetch_one(pool)
+    .await
+    .expect("edge count");
+    (rows, edges)
+}
+
+/// A `reader` member can READ a group-private workflow but may not publish it;
+/// a `writer` member of the same group may. The two differ only in role, so
+/// the refusal is the write predicate and not a read miss.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_member_cannot_publish_a_group_private_claim(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let content = "Workflow: rotate the signing key, then revoke the old one.";
+
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "pub-owner").await;
+    let workflow = fixture::seed_group_claim(&pool, owner, group, content).await;
+    stamp_real_content_hash(&pool, workflow, content).await;
+
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "pub-reader").await;
+    add_member(&pool, group, reader, "reader").await;
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "pub-writer").await;
+    add_member(&pool, group, writer, "writer").await;
+    let scopes = ["claims:read", "claims:write"];
+
+    // CALIBRATION: the reader can READ the original. Without this, a 404-class
+    // refusal below would prove only that the fixture failed to grant the read,
+    // not that publication needs more than a read.
+    let reader_viewer = epigraph_db::Viewer::resolve(&pool, reader)
+        .await
+        .expect("resolve reader");
+    assert!(
+        epigraph_db::ClaimRepository::get_by_id(
+            &pool,
+            &reader_viewer,
+            epigraph_core::ClaimId::from_uuid(workflow),
+        )
+        .await
+        .expect("read")
+        .is_some(),
+        "CALIBRATION: a reader member must be able to read the group's claim"
+    );
+
+    let (status, body) = share(
+        addr,
+        &common::mint_token_with_agent(&scopes, reader),
+        workflow,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "a reader member must not publish a group-private claim: {body}"
+    );
+    assert_eq!(
+        copies_of(&pool, content, workflow).await,
+        (1, 0),
+        "a refused share must insert no copy and no SHARED_BY edge"
+    );
+
+    let (status, body) = share(
+        addr,
+        &common::mint_token_with_agent(&scopes, writer),
+        workflow,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a writer member holds publish authority over the group's claim: {body}"
+    );
+    assert_eq!(copies_of(&pool, content, workflow).await, (2, 1));
+
+    // Why the gate exists: the copy IS world-readable.
+    let visibility: String = sqlx::query_scalar("SELECT visibility FROM claims WHERE id = $1")
+        .bind(uuid_field(&body, "shared_claim_id"))
+        .fetch_one(&pool)
+        .await
+        .expect("the copy");
+    assert_eq!(
+        visibility, "public",
+        "sharing publishes the original's content"
+    );
+}
+
+/// A token without `claims:write` cannot share, even the original's admin's
+/// own claim: sharing inserts a claim and an edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_read_only_token_cannot_share(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let content = "Workflow: pin the toolchain before bisecting.";
+
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "ro-owner").await;
+    let workflow = fixture::seed_group_claim(&pool, owner, group, content).await;
+    stamp_real_content_hash(&pool, workflow, content).await;
+
+    let (status, body) = share(
+        addr,
+        &common::mint_token_with_agent(&["claims:read"], owner),
+        workflow,
+    )
+    .await;
+    assert_eq!(
+        status, 403,
+        "a claims:read-only token must not share: {body}"
+    );
+    assert_eq!(
+        copies_of(&pool, content, workflow).await,
+        (1, 0),
+        "a refused share must insert no copy and no SHARED_BY edge"
+    );
+}
+
+/// A non-member may republish a claim that is ALREADY public (nothing is
+/// disclosed), and gets 404 -- not 403 -- for a group-private claim it cannot
+/// read, so the publish gate is no existence oracle.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stranger_may_share_only_what_is_already_public(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let public_text = "Workflow: read the error before the stack trace.";
+    let private_text = "Workflow: the incident runbook for tenant G.";
+
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "st-owner").await;
+    let public = fixture::seed_public_claim(&pool, owner, public_text).await;
+    stamp_real_content_hash(&pool, public, public_text).await;
+    let private = fixture::seed_group_claim(&pool, owner, group, private_text).await;
+    stamp_real_content_hash(&pool, private, private_text).await;
+
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "st-stranger").await;
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], stranger);
+
+    let (status, body) = share(addr, &token, private).await;
+    assert_eq!(
+        status, 404,
+        "a claim the caller cannot read is not found, not forbidden: {body}"
+    );
+    assert_eq!(copies_of(&pool, private_text, private).await, (1, 0));
+
+    let (status, body) = share(addr, &token, public).await;
+    assert_eq!(
+        status, 201,
+        "republishing an already-public claim needs no group authority: {body}"
+    );
+    assert_eq!(copies_of(&pool, public_text, public).await, (2, 1));
 }
