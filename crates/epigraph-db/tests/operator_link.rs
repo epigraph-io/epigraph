@@ -1195,3 +1195,114 @@ async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgP
         );
     }
 }
+
+/// Migration 103 (review attack 2c): an operated WRITER cannot make itself an
+/// admin of its operator's group by rewriting the group's creator.
+///
+/// As `epigraph_app`, stamped from the operated agent's own `Viewer::resolve`
+/// (so the operator group is in its writable set):
+///
+/// * rewriting the operator group's `created_by_agent_id` to itself — the one
+///   UPDATE `groups_tenancy`'s WITH CHECK admits on that row, and the review's
+///   exact attack — is refused by 103's trigger, and so is the follow-on
+///   enrolment of a third agent;
+/// * rewriting `did_key` or `kind` on a group the agent legitimately created
+///   (its own personal group, where the WITH CHECK passes) is refused by the
+///   trigger too;
+/// * CALIBRATION in the same session: an ordinary-column update of that same
+///   own group succeeds, so the refusal is about the identity columns, not the
+///   row or the role.
+///
+/// Every refusal is asserted to be the TRIGGER's (its message), not the RLS
+/// policy's, which also raises 42501.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_writer_cannot_rewrite_its_operator_groups_identity(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (a, a_group) = fixture::seed_agent_with_group(&pool, "operated-writer").await;
+    let z = seed_bare_agent(&pool).await;
+    link(&pool, a, operator).await;
+    let viewer = Viewer::resolve(&pool, a).await.expect("resolve A");
+    assert!(
+        viewer.writable_groups().contains(&op_group),
+        "PREMISE: the operated writer can write rows the operator's group owns"
+    );
+
+    let (creator, did, kind, ordinary, enrol) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            set_gucs_from(&mut conn, &viewer).await;
+            let creator = sqlx::query("UPDATE groups SET created_by_agent_id = $2 WHERE id = $1")
+                .bind(op_group)
+                .bind(a)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected());
+            let enrol = sqlx::query(
+                "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, \
+                                                role) \
+                 VALUES ($1, $2, ''::bytea, 0, 'writer')",
+            )
+            .bind(op_group)
+            .bind(z)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+            let did = sqlx::query(
+                "UPDATE groups SET did_key = 'did:epigraph:personal:' || $2::text WHERE id = $1",
+            )
+            .bind(a_group)
+            .bind(z)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+            let kind = sqlx::query("UPDATE groups SET kind = 'community' WHERE id = $1")
+                .bind(a_group)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected());
+            let ordinary = sqlx::query("UPDATE groups SET updated_at = now() WHERE id = $1")
+                .bind(a_group)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected());
+            (conn, (creator, did, kind, ordinary, enrol))
+        })
+        .await;
+
+    for (what, result) in [
+        ("the operator group's created_by_agent_id", creator),
+        ("its own group's did_key", did),
+        ("its own group's kind", kind),
+    ] {
+        let err = result.expect_err(&format!(
+            "an app session rewrote {what}: 092's creator arm makes a creator admin-equivalent"
+        ));
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{what}: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("immutable outside a maintenance session"),
+            "{what}: the refusal must be migration 103's trigger, not the RLS policy: {err}"
+        );
+    }
+    assert_eq!(
+        ordinary.expect("CALIBRATION: an ordinary-column update of its own group must succeed"),
+        1
+    );
+    assert!(
+        enrol.is_err(),
+        "the operated writer enrolled a third agent in the operator's group"
+    );
+
+    let (creator_after, kind_after): (Uuid, String) =
+        sqlx::query_as("SELECT created_by_agent_id, kind::text FROM groups WHERE id = $1")
+            .bind(op_group)
+            .fetch_one(&pool)
+            .await
+            .expect("group after");
+    assert_eq!((creator_after, kind_after.as_str()), (operator, "personal"));
+    assert!(membership_rows(&pool, op_group, z).await.is_empty());
+}

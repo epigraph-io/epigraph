@@ -274,9 +274,23 @@ Current reservation:
   binary that no longer calls them. **Applied to a throwaway database only, NOT
   to any deployed database.**
 
-- **103+**: public next
+- **103**: public `groups_identity_immutable` — one invoker trigger function
+  (`epigraph_groups_identity_immutable`) and a `BEFORE UPDATE` trigger on
+  `groups` that raises `42501` when `created_by_agent_id`, `did_key` or `kind`
+  changes outside `epigraph_bypass()` / `epigraph_definer_bypass()`. Closes a
+  pre-existing 077 hole that 102 made reachable: `groups_tenancy`'s WITH CHECK
+  let any member rewrite a group's creator to itself, and 092's creator arm
+  then made an operated `writer` admin-equivalent in its operator's group.
+  Behaviour in
+  `epigraph-db/tests/operator_link.rs::an_operated_writer_cannot_rewrite_its_operator_groups_identity`.
+  Like 100–102 it sits inside internal's `060–112`. **No undo runbook ships**:
+  undo is the `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked
+  before claiming: no remote branch carries a `103`. **Applied to a throwaway
+  database only, NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `103` or
+- **104+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `104` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
