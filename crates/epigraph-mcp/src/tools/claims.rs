@@ -1091,6 +1091,29 @@ pub async fn update_with_evidence(
 ///   neither `--jwt-secret` nor (unix-only) `--allow-unauthenticated-http`.
 ///
 /// A server WITH a declared signer keeps the strict behavior unchanged.
+///
+/// ## The operator arm (migration 102)
+///
+/// Added BESIDE every branch above, never in place of one. Agents that an
+/// operator has linked (`epigraph_link_operator`: an `OPERATED_BY` edge plus a
+/// live `writer` membership in the operator's personal group) author into that
+/// operator's group, and the operator's authority over those claims is the
+/// point of linking them. So, with `caller` = the server's own agent on stdio
+/// and `auth.agent_id` over HTTP, and `op(x)` = x's ONE live operator:
+///
+/// - `op(target) == caller` — the operator acting on its agents' claims
+///   (over HTTP this is the operator's own login principal);
+/// - `op(caller) == op(target)`, both present — sibling agents of one operator,
+///   e.g. a job whose model was bumped and so runs under a new identity;
+/// - `op(caller) == target` — an agent acting on a claim its operator authored
+///   directly. This arm is from the operator's request ("agents should inherit
+///   my owner permissions"), not from the brief's enumerated rule.
+///
+/// It is keyed on AUTHORS, never on the claim's owner group. "The owner group is
+/// writable by the caller" would be the wrong generalisation: most pre-tenancy
+/// claims are world-owned, and an agent's writable set would make it an owner
+/// of everything. `None == None` never matches — an unlinked caller and an
+/// unlinked target share no operator.
 pub(crate) async fn require_owner_or_admin(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
@@ -1103,6 +1126,11 @@ pub(crate) async fn require_owner_or_admin(
         let principal = auth.owner_id.unwrap_or(auth.client_id);
         if principal == target_agent_id {
             return Ok(());
+        }
+        if let Some(caller) = auth.agent_id {
+            if operator_arm_allows(server, caller, target_agent_id).await? {
+                return Ok(());
+            }
         }
         return Err(McpError {
             code: rmcp::model::ErrorCode::INVALID_PARAMS,
@@ -1118,6 +1146,10 @@ pub(crate) async fn require_owner_or_admin(
 
     let caller_agent = server.agent_id().await?;
     if caller_agent == target_agent_id {
+        return Ok(());
+    }
+
+    if operator_arm_allows(server, caller_agent, target_agent_id).await? {
         return Ok(());
     }
 
@@ -1150,6 +1182,46 @@ pub(crate) async fn require_owner_or_admin(
         .into(),
         data: None,
     })
+}
+
+/// The operator arm of [`require_owner_or_admin`]; see its doc for the rule.
+///
+/// Read through `AgentRepository::operator_of` (migration 102's definer read),
+/// which treats an ambiguous agent — more than one live link — as unoperated,
+/// so ambiguity can only REMOVE this arm, never widen it. A lookup failure is
+/// an error, not a `false`: the gate must not quietly decide ownership without
+/// the answer it asked for.
+async fn operator_arm_allows(
+    server: &EpiGraphMcpFull,
+    caller: uuid::Uuid,
+    target: uuid::Uuid,
+) -> Result<bool, McpError> {
+    let target_op = epigraph_db::AgentRepository::operator_of_pool(&server.pool, target)
+        .await
+        .map_err(internal_error)?
+        .map(|l| l.operator_id);
+    let caller_op = epigraph_db::AgentRepository::operator_of_pool(&server.pool, caller)
+        .await
+        .map_err(internal_error)?
+        .map(|l| l.operator_id);
+
+    let reason = if target_op == Some(caller) {
+        "caller is the operator of the claim's author"
+    } else if caller_op.is_some() && caller_op == target_op {
+        "caller and the claim's author share an operator"
+    } else if caller_op == Some(target) {
+        "the claim's author is the caller's operator"
+    } else {
+        return Ok(false);
+    };
+    tracing::info!(
+        caller = %caller,
+        target_agent = %target,
+        operator = ?target_op.or(caller_op),
+        reason,
+        "claim ownership granted through an operator link"
+    );
+    Ok(true)
 }
 
 /// One-call backlog-item retirement.
