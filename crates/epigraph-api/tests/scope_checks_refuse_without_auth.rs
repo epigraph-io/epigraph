@@ -211,3 +211,45 @@ async fn tasks_rs_refuses_without_auth() {
     ];
     assert_refused(router, &cases).await;
 }
+
+#[tokio::test]
+async fn agent_keys_rs_refuses_without_auth() {
+    use routes::agent_keys;
+    let router = Router::new()
+        .route("/api/v1/agents/:id/keys", get(agent_keys::list_agent_keys))
+        .route(
+            "/api/v1/agents/:id/keys/rotate",
+            post(agent_keys::rotate_agent_key),
+        )
+        .route(
+            "/api/v1/agents/:id/keys/:key_id/revoke",
+            post(agent_keys::revoke_agent_key),
+        )
+        .with_state(unreachable_state());
+    let id = Uuid::new_v4();
+    let cases = [
+        case(
+            "agent_keys.rs::list_agent_keys",
+            Method::GET,
+            format!("/api/v1/agents/{id}/keys"),
+            None,
+        ),
+        case(
+            "agent_keys.rs::rotate_agent_key",
+            Method::POST,
+            format!("/api/v1/agents/{id}/keys/rotate"),
+            Some(json!({
+                "new_public_key": "00".repeat(32),
+                "old_key_signature": "00".repeat(64),
+                "new_key_signature": "00".repeat(64),
+            })),
+        ),
+        case(
+            "agent_keys.rs::revoke_agent_key",
+            Method::POST,
+            format!("/api/v1/agents/{id}/keys/{}/revoke", Uuid::new_v4()),
+            Some(json!({"reason": "r"})),
+        ),
+    ];
+    assert_refused(router, &cases).await;
+}

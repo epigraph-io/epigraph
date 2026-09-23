@@ -304,7 +304,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 ///
 /// Asserted exactly for the same monotonicity reason as above.
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
-    ("agent_keys.rs", 3),
+    // `("agent_keys.rs", 3)` REMOVED by the fail-open-scope-sites conversion:
+    // list/rotate/revoke now refuse 401 without an `AuthContext`, and
+    // `revoke_agent_key`'s self-or-`claims:admin` check, which sat inside the
+    // same `if let`, runs unconditionally with it.
     // 1 → 2 when the needle set widened from one spelling to four. NOT a new
     // site and NOT a regression: `create_agent`'s `agents:write` check is
     // written `if let Some(axum::Extension(ref auth)) = &auth_ctx` — the same
