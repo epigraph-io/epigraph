@@ -2,6 +2,13 @@
 //!
 //! Provides HTTP endpoints for creating, querying, and transitioning tasks.
 //! Write operations require `tasks:write` scope; reads require `tasks:read`.
+//!
+//! Every handler refuses 401 when no `AuthContext` reached it. The scope checks
+//! used to sit inside `if let Some(..) = auth_ctx { .. }`, which authorizes
+//! nothing when the extension is absent; they were safe only because these
+//! routes are registered behind `bearer_auth_middleware`. Refusing in the
+//! handler removes that dependency on the router chain.
+//! `tests/scope_checks_refuse_without_auth.rs` mounts them bare to prove it.
 
 use axum::{
     extract::{Path, Query, State},
@@ -99,16 +106,19 @@ pub struct FailTaskRequest {
 ///
 /// POST /api/v1/tasks
 ///
-/// Requires `tasks:write` scope when OAuth2-authenticated.
+/// Requires `tasks:write` scope; refuses 401 without an `AuthContext`.
 #[cfg(feature = "db")]
 pub async fn create_task(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     let now = Utc::now();
     let row = TaskRow {
@@ -155,16 +165,19 @@ pub async fn create_task(
 ///
 /// GET /api/v1/tasks/:id
 ///
-/// Requires `tasks:read` scope when OAuth2-authenticated.
+/// Requires `tasks:read` scope; refuses 401 without an `AuthContext`.
 #[cfg(feature = "db")]
 pub async fn get_task(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
 
     let row = TaskRepository::get_by_id(&state.db_pool, id)
         .await?
@@ -194,16 +207,19 @@ pub async fn get_task(
 /// GET /api/v1/tasks
 ///
 /// Optional query params: state, workflow_id, limit (default 50).
-/// Requires `tasks:read` scope when OAuth2-authenticated.
+/// Requires `tasks:read` scope; refuses 401 without an `AuthContext`.
 #[cfg(feature = "db")]
 pub async fn list_tasks(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(params): Query<ListTasksQuery>,
 ) -> Result<Json<Vec<TaskResponse>>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:read"])?;
 
     let limit = params.limit.unwrap_or(50);
 
@@ -248,7 +264,7 @@ pub async fn list_tasks(
 ///
 /// POST /api/v1/tasks/:id/assign
 ///
-/// Requires `tasks:write` scope when OAuth2-authenticated.
+/// Requires `tasks:write` scope; refuses 401 without an `AuthContext`.
 #[cfg(feature = "db")]
 pub async fn assign_task(
     State(state): State<AppState>,
@@ -256,9 +272,12 @@ pub async fn assign_task(
     Path(id): Path<Uuid>,
     Json(request): Json<AssignTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     // Verify task exists
     let _ = TaskRepository::get_by_id(&state.db_pool, id)
@@ -297,7 +316,7 @@ pub async fn assign_task(
 ///
 /// POST /api/v1/tasks/:id/complete
 ///
-/// Requires `tasks:write` scope when OAuth2-authenticated.
+/// Requires `tasks:write` scope; refuses 401 without an `AuthContext`.
 #[cfg(feature = "db")]
 pub async fn complete_task(
     State(state): State<AppState>,
@@ -305,9 +324,12 @@ pub async fn complete_task(
     Path(id): Path<Uuid>,
     Json(request): Json<CompleteTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     // Verify task exists
     let _ = TaskRepository::get_by_id(&state.db_pool, id)
@@ -346,7 +368,7 @@ pub async fn complete_task(
 ///
 /// POST /api/v1/tasks/:id/fail
 ///
-/// Requires `tasks:write` scope when OAuth2-authenticated.
+/// Requires `tasks:write` scope; refuses 401 without an `AuthContext`.
 #[cfg(feature = "db")]
 pub async fn fail_task(
     State(state): State<AppState>,
@@ -354,9 +376,12 @@ pub async fn fail_task(
     Path(id): Path<Uuid>,
     Json(request): Json<FailTaskRequest>,
 ) -> Result<Json<TaskResponse>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["tasks:write"])?;
 
     // Verify task exists
     let _ = TaskRepository::get_by_id(&state.db_pool, id)

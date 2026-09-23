@@ -335,7 +335,11 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     ("crud.rs", 6),
     ("edges.rs", 5),
     ("papers.rs", 1),
-    ("tasks.rs", 6),
+    // `("tasks.rs", 6)` REMOVED by the fail-open-scope-sites conversion: all
+    // six handlers now take the `let Some(..) = auth_ctx else { return
+    // Err(Unauthorized) }` shape and check `tasks:read`/`tasks:write`
+    // unconditionally. `tests/scope_checks_refuse_without_auth.rs` observes the
+    // 401 over a router with no bearer layer.
     // `("webhooks.rs", 2)` REMOVED by PR-10, which converted both sites in
     // `delete_webhook` to the prescribed
     // `auth_ctx.ok_or(ApiError::Unauthorized { .. })?` shape and made the scope
