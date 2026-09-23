@@ -28,8 +28,9 @@
 //! # What this lint checks, stated precisely
 //!
 //! Within a scanned file, it splits the source into function-sized regions and,
-//! for each region that MINTS a bypass ([`MINTS`]), asserts that the region
-//! names no FOREIGN POOL HANDLE ([`FOREIGN_POOLS`]).
+//! for each region that MINTS a bypass ([`MINTS`]) or HOLDS one it was handed
+//! ([`HOLDS`] — the `MaintenanceSession` type), asserts that the region names no
+//! FOREIGN POOL HANDLE ([`FOREIGN_POOLS`]).
 //!
 //! The granularity is the FUNCTION and that is an over-approximation, the same
 //! one `visibility_lint.rs` states for `no_spliced_statement_binds_the_unconditional_group_array`:
@@ -70,34 +71,31 @@
 //! pool, that assumption dies and this paragraph is the thing to re-measure.
 //!
 //! **(b) A MINT AND A SPEND IN DIFFERENT FUNCTIONS — OR DIFFERENT FILES — ARE
-//! INVISIBLE TO THIS SCANNER, AND THAT IS WHERE THE LARGEST RESIDUAL LIVES.**
-//! [`scan`] keys on one function-sized region containing BOTH a [`MINTS`]
-//! spelling and a [`FOREIGN_POOLS`] one. A function that mints and hands the
-//! `&Viewer` to a callee that runs the statements elsewhere matches neither
-//! half anywhere. **Measured instance:** `epigraph-mcp/src/server.rs`'s three
-//! maintenance tools mint through `maintenance_viewer(` and pass the viewer
-//! into `crates/epigraph-mcp/src/tools/`, whose statements run on
-//! `server.pool`. No file under `crates/epigraph-mcp/src` that names
-//! `server.pool` also carries a [`MINTS`] spelling, so the `"server.pool"` entry
-//! in [`FOREIGN_POOLS`] contributes **zero** detections today and a reader of
-//! this file alone would wrongly conclude that surface is covered.
+//! INVISIBLE TO THIS SCANNER WHEN WHAT CROSSES THE BOUNDARY IS A BARE
+//! `&Viewer`.** [`scan`] keys on one function-sized region containing BOTH a
+//! bypass spelling and a [`FOREIGN_POOLS`] one. A function that mints and hands
+//! a `&Viewer` to a callee that runs the statements elsewhere matches neither
+//! half anywhere, because `Viewer` is also the type every REQUEST viewer has
+//! and cannot be keyed on.
 //!
-//! Those three sites are NOT in [`EXPECTED_HYBRIDS`], deliberately: [`scan`]
-//! cannot find them, so registering them would put them in the `fixed` set and
-//! fail the second assertion of
-//! `no_function_mints_a_bypass_and_names_a_foreign_pool` — a register can only
-//! hold rows this scanner can confirm. The class IS recorded elsewhere:
-//! `no_unmaintained_dsn.rs`'s register carries `epigraph-mcp/src/main.rs` with
-//! the reasoning, `main.rs` documents it, and `EpiGraphMcpFull::with_scoped_pool`
-//! has no production caller, so `maintenance_viewer` fails CLOSED there today.
-//! Owner for closing the gap: `D-PR17-hybrid-shape-lint`.
+//! The measured instance of this limit is gone, and how it went is what (c)
+//! below is about. `epigraph-mcp/src/server.rs`'s three maintenance tools used
+//! to mint through `maintenance_viewer(` and hand a bare `&Viewer` into
+//! `crates/epigraph-mcp/src/tools/`, whose statements ran on `server.pool`; the
+//! `"server.pool"` entry in [`FOREIGN_POOLS`] contributed zero detections. The
+//! tools now take `&mut MaintenanceSession` instead and run on it, which both
+//! fixes them and moves them INTO this scanner's reach: each tool function's
+//! region now carries a [`HOLDS`] spelling, so a regression to `server.pool`
+//! is a same-region finding. `the_mcp_maintenance_tools_are_in_reach_and_clean`
+//! pins that by name, in both directions.
 //!
-//! **(c) Passing a `MaintenanceSession` into a callee has the same shape as
-//! (b).** A helper taking `&mut MaintenanceSession`
-//! and a pool handle contains no [`MINTS`] spelling in its own region. The type
-//! is new in this batch and is designed to be handed around as one value, so the
-//! ergonomics win and this blind spot are the same change. Recorded rather than
-//! left for the next reader to discover.
+//! **(c) Passing a `MaintenanceSession` into a callee — CLOSED.** A helper
+//! taking `&mut MaintenanceSession` and a pool handle used to contain no
+//! [`MINTS`] spelling in its own region. [`HOLDS`] now counts naming the
+//! session type as holding a bypass, so such a helper is scanned exactly like a
+//! function that mints. What stays invisible is (b): the bare-`&Viewer`
+//! hand-off. The remedy there is the one the MCP tools took — pass the session,
+//! not the viewer.
 //!
 //! # A RATCHET WITH A NAMED RESIDUE, not an invariant
 //!
@@ -121,6 +119,21 @@ const MINTS: &[&str] = &[
     "maintenance_viewer(",
     "maintenance_session(",
 ];
+
+/// Spellings by which a region HOLDS a bypass it did not mint: naming the
+/// session type, whether as a parameter, a return type or a local annotation.
+///
+/// Kept apart from [`MINTS`] because the claim is different — a region here
+/// may never call a mint, yet the `&Viewer` it can reach through
+/// `MaintenanceSession::viewer` / `::split` is just as unrestricted. Known
+/// limit (c) is what this closes. `GatedMaintenanceSession`
+/// (`epigraph-mcp/src/maintenance.rs`) contains the spelling and is meant to.
+const HOLDS: &[&str] = &["MaintenanceSession"];
+
+/// Does this region hold a bypass viewer, by minting one or by being handed one?
+fn holds_a_bypass(body: &str) -> bool {
+    MINTS.iter().any(|m| body.contains(m)) || HOLDS.iter().any(|h| body.contains(h))
+}
 
 /// Pool handles that are NOT derived from a maintenance connection.
 ///
@@ -454,8 +467,7 @@ fn scan() -> BTreeSet<(String, String)> {
             // and the production half is what this lint is about.
             let prod = strip_cfg_test_modules(&src);
             for r in regions(&prod) {
-                let mints = MINTS.iter().any(|m| r.body.contains(m));
-                if !mints {
+                if !holds_a_bypass(&r.body) {
                     continue;
                 }
                 if FOREIGN_POOLS.iter().any(|p| r.body.contains(p)) {
@@ -506,6 +518,7 @@ fn no_function_mints_a_bypass_and_names_a_foreign_pool() {
 #[test]
 fn the_scanner_is_not_vacuous() {
     let mut minting_regions = 0usize;
+    let mut holding_regions = 0usize;
     let mut foreign_pool_regions = 0usize;
     let mut files_seen = 0usize;
     for root in SCAN_ROOTS {
@@ -518,6 +531,9 @@ fn the_scanner_is_not_vacuous() {
             for r in regions(&prod) {
                 if MINTS.iter().any(|m| r.body.contains(m)) {
                     minting_regions += 1;
+                }
+                if HOLDS.iter().any(|h| r.body.contains(h)) {
+                    holding_regions += 1;
                 }
                 if FOREIGN_POOLS.iter().any(|p| r.body.contains(p)) {
                     foreign_pool_regions += 1;
@@ -534,6 +550,14 @@ fn the_scanner_is_not_vacuous() {
         minting_regions >= 5,
         "only {minting_regions} regions mint a bypass. If the mint spellings in \
          MINTS ever go stale the whole lint passes by matching nothing."
+    );
+    // The three MCP maintenance tool functions take a session, so HOLDS must
+    // match at least those; below that the spelling has gone stale and known
+    // limit (c) is open again without anything saying so.
+    assert!(
+        holding_regions >= 3,
+        "only {holding_regions} regions name MaintenanceSession. If HOLDS ever \
+         goes stale, a function handed a session is invisible again."
     );
     // DELIBERATELY LOW, and not a ratchet. COMPLETION-PLAN 2.1's conversion tail
     // exists to drive `state.db_pool` uses toward zero, so a floor set at
@@ -612,6 +636,69 @@ fn the_registered_hybrid_is_really_there() {
         FOREIGN_POOLS.iter().any(|p| region.body.contains(p)),
         "CALIBRATION: the registered hybrid must still name a foreign pool \
          handle. If it does not, the row belongs in a DELETE, not here."
+    );
+}
+
+/// The three MCP maintenance tools, asserted BY NAME: each is in the scanner's
+/// reach (its region names the session type) and names no foreign pool.
+///
+/// This is known limit (b)'s measured instance, turned into a calibration
+/// case. Before the tools took a `MaintenanceSession` they took a bare
+/// `&Viewer` and queried `server.pool`, and this scanner could see neither half.
+/// "Not in `scan()`" alone would be satisfied by a broken scanner, so both
+/// halves are asserted directly — and the SAME predicate `scan` uses is shown to
+/// fire on the regression, so the clean result is not a blind spot.
+#[test]
+fn the_mcp_maintenance_tools_are_in_reach_and_clean() {
+    for (src, name) in [
+        (
+            include_str!("../../epigraph-mcp/src/tools/dedup_sweep.rs"),
+            "sweep_semantic_duplicates",
+        ),
+        (
+            include_str!("../../epigraph-mcp/src/tools/embeddings.rs"),
+            "backfill_embeddings",
+        ),
+        (
+            include_str!("../../epigraph-mcp/src/tools/cdst_maintenance.rs"),
+            "recompute_beliefs",
+        ),
+    ] {
+        let src = strip_cfg_test_modules(&strip_comments(src));
+        let region = regions(&src)
+            .into_iter()
+            .find(|r| r.name == name)
+            .unwrap_or_else(|| panic!("tools must still define {name}"));
+        assert!(
+            holds_a_bypass(&region.body),
+            "{name} must take the maintenance session. If it went back to a bare \
+             `&Viewer`, it is out of this scanner's reach again (known limit b)."
+        );
+        assert!(
+            !FOREIGN_POOLS.iter().any(|p| region.body.contains(p)),
+            "{name} names an application pool handle: its bypass viewer would read \
+             zero rows there under row security"
+        );
+    }
+
+    // The regression, as the scanner sees it.
+    let regressed = r#"
+pub async fn sweep_semantic_duplicates(
+    _server: &EpiGraphMcpFull,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
+) {
+    let (_conn, viewer) = session.split();
+    let _ = ClaimRepository::content_hashes_for(&server.pool, viewer, &[]).await;
+}
+"#;
+    let region = regions(regressed)
+        .into_iter()
+        .next()
+        .expect("sample has a region");
+    assert!(
+        holds_a_bypass(&region.body) && FOREIGN_POOLS.iter().any(|p| region.body.contains(p)),
+        "CALIBRATION: a session-holding function that queries `server.pool` must \
+         be a finding"
     );
 }
 
