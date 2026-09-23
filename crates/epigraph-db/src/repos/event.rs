@@ -339,6 +339,35 @@ impl EventRepository {
     /// swallowed: it means the caller's transaction was already unusable, which
     /// this method has no way to repair and must not mask by panicking.
     ///
+    /// # An event's `created_at` is NOT its visibility order
+    ///
+    /// Stated because the transactional callers multiplied and the consequence
+    /// is invisible from any one of them. `created_at` is `NOW()`, which inside
+    /// a transaction is the transaction's START time, and `graph_version` is a
+    /// `nextval` taken at INSERT time — but a reader sees the row only at
+    /// COMMIT. So an event can become visible carrying a timestamp (and a
+    /// version) EARLIER than events that were already visible. MEASURED: the
+    /// review saw one transactional `ingest_workflow` write 18 `claim.created`
+    /// events with ONE distinct `created_at`; `scripts/e2e/probe-unit-e.sh`'s
+    /// TRANSACTIONAL EVENTS arm reads groups of up to 8 sharing one timestamp
+    /// on this branch, against 1 on main, whose walk was not transactional.
+    ///
+    /// The consequence for a poller: `GET /api/v1/events` filters on
+    /// `created_at >= since`. A consumer that advances `since` past the start
+    /// of a transaction that is still open when it polls will never see that
+    /// transaction's events. Inferred from the code, not observed. Not new in
+    /// kind — `ClaimRepository::create_strict` and `::supersede` published
+    /// through here inside transactions before the Unit E conversions — but
+    /// those conversions put whole ingest walks (many events, long
+    /// transactions) on this path.
+    ///
+    /// Not fixed here, deliberately: `clock_timestamp()` would narrow the
+    /// window without closing it (it is still pre-commit), and a
+    /// commit-ordered cursor is a change to the events API's contract, not to
+    /// this helper. A consumer that must not miss events should re-read an
+    /// overlap window behind its cursor (the endpoint's `since` is inclusive)
+    /// and dedupe by event id.
+    ///
     /// Uses runtime `sqlx::query` (not the compile-time macro) to avoid
     /// adding offline-data churn for callers in transactional contexts.
     pub async fn publish_or_log_conn(
