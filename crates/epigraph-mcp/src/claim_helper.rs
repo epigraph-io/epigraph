@@ -43,11 +43,51 @@ use crate::server::EpiGraphMcpFull;
 /// `tenancy.scoped_write` log target as
 /// `epigraph-api/src/routes/groups.rs::rotate_key`.
 ///
+/// # Why the author's personal group is ensured HERE, on the pool, first
+///
+/// The stamp is taken from the viewer as it is at `BEGIN` time, and every row
+/// this submission writes is owned by the author's personal group — so if that
+/// group does not exist yet, or exists with no live writable membership, the
+/// viewer's writable set is EMPTY and the `WITH CHECK` on `claims` /
+/// `reasoning_traces` / `evidence` refuses the write from inside the
+/// transaction. Minting the group *inside* the transaction cannot repair that:
+/// `create_claim_idempotent`'s first statement is
+/// `ClaimRepository::default_decl_for_author`, whose `personal_group_of` does
+/// mint on a miss, but the GUCs were stamped before it ran and a session's
+/// writable set is not re-read per statement.
+///
+/// `server.rs::agent_id`'s PR-09 block already ensures the group on a pool
+/// checkout before either caller reaches this function, so on the live path this
+/// is a lookup. It is repeated here because that call is WARN-ONLY and its
+/// result is cached unconditionally (`*cached = Some(id)` runs whether or not the
+/// ensure succeeded), so one transient failure at process start would otherwise
+/// leave every later submission in that process stamped `{}` — and because a
+/// helper whose correctness depends on a side effect of an unrelated earlier call
+/// is one refactor away from being wrong. `personal_group_of_pool` is read-first
+/// and mints only when the group is absent, so it cannot revive a membership
+/// somebody revoked (see its doc).
+///
+/// # Why an empty writable set is a refusal
+///
+/// It is the one condition under which the stamp is provably useless: nothing the
+/// submission writes can satisfy any tier-A `WITH CHECK`, so the transaction
+/// would fail mid-way and be rolled back anyway. Refusing up front reports the
+/// real cause — this author has no writable group — instead of a `42501` from
+/// whichever statement happened to be first.
+///
+/// This is the one part of the conversion that changes behaviour for a
+/// deployment that currently works: on a superuser DSN `epigraph_bypass()` is
+/// true, so a submission by an author with no writable group commits today. That
+/// is exactly the configuration whose DSN change turned the same write into a
+/// half-landed orphan, and a write that only succeeds because the session
+/// bypasses RLS is not a write this path should be making.
+///
 /// # Errors
 /// * `McpError::internal_error` if this process was not built from a
 ///   [`epigraph_db::ScopedPool`].
-/// * `McpError::internal_error` if the author's viewer cannot be resolved, or if
-///   `BEGIN` / the GUC stamp fails.
+/// * `McpError::internal_error` if the author's personal group cannot be
+///   resolved, if the author's viewer cannot be resolved, if that viewer has no
+///   writable group, or if `BEGIN` / the GUC stamp fails.
 pub async fn begin_author_stamped_tx<'p>(
     server: &'p EpiGraphMcpFull,
     author_agent_id: uuid::Uuid,
@@ -70,6 +110,24 @@ pub async fn begin_author_stamped_tx<'p>(
         ))
     })?;
 
+    // On the pool and BEFORE the resolve, so the membership the stamp is taken
+    // from exists by the time it is read. See the doc above.
+    let author_group = ClaimRepository::personal_group_of_pool(&server.pool, author_agent_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                author = %author_agent_id,
+                error = %e,
+                "could not resolve the author's personal group, so no connection can be \
+                 stamped with a group the submission's rows will be owned by"
+            );
+            internal_error(format!(
+                "{tool_name}: could not resolve the author's personal group: {e}"
+            ))
+        })?;
+
     let author_viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, author_agent_id)
         .await
         .map_err(|e| {
@@ -84,6 +142,26 @@ pub async fn begin_author_stamped_tx<'p>(
                 "{tool_name}: could not resolve the author's viewer: {e}"
             ))
         })?;
+
+    if author_viewer.writable_groups().is_empty() {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            author = %author_agent_id,
+            author_group = %author_group,
+            "write refused: the author's viewer carries NO writable group, so the session \
+             would be stamped with an empty writable set and every tier-A WITH CHECK would \
+             refuse this submission from inside the transaction. The author's personal group \
+             exists; what is missing is a live `admin`/`writer` membership in it (a revoked \
+             membership is deliberately never revived by a write path). Nothing was written."
+        );
+        return Err(internal_error(format!(
+            "{tool_name}: the author ({author_agent_id}) has no writable group — its personal \
+             group {author_group} carries no live admin/writer membership — so no connection \
+             can be stamped with write authority for the rows this submission would own. \
+             Nothing was written."
+        )));
+    }
 
     scoped.begin_as(&author_viewer).await.map_err(|e| {
         tracing::error!(

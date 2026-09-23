@@ -114,6 +114,29 @@ fn memorize_params(content: &str) -> MemorizeParams {
     }
 }
 
+/// The agent the MCP server authored a claim as — read back from the row rather
+/// than from `server.agent_id()`, which is `pub(crate)`.
+async fn author_of(pool: &PgPool, claim: Uuid) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read the claim's author")
+}
+
+/// The author's personal group, identified the way production identifies it:
+/// the deterministic `did:epigraph:personal:<agent>` key. Nothing on `agents`
+/// records which group is the personal one.
+async fn personal_group_of(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(agent)
+    .fetch_optional(pool)
+    .await
+    .expect("read the author's personal group")
+}
+
 async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM claims WHERE content_hash = $1")
         .bind(ContentHasher::hash(content.as_bytes()).as_slice())
@@ -327,6 +350,194 @@ async fn the_committed_submission_carries_claim_trace_evidence_and_link(pool: Pg
     assert!(
         trace_id_of(&pool, claim).await.is_some(),
         "claims.trace_id must be linked in the same transaction"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// WHAT THE STAMP IS TAKEN FROM: the author's writable group set
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A NEVER-SEEN author's FIRST submission must land, and the viewer the stamp is
+/// taken from must carry that author's personal group as WRITABLE.
+///
+/// # The review finding this answers, and the part of it that is real
+///
+/// A reviewer read `begin_author_stamped_tx` as resolving the viewer before the
+/// author's personal group exists, so that the group is minted by
+/// `default_decl_for_author` as the FIRST statement inside the transaction —
+/// after the GUCs were stamped `{}` — making every first submission by a new
+/// author fail. The ordering claim is wrong on this tree: `server.rs::agent_id`
+/// calls `AgentRepository::ensure_personal_group` on a pool checkout, and both
+/// tools call it (claims.rs, memory.rs) before reaching the helper.
+///
+/// The OUTCOME is still reachable, by a route the finding did not name: that
+/// ensure is warn-only and its result is cached unconditionally, so a single
+/// transient failure at process start leaves every later submission stamped with
+/// an empty writable set. `begin_author_stamped_tx` therefore ensures the group
+/// itself, before the resolve, and refuses an empty writable set outright.
+///
+/// This arm is the positive half. It is NOT vacuous under the superuser harness
+/// even though no policy filters it, because the refusal it calibrates is in
+/// Rust: with the guard in place, a submission that reached `COMMIT` proves the
+/// resolved viewer had a writable group at `BEGIN` time. The second assertion
+/// then names WHICH group, so the arm cannot pass on a writable set that happens
+/// to be non-empty for an unrelated reason.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_brand_new_authors_first_submission_carries_a_writable_stamp(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (server, _scoped) = server_with_scoped(&pool, 0xC1).await;
+    let content = format!("first submission by a never-seen author {}", Uuid::new_v4());
+
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+        .await
+        .expect(
+            "the FIRST submission by an author with no pre-existing personal group must land. \
+             A refusal naming 'no writable group' means the group is being minted too late — \
+             after the stamp — which is the regression this arm exists to catch.",
+        );
+
+    let claim = claim_id_for(&pool, &content).await;
+    let author = author_of(&pool, claim).await;
+    let personal = personal_group_of(&pool, author)
+        .await
+        .expect("the author's personal group must exist after its first submission");
+
+    let author_viewer = epigraph_db::visibility::Viewer::resolve(&pool, author)
+        .await
+        .expect("resolve the author's viewer, the way the write path does");
+    assert!(
+        author_viewer.writable_groups().contains(&personal),
+        "the viewer the session is stamped from must carry the author's own personal group as \
+         WRITABLE — every row this submission writes is owned by it, and migration 077's \
+         WITH CHECK asks `owner_group_id = ANY(epigraph_writable_groups())`. Got: {:?}",
+        author_viewer.writable_groups()
+    );
+}
+
+/// The negative half: an author whose personal-group membership has been REVOKED
+/// is refused up front, and nothing is written.
+///
+/// Why revocation rather than a missing group: `personal_group_of` is read-first
+/// and mints only when the group is ABSENT, deliberately, so that a write path
+/// can never revive a membership somebody revoked
+/// (`claim.rs::personal_group_of`'s doc states that as a security property). So a
+/// revoked membership is the one state the pre-ensure cannot repair — and it is
+/// exactly the state in which the stamp would be `{}` and the submission would
+/// fail from inside the transaction, on whichever statement came first, with a
+/// `42501` naming a table rather than the cause.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_author_with_no_live_writable_membership_is_refused_before_anything_is_written(
+    pool: PgPool,
+) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (server, _scoped) = server_with_scoped(&pool, 0xC2).await;
+
+    let first = format!("establish the author {}", Uuid::new_v4());
+    tools::claims::submit_claim(&server, &viewer, submit_params(&first))
+        .await
+        .expect("CALIBRATION: the first submission establishes the author and its group");
+    let author = author_of(&pool, claim_id_for(&pool, &first).await).await;
+
+    let revoked =
+        sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+            .bind(author)
+            .execute(&pool)
+            .await
+            .expect("revoke the author's memberships")
+            .rows_affected();
+    assert!(
+        revoked > 0,
+        "CALIBRATION: the author had a membership to revoke, or the arm below is vacuous"
+    );
+
+    let content = format!("submission with no writable group {}", Uuid::new_v4());
+    let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+        .await
+        .expect_err(
+            "an author with no live admin/writer membership cannot satisfy any tier-A WITH \
+             CHECK, so the submission must be refused before anything is written. Succeeding \
+             here means the process is relying on the session bypassing RLS.",
+        );
+    assert!(
+        err.message.contains("no writable group"),
+        "the refusal must name the cause — the author has no writable group — rather than \
+         surfacing a 42501 from whichever statement ran first; got: {}",
+        err.message
+    );
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        0,
+        "the refusal must leave nothing behind"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// A SWALLOWED ERROR ONE CALL DEEPER: the durable event INSERT
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `ClaimRepository::create_strict` publishes its `claim.created` event with
+/// `let _ = EventRepository::publish_or_log_conn(…)`. Inside a transaction that
+/// contract only holds if the failed INSERT is rolled back to a SAVEPOINT: a
+/// bare failed statement aborts the transaction, so the swallowed error
+/// resurfaces at the next statement as `25P02 current transaction is aborted`
+/// with the real cause only in the log.
+///
+/// Non-vacuous under the superuser harness for the same reason as the rollback
+/// arms: it asserts TRANSACTION semantics, not row visibility. Revert the
+/// savepoint in `publish_or_log_conn` and this arm fails with the submission
+/// erroring out on `current transaction is aborted`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refused_event_insert_does_not_abort_the_submission(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (server, _scoped) = server_with_scoped(&pool, 0xC3).await;
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION refuse_event_for_test() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             RAISE EXCEPTION 'refused events insert (test trigger)' USING ERRCODE = '42501';
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_event_for_test BEFORE INSERT ON events
+         FOR EACH ROW EXECUTE FUNCTION refuse_event_for_test()",
+    )
+    .execute(&pool)
+    .await
+    .expect("install the refusing trigger");
+
+    let content = format!("event-refused submit {}", Uuid::new_v4());
+    tools::claims::submit_claim(&server, &viewer, submit_params(&content))
+        .await
+        .expect(
+            "a refused `events` INSERT is observability, not the write. The submission must \
+             still commit; an error here means the swallowed failure aborted the caller's \
+             transaction.",
+        );
+
+    let claim = claim_id_for(&pool, &content).await;
+    let (traces, evidence) = counts_for(&pool, claim).await;
+    assert_eq!(
+        (traces, evidence),
+        (1, 1),
+        "the whole submission must have landed, not just the claim"
+    );
+    assert!(
+        trace_id_of(&pool, claim).await.is_some(),
+        "`update_trace_id` runs AFTER the event INSERT inside the same transaction, so a NULL \
+         here is the 25P02 this arm exists to catch"
+    );
+    let events = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM events")
+        .fetch_one(&pool)
+        .await
+        .expect("count events");
+    assert_eq!(
+        events, 0,
+        "CALIBRATION: the trigger really did refuse every event INSERT. A non-zero count means \
+         this arm proved nothing."
     );
 }
 
