@@ -184,6 +184,128 @@ impl SecurityEventRepository {
             .collect())
     }
 
+    /// Query security events a PRINCIPAL may read, on a caller-supplied
+    /// connection.
+    ///
+    /// Same filter, ordering and limit as [`Self::query`], plus one conjunct:
+    /// the row is the principal's own (`agent_id = $7`), or the principal is a
+    /// live instance administrator. That is migration 083's
+    /// `security_events_read` policy restated in the statement, so the policy
+    /// and the statement are two independent filters that give the same answer.
+    ///
+    /// # Why the statement repeats the policy
+    ///
+    /// Without the in-query conjunct, the policy is the only thing that narrows
+    /// this read, and RLS does nothing on a session that bypasses it: a
+    /// superuser or a `BYPASSRLS` role. The policy narrows the API pool only
+    /// once plan §9.2 step 11d makes `epigraph_app` the connecting role, and CI
+    /// and every developer host connect as a superuser. On such a session a
+    /// stamped connection still returns every principal's events. The conjunct
+    /// binds whatever the session role is; `security_event_principal_read.rs`
+    /// pins that on a superuser connection, where RLS cannot be what narrows.
+    ///
+    /// # The policy's two bypass arms are left out on purpose
+    ///
+    /// 083's policy begins `epigraph_bypass() OR epigraph_definer_bypass()`.
+    /// `epigraph_bypass()` is true for any session whose `session_user` is a
+    /// member of `epigraph_maintenance`, and a superuser is a member of every
+    /// role. Copying that arm would admit every row on exactly the sessions the
+    /// conjunct exists for. No request-path read is a maintenance read, so the
+    /// arm has no legitimate caller here.
+    ///
+    /// # Why a principal and not a `Viewer`
+    ///
+    /// `security_events` has no `visibility` and no `owner_group_id`. A `Viewer`
+    /// filters on those two columns, so here it would be a parameter that is
+    /// never spent, which is the shape `visibility_lint.rs` exists to catch.
+    /// The principal is what the policy keys on, so it is what this takes. The
+    /// caller must pass the principal of the viewer the connection was stamped
+    /// with, taken from the same `Viewer` it handed to `AppState::read_as`. The
+    /// principal is BOUND rather than read from `epigraph_principal_id()`, so
+    /// the conjunct does not depend on the session at all.
+    ///
+    /// # The instance-admin call is a sub-select, and that is a guard
+    ///
+    /// `(SELECT public.epigraph_is_instance_admin($7))` is evaluated once per
+    /// statement as an `InitPlan`. Written without the `SELECT`, the call would
+    /// land in the row `Filter` and run once per SCANNED row. It is a
+    /// `SECURITY DEFINER` function doing an `EXISTS` over `instance_admins`, so
+    /// that would be one such call per row of an actor log that only grows.
+    /// This is 083's regression note, applied to the statement as 083 applies
+    /// it to the policy.
+    ///
+    /// The function answers `false` unless its argument is the session
+    /// principal or the session is a bypass session (083's body). On a stamped
+    /// connection the argument IS the session principal. On a superuser
+    /// connection the bypass arm lets it answer for the bound principal. So it
+    /// tells the truth on both.
+    ///
+    /// Unattributed rows (`agent_id IS NULL`, written by pre-authentication
+    /// paths) fail the first arm, so only an instance administrator reads them.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the SELECT fails.
+    #[instrument(skip(conn))]
+    pub async fn query_for_principal_conn(
+        conn: &mut sqlx::PgConnection,
+        principal: Uuid,
+        filter: SecurityEventFilter,
+    ) -> Result<Vec<SecurityEventRow>, DbError> {
+        let limit = filter.limit.unwrap_or(1000).min(10_000);
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id,
+                event_type,
+                agent_id,
+                success,
+                details,
+                ip_address::text AS ip_address,
+                user_agent,
+                correlation_id,
+                created_at
+            FROM security_events
+            WHERE
+                ($1::uuid IS NULL        OR agent_id   = $1)
+            AND ($2::text IS NULL        OR event_type = $2)
+            AND ($3::timestamptz IS NULL OR created_at >= $3)
+            AND ($4::timestamptz IS NULL OR created_at <= $4)
+            AND (NOT $5                  OR success = false)
+            -- security_events_read (migration 083) minus its two bypass arms.
+            AND (agent_id = $7::uuid
+                 OR (SELECT public.epigraph_is_instance_admin($7::uuid)))
+            ORDER BY created_at DESC
+            LIMIT $6
+            "#,
+            filter.agent_id as Option<Uuid>,
+            filter.event_type as Option<String>,
+            filter.from as Option<DateTime<Utc>>,
+            filter.until as Option<DateTime<Utc>>,
+            filter.failures_only,
+            limit,
+            principal,
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(DbError::from)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| SecurityEventRow {
+                id: r.id,
+                event_type: r.event_type,
+                agent_id: r.agent_id,
+                success: r.success,
+                details: r.details,
+                ip_address: r.ip_address,
+                user_agent: r.user_agent,
+                correlation_id: r.correlation_id,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
     /// Count failure events for a specific agent since a given timestamp.
     ///
     /// A row is counted as a failure when `success = false`.

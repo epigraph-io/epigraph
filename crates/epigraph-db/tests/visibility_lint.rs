@@ -924,6 +924,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          same answer.",
     ),
     (
+        "security_event.rs",
+        "query_for_principal_conn",
+        "READ of `security_events`, which has no `visibility` and no `owner_group_id`, so a \
+         `Viewer` would have nothing to be spent on. It takes the PRINCIPAL instead and narrows \
+         in its own `WHERE` with `agent_id = $7 OR (SELECT epigraph_is_instance_admin($7))`: \
+         migration 083's `security_events_read` minus its bypass arms, which are true on every \
+         superuser session. So it narrows on a connection RLS does not filter, and \
+         `security_event_principal_read.rs` pins that. The caller passes the principal of the \
+         viewer it gave `AppState::read_as`, so on a stamped app connection the policy and the \
+         conjunct agree.",
+    ),
+    (
         "provenance.rs",
         "append_conn",
         "WRITE, append-only, into `provenance_log`. It records who authorised a write that the \
