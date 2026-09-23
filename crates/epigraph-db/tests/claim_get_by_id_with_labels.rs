@@ -51,8 +51,8 @@ async fn get_by_id_with_labels_returns_none_when_no_row(pool: PgPool) {
     // the only reason the result is None.
     let decoy_agent = Uuid::new_v4();
     insert_test_agent(&pool, decoy_agent).await;
-    let decoy = ClaimRepository::create(
-        &pool,
+    let decoy = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
         &make_claim(&format!("decoy {}", Uuid::new_v4()), decoy_agent),
         epigraph_core::TenancyDecl::Inherited,
     )
@@ -84,9 +84,13 @@ async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("atomic read {}", Uuid::new_v4()), agent_id);
-    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create");
+    let created = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create");
 
     ClaimRepository::update_labels(
         &pool,
@@ -104,8 +108,8 @@ async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
     // The decoy's labels are disjoint, so any leak changes the result.
     let decoy_agent = Uuid::new_v4();
     insert_test_agent(&pool, decoy_agent).await;
-    let decoy = ClaimRepository::create(
-        &pool,
+    let decoy = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
         &make_claim(&format!("decoy labels {}", Uuid::new_v4()), decoy_agent),
         epigraph_core::TenancyDecl::Inherited,
     )

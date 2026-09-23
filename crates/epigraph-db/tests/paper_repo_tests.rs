@@ -63,9 +63,13 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
         .await
         .expect("create agent");
     let claim = make_claim(agent_row.id, "test claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create claim");
+    let claim_row = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create claim");
 
     EdgeRepository::create(
         &pool,
@@ -119,9 +123,13 @@ async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
         .await
         .expect("create agent");
     let claim = make_claim(agent_row.id, "orphan-labeled claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create claim");
+    let claim_row = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create claim");
 
     // Label the claim but deliberately create no `asserts` edge.
     ClaimRepository::update_labels(&pool, claim_row.id.into(), &[format!("doi:{doi}")], &[])

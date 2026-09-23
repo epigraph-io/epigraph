@@ -600,117 +600,6 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
-    /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
-    ///
-    /// **Legacy behavior:** dedups on `content_hash` alone (NOT on
-    /// `(content_hash, agent_id)`), so a request from agent B with the same
-    /// content as an earlier claim from agent A returns agent A's row. This is
-    /// a noun-claim invariant violation. New code should use
-    /// `find_by_content_hash_and_agent` + `create_or_get` / `create_strict`
-    /// (see `docs/architecture/noun-claims-and-verb-edges.md`). The ~44
-    /// internal callers of this method are migrated as a separate
-    /// out-of-band task.
-    ///
-    /// `decl` declares the row's tenancy. Migration 074 drops the
-    /// `visibility` / `owner_group_id` defaults, so a write that names neither
-    /// and has no parent to inherit from raises `23502`. This method's INSERT
-    /// binds no parent at all, so [`TenancyDecl::Inherited`] here reaches the
-    /// seed escape hatch for a test-harness role and raises for an application
-    /// role — which is the intended asymmetry, not an oversight. See
-    /// `docs/tenancy.md#declaring-visibility-on-write`.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, claim))]
-    pub async fn create(pool: &PgPool, claim: &Claim, decl: TenancyDecl) -> Result<Claim, DbError> {
-        let id: Uuid = claim.id.into();
-        let agent_id: Uuid = claim.agent_id.into();
-        let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
-        let truth_value = claim.truth_value.value();
-        let created_at = claim.created_at;
-        let updated_at = claim.updated_at;
-
-        // Calculate content hash using BLAKE3
-        let content_hash = ContentHasher::hash(claim.content.as_bytes());
-
-        // Dedup: if a claim with this content already exists, return it instead of
-        // inserting a duplicate. Two round-trips are acceptable; the race window is
-        // tiny and duplicate claims are idempotent in practice.
-        let existing = sqlx::query!(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-               SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-               FROM claims WHERE content_hash = $1 LIMIT 1"#,
-            content_hash.as_slice()
-        )
-        .fetch_optional(pool)
-        .await?;
-
-        if let Some(existing_row) = existing {
-            let tv = TruthValue::new(existing_row.truth_value)?;
-            return Ok(claim_from_row(
-                existing_row.id,
-                existing_row.content,
-                existing_row.agent_id,
-                existing_row.trace_id,
-                tv,
-                existing_row.created_at,
-                existing_row.updated_at,
-            ));
-        }
-
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO claims (
-                id, content, content_hash, truth_value, agent_id, trace_id,
-                created_at, updated_at, visibility, owner_group_id
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            "#,
-            id,
-            claim.content,
-            content_hash.as_slice(),
-            truth_value,
-            agent_id,
-            trace_id,
-            created_at,
-            updated_at,
-            decl.visibility_bind(),
-            decl.owner_group_bind()
-        )
-        .fetch_one(pool)
-        .await?;
-
-        // Fire-and-forget claim.created event (closes #61). This is the
-        // central emit for ALL writers that go through ClaimRepository::create
-        // (MCP ingestion paths, API conventions, paper repo, tests). The
-        // dedup early-return above does NOT emit, so resubmissions of an
-        // existing content_hash do not pollute the audit log.
-        let _ = crate::repos::EventRepository::publish_or_log(
-            pool,
-            "claim.created",
-            Some(row.agent_id),
-            &serde_json::json!({
-                "claim_id": row.id,
-                "agent_id": row.agent_id,
-                "truth_value": row.truth_value,
-            }),
-        )
-        .await;
-
-        let truth_value = TruthValue::new(row.truth_value)?;
-
-        Ok(claim_from_row(
-            row.id,
-            row.content,
-            row.agent_id,
-            row.trace_id,
-            truth_value,
-            row.created_at,
-            row.updated_at,
-        ))
-    }
-
     /// Set the `properties` JSONB column on an existing claim. Overwrites the
     /// existing value (does not merge). Used by ingest to attach hierarchy
     /// metadata (level, section, source_type, generality) at creation time.
@@ -1564,106 +1453,6 @@ impl ClaimRepository {
             });
         }
         Ok(())
-    }
-
-    /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
-    ///
-    /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.
-    /// Uses runtime query (not compile-time macro) to support the connection executor.
-    ///
-    /// **Legacy behavior:** see the note on `create()` — this method shares
-    /// the same cross-agent collapse bug. New transactional code should use
-    /// `create_or_get` / `create_strict`.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    pub async fn create_with_tx(
-        conn: &mut sqlx::PgConnection,
-        claim: &Claim,
-        decl: TenancyDecl,
-    ) -> Result<Claim, DbError> {
-        let id: Uuid = claim.id.into();
-        let agent_id: Uuid = claim.agent_id.into();
-        let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
-        let truth_value = claim.truth_value.value();
-        let created_at = claim.created_at;
-        let updated_at = claim.updated_at;
-        let content_hash = ContentHasher::hash(claim.content.as_bytes());
-
-        use sqlx::Row;
-
-        // Dedup check within the same transaction
-        let existing = sqlx::query(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-             FROM claims WHERE content_hash = $1 LIMIT 1"#,
-        )
-        .bind(content_hash.as_slice())
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        if let Some(existing_row) = existing {
-            let truth_val: f64 = existing_row.get("truth_value");
-            let tv = TruthValue::new(truth_val)?;
-            return Ok(claim_from_row(
-                existing_row.get("id"),
-                existing_row.get("content"),
-                existing_row.get("agent_id"),
-                existing_row.get("trace_id"),
-                tv,
-                existing_row.get("created_at"),
-                existing_row.get("updated_at"),
-            ));
-        }
-
-        let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
-        )
-        .bind(id)
-        .bind(&claim.content)
-        .bind(content_hash.as_slice())
-        .bind(truth_value)
-        .bind(agent_id)
-        .bind(trace_id)
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(decl.visibility_bind())
-        .bind(decl.owner_group_bind())
-        .fetch_one(&mut *conn)
-        .await?;
-
-        let row_id: Uuid = row.get("id");
-        let row_agent_id: Uuid = row.get("agent_id");
-        let row_truth_value: f64 = row.get("truth_value");
-
-        // Fire-and-forget claim.created event (closes #61). Same rationale
-        // as the create() method: emitted only on the post-INSERT branch
-        // (the dedup early-return above does not reach here). Uses
-        // publish_or_log_conn so the event rides the caller's transaction.
-        let _ = crate::repos::EventRepository::publish_or_log_conn(
-            &mut *conn,
-            "claim.created",
-            Some(row_agent_id),
-            &serde_json::json!({
-                "claim_id": row_id,
-                "agent_id": row_agent_id,
-                "truth_value": row_truth_value,
-            }),
-        )
-        .await;
-
-        let tv = TruthValue::new(row_truth_value)?;
-        Ok(claim_from_row(
-            row_id,
-            row.get("content"),
-            row_agent_id,
-            row.get("trace_id"),
-            tv,
-            row.get("created_at"),
-            row.get("updated_at"),
-        ))
     }
 
     /// The authoring agent of a claim, or `None` when no such claim exists.
@@ -3869,11 +3658,12 @@ impl ClaimRepository {
 
     /// Find an existing claim by `(content_hash, agent_id)`.
     ///
-    /// Returns the matching row if any, else `None`. Unlike `create()` /
-    /// `create_with_tx()` (which dedup on `content_hash` alone and return
-    /// the first agent's row regardless of requester), this helper enforces
-    /// the noun-claim invariant that `(content_hash, agent_id)` is the
-    /// canonical key.
+    /// Returns the matching row if any, else `None`. This helper enforces the
+    /// noun-claim invariant that `(content_hash, agent_id)` is the canonical
+    /// key. (The legacy `create()` / `create_with_tx()`, which deduped on
+    /// `content_hash` alone and returned the first matching row whoever wrote
+    /// it, are deleted; `tests/no_content_hash_only_dedup.rs` keeps that
+    /// shape out of `crates/*/src`.)
     ///
     /// Takes `&mut PgConnection` so the caller can compose the lookup with
     /// edge creation in the same transaction.
@@ -6181,10 +5971,13 @@ mod tests {
             public_key,
             TruthValue::clamped(0.5),
         );
-        let persisted =
-            ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-                .await
-                .unwrap();
+        let persisted = ClaimRepository::create_strict(
+            &mut pool.acquire().await.expect("acquire"),
+            &claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await
+        .unwrap();
         let props = serde_json::json!({"level": 3, "section": "Body", "source_type": "Wiki"});
 
         ClaimRepository::set_properties(&pool, persisted.id, props.clone())
@@ -6223,10 +6016,13 @@ mod tests {
             public_key,
             TruthValue::clamped(0.5),
         );
-        let persisted =
-            ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-                .await
-                .unwrap();
+        let persisted = ClaimRepository::create_strict(
+            &mut pool.acquire().await.expect("acquire"),
+            &claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await
+        .unwrap();
         ClaimRepository::set_properties(&pool, persisted.id, serde_json::json!({"level": 2}))
             .await
             .unwrap();

@@ -1343,10 +1343,13 @@ async fn the_pr16_migrations_can_be_applied_twice(pool: PgPool) {
 // Every one of the ~40 converted call sites in this workspace passes
 // `TenancyDecl::Inherited`, which binds SQL NULL for BOTH columns. That makes
 // the whole suite blind to the defect class this conversion is most exposed
-// to: FOUR of the six converted `ClaimRepository` writers
-// (`create_with_tx`, `create_strict`, `create_with_id_if_absent`,
-// `batch_create`) build their INSERT with runtime `sqlx::query`/`query_as` and
-// UNTYPED `.bind()`. Swapping `decl.visibility_bind()` for
+// to: THREE of the four `ClaimRepository` writers (`create_strict`,
+// `create_with_id_if_absent`, `batch_create`; `create_or_get` delegates to
+// `create_strict`) build their INSERT with runtime `sqlx::query`/`query_as` and
+// UNTYPED `.bind()`. (There were six writers and six cases here until the
+// legacy content-hash-only `create` / `create_with_tx` pair was deleted,
+// deferred-commitment key legacy-claim-create-callers; their two round-trip
+// cases went with them.) Swapping `decl.visibility_bind()` for
 // `decl.owner_group_bind()`, or dropping one of the two, compiles cleanly and
 // passes every existing test — because with `Inherited` both binds are NULL
 // and Postgres infers each parameter's type from its column.
@@ -1372,68 +1375,6 @@ fn unsaved_claim(agent: Uuid, content: &str) -> epigraph_core::Claim {
         [0u8; 32],
         epigraph_core::TruthValue::new(0.7).expect("0.7 is in [0,1]"),
     )
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn create_stores_the_declared_tenancy(pool: PgPool) {
-    let (agent, group) = fixture::seed_agent_with_group(&pool, "rt-create").await;
-
-    let private = ClaimRepository::create(
-        &pool,
-        &unsaved_claim(agent, "create declares group"),
-        epigraph_core::TenancyDecl::group(group),
-    )
-    .await
-    .expect("create with an explicit group declaration");
-    assert_eq!(
-        tenancy_of(&pool, "claims", private.id.into()).await,
-        (group, "group".to_string())
-    );
-
-    let public = ClaimRepository::create(
-        &pool,
-        &unsaved_claim(agent, "create declares public"),
-        epigraph_core::TenancyDecl::public(group),
-    )
-    .await
-    .expect("create with an explicit public declaration");
-    assert_eq!(
-        tenancy_of(&pool, "claims", public.id.into()).await,
-        (group, "public".to_string()),
-        "`public(G)` means world-READABLE but G-OWNED; binding the visibility \
-         into owner_group_id (or vice versa) would show up here"
-    );
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn create_with_tx_stores_the_declared_tenancy(pool: PgPool) {
-    let (agent, group) = fixture::seed_agent_with_group(&pool, "rt-withtx").await;
-    let mut tx = pool.begin().await.expect("begin");
-
-    let private = ClaimRepository::create_with_tx(
-        &mut tx,
-        &unsaved_claim(agent, "with_tx declares group"),
-        epigraph_core::TenancyDecl::group(group),
-    )
-    .await
-    .expect("create_with_tx group");
-    let public = ClaimRepository::create_with_tx(
-        &mut tx,
-        &unsaved_claim(agent, "with_tx declares public"),
-        epigraph_core::TenancyDecl::public(group),
-    )
-    .await
-    .expect("create_with_tx public");
-    tx.commit().await.expect("commit");
-
-    assert_eq!(
-        tenancy_of(&pool, "claims", private.id.into()).await,
-        (group, "group".to_string())
-    );
-    assert_eq!(
-        tenancy_of(&pool, "claims", public.id.into()).await,
-        (group, "public".to_string())
-    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

@@ -308,5 +308,6 @@ Title remains as currently set.
 - **S4 — Apply migration 107.** Becomes a one-liner once writers are clean and S2's backfill has settled. User-authorized `sqlx migrate run`.
 
 - **(Out of band)** Migrate the ~44 internal Rust callers of `ClaimRepository::create()` / `create_with_tx()` to `create_or_get` or `create_strict` and remove the legacy implicit content-hash dedup. Independent of S2/S3/S4 (the API endpoint already routes around these legacy methods after S1); priority is low since the legacy callers are mostly tests and the cross-agent collapse bug is rare in practice. Future task.
+  - **DISCHARGED 2026-09-22** (deferred-commitment key `legacy-claim-create-callers`; s3a-followup #7 and #8). Both legacy methods are deleted and their callers migrated. The low-priority rationale above did not hold by then: the three non-test callers were live defects — `share_skill` collided with its own original on essentially every call, `learn_convention` failed on any content match, and after the tenancy series the ingest atom path wrote across tenant boundaries. Details in the s3a spec's followup item 7.
 
 Each future sub-project gets its own brainstorm → spec → plan cycle.

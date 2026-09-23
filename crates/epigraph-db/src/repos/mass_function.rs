@@ -470,7 +470,7 @@ impl MassFunctionRepository {
     /// "there was nothing to clear". Without the guard this is **not** a no-op
     /// on a claim that never had a BBA: `claims.mass_on_empty` and
     /// `claims.mass_on_missing` are `DEFAULT 0.0` (migration
-    /// `001_initial_schema.sql`) and `ClaimRepository::create` omits them, so
+    /// `001_initial_schema.sql`) and `ClaimRepository::create_strict` omits them, so
     /// an unconditional clear flips a real `0.0` to NULL and bumps
     /// `updated_at` on a claim the retraction never touched — visible through
     /// `GET /api/v1/claims/{id}/belief` as `mass_on_conflict: 0.0 → null`.

@@ -65,9 +65,13 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
         TruthValue::new(0.7).unwrap(),
     );
     claim.content_hash = ContentHasher::hash(content.as_bytes());
-    let persisted = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create claim");
+    let persisted = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create claim");
     let persisted_id: uuid::Uuid = persisted.id.into();
     ClaimRepository::update_labels(&pool, persisted_id, &[format!("doi:{doi}")], &[])
         .await

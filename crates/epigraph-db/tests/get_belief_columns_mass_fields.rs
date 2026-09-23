@@ -39,9 +39,13 @@ async fn get_belief_columns_includes_mass_on_empty_and_missing(pool: PgPool) {
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("belief mass fields {}", Uuid::new_v4()), agent_id);
-    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create");
+    let created = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create");
 
     let claim_id: Uuid = created.id.into();
     sqlx::query(
@@ -83,9 +87,13 @@ async fn get_belief_columns_mass_fields_default_to_zero_on_fresh_claim(pool: PgP
         &format!("belief mass fields default {}", Uuid::new_v4()),
         agent_id,
     );
-    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create");
+    let created = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create");
 
     let cols = ClaimRepository::get_belief_columns(
         &pool,

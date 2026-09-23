@@ -182,10 +182,10 @@ async fn create_test_router(pool: PgPool) -> Router {
 
 /// Insert a claim with embedding directly into the database.
 ///
-/// Uses raw SQL rather than ClaimRepository::create() because:
-/// 1. ClaimRepository::create() does not support the `embedding` column (pgvector),
+/// Uses raw SQL rather than ClaimRepository::create_strict() because:
+/// 1. ClaimRepository::create_strict() does not support the `embedding` column (pgvector),
 ///    which is managed separately via EvidenceRepository::store_embedding()
-/// 2. ClaimRepository::create() does not support the `labels` column directly
+/// 2. ClaimRepository::create_strict() does not support the `labels` column directly
 /// 3. These tests need to set up specific embedding vectors for similarity assertions,
 ///    which requires inserting the embedding in the same INSERT statement
 async fn insert_claim_with_embedding(

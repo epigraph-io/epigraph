@@ -184,8 +184,8 @@ async fn test_batch_create_claims_atomicity(pool: PgPool) {
 
     // Create a claim and insert it first
     let existing_claim = create_test_claim_entity(agent.id, "Existing claim", 0.7);
-    ClaimRepository::create(
-        &pool,
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
         &existing_claim,
         epigraph_core::TenancyDecl::Inherited,
     )
@@ -259,9 +259,13 @@ async fn test_batch_update_truth_values_single(pool: PgPool) {
 
     // Create a claim
     let claim = create_test_claim_entity(agent.id, "Claim to update", 0.5);
-    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("Create should succeed");
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Create should succeed");
 
     // Update its truth value
     let new_truth = TruthValue::new(0.9).unwrap();
@@ -302,9 +306,13 @@ async fn test_batch_update_truth_values_multiple(pool: PgPool) {
         .collect();
 
     for claim in &claims {
-        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Create should succeed");
+        ClaimRepository::create_strict(
+            &mut pool.acquire().await.expect("acquire"),
+            claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await
+        .expect("Create should succeed");
     }
 
     // Prepare updates with different truth values
@@ -350,9 +358,13 @@ async fn test_batch_update_truth_values_nonexistent_claims(pool: PgPool) {
 
     // Create one real claim
     let claim = create_test_claim_entity(agent.id, "Real claim", 0.5);
-    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("Create should succeed");
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Create should succeed");
 
     // Mix real and fake claim IDs
     let updates = vec![
@@ -392,9 +404,13 @@ async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
         .collect();
 
     for claim in &claims {
-        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Create should succeed");
+        ClaimRepository::create_strict(
+            &mut pool.acquire().await.expect("acquire"),
+            claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await
+        .expect("Create should succeed");
     }
 
     // Update to different values
@@ -450,9 +466,13 @@ async fn test_batch_create_evidence_single(pool: PgPool) {
 
     // Create a claim first
     let claim = create_test_claim_entity(agent.id, "Claim for evidence", 0.7);
-    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("Create claim should succeed");
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Create claim should succeed");
 
     let evidence = create_test_evidence_entity(agent.id, claim.id, "Single evidence content");
     let evidence_list = vec![evidence.clone()];
@@ -476,9 +496,13 @@ async fn test_batch_create_evidence_multiple(pool: PgPool) {
 
     // Create a claim
     let claim = create_test_claim_entity(agent.id, "Claim for multiple evidence", 0.7);
-    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("Create claim should succeed");
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Create claim should succeed");
 
     // Create multiple evidence items
     let evidence_list: Vec<Evidence> = (0..5)
@@ -518,9 +542,13 @@ async fn test_batch_create_evidence_multiple_claims(pool: PgPool) {
         .collect();
 
     for claim in &claims {
-        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Create claim should succeed");
+        ClaimRepository::create_strict(
+            &mut pool.acquire().await.expect("acquire"),
+            claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await
+        .expect("Create claim should succeed");
     }
 
     // Create evidence for each claim
@@ -576,9 +604,13 @@ async fn test_batch_create_evidence_atomicity(pool: PgPool) {
 
     // Create a claim
     let claim = create_test_claim_entity(agent.id, "Claim for atomicity test", 0.7);
-    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("Create claim should succeed");
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Create claim should succeed");
 
     // Create and insert evidence first
     let existing_evidence = create_test_evidence_entity(agent.id, claim.id, "Existing evidence");
@@ -705,9 +737,13 @@ async fn test_batch_insert_performance(pool: PgPool) {
 
     let individual_start = Instant::now();
     for claim in &individual_claims {
-        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Create should succeed");
+        ClaimRepository::create_strict(
+            &mut pool.acquire().await.expect("acquire"),
+            claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await
+        .expect("Create should succeed");
     }
     let individual_duration = individual_start.elapsed();
 

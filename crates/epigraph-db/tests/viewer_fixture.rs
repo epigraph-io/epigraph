@@ -219,8 +219,9 @@ pub async fn bypass(pool: &PgPool) -> (ScopedPool, Viewer) {
 /// empty group set, so it reads exactly the `visibility = 'public'` corpus.
 ///
 /// This is the right default for the ~45 pre-existing integration tests PR-06
-/// had to touch. Their fixtures write claims through `ClaimRepository::create`,
-/// which takes migration 062's `visibility` DEFAULT of `'public'`, so a
+/// had to touch. Their fixtures wrote claims through the (since deleted) legacy
+/// `ClaimRepository::create` — today `create_strict` with
+/// `TenancyDecl::Inherited` — which lands `'public'`, so a
 /// public-only viewer returns exactly what those tests asserted before the
 /// predicate existed — which is the "nothing changes" property the conversion
 /// is supposed to have. A bypass viewer would also pass, and would prove less:

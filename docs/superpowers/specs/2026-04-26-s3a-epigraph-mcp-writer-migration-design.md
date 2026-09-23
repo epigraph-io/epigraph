@@ -34,6 +34,7 @@ S3a migrates the canonical-codebase writer that contributed Cause 2's ~72k dupli
 - **No edge signing for AUTHORED.** Mirrors the API handler at `routes/claims.rs:565` which passes `None` for signature fields. The architecture doc explicitly defers edge signing.
 - **No migration of the ~44 internal Rust callers** of legacy `ClaimRepository::create()` / `create_with_tx()` (test files, epigraph-api routes, other crates). Only the 5 epigraph-mcp callers are migrated. Legacy methods stay.
 - **No removal of legacy `ClaimRepository::create()` / `create_with_tx()`.** They remain with their cross-agent collapse bug, documented as legacy.
+  - **DISCHARGED 2026-09-22** (both bullets above; followup items 7 and 8 below): the remaining production callers were migrated and both methods deleted. See item 7.
 
 ## Architecture
 
@@ -201,7 +202,9 @@ All deferred items are submitted to EpiGraph via `submit_claim` with labels `["b
 5. **S3c — V2 ingest scripts migration.** May be skipped if V2 deprecates first.
 6. **S3d — V2 `epigraph-nano/provenance.rs` migration.** Cause 3 source.
 7. **Migrate ~44 internal Rust callers** of legacy `ClaimRepository::create()` / `create_with_tx()` (test files in epigraph-db + epigraph-api integration tests + epigraph-api/routes/{claims,conventions}.rs). Out-of-band cleanup.
+   **DISCHARGED 2026-09-22** (deferred-commitment key `legacy-claim-create-callers`). The three production callers were not test-only and were live bugs: `routes/conventions.rs::{learn_convention, share_skill}` now use `create_or_get` keyed on `(content_hash, system agent)` and act on the returned id (both previously 400'd whenever the text already existed; `share_skill` on essentially every call); the MCP document ingest's atom branch (`tools/ingestion.rs::persist_atom`) writes by the content-addressed atom id and converges only onto rows the ingesting viewer can read, failing closed otherwise (it previously labelled and wrote provenance onto other tenants' private claims). `epigraph-cli/src/bin/method_search.rs`'s own content-hash-only duplicate check now keys on the agent. The test callers moved to `create_strict`.
 8. **Remove legacy `ClaimRepository::create()` / `create_with_tx()`** methods. Gated on (7).
+   **DISCHARGED 2026-09-22**: both deleted; `crates/epigraph-db/tests/no_content_hash_only_dedup.rs` keeps a `claims` lookup keyed on `content_hash` alone out of `crates/*/src`.
 9. **Tier-2 integration tests for memorize, store_workflow, improve_workflow.** Deferred from S3a.
 10. **Spot-check epigraph-agent for reliance on per-call MCP-tool UUID uniqueness.** Risk surface from S3a's behavior change.
 11. **Align API handler's `HAS_TRACE` / `DERIVED_FROM` emission to accumulating semantics.** S3a's MCP Option B emits these on resubmit; the API handler at `routes/claims.rs:585-614` only emits on first create. Align the API later so query semantics are uniform across writers.

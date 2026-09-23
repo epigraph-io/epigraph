@@ -227,15 +227,20 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
     );
 }
 
-/// Spec-review I1 regression guard: `ClaimRepository::create` is the
-/// boundary that `tools/ingestion.rs::ingest_paper` (line 204) and the
-/// API `routes/conventions.rs` paths call. Pre-fix the emit lived in
-/// `claim_helper.rs::create_claim_idempotent`, which `ingest_paper` and
-/// `ingest_paper_url` bypass entirely — so those paths never emitted
-/// `claim.created`. This test calls `ClaimRepository::create` directly
-/// (the smallest reproduction of the bug) and asserts the event surfaces.
+/// Spec-review I1 regression guard: the repository insert is where
+/// `claim.created` is emitted, so a writer that bypasses
+/// `claim_helper.rs::create_claim_idempotent` still emits. Pre-fix the emit
+/// lived only in that helper, which `ingest_paper` and `ingest_paper_url`
+/// bypass entirely — so those paths never emitted `claim.created`.
+///
+/// This guarded the legacy `ClaimRepository::create` until that method (and
+/// its content-hash-only dedup) was deleted — deferred-commitment key
+/// legacy-claim-create-callers. Its callers moved to `create_strict` (the API
+/// `routes/conventions.rs` handlers, via `create_or_get`) and to
+/// `create_with_id_if_absent` (the document ingest; guarded by the next test),
+/// so this now calls `create_strict` directly and asserts the event surfaces.
 #[tokio::test]
-async fn claim_repo_create_emits_claim_created_event() {
+async fn claim_repo_create_strict_emits_claim_created_event() {
     let pool = test_pool_or_skip!();
     let server = build_test_server(pool.clone(), [0xC5u8; 32]).await;
 
@@ -256,9 +261,13 @@ async fn claim_repo_create_emits_claim_created_event() {
 
     let before = chrono::Utc::now();
 
-    let persisted = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("ClaimRepository::create succeeds");
+    let persisted = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("ClaimRepository::create_strict succeeds");
     let persisted_id = persisted.id.as_uuid();
 
     let result = tools::events::list_events(
@@ -293,8 +302,8 @@ async fn claim_repo_create_emits_claim_created_event() {
         recent.len(),
         1,
         "expected exactly one claim.created event for the claim we just \
-         created via ClaimRepository::create (the boundary used by \
-         tools/ingestion.rs::ingest_paper); got {body}"
+         created via ClaimRepository::create_strict (the boundary \
+         create_or_get delegates to); got {body}"
     );
 }
 

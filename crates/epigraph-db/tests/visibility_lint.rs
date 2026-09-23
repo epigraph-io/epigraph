@@ -964,16 +964,6 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
-        "create_with_tx",
-        "WRITE path into `claims` (LEGACY content-hash dedup), plus the dedup SELECT that is part \
-         of the mutation. Migration 077's `WITH CHECK` rather than a read predicate is the \
-         control, exactly as for the `*_conn` writes above. The dedup read already carries its own \
-         `VISIBILITY-EXEMPT` marker in the SQL; note that marker is INERT for \
-         `the_exemption_set_is_exactly_what_was_reviewed`, which inspects only viewer-taking \
-         functions, and this one takes no viewer.",
-    ),
-    (
-        "claim.rs",
         "create_strict",
         "WRITE into `claims`, a single INSERT with an explicit `visibility` and `owner_group_id` \
          supplied by the caller's `TenancyDecl`. It is the D1-compliant creation path: ownership \

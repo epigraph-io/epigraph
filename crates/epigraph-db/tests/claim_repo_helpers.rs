@@ -34,8 +34,8 @@
 //! establishes the pre-107 fixture rather than an accident of shared state.
 //!
 //! Transactional rollback was rejected: a wrapping transaction cannot contain
-//! `ALTER TABLE` for a concurrent observer, and `ClaimRepository::create` takes
-//! its own pool connection, which would not see the fixture's uncommitted rows.
+//! `ALTER TABLE` for a concurrent observer, and the fixtures here acquire their
+//! own pool connections, which would not see the fixture's uncommitted rows.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -249,8 +249,8 @@ async fn find_by_content_hash_and_agent_returns_none_when_no_row(pool: PgPool) {
     // deliberately, or dropping the `agent_id = $2` predicate would pass.
     let other_agent = Uuid::new_v4();
     insert_test_agent(&pool, other_agent).await;
-    ClaimRepository::create(
-        &pool,
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
         &make_claim(&content, other_agent),
         epigraph_core::TenancyDecl::Inherited,
     )
@@ -293,17 +293,21 @@ async fn find_by_content_hash_and_agent_returns_some_when_matching(pool: PgPool)
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("matching {}", Uuid::new_v4()), agent_id);
-    let _ = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
-        .await
-        .expect("create");
+    let _ = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create");
 
     // A competing row with an IDENTICAL content_hash under a different agent.
     // The `found_agent == agent_id` assertion below is only meaningful if
     // another agent's row with the same hash is present to be picked wrongly.
     let other_agent = Uuid::new_v4();
     insert_test_agent(&pool, other_agent).await;
-    ClaimRepository::create(
-        &pool,
+    ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
         &make_claim(&claim.content, other_agent),
         epigraph_core::TenancyDecl::Inherited,
     )

@@ -215,10 +215,13 @@ async fn create_trace_with_initial_claim(
         0.5,
         "Initial placeholder claim for trace".to_string(),
     );
-    let created_claim =
-        ClaimRepository::create(pool, &initial_claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Initial claim creation should succeed");
+    let created_claim = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &initial_claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Initial claim creation should succeed");
 
     // Create trace with claim_id
     let trace = create_test_trace(agent_id, public_key, methodology);
@@ -267,10 +270,13 @@ async fn create_claim_with_trace(
 ) -> ClaimWithTrace {
     // Create claim first (without trace)
     let claim = create_test_claim_without_trace(agent_id, public_key, truth_value, content);
-    let created_claim =
-        ClaimRepository::create(pool, &claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Claim creation should succeed");
+    let created_claim = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Claim creation should succeed");
 
     // Create trace with claim_id
     let trace = create_test_trace(agent_id, public_key, methodology);
@@ -328,10 +334,13 @@ async fn create_claim_with_embedding(
     let claim = Claim::new(content.to_string(), agent_id, [0u8; 32], truth);
 
     // Insert claim first
-    let created_claim =
-        ClaimRepository::create(pool, &claim, epigraph_core::TenancyDecl::Inherited)
-            .await
-            .expect("Claim creation should succeed");
+    let created_claim = ClaimRepository::create_strict(
+        &mut pool.acquire().await.expect("acquire"),
+        &claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Claim creation should succeed");
 
     // Generate and set embedding
     let embedding = generate_mock_embedding(content);
