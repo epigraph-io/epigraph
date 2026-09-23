@@ -16,6 +16,12 @@
 #   E2  link_epistemic's belief wiring (`belief_wired`), and the atom BBAs the
 #       workflow / document ingests wire
 #
+#   REVIEW  plan order under one transaction (report attribution), a SECOND
+#           store_workflow on a non-empty database, transactional event
+#           timestamps, a hidden axis frame inside the DS transaction, and a
+#           server agent revoked in its PERSONAL group but live in a team group
+#           (warm session, and a fresh MCP session)
+#
 # add_step and store_workflow are probe-embed.sh's; update_with_evidence and
 # submit_ds_evidence are probe-tools.sh's; report_workflow_outcome and
 # deprecate_workflow are probe-workflow.sh's.
@@ -303,6 +309,111 @@ else
   echo "$R" | tail -c 300; echo
   echo "   after:  $(rstate)   rows written: claims +$(( $(q "SELECT count(*) FROM claims WHERE agent_id='$SYS'") - CB ))"
   q "UPDATE group_memberships SET role = 'admin' WHERE agent_id = '$SYS'" >/dev/null
+fi
+
+echo
+echo "=== REVIEW ARMS (Unit E revise round) ==="
+
+echo
+echo "=== PLAN ORDER: store_workflow 6 steps, report_workflow_outcome step_index 0..5 ==="
+# The walk is ONE transaction, so every executes edge shares one created_at. A
+# reader keyed on (created_at, c.id) attributes steps in UUID order. PASS =
+# misattributed=0. The first Unit E revision measured 4 of 6 misattributed here,
+# on both configs, with isError:false.
+PO_STEPS='"alpha: gather the inputs","bravo: validate the inputs","charlie: run the transform","delta: check the output","echo: publish the output","foxtrot: record the run"'
+R=$(tool store_workflow "{\"goal\":\"Unit E plan order probe $LABEL\",\"steps\":[$PO_STEPS]}")
+PO_WF=$(uuid_of "$R" workflow_id)
+if [ -n "$PO_WF" ]; then
+  q "SELECT '   executes edges='||count(*)||' distinct created_at='||count(DISTINCT created_at) FROM edges WHERE source_id='$PO_WF' AND relationship='executes'"
+  EX=""; i=0
+  for s in "alpha: gather the inputs" "bravo: validate the inputs" "charlie: run the transform" "delta: check the output" "echo: publish the output" "foxtrot: record the run"; do
+    EX="${EX:+$EX,}{\"step_index\":$i,\"planned\":\"$s\",\"actual\":\"done\",\"deviated\":false}"; i=$((i+1))
+  done
+  R=$(tool report_workflow_outcome "{\"workflow_id\":\"$PO_WF\",\"success\":true,\"outcome_details\":\"plan order probe\",\"execution_log\":[$EX]}")
+  echo "   report: $(echo "$R" | grep -oE '"isError":(true|false)' | head -1)"
+  q "SELECT '   behavioral_executions='||count(*)||' misattributed='||count(*) FILTER (WHERE c.content IS DISTINCT FROM b.tool_pattern[1])
+       FROM behavioral_executions b LEFT JOIN claims c ON c.id=b.step_claim_id WHERE b.workflow_id='$PO_WF'"
+else
+  echo "   SKIP: store_workflow wrote no workflow: $(echo "$R" | tail -c 300)"
+fi
+
+echo
+echo "=== STORE_WORKFLOW TWICE: a SECOND workflow on a database that already holds one ==="
+# README trap 5. Every probe TRUNCATEs first, so "store_workflow succeeds" had
+# only ever been measured for the FIRST workflow in a database. Its constant
+# "Body" phase collides on uq_claims_content_hash_agent for every later one.
+# PASS for this unit = the collision fails LOUDLY and ATOMICALLY (delta 0/0/0);
+# the collision itself is open work (see the README).
+CB=$(q "SELECT count(*) FROM claims"); WB=$(q "SELECT count(*) FROM workflows"); EB=$(q "SELECT count(*) FROM edges")
+R=$(tool store_workflow "{\"goal\":\"Unit E second workflow probe $LABEL\",\"steps\":[\"second workflow step $LABEL\"]}")
+echo "   $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,160}|workflow_id[^,]{0,60}' | head -2 | tr '\n' ' ')"
+echo "   delta: claims=$(( $(q "SELECT count(*) FROM claims") - CB )) workflows=$(( $(q "SELECT count(*) FROM workflows") - WB )) edges=$(( $(q "SELECT count(*) FROM edges") - EB ))"
+
+echo
+echo "=== TRANSACTIONAL EVENTS: claim.created timestamps of one ingest_workflow ==="
+# Measures the disclosure on EventRepository::publish_or_log_conn: a walk's events
+# share the transaction's START time.
+q "SELECT '   claim.created events='||sum(n)||' in '||count(*)||' distinct created_at values; largest group sharing ONE created_at='||max(n)
+     FROM (SELECT created_at, count(*) n FROM events WHERE event_type='claim.created' GROUP BY created_at) g"
+
+echo
+echo "=== HIDDEN AXIS FRAME: one unresolvable axis entry must not roll back the document's other BBAs ==="
+# A frame named like the declared axis exists but is invisible to the ingesting
+# agent: get_by_name -> None, create -> 23505. Before the savepoint fix that
+# aborted the post-commit DS transaction and its COMMIT silently rolled back
+# every BBA (review: binary_atom_bbas 2 -> 0). PASS = binary_atom_bbas=2 on both.
+AX_G=$(q "INSERT INTO groups (display_name, did_key, public_key, kind) VALUES ('ue axis owner $LABEL', 'did:ue:axis:$LABEL:'||gen_random_uuid(), decode(repeat('ef',32),'hex'), 'team') RETURNING id" | head -1)
+ax_doc() {  # $1 tag  $2 axis frame name
+  local DOI="10.9999/unit-e-axis-$LABEL-$1"
+  local D='{"source":{"title":"Unit E axis '"$1"'","doi":"'"$DOI"'","source_type":"Paper","authors":[]},"thesis":"Unit E axis thesis '"$1"'","thesis_derivation":"TopDown","sections":[{"title":"Binary","paragraphs":[{"text":"Binary paragraph '"$1"'","atoms":["Binary atom one of axis probe '"$1"'","Binary atom two of axis probe '"$1"'"],"generality":[3,3],"confidence":0.8}]},{"title":"Axis","paragraphs":[{"text":"Axis paragraph '"$1"'","atoms":["Axis atom of axis probe '"$1"'"],"generality":[3],"confidence":0.8,"axis":{"frame":"'"$2"'","hypotheses":["low","high"],"label":"high"}}]}],"relationships":[{"source_path":"sections/0/paragraphs/0/atoms/0","target_path":"sections/0/paragraphs/0/atoms/1","relationship":"supports"}]}'
+  local RR; RR=$(tool ingest_document_inline "{\"extraction\":$D}")
+  echo "   [$1] $(echo "$RR" | grep -oE '"isError":(true|false)' | head -1)"
+  settle "$DOI"; sleep 2
+  q "SELECT '   [$1] doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI'=ANY(labels))
+          ||' atom_bbas='||(SELECT count(*) FROM mass_functions m JOIN claims c ON c.id=m.claim_id WHERE c.content LIKE '% of axis probe $1')
+          ||' binary_atom_bbas='||(SELECT count(*) FROM mass_functions m JOIN claims c ON c.id=m.claim_id WHERE c.content LIKE 'Binary atom % of axis probe $1')"
+}
+ax_doc ctl "ue_axis_fresh_$LABEL"
+q "INSERT INTO frames (name, description, hypotheses, visibility, owner_group_id) VALUES ('ue_axis_hidden_$LABEL', 'hidden', ARRAY['low','high'], 'group', '$AX_G')" >/dev/null
+ax_doc trg "ue_axis_hidden_$LABEL"
+
+echo
+echo "=== PERSONAL-REVOKED: server agent revoked in its PERSONAL group, live writer in a TEAM group ==="
+# Hard constraint #3. Review measured personal:admin(revoked) -> (live) and +3/+4
+# claims committed by ingest_document_inline. PASS (warm session) = refused
+# synchronously, stays revoked, +0 claims. The FRESH-session arm measures the
+# per-session PR-09 provisioning in server.rs::agent_id — pre-existing main
+# behaviour, NOT in this unit's scope; it is recorded, not asserted.
+MA=$(q "SELECT agent_id FROM claims WHERE content='Unit E register probe parent' LIMIT 1")
+if [ -n "$MA" ]; then
+  PG=$(q "SELECT id FROM groups WHERE did_key='did:epigraph:personal:$MA'")
+  TG=$(q "INSERT INTO groups (display_name, did_key, public_key, kind) VALUES ('ue team $LABEL', 'did:ue:team:$LABEL:'||gen_random_uuid(), decode(repeat('ab',32),'hex'), 'team') RETURNING id" | head -1)
+  q "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) VALUES ('$TG','$MA','\\x00',0,'writer')" >/dev/null
+  pstate() { q "SELECT string_agg(CASE WHEN group_id='$PG' THEN 'personal' ELSE 'team' END||':'||role||CASE WHEN revoked_at IS NULL THEN '(live)' ELSE '(revoked)' END, ' ' ORDER BY group_id='$PG' DESC) FROM group_memberships WHERE agent_id='$MA' AND group_id IN ('$PG','$TG')"; }
+  pr_doc() {  # $1 tag
+    echo '{"source":{"title":"Unit E personal '"$1"'","doi":"10.9999/unit-e-personal-'"$LABEL-$1"'","source_type":"Paper","authors":[]},"thesis":"Unit E personal thesis '"$1"'","thesis_derivation":"TopDown","sections":[{"title":"S","paragraphs":[{"text":"Unit E personal paragraph '"$1"'","atoms":["Unit E personal atom '"$1"'"],"generality":[3],"confidence":0.8}]}],"relationships":[]}'
+  }
+  for arm in warm fresh; do
+    q "UPDATE group_memberships SET revoked_at = now() WHERE agent_id='$MA' AND group_id='$PG' AND revoked_at IS NULL" >/dev/null
+    if [ "$arm" = fresh ]; then
+      # A NEW MCP session: the HTTP transport builds a fresh server per session,
+      # so its agent-id cache is empty.
+      curl -s --unix-socket "$SOCK" "${H[@]}" -X POST http://localhost/mcp -D "$E2E/ueh.$LABEL.s2" -o /dev/null \
+        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"unit-e-probe-2","version":"1"}}}'
+      SID=$(grep -i '^mcp-session-id:' "$E2E/ueh.$LABEL.s2" | tr -d '\r' | cut -d' ' -f2)
+      call '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+    fi
+    CB=$(q "SELECT count(*) FROM claims WHERE agent_id='$MA'")
+    echo "   [$arm] before: $(pstate)"
+    R=$(tool ingest_document_inline "{\"extraction\":$(pr_doc "$arm")}")
+    echo "   [$arm] $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,140}' | head -2 | tr '\n' ' ')"
+    sleep 4
+    echo "   [$arm] after:  $(pstate)   claims by agent +$(( $(q "SELECT count(*) FROM claims WHERE agent_id='$MA'") - CB ))"
+  done
+  q "UPDATE group_memberships SET revoked_at = NULL WHERE agent_id='$MA' AND group_id='$PG'" >/dev/null
+  q "DELETE FROM group_memberships WHERE agent_id='$MA' AND group_id='$TG'" >/dev/null
+else
+  echo "   SKIP: could not identify the server's own agent"
 fi
 
 echo
