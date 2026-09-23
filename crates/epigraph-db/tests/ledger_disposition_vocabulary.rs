@@ -48,8 +48,9 @@
 //!
 //! * This is a lint over the ledger's SHAPE. It cannot tell whether a
 //!   disposition is the RIGHT one for its entry — only that the term is
-//!   declared, that it is not future-tense, and that no obligation is left with
-//!   neither a disposition nor an owner.
+//!   declared, that it is not future-tense, that no obligation is left with
+//!   neither a disposition nor an owner, and that no closed finding's `status`
+//!   still says it is open.
 //! * An entry with no `disposition` key is not a vocabulary violation. On the
 //!   tree this landed against, fourteen `closed_findings` and five
 //!   `deferred_obligations` entries have no such key; treating absence as an
@@ -384,5 +385,91 @@ fn no_deferred_obligation_is_both_undischarged_and_unowned() {
          `{VOCABULARY_BLOCK}.vocabulary`, or name an owner.",
         orphaned.len(),
         orphaned.join("\n  ")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Register self-consistency
+// ---------------------------------------------------------------------------
+
+/// A `closed_findings` entry must not say, in its own `status`, that it is open.
+///
+/// # Why this exists
+///
+/// `F-PR28-nodb-lib-test-build` was moved into `closed_findings` with
+/// `disposition: "CLOSED"` while its `status` still read `"open"` and its
+/// `assigned` still read "unowned -- needs an owner". It was the only one of 38
+/// closed entries in that state, and its own correction note named the
+/// contradiction and kept it. A reader or a grep keyed on `status` saw an open,
+/// unowned finding; a reader keyed on the register saw a closed one. The
+/// register disagreed with itself and nothing failed.
+///
+/// # The predicate, and why it is the FIRST WORD
+///
+/// `open_findings` spells its status as prose that LEADS with the state —
+/// "open", "open, ratcheted", "open; detail held privately", "OPEN. Filed
+/// 2026-09-12 ..." — so the first alphanumeric word, case-folded, is the
+/// state. A substring test for `open` would be wrong in the other direction.
+/// Measured when this was written: two correctly closed entries,
+/// `F-PR23-existence-probe-collapses-under-force` and
+/// `F-PR24-event-list-existence-arm-collapses-under-force`, lead with "CLOSED
+/// by ..." and use the word "open" later in the prose (the second says other
+/// tests "remain open, so STEP 11d STILL MUST NOT RUN"). A substring predicate
+/// would arrive red on both, and a ratchet that goes red on a correct entry
+/// gets weakened.
+///
+/// # Absent and malformed
+///
+/// Six closed entries carry no `status` key at all, and that is not a
+/// contradiction: the register placement and `disposition` are then the only
+/// statements, and they agree. A `status` that is present but not a JSON
+/// string cannot be read either way, so it is reported rather than skipped,
+/// the same fail-closed direction [`dispositions`] takes for a malformed
+/// `disposition`.
+#[test]
+fn no_closed_finding_says_in_its_status_that_it_is_open() {
+    let ledger = ledger();
+    let entries = ledger["closed_findings"]
+        .as_array()
+        .expect("`closed_findings` is an array");
+
+    let mut read = 0usize;
+    let mut contradictions = Vec::new();
+    for entry in entries {
+        let id = entry["id"].as_str().unwrap_or("<no id>");
+        match entry.get("status") {
+            None => {}
+            Some(Value::String(status)) => {
+                read += 1;
+                let first_word = status
+                    .split(|c: char| !c.is_alphanumeric())
+                    .find(|w| !w.is_empty())
+                    .unwrap_or("");
+                if first_word.eq_ignore_ascii_case("open") {
+                    contradictions.push(format!("closed_findings[{id}].status = {status:?}"));
+                }
+            }
+            Some(malformed) => {
+                contradictions.push(format!(
+                    "closed_findings[{id}].status is not a string: {malformed}"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        read > 0,
+        "no `closed_findings` entry carries a string `status`; either the key \
+         was renamed or the register moved, and the assertion below is \
+         measuring nothing"
+    );
+    assert!(
+        contradictions.is_empty(),
+        "{} closed finding(s) have a `status` that says open or cannot be read:\n  {}\n\
+         The entry sits in `closed_findings`, so its status must say closed. \
+         Rewrite it (e.g. \"closed <date> by <branch>\") and keep the old value \
+         under `prior_status` if the history matters.",
+        contradictions.len(),
+        contradictions.join("\n  ")
     );
 }
