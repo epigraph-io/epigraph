@@ -1,12 +1,48 @@
 //! Tier-1 unit tests for create_claim_idempotent.
-//! Patterns after crates/epigraph-db/tests/claim_repo_helpers.rs.
+//! Patterns after crates/epigraph-db/tests/claim_repo_helpers.rs — which is
+//! also where the `#[sqlx::test]` shape below comes from: that file has run on
+//! a per-test database since it was written, with its own
+//! `drop_unique_constraint` / `add_unique_constraint`.
+//!
+//! # Why every arm takes an injected `pool`
+//!
+//! These arms mutate the SCHEMA, not just rows. Five of the six run
+//! `common::drop_unique_constraint`, which is
+//! `ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent`
+//! and is never restored by the arm that ran it; `helper_post_107_idempotent`
+//! re-adds it after a table-wide dedup `DELETE FROM claims`; and
+//! `helper_authored_failure_does_not_propagate` adds a `CHECK` on `edges` that
+//! rejects every `AUTHORED` write while it is installed. On a shared database
+//! each of those is visible to every other test in the process and to any other
+//! process pointed at the same database.
+//!
+//! `#[sqlx::test]` gives each arm its own database, so the schema change is
+//! scoped to the arm that made it and the assertions are unchanged. The
+//! `test_pool_or_skip!` construction is dropped with the shared pool: it built a
+//! pool from the ambient `DATABASE_URL` and silently RETURNED — a green,
+//! vacuous pass — when that variable was unset.
+//!
+//! # What this does NOT license
+//!
+//! `ci.yml` runs `cargo test -p epigraph-mcp -- --test-threads=1` and names
+//! this file's `CHECK` constraint as the reason. That flag is deliberately left
+//! alone, and the comment's premise is now incomplete rather than merely stale:
+//! `common::drop_unique_constraint` has FIVE callers in this crate —
+//! `novelty_gate_test.rs`, `event_log_wiring_tests.rs`, `tool_resubmit_tests.rs`
+//! and `memorize_persists_labels.rs` besides this file — and all four of those
+//! still run on the shared pool. Converting this binary does not make the crate
+//! safe to parallelise; the other four are reported as a measurement, not swept
+//! in here on borrowed evidence.
 
-#[macro_use]
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 
 use common::*;
 use epigraph_crypto::ContentHasher;
 use epigraph_mcp::claim_helper::create_claim_idempotent;
+use sqlx::PgPool;
 use tracing_test::traced_test;
 use uuid::Uuid;
 
@@ -14,9 +50,9 @@ use uuid::Uuid;
 // helper_creates_when_absent — first call inserts and emits AUTHORED
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn helper_creates_when_absent() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_creates_when_absent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -24,9 +60,16 @@ async fn helper_creates_when_absent() {
 
     let claim = make_claim(&format!("absent {}", Uuid::new_v4()), agent_id);
 
-    let (returned, was_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    // `create_claim_idempotent` takes `&mut PgConnection` rather than a pool
+    // now — the whole point of the change is that a submission's claim, trace,
+    // evidence and AUTHORED edge share ONE stamped connection. A bare checkout
+    // is the minimum shape that satisfies that here; `tx_is_not_poisoned_...`
+    // below is the arm that drives the transactional one.
+    let mut conn = pool.acquire().await.expect("checkout");
+    let (returned, was_created) = create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
         .await
         .expect("helper call");
+    drop(conn);
     assert!(was_created, "first call should be was_created=true");
 
     let claim_uuid: Uuid = returned.id.into();
@@ -55,9 +98,9 @@ async fn helper_creates_when_absent() {
 // helper_returns_existing_when_present — second call returns canonical
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn helper_returns_existing_when_present() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_returns_existing_when_present(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -67,12 +110,20 @@ async fn helper_returns_existing_when_present() {
     let claim_a = make_claim(&content, agent_id);
     let claim_b = make_claim(&content, agent_id);
 
-    let (first, first_created) = create_claim_idempotent(&pool, &claim_a, "test_tool")
+    // `create_claim_idempotent` takes `&mut PgConnection` rather than a pool
+    // now — the whole point of the change is that a submission's claim, trace,
+    // evidence and AUTHORED edge share ONE stamped connection. A bare checkout
+    // is the minimum shape that satisfies that here; `tx_is_not_poisoned_...`
+    // below is the arm that drives the transactional one.
+    let mut conn = pool.acquire().await.expect("checkout");
+    let (first, first_created) = create_claim_idempotent(&mut conn, &viewer, &claim_a, "test_tool")
         .await
         .expect("first call");
-    let (second, second_created) = create_claim_idempotent(&pool, &claim_b, "test_tool")
-        .await
-        .expect("second call");
+    let (second, second_created) =
+        create_claim_idempotent(&mut conn, &viewer, &claim_b, "test_tool")
+            .await
+            .expect("second call");
+    drop(conn);
 
     assert!(first_created);
     assert!(!second_created, "second call should be was_created=false");
@@ -124,9 +175,9 @@ async fn helper_returns_existing_when_present() {
 // helper_emits_authored_on_both_branches — sanity cross-check
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn helper_emits_authored_on_both_branches() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_emits_authored_on_both_branches(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -135,12 +186,19 @@ async fn helper_emits_authored_on_both_branches() {
     let content = format!("both-branches {}", Uuid::new_v4());
     let claim = make_claim(&content, agent_id);
 
-    let _ = create_claim_idempotent(&pool, &claim, "test_tool")
+    // `create_claim_idempotent` takes `&mut PgConnection` rather than a pool
+    // now — the whole point of the change is that a submission's claim, trace,
+    // evidence and AUTHORED edge share ONE stamped connection. A bare checkout
+    // is the minimum shape that satisfies that here; `tx_is_not_poisoned_...`
+    // below is the arm that drives the transactional one.
+    let mut conn = pool.acquire().await.expect("checkout");
+    let _ = create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
         .await
         .expect("first");
-    let _ = create_claim_idempotent(&pool, &claim, "test_tool")
+    let _ = create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
         .await
         .expect("second");
+    drop(conn);
 
     let claim_uuid: (Uuid,) =
         sqlx::query_as("SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2")
@@ -186,9 +244,9 @@ async fn helper_emits_authored_on_both_branches() {
 // the find-then-return or INSERT-catch-refind branch fired internally.
 // Mirrors the equivalent test in crates/epigraph-db/tests/claim_repo_helpers.rs.
 
-#[tokio::test]
-async fn helper_post_107_idempotent() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_post_107_idempotent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     add_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -197,12 +255,19 @@ async fn helper_post_107_idempotent() {
     let content = format!("post-107 {}", Uuid::new_v4());
     let claim = make_claim(&content, agent_id);
 
-    let (first, first_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    // `create_claim_idempotent` takes `&mut PgConnection` rather than a pool
+    // now — the whole point of the change is that a submission's claim, trace,
+    // evidence and AUTHORED edge share ONE stamped connection. A bare checkout
+    // is the minimum shape that satisfies that here; `tx_is_not_poisoned_...`
+    // below is the arm that drives the transactional one.
+    let mut conn = pool.acquire().await.expect("checkout");
+    let (first, first_created) = create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
         .await
         .expect("first call");
-    let (second, second_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    let (second, second_created) = create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
         .await
         .expect("second call");
+    drop(conn);
 
     assert!(first_created);
     assert!(!second_created);
@@ -215,9 +280,9 @@ async fn helper_post_107_idempotent() {
 // helper_pre_107_no_constraint — find-then-return path under pre-107 fixture
 // ────────────────────────────────────────────────────────────────────────────
 
-#[tokio::test]
-async fn helper_pre_107_no_constraint() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_pre_107_no_constraint(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -226,12 +291,20 @@ async fn helper_pre_107_no_constraint() {
     let content = format!("pre-107 {}", Uuid::new_v4());
     let claim = make_claim(&content, agent_id);
 
-    let (_first, first_created) = create_claim_idempotent(&pool, &claim, "test_tool")
+    // `create_claim_idempotent` takes `&mut PgConnection` rather than a pool
+    // now — the whole point of the change is that a submission's claim, trace,
+    // evidence and AUTHORED edge share ONE stamped connection. A bare checkout
+    // is the minimum shape that satisfies that here; `tx_is_not_poisoned_...`
+    // below is the arm that drives the transactional one.
+    let mut conn = pool.acquire().await.expect("checkout");
+    let (_first, first_created) = create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
         .await
         .expect("first call");
-    let (_second, second_created) = create_claim_idempotent(&pool, &claim, "test_tool")
-        .await
-        .expect("second call");
+    let (_second, second_created) =
+        create_claim_idempotent(&mut conn, &viewer, &claim, "test_tool")
+            .await
+            .expect("second call");
+    drop(conn);
 
     assert!(first_created);
     assert!(
@@ -258,12 +331,17 @@ async fn helper_pre_107_no_constraint() {
 // log, then drops the constraint. Earlier versions tried renaming `edges`
 // away — that doesn't work because sqlx prepared statements bind to table
 // OIDs (RENAME preserves OID, so the INSERT still hits the renamed table).
-// `--test-threads=1` makes this safe (no other test sees the constraint).
+//
+// What makes the constraint safe is now the per-test database, not
+// `--test-threads=1`: no other arm and no other process shares this `edges`.
+// The DROP below is kept anyway — the constraint is dropped before the result
+// is unwrapped, so a failing assertion still cannot leave it installed if this
+// arm is ever run against a shared pool again.
 
 #[traced_test]
-#[tokio::test]
-async fn helper_authored_failure_does_not_propagate() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_authored_failure_does_not_propagate(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     let agent_id = Uuid::new_v4();
@@ -282,12 +360,21 @@ async fn helper_authored_failure_does_not_propagate() {
     .await
     .expect("add no-AUTHORED constraint");
 
-    let result = create_claim_idempotent(&pool, &claim, "test_tool").await;
-
-    sqlx::query("ALTER TABLE edges DROP CONSTRAINT no_authored_edges_for_test")
-        .execute(&pool)
-        .await
-        .expect("drop no-AUTHORED constraint");
+    // RUN IT IN A TRANSACTION, which is the shape `submit_claim` / `memorize`
+    // now use, and the only shape that can show the savepoint is doing work.
+    //
+    // WHY THIS ARM CHANGED RATHER THAN JUST HAVING ITS ARGUMENT SWAPPED: a
+    // failed statement aborts the WHOLE PostgreSQL transaction, so the old
+    // `let _ = EdgeRepository::create(...)` — an error swallowed into a warn —
+    // stops preserving "AUTHORED failure does not propagate" the instant the
+    // claim INSERT shares a transaction with it. It becomes "the claim is lost
+    // at COMMIT, with `current transaction is aborted` in place of the real
+    // cause". `emit_verb_edge_best_effort` wraps the edge in a SAVEPOINT for
+    // exactly that reason, and the assertions below are what distinguish the two
+    // implementations: a plain swallow makes the `SELECT` after the failure and
+    // then the `commit()` both fail.
+    let mut tx = pool.begin().await.expect("begin");
+    let result = create_claim_idempotent(&mut tx, &viewer, &claim, "test_tool").await;
 
     let (returned, was_created) = result.expect("helper must not propagate AUTHORED failure");
     assert!(
@@ -296,17 +383,50 @@ async fn helper_authored_failure_does_not_propagate() {
     );
     let claim_uuid: Uuid = returned.id.into();
 
-    // Claim row exists despite AUTHORED edge missing
+    // THE TRANSACTION IS STILL USABLE. On a swallowed-error implementation this
+    // statement fails with 25P02 `current transaction is aborted`.
+    let in_tx_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM claims WHERE id = $1")
+        .bind(claim_uuid)
+        .fetch_one(&mut *tx)
+        .await
+        .expect(
+            "the outer transaction must still be usable after a refused verb-edge; a              swallowed error would have left it in the aborted state (25P02)",
+        );
+    assert_eq!(in_tx_count.0, 1, "claim row is visible inside the tx");
+
+    tx.commit()
+        .await
+        .expect("the commit must succeed: only the edge was rolled back, to its savepoint");
+
+    sqlx::query("ALTER TABLE edges DROP CONSTRAINT no_authored_edges_for_test")
+        .execute(&pool)
+        .await
+        .expect("drop no-AUTHORED constraint");
+
+    // The claim survived the commit...
     let claim_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM claims WHERE id = $1")
         .bind(claim_uuid)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(claim_count.0, 1, "orphan claim row persisted");
+    assert_eq!(claim_count.0, 1, "claim row persisted");
+
+    // ...and the edge did not. The savepoint rolled back exactly one statement.
+    let authored_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'AUTHORED'",
+    )
+    .bind(claim_uuid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        authored_count.0, 0,
+        "the refused AUTHORED edge must not have been committed"
+    );
 
     // Confirm the warn fired
     assert!(
-        logs_contain("AUTHORED verb-edge emit failed"),
+        logs_contain("verb-edge emit failed"),
         "tracing::warn! must fire on AUTHORED failure"
     );
 }

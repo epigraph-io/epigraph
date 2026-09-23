@@ -41,6 +41,8 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 import umap
 
+from maintenance_dsn import maintenance_dsn
+
 psycopg2.extras.register_uuid()
 
 
@@ -391,7 +393,7 @@ def main():
     parser = argparse.ArgumentParser(description="Interactive cluster refinement")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
         help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
     )
     parser.add_argument("--cluster-id", type=int, required=False)

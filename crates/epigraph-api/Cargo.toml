@@ -13,9 +13,6 @@ genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPI
 integration = []
 tls = ["axum-server"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
-# Enterprise features: encrypted subgraphs, MPC, key rotation.
-# Enable only when epigraph-privacy is added as a dep (epigraph-enterprise repo).
-enterprise = []
 # Episcience features: structural isomorphism detection.
 # Enable only when epigraph-isomorphism is added as a dep (epigraph-io/episcience repo).
 episcience = []
@@ -32,7 +29,8 @@ required-features = ["db"]
 
 [dependencies]
 epigraph-auth = { workspace = true }
-epigraph-interfaces = { workspace = true }  # Extension point traits (EncryptionProvider, PolicyGate, OrchestrationBackend)
+epigraph-interfaces = { workspace = true }  # Extension point traits (PolicyGate, LlmProvider)
+epigraph-authz = { workspace = true }  # Fail-closed write gate installed in AppState (no SQL, no pool — nameable under --no-default-features)
 epigraph-ingest = { workspace = true, features = ["openapi"] }  # Workflow/document extraction schemas and ingest planners
 epigraph-ingest-executor = { workspace = true, optional = true }  # Persistence executor for workflow ingest (db feature)
 # k-means for /api/v1/themes/build-from-corpus lives in epigraph-engine
@@ -47,9 +45,8 @@ epigraph-mcp = { workspace = true, optional = true }
 epigraph-ds = { workspace = true }  # Dempster-Shafer math for belief endpoints
 epigraph-events = { workspace = true }  # Event bus for pub/sub messaging
 epigraph-cli = { workspace = true, optional = true }  # LlmClient trait + AnthropicClient (genai feature)
-# Enterprise and episcience deps are optional and not bundled in the kernel.
+# The episcience dep is optional and not bundled in the kernel.
 # To enable, add the git dep and uncomment:
-# epigraph-privacy    = { git = "...", optional = true }
 # epigraph-isomorphism = { git = "...", optional = true }
 hmac = "0.12"  # HMAC signing for webhook payloads
 sha2 = "0.10"  # SHA-256 for webhook HMAC signatures
@@ -113,6 +110,19 @@ wiremock = "0.6"  # HTTP fixture for OAuth provider integration tests
 rsa = "0.9"  # RSA keypair fixture for OAuth tests
 pkcs1 = "0.7"  # PKCS#1 encoding for RSA fixtures
 toml = "0.8"  # provider config TOML parsing in tests
+# `tests/privatization_seal.rs` only. The seal ceremony is client-driven, so an
+# end-to-end route test has to play the client — pad, derive an epoch key, and
+# produce a field-tagged ciphertext exactly as `epigraph-privatize` does.
+# Hand-rolling those bytes would test this file's idea of the wire format
+# instead of the one the CLI writes.
+epigraph-privacy = { workspace = true }
+# `tests/webhook_suppression_log.rs` only. The webhook fan-out's suppression
+# decisions are observable ONLY as a tracing event, so asserting that the
+# `webhook.delivery.suppressed` target fires needs a capturing subscriber.
+# `no-env-filter` is required: without it the filter is scoped to the CRATE THE
+# TEST TARGET IS IN, and events emitted from `src/` are never captured. Same
+# version and same feature as `epigraph-mcp`, which set this precedent.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 
 [[test]]
 name = "boot_secret_gate_test"

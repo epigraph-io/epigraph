@@ -2,7 +2,7 @@
 
 use crate::errors::DbError;
 use chrono::{DateTime, Utc};
-use epigraph_core::{AgentId, Claim, ClaimId, TraceId, TruthValue};
+use epigraph_core::{AgentId, Claim, ClaimId, TenancyDecl, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
 use sqlx::PgPool;
 use tracing::instrument;
@@ -15,6 +15,33 @@ pub struct ClaimRepository;
 /// negative value would turn that query into a silent "return nothing" (or a
 /// Postgres error) rather than a cap. Enforced at compile time.
 const _: () = assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
+
+/// **The embedded population**, as one SQL predicate over `claims`: the rows
+/// CLAUDE.md's embedding invariant says should carry a vector.
+///
+/// Spliced by all three statements that decide whether a given claim is owed an
+/// embedding — [`ClaimRepository::find_claims_needing_embeddings`] (the
+/// maintenance enumerator), [`ClaimRepository::claim_text_for_embedding`] (the
+/// by-id read the unseal restoration uses) and
+/// [`ClaimRepository::claim_text_if_embedding_missing`] (the by-id read the MCP
+/// write path's repair arm uses). One string rather than three copies because
+/// the three answers must agree: a copy that omitted the telemetry clauses would
+/// make a write path embed the very population the enumerator excludes
+/// (host-provenance claims are `is_current = true` with `embedding IS NULL` BY
+/// DESIGN and dominate the gap), and one that omitted the `claim_encryption`
+/// clause would put a plaintext-derived vector on a sealed row, which CLAUDE.md
+/// calls a confidentiality violation rather than an embedding gap.
+///
+/// Deliberately does NOT include `embedding IS NULL`: "is this claim in the
+/// embedded population" and "is its vector missing right now" are different
+/// questions, and `claim_text_for_embedding`'s caller already holds a row it
+/// intends to (re)embed.
+const EMBEDDABLE_POPULATION: &str = "COALESCE(is_current, true) = true \
+     AND NOT ('telemetry' = ANY(labels)) \
+     AND (properties->>'event') IS NULL \
+     AND NOT EXISTS ( \
+         SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
+     )";
 
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
@@ -30,6 +57,111 @@ pub struct ClaimBeliefColumns {
     pub mass_on_missing: Option<f64>,
 }
 
+/// Sort key for [`ClaimRepository::list_filtered`].
+///
+/// An enum, not a string: the column name is interpolated into the `ORDER BY`
+/// clause, so it must never be reachable from request data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimSortField {
+    /// `ORDER BY created_at` (the endpoint default).
+    #[default]
+    CreatedAt,
+    /// `ORDER BY truth_value`.
+    TruthValue,
+}
+
+/// Sort direction for [`ClaimRepository::list_filtered`]. Enum for the same
+/// reason as [`ClaimSortField`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimSortOrder {
+    /// Highest / most-recent first (the endpoint default).
+    #[default]
+    Desc,
+    /// Lowest / oldest first.
+    Asc,
+}
+
+/// Predicate set shared by [`ClaimRepository::list_filtered`] and
+/// [`ClaimRepository::count_filtered`].
+///
+/// Every field is `None` by default, meaning "do not constrain this column",
+/// so `ClaimListFilter::default()` selects the whole table. The two methods
+/// bind this struct through the **same** WHERE clause, which is the point of
+/// the struct: a `total` produced by a different predicate set than the rows
+/// it describes is the defect this type exists to prevent (backlog
+/// `2265a67b`).
+#[derive(Debug, Default, Clone)]
+pub struct ClaimListFilter<'a> {
+    /// Case-insensitive `content ILIKE '%search%'`.
+    pub search: Option<&'a str>,
+    /// Inclusive lower bound on `truth_value`.
+    pub truth_min: Option<f64>,
+    /// Inclusive upper bound on `truth_value`.
+    pub truth_max: Option<f64>,
+    /// Restrict to claims authored by this agent.
+    pub agent_id: Option<Uuid>,
+    /// Drop claims authored by this agent (composes with `agent_id`).
+    pub exclude_agent_id: Option<Uuid>,
+    /// Restrict to current (`true`) or superseded (`false`) claims.
+    /// `None` returns both.
+    pub is_current: Option<bool>,
+    /// Inclusive lower bound on `created_at`.
+    pub created_after: Option<DateTime<Utc>>,
+    /// Inclusive upper bound on `created_at`.
+    pub created_before: Option<DateTime<Utc>>,
+    /// Restrict to this id set (used for predicates resolved by a prior query,
+    /// e.g. "has a reasoning trace with methodology X").
+    ///
+    /// **`Some(&[])` means "nothing matches", not "no filter"** — it becomes
+    /// `id = ANY('{}')`, which is false for every row. A caller that resolved
+    /// an id set and found it empty must pass the empty slice, not `None`, or
+    /// the filter inverts into "return everything".
+    pub ids: Option<&'a [Uuid]>,
+    /// `ORDER BY` column (ignored by `count_filtered`).
+    pub sort_by: ClaimSortField,
+    /// `ORDER BY` direction (ignored by `count_filtered`).
+    pub sort_order: ClaimSortOrder,
+}
+
+/// Filter arguments for [`ClaimRepository::list_by_labels`].
+///
+/// These six travelled as positional parameters until the tenancy work added a
+/// `viewer` argument. Grouping them is not only about the argument count: the
+/// tail was `(.., current_only, min_truth, limit, offset)`, four unnamed
+/// literals whose types (`bool`, `f64`, `i64`, `i64`) let `limit` and `offset`
+/// swap silently. As named fields that becomes a compile error.
+///
+/// [`Default`] gives the common "no exclusions, everything, first page" shape,
+/// so a caller states only what it actually constrains.
+#[derive(Debug, Clone, Copy)]
+pub struct LabelQuery<'a> {
+    /// Claims must contain ALL of these (PostgreSQL `@>` containment).
+    pub labels: &'a [String],
+    /// Drop any claim whose labels intersect these (`&&` overlap). Empty = no exclusion.
+    pub exclude_labels: &'a [String],
+    /// Restrict to `is_current = true`, dropping superseded rows.
+    pub current_only: bool,
+    /// Minimum `truth_value`.
+    pub min_truth: f64,
+    /// Max rows returned.
+    pub limit: i64,
+    /// Rows to skip, for paging `created_at DESC`.
+    pub offset: i64,
+}
+
+impl Default for LabelQuery<'_> {
+    fn default() -> Self {
+        Self {
+            labels: &[],
+            exclude_labels: &[],
+            current_only: false,
+            min_truth: 0.0,
+            limit: 100,
+            offset: 0,
+        }
+    }
+}
+
 /// Result row for [`ClaimRepository::search_by_embedding`].
 ///
 /// `similarity` is `1 - cosine_distance`, in `[0, 1]` for non-degenerate
@@ -38,6 +170,190 @@ pub struct ClaimBeliefColumns {
 pub struct ClaimEmbeddingHit {
     pub claim_id: Uuid,
     pub similarity: f64,
+}
+
+/// One link in the supersession chain returned by
+/// [`ClaimRepository::version_history`], ordered oldest-first by
+/// `(depth, id)`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ClaimVersionHit {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub is_current: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub depth: i32,
+    /// The claim that supersedes this one, read from `claims.supersedes` — not
+    /// inferred from the position of the next row.
+    ///
+    /// Positional inference is wrong on a forked chain, and forks are reachable
+    /// in normal operation: `ClaimRepository::mark_duplicate` sets
+    /// `supersedes = <canonical>` on every duplicate, so any canonical claim
+    /// with two marked duplicates has two children. `None` here means "nothing
+    /// visible to this viewer supersedes it", which is the honest answer; a
+    /// successor in another tenant is correctly reported as absent rather than
+    /// as a dangling id.
+    pub superseded_by: Option<Uuid>,
+}
+
+/// Result row for [`ClaimRepository::semantic_search_flat`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticFlatHit {
+    pub claim_id: Uuid,
+    pub statement: String,
+    pub similarity: f64,
+    pub truth_value: f64,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub agent_id: Uuid,
+    pub trace_id: Option<Uuid>,
+    pub claim_type: Option<String>,
+    /// `Option` to match the `SemanticSearchResult` DTO, which has always
+    /// modelled this as nullable.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One `(properties->>'level', properties->>'source_type')` pair from
+/// [`ClaimRepository::embedding_radius_breakdown`].
+///
+/// A named alias rather than the bare tuple only because
+/// `clippy::type_complexity` rejects `Vec<(Option<String>, Option<String>)>` in
+/// a return position; both fields are genuinely optional (the JSON keys are not
+/// guaranteed present) and the caller histograms them.
+pub type LevelAndSourceType = (Option<String>, Option<String>);
+
+/// Result row for [`ClaimRepository::neighborhood_embeddings`].
+///
+/// A named struct rather than a `(Uuid, Vec<f32>, Option<f64>)` tuple: the
+/// projection is a raw embedding, and an unlabelled `Vec<f32>` at a call site
+/// is exactly the kind of value that gets forwarded somewhere it should not go.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NeighborhoodEmbeddingRow {
+    pub id: Uuid,
+    pub embedding: Vec<f32>,
+    pub truth_value: Option<f64>,
+}
+
+/// Result row for [`ClaimRepository::semantic_graph_neighbors`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticNeighborHit {
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relationship: String,
+    pub neighbor_id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub nb_belief: Option<f64>,
+    pub nb_plausibility: Option<f64>,
+    pub similarity: f64,
+    pub direction: String,
+}
+
+/// Result row for [`ClaimRepository::list_by_belief_bounds`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BeliefBoundedClaimHit {
+    pub id: Uuid,
+    pub content: String,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub mass_on_empty: Option<f64>,
+    pub mass_on_missing: Option<f64>,
+}
+
+/// Result row for [`ClaimRepository::frame_claims_sorted`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrameClaimBeliefHit {
+    pub claim_id: Uuid,
+    pub content: String,
+    pub hypothesis_index: Option<i32>,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub mass_on_missing: Option<f64>,
+}
+
+/// Sort key for [`ClaimRepository::frame_claims_sorted`].
+///
+/// An enum rather than a `&str` so the `ORDER BY` interpolation in that
+/// function is unreachable from user input by construction, instead of being
+/// safe only as long as every caller keeps validating with a match arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeliefSort {
+    Belief,
+    Plausibility,
+    Ignorance,
+}
+
+impl BeliefSort {
+    /// The SQL expression to sort on. Always a compile-time literal.
+    #[must_use]
+    pub const fn sql_expr(self) -> &'static str {
+        match self {
+            BeliefSort::Belief => "c.belief",
+            BeliefSort::Plausibility => "c.plausibility",
+            BeliefSort::Ignorance => "(c.plausibility - c.belief)",
+        }
+    }
+
+    /// Parse the wire value. `None` for anything else — callers turn that into
+    /// a 400 rather than silently defaulting.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "belief" => Some(BeliefSort::Belief),
+            "plausibility" => Some(BeliefSort::Plausibility),
+            "ignorance" => Some(BeliefSort::Ignorance),
+            _ => None,
+        }
+    }
+}
+
+/// Sort direction for [`ClaimRepository::frame_claims_sorted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    /// Always a compile-time literal.
+    #[must_use]
+    pub const fn sql_keyword(self) -> &'static str {
+        match self {
+            SortDirection::Asc => "ASC",
+            SortDirection::Desc => "DESC",
+        }
+    }
+
+    /// Parse the wire value. `None` for anything else.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "asc" => Some(SortDirection::Asc),
+            "desc" => Some(SortDirection::Desc),
+            _ => None,
+        }
+    }
+}
+
+/// Result row for [`ClaimRepository::rag_hybrid_context`].
+///
+/// Mirrors the projection `GET /api/v1/query/rag` serialises. It lives here
+/// rather than in `epigraph-api` because PR-07 moved the statement out of
+/// `routes/rag.rs` — where it was inline SQL with no visibility predicate —
+/// into the repo layer, which is the only place a `{VISIBILITY:...}` marker is
+/// reviewed (CLAUDE.md: "All SQL stays in `crates/epigraph-db/src/repos/`").
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RagContextHit {
+    pub claim_id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub similarity: f64,
+    pub domain: Option<String>,
+    pub trace_id: Option<Uuid>,
+    pub agent_id: Uuid,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub edge_count: i64,
+    pub hybrid_score: f64,
 }
 
 /// Result row for [`ClaimRepository::nearest_by_embedding`].
@@ -137,10 +453,53 @@ pub struct PatchClaimDiff {
 
 /// Build a Claim from database row data.
 ///
-/// This helper function handles the crypto fields that may not exist in
-/// the database yet (public_key, content_hash, signature). It computes
-/// the content hash from the content and uses placeholder values for
-/// the public key and signature until the database schema is migrated.
+/// # The crypto fields are PLACEHOLDERS, not data
+///
+/// `content_hash` is **recomputed from `content`**, `public_key` is
+/// `[0u8; 32]`, and `signature` is `None` — regardless of what the row says.
+/// The older comment here claimed these columns "may not exist in the database
+/// yet ... until the database schema is migrated"; that was false. `claims`
+/// has carried `content_hash bytea NOT NULL`, `signature bytea` and
+/// `signer_id uuid` (FK to `agents`, with the
+/// `claims_signature_requires_signer` CHECK) since `001_initial_schema.sql`,
+/// and `agents.public_key bytea NOT NULL` alongside them. The placeholders are
+/// a projection gap, and the false comment is why it went unnoticed long
+/// enough for MCP `verify_claim` to ship as theatre (backlog `49c17386`):
+/// recomputing the digest makes `computed == stored` a tautology, so a
+/// tampered body verified clean.
+///
+/// Callers that expose or verify crypto state MUST extend their `SELECT` and
+/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly three
+/// do: [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
+/// [`ClaimRepository::get_by_id_with_labels`].
+///
+/// # The residual set is NOT just the bulk readers
+///
+/// Every other call site still returns fabricated crypto, and that includes
+/// single-claim paths, not only list/search:
+///
+/// * single-claim reads — `find_by_content_hash_and_agent`, `get_by_agent`
+/// * create paths that return the row they wrote — `create`, `create_with_tx`,
+///   `create_strict`, `batch_create`
+/// * single-claim updates that return the updated row — `update_truth_value`,
+///   `update_truth_value_conn`, `update_trace_id`, `update_trace_id_conn`
+/// * the bulk list/search readers (`list`, `list_by_labels`, `search_*`, …)
+///
+/// The create paths are the sharpest case: `create` INSERTs the caller's
+/// `claim.content_hash` — which on the ingest path is a seed-scoped compound
+/// digest, deliberately not `blake3(content)` — and then hands back a `Claim`
+/// whose `content_hash` is `claim_from_row`'s recomputed `blake3(content)`, so
+/// the read-back disagrees with the row just written. No current caller reads
+/// that field off a create/update return, which is the only reason this is
+/// latent rather than a live bug; anything promoted to a crypto-reading path
+/// must move to the post-fix pattern first.
+///
+/// The bulk readers are left alone on cost grounds (a per-row `agents` join to
+/// hydrate a field no summary projection reads). The single-claim ones above are
+/// left alone only because nothing reads them — a weaker justification, recorded
+/// here rather than glossed.
+///
+/// Its signature stays fixed (~20 call sites) per `CLAUDE.md`.
 fn claim_from_row(
     id: Uuid,
     content: String,
@@ -175,7 +534,297 @@ fn claim_from_row(
     )
 }
 
+/// The crypto columns a single-claim reader must project to make
+/// `claim_from_row`'s placeholders real: `claims.content_hash`,
+/// `claims.signature`, and the signer's `agents.public_key` resolved through
+/// `claims.signer_id`.
+///
+/// `signer_public_key` is `Option` because the join that supplies it MUST be a
+/// `LEFT JOIN` — `signer_id` is NULL on every claim written by today's
+/// `create*` methods (none of them insert `signature`/`signer_id`), so an inner
+/// join would turn every single-claim read into "not found".
+struct RowCryptoColumns {
+    content_hash: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    signer_public_key: Option<Vec<u8>>,
+}
+
+/// Replace [`claim_from_row`]'s fabricated crypto fields with the row's stored
+/// values.
+///
+/// - `content_hash` is the **stored** digest, so a hash check against a
+///   freshly computed digest is falsifiable: if the body was mutated without
+///   rewriting the column, they differ. Note that "they differ" is not the same
+///   as "the body was mutated" — the ingest writer stores a seed-scoped digest
+///   on document-scoped compound rows, so a reader must classify before it
+///   accuses (see `epigraph_mcp::tools::claims::verify_claim`).
+/// - `signature` is `None` unless the column holds exactly
+///   [`SIGNATURE_SIZE`](epigraph_crypto::SIGNATURE_SIZE) bytes. A wrong-length
+///   blob is a corrupt signature, and `None` ("unsigned") is the only safe
+///   reading — decoding it as valid is impossible and panicking on a row is
+///   worse than reporting it unverifiable.
+/// - `public_key` is the **signer's** key, not the author's. It stays
+///   `[0u8; 32]` when `signer_id` is NULL: there is no signing agent, and
+///   substituting `agents.public_key` for `claims.agent_id` would re-introduce
+///   a fabricated value (and verify a signature against the wrong key if one
+///   were ever present without a signer).
+///
+/// Both length checks are DEFENSIVE ONLY and unreachable through Postgres:
+/// `001_initial_schema.sql` carries `CONSTRAINT claims_content_hash_length CHECK
+/// (octet_length(content_hash) = 32)` and `CONSTRAINT claims_signature_length
+/// CHECK (signature IS NULL OR octet_length(signature) = 64)`. They exist so the
+/// `Vec<u8>` → fixed-array conversion has a defined answer rather than a panic,
+/// not because a wrong-length row is an anticipated state.
+///
+/// # Errors
+/// [`DbError::InvalidData`] if `content_hash` is not 32 bytes. Unlike the
+/// signature there is no safe fallback: the column is `NOT NULL` and a
+/// wrong-length digest means the row cannot be integrity-checked at all.
+fn post_fix_crypto_columns(claim: &mut Claim, cols: RowCryptoColumns) -> Result<(), DbError> {
+    let len = cols.content_hash.len();
+    claim.content_hash =
+        <[u8; 32]>::try_from(cols.content_hash.as_slice()).map_err(|_| DbError::InvalidData {
+            reason: format!(
+                "claims.content_hash for {} is {len} bytes, expected 32",
+                claim.id.as_uuid()
+            ),
+        })?;
+
+    claim.signature = match cols.signature {
+        Some(sig) => match <[u8; epigraph_crypto::SIGNATURE_SIZE]>::try_from(sig.as_slice()) {
+            Ok(sig) => Some(sig),
+            Err(_) => {
+                tracing::warn!(
+                    claim_id = %claim.id.as_uuid(),
+                    len = sig.len(),
+                    "claims.signature is not 64 bytes; treating claim as unsigned"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    claim.public_key = match cols.signer_public_key {
+        Some(key) => match <[u8; 32]>::try_from(key.as_slice()) {
+            Ok(key) => key,
+            Err(_) => {
+                tracing::warn!(
+                    claim_id = %claim.id.as_uuid(),
+                    len = key.len(),
+                    "signer agents.public_key is not 32 bytes; leaving key unset"
+                );
+                [0u8; 32]
+            }
+        },
+        None => [0u8; 32],
+    };
+
+    Ok(())
+}
+
 impl ClaimRepository {
+    /// The declaration a write path uses when its caller expressed no
+    /// preference: **`('public', <the author's personal group>)`**.
+    ///
+    /// This is D2's shape, applied forward. The one-shot backfill stamps every
+    /// pre-existing row `('public', <author's personal group>)` — those rows
+    /// were already world-readable, so declaring `public` is a no-op rather
+    /// than a new disclosure — and a new claim from a surface that has not yet
+    /// grown a "which group?" parameter must land in the same place, or the
+    /// corpus splits into two populations with different owners for no reason a
+    /// reader could see.
+    ///
+    /// **It is not a default.** The distinction matters and is the whole of
+    /// D1: a `DEFAULT` in `pg_attrdef` applies to a write that said nothing,
+    /// with no principal in scope and nobody to hold responsible. This resolves
+    /// a *named* agent's *own* group, fails if it cannot, and is spelled at
+    /// every call site. Grepping this symbol enumerates exactly the surfaces
+    /// that still owe their callers a visibility parameter.
+    ///
+    /// `ensure_personal_group` is idempotent and is already called for every
+    /// authenticated principal at token mint (PR-02), so on a live path this is
+    /// a lookup, not a write.
+    ///
+    /// # Errors
+    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
+    /// `DbError::QueryFailed` for other database failures.
+    pub async fn default_decl_for_author(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<TenancyDecl, DbError> {
+        Ok(TenancyDecl::public(
+            Self::personal_group_of(conn, agent_id).await?,
+        ))
+    }
+
+    /// The id of `agent_id`'s personal group: **read first, mint only if
+    /// absent.**
+    ///
+    /// The read-first order is a security property, not an optimisation.
+    /// `AgentRepository::ensure_personal_group`'s membership statement is
+    /// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
+    /// NULL, role = 'admin'`, so calling it unconditionally **revives a revoked
+    /// membership as admin**. That is correct where it is called from — PR-02's
+    /// token mint, where the principal is authenticating and its own personal
+    /// group must work — and wrong on a write path, where restoring a
+    /// membership somebody deliberately revoked would be a privilege change
+    /// hidden inside an unrelated claim insert.
+    ///
+    /// The lookup below cannot revive anything. The mint runs only when the
+    /// group does not exist at all, and then there is no membership to revive.
+    ///
+    /// The `did_key` is the deterministic
+    /// `did:epigraph:personal:<agent_uuid>`, spelled the same way
+    /// `ensure_personal_group` spells it: nothing on `agents` records which
+    /// group is the personal one, so that key against `groups_did_key_key
+    /// UNIQUE` is the whole of the identification. A second spelling here would
+    /// silently resolve a different row — which is exactly the defect the test
+    /// fixture `seed_agent_with_group` had until PR-16.
+    ///
+    /// # Errors
+    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent (the
+    /// mint path FKs to `agents`), and `DbError::QueryFailed` otherwise.
+    async fn personal_group_of(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Uuid, DbError> {
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        match existing {
+            Some(g) => Ok(g),
+            None => crate::repos::AgentRepository::ensure_personal_group(conn, agent_id).await,
+        }
+    }
+
+    /// [`Self::default_decl_for_author`] for a caller holding a pool rather
+    /// than a connection.
+    ///
+    /// # Errors
+    /// As [`Self::default_decl_for_author`], plus `DbError::ConnectionFailed`
+    /// if no connection can be acquired.
+    pub async fn default_decl_for_author_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<TenancyDecl, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::default_decl_for_author(&mut conn, agent_id).await
+    }
+
+    /// [`Self::personal_group_of`] for a caller holding a pool, and for a
+    /// caller that wants the GROUP rather than the `public` declaration
+    /// [`Self::default_decl_for_author_pool`] wraps it in.
+    ///
+    /// Exists because not every row an agent owns is a row anyone else should
+    /// read. `default_decl_for_author_pool` is the right answer for a claim —
+    /// the corpus is shared and the author's group is who a later privatization
+    /// acts on — and the wrong one for a private audit row, which wants the
+    /// same owner and `visibility = 'group'`. Returning the id keeps that
+    /// choice at the call site instead of hiding it in a helper's name.
+    ///
+    /// Read-first, mint-if-absent, with the security property that ordering
+    /// carries — see [`Self::personal_group_of`].
+    ///
+    /// # Errors
+    /// As [`Self::personal_group_of`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn personal_group_of_pool(pool: &PgPool, agent_id: Uuid) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::personal_group_of(&mut conn, agent_id).await
+    }
+
+    /// The grounded embedding neighborhood of a query vector, read through a
+    /// `Viewer`.
+    ///
+    /// "Grounded" is the caller's existing definition and is unchanged: a claim
+    /// counts only if some `paper` / `evidence` / `analysis` row asserts,
+    /// supports, concludes or provides evidence for it. Claim-to-claim
+    /// propagation alone is not grounded evidence.
+    ///
+    /// # Why this exists rather than an inline route read
+    ///
+    /// `routes/hypothesis.rs::create_hypothesis` ran this statement inline
+    /// against a pool, with no viewer, and returned aggregate statistics
+    /// derived from it — so the aggregates were functions of rows the caller
+    /// may not read. That is latent only while the corpus is entirely public,
+    /// and `routes/privatization.rs` makes private claims producible today.
+    /// `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` carried it as
+    /// `("hypothesis.rs", 1)`: the statement names `FROM claims` and projects
+    /// `embedding`, which is the tier-A content column set the register
+    /// matches, so it was counted debt rather than an unseen read. This moves
+    /// it to the repo layer, where CLAUDE.md says the SQL belongs, and retires
+    /// that register entry.
+    ///
+    /// # Both relations are marked
+    ///
+    /// `claims c` carries `/* {VISIBILITY:c} */` and the grounding subquery's
+    /// `edges e` carries `/* {EDGE_VISIBILITY:e} */`. Marking only the outer
+    /// relation would leave the *grounding decision* — and therefore
+    /// `neighbor_count` — a function of edges the viewer cannot see. Both
+    /// markers resolve to the SAME bind index, so the statement still binds
+    /// [`Viewer::group_bind`](crate::visibility::Viewer::group_bind) exactly
+    /// once. Migration 070 makes an edge inherit its endpoints' tenancy, so on
+    /// a public claim the edge predicate is satisfied by the leading `public`
+    /// disjunct and the result is unchanged; it becomes load-bearing exactly
+    /// when the endpoints are private.
+    ///
+    /// **The edge marker is defense in depth and is NOT what the acceptance
+    /// test proves**, which is stated rather than left for a reader to assume.
+    /// Because 070 makes the edge inherit, a private claim's grounding edge is
+    /// private too, and the edge predicate alone would exclude the neighbour
+    /// whatever the `claims` predicate did — a test built that way passes with
+    /// the `claims` filter removed. So
+    /// `hypothesis_ownership_from_principal.rs::hypothesis_voi_neighborhood_excludes_claims_the_caller_cannot_read`
+    /// forces the grounding edge public, leaving the `claims` predicate as the
+    /// only thing that can exclude the row.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn grounded_neighborhood<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_vector: &str,
+        exclude: Uuid,
+        min_similarity: f64,
+        limit: i64,
+    ) -> Result<Vec<GroundedNeighbor>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.belief, c.plausibility,
+                   1 - (c.embedding <=> $1::vector) AS similarity
+            FROM claims c
+            WHERE c.embedding IS NOT NULL
+              AND c.id != $2
+              AND 1 - (c.embedding <=> $1::vector) >= $3
+              AND EXISTS (
+                  SELECT 1 FROM edges e
+                  WHERE e.target_id = c.id
+                    AND e.target_type = 'claim'
+                    AND e.source_type IN ('paper', 'evidence', 'analysis')
+                    AND e.relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                    /* {EDGE_VISIBILITY:e} */
+              )
+              /* {VISIBILITY:c} */
+            ORDER BY similarity DESC
+            LIMIT $4
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_as::<_, GroundedNeighbor>(&sql)
+            .bind(query_vector)
+            .bind(exclude)
+            .bind(min_similarity)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Create a new claim in the database (LEGACY — implicit content-hash dedup)
     ///
     /// **Legacy behavior:** dedups on `content_hash` alone (NOT on
@@ -187,10 +836,18 @@ impl ClaimRepository {
     /// internal callers of this method are migrated as a separate
     /// out-of-band task.
     ///
+    /// `decl` declares the row's tenancy. Migration 074 drops the
+    /// `visibility` / `owner_group_id` defaults, so a write that names neither
+    /// and has no parent to inherit from raises `23502`. This method's INSERT
+    /// binds no parent at all, so [`TenancyDecl::Inherited`] here reaches the
+    /// seed escape hatch for a test-harness role and raises for an application
+    /// role — which is the intended asymmetry, not an oversight. See
+    /// `docs/tenancy.md#declaring-visibility-on-write`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, claim))]
-    pub async fn create(pool: &PgPool, claim: &Claim) -> Result<Claim, DbError> {
+    pub async fn create(pool: &PgPool, claim: &Claim, decl: TenancyDecl) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -205,7 +862,8 @@ impl ClaimRepository {
         // inserting a duplicate. Two round-trips are acceptable; the race window is
         // tiny and duplicate claims are idempotent in practice.
         let existing = sqlx::query!(
-            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+               SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
                FROM claims WHERE content_hash = $1 LIMIT 1"#,
             content_hash.as_slice()
         )
@@ -229,9 +887,9 @@ impl ClaimRepository {
             r#"
             INSERT INTO claims (
                 id, content, content_hash, truth_value, agent_id, trace_id,
-                created_at, updated_at
+                created_at, updated_at, visibility, owner_group_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
             "#,
             id,
@@ -241,7 +899,9 @@ impl ClaimRepository {
             agent_id,
             trace_id,
             created_at,
-            updated_at
+            updated_at,
+            decl.visibility_bind(),
+            decl.owner_group_bind()
         )
         .fetch_one(pool)
         .await?;
@@ -306,6 +966,56 @@ impl ClaimRepository {
         Ok(())
     }
 
+    /// Read a claim's whole `properties` JSONB.
+    ///
+    /// `Ok(None)` means there is no such claim; a claim with a NULL column reads
+    /// back as `Ok(Some(json!({})))` so callers can treat "no properties" and
+    /// "empty properties" alike.
+    ///
+    /// Exists for readers that must classify a row by its ingest provenance
+    /// rather than act on one key — MCP `verify_claim` needs `level` and
+    /// `source_type` together to tell a document-scoped compound digest (which
+    /// is NOT `blake3(content)` by construction) from a body/digest
+    /// disagreement. Deliberately the whole object and not a `->>` projection:
+    /// the predicate lives next to the writer in
+    /// `epigraph_ingest::document::stored_content_hash_is_seed_scoped`, so the
+    /// repo layer must not re-encode which keys matter.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, viewer))]
+    pub async fn get_properties(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        claim_id: ClaimId,
+    ) -> Result<Option<serde_json::Value>, DbError> {
+        let id: Uuid = claim_id.into();
+        // Runtime `query_scalar`, not the `query!` macro: adding a macro call
+        // would require regenerating `.sqlx`.
+        //
+        // Viewer-scoped like every other claim read. This one took `&PgPool`
+        // rather than `PgConnection`/`PgExecutor` and never called `splice`, so
+        // it sat in the one gap none of the four ratchets cover:
+        // `every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt` selects on
+        // `PgConnection`, `every_executor_taking_repo_fn_...` on `PgExecutor`,
+        // `every_spliced_statement_carries_the_canonical_marker_spelling` on
+        // `.splice(`, and `no_unscoped_pool` scans handler call sites for
+        // `state.db_pool` (this caller is MCP, on `server.pool`). A passing test
+        // suite was no evidence either way: `splice` panics on a missing marker,
+        // but only for statements that call it at all.
+        let sql = viewer.splice(
+            "SELECT COALESCE(properties, '{}'::jsonb) FROM claims \
+             WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let props: Option<serde_json::Value> = q.fetch_optional(pool).await?;
+        Ok(props)
+    }
+
     /// Read a claim's workflow-promotion flag
     /// (`properties->'promotion'->>'promotable'`). `None` when the claim was
     /// never evaluated (or does not exist); `Some(bool)` otherwise. Used by
@@ -313,15 +1023,23 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn promotion_flag(pool: &PgPool, claim_id: ClaimId) -> Result<Option<bool>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn promotion_flag<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: ClaimId,
+    ) -> Result<Option<bool>, DbError> {
         let id: Uuid = claim_id.into();
-        let flag: Option<Option<bool>> = sqlx::query_scalar(
-            "SELECT (properties->'promotion'->>'promotable')::bool FROM claims WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+        let sql = viewer.splice(
+            "SELECT (properties->'promotion'->>'promotable')::bool FROM claims \
+             WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Option<bool>>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let flag: Option<Option<bool>> = q.fetch_optional(executor).await?;
         Ok(flag.flatten())
     }
 
@@ -345,19 +1063,859 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_belief_columns(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_belief_columns<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Option<ClaimBeliefColumns>, DbError> {
         let id: Uuid = claim_id.into();
-        let row: Option<ClaimBeliefColumns> = sqlx::query_as(
-            "SELECT belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing FROM claims WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
+        let sql = viewer.splice(
+            "SELECT belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing \
+             FROM claims WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimBeliefColumns>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<ClaimBeliefColumns> = q.fetch_optional(executor).await?;
         Ok(row)
+    }
+
+    /// The scalar an epistemic quality gate (`min_truth`) should compare
+    /// against, for a whole page of claims in ONE round-trip.
+    ///
+    /// Backlog `14b98adc`. `claims.truth_value` is an **independently authored**
+    /// scalar: `submit_claim` and `update_with_evidence` seed it from BetP, but
+    /// `patch_claim`, `POST /api/v1/claims`, `routes/conventions.rs` and
+    /// `tools/workflows.rs` all set it directly, and NO Dempster–Shafer write
+    /// path ever refreshes it — `auto_wire_ds_for_edge` →
+    /// `recompute_combined_belief` and `recompute_beliefs` both write
+    /// `claims.{belief, plausibility, pignistic_prob, …}` and leave
+    /// `truth_value` alone. So the two columns agree only until the first
+    /// epistemic edge is wired, after which a thoroughly refuted claim still
+    /// carries its pre-edge `truth_value` (production 2026-09-07: claim
+    /// `8f192373` at `truth_value` 1.0000 against BetP 0.1797).
+    ///
+    /// Because `truth_value` has independent authorship, syncing it FROM the DS
+    /// state is the wrong repair — a third party's `refutes` edge would silently
+    /// overwrite an operator-set value. The repair is that the *gate* reads the
+    /// DS state, which is what this method returns.
+    ///
+    /// The selection is the exact SQL twin of `belief_query::get_belief`'s
+    /// unframed branch, deliberately including its both-of-`(belief,
+    /// plausibility)` guard: a bare `COALESCE(pignistic_prob, belief,
+    /// truth_value)` would report a half-written DS row as authoritative, which
+    /// is precisely what that guard exists to prevent. `truth_value` is
+    /// `NOT NULL` (migration 001), so the `ELSE` arm always yields a value and
+    /// the returned `f64` is never null.
+    ///
+    /// Claims absent from the returned map are absent because the **viewer
+    /// cannot see them** (or they were deleted mid-page). Callers must fall back
+    /// to the `truth_value` they already hydrated rather than treating absence
+    /// as pass-or-drop — see the four `min_truth` call sites.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn effective_belief_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, f64>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, \
+             (CASE WHEN belief IS NOT NULL AND plausibility IS NOT NULL \
+                   THEN COALESCE(pignistic_prob, belief) \
+                   ELSE truth_value END)::float8 AS score \
+             FROM claims WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
+    }
+
+    /// The subset of `claim_ids` that occupy the **paragraph** role —
+    /// `(properties->>'level')::int = 2` — as the viewer sees them.
+    ///
+    /// Backlog `4e856a99`. `recall_with_context` is paragraph-primary on every
+    /// ANN surface it has: the flat kNN is level=2 only and the diverse path
+    /// coerces to level=2. Its graph-expansion pool
+    /// ([`Self::graph_expand_seeds_since`]) had no level predicate at all, so a
+    /// level-3 atom reached over a `supports`/`elaborates` edge could be folded
+    /// straight into the top-level hit list beside paragraphs — and
+    /// `ingest_document` writes a `paper -asserts-> claim` edge for EVERY
+    /// planned claim including atoms, so the paper-attribution drop downstream
+    /// does not catch it. This is the predicate that does.
+    ///
+    /// The spelling is deliberately IDENTICAL to the one the seed surfaces use
+    /// (`recall.rs`'s flat kNN and sibling queries, `Self::nearest_by_embedding`
+    /// and friends), so the two candidate-producing surfaces cannot drift into
+    /// disagreeing about what a paragraph is.
+    ///
+    /// A claim with NO `level` property is therefore also excluded — `NULL` is
+    /// not `2`. That is the `decompose_claims` population, which carries no
+    /// level property at all and was never reachable as a top-level
+    /// `recall_with_context` hit on any path, so excluding it here changes
+    /// nothing; it is stated because the arm is silent in the SQL.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn paragraph_level_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id FROM claims \
+             WHERE id = ANY($1) AND (properties->>'level')::int = 2 \
+             /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect())
+    }
+
+    /// Walk a claim's supersession chain and return every version the viewer
+    /// may see, oldest first (`depth` 0 = root).
+    ///
+    /// Backs `GET /api/v1/claims/:id/history`. Returns an empty vector when
+    /// `claim_id` does not exist **or the viewer cannot see it** — the caller
+    /// renders both as 404, so the endpoint stops being an existence oracle.
+    ///
+    /// A chain whose *ancestors* are invisible is NOT empty: the walk is
+    /// rooted at the deepest visible ancestor, so a viewer that can read a
+    /// claim always gets that claim back even when an earlier revision is
+    /// another tenant's. Versions the viewer cannot see are omitted from the
+    /// chain rather than truncating it to nothing.
+    ///
+    /// # Forked chains
+    ///
+    /// A fork (two claims superseding the same claim) returns both branches,
+    /// interleaved by depth. Two things make that well-defined rather than
+    /// nondeterministic:
+    ///
+    /// * The final `ORDER BY chain.depth, chain.id` is a **total** order.
+    ///   `ORDER BY depth` alone is not — two rows at the same depth could come
+    ///   back in either order, and because the handler derives the version
+    ///   number from row position, two identical requests could report
+    ///   different version numbers for the same claim.
+    /// * `superseded_by` is selected from `claims.supersedes` rather than
+    ///   inferred by the handler as "the following row's id". Positional
+    ///   inference is simply wrong at a fork point, and forks are reachable:
+    ///   `mark_duplicate` points every duplicate at the same canonical claim.
+    ///
+    /// # Cycle safety
+    ///
+    /// Both recursive terms are capped at depth 100. `mark_duplicate` refuses
+    /// only when the *duplicate* is already superseded, so `A.supersedes = B`
+    /// followed by `B.supersedes = A` is accepted and forms a cycle. Without
+    /// the cap the CTE never terminates: it pins one backend at 100% CPU
+    /// building an unbounded tuplestore that spills to disk, and the request
+    /// pool sets no `statement_timeout` to stop it. 100 is far above any real
+    /// supersession depth.
+    ///
+    /// # Why one statement and not a loop
+    ///
+    /// Before PR-07 the handler ran this as an N+1 walk of three inline
+    /// statements (`SELECT supersedes …`, `SELECT id, content … `,
+    /// `SELECT id … WHERE supersedes = $1`), none of them filtered. Beyond the
+    /// round trips, a per-row loop is the wrong shape for a visibility
+    /// predicate: filtering each step individually would let a chain be walked
+    /// *through* a version the reader cannot see, disclosing the existence and
+    /// position of hidden revisions even while withholding their content. A
+    /// single recursive CTE with the predicate on every branch cannot do that
+    /// — an invisible link terminates the walk.
+    ///
+    /// `is_current` is `COALESCE(is_current, true)`, matching the handler's
+    /// prior semantics for rows predating the column.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn version_history<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<ClaimVersionHit>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE up AS (
+                SELECT c.id, c.supersedes, 0::int4 AS up_depth
+                FROM claims c
+                WHERE c.id = $1 /* {VISIBILITY:c} */
+              UNION ALL
+                SELECT p.id, p.supersedes, up.up_depth + 1
+                FROM claims p
+                JOIN up ON p.id = up.supersedes
+                WHERE up.up_depth < 100 /* {VISIBILITY:p} */
+            ),
+            -- The DEEPEST VISIBLE ancestor, not the true root. `up` already
+            -- stops at the first link the viewer cannot see, so requiring
+            -- `supersedes IS NULL` here would return nothing whenever a
+            -- visible claim has an invisible ancestor — a 404 on a read the
+            -- caller is entitled to. When the whole chain is visible the
+            -- deepest row IS the `supersedes IS NULL` root, so this is the
+            -- same answer for the fully-visible case.
+            root AS (
+                SELECT id FROM up ORDER BY up_depth DESC LIMIT 1
+            ),
+            chain AS (
+                SELECT r0.id,
+                       r0.content,
+                       r0.truth_value,
+                       COALESCE(r0.is_current, true) AS is_current,
+                       r0.created_at,
+                       0::int4 AS depth
+                FROM claims r0
+                JOIN root ON root.id = r0.id
+                WHERE true /* {VISIBILITY:r0} */
+              UNION ALL
+                SELECT n.id,
+                       n.content,
+                       n.truth_value,
+                       COALESCE(n.is_current, true) AS is_current,
+                       n.created_at,
+                       chain.depth + 1
+                FROM claims n
+                JOIN chain ON n.supersedes = chain.id
+                WHERE chain.depth < 100 /* {VISIBILITY:n} */
+            )
+            SELECT chain.id,
+                   chain.content,
+                   chain.truth_value,
+                   chain.is_current,
+                   chain.created_at,
+                   chain.depth,
+                   (
+                       SELECT n2.id
+                       FROM claims n2
+                       WHERE n2.supersedes = chain.id /* {VISIBILITY:n2} */
+                       ORDER BY n2.created_at, n2.id
+                       LIMIT 1
+                   ) AS superseded_by
+            FROM chain
+            ORDER BY chain.depth, chain.id
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimVersionHit>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+
+        Ok(rows)
+    }
+
+    /// Flat pgvector ANN search over `claims.embedding`.
+    ///
+    /// Backs the **default** path of `POST /api/v1/search/semantic` — the one
+    /// taken whenever `diverse` is absent, and also whenever `diverse=true` but
+    /// the corpus has no themes yet.
+    ///
+    /// # Why this moved out of `routes/search.rs`
+    ///
+    /// AS MEASURED AT PR-07: `semantic_search` destructured a `ViewerExtractor`
+    /// and then spent it on exactly one of its four statements — the theme
+    /// candidate pull, then reached through the engine wrapper
+    /// `candidates_in_themes_at_dim` and since PR-29 called directly as
+    /// `ClaimThemeRepository::claims_in_themes_at_dim_since`. (That handler now
+    /// runs six statements, all viewer-stamped; the count and the callee name
+    /// are both restated here rather than left to read as current.) This
+    /// one — which returns `claims.content` for the whole corpus ranked against
+    /// a caller-supplied probe vector — ran unfiltered, with no
+    /// `check_content_access` pass behind it either.
+    ///
+    /// That is the same primitive [`Self::rag_hybrid_context`] describes as
+    /// "the single highest-value exfiltration primitive in the API": an
+    /// authenticated principal submits an arbitrary probe vector and gets other
+    /// tenants' claim text back, verbatim, ranked by relevance. PR-07 closed it
+    /// in `rag.rs` and left it standing in the more heavily used sibling
+    /// endpoint, because the self-audit was scoped to files the PR touched and
+    /// `search.rs` was not one of them.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_search_flat<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        min_similarity: f64,
+        claim_type: Option<&str>,
+        created_after: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<SemanticFlatHit>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH query_vec AS (
+                SELECT $1::vector AS vec
+            )
+            SELECT
+                c.id as claim_id,
+                c.content as statement,
+                1 - (c.embedding <=> q.vec) as similarity,
+                c.truth_value,
+                c.belief,
+                c.plausibility,
+                c.agent_id,
+                c.trace_id,
+                c.labels[1] as claim_type,
+                c.created_at
+            FROM claims c, query_vec q
+            WHERE c.embedding IS NOT NULL
+              AND 1 - (c.embedding <=> q.vec) >= $2
+              AND ($3::text IS NULL OR $3 = ANY(c.labels))
+              AND ($4::timestamptz IS NULL OR c.created_at >= $4)
+              AND ($5::timestamptz IS NULL OR c.created_at <= $5)
+              AND ($6::uuid IS NULL OR c.agent_id = $6)
+              /* {VISIBILITY:c} */
+            ORDER BY similarity DESC
+            LIMIT $7
+            "#,
+            8,
+        );
+        let mut q = sqlx::query_as::<_, SemanticFlatHit>(&sql)
+            .bind(embedding)
+            .bind(min_similarity)
+            .bind(claim_type)
+            .bind(created_after)
+            .bind(created_before)
+            .bind(agent_id)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// `claims.content` and `claims.properties` for one id, viewer-filtered.
+    ///
+    /// # Why this exists
+    ///
+    /// `routes/hypothesis.rs::hypothesis_status` destructured a
+    /// `ViewerExtractor` and then ran `SELECT id, content, truth_value, belief,
+    /// plausibility, labels, properties FROM claims WHERE id = $1` straight
+    /// against the pool. Its viewer was spent only on
+    /// `MassFunctionRepository::get_for_claim_frame` and
+    /// `ExperimentRepository::count_completed_with_analysis`, both of which
+    /// return scalars — so the handler satisfied acceptance criterion #1
+    /// *syntactically* (a `ViewerExtractor` is present) while disclosing
+    /// content, truth value, belief, plausibility, labels and properties for an
+    /// arbitrary claim id to any bearer principal. That is the same
+    /// Viewer-held-but-never-spent shape as `frame_claims_sorted`, which is the
+    /// defect PR-07 exists to eliminate, and it had no `check_content_access`
+    /// pass behind it (`hypothesis.rs` contains zero calls to it).
+    ///
+    /// [`Self::get_by_id`] is not reusable here: it returns a `Claim`, which
+    /// carries no `properties`, and CLAUDE.md forbids widening
+    /// `claim_from_row`'s signature to add one.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn content_and_properties<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(String, serde_json::Value)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.content, c.properties \
+             FROM claims c \
+             WHERE c.id = $1 \
+               /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String, serde_json::Value)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// Corpus-wide embedding-neighbourhood cardinality and mean similarity.
+    ///
+    /// Backs `GET /api/v1/voids/density`, which ran this aggregate inline and
+    /// unfiltered over the whole corpus against a caller-supplied probe vector.
+    /// A bare `COUNT(*)` there is a cardinality oracle in the sense
+    /// [`MassFunctionRepository::count_for_claim`] documents: it reports how
+    /// much of the corpus sits near an arbitrary point in embedding space
+    /// without disclosing any of it. Filtered, the count is the reader's count.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn embedding_density_stats<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        radius: f64,
+    ) -> Result<(i64, Option<f64>), DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*), AVG(1 - (c.embedding <=> $1::vector)) \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND 1 - (c.embedding <=> $1::vector) >= $2 \
+               /* {VISIBILITY:c} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>)>(&sql)
+            .bind(embedding)
+            .bind(radius);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
+    /// Raw `claims.embedding` vectors for a probe neighbourhood, viewer-filtered.
+    ///
+    /// Backs the optional clustering branch of `POST /api/v1/experiments/hypothesize`.
+    ///
+    /// A raw embedding is not a weaker disclosure than the text it encodes —
+    /// PR-07's own acceptance criteria treat embeddings as approximately
+    /// invertible to content, which is why `/themes/:id/embeddings` returns
+    /// none. This projection handed back full 1536-d vectors for the 200 claims
+    /// nearest a caller-supplied probe, unfiltered.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn neighborhood_embeddings<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        min_similarity: f64,
+        limit: i64,
+    ) -> Result<Vec<NeighborhoodEmbeddingRow>, DbError> {
+        // `embedding::real[]` rather than `embedding::text::float4[]`: pgvector's
+        // text form `[a,b,c]` is not a valid Postgres array literal.
+        let sql = viewer.splice(
+            "SELECT c.id, c.embedding::real[], c.truth_value \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND c.is_current = true \
+               AND 1 - (c.embedding <=> $1::vector) >= $2 \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.embedding <=> $1::vector \
+             LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, NeighborhoodEmbeddingRow>(&sql)
+            .bind(embedding)
+            .bind(min_similarity)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Count / mean / median cosine similarity inside a distance radius of a
+    /// probe vector, viewer-filtered.
+    ///
+    /// Backs MCP `embedding_neighborhood_density` (PR-09). That tool ran this
+    /// aggregate inline in `epigraph-mcp/src/tools/embeddings.rs` with no
+    /// `Viewer` parameter at all. It is the same cardinality-oracle shape as
+    /// [`Self::embedding_density_stats`] — which already exists for the HTTP
+    /// twin `GET /api/v1/voids/density` — but not the same query: this one
+    /// gates on cosine *distance* `<= radius` rather than similarity
+    /// `>= min_similarity`, and adds the median. Keeping them separate is
+    /// deliberate: collapsing them would silently change one caller's
+    /// threshold semantics.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn embedding_radius_density<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        radius: f64,
+    ) -> Result<(i64, Option<f64>, Option<f64>), DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*)::bigint, \
+                    AVG(1 - (c.embedding <=> $1::vector))::float8, \
+                    percentile_cont(0.5) WITHIN GROUP \
+                        (ORDER BY 1 - (c.embedding <=> $1::vector))::float8 \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND c.is_current = true \
+               AND (c.embedding <=> $1::vector) <= $2 \
+               /* {VISIBILITY:c} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(&sql)
+            .bind(embedding)
+            .bind(radius);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
+    /// `properties->>'level'` / `properties->>'source_type'` for the nearest
+    /// claims inside a distance radius, viewer-filtered.
+    ///
+    /// The MCP `embedding_neighborhood_density` breakdown. Unfiltered this was
+    /// the sharper of that tool's two leaks: the level/source-type histogram of
+    /// the nearest neighbours to a caller-chosen probe is a membership oracle
+    /// over the whole corpus — it answers "is there private material near this
+    /// topic, and what kind" without returning a single id.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn embedding_radius_breakdown<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding: &str,
+        radius: f64,
+        limit: i64,
+    ) -> Result<Vec<LevelAndSourceType>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.properties->>'level', c.properties->>'source_type' \
+             FROM claims c \
+             WHERE c.embedding IS NOT NULL \
+               AND c.is_current = true \
+               AND (c.embedding <=> $1::vector) <= $2 \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.embedding <=> $1::vector \
+             LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, LevelAndSourceType>(&sql)
+            .bind(embedding)
+            .bind(radius)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Graph neighbours of a selected claim set, for the diverse search path's
+    /// `graph_neighbors` enrichment.
+    ///
+    /// `embedding_col` must be `"embedding"` or `"embedding_3072"`; anything
+    /// else is rejected rather than interpolated, so the `format!` below cannot
+    /// carry caller-controlled text even if a future caller forgets to validate.
+    ///
+    /// # Why this is filtered
+    ///
+    /// The neighbour ids come from traversing `edges` outward from the
+    /// selected claims — they are NOT in the viewer-checked `selected_claim_ids`
+    /// set. The previous inline version projected `left(c.content, 200)` for
+    /// each one, so 200 characters of arbitrary out-of-tenant claim text rode
+    /// out attached to every result. The predicate is spliced onto the joined
+    /// `c`, so an invisible neighbour drops out of the row entirely rather than
+    /// appearing with truncated content.
+    ///
+    /// # What is NOT filtered — the `edges` alias
+    ///
+    /// Only the joined `claims` alias `c` carries a predicate. The `edges`
+    /// alias `e` carries none, and the projection includes `e.source_id`,
+    /// `e.target_id` and `e.relationship` — so this is a member of
+    /// `F-edges-unfiltered` (see `docs/tenancy/progress.json`), and a stronger
+    /// one than `rag_hybrid_context`, whose residual is a scalar `edge_count`.
+    /// PR-13 converted every `edges` read that ALREADY carried a visibility
+    /// predicate; it did not ADD predicates to never-filtered statements,
+    /// because each needs its own JOIN-vs-WHERE placement reasoning rather than
+    /// a fragment swap. Adding `/* {{EDGE_VISIBILITY:e}} */` here is the fix,
+    /// and it is bind-safe (both fragments render to the same `$3`) — it is
+    /// deferred only so the whole class lands with one set of acceptance
+    /// numbers. Bounded meanwhile: the returned rows are claims-filtered, so
+    /// this discloses STRUCTURE, never content.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails, or
+    /// `DbError::InvalidData` for an unrecognised `embedding_col`.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_graph_neighbors<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding_col: &str,
+        embedding: &str,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SemanticNeighborHit>, DbError> {
+        if embedding_col != "embedding" && embedding_col != "embedding_3072" {
+            return Err(DbError::InvalidData {
+                reason: format!("unsupported embedding column {embedding_col:?}"),
+            });
+        }
+        let sql = viewer.splice(
+            &format!(
+                r#"
+                SELECT
+                    e.source_id, e.target_id, e.relationship,
+                    c.id as neighbor_id, left(c.content, 200) as content,
+                    c.truth_value, c.belief as nb_belief,
+                    c.plausibility as nb_plausibility,
+                    (1 - (c.{embedding_col} <=> $1::vector))::float8 as similarity,
+                    CASE WHEN e.source_id = ANY($2) THEN 'outbound'
+                         ELSE 'inbound' END as direction
+                FROM edges e
+                JOIN claims c
+                  ON c.id = CASE WHEN e.source_id = ANY($2)
+                                 THEN e.target_id ELSE e.source_id END
+                WHERE (e.source_id = ANY($2) OR e.target_id = ANY($2))
+                  AND e.source_type = 'claim' AND e.target_type = 'claim'
+                  AND e.relationship IN ('CORROBORATES', 'supports', 'refines',
+                                         'continues_argument', 'contradicts')
+                  /* {{VISIBILITY:c}} */
+                ORDER BY c.{embedding_col} <=> $1::vector
+                LIMIT 50
+                "#
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, SemanticNeighborHit>(&sql)
+            .bind(embedding)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Claims whose belief interval falls inside the given bounds, optionally
+    /// restricted to one frame.
+    ///
+    /// Backs `GET /api/v1/claims/by-belief`.
+    ///
+    /// # Why this moved out of `routes/belief.rs`
+    ///
+    /// The handler ran this inline with **no `ViewerExtractor` at all** — only
+    /// the fail-open `auth_ctx: Option<Extension<AuthContext>>` pattern — over
+    /// an unbounded, caller-paginated corpus scan projecting `c.content`. It
+    /// was the live counterexample to PR-07's own acceptance criterion ("no
+    /// handler that returns claim content lacks a `ViewerExtractor`"). Its only
+    /// control was the per-row `check_content_access`, whose backward-compat
+    /// branch returns `ContentAccess::Full` for any claim with no `ownership`
+    /// row — i.e. most of the corpus.
+    ///
+    /// Both `claims` and the `claim_frames` subquery are filtered: an unfiltered
+    /// frame subquery would let a caller test membership of claims they cannot
+    /// read by watching the result set change.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_by_belief_bounds<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        min_belief: f64,
+        max_plausibility: f64,
+        frame_id: Option<Uuid>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<BeliefBoundedClaimHit>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, c.belief, c.plausibility,
+                   c.mass_on_empty, c.mass_on_missing
+            FROM claims c
+            WHERE c.belief >= $1 AND c.plausibility <= $2
+              AND ($3::uuid IS NULL OR c.id IN (
+                  SELECT cf.claim_id FROM claim_frames cf
+                  WHERE cf.frame_id = $3 /* {VISIBILITY:cf} */
+              ))
+              /* {VISIBILITY:c} */
+            ORDER BY c.belief DESC, c.id
+            LIMIT $4 OFFSET $5
+            "#,
+            6,
+        );
+        let mut q = sqlx::query_as::<_, BeliefBoundedClaimHit>(&sql)
+            .bind(min_belief)
+            .bind(max_plausibility)
+            .bind(frame_id)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Claims belonging to a frame, sorted by a belief metric.
+    ///
+    /// Backs `GET /api/v1/frames/:id/claims`.
+    ///
+    /// # Why this moved out of `routes/belief.rs`
+    ///
+    /// `frame_claims_sorted` took a `ViewerExtractor`, spent the viewer on
+    /// `FrameRepository::get_by_id`, and then built this statement with
+    /// `format!` + `sqlx::query_as` — no `{VISIBILITY:...}` marker, no
+    /// `splice` call. That is exactly the fail-open [`Viewer::splice`]'s panic
+    /// exists to catch, and it evaded the panic precisely *because* `splice`
+    /// was never called. Both `claims` and `claim_frames` are filtered here;
+    /// `claim_frames` is in migration 062's `tier_a` list and carries its own
+    /// tenancy columns.
+    ///
+    /// `sort` and `direction` are enums, not strings. The previous code
+    /// interpolated `&str`s that happened to come from handler match arms —
+    /// safe, but only readable as safe by tracing back to the caller. Taking
+    /// enums moves that guarantee into the type system, so the `format!` here
+    /// cannot be made injectable by a future edit to the handler.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn frame_claims_sorted<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frame_id: Uuid,
+        sort: BeliefSort,
+        direction: SortDirection,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<FrameClaimBeliefHit>, DbError> {
+        let order_col = sort.sql_expr();
+        let order_dir = direction.sql_keyword();
+        let sql = viewer.splice(
+            &format!(
+                r#"
+                SELECT cf.claim_id, c.content, cf.hypothesis_index,
+                       c.belief, c.plausibility, c.mass_on_missing
+                FROM claim_frames cf
+                JOIN claims c ON c.id = cf.claim_id
+                WHERE cf.frame_id = $1
+                  /* {{VISIBILITY:cf}} */
+                  /* {{VISIBILITY:c}} */
+                ORDER BY {order_col} {order_dir} NULLS LAST, cf.claim_id
+                LIMIT $2 OFFSET $3
+                "#
+            ),
+            4,
+        );
+        let mut q = sqlx::query_as::<_, FrameClaimBeliefHit>(&sql)
+            .bind(frame_id)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Hybrid semantic + epistemic + connectivity retrieval for
+    /// `GET /api/v1/query/rag`.
+    ///
+    /// `hybrid_score = similarity * 0.6 + truth_value * 0.2 +
+    /// min(edge_count / 10, 1) * 0.2`. `min_truth` is the epistemic quality
+    /// gate that distinguishes this from plain semantic search; `domain`, when
+    /// `Some`, restricts to claims carrying that label.
+    ///
+    /// # Why this is here and not in `routes/rag.rs`
+    ///
+    /// Until PR-07 this statement was inline in the handler with no visibility
+    /// predicate. That made `/api/v1/query/rag` a verbatim-corpus oracle: any
+    /// authenticated principal could submit an arbitrary probe vector and get
+    /// back other tenants' `claims.content` verbatim, ranked by relevance to
+    /// the probe. Semantic search is the most efficient exfiltration primitive
+    /// in the API precisely because it does not require knowing what to ask
+    /// for. The predicate is spliced onto `c` below.
+    ///
+    /// `edge_count` is NOT visibility-filtered, and — correcting an earlier
+    /// version of this comment — it **is** returned to the caller.
+    /// `rag::rag_context` maps it to `RagContextResult::edge_count` as
+    /// `Some(row.edge_count)`, which is always `Some`, so the
+    /// `skip_serializing_if = "Option::is_none"` attribute never fires and the
+    /// field is always emitted.
+    ///
+    /// What it discloses is therefore a *degree* over unfiltered `edges` for a
+    /// claim the viewer can already see: a scalar count, never the ids or the
+    /// adjacency. That is a real residual, not a non-issue, and it is the same
+    /// unfiltered-`edges` gap recorded in `repos/graph_view.rs`. PR-13 shipped
+    /// `Viewer::edge_predicate_fragment` and `edges.co_owner_group_id`, so the
+    /// tool to close it now exists — but this statement never carried an `edges`
+    /// marker at all, so it needs a predicate ADDED rather than swapped, and
+    /// PR-13 converted only the reads that already had one. Still open as
+    /// `F-edges-unfiltered` in `docs/tenancy/progress.json`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn rag_hybrid_context<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        min_truth: f64,
+        domain: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<RagContextHit>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH query_vec AS (
+                SELECT $1::vector AS vec
+            ),
+            base AS (
+                SELECT
+                    c.id as claim_id,
+                    c.content,
+                    c.truth_value,
+                    1 - (c.embedding <=> q.vec) as similarity,
+                    c.labels[1] as domain,
+                    c.trace_id,
+                    c.agent_id,
+                    c.created_at,
+                    COALESCE((
+                        SELECT COUNT(*)
+                        FROM edges e
+                        WHERE e.source_id = c.id OR e.target_id = c.id
+                    ), 0) as edge_count
+                FROM claims c, query_vec q
+                WHERE c.embedding IS NOT NULL
+                  AND c.truth_value >= $2
+                  AND 1 - (c.embedding <=> q.vec) >= 0.0
+                  AND ($3::text IS NULL OR $3 = ANY(c.labels))
+                  /* {VISIBILITY:c} */
+            )
+            SELECT *,
+                similarity * 0.6
+                    + truth_value * 0.2
+                    + LEAST(edge_count::float / 10.0, 1.0) * 0.2
+                as hybrid_score
+            FROM base
+            ORDER BY hybrid_score DESC
+            LIMIT $4
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_as::<_, RagContextHit>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(min_truth)
+            .bind(domain)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+
+        Ok(rows)
     }
 
     /// Shallow-merge `patch` into the claim's `properties` JSONB (`||`),
@@ -408,6 +1966,7 @@ impl ClaimRepository {
     pub async fn create_with_tx(
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
+        decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
@@ -421,8 +1980,9 @@ impl ClaimRepository {
 
         // Dedup check within the same transaction
         let existing = sqlx::query(
-            "SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-             FROM claims WHERE content_hash = $1 LIMIT 1",
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+             FROM claims WHERE content_hash = $1 LIMIT 1"#,
         )
         .bind(content_hash.as_slice())
         .fetch_optional(&mut *conn)
@@ -443,8 +2003,8 @@ impl ClaimRepository {
         }
 
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
@@ -455,6 +2015,8 @@ impl ClaimRepository {
         .bind(trace_id)
         .bind(created_at)
         .bind(updated_at)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -505,35 +2067,106 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_agent_id(pool: &PgPool, id: Uuid) -> Result<Option<Uuid>, DbError> {
-        let agent_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_agent_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT agent_id FROM claims WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let agent_id: Option<Uuid> = q.fetch_optional(executor).await?;
         Ok(agent_id)
     }
 
     /// Get a claim by ID
     ///
+    /// # Returns
+    /// A `Claim` post-fixed with the row's real retirement state
+    /// (`is_current`, `supersedes`) **and** its real crypto state
+    /// (`content_hash`, `signature`, signer `public_key`) — see
+    /// [`post_fix_crypto_columns`]. This is the read MCP `verify_claim` runs
+    /// on, and until backlog `49c17386` it inherited `claim_from_row`'s
+    /// placeholders: `content_hash` recomputed from `content` (so
+    /// `computed == stored` compared a value against itself and a tampered
+    /// body verified clean) and `signature = None` (so the signature check
+    /// could never pass).
+    ///
+    /// Uses a runtime `query_as` with a local `Row` rather than `sqlx::query!`,
+    /// mirroring [`Self::list`]: the `LEFT JOIN agents` needed to resolve
+    /// `signer_id → public_key` would otherwise require regenerating `.sqlx`,
+    /// which is a serialized, separately owned step in this repo.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: ClaimId) -> Result<Option<Claim>, DbError> {
+    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    ///
+    /// # Not a `sqlx::query!` macro site any more
+    ///
+    /// The tenancy series left this read on the macro's static three-bind
+    /// spelling (`$2::bool OR visibility = 'public' OR owner_group_id =
+    /// ANY($3)`). Backlog `49c17386` then needed three more columns and a
+    /// `LEFT JOIN agents`, which the macro cannot express without regenerating
+    /// `.sqlx` — a serialized, separately owned step in this repo. The runtime
+    /// `query_as` + [`crate::visibility::Viewer::splice`] form is the
+    /// alternative `visibility.rs` names, and it is STRICTER than what it
+    /// replaces: an omitted marker panics, where an omitted macro disjunct
+    /// merely compiles.
+    ///
+    /// The marker sits on `c` and on `c` only. `agents` is not in migration
+    /// 062's `tier_a` set — it has `profile_visibility`, not `owner_group_id` —
+    /// so there is nothing on `s` to filter, and the join reaches it only to
+    /// resolve a public key for a claim the viewer has already been allowed to
+    /// see.
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: ClaimId,
+    ) -> Result<Option<Claim>, DbError> {
         let uuid: Uuid = id.into();
 
-        let row = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+            content_hash: Vec<u8>,
+            signature: Option<Vec<u8>>,
+            signer_public_key: Option<Vec<u8>>,
+        }
+
+        let sql = viewer.splice(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id,
-                   created_at, updated_at, is_current, supersedes
-            FROM claims
-            WHERE id = $1
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes,
+                   c.content_hash, c.signature,
+                   s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = $1
+              /* {VISIBILITY:c} */
             "#,
-            uuid
-        )
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => {
@@ -549,11 +2182,17 @@ impl ClaimRepository {
                 );
                 // Post-fix retirement state so callers see real DB values
                 // instead of `claim_from_row`'s defaults (is_current=true,
-                // supersedes=None). sqlx::query! returns is_current as a
-                // plain bool here because the schema marks it NOT NULL with
-                // a DEFAULT — the macro trusts the NOT NULL annotation.
+                // supersedes=None).
                 claim.is_current = row.is_current;
                 claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+                post_fix_crypto_columns(
+                    &mut claim,
+                    RowCryptoColumns {
+                        content_hash: row.content_hash,
+                        signature: row.signature,
+                        signer_public_key: row.signer_public_key,
+                    },
+                )?;
                 Ok(Some(claim))
             }
             None => Ok(None),
@@ -565,12 +2204,21 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_labels(pool: &PgPool, id: ClaimId) -> Result<Vec<String>, DbError> {
-        let row: Option<(Vec<String>,)> = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
-            .bind(id.as_uuid())
-            .fetch_optional(pool)
-            .await?;
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: ClaimId,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT labels FROM claims WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Vec<String>,)>(&sql).bind(id.as_uuid());
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<(Vec<String>,)> = q.fetch_optional(executor).await?;
         Ok(row.map(|(l,)| l).unwrap_or_default())
     }
 
@@ -585,25 +2233,34 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id_with_labels(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
         let uuid: Uuid = id.into();
 
         use sqlx::Row;
-        let row = sqlx::query(
+        let sql = viewer.splice(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id,
-                   created_at, updated_at, is_current, supersedes, labels
-            FROM claims
-            WHERE id = $1
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes,
+                   c.labels, c.content_hash, c.signature,
+                   s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = $1
+              /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => {
@@ -623,6 +2280,22 @@ impl ClaimRepository {
                 claim.supersedes = row
                     .get::<Option<Uuid>, _>("supersedes")
                     .map(ClaimId::from_uuid);
+                // ... and the crypto state, for the same reason. MCP
+                // `get_claim` renders this `content_hash` to the caller as hex
+                // as the claim's stable identity; serving a digest recomputed
+                // from the body there is the same fabrication `verify_claim`
+                // was caught on. (It was also fed to `redact_content` until
+                // PR-14 deleted redaction — a non-visible row is now absent
+                // rather than blanked, so the hex rendering is the only
+                // surviving reader.)
+                post_fix_crypto_columns(
+                    &mut claim,
+                    RowCryptoColumns {
+                        content_hash: row.get("content_hash"),
+                        signature: row.get("signature"),
+                        signer_public_key: row.get("signer_public_key"),
+                    },
+                )?;
                 let labels: Vec<String> = row.get("labels");
                 Ok(Some((claim, labels)))
             }
@@ -652,9 +2325,10 @@ impl ClaimRepository {
     /// Retained at its original arity as a delegating wrapper over
     /// [`Self::search_by_embedding_since`]; `None` = no window = today's
     /// behaviour.
-    #[instrument(skip(pool, query_embedding_pgvector))]
+    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
     pub async fn search_by_embedding(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         dim: u32,
         limit: i64,
@@ -662,6 +2336,7 @@ impl ClaimRepository {
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
         Self::search_by_embedding_since(
             pool,
+            viewer,
             query_embedding_pgvector,
             dim,
             limit,
@@ -679,9 +2354,10 @@ impl ClaimRepository {
     /// pool rather than trimming an already-truncated top-K (see
     /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
     /// correctness rather than performance).
-    #[instrument(skip(pool, query_embedding_pgvector))]
-    pub async fn search_by_embedding_since(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         dim: u32,
         limit: i64,
@@ -706,6 +2382,11 @@ impl ClaimRepository {
         // DOI moves to $4. Appending `since` after a conditionally-bound
         // parameter would leave the no-filter shape with a bind-count
         // mismatch — a runtime error, not a compile error.
+        // The marker is written `{{VISIBILITY:c}}` in these two literals because
+        // they are `format!` templates: `{` is a format placeholder, so the
+        // braces are doubled and `format!` emits the single-brace marker
+        // `Viewer::splice` looks for. `visibility_lint.rs` normalises `{{` to
+        // `{` before matching, for the same reason.
         let sql = if paper_doi_filter.is_some() {
             format!(
                 r#"
@@ -722,6 +2403,7 @@ impl ClaimRepository {
                         AND e.relationship = 'asserts'
                         AND p.doi = $4
                   )
+                  /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
                 LIMIT $2
                 "#
@@ -735,11 +2417,18 @@ impl ClaimRepository {
                 WHERE (c.properties->>'level')::int = 2
                   AND c.{column} IS NOT NULL
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
+                  /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
                 LIMIT $2
                 "#
             )
         };
+
+        // The DOI shape binds its filter at $4, so the group bind lands at $5
+        // there and at $4 without it. Splicing per-shape is what keeps the two
+        // literals from sharing a wrong index.
+        let vis_bind = if paper_doi_filter.is_some() { 5 } else { 4 };
+        let sql = viewer.splice(&sql, vis_bind);
 
         let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
             .bind(query_embedding_pgvector)
@@ -748,8 +2437,11 @@ impl ClaimRepository {
         if let Some(doi) = paper_doi_filter {
             q = q.bind(doi);
         }
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
 
-        Ok(q.fetch_all(pool).await?)
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Search **current** claims by embedding similarity across **all levels**.
@@ -766,13 +2458,15 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(pool, query_embedding_pgvector))]
+    #[instrument(skip(pool, viewer, query_embedding_pgvector))]
     pub async fn search_by_embedding_current(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
-        Self::search_by_embedding_scoped(pool, query_embedding_pgvector, limit, None, None).await
+        Self::search_by_embedding_scoped(pool, viewer, query_embedding_pgvector, limit, None, None)
+            .await
     }
 
     /// [`search_by_embedding_current`] with optional scope predicates pushed
@@ -784,9 +2478,10 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(pool, query_embedding_pgvector))]
-    pub async fn search_by_embedding_scoped(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
         tags: Option<&[String]>,
@@ -799,7 +2494,7 @@ impl ClaimRepository {
             _ => None,
         };
 
-        let rows = sqlx::query_as::<_, ClaimEmbeddingHit>(
+        let sql = viewer.splice(
             r#"
             SELECT c.id AS claim_id,
                    1 - (c.embedding <=> $1::vector) AS similarity
@@ -808,16 +2503,21 @@ impl ClaimRepository {
               AND c.is_current
               AND ($3::text[] IS NULL OR c.labels @> $3::text[])
               AND ($4::uuid IS NULL OR c.agent_id = $4::uuid)
+              /* {VISIBILITY:c} */
             ORDER BY c.embedding <=> $1::vector
             LIMIT $2
             "#,
-        )
-        .bind(query_embedding_pgvector)
-        .bind(limit)
-        .bind(tags_owned)
-        .bind(agent_id)
-        .fetch_all(pool)
-        .await?;
+            5,
+        );
+        let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit)
+            .bind(tags_owned)
+            .bind(agent_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -836,27 +2536,33 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    #[instrument(skip(pool, query_embedding_pgvector))]
-    pub async fn nearest_by_embedding(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn nearest_by_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<NearestClaimHit>, DbError> {
-        let rows = sqlx::query_as::<_, NearestClaimHit>(
+        let sql = viewer.splice(
             r#"
             SELECT id AS claim_id,
                    (embedding <=> $1::vector)::float8 AS distance
             FROM claims
             WHERE embedding IS NOT NULL
               AND is_current
+              /* {VISIBILITY:claims} */
             ORDER BY embedding <=> $1::vector
             LIMIT $2
             "#,
-        )
-        .bind(query_embedding_pgvector)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, NearestClaimHit>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -875,6 +2581,7 @@ impl ClaimRepository {
     #[allow(clippy::too_many_arguments)]
     pub async fn search_hybrid_scoped(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         query_text: &str,
         candidate_pool: i64,
@@ -885,6 +2592,7 @@ impl ClaimRepository {
     ) -> Result<Vec<HybridHit>, DbError> {
         Self::search_hybrid_scoped_since(
             pool,
+            viewer,
             query_embedding_pgvector,
             query_text,
             candidate_pool,
@@ -913,8 +2621,9 @@ impl ClaimRepository {
     /// belief recomputation touches without changing its content, so an
     /// `updated_at` window would report the whole recomputed corpus as new.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_hybrid_scoped_since(
-        pool: &PgPool,
+    pub async fn search_hybrid_scoped_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         query_text: &str,
         candidate_pool: i64,
@@ -924,12 +2633,101 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_hybrid_scoped_since_in_theme(
+            executor,
+            viewer,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            0,
+            tags,
+            agent_id,
+            since,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped_since`] plus an optional `claims.theme_id`
+    /// narrowing and an `offset` for paging the fused output.
+    ///
+    /// `theme_id` is pushed into **both** the `dense` and `lex` CTEs, above
+    /// their `LIMIT $3`, for exactly the reason spelled out on
+    /// `search_hybrid_scoped_since` for `since`: a theme predicate applied to
+    /// the fused output would let `candidate_pool` off-theme rows consume the
+    /// whole pool and then be discarded, returning `[]` for a theme that has a
+    /// real answer. Off-theme rows must never enter the pool in the first
+    /// place.
+    ///
+    /// `offset` pages the fused output so a caller can walk one theme to
+    /// exhaustion (the stated requirement of backlog `c95a2509`). For that walk
+    /// to be sound the final `ORDER BY` must be TOTAL, so it carries a
+    /// `claim_id` tiebreaker: `rrf_score` is a sum of `1/(k+rank)` terms and
+    /// ties are common (two claims appearing in the same pair of legs at
+    /// mirrored ranks collide exactly), and under a non-total sort Postgres may
+    /// return tied rows in a different order per page — showing the caller one
+    /// claim twice and another never.
+    ///
+    /// ## The tiebreaker is on the FUSED output only, deliberately
+    ///
+    /// The two CTEs' own `ORDER BY`s are left alone. An earlier revision added
+    /// `, c.id` to each CTE's `row_number()` window and `LIMIT` as well, on the
+    /// theory that a deterministic candidate-pool cut is strictly better. It is
+    /// not free: the dense and lexical legs then break their ties on
+    /// *independent* keys, so a claim can be 2nd in one leg and 3rd in the
+    /// other where previously the two arbitrary orders were correlated, and the
+    /// RRF sum flips. That regressed
+    /// `claim_search_hybrid::hybrid_fuses_both_legs_ranking_the_overlap_first`
+    /// in 2 of 6 runs (6 of 6 green before, 6 of 6 green again after this was
+    /// reverted). Making the pool cut deterministic is a real improvement but
+    /// it is a RANKING change, not a paging one, and it belongs in its own
+    /// commit with its own analysis of which tied row deserves the pool slot.
+    ///
+    /// ## Residual, recorded rather than fixed
+    ///
+    /// The fused `ORDER BY` is total WITHIN one execution. A walk spans several
+    /// executions, and across them two things are still arbitrary:
+    ///
+    ///  - which rows of a tie group enter the pool when `candidate_pool`
+    ///    truncates it (needs a tie group straddling the 200th candidate at
+    ///    `HYBRID_CANDIDATE_POOL = 200`); and
+    ///  - the `row_number()` ranks assigned inside a tie group, which feed
+    ///    `rrf_score`, so two executions could in principle score a tied group
+    ///    differently and reorder it.
+    ///
+    /// In practice the legs stay correlated — each sees the same physical scan
+    /// order, so a fully tied group scores `2/(k+r)`, monotone in the same `r`
+    /// — which is why the paging walk is stable. Both hazards predate this
+    /// change; neither is introduced by it. Closing them properly means an
+    /// explicit deterministic key inside each leg, which is the ranking change
+    /// described above.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since_in_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
         };
 
-        let rows = sqlx::query_as::<_, HybridHit>(
+        // BOTH CTEs are marked. The recursive hazard's flat cousin: filtering
+        // only `dense` would let `lex` re-admit a row the viewer cannot read,
+        // and the FULL OUTER JOIN would surface it. `splice` asserts both
+        // markers resolve to the same bind ($11).
+        let sql = viewer.splice(
             r#"
             WITH dense AS (
                 SELECT c.id,
@@ -940,6 +2738,8 @@ impl ClaimRepository {
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
+                  AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
+                  /* {VISIBILITY:c} */
                 ORDER BY c.embedding <=> $1::vector
                 LIMIT $3
             ),
@@ -951,6 +2751,8 @@ impl ClaimRepository {
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
+                  AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
+                  /* {VISIBILITY:c} */
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC
                 LIMIT $3
             )
@@ -961,20 +2763,26 @@ impl ClaimRepository {
                    (l.rank IS NOT NULL) AS in_lexical
             FROM dense d
             FULL OUTER JOIN lex l ON d.id = l.id
-            ORDER BY rrf_score DESC
-            LIMIT $5
+            ORDER BY rrf_score DESC, claim_id
+            LIMIT $5 OFFSET $9
             "#,
-        )
-        .bind(query_embedding_pgvector) // $1
-        .bind(query_text) // $2
-        .bind(candidate_pool) // $3
-        .bind(k_rrf) // $4
-        .bind(limit) // $5
-        .bind(tags_owned) // $6
-        .bind(agent_id) // $7
-        .bind(since) // $8
-        .fetch_all(pool)
-        .await?;
+            11,
+        );
+        let mut q = sqlx::query_as::<_, HybridHit>(&sql)
+            .bind(query_embedding_pgvector) // $1
+            .bind(query_text) // $2
+            .bind(candidate_pool) // $3
+            .bind(k_rrf) // $4
+            .bind(limit) // $5
+            .bind(tags_owned) // $6
+            .bind(agent_id) // $7
+            .bind(since) // $8
+            .bind(offset) // $9
+            .bind(theme_id); // $10
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g); // $11
+        }
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -990,14 +2798,17 @@ impl ClaimRepository {
     /// behaviour.
     pub async fn search_lexical_scoped(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         query_text: &str,
         k_rrf: i64,
         limit: i64,
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
     ) -> Result<Vec<HybridHit>, DbError> {
-        Self::search_lexical_scoped_since(pool, query_text, k_rrf, limit, tags, agent_id, None)
-            .await
+        Self::search_lexical_scoped_since(
+            pool, viewer, query_text, k_rrf, limit, tags, agent_id, None,
+        )
+        .await
     }
 
     /// [`Self::search_lexical_scoped`] plus an optional `created_at >= since`
@@ -1007,8 +2818,9 @@ impl ClaimRepository {
     /// falls back to when the embedder is down; a window that held on the
     /// hybrid path but not here would silently widen on embedder failure.
     #[allow(clippy::too_many_arguments)]
-    pub async fn search_lexical_scoped_since(
-        pool: &PgPool,
+    pub async fn search_lexical_scoped_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_text: &str,
         k_rrf: i64,
         limit: i64,
@@ -1016,16 +2828,49 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_lexical_scoped_since_in_theme(
+            executor, viewer, query_text, k_rrf, limit, 0, tags, agent_id, since, None,
+        )
+        .await
+    }
+
+    /// [`Self::search_lexical_scoped_since`] plus the same optional
+    /// `claims.theme_id` narrowing and `offset` paging as
+    /// [`Self::search_hybrid_scoped_since_in_theme`].
+    ///
+    /// This is `recall`'s embedder-down fallback. The theme filter has to hold
+    /// HERE as well as on the hybrid path, or the scope would silently widen to
+    /// the whole corpus exactly when the embedder is unavailable — the same
+    /// argument that put `since` on both surfaces.
+    ///
+    /// `row_number()` is evaluated over the whole filtered set before
+    /// `LIMIT`/`OFFSET`, so the reported `rrf_score` stays on the global rank
+    /// rather than restarting at 1 on each page. Its window and the outer
+    /// `ORDER BY` share the `c.id` tiebreaker so the two agree and the walk is
+    /// repeat-free.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_lexical_scoped_since_in_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
         };
 
-        let rows = sqlx::query_as::<_, HybridHit>(
+        let sql = viewer.splice(
             r#"
             SELECT c.id AS claim_id,
                    (1.0 / ($2 + row_number() OVER (
-                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC)))::float8 AS rrf_score,
+                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id)))::float8 AS rrf_score,
                    NULL::float8 AS dense_similarity,
                    true AS in_lexical
             FROM claims c, websearch_to_tsquery('english', $1) q
@@ -1033,18 +2878,26 @@ impl ClaimRepository {
               AND ($4::text[] IS NULL OR c.labels @> $4::text[])
               AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
               AND ($6::timestamptz IS NULL OR c.created_at >= $6::timestamptz)
-            ORDER BY ts_rank_cd(c.content_tsv, q) DESC
-            LIMIT $3
+              AND ($8::uuid IS NULL OR c.theme_id = $8::uuid)
+              /* {VISIBILITY:c} */
+            ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id
+            LIMIT $3 OFFSET $7
             "#,
-        )
-        .bind(query_text) // $1
-        .bind(k_rrf) // $2
-        .bind(limit) // $3
-        .bind(tags_owned) // $4
-        .bind(agent_id) // $5
-        .bind(since) // $6
-        .fetch_all(pool)
-        .await?;
+            9,
+        );
+        let mut q = sqlx::query_as::<_, HybridHit>(&sql)
+            .bind(query_text) // $1
+            .bind(k_rrf) // $2
+            .bind(limit) // $3
+            .bind(tags_owned) // $4
+            .bind(agent_id) // $5
+            .bind(since) // $6
+            .bind(offset) // $7
+            .bind(theme_id); // $8
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g); // $9
+        }
+        let rows = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -1059,23 +2912,32 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_agent(pool: &PgPool, agent_id: AgentId) -> Result<Vec<Claim>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_agent<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        agent_id: AgentId,
+    ) -> Result<Vec<Claim>, DbError> {
         let uuid: Uuid = agent_id.into();
 
-        let rows = sqlx::query_as::<_, ClaimRow>(
+        let sql = viewer.splice(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE agent_id = $1
+              /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
             LIMIT $2
             "#,
-        )
-        .bind(uuid)
-        .bind(Self::MAX_AGENT_CLAIMS)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, ClaimRow>(&sql)
+            .bind(uuid)
+            .bind(Self::MAX_AGENT_CLAIMS);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
 
@@ -1280,18 +3142,26 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_high_truth(pool: &PgPool, threshold: f64) -> Result<Vec<Claim>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_high_truth<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        threshold: f64,
+    ) -> Result<Vec<Claim>, DbError> {
+        // MACRO SITE — static three-bind spelling; see `get_by_id`.
         let rows = sqlx::query!(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE truth_value >= $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             ORDER BY truth_value DESC, created_at DESC
             "#,
-            threshold
+            threshold,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         let mut claims = Vec::with_capacity(rows.len());
@@ -1317,18 +3187,26 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_low_truth(pool: &PgPool, threshold: f64) -> Result<Vec<Claim>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_low_truth<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        threshold: f64,
+    ) -> Result<Vec<Claim>, DbError> {
+        // MACRO SITE — static three-bind spelling; see `get_by_id`.
         let rows = sqlx::query!(
             r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
             FROM claims
             WHERE truth_value <= $1
+              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))
             ORDER BY truth_value ASC, created_at DESC
             "#,
-            threshold
+            threshold,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         let mut claims = Vec::with_capacity(rows.len());
@@ -1374,26 +3252,70 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get a claim by ID within an existing transaction.
+    /// Get a claim by ID on a caller-supplied connection.
+    ///
+    /// The connection-taking twin of [`Self::get_by_id`], and — since PR-23 —
+    /// the shape a request handler reaches through `AppState::read_as`. It
+    /// takes the `Viewer` and splices `/* {VISIBILITY:c} */`, so it is
+    /// visibility-equivalent to its pool-taking sibling.
+    ///
+    /// # It is now FIELD-equivalent too, and it was not before
+    ///
+    /// This function used to select seven columns where `get_by_id` selects
+    /// nine, leaving `claim_from_row`'s defaults (`is_current = true`,
+    /// `supersedes = None`) in place. That is a *widening* default rather than
+    /// a visibility defect — a superseded claim read as current — and it is
+    /// invisible to every gate, because the dropped fields default to plausible
+    /// values instead of erroring. The projection and the post-fix below are
+    /// now the same as `get_by_id`'s, per the `claim_from_row` rule in
+    /// `CLAUDE.md`: extend the caller's `SELECT` and post-fix the `Claim`.
+    ///
+    /// **A `*_conn` sibling is not automatically a drop-in for its pool-taking
+    /// twin.** A conversion shard must diff the projected columns as well as
+    /// the visibility marker.
+    ///
+    /// # …and CRYPTO-equivalent, which is the same argument one column further
+    ///
+    /// Backlog `49c17386` added `content_hash` / `signature` /
+    /// `signer_public_key` to `get_by_id` because `claim_from_row` fabricates
+    /// the first (recomputing it from `content`, so `computed == stored`
+    /// compared a value against itself) and blanks the second. That is the
+    /// identical *widening-default* class the section above names, and leaving
+    /// it here would have made this function a drop-in that silently verifies
+    /// clean. The `LEFT JOIN agents` is why this is a spliced runtime query
+    /// rather than a macro site — see [`Self::get_by_id`].
+    ///
+    /// # Errors
+    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
     pub async fn get_by_id_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<Claim>, DbError> {
         let uuid: Uuid = id.into();
 
         use sqlx::Row;
-        let row = sqlx::query(
-            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims WHERE id = $1"#,
-        )
-        .bind(uuid)
-        .fetch_optional(&mut *conn)
-        .await?;
+        let sql = viewer.splice(
+            r#"SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                      c.created_at, c.updated_at, c.is_current, c.supersedes,
+                      c.content_hash, c.signature,
+                      s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = $1 /* {VISIBILITY:c} */"#,
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_optional(&mut *conn).await?;
 
         match row {
             Some(row) => {
                 let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                Ok(Some(claim_from_row(
+                let mut claim = claim_from_row(
                     row.get("id"),
                     row.get("content"),
                     row.get("agent_id"),
@@ -1401,7 +3323,24 @@ impl ClaimRepository {
                     tv,
                     row.get("created_at"),
                     row.get("updated_at"),
-                )))
+                );
+                // Post-fix retirement state, exactly as `get_by_id` does.
+                // `claims.is_current` is NOT NULL in the schema, so the plain
+                // `bool` decode is safe; `supersedes` is nullable.
+                claim.is_current = row.get::<bool, _>("is_current");
+                claim.supersedes = row
+                    .get::<Option<Uuid>, _>("supersedes")
+                    .map(ClaimId::from_uuid);
+                // ... and the crypto state, also exactly as `get_by_id` does.
+                post_fix_crypto_columns(
+                    &mut claim,
+                    RowCryptoColumns {
+                        content_hash: row.get("content_hash"),
+                        signature: row.get("signature"),
+                        signer_public_key: row.get("signer_public_key"),
+                    },
+                )?;
+                Ok(Some(claim))
             }
             None => Ok(None),
         }
@@ -1409,50 +3348,99 @@ impl ClaimRepository {
 
     /// List claims with pagination
     ///
+    /// # Returns
+    /// Claims post-fixed with the row's real `is_current` and `supersedes`, so
+    /// superseded rows are distinguishable from live ones. Before backlog bug
+    /// `f1992766` this SELECT omitted both columns and every row inherited
+    /// `claim_from_row`'s defaults (`is_current = true`, `supersedes = None`) —
+    /// `GET /api/v1/claims` asserted currency it had never read, and that
+    /// endpoint's `?is_current=false` filter (an in-memory `retain` over this
+    /// result) compared against a constant and could never match.
+    ///
+    /// `supersedes` has no reader on the `ClaimSummary` path today, but it is
+    /// projected anyway: leaving a `Claim` field fabricated because nothing
+    /// currently reads it is precisely how `is_current` rotted, and the two
+    /// belong to the same retirement state. Every other retirement-aware
+    /// reader ([`Self::get_by_id`], [`Self::get_by_id_with_labels`],
+    /// [`Self::list_by_labels`]) post-fixes both.
+    ///
+    /// Uses a local `Row` rather than the shared [`ClaimRow`] because that
+    /// struct backs five other SELECTs that don't project these columns, and
+    /// `claim_from_row`'s signature stays untouched per `CLAUDE.md` — same
+    /// shape as [`Self::list_by_labels`].
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn list(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
         search: Option<&str>,
     ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
         let search_pattern = search.map(|s| format!("%{}%", s));
 
-        let query_str = if search_pattern.is_some() {
-            r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+        // Two shapes, two bind indices: the ILIKE shape consumes $3, so the
+        // group bind lands at $4 there and at $3 without it.
+        let (query_str, vis_bind) = if search_pattern.is_some() {
+            (
+                r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
             FROM claims
             WHERE content ILIKE $3
+              /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
-            "#
+            "#,
+                4,
+            )
         } else {
-            r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            (
+                r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
             FROM claims
+            WHERE true /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
-            "#
+            "#,
+                3,
+            )
         };
+        let sql = viewer.splice(query_str, vis_bind);
 
-        let mut query = sqlx::query_as::<_, ClaimRow>(query_str)
-            .bind(limit)
-            .bind(offset);
+        let mut query = sqlx::query_as::<_, Row>(&sql).bind(limit).bind(offset);
 
         if let Some(s) = search_pattern {
             query = query.bind(s);
         }
+        if let Some(g) = viewer.group_bind() {
+            query = query.bind(g);
+        }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
 
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
 
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -1460,7 +3448,271 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            // Post-fix retirement state; `claim_from_row` defaults these to
+            // (true, None) regardless of what the row actually says.
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
+        }
+
+        Ok(claims)
+    }
+
+    /// WHERE clause shared verbatim by [`Self::list_filtered`] and
+    /// [`Self::count_filtered`].
+    ///
+    /// Every predicate is guarded by `$n IS NULL OR …` and every parameter is
+    /// bound unconditionally in a fixed order (see [`Self::bind_filter`]), so
+    /// the two queries cannot drift apart: there is one clause string and one
+    /// bind order, used by both.
+    ///
+    /// # The visibility marker is NOT in here, and that was a deliberate reversal
+    ///
+    /// It was, briefly: appending `/* {VISIBILITY:claims} */` to this constant
+    /// makes both methods inherit the tenancy predicate by construction, which
+    /// is the same argument the constant itself rests on. It also makes both
+    /// methods invisible to
+    /// `crates/epigraph-db/tests/visibility_lint.rs::every_spliced_statement_carries_the_canonical_marker_spelling`,
+    /// which scans the FUNCTION BODY — measured: it reported both as splicing
+    /// marker-free SQL. Hiding the marker from the ratchet that checks for its
+    /// ABSENCE buys a construction guarantee by disabling a control, which is
+    /// the wrong trade.
+    ///
+    /// So each method writes the marker itself, and three things hold it in
+    /// place:
+    ///
+    /// * [`crate::visibility::Viewer::splice`] PANICS on SQL carrying no
+    ///   marker, so removing it from either body fails that method's first
+    ///   execution rather than silently widening it. Both are executed by
+    ///   `tests/claim_list_filtered.rs`.
+    /// * `visibility_lint` fails the build if a `.splice(` body carries no
+    ///   marker at all.
+    /// * `claim_list_filtered.rs::the_viewer_filters_both_halves_of_the_pair`
+    ///   asserts the two AGREE against a corpus containing rows the viewer
+    ///   cannot read — the assertion neither of the controls above can make,
+    ///   because each sees one statement at a time.
+    ///
+    /// That last one is the invariant that matters. A `total` computed over a
+    /// different predicate set than the rows it describes is backlog
+    /// `2265a67b`, and "the rows are viewer-filtered but the count is not" is
+    /// that defect in its widest form — `total` reporting the whole corpus
+    /// while the page shows one tenant's slice.
+    ///
+    /// The bind indices differ (`$10` for the count, `$12` after
+    /// `LIMIT`/`OFFSET`), so the viewer half of these two statements could
+    /// never have been literally shared anyway.
+    const FILTER_WHERE: &'static str = r#"
+            WHERE ($1::text IS NULL OR content ILIKE $1)
+              AND ($2::float8 IS NULL OR truth_value >= $2)
+              AND ($3::float8 IS NULL OR truth_value <= $3)
+              AND ($4::uuid IS NULL OR agent_id = $4)
+              AND ($5::uuid IS NULL OR agent_id <> $5)
+              AND ($6::bool IS NULL OR COALESCE(is_current, true) = $6)
+              AND ($7::timestamptz IS NULL OR created_at >= $7)
+              AND ($8::timestamptz IS NULL OR created_at <= $8)
+              AND ($9::uuid[] IS NULL OR id = ANY($9))
+    "#;
+
+    /// Bind `$1..$9` of [`Self::FILTER_WHERE`], in order.
+    ///
+    /// Generic over the query type so `query_as` (rows) and `query_scalar`
+    /// (count) share one implementation — the binds cannot diverge between
+    /// the two call sites because there is only one.
+    fn bind_filter<'q, O>(
+        query: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
+        search_pattern: Option<String>,
+        filter: &ClaimListFilter<'_>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
+        query
+            .bind(search_pattern)
+            .bind(filter.truth_min)
+            .bind(filter.truth_max)
+            .bind(filter.agent_id)
+            .bind(filter.exclude_agent_id)
+            .bind(filter.is_current)
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .bind(filter.ids.map(|ids| ids.to_vec()))
+    }
+
+    /// `%`-wrap the substring search, or `None` when no search was requested.
+    fn filter_search_pattern(filter: &ClaimListFilter<'_>) -> Option<String> {
+        filter.search.map(|s| format!("%{}%", s))
+    }
+
+    /// Count the claims matching `filter` — a real `COUNT(*)` over the whole
+    /// table, evaluated by PostgreSQL.
+    ///
+    /// Paired with [`Self::list_filtered`], which applies the identical
+    /// predicates before `LIMIT`. Callers must use the pair: the previous
+    /// approach (fetch a capped window, filter in memory, report the slice
+    /// length as `total`) both understated the count and, because the window
+    /// was always the most-recent rows, returned an empty set for filters that
+    /// only match older claims — indistinguishable from a true zero
+    /// (backlog `2265a67b`).
+    ///
+    /// Uses the runtime `query_scalar` form (no compile-time `.sqlx` cache
+    /// entry) to keep `cargo sqlx prepare` out of this change's footprint —
+    /// same rationale as [`Self::contents_by_ids`] and [`Self::labels_by_ids`].
+    ///
+    /// The tracing span skips `filter` and records only `id_count`: `filter`
+    /// carries an unbounded `ids` slice (the `methodology` / `evidence_type`
+    /// pre-resolution has no `LIMIT`) and the raw caller-supplied `search`
+    /// string, and `#[instrument]` records fields eagerly at INFO — which the
+    /// deployed `EnvFilter` admits. See [`Self::list_filtered`] for the same
+    /// treatment.
+    ///
+    /// # The viewer is not optional, and neither is running it on the SAME
+    /// executor as [`Self::list_filtered`]
+    ///
+    /// Two statements describe one population only if both saw the same corpus.
+    /// Splicing the viewer into both but running one on a pooled connection and
+    /// the other on the handler's viewer-stamped one restores `2265a67b` in a
+    /// new form: under `SessionGucMode::Transaction` the stamped handle is also
+    /// a transaction, so the unstamped statement is a different snapshot AND —
+    /// once migration 079 FORCEs RLS — carries no `epigraph.group_ids` GUC for
+    /// the policies to read. Hence `E: PgExecutor`, so a caller passes the one
+    /// `&mut *read` to both.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails.
+    #[instrument(skip(executor, viewer, filter), fields(id_count = filter.ids.map(|ids| ids.len())))]
+    pub async fn count_filtered<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        filter: &ClaimListFilter<'_>,
+    ) -> Result<i64, DbError> {
+        // `bind_filter` consumes `$1..$9` and this statement has no `LIMIT`, so
+        // the group bind is `$10` here and `$12` in `list_filtered`. The
+        // marker is written here rather than carried by `FILTER_WHERE` — see
+        // that constant's doc for why, and for what holds the two in step.
+        let sql = viewer.splice(
+            &format!(
+                "SELECT COUNT(*) FROM claims{where_clause}\n              /* {{VISIBILITY:claims}} */",
+                where_clause = Self::FILTER_WHERE,
+            ),
+            10,
+        );
+        // `query_scalar` is `query_as` over a 1-tuple; going through the
+        // tuple form lets `bind_filter` serve both methods.
+        let mut q = Self::bind_filter(
+            sqlx::query_as::<_, (i64,)>(&sql),
+            Self::filter_search_pattern(filter),
+            filter,
+        );
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let (count,): (i64,) = q.fetch_one(executor).await?;
+        Ok(count)
+    }
+
+    /// List the claims matching `filter`, sorted and paginated **in SQL**.
+    ///
+    /// All predicates run before `LIMIT`/`OFFSET`, so a matching claim is
+    /// reachable regardless of how recently it was created — the property
+    /// [`Self::list_by_truth_range`] established for `truth_value` and this
+    /// method generalises to the rest of the `GET /api/v1/claims` filter set.
+    ///
+    /// The returned `Claim`s are post-fixed with the row's `is_current` and
+    /// `supersedes`; `claim_from_row`'s signature stays untouched per
+    /// `CLAUDE.md`, same shape as [`Self::list`] and [`Self::list_by_labels`].
+    ///
+    /// `ORDER BY` is built from the [`ClaimSortField`] / [`ClaimSortOrder`]
+    /// enums, never from caller-supplied strings, and carries an `id`
+    /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across rows sharing a
+    /// `created_at` or `truth_value`.
+    ///
+    /// The tracing span skips `filter` for the reason given on
+    /// [`Self::count_filtered`]; `limit`/`offset` are still recorded, and
+    /// `id_count` keeps the cardinality without the payload.
+    ///
+    /// The `Viewer` is threaded and spent for the reason given on
+    /// [`Self::count_filtered`], which also explains why both take an executor
+    /// rather than a pool.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] if the database query fails, or
+    /// [`DbError`] from [`TruthValue::new`] on an out-of-range stored value.
+    #[instrument(skip(executor, viewer, filter), fields(id_count = filter.ids.map(|ids| ids.len())))]
+    pub async fn list_filtered<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        filter: &ClaimListFilter<'_>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
+        let sort_column = match filter.sort_by {
+            ClaimSortField::CreatedAt => "created_at",
+            ClaimSortField::TruthValue => "truth_value",
+        };
+        let direction = match filter.sort_order {
+            ClaimSortOrder::Desc => "DESC",
+            ClaimSortOrder::Asc => "ASC",
+        };
+
+        // `bind_filter` consumes `$1..$9`, `LIMIT`/`OFFSET` take `$10`/`$11`,
+        // so the group bind is `$12`. The marker is the same literal
+        // `count_filtered` writes, and `the_viewer_filters_both_halves_of_the_pair`
+        // is what asserts the two statements agree about it.
+        let sql = viewer.splice(
+            &format!(
+                r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
+            FROM claims{where_clause}
+              /* {{VISIBILITY:claims}} */
+            ORDER BY {sort_column} {direction}, id {direction}
+            LIMIT $10 OFFSET $11
+            "#,
+                where_clause = Self::FILTER_WHERE,
+            ),
+            12,
+        );
+
+        let mut q = Self::bind_filter(
+            sqlx::query_as::<_, Row>(&sql),
+            Self::filter_search_pattern(filter),
+            filter,
+        )
+        .bind(limit)
+        .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            let mut claim = claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            );
+            // Post-fix retirement state; `claim_from_row` defaults these to
+            // (true, None) regardless of what the row actually says.
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
 
         Ok(claims)
@@ -1476,33 +3728,70 @@ impl ClaimRepository {
     /// outside that window is silently invisible (backlog bug `5a55a48e`:
     /// `query_claims(max_truth=0.75)` returned empty while matching claims
     /// existed).
-    pub async fn list_by_truth_range(
-        pool: &PgPool,
+    ///
+    /// `is_current` filters retirement state in SQL for the same reason:
+    /// `Some(true)` = current claims only, `Some(false)` = superseded only,
+    /// `None` = both. The returned `Claim`s carry the row's real `is_current`
+    /// and `supersedes` (post-fixed after `claim_from_row`, whose signature
+    /// stays untouched per `CLAUDE.md`), so a caller can no longer assert
+    /// currency it never read — the defect `ClaimRepository::list` had in
+    /// backlog `f1992766` and this query still had in `a85ee585`.
+    ///
+    /// `is_current` occupies `$3`, so the viewer's group bind is `$6`, not the
+    /// `$5` the pre-`a85ee585` shape used.
+    pub async fn list_by_truth_range<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         min_truth: f64,
         max_truth: f64,
+        is_current: Option<bool>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Claim>, DbError> {
-        let rows = sqlx::query_as::<_, ClaimRow>(
+        // Inline row type, NOT the shared `ClaimRow`: adding these columns to
+        // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
+        // SELECT omits them, and at runtime rather than at compile time.
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            is_current: bool,
+            supersedes: Option<Uuid>,
+        }
+
+        let sql = viewer.splice(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   COALESCE(is_current, true) AS is_current, supersedes
             FROM claims
             WHERE truth_value >= $1 AND truth_value <= $2
+              AND ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
+              /* {VISIBILITY:claims} */
             ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
+            LIMIT $4 OFFSET $5
             "#,
-        )
-        .bind(min_truth)
-        .bind(max_truth)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            6,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(min_truth)
+            .bind(max_truth)
+            .bind(is_current)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
             let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
+            let mut claim = claim_from_row(
                 row.id,
                 row.content,
                 row.agent_id,
@@ -1510,7 +3799,10 @@ impl ClaimRepository {
                 truth_value,
                 row.created_at,
                 row.updated_at,
-            ));
+            );
+            claim.is_current = row.is_current;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
         }
         Ok(claims)
     }
@@ -1523,17 +3815,28 @@ impl ClaimRepository {
     /// all yield `false`. Used to guard structural-edge creation against
     /// stale/duplicate endpoints — e.g. a CORROBORATES edge must not point at
     /// a claim that has already been retired (backlog bug `5c7fc645`).
-    pub async fn are_all_current(pool: &PgPool, ids: &[uuid::Uuid]) -> Result<bool, DbError> {
+    pub async fn are_all_current<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<bool, DbError> {
         if ids.is_empty() {
             return Ok(true);
         }
-        let live: i64 = sqlx::query_scalar(
+        // Filtered, so an invisible endpoint reads as "not current" and the
+        // structural-edge guard refuses rather than silently wiring a claim the
+        // caller cannot see.
+        let sql = viewer.splice(
             "SELECT COUNT(*) FROM claims \
-             WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
-        )
-        .bind(ids)
-        .fetch_one(pool)
-        .await?;
+             WHERE id = ANY($1) AND COALESCE(is_current, true) = true \
+             /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let live: i64 = q.fetch_one(executor).await?;
         // Distinct ids must each be present-and-current. A missing or
         // non-current id lowers the count below the distinct cardinality.
         let distinct: std::collections::HashSet<&uuid::Uuid> = ids.iter().collect();
@@ -1556,21 +3859,191 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    pub async fn contents_by_ids(
-        pool: &PgPool,
+    pub async fn contents_by_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
-            "SELECT id, content FROM claims \
-             WHERE id = ANY($1) AND COALESCE(is_current, true) = true",
-        )
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+        let sql = viewer.splice(
+            "SELECT c.id, c.content FROM claims c \
+             WHERE c.id = ANY($1) AND COALESCE(c.is_current, true) = true \
+             /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, String)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Fetch `(id, content)` for a batch of claim ids **at any version**.
+    ///
+    /// Identical to [`Self::contents_by_ids`] except that it does not filter
+    /// `is_current`. It exists because that filter is a *contract of the rerank
+    /// pool*, not a property of "fetch some content" — and PR-09 nearly
+    /// exported it as one.
+    ///
+    /// `epigraph-api`'s `routes/cross_source.rs::list_candidates` replaced an
+    /// inline `SELECT id, content FROM claims WHERE id = ANY($1)` (no
+    /// `is_current`) with a call to `contents_by_ids` (which has one).
+    /// `match_candidates` rows are long-lived and routinely name claims that
+    /// are later retired by `supersede_claim` / `mark_duplicate`, and nothing
+    /// prunes the queue when that happens — so every such row would have
+    /// rendered as the literal string `"(claim not found)"` for a claim that
+    /// does exist. That is a silent narrowing of an endpoint whose own doc
+    /// advertises "verbatim content excerpts of both claims in each pair", and
+    /// it is unrelated to tenancy. A separate function rather than a
+    /// `bool` parameter: a boolean at a security-relevant read is a flag that
+    /// eventually gets passed wrong, and `contents_by_ids`'s current-only
+    /// contract is pinned by name in
+    /// `contents_by_ids_returns_current_only_and_skips_missing`.
+    ///
+    /// The visibility predicate is identical, so this is not a widening of read
+    /// authority — only of version scope.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn contents_by_ids_any_version<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashMap<uuid::Uuid, String>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT c.id, c.content FROM claims c \
+             WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, String)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// The subset of `ids` that name a `claims` row this viewer **cannot**
+    /// read.
+    ///
+    /// The Rust-callable half of the rule
+    /// [`crate::repos::EventRepository::list`] implements in SQL, for callers
+    /// that hold rows the database cannot filter — specifically
+    /// `epigraph-api`'s `list_events`, which merges an in-process ring buffer
+    /// (`global_event_store()`) into the same response as the persisted table.
+    /// Filtering only the SQL half would have left the merge as the trivial
+    /// bypass for the filter, and the ring buffer is not a no-db artefact: the
+    /// `db`-build handlers in `routes/edges.rs`, `routes/belief.rs` and
+    /// `routes/community.rs` all push into it.
+    ///
+    /// "Cannot read" is deliberately narrower than "is absent from the
+    /// result": an id that names **no** row at all is not returned, because
+    /// there is no row to classify and no owner to protect. Only
+    /// *existing-but-invisible* ids come back, so a caller that drops its
+    /// records on a non-empty intersection matches the SQL exactly.
+    ///
+    /// # BOTH ARMS RUN INSIDE A DEFINER FRAME — THIS IS STILL NOT A CONVERSION SITE
+    ///
+    /// The set difference below asks two questions: *does this id name a row*
+    /// (first arm) and *may this viewer read it* (second, spliced arm). It only
+    /// answers anything while the two arms have **different authority**.
+    ///
+    /// Read against `claims` directly, they do not, once migration 079's FORCE
+    /// posture is live on an application role: `claims_tenancy` (077) filters
+    /// both, its `USING` predicate keys on `epigraph_session_groups()` — the
+    /// session GUCs — and the difference collapses. That was
+    /// `F-PR23-existence-probe-collapses-under-force`, and an empty result is
+    /// read by both callers as "nothing is hidden", so the failure was
+    /// uninformative rather than conservative. **It could not be repaired by
+    /// stamping the connection**: `epigraph_bypass()` and
+    /// `epigraph_definer_bypass()` are role-based (`session_user` /
+    /// `current_user`) and unreachable from `ScopedPool::apply_session_gucs`.
+    ///
+    /// Migration **086** repairs it by moving *both* arms into a
+    /// `SECURITY DEFINER` frame — `public.epigraph_claim_tenancy_by_ids(uuid[])`,
+    /// which returns `(id, visibility, owner_group_id)` for caller-named ids and
+    /// never content — and splicing the viewer predicate over that function's
+    /// output instead of over `claims`. The only filter left on either arm is
+    /// then the viewer's own predicate, which is the authority this signature
+    /// promises.
+    ///
+    /// ## Why the existence arm alone was not enough
+    ///
+    /// Measured on the throwaway at head 91 with FORCE live. With only the
+    /// existence arm in the frame, the spliced arm is *still* narrowed by the
+    /// policy to `visibility = 'public'` whatever `$V` binds — so on an
+    /// **unstamped** connection carrying a **member** viewer, a group-private
+    /// claim the viewer is entitled to read comes back reported hidden, and
+    /// both callers drop its delivery. That is the shape both call sites
+    /// actually have: they take a raw `&PgPool` as a parameter and nothing
+    /// stamps it (`D-PR17-request-path-never-stamps-session-gucs`). Splicing
+    /// over the function's output is what makes the answer independent of
+    /// whether the session is stamped, unstamped, or incoherently stamped.
+    ///
+    /// ## What did NOT change
+    ///
+    /// * A `Bypass` viewer still short-circuits through the existing mechanism:
+    ///   `splice` renders it to a bare separator, the two arms coincide, and
+    ///   the difference is empty. No hand-rolled branch.
+    /// * The contract above — an id naming **no** row is not reported — is
+    ///   unchanged and is what `locked_decisions.rs` pins for both callers.
+    /// * The two callers (`epigraph-api`'s `routes/webhooks.rs` and
+    ///   `routes/events.rs`) must **still not** be "converted" onto
+    ///   `AppState::read_as`. Closing this probe does not by itself make them
+    ///   safe to convert; that is a separate decision, and the do-not-convert
+    ///   rule in `epigraph-db/tests/no_unscoped_pool.rs` is updated rather than
+    ///   removed. Step 11d also remains blocked on
+    ///   `D-PR17-request-path-never-stamps-session-gucs`; this discharged one
+    ///   precondition, not the gate.
+    ///
+    /// The behaviour is pinned by
+    /// `epigraph-db/tests/rls_enforcement.rs::hidden_claim_ids_still_classifies_on_the_app_role_under_force`,
+    /// which runs on a real `epigraph_app` session and carries an
+    /// owner-connection calibration arm — the unit test below runs on the
+    /// superuser harness pool, where no policy applies, and therefore cannot
+    /// distinguish a working probe from a broken one.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    pub async fn hidden_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<std::collections::HashSet<uuid::Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        // EXCEPT rather than a negated predicate: `render_predicate` produces a
+        // positive `AND (...)` fragment and there is no spelling of the marker
+        // that inverts it. Set difference gets the same answer without asking
+        // the splice mechanism to do something it was not built for.
+        //
+        // The CTE is not cosmetic: it calls the definer ONCE for both arms, so
+        // the two cannot disagree about the row set, and it gives the spliced
+        // arm an alias to hang `/* {VISIBILITY:c} */` on. `WHERE true` is the
+        // established spelling for a marker with no other predicate to append
+        // to (see `repos/frame.rs`, `repos/community.rs`).
+        let sql = viewer.splice(
+            "WITH t AS ( \
+                 SELECT id, visibility, owner_group_id \
+                   FROM public.epigraph_claim_tenancy_by_ids($1) \
+             ) \
+             SELECT id FROM t \
+             EXCEPT \
+             SELECT c.id FROM t c WHERE true /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, uuid::Uuid>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
     /// Fetch `labels` for a batch of claim ids in one round-trip.
@@ -1580,32 +4053,39 @@ impl ClaimRepository {
     /// `get_labels` calls (backlog bug `babd5904`: `query_claims` hardcoded
     /// `labels: Vec::new()`).
     ///
-    /// Deliberately does **NOT** filter on `is_current`. `query_claims` runs
-    /// [`Self::list_by_truth_range`], which returns superseded rows, and the
-    /// single-claim label source it mirrors (`get_labels` →
-    /// `SELECT labels FROM claims WHERE id = $1`) has no `is_current` clause
-    /// either. Filtering here would silently re-drop labels for superseded
-    /// claims — the same bug class, narrowed. A missing id is simply absent
-    /// from the map (caller treats absence as "no labels").
+    /// Deliberately does **NOT** filter on `is_current`. Whether superseded
+    /// rows reach this helper is the *caller's* decision — `query_claims`
+    /// passes `is_current` through to [`Self::list_by_truth_range`] and may
+    /// legitimately ask for superseded rows — and the single-claim label
+    /// source this mirrors (`get_labels` → `SELECT labels FROM claims WHERE
+    /// id = $1`) has no `is_current` clause either. Filtering here would
+    /// silently drop labels for whichever superseded rows the caller
+    /// deliberately selected — the same bug class, narrowed. A missing id is
+    /// simply absent from the map (caller treats absence as "no labels").
     ///
     /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry)
     /// to keep `cargo sqlx prepare` out of this change's footprint.
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
-    pub async fn labels_by_ids(
-        pool: &PgPool,
+    pub async fn labels_by_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         ids: &[uuid::Uuid],
     ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<String>>, DbError> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let rows = sqlx::query_as::<_, (uuid::Uuid, Vec<String>)>(
-            "SELECT id, COALESCE(labels, ARRAY[]::text[]) FROM claims WHERE id = ANY($1)",
-        )
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+        let sql = viewer.splice(
+            "SELECT id, COALESCE(labels, ARRAY[]::text[]) FROM claims \
+             WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, Vec<String>)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
         Ok(rows.into_iter().collect())
     }
 
@@ -1630,16 +4110,20 @@ impl ClaimRepository {
     /// queries that don't need these columns) untouched, and we don't widen
     /// `claim_from_row`'s signature — its other ~20 callers don't care about
     /// retirement state.
-    #[instrument(skip(pool))]
-    pub async fn list_by_labels(
-        pool: &PgPool,
-        labels: &[String],
-        exclude_labels: &[String],
-        current_only: bool,
-        min_truth: f64,
-        limit: i64,
-        offset: i64,
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_by_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query: LabelQuery<'_>,
     ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
+        let LabelQuery {
+            labels,
+            exclude_labels,
+            current_only,
+            min_truth,
+            limit,
+            offset,
+        } = query;
         #[derive(sqlx::FromRow)]
         struct Row {
             id: Uuid,
@@ -1656,28 +4140,33 @@ impl ClaimRepository {
 
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
-        let rows = sqlx::query_as::<_, Row>(
+        let sql = viewer.splice(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id,
-                   created_at, updated_at, labels, is_current, supersedes
-            FROM claims
-            WHERE labels @> $1
-              AND truth_value >= $2
-              AND ($3::text[] = '{}'::text[] OR NOT (labels && $3))
-              AND ($4 = false OR COALESCE(is_current, true) = true)
-            ORDER BY created_at DESC
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at, c.labels, c.is_current, c.supersedes
+            FROM claims c
+            WHERE c.labels @> $1
+              AND c.truth_value >= $2
+              AND ($3::text[] = '{}'::text[] OR NOT (c.labels && $3))
+              AND ($4 = false OR COALESCE(c.is_current, true) = true)
+              /* {VISIBILITY:c} */
+            ORDER BY c.created_at DESC
             LIMIT $5
             OFFSET $6
             "#,
-        )
-        .bind(labels)
-        .bind(min_truth)
-        .bind(exclude_labels)
-        .bind(current_only)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            7,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(labels)
+            .bind(min_truth)
+            .bind(exclude_labels)
+            .bind(current_only)
+            .bind(limit)
+            .bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1723,8 +4212,9 @@ impl ClaimRepository {
     ///
     /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
     /// monotonic progress through the backlog across scheduled runs.
-    pub async fn list_undecomposed(
-        pool: &PgPool,
+    pub async fn list_undecomposed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Claim>, DbError> {
@@ -1741,7 +4231,12 @@ impl ClaimRepository {
 
         let limit = limit.clamp(1, 1000);
         let offset = offset.max(0);
-        let rows = sqlx::query_as::<_, Row>(
+        // The two `NOT EXISTS` probes over `edges` are deliberately NOT marked:
+        // they are exclusion tests, so filtering them would make a
+        // decomposes_to edge the viewer cannot see stop excluding its claim —
+        // widening the result set, not narrowing it. The `claims` alias carries
+        // the predicate.
+        let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
                    c.created_at, c.updated_at
@@ -1758,14 +4253,17 @@ impl ClaimRepository {
                   SELECT 1 FROM edges e
                   WHERE e.target_id = c.id AND e.relationship = 'decomposes_to'
               )
+              /* {VISIBILITY:c} */
             ORDER BY c.created_at ASC
             LIMIT $1 OFFSET $2
             "#,
-        )
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql).bind(limit).bind(offset);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1797,9 +4295,10 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn search_by_label_and_text(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn search_by_label_and_text<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         labels: &[String],
         text: &str,
         min_truth: f64,
@@ -1810,24 +4309,30 @@ impl ClaimRepository {
         // the `idx_claims_content_tsv` index (migration 050) instead of forcing
         // a sequential scan with a leading-wildcard ILIKE. `websearch_to_tsquery`
         // accepts free-form query strings and handles quoting internally.
-        let rows = sqlx::query_as::<_, ClaimRow>(
+        let sql = viewer.splice(
             r#"
-            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims
-            WHERE labels @> $1
-              AND content_tsv @@ websearch_to_tsquery('english', $2)
-              AND truth_value >= $3
-              AND COALESCE(is_current, true) = true
-            ORDER BY truth_value DESC, created_at DESC
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at
+            FROM claims c
+            WHERE c.labels @> $1
+              AND c.content_tsv @@ websearch_to_tsquery('english', $2)
+              AND c.truth_value >= $3
+              AND COALESCE(c.is_current, true) = true
+              /* {VISIBILITY:c} */
+            ORDER BY c.truth_value DESC, c.created_at DESC
             LIMIT $4
             "#,
-        )
-        .bind(labels)
-        .bind(text)
-        .bind(min_truth)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            5,
+        );
+        let mut q = sqlx::query_as::<_, ClaimRow>(&sql)
+            .bind(labels)
+            .bind(text)
+            .bind(min_truth)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
 
         let mut claims = Vec::with_capacity(rows.len());
         for row in rows {
@@ -1849,89 +4354,84 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn count(pool: &PgPool, search: Option<&str>) -> Result<i64, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn count<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        search: Option<&str>,
+    ) -> Result<i64, DbError> {
         let search_pattern = search.map(|s| format!("%{}%", s));
 
-        let query_str = if search_pattern.is_some() {
-            r#"
+        let (query_str, vis_bind) = if search_pattern.is_some() {
+            (
+                r#"
             SELECT COUNT(*) as count
             FROM claims
-            WHERE content ILIKE $1
-            "#
+            WHERE content ILIKE $1 /* {VISIBILITY:claims} */
+            "#,
+                2,
+            )
         } else {
-            r#"
+            (
+                r#"
             SELECT COUNT(*) as count
             FROM claims
-            "#
+            WHERE true /* {VISIBILITY:claims} */
+            "#,
+                1,
+            )
         };
+        let sql = viewer.splice(query_str, vis_bind);
 
-        let mut query = sqlx::query_scalar::<_, i64>(query_str);
+        let mut query = sqlx::query_scalar::<_, i64>(&sql);
 
         if let Some(s) = search_pattern {
             query = query.bind(s);
         }
+        if let Some(g) = viewer.group_bind() {
+            query = query.bind(g);
+        }
 
-        let row_count = query.fetch_one(pool).await?;
+        let row_count = query.fetch_one(executor).await?;
 
         Ok(row_count)
     }
 
     /// List claims with pagination within an existing transaction.
+    ///
+    /// Delegates to the generic form above, which accepts any executor —
+    /// `&mut PgConnection` included — so the visibility predicate exists in
+    /// exactly one SQL text. The hand-written duplicate this replaced was the
+    /// same drift class `count_conn` was collapsed for: two copies of one
+    /// tenancy predicate, only one of which a future fix reaches, and no gate
+    /// can see the divergence because each copy carries its own marker.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn list_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
         offset: i64,
         search: Option<&str>,
     ) -> Result<Vec<Claim>, DbError> {
-        let search_pattern = search.map(|s| format!("%{}%", s));
-        let query_str = if search_pattern.is_some() {
-            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims WHERE content ILIKE $3 ORDER BY created_at DESC LIMIT $1 OFFSET $2"#
-        } else {
-            r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-            FROM claims ORDER BY created_at DESC LIMIT $1 OFFSET $2"#
-        };
-        let mut query = sqlx::query_as::<_, ClaimRow>(query_str)
-            .bind(limit)
-            .bind(offset);
-        if let Some(s) = search_pattern {
-            query = query.bind(s);
-        }
-        let rows = query.fetch_all(&mut *conn).await?;
-        let mut claims = Vec::with_capacity(rows.len());
-        for row in rows {
-            let truth_value = TruthValue::new(row.truth_value)?;
-            claims.push(claim_from_row(
-                row.id,
-                row.content,
-                row.agent_id,
-                row.trace_id,
-                truth_value,
-                row.created_at,
-                row.updated_at,
-            ));
-        }
-        Ok(claims)
+        Self::list(&mut *conn, viewer, limit, offset, search).await
     }
 
     /// Count total number of claims within an existing transaction.
+    ///
+    /// Delegates to the generic form above, which accepts any executor. The
+    /// hand-written duplicate this replaced was the drift class that a gate
+    /// cannot see: two copies of one predicate, only one of which gets fixed.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn count_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         search: Option<&str>,
     ) -> Result<i64, DbError> {
-        let search_pattern = search.map(|s| format!("%{}%", s));
-        let query_str = if search_pattern.is_some() {
-            r#"SELECT COUNT(*) as count FROM claims WHERE content ILIKE $1"#
-        } else {
-            r#"SELECT COUNT(*) as count FROM claims"#
-        };
-        let mut query = sqlx::query_scalar::<_, i64>(query_str);
-        if let Some(s) = search_pattern {
-            query = query.bind(s);
-        }
-        let count = query.fetch_one(&mut *conn).await?;
-        Ok(count)
+        Self::count(&mut *conn, viewer, search).await
     }
 
     /// Batch create multiple claims in a single transaction
@@ -1942,6 +4442,11 @@ impl ClaimRepository {
     /// # Arguments
     /// * `pool` - Database connection pool
     /// * `claims` - Slice of claims to insert
+    /// * `decl` - the tenancy declaration applied to EVERY claim in the batch.
+    ///   One declaration for the whole batch, not one per claim: a batch is a
+    ///   single caller's single decision, and a per-claim vector would make it
+    ///   possible to mix two groups' rows into one statement, which is the
+    ///   shape `consolidate`'s cross-group refusal exists to forbid.
     ///
     /// # Returns
     /// Vector of created claims with server-generated timestamps
@@ -1954,7 +4459,11 @@ impl ClaimRepository {
     /// - Batch size is limited internally to prevent memory issues
     /// - For very large batches (>1000), consider chunking externally
     #[instrument(skip(pool, claims), fields(batch_size = claims.len()))]
-    pub async fn batch_create(pool: &PgPool, claims: &[Claim]) -> Result<Vec<Claim>, DbError> {
+    pub async fn batch_create(
+        pool: &PgPool,
+        claims: &[Claim],
+        decl: TenancyDecl,
+    ) -> Result<Vec<Claim>, DbError> {
         if claims.is_empty() {
             return Ok(Vec::new());
         }
@@ -1975,28 +4484,32 @@ impl ClaimRepository {
         // Build multi-value INSERT query dynamically
         // PostgreSQL supports multi-row VALUES: INSERT INTO t VALUES (...), (...), (...)
         let mut query_builder = String::from(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
                VALUES "#,
         );
 
-        // Build parameter placeholders and collect values
+        // Build parameter placeholders and collect values.
+        //
+        // TEN placeholders per row, not eight: the two tenancy columns are
+        // bound per row rather than hoisted into a single shared pair of
+        // parameters. Hoisting would be fewer binds, but it would put the
+        // declaration outside the per-row loop below and the two would drift
+        // the first time someone made `decl` per-claim. The stride and the
+        // bind order are the same arithmetic; keeping them adjacent is what
+        // makes an off-by-two visible.
+        const PARAMS_PER_ROW: usize = 10;
         let mut param_idx = 1;
         for (i, _) in claims.iter().enumerate() {
             if i > 0 {
                 query_builder.push_str(", ");
             }
-            query_builder.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                param_idx,
-                param_idx + 1,
-                param_idx + 2,
-                param_idx + 3,
-                param_idx + 4,
-                param_idx + 5,
-                param_idx + 6,
-                param_idx + 7
-            ));
-            param_idx += 8;
+            let placeholders: Vec<String> = (0..PARAMS_PER_ROW)
+                .map(|k| format!("${}", param_idx + k))
+                .collect();
+            query_builder.push('(');
+            query_builder.push_str(&placeholders.join(", "));
+            query_builder.push(')');
+            param_idx += PARAMS_PER_ROW;
         }
 
         query_builder.push_str(
@@ -2026,7 +4539,9 @@ impl ClaimRepository {
                 .bind(agent_id)
                 .bind(trace_id)
                 .bind(claim.created_at)
-                .bind(claim.updated_at);
+                .bind(claim.updated_at)
+                .bind(decl.visibility_bind())
+                .bind(decl.owner_group_bind());
         }
 
         let rows = query.fetch_all(&mut *tx).await?;
@@ -2133,14 +4648,83 @@ impl ClaimRepository {
     ///
     /// # Implementation Notes
     /// The UPDATE that marks the old claim `is_current = false` also sets
-    /// `embedding = NULL` in the **same statement**.  This is required by the
-    /// CHECK constraint `chk_deprecated_no_embedding` (migration 052), which
-    /// fires per-statement rather than per-transaction: splitting the two
-    /// assignments across two UPDATE statements would violate the constraint
-    /// between statements.  Any future caller — REST handlers, CLI tools, tests
+    /// `embedding = NULL` and `embedding_3072 = NULL` in the **same
+    /// statement**.  This is required by the CHECK constraint
+    /// `chk_deprecated_no_embedding` (migration 052), which fires
+    /// per-statement rather than per-transaction: splitting the assignments
+    /// across two UPDATE statements would violate the constraint between
+    /// statements.  Any future caller — REST handlers, CLI tools, tests
     /// — must preserve this single-statement invariant.  See also
     /// [`ClaimRepository::mark_duplicate`] which is subject to the same
     /// constraint.
+    ///
+    /// # Edge migration policy (issue #398)
+    ///
+    /// Edges are re-pointed at the replacement in both directions, with one
+    /// exception: the WEAKENING relationships
+    /// ([`crate::repos::edge::WEAKENING_RELATIONSHIPS`] — `refutes`,
+    /// `contradicts`) do NOT migrate, in either direction. They stay on
+    /// `old_claim_id`.
+    ///
+    /// The rule follows from what an edge asserts. `A -refutes-> B` is a claim
+    /// about a *specific pair of contents*. Supersession replaces one of those
+    /// contents, so the relation has to be re-established, not assumed — and
+    /// the same reasoning already stated fifty lines below for `properties`
+    /// ("blanket copy would propagate the bug the supersede was meant to
+    /// correct") applies with more force here, because a migrated weakening
+    /// edge does not merely carry a stale value forward, it *suppresses the
+    /// correction*: [`ClaimRepository::dispute_batch`] reads exactly these two
+    /// relationships into `is_contested`, and `recall(exclude_contested: true)`
+    /// drops contested rows.
+    ///
+    /// Both directions are excluded because both were observed corrupting
+    /// production (issue #398):
+    ///
+    /// * **Incoming.** Refute the false claim, then correct it — the natural
+    ///   correction workflow — and the refutation lands on the correction. The
+    ///   fix arrives pre-refuted, by the very claim that motivated it.
+    /// * **Outgoing.** A claim holding two `contradicts` edges was superseded
+    ///   by a replacement that *retracted* those objections; the edges followed,
+    ///   recording the retraction as contesting the claims it declared correct.
+    ///   That instance was cleaned up by hand with `DELETE /api/v1/edges/:id`.
+    ///
+    /// Leaving an outgoing weakening edge on the superseded source is not a
+    /// leak, because `dispute_batch` joins `claims src ON … AND src.is_current`:
+    /// a retired contester stops counting automatically. The cost of the rule is
+    /// therefore bounded and one-directional — a supersession that merely
+    /// *sharpens* an existing refutation must re-file it via `link_epistemic`,
+    /// exactly as it must re-set `properties`. The cost of the opposite default
+    /// is unbounded and silent.
+    ///
+    /// Incoming STRENGTHENING edges still migrate, unchanged. They are the
+    /// mirror-image judgement call, but their failure mode is the loss of a
+    /// positive signal rather than the manufacture of a negative one, and
+    /// changing them is not this function's decision to make.
+    ///
+    /// ## Self-loop guards — deliberately unreachable
+    ///
+    /// Both statements also carry [`ClaimRepository::mark_duplicate`]'s
+    /// `source_id`/`target_id` self-loop guards, and unlike there they are
+    /// **defence in depth, not a live defect fix**. Issue #398 reports the
+    /// guards as missing; they are, but nothing can currently reach them:
+    ///
+    /// * `supersede` MINTS `new_uuid` in this transaction, so no pre-existing
+    ///   edge can already name it (the only one that does is the `supersedes`
+    ///   edge inserted above, excluded by `relationship != 'supersedes'`).
+    ///   Contrast `mark_duplicate`, whose canonical claim pre-exists and
+    ///   routinely already has edges — there the guards are load-bearing.
+    /// * The remaining shape — a pre-existing `old -rel-> old` self-edge that
+    ///   the two statements would compose into `new -rel-> new` — cannot be
+    ///   stored at all: `edges_no_self_loop`
+    ///   (`CHECK (source_id <> target_id OR source_type <> target_type)`,
+    ///   migration 001) rejects claim→claim self-edges on insert.
+    ///
+    /// They are kept anyway because the schema CHECK's failure mode is worse
+    /// than the guards': were a future migration to relax it, an ungarded
+    /// UPDATE that produced a self-loop would abort the whole transaction and
+    /// turn a bad edge into a failed supersession. The guard degrades that to
+    /// "this one edge does not migrate". There is no test pinning them, because
+    /// the precondition cannot be constructed through the schema.
     #[instrument(skip(pool))]
     pub async fn supersede(
         pool: &PgPool,
@@ -2166,9 +4750,10 @@ impl ClaimRepository {
         // want to preserve specific properties on the new claim should set
         // them via a follow-up `patch_claim`.
         let old_row: Option<(Uuid, bool, Vec<String>)> = sqlx::query_as(
-            "SELECT agent_id, COALESCE(is_current, true), \
-                    COALESCE(labels, ARRAY[]::text[]) \
-             FROM claims WHERE id = $1",
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             SELECT agent_id, COALESCE(is_current, true),
+                    COALESCE(labels, ARRAY[]::text[])
+             FROM claims WHERE id = $1"#,
         )
         .bind(old_uuid)
         .fetch_optional(&mut *tx)
@@ -2188,13 +4773,14 @@ impl ClaimRepository {
             });
         }
 
-        // Mark old claim as non-current and null its embedding in one statement.
-        // Combining both in a single UPDATE is required by the CHECK constraint
-        // `chk_deprecated_no_embedding` (migration 052) which fires per-statement,
-        // not per-transaction: a two-step update would violate it between statements.
+        // Mark old claim as non-current and null both embedding columns in one
+        // statement. Combining all three in a single UPDATE is required by the
+        // CHECK constraint `chk_deprecated_no_embedding` (migration 052) which
+        // fires per-statement, not per-transaction: a two-step update would
+        // violate it between statements.
         sqlx::query(
-            "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
-             WHERE id = $1",
+            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+             updated_at = NOW() WHERE id = $1",
         )
         .bind(old_uuid)
         .execute(&mut *tx)
@@ -2232,23 +4818,46 @@ impl ClaimRepository {
         .execute(&mut *tx)
         .await?;
 
-        // Migrate incoming edges: redirect edges pointing TO old claim to point to new claim
+        // Edge migration. Both directions carry the STRENGTHENING relationships
+        // forward and leave the WEAKENING ones
+        // (`crate::repos::edge::WEAKENING_RELATIONSHIPS` — `refutes`,
+        // `contradicts`) attached to the claim they were filed against or by.
+        // See the "Edge migration policy" section of this function's doc comment
+        // for why (issue #398).
+        let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        // Migrate incoming edges: redirect edges pointing TO old claim to point
+        // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
+        // mark_duplicate's self-loop guard, carried over so the two replacement
+        // paths share one rule; see the doc comment for the one shape that
+        // reaches it here.
         sqlx::query(
             "UPDATE edges SET target_id = $1 \
-             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes'",
+             WHERE target_id = $2 AND target_type = 'claim' \
+               AND relationship != 'supersedes' \
+               AND NOT (relationship = ANY($3)) \
+               AND NOT (source_type = 'claim' AND source_id = $1)",
         )
         .bind(new_uuid)
         .bind(old_uuid)
+        .bind(&weakening)
         .execute(&mut *tx)
         .await?;
 
         // Migrate outgoing edges: redirect edges FROM old claim to come from new claim
         sqlx::query(
             "UPDATE edges SET source_id = $1 \
-             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes'",
+             WHERE source_id = $2 AND source_type = 'claim' \
+               AND relationship != 'supersedes' \
+               AND NOT (relationship = ANY($3)) \
+               AND NOT (target_type = 'claim' AND target_id = $1)",
         )
         .bind(new_uuid)
         .bind(old_uuid)
+        .bind(&weakening)
         .execute(&mut *tx)
         .await?;
 
@@ -2277,21 +4886,25 @@ impl ClaimRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn find_by_content_hash_and_agent(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         content_hash: &[u8],
         agent_id: Uuid,
     ) -> Result<Option<Claim>, DbError> {
         use sqlx::Row;
 
-        let row = sqlx::query(
+        let sql = viewer.splice(
             r#"SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
                FROM claims
                WHERE content_hash = $1 AND agent_id = $2
+                 /* {VISIBILITY:claims} */
                LIMIT 1"#,
-        )
-        .bind(content_hash)
-        .bind(agent_id)
-        .fetch_optional(&mut *conn)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(content_hash).bind(agent_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_optional(&mut *conn).await?;
 
         match row {
             Some(row) => {
@@ -2331,6 +4944,7 @@ impl ClaimRepository {
     pub async fn create_strict(
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
+        decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
         use sqlx::Row;
 
@@ -2343,8 +4957,8 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
         let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
         )
         .bind(id)
@@ -2355,6 +4969,8 @@ impl ClaimRepository {
         .bind(trace_id)
         .bind(created_at)
         .bind(updated_at)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -2421,28 +5037,88 @@ impl ClaimRepository {
     ///
     /// Takes `&mut PgConnection` for transactional composition.
     ///
+    /// # Why the insert attempt runs inside a SAVEPOINT
+    ///
+    /// The race-handling above is only expressible if the connection is still
+    /// usable after the failed INSERT, and inside a transaction it is not:
+    /// PostgreSQL aborts the whole transaction on the first failed statement, so
+    /// the `find_by_content_hash_and_agent` re-read in the catch path could not
+    /// run at all. MEASURED, by removing this savepoint and running
+    /// `claim_repo_helpers.rs::the_dedup_race_is_absorbed_inside_a_caller_transaction`:
+    /// the call fails with `25P02 current transaction is aborted, commands
+    /// ignored until end of transaction block`. So a genuine
+    /// `(content_hash, agent_id)` race — the only thing this method's dedup
+    /// contract exists for — stopped de-duplicating and started failing the
+    /// caller's whole unit of work the moment a writer wrapped it in a
+    /// transaction. `epigraph-mcp`'s submission path is that writer.
+    ///
+    /// The savepoint restores the contract without changing it: the refused
+    /// INSERT is rolled back alone, the re-find runs on a usable connection, and
+    /// the caller gets `(existing, false)`. Same construction as
+    /// `EventRepository::publish_or_log_conn` and
+    /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`, for the
+    /// same reason.
+    ///
+    /// On a connection that is NOT already in a transaction, `conn.begin()` is a
+    /// real `BEGIN`/`COMMIT` pair around the one INSERT — same durability, one
+    /// extra round trip, and the same visible behaviour the pre-savepoint code
+    /// had.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` for non-unique-violation database errors.
+    /// Returns `DbError::QueryFailed` for non-unique-violation database errors,
+    /// and for a failure to take or release the savepoint (the caller's
+    /// transaction is then already unusable and must not be handed back as if
+    /// the write had succeeded).
     pub async fn create_or_get(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         claim: &Claim,
+        decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
+        use sqlx::Acquire;
+
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
-        if let Some(existing) =
-            Self::find_by_content_hash_and_agent(&mut *conn, content_hash.as_slice(), agent_id)
-                .await?
+        if let Some(existing) = Self::find_by_content_hash_and_agent(
+            &mut *conn,
+            viewer,
+            content_hash.as_slice(),
+            agent_id,
+        )
+        .await?
         {
             return Ok((existing, false));
         }
 
-        match Self::create_strict(&mut *conn, claim).await {
+        let attempt = {
+            let mut sp = conn
+                .begin()
+                .await
+                .map_err(|source| DbError::QueryFailed { source })?;
+            match Self::create_strict(&mut sp, claim, decl).await {
+                Ok(c) => {
+                    sp.commit()
+                        .await
+                        .map_err(|source| DbError::QueryFailed { source })?;
+                    Ok(c)
+                }
+                Err(e) => {
+                    sp.rollback()
+                        .await
+                        .map_err(|source| DbError::QueryFailed { source })?;
+                    Err(e)
+                }
+            }
+        };
+
+        match attempt {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
                 // Post-107 race: another writer won. Re-find and return.
                 let existing = Self::find_by_content_hash_and_agent(
                     &mut *conn,
+                    viewer,
                     content_hash.as_slice(),
                     agent_id,
                 )
@@ -2463,7 +5139,15 @@ impl ClaimRepository {
     /// generate deterministic UUIDs and rely on idempotent re-runs.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` for non-conflict failures.
+    /// Returns `DbError::QueryFailed` for non-conflict failures, or
+    /// `DbError::InvalidData` if a label carries unexpanded shell syntax.
+    // Eight parameters, one over clippy's default. Allowed rather than bundled
+    // into a struct: the eighth is `decl`, and the whole point of PR-16 is that
+    // the tenancy declaration is VISIBLE at every call site. A parameter object
+    // would hide it inside a literal that a caller can construct without
+    // thinking about the field — which is the shape a `Default` impl grows out
+    // of, and D1 is the rule that says there must not be one.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
@@ -2473,10 +5157,17 @@ impl ClaimRepository {
         agent_id: Uuid,
         truth: TruthValue,
         labels: &[String],
+        decl: TenancyDecl,
     ) -> Result<bool, DbError> {
+        // Labels-at-creation is the second caller-supplied label surface (the
+        // ingest paths); same predicate, refused before the INSERT so a bad
+        // label never reaches a row.
+        crate::label_validation::reject_unexpanded_labels(labels)?;
+
         let row: Option<(bool,)> = sqlx::query_as(
-            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, \
+                                 visibility, owner_group_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (id) DO NOTHING \
              RETURNING (xmax = 0) AS was_inserted",
         )
@@ -2486,6 +5177,8 @@ impl ClaimRepository {
         .bind(agent_id)
         .bind(truth.value())
         .bind(labels)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .fetch_optional(pool)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
@@ -2523,12 +5216,17 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn latest_in_lineage(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn latest_in_lineage<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         lineage_id: Uuid,
     ) -> Result<Vec<LineageHead>, DbError> {
-        let rows = sqlx::query_as::<_, LineageHead>(
+        // The `NOT EXISTS` over `edges` is an EXCLUSION test and is left
+        // unfiltered on purpose: filtering it would let a supersedes edge the
+        // viewer cannot see stop suppressing a stale head, so the function
+        // would return MORE, and wrong. Only `c` carries the predicate.
+        let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.created_at
             FROM claims c
@@ -2538,12 +5236,16 @@ impl ClaimRepository {
                   WHERE e.target_id = c.id
                     AND e.relationship = 'supersedes'
               )
+              /* {VISIBILITY:c} */
             ORDER BY c.created_at DESC
             "#,
-        )
-        .bind(lineage_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, LineageHead>(&sql).bind(lineage_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
         Ok(rows)
     }
 }
@@ -2578,12 +5280,13 @@ impl ClaimRepository {
     ) -> Result<usize, DbError> {
         // Create derived_from edges from new claim to old claim's evidence
         let result = sqlx::query(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             SELECT $1, 'claim', e.id, 'evidence', 'derived_from', \
-                    jsonb_build_object('inherited_from', $2::text) \
-             FROM evidence e \
-             WHERE e.claim_id = $2 \
-             ON CONFLICT DO NOTHING",
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+             SELECT $1, 'claim', e.id, 'evidence', 'derived_from', 
+                    jsonb_build_object('inherited_from', $2::text) 
+             FROM evidence e 
+             WHERE e.claim_id = $2 
+             ON CONFLICT DO NOTHING"#,
         )
         .bind(new_claim_id)
         .bind(old_claim_id)
@@ -2594,11 +5297,15 @@ impl ClaimRepository {
     }
 
     /// Count all evidence for a claim, including inherited evidence (via derived_from edges).
-    pub async fn count_all_evidence_for_claim(
-        pool: &PgPool,
+    pub async fn count_all_evidence_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<i64, DbError> {
-        let row: (i64,) = sqlx::query_as(
+        // PARENTHESES: the WHERE is an OR, and AND binds tighter. The `edges`
+        // marker sits in the LEFT JOIN's ON clause so it cannot null-filter the
+        // outer side into an inner join.
+        let sql = viewer.splice(
             "SELECT COUNT(DISTINCT e.id) \
              FROM evidence e \
              LEFT JOIN edges ed ON ed.target_id = e.id \
@@ -2606,11 +5313,15 @@ impl ClaimRepository {
                 AND ed.source_id = $1 \
                 AND ed.source_type = 'claim' \
                 AND ed.relationship = 'derived_from' \
-             WHERE e.claim_id = $1 OR ed.id IS NOT NULL",
-        )
-        .bind(claim_id)
-        .fetch_one(pool)
-        .await?;
+                /* {EDGE_VISIBILITY:ed} */ \
+             WHERE (e.claim_id = $1 OR ed.id IS NOT NULL) /* {VISIBILITY:e} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (i64,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (i64,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }
@@ -2625,8 +5336,12 @@ impl ClaimRepository {
     /// - `evidence --SUPPORTS-->       claim`
     /// - `analysis --concludes-->      claim`
     /// - `analysis --provides_evidence--> claim`
-    pub async fn has_grounded_evidence(pool: &PgPool, claim_id: Uuid) -> Result<bool, DbError> {
-        let row: (bool,) = sqlx::query_as(
+    pub async fn has_grounded_evidence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
             r#"
             SELECT EXISTS (
                 SELECT 1 FROM edges
@@ -2634,12 +5349,16 @@ impl ClaimRepository {
                   AND target_type = 'claim'
                   AND source_type IN ('paper', 'evidence', 'analysis')
                   AND relationship IN ('asserts', 'SUPPORTS', 'concludes', 'provides_evidence')
+                  /* {EDGE_VISIBILITY:edges} */
             )
             "#,
-        )
-        .bind(claim_id)
-        .fetch_one(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (bool,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: (bool,) = q.fetch_one(executor).await?;
 
         Ok(row.0)
     }
@@ -2650,21 +5369,26 @@ impl ClaimRepository {
     ///
     /// Valid values mirror the DB CHECK constraint on reasoning_traces:
     /// deductive, inductive, abductive, analogical, statistical.
-    pub async fn claim_ids_by_methodology(
-        pool: &PgPool,
+    pub async fn claim_ids_by_methodology<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         reasoning_type: &str,
     ) -> Result<Vec<Uuid>, DbError> {
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT DISTINCT c.id
             FROM claims c
             INNER JOIN reasoning_traces rt ON c.trace_id = rt.id
             WHERE rt.reasoning_type = $1
+              /* {VISIBILITY:c} */ /* {VISIBILITY:rt} */
             "#,
-        )
-        .bind(reasoning_type)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(reasoning_type);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
@@ -2673,20 +5397,25 @@ impl ClaimRepository {
     ///
     /// Valid values mirror the DB evidence_type column:
     /// document, observation, testimony, computation, reference, figure, conversational.
-    pub async fn claim_ids_by_evidence_type(
-        pool: &PgPool,
+    pub async fn claim_ids_by_evidence_type<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         evidence_type: &str,
     ) -> Result<Vec<Uuid>, DbError> {
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT DISTINCT e.claim_id
             FROM evidence e
             WHERE e.evidence_type = $1
+              /* {VISIBILITY:e} */
             "#,
-        )
-        .bind(evidence_type)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(evidence_type);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid,)> = q.fetch_all(executor).await?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
@@ -2697,13 +5426,36 @@ impl ClaimRepository {
     ///
     /// Excludes activity log claims (content starting with known activity prefixes).
     ///
+    /// # The executor is generic, and that is the point
+    ///
+    /// This is a corpus-wide maintenance enumerator: it runs under a bypass
+    /// `Viewer`, which emits no predicate, so once RLS is active the
+    /// *connection* — not the viewer — decides what it sees. Taking `&PgPool`
+    /// forced every caller onto whatever pool it happened to hold, which is how
+    /// `epigraph-api`'s handler ended up minting a privileged lease and then
+    /// spending it on the application pool: the privileged handle existed and
+    /// the statement ran somewhere else. Accepting any `PgExecutor` lets a
+    /// caller pass the maintenance connection it is already holding
+    /// (`&mut *maint_conn`), so the bypass and the connection cannot drift
+    /// apart. Callers that legitimately hold a maintenance pool still pass
+    /// `&PgPool` unchanged.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn find_claims_needing_embeddings(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn find_claims_needing_embeddings<'e, E>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         limit: i64,
-    ) -> Result<Vec<(Uuid, String)>, DbError> {
+    ) -> Result<Vec<(Uuid, String)>, DbError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+    {
+        debug_assert!(
+            viewer.is_bypass(),
+            "find_claims_needing_embeddings is a maintenance enumerator; a Scoped \
+             viewer here would silently leave other tenants unembedded forever"
+        );
         // Exclude host-provenance telemetry (epiclaw-host ProvenanceRecorder
         // signs every observable event as an immutable claim — container
         // lifecycle, task execution, agent output, messages). These are
@@ -2715,22 +5467,147 @@ impl ClaimRepository {
         // excluded. Also restrict to current claims: per the embedding
         // invariant, `is_current = false` rows should have `embedding = NULL`
         // by design, so they never "need" an embedding. (backlog a4aaa487)
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
             r#"
+            -- VISIBILITY-EXEMPT: embedding backfill must see every unembedded
+            -- row; a per-tenant view of the gap would leave every other
+            -- tenant's claims unembedded forever and silently break semantic
+            -- recall for them. Runs under SystemReason::EmbeddingBackfill on a
+            -- maintenance connection (debug_assert above, and the generic
+            -- executor so the caller can pass that very connection).
+            --
+            -- The population predicate is `EMBEDDABLE_POPULATION`, shared with
+            -- the two by-id reads so the enumerator and the write paths cannot
+            -- disagree about which rows are owed a vector. Encrypted claims are
+            -- excluded there, keyed on `claim_encryption` and NEVER on
+            -- `visibility`: a group-private claim is still plaintext in
+            -- `claims.content` and must be embedded, whereas a sealed claim has
+            -- no plaintext to embed and calling the embedder on its ciphertext
+            -- would both fail and leak length.
             SELECT id, content FROM claims
             WHERE embedding IS NULL
-              AND COALESCE(is_current, true) = true
-              AND NOT ('telemetry' = ANY(labels))
-              AND (properties->>'event') IS NULL
+              AND {EMBEDDABLE_POPULATION}
             ORDER BY created_at
             LIMIT $1
-            "#,
-        )
+            "#
+        ))
         .bind(limit)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows)
+    }
+
+    /// The text one claim should be embedded from, or `None` if it should not
+    /// be embedded at all.
+    ///
+    /// The by-id counterpart to
+    /// [`find_claims_needing_embeddings`](Self::find_claims_needing_embeddings),
+    /// for the restoration a privatization unseal enqueues: that path knows the
+    /// claim id and must not enumerate the corpus, but it has to apply the SAME
+    /// population rules, or the two paths disagree about which rows carry a
+    /// vector.
+    ///
+    /// # Why the encryption check is here and not at the caller
+    ///
+    /// **This is the load-bearing predicate.** A privatization seal nulls the
+    /// vector columns and replaces `content` with a stub; the plaintext lives
+    /// only in `claim_encryption`, which the server cannot read. Embedding a
+    /// sealed row would therefore either fail on the stub or — worse, if a
+    /// caller had plaintext in hand — write a plaintext-derived vector onto a
+    /// row whose whole point is that no such derivative exists. CLAUDE.md's
+    /// audit calls a sealed claim carrying a vector a confidentiality
+    /// violation rather than an embedding gap, so the refusal belongs in the
+    /// statement every caller shares, not in one caller's control flow. The
+    /// same predicate is in all three statements that can put a vector on a
+    /// claim — this read, [`store_embedding`](Self::store_embedding) and
+    /// [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed) —
+    /// rather than in the one path that happened to be written last.
+    ///
+    /// Keyed on `claim_encryption`, NEVER on `visibility`: a group-private
+    /// claim is ordinary plaintext and must still be embedded.
+    ///
+    /// # The viewer IS spent
+    ///
+    /// The job runner holds a bypass, for which the predicate renders empty —
+    /// but the parameter is real rather than decorative: any caller that is not
+    /// a maintenance path is filtered, so this cannot become a by-id content
+    /// read that ignores tenancy.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_text_for_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT content FROM claims WHERE id = $1 AND {EMBEDDABLE_POPULATION} \
+                 /* {{VISIBILITY:claims}} */"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<(String,)> = q.fetch_optional(executor).await?;
+        Ok(row.map(|(content,)| content))
+    }
+
+    /// [`claim_text_for_embedding`](Self::claim_text_for_embedding) narrowed to
+    /// claims that are **missing** their vector: the text to embed, or `None` if
+    /// this claim either already carries one or does not belong to the embedded
+    /// population at all.
+    ///
+    /// # Why a write path needs this and `was_created` is not enough
+    ///
+    /// The MCP submission path used to gate its post-commit embed on
+    /// `was_created` alone, on the reasoning that a dedup hit means "the
+    /// canonical row already has its embedding". That is false for exactly the
+    /// row the orphan-repair arms were added for. A production orphan is a claim
+    /// whose submission committed the claim and was then refused on
+    /// `reasoning_traces` with `42501` — and the refusal arrived BEFORE the
+    /// post-commit embed, so the row carries `is_current = true` AND
+    /// `embedding IS NULL`, which is CLAUDE.md's `live_missing` invariant
+    /// violation. Repairing its provenance and leaving that `NULL` in place
+    /// leaves it permanently invisible to `recall()`, while the tool reports
+    /// HTTP success.
+    ///
+    /// # The population rules are shared, not restated
+    ///
+    /// [`EMBEDDABLE_POPULATION`] is the single predicate this and
+    /// `claim_text_for_embedding` splice, so the repair path cannot drift into
+    /// embedding a row the enumerators exclude. That matters most for TELEMETRY:
+    /// host-provenance claims are `is_current = true` with `embedding IS NULL`
+    /// BY DESIGN (CLAUDE.md's telemetry exception — they dominate the gap), so a
+    /// naive `embedding IS NULL` test would make every telemetry resubmit pay an
+    /// embedding call and pollute semantic recall. Sealed claims are excluded for
+    /// the reason `claim_text_for_embedding`'s doc gives.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_text_if_embedding_missing<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT content FROM claims WHERE id = $1 AND embedding IS NULL \
+                 AND {EMBEDDABLE_POPULATION} /* {{VISIBILITY:claims}} */"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<(String,)> = q.fetch_optional(executor).await?;
+        Ok(row.map(|(content,)| content))
     }
 
     /// Read a claim's cached CDST classification label (`supported` |
@@ -2740,23 +5617,51 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_classification(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_classification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<String>, DbError> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT classification FROM claims WHERE id = $1")
-                .bind(claim_id)
-                .fetch_optional(pool)
-                .await?;
+        let sql = viewer.splice(
+            "SELECT classification FROM claims WHERE id = $1 /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Option<String>,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<(Option<String>,)> = q.fetch_optional(executor).await?;
         Ok(row.and_then(|(c,)| c))
     }
 
-    /// Store an embedding vector on a claim.
+    /// Store an embedding vector on a claim that is not sealed.
     ///
     /// The embedding string must be a valid pgvector literal (e.g., "[0.1,0.2,...]").
     /// Follows the same pattern as `EvidenceRepository::store_embedding`.
+    ///
+    /// # Why the seal predicate is in THIS statement
+    ///
+    /// This is the shared write every embedding producer goes through — the MCP
+    /// submit/memorize/ingest paths, the backfill tool, `embed_backfill`, and
+    /// `PUT /api/v1/claims/:id`, whose caller supplies the vector itself. The
+    /// enumerators those callers select from already exclude sealed rows, so
+    /// the predicate is a no-op for every one of them; the by-id caller has no
+    /// enumerator at all, and for it the predicate is the only thing standing
+    /// between a caller who still holds plaintext and a plaintext-derived
+    /// vector on a row whose whole point is that no such derivative survives.
+    /// CLAUDE.md's audit calls that a confidentiality violation rather than an
+    /// embedding gap, which is why the refusal is in the statement every caller
+    /// shares rather than in one caller's control flow.
+    ///
+    /// Keyed on `claim_encryption`, NEVER on `visibility`: a group-private
+    /// claim is ordinary plaintext and must still be embedded.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated; `false` for both "no such claim" and "the
+    /// claim is sealed", which this statement deliberately does not
+    /// distinguish. Callers treat a `false` as "nothing to store".
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -2766,12 +5671,101 @@ impl ClaimRepository {
         id: Uuid,
         embedding_pgvector: &str,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-            .bind(embedding_pgvector)
+        let result = sqlx::query(
+            "UPDATE claims SET embedding = $1::vector \
+              WHERE id = $2 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
+                )",
+        )
+        .bind(embedding_pgvector)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Store an embedding vector on a claim **only while that claim is not
+    /// sealed**, and only on a row the viewer may write.
+    ///
+    /// The counterpart to
+    /// [`claim_text_for_embedding`](Self::claim_text_for_embedding), and the
+    /// reason the pair exists rather than a single read followed by
+    /// [`store_embedding`](Self::store_embedding): the read and the write are
+    /// separated by a network round trip to an embedding provider, and a claim
+    /// can be sealed inside that window. Both halves of the pair therefore
+    /// apply the same population rules — `claim_encryption`, `is_current`.
+    ///
+    /// The `NOT EXISTS` is on `claim_encryption`, not on `visibility` — a
+    /// group-private claim is ordinary plaintext and must still be embedded.
+    ///
+    /// # Why the row is locked first, rather than trusting one statement's `WHERE`
+    ///
+    /// A single `UPDATE` whose `WHERE` re-checks `claim_encryption` is NOT
+    /// enough, and an earlier revision of this comment claimed it was. Under
+    /// `READ COMMITTED` an `UPDATE` that blocks on a row another transaction is
+    /// updating re-evaluates its qualification after that transaction commits,
+    /// but it does so against its ORIGINAL snapshot for every OTHER table — and
+    /// `claim_encryption` is another table. A seal committing inside that wait
+    /// would therefore go unseen and the vector would be written anyway.
+    ///
+    /// Taking the row lock in a SEPARATE statement first fixes that: the
+    /// `UPDATE` then takes a fresh statement snapshot AFTER the lock is
+    /// granted, and that snapshot does include the committed seal. It must be a
+    /// separate statement — folding the lock into a CTE of the same statement
+    /// changes nothing, because all parts of one statement share a snapshot.
+    /// The reverse interleaving is safe without any of this: if this
+    /// transaction takes the lock first, the seal's own `UPDATE` blocks behind
+    /// it and nulls the vector when it proceeds.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated. `false` covers four cases deliberately
+    /// indistinguishable to the caller: no such claim, a claim sealed since the
+    /// text was read, a claim superseded since the text was read, and a claim
+    /// the viewer may not write. A caller that needs to tell "sealed" from
+    /// "absent" would need a second read, and the answer it got would already
+    /// be stale.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, embedding_pgvector))]
+    pub async fn store_embedding_if_unsealed(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        embedding_pgvector: &str,
+    ) -> Result<bool, DbError> {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+
+        // The lock, as its own statement. See the section above: this is what
+        // makes the `NOT EXISTS` below read a snapshot that contains a seal
+        // which committed while this job was calling the provider.
+        sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .execute(pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c SET embedding = $2::vector \
+              WHERE c.id = $1 \
+                AND COALESCE(c.is_current, true) = true \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = c.id \
+                ) \
+                /* {WRITABLE:c} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(id).bind(embedding_pgvector);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$3` to fill and binding unconditionally would
+        // over-supply the maintenance path by one parameter.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let result = q.execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -2780,21 +5774,76 @@ impl ClaimRepository {
     /// this threshold query time becomes unreasonable and the result set itself is huge.
     pub const MAX_PAIRWISE_IDS: usize = 1_000;
 
-    /// Compute pairwise cosine distances between claims in the given set.
+    /// Compute pairwise cosine distances between claims in the given set, over
+    /// `claims.embedding` (1536d).
     ///
-    /// Returns all pairs where distance < `max_distance`, ordered ascending.
-    /// Uses pgvector `<=>` operator. Note: this is a brute-force O(N²) scan
-    /// — HNSW indexes do not accelerate distance filters.
+    /// Thin wrapper over [`Self::pairwise_cosine_distance_at_dim`] at
+    /// `dim = 1536`, kept because 1536 is this repo's default vector space and
+    /// most callers have no dim to thread.
     ///
     /// # Errors
-    /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
-    /// - `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn pairwise_cosine_distance(
-        pool: &PgPool,
+    /// See [`Self::pairwise_cosine_distance_at_dim`].
+    #[instrument(skip(executor))]
+    pub async fn pairwise_cosine_distance<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
         max_distance: f64,
     ) -> Result<Vec<ClaimPairDistance>, DbError> {
+        Self::pairwise_cosine_distance_at_dim(executor, viewer, claim_ids, max_distance, 1536).await
+    }
+
+    /// Compute pairwise cosine distances between claims in the given set, in
+    /// the vector space named by `dim`.
+    ///
+    /// Returns all pairs where distance < `max_distance`, ordered ascending.
+    /// Uses pgvector `<=>` operator, so distances are on `[0, 2]` and a
+    /// SMALLER number means MORE similar. Note: this is a brute-force O(N²)
+    /// scan — HNSW indexes do not accelerate distance filters.
+    ///
+    /// # `dim` must be the dim the retrieval being filtered actually searched
+    ///
+    /// `claims.embedding` (1536) and `claims.embedding_3072` are different
+    /// spaces. Measuring a page retrieved at 3072 against the 1536 column
+    /// compares vectors that were never comparable, and on a corpus embedded
+    /// only at 3072 it silently returns NO pairs at all — which every caller
+    /// that reads "no pair" as "far apart" would report as a perfectly diverse
+    /// result set. `recall_with_context` chooses its dim at runtime
+    /// (`detect_centroid_dim`), which is why this parameter exists rather than
+    /// the column being hardcoded as it was when this function had no callers.
+    ///
+    /// # An unmeasurable pair is ABSENT from the result, never distance 0
+    ///
+    /// A pair is absent when either side has a NULL vector in the selected
+    /// column (the embedder-down lexical leg produces such hits; so does a
+    /// corpus half-migrated between the two columns), when either id is not a
+    /// `claims` row at all, or when the viewer predicate excludes it. Callers
+    /// must read absence as "not known to be near": treating it as distance 0
+    /// would mark every unembedded row a duplicate of everything.
+    ///
+    /// # Errors
+    /// - `DbError::InvalidData` for a `dim` other than 1536 or 3072
+    /// - `DbError::QueryFailed` if `claim_ids.len() > MAX_PAIRWISE_IDS`
+    /// - `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor))]
+    pub async fn pairwise_cosine_distance_at_dim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        max_distance: f64,
+        dim: u32,
+    ) -> Result<Vec<ClaimPairDistance>, DbError> {
+        // A closed match, never caller-supplied text: `column` is interpolated
+        // into the statement, so only these two spellings can reach it.
+        let column = match dim {
+            1536 => "embedding",
+            3072 => "embedding_3072",
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!("unsupported centroid_dim: {dim} (must be 1536 or 3072)"),
+                });
+            }
+        };
         if claim_ids.len() < 2 {
             return Ok(vec![]);
         }
@@ -2809,26 +5858,39 @@ impl ClaimRepository {
             });
         }
 
-        let rows: Vec<ClaimPairDistance> = sqlx::query_as(
-            r#"
+        // `{{VISIBILITY:…}}` is doubled because this is now a `format!`
+        // template; see `search_by_embedding_since` for the same doubling and
+        // why `visibility_lint.rs` normalises it before matching. Both aliases
+        // stay marked — they resolve to the SAME bind index, so two markers
+        // still cost one bind, and marking only `c1` would measure a pair
+        // against a `c2` the reader cannot see.
+        let sql = viewer.splice(
+            &format!(
+                r#"
             SELECT
                 c1.id AS claim_a,
                 c2.id AS claim_b,
-                (c1.embedding <=> c2.embedding)::float8 AS distance
+                (c1.{column} <=> c2.{column})::float8 AS distance
             FROM claims c1
             JOIN claims c2 ON c1.id < c2.id
             WHERE c1.id = ANY($1)
               AND c2.id = ANY($1)
-              AND c1.embedding IS NOT NULL
-              AND c2.embedding IS NOT NULL
-              AND (c1.embedding <=> c2.embedding) < $2
-            ORDER BY (c1.embedding <=> c2.embedding)
-            "#,
-        )
-        .bind(claim_ids)
-        .bind(max_distance)
-        .fetch_all(pool)
-        .await?;
+              AND c1.{column} IS NOT NULL
+              AND c2.{column} IS NOT NULL
+              AND (c1.{column} <=> c2.{column}) < $2
+              /* {{VISIBILITY:c1}} */ /* {{VISIBILITY:c2}} */
+            ORDER BY (c1.{column} <=> c2.{column})
+            "#
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, ClaimPairDistance>(&sql)
+            .bind(claim_ids)
+            .bind(max_distance);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<ClaimPairDistance> = q.fetch_all(executor).await?;
 
         Ok(rows)
     }
@@ -2867,15 +5929,51 @@ impl ClaimRepository {
         let parent_uuid: Uuid = parent.into();
         let mut tx = pool.begin().await?;
 
-        let row: Option<(Option<Uuid>, bool)> =
-            sqlx::query_as("SELECT step_lineage_id, COALESCE(is_current, true) FROM claims WHERE id = $1 FOR UPDATE")
+        // The parent's tenancy is read HERE, under the same FOR UPDATE that
+        // guards the lineage id, and bound explicitly on the INSERT below.
+        //
+        // Migration 074 arm 2 would derive it from `step_lineage_id` anyway, so
+        // this is belt and braces -- but the plan says "prefer explicit" and the
+        // reason is concrete: arm 2 picks the lineage's most recent row by
+        // `created_at DESC`, which is not necessarily THIS parent. On a
+        // `revises` branch the lineage has two live heads, and inheriting from
+        // whichever was written last is a different answer from inheriting from
+        // the step being revised. Binding the parent's own values makes the two
+        // agree by construction instead of by timing.
+        let row: Option<(Option<Uuid>, bool, Uuid, String)> =
+            sqlx::query_as(
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                SELECT step_lineage_id, COALESCE(is_current, true),
+                       owner_group_id, visibility
+                FROM claims
+                WHERE id = $1 FOR UPDATE"#,
+            )
                 .bind(parent_uuid)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let (existing_lineage, parent_current) = row.ok_or(DbError::NotFound {
-            entity: "Claim".into(),
-            id: parent_uuid,
-        })?;
+        let (existing_lineage, parent_current, parent_group, parent_visibility) =
+            row.ok_or(DbError::NotFound {
+                entity: "Claim".into(),
+                id: parent_uuid,
+            })?;
+        let decl = match epigraph_core::Visibility::from_db_str(&parent_visibility) {
+            Some(v) => TenancyDecl::Declared {
+                visibility: v,
+                owner_group_id: parent_group,
+            },
+            // An unparseable stored visibility is not a value to guess at. The
+            // column is NOT NULL with a CHECK, so reaching this means the
+            // constraint was dropped out of band -- fail the write rather than
+            // pick a side.
+            None => {
+                return Err(DbError::InvalidData {
+                    reason: format!(
+                        "evolve_step: parent claim {parent_uuid} has visibility \
+                         {parent_visibility:?}, which is outside the vocabulary"
+                    ),
+                })
+            }
+        };
         if edge_type == "supersedes" && !parent_current {
             return Err(DbError::QueryFailed {
                 source: sqlx::Error::Protocol(format!(
@@ -2903,8 +6001,9 @@ impl ClaimRepository {
             "step_lineage_id": lineage_id.to_string(),
         });
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id) \
-             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6)",
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id, \
+                                 visibility, owner_group_id) \
+             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8)",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -2912,6 +6011,8 @@ impl ClaimRepository {
         .bind(agent_id)
         .bind(&properties)
         .bind(lineage_id)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .execute(&mut *tx)
         .await?;
 
@@ -2929,12 +6030,13 @@ impl ClaimRepository {
         .await?;
 
         if edge_type == "supersedes" {
-            // Also null the embedding so the retired step drops out of semantic
-            // search. Mirrors the invariant enforced by supersede() and
-            // mark_duplicate(): is_current=false → embedding=NULL.
+            // Also null both embedding columns so the retired step drops out
+            // of semantic search. Mirrors the invariant enforced by
+            // supersede() and mark_duplicate(): is_current=false → embedding
+            // (and embedding_3072) = NULL.
             sqlx::query(
-                "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
-                 WHERE id = $1",
+                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+                 updated_at = NOW() WHERE id = $1",
             )
             .bind(parent_uuid)
             .execute(&mut *tx)
@@ -2961,12 +6063,13 @@ impl ClaimRepository {
     ///
     /// # Implementation Notes
     /// The UPDATE that sets `is_current = false` on the duplicate also sets
-    /// `embedding = NULL` in the **same statement**, satisfying the CHECK
-    /// constraint `chk_deprecated_no_embedding` (migration 052).  This
-    /// constraint fires per-statement, so any split across two UPDATE statements
-    /// would violate it between them.  Any future caller must preserve this
-    /// single-statement invariant.  See also [`ClaimRepository::supersede`]
-    /// which has the same requirement.
+    /// `embedding = NULL` and `embedding_3072 = NULL` in the **same
+    /// statement**, satisfying the CHECK constraint
+    /// `chk_deprecated_no_embedding` (migration 052).  This constraint fires
+    /// per-statement, so any split across two UPDATE statements would violate
+    /// it between them.  Any future caller must preserve this single-statement
+    /// invariant.  See also [`ClaimRepository::supersede`] which has the same
+    /// requirement.
     #[instrument(skip(pool))]
     pub async fn mark_duplicate(
         pool: &PgPool,
@@ -3028,7 +6131,10 @@ impl ClaimRepository {
         }
         let mut tx = pool.begin().await?;
         let canon_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)")
+            sqlx::query_scalar(
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
+            )
                 .bind(canon_uuid)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -3039,7 +6145,10 @@ impl ClaimRepository {
             });
         }
         let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as("SELECT supersedes FROM claims WHERE id = $1 FOR UPDATE")
+            sqlx::query_as(
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                SELECT supersedes FROM claims WHERE id = $1 FOR UPDATE"#,
+            )
                 .bind(dup_uuid)
                 .fetch_optional(&mut *tx)
                 .await?;
@@ -3056,13 +6165,14 @@ impl ClaimRepository {
                 )),
             });
         }
-        // Null the embedding in the same statement as is_current=false so the
-        // CHECK constraint chk_deprecated_no_embedding (migration 052) is not
-        // violated mid-transaction. Dropping it from semantic search is the same
-        // invariant as supersede() and deprecate_claim().
+        // Null both embedding columns in the same statement as is_current=false
+        // so the CHECK constraint chk_deprecated_no_embedding (migration 052)
+        // is not violated mid-transaction. Dropping it from semantic search is
+        // the same invariant as supersede() and deprecate_claim().
         sqlx::query(
             "UPDATE claims \
-             SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW() \
+             SET supersedes = $1, is_current = false, embedding = NULL, \
+                 embedding_3072 = NULL, updated_at = NOW() \
              WHERE id = $2",
         )
         .bind(canon_uuid)
@@ -3110,21 +6220,22 @@ impl ClaimRepository {
         // `target_id` — have to be deleted with them, so the ids must be
         // captured before the DELETE commits.
         let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
-            "UPDATE edges AS e SET valid_to = now() \
-             WHERE e.target_id = $2 AND e.target_type = 'claim' \
-               AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
-               AND e.source_type = 'claim' AND e.source_id != $1 \
-               AND e.valid_to IS NULL \
-               AND EXISTS ( \
-                   SELECT 1 FROM edges e2 \
-                   WHERE e2.source_id = e.source_id \
-                     AND e2.source_type = e.source_type \
-                     AND e2.target_id = $1 \
-                     AND e2.target_type = 'claim' \
-                     AND e2.relationship = e.relationship \
-                     AND (e2.valid_to IS NULL OR e2.valid_to > now()) \
-               ) \
-             RETURNING e.id, e.target_id",
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             UPDATE edges AS e SET valid_to = now()
+             WHERE e.target_id = $2 AND e.target_type = 'claim'
+             AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+             AND e.source_type = 'claim' AND e.source_id != $1
+             AND e.valid_to IS NULL
+             AND EXISTS (
+             SELECT 1 FROM edges e2
+             WHERE e2.source_id = e.source_id
+             AND e2.source_type = e.source_type
+             AND e2.target_id = $1
+             AND e2.target_type = 'claim'
+             AND e2.relationship = e.relationship
+             AND (e2.valid_to IS NULL OR e2.valid_to > now())
+             )
+             RETURNING e.id, e.target_id"#,
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
@@ -3136,21 +6247,22 @@ impl ClaimRepository {
         // must refer to the outer (being-deleted) row, not the subquery table.
         deleted_edges.extend(
             sqlx::query_as::<_, (Uuid, Uuid)>(
-                "UPDATE edges AS e SET valid_to = now() \
-                 WHERE e.source_id = $2 AND e.source_type = 'claim' \
-                   AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED' \
-                   AND e.target_type = 'claim' AND e.target_id != $1 \
-                   AND e.valid_to IS NULL \
-                   AND EXISTS ( \
-                       SELECT 1 FROM edges e2 \
-                       WHERE e2.source_id = $1 \
-                         AND e2.source_type = 'claim' \
-                         AND e2.target_id = e.target_id \
-                         AND e2.target_type = e.target_type \
-                         AND e2.relationship = e.relationship \
-                         AND (e2.valid_to IS NULL OR e2.valid_to > now()) \
-                   ) \
-                 RETURNING e.id, e.target_id",
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                 UPDATE edges AS e SET valid_to = now()
+                 WHERE e.source_id = $2 AND e.source_type = 'claim'
+                 AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+                 AND e.target_type = 'claim' AND e.target_id != $1
+                 AND e.valid_to IS NULL
+                 AND EXISTS (
+                 SELECT 1 FROM edges e2
+                 WHERE e2.source_id = $1
+                 AND e2.source_type = 'claim'
+                 AND e2.target_id = e.target_id
+                 AND e2.target_type = e.target_type
+                 AND e2.relationship = e.relationship
+                 AND (e2.valid_to IS NULL OR e2.valid_to > now())
+                 )
+                 RETURNING e.id, e.target_id"#,
             )
             .bind(canon_uuid)
             .bind(dup_uuid)
@@ -3178,24 +6290,25 @@ impl ClaimRepository {
         // left for the self-loop guards in the migration UPDATEs below.
         deleted_edges.extend(
             sqlx::query_as::<_, (Uuid, Uuid)>(
-                "UPDATE edges AS e SET valid_to = now() \
-                 WHERE e.relationship = 'alternative_of' \
-                   AND e.valid_to IS NULL \
-                   AND e.source_type = 'claim' AND e.target_type = 'claim' \
-                   AND (e.source_id = $2 OR e.target_id = $2) \
-                   AND e.source_id != $1 AND e.target_id != $1 \
-                   AND EXISTS ( \
-                       SELECT 1 FROM edges e2 \
-                       WHERE e2.relationship = 'alternative_of' \
-                         AND e2.source_type = 'claim' AND e2.target_type = 'claim' \
-                         AND e2.id <> e.id \
-                         AND (e2.valid_to IS NULL OR e2.valid_to > now()) \
-                         AND LEAST(e2.source_id, e2.target_id) = \
-                             LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
-                         AND GREATEST(e2.source_id, e2.target_id) = \
-                             GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END) \
-                   ) \
-                 RETURNING e.id, e.target_id",
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                 UPDATE edges AS e SET valid_to = now()
+                 WHERE e.relationship = 'alternative_of'
+                 AND e.valid_to IS NULL
+                 AND e.source_type = 'claim' AND e.target_type = 'claim'
+                 AND (e.source_id = $2 OR e.target_id = $2)
+                 AND e.source_id != $1 AND e.target_id != $1
+                 AND EXISTS (
+                 SELECT 1 FROM edges e2
+                 WHERE e2.relationship = 'alternative_of'
+                 AND e2.source_type = 'claim' AND e2.target_type = 'claim'
+                 AND e2.id <> e.id
+                 AND (e2.valid_to IS NULL OR e2.valid_to > now())
+                 AND LEAST(e2.source_id, e2.target_id) =
+                 LEAST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END)
+                 AND GREATEST(e2.source_id, e2.target_id) =
+                 GREATEST($1, CASE WHEN e.source_id = $2 THEN e.target_id ELSE e.source_id END)
+                 )
+                 RETURNING e.id, e.target_id"#,
             )
             .bind(canon_uuid)
             .bind(dup_uuid)
@@ -3246,10 +6359,11 @@ impl ClaimRepository {
             // about to inherit, or the frame-scoped read paths
             // (`claim_frames.hypothesis_index`) would not see them.
             sqlx::query(
-                "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) \
-                 SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf \
-                 WHERE cf.claim_id = $2 \
-                 ON CONFLICT (claim_id, frame_id) DO NOTHING",
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                 INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+                 SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf 
+                 WHERE cf.claim_id = $2 
+                 ON CONFLICT (claim_id, frame_id) DO NOTHING"#,
             )
             .bind(canon_uuid)
             .bind(dup_uuid)
@@ -3264,15 +6378,16 @@ impl ClaimRepository {
             // brand-new failure mode. Drop the canonical-side duplicate first;
             // the row arriving from `dup` is the one whose edge survived.
             sqlx::query(
-                "DELETE FROM mass_functions mf \
-                 WHERE mf.claim_id = $1 AND mf.perspective_id = ANY($3) \
-                   AND EXISTS ( \
-                       SELECT 1 FROM mass_functions m2 \
-                       WHERE m2.claim_id = $2 \
-                         AND m2.perspective_id = mf.perspective_id \
-                         AND m2.frame_id = mf.frame_id \
-                         AND m2.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id \
-                   )",
+                r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+                 DELETE FROM mass_functions mf
+                 WHERE mf.claim_id = $1 AND mf.perspective_id = ANY($3) 
+                   AND EXISTS ( 
+                       SELECT 1 FROM mass_functions m2 
+                       WHERE m2.claim_id = $2 
+                         AND m2.perspective_id = mf.perspective_id 
+                         AND m2.frame_id = mf.frame_id 
+                         AND m2.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id 
+                   )"#,
             )
             .bind(canon_uuid)
             .bind(dup_uuid)
@@ -3347,8 +6462,10 @@ impl ClaimRepository {
         use sqlx::Row as _;
         let id_uuid: Uuid = id.into();
         let row = sqlx::query(
-            "SELECT trace_id, COALESCE(labels, ARRAY[]::text[]) AS labels, COALESCE(properties, '{}'::jsonb) AS properties \
-             FROM claims WHERE id = $1 FOR UPDATE",
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             SELECT trace_id, COALESCE(labels, ARRAY[]::text[]) AS labels,
+                    COALESCE(properties, '{}'::jsonb) AS properties
+             FROM claims WHERE id = $1 FOR UPDATE"#,
         )
         .bind(id_uuid).fetch_optional(&mut **tx).await?
         .ok_or(DbError::NotFound { entity: "Claim".into(), id: id_uuid })?;
@@ -3474,10 +6591,11 @@ impl ClaimRepository {
     #[instrument(skip(pool, seed_ids))]
     pub async fn graph_expand_seeds(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         seed_ids: &[Uuid],
         max_depth: u32,
     ) -> Result<Vec<GraphExpansionHit>, DbError> {
-        Self::graph_expand_seeds_since(pool, seed_ids, max_depth, None).await
+        Self::graph_expand_seeds_since(pool, viewer, seed_ids, max_depth, None).await
     }
 
     /// [`Self::graph_expand_seeds`] plus an optional `created_at >= since`
@@ -3510,9 +6628,10 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any underlying edge query fails.
-    #[instrument(skip(pool, seed_ids))]
+    #[instrument(skip(pool, viewer, seed_ids))]
     pub async fn graph_expand_seeds_since(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         seed_ids: &[Uuid],
         max_depth: u32,
         since: Option<DateTime<Utc>>,
@@ -3543,7 +6662,8 @@ impl ClaimRepository {
             let mut level_new: Vec<Uuid> = Vec::new();
             'level: for &node in &frontier {
                 let outgoing =
-                    crate::repos::edge::EdgeRepository::get_by_source(pool, node, "claim").await?;
+                    crate::repos::edge::EdgeRepository::get_by_source(pool, viewer, node, "claim")
+                        .await?;
                 for e in outgoing {
                     if !EXPANSION_RELATIONSHIPS.contains(&e.relationship.as_str()) {
                         continue;
@@ -3567,15 +6687,19 @@ impl ClaimRepository {
                 None => level_new,
                 Some(_) if level_new.is_empty() => level_new,
                 Some(since) => {
-                    let in_window: std::collections::HashSet<Uuid> = sqlx::query_scalar::<_, Uuid>(
-                        "SELECT id FROM claims WHERE id = ANY($1) AND created_at >= $2",
-                    )
-                    .bind(&level_new)
-                    .bind(since)
-                    .fetch_all(pool)
-                    .await?
-                    .into_iter()
-                    .collect();
+                    let win_sql = viewer.splice(
+                        "SELECT id FROM claims WHERE id = ANY($1) AND created_at >= $2 \
+                         /* {VISIBILITY:claims} */",
+                        3,
+                    );
+                    let mut wq = sqlx::query_scalar::<_, Uuid>(&win_sql)
+                        .bind(&level_new)
+                        .bind(since);
+                    if let Some(g) = viewer.group_bind() {
+                        wq = wq.bind(g);
+                    }
+                    let in_window: std::collections::HashSet<Uuid> =
+                        wq.fetch_all(pool).await?.into_iter().collect();
                     level_new
                         .into_iter()
                         .filter(|id| in_window.contains(id))
@@ -3614,9 +6738,10 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, claim_ids))]
-    pub async fn in_epistemic_degree_batch(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn in_epistemic_degree_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, i64>, DbError> {
         if claim_ids.is_empty() {
@@ -3633,12 +6758,18 @@ impl ClaimRepository {
             WHERE target_id = ANY($1)
               AND source_type = 'claim' AND target_type = 'claim'
               AND relationship = ANY($2)
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
             GROUP BY target_id
             "#,
             claim_ids,
             &relationships[..],
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows.into_iter().map(|r| (r.target_id, r.degree)).collect())
@@ -3670,9 +6801,10 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, claim_ids))]
-    pub async fn dispute_batch(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn dispute_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, ClaimDispute>, DbError> {
         if claim_ids.is_empty() {
@@ -3689,11 +6821,18 @@ impl ClaimRepository {
             WHERE e.target_id = ANY($1)
               AND e.source_type = 'claim' AND e.target_type = 'claim'
               AND e.relationship IN ('contradicts', 'refutes')
+              AND ($2::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($3::uuid[])
+                       AND (e.co_owner_group_id IS NULL
+                            OR e.co_owner_group_id = ANY($3::uuid[]))))
+              AND ($2::bool OR src.visibility = 'public' OR src.owner_group_id = ANY($3::uuid[]))
             GROUP BY e.target_id
             "#,
             claim_ids,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -3779,9 +6918,15 @@ mod tests {
         .await
         .unwrap();
 
-        let missing = ClaimRepository::find_claims_needing_embeddings(&pool, 1000)
-            .await
-            .unwrap();
+        let missing = ClaimRepository::find_claims_needing_embeddings(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::EmbeddingBackfill,
+            ),
+            1000,
+        )
+        .await
+        .unwrap();
         assert!(
             missing.iter().any(|(id, _)| *id == claim_id),
             "substantive claim must be returned"
@@ -3834,9 +6979,13 @@ mod tests {
         .unwrap();
 
         let absent_id = Uuid::new_v4();
-        let map = ClaimRepository::contents_by_ids(&pool, &[current_id, stale_id, absent_id])
-            .await
-            .unwrap();
+        let map = ClaimRepository::contents_by_ids(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &[current_id, stale_id, absent_id],
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             map.get(&current_id).map(String::as_str),
@@ -3858,8 +7007,331 @@ mod tests {
         );
 
         // Empty input short-circuits to an empty map without touching the DB.
-        let empty = ClaimRepository::contents_by_ids(&pool, &[]).await.unwrap();
+        let empty = ClaimRepository::contents_by_ids(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &[],
+        )
+        .await
+        .unwrap();
         assert!(empty.is_empty());
+    }
+
+    /// The sibling that does NOT filter `is_current`, and the reason it exists.
+    ///
+    /// `routes/cross_source.rs::list_candidates` renders excerpts for a queue
+    /// of `match_candidates` rows that outlive the claims they name — nothing
+    /// prunes the queue when `supersede_claim` / `mark_duplicate` flips
+    /// `is_current`. Calling `contents_by_ids` there returns `None` for every
+    /// such pair, and `excerpt(None)` renders the literal
+    /// `"(claim not found)"` for a claim that exists. This test is the
+    /// discriminator between the two functions: swap the call under test to
+    /// `contents_by_ids` and the `stale_id` assertion fails.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn contents_by_ids_any_version_returns_superseded_rows_too(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-any-version', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let current_text = format!("current-claim-{}", Uuid::new_v4());
+        let current_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, true)
+             RETURNING id",
+        )
+        .bind(&current_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let stale_text = format!("superseded-claim-{}", Uuid::new_v4());
+        let stale_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false)
+             RETURNING id",
+        )
+        .bind(&stale_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let absent_id = Uuid::new_v4();
+        let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let map = ClaimRepository::contents_by_ids_any_version(
+            &pool,
+            &viewer,
+            &[current_id, stale_id, absent_id],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            map.get(&stale_id).map(String::as_str),
+            Some(stale_text.as_str()),
+            "a superseded claim's content MUST come back — this is the whole difference from `contents_by_ids`, and the reason `list_candidates` calls this one"
+        );
+        assert_eq!(
+            map.get(&current_id).map(String::as_str),
+            Some(current_text.as_str()),
+            "current rows are unaffected"
+        );
+        assert!(
+            !map.contains_key(&absent_id),
+            "an id naming no row is still absent"
+        );
+        assert_eq!(map.len(), 2);
+
+        // The visibility predicate is NOT relaxed alongside the version scope.
+        // A stranger's viewer (empty group set) must still be refused a
+        // group-private superseded row.
+        // A REAL group, not the world group: `claims_group_needs_real_group`
+        // (migration 062) refuses `visibility = 'group'` paired with the
+        // all-zero world group id, which is exactly what makes an unbackfilled
+        // row unable to masquerade as private.
+        let group_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
+             VALUES ('t', 'did:epigraph:test:' || gen_random_uuid()::text, ''::bytea,
+                     'personal', $1)
+             RETURNING id",
+        )
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let private_text = format!("private-superseded-{}", Uuid::new_v4());
+        let private_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,
+                                 visibility, owner_group_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false, 'group', $3)
+             RETURNING id",
+        )
+        .bind(&private_text)
+        .bind(agent_id)
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let stranger_map =
+            ClaimRepository::contents_by_ids_any_version(&pool, &viewer, &[private_id])
+                .await
+                .unwrap();
+        assert!(
+            stranger_map.is_empty(),
+            "dropping the `is_current` filter must not drop the visibility predicate with it"
+        );
+
+        let member = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![group_id]);
+        let member_map =
+            ClaimRepository::contents_by_ids_any_version(&pool, &member, &[private_id])
+                .await
+                .unwrap();
+        assert_eq!(
+            member_map.get(&private_id).map(String::as_str),
+            Some(private_text.as_str()),
+            "a member of the owning group must still read it — otherwise the assertion above is satisfied by a function that returns nothing"
+        );
+    }
+
+    /// `hidden_claim_ids` is the Rust half of `EventRepository::list`'s rule,
+    /// used to filter the in-process event ring buffer in
+    /// `epigraph-api`'s `list_events`. Its contract is narrower than "absent
+    /// from the visible set": an id naming NO row must not be reported, or the
+    /// caller would drop events for hard-deleted claims and agent ids.
+    ///
+    /// **This is the OWNER-SIDE calibration and is NOT the acceptance test for
+    /// migration 086.** `#[sqlx::test]` hands out a pool connected as the
+    /// owning superuser, for whom RLS does not apply and `FORCE` is irrelevant,
+    /// so it returned exactly these answers before 086 and returns them after —
+    /// it cannot distinguish a working probe from a collapsed one. Its value is
+    /// the other direction: it proves the fixture can detect a hidden id at all.
+    /// The discriminating test is
+    /// `crates/epigraph-db/tests/rls_enforcement.rs::hidden_claim_ids_still_classifies_on_the_app_role_under_force`,
+    /// which runs under `SET SESSION AUTHORIZATION epigraph_app`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn hidden_claim_ids_reports_existing_but_invisible_ids_only(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-hidden-ids', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // A REAL group, not the world group: `claims_group_needs_real_group`
+        // (migration 062) refuses `visibility = 'group'` paired with the
+        // all-zero world group id, which is exactly what makes an unbackfilled
+        // row unable to masquerade as private.
+        let group_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id)
+             VALUES ('t', 'did:epigraph:test:' || gen_random_uuid()::text, ''::bytea,
+                     'personal', $1)
+             RETURNING id",
+        )
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let public_text = format!("public-{}", Uuid::new_v4());
+        let public_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+        )
+        .bind(&public_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let private_text = format!("private-{}", Uuid::new_v4());
+        let private_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id,
+                                 visibility, owner_group_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, 'group', $3) RETURNING id",
+        )
+        .bind(&private_text)
+        .bind(agent_id)
+        .bind(group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let absent_id = Uuid::new_v4();
+        let stranger = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let hidden = ClaimRepository::hidden_claim_ids(
+            &pool,
+            &stranger,
+            &[public_id, private_id, absent_id],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            hidden.contains(&private_id),
+            "an existing row the viewer cannot read IS hidden"
+        );
+        assert!(!hidden.contains(&public_id), "a public row is not hidden");
+        assert!(
+            !hidden.contains(&absent_id),
+            "an id naming no row has no owner to protect and must NOT be reported — reporting it would make the caller drop every event carrying an agent_id or a hard-deleted claim id"
+        );
+        assert_eq!(hidden.len(), 1);
+
+        let member = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![group_id]);
+        let for_member =
+            ClaimRepository::hidden_claim_ids(&pool, &member, &[public_id, private_id])
+                .await
+                .unwrap();
+        assert!(
+            for_member.is_empty(),
+            "nothing is hidden from a member of the owning group — without this, a function that reports EVERY id passes the assertions above"
+        );
+    }
+
+    /// `get_by_id_conn` must report retirement state, not `claim_from_row`'s
+    /// defaults.
+    ///
+    /// PR-23 makes the `*_conn` sibling the shape a conversion shard writes
+    /// when it moves a handler onto `AppState::read_as`, and this one used to
+    /// project seven columns where its pool-taking twin projects nine — so a
+    /// superseded claim came back reporting `is_current = true, supersedes =
+    /// None`. No gate could catch it: the dropped fields default to *plausible*
+    /// values instead of erroring, so the only failure is a widened answer.
+    ///
+    /// Asserted against `get_by_id` on the same row rather than against
+    /// literals, so the two cannot drift apart again for either value of the
+    /// field. The CALIBRATION half is the retired row: without it, two
+    /// functions that both returned the defaults would agree and pass.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_by_id_conn_reports_the_same_retirement_state_as_get_by_id(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'conn-parity', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let live_text = format!("live-{}", Uuid::new_v4());
+        let live_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id)
+             VALUES ($1, sha256($1::bytea), 0.5, $2) RETURNING id",
+        )
+        .bind(&live_text)
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // The retired row: is_current = false AND supersedes set, so both
+        // dropped columns carry a value that differs from the default.
+        let retired_text = format!("retired-{}", Uuid::new_v4());
+        let retired_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id,
+                                 is_current, supersedes)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, false, $3) RETURNING id",
+        )
+        .bind(&retired_text)
+        .bind(agent_id)
+        .bind(live_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let viewer = crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]);
+        let mut conn = pool.acquire().await.unwrap();
+
+        for id in [live_id, retired_id] {
+            let via_pool = ClaimRepository::get_by_id(&pool, &viewer, ClaimId::from_uuid(id))
+                .await
+                .unwrap()
+                .expect("public claim is readable");
+            let via_conn =
+                ClaimRepository::get_by_id_conn(&mut conn, &viewer, ClaimId::from_uuid(id))
+                    .await
+                    .unwrap()
+                    .expect("public claim is readable on a connection too");
+
+            assert_eq!(
+                via_conn.is_current, via_pool.is_current,
+                "get_by_id_conn must report the same is_current as get_by_id for {id}; a \
+                 *_conn sibling that drops the column reports every claim as live"
+            );
+            let conn_sup: Option<Uuid> = via_conn.supersedes.map(Into::into);
+            let pool_sup: Option<Uuid> = via_pool.supersedes.map(Into::into);
+            assert_eq!(
+                conn_sup, pool_sup,
+                "get_by_id_conn must report the same supersedes as get_by_id for {id}"
+            );
+        }
+
+        // CALIBRATION: the retired row really does differ from the defaults, or
+        // the parity above is satisfied by two functions returning the same
+        // wrong answer.
+        let retired =
+            ClaimRepository::get_by_id_conn(&mut conn, &viewer, ClaimId::from_uuid(retired_id))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            !retired.is_current,
+            "CALIBRATION: the retired fixture must not be current"
+        );
+        let retired_sup: Option<Uuid> = retired.supersedes.map(Into::into);
+        assert_eq!(
+            retired_sup,
+            Some(live_id),
+            "CALIBRATION: the retired fixture must name what it supersedes"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -3883,7 +7355,10 @@ mod tests {
             public_key,
             TruthValue::clamped(0.5),
         );
-        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        let persisted =
+            ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+                .await
+                .unwrap();
         let props = serde_json::json!({"level": 3, "section": "Body", "source_type": "Wiki"});
 
         ClaimRepository::set_properties(&pool, persisted.id, props.clone())
@@ -3922,7 +7397,10 @@ mod tests {
             public_key,
             TruthValue::clamped(0.5),
         );
-        let persisted = ClaimRepository::create(&pool, &claim).await.unwrap();
+        let persisted =
+            ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+                .await
+                .unwrap();
         ClaimRepository::set_properties(&pool, persisted.id, serde_json::json!({"level": 2}))
             .await
             .unwrap();
@@ -3990,9 +7468,14 @@ mod tests {
         }
 
         let (id1, id2, expected_distance) = &pairs[0];
-        let results = ClaimRepository::pairwise_cosine_distance(&pool, &[*id1, *id2], 1.0)
-            .await
-            .unwrap();
+        let results = ClaimRepository::pairwise_cosine_distance(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &[*id1, *id2],
+            1.0,
+        )
+        .await
+        .unwrap();
 
         assert!(!results.is_empty());
         let first = &results[0];
@@ -4020,6 +7503,7 @@ mod tests {
             agent_id,
             TruthValue::clamped(0.5),
             &["test".to_string()],
+            epigraph_core::TenancyDecl::Inherited,
         )
         .await
         .unwrap();
@@ -4031,6 +7515,7 @@ mod tests {
             agent_id,
             TruthValue::clamped(0.5),
             &["test".to_string()],
+            epigraph_core::TenancyDecl::Inherited,
         )
         .await
         .unwrap();
@@ -4043,14 +7528,15 @@ mod tests {
 
 impl ClaimRepository {
     /// Deprecate a single claim: drop its truth to the 0.05 sentinel, flip
-    /// `is_current = false`, and NULL its embedding in one statement.
+    /// `is_current = false`, and NULL its `embedding` and `embedding_3072` in
+    /// one statement.
     ///
     /// This is the canonical deprecation primitive for workflow claims. It is
     /// the THIRD `is_current = false` cleanup path (alongside `supersede` and
     /// `mark_duplicate`); per CLAUDE.md "Embedding policy → Cleanup paths",
-    /// any path flipping `is_current = false` MUST null the embedding in the
-    /// same statement so the row drops out of semantic recall and does not
-    /// inflate the `stale_present` audit count.
+    /// any path flipping `is_current = false` MUST null both embedding
+    /// columns in the same statement so the row drops out of semantic recall
+    /// and does not inflate the `stale_present` audit count.
     ///
     /// Returns the number of rows affected (0 when `id` does not exist).
     /// Idempotent: re-running on an already-deprecated claim is a no-op flip
@@ -4067,7 +7553,8 @@ impl ClaimRepository {
         let uuid: Uuid = id.into();
         let result = sqlx::query(
             "UPDATE claims \
-             SET truth_value = 0.05, is_current = false, embedding = NULL, updated_at = NOW() \
+             SET truth_value = 0.05, is_current = false, embedding = NULL, \
+                 embedding_3072 = NULL, updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(uuid)
@@ -4081,8 +7568,16 @@ impl ClaimRepository {
     /// Uses PostgreSQL array functions. Idempotent: adding a duplicate is a no-op,
     /// removing a nonexistent label is a no-op. Returns the updated labels array.
     ///
+    /// This is the chokepoint for caller-supplied labels: the HTTP
+    /// `PATCH /api/v1/claims/:id/labels` handler and the MCP `submit_claim`,
+    /// `update_labels` and `resolve_backlog_item` tools all route their label
+    /// writes through here, so the `add`-side validation below covers every one.
+    /// `remove` is deliberately NOT validated — it is the remediation path for
+    /// labels already corrupted in the graph.
+    ///
     /// # Errors
-    /// Returns `DbError::NotFound` if the claim doesn't exist.
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if an added label carries unexpanded shell syntax.
     #[instrument(skip(pool))]
     pub async fn update_labels(
         pool: &PgPool,
@@ -4090,8 +7585,11 @@ impl ClaimRepository {
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add)?;
+
         let row: Option<(Vec<String>,)> = sqlx::query_as(
             r#"
+            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             WITH current AS (
                 SELECT id, labels FROM claims WHERE id = $1
             ),
@@ -4128,15 +7626,26 @@ impl ClaimRepository {
     }
 
     /// Update labels using an existing connection (e.g. inside a transaction).
+    ///
+    /// Same `add`-only validation contract as [`Self::update_labels`]; this is
+    /// the variant `patch_claim_atomic_conn` (HTTP `PATCH /api/v1/claims/:id`
+    /// and MCP `patch_claim`) calls, so the rejection reaches those too.
+    ///
+    /// # Errors
+    /// Returns `DbError::NotFound` if the claim doesn't exist, or
+    /// `DbError::InvalidData` if an added label carries unexpanded shell syntax.
     pub async fn update_labels_conn(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
         add: &[String],
         remove: &[String],
     ) -> Result<Vec<String>, DbError> {
+        crate::label_validation::reject_unexpanded_labels(add)?;
+
         use sqlx::Row;
         let row: Option<sqlx::postgres::PgRow> = sqlx::query(
-            r#"WITH current AS (
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+               WITH current AS (
                    SELECT id, labels FROM claims WHERE id = $1
                ),
                updated AS (
@@ -4294,10 +7803,16 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &["backlog".into()], &[], false, 0.0, 100, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["backlog".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "should find claim by single label"
@@ -4305,12 +7820,11 @@ mod label_tests {
 
         let results = ClaimRepository::list_by_labels(
             &pool,
-            &["backlog".into(), "pending".into()],
-            &[],
-            false,
-            0.0,
-            100,
-            0,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["backlog".into(), "pending".into()],
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -4332,12 +7846,11 @@ mod label_tests {
 
         let results = ClaimRepository::list_by_labels(
             &pool,
-            &["nonexistent-label".into()],
-            &[],
-            false,
-            0.0,
-            100,
-            0,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["nonexistent-label".into()],
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -4358,19 +7871,33 @@ mod label_tests {
             .await
             .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.4, 100, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["truth-test".into()],
+                min_truth: 0.4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 >= 0.4 should match"
         );
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &["truth-test".into()], &[], false, 0.9, 100, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["truth-test".into()],
+                min_truth: 0.9,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(
             !results.iter().any(|(c, _)| c.id.as_uuid() == claim_id),
             "0.5 < 0.9 should not match"
@@ -4404,10 +7931,17 @@ mod label_tests {
         .await
         .unwrap();
 
-        let results =
-            ClaimRepository::list_by_labels(&pool, &["limit-test".into()], &[], false, 0.0, 1, 0)
-                .await
-                .unwrap();
+        let results = ClaimRepository::list_by_labels(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            crate::repos::claim::LabelQuery {
+                labels: &["limit-test".into()],
+                limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 1, "limit=1 should return exactly 1 result");
 
         // cleanup
@@ -4438,6 +7972,12 @@ mod label_tests {
         }
     }
 
+    // The two unexpanded-shell-variable regression tests that used to live here
+    // moved to `crates/epigraph-db/tests/label_shell_variable_repo.rs`. Reason:
+    // every test in this module is `#[ignore]` (live-DB convention), so
+    // `cargo test -p epigraph-db` skipped the headline regression test for
+    // backlog f6310444. The new file uses `#[sqlx::test]` and runs in the gate.
+
     /// Verify `pairwise_cosine_distance` enforces the `MAX_PAIRWISE_IDS` cap.
     /// No DB required: the size guard fires before the query is issued.
     #[tokio::test]
@@ -4451,7 +7991,13 @@ mod label_tests {
         let too_many: Vec<Uuid> = (0..=ClaimRepository::MAX_PAIRWISE_IDS)
             .map(|_| Uuid::new_v4())
             .collect();
-        let result = ClaimRepository::pairwise_cosine_distance(&pool, &too_many, 0.5).await;
+        let result = ClaimRepository::pairwise_cosine_distance(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            &too_many,
+            0.5,
+        )
+        .await;
         assert!(
             result.is_err(),
             "should return Err when claim_ids exceeds MAX_PAIRWISE_IDS"
@@ -4597,7 +8143,8 @@ impl ClaimRepository {
         // interleave between validation and retirement.
         let locked = sqlx::query!(
             r#"
-            SELECT id, is_current, supersedes, labels
+            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT id, is_current, supersedes, labels, visibility, owner_group_id
             FROM claims WHERE id = ANY($1) FOR UPDATE
             "#,
             source_ids,
@@ -4647,13 +8194,133 @@ impl ClaimRepository {
                 "reason": reason,
             }
         });
+        // ── The merged row's tenancy (plan §4.6) ──
+        //
+        // `consolidate` binds NEITHER `supersedes` NOR `step_lineage_id` --
+        // the sources are retired separately, AFTER this insert -- so none of
+        // migration 074's inheritance arms can reach it. Left undeclared it
+        // would raise 23502 for the app role. Left on the old default it was
+        // worse than that: a WIDENING primitive, merging a private claim into a
+        // world-owned public row.
+        //
+        // The rule itself is a pure function in epigraph-core so it can be
+        // tested without a database (§8.1); this is the only place it is
+        // applied. `owner_group_id` on a source is read under the FOR UPDATE
+        // taken above, so it cannot change between the decision and the insert.
+        let source_tenancy: Vec<epigraph_core::SourceTenancy> = locked
+            .iter()
+            .map(|r| {
+                epigraph_core::Visibility::from_db_str(&r.visibility)
+                    .map(|v| (r.owner_group_id, v))
+                    .ok_or_else(|| DbError::InvalidData {
+                        reason: format!(
+                            "consolidate: source {} has visibility {:?}, which is outside \
+                             the vocabulary",
+                            r.id, r.visibility
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // THE REFUSAL IS DECIDED FIRST, and it costs nothing: `consolidate_owner`
+        // is a pure function over the tenancies just read under FOR UPDATE. A
+        // cross-group merge therefore refuses before this transaction has
+        // written anything at all, and refuses identically whether or not a
+        // retry has already inserted the row.
+        //
+        // `Ok(None)` means every source is public, and the owner is the acting
+        // agent's own group -- resolved BELOW, after the idempotent-return
+        // branch, because that resolution can WRITE.
+        let merged_owner = epigraph_core::consolidate_owner(&source_tenancy).map_err(|e| {
+            // The PAIR is logged, never rendered into the 409: see
+            // `ConsolidateTenancyError`'s `Display` impl for why. An
+            // operator reads the owners here; the caller reads only that
+            // the sources span more than one group.
+            // A `match` rather than `if let`: `ConsolidateTenancyError` has
+            // one variant today, so `if let` is irrefutable and lints — and
+            // a `match` is what forces this arm to be revisited if a second
+            // refusal reason is ever added.
+            match &e {
+                epigraph_core::ConsolidateTenancyError::CrossGroup { groups: (a, b) } => {
+                    tracing::warn!(
+                        owner_a = %a,
+                        owner_b = %b,
+                        acting_agent_id = %acting_agent_id,
+                        "consolidate refused: sources span two owner groups"
+                    );
+                }
+            }
+            DbError::Conflict {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // ── The actor must be IN the group it is writing into (PR-16) ──
+        //
+        // `consolidate` takes no `Viewer`. Before migration 074 that was a
+        // DISCLOSURE hole and nothing more: a cross-tenant merge landed on the
+        // world default, so it produced a public row. The meet rule above is
+        // the right rule, but it changes the shape of the hole — the merged row
+        // now lands INSIDE the owning group, so an unrelated caller could write
+        // its own content into a foreign group's private corpus while retiring
+        // that group's claims through the `supersedes` forwarding below. That
+        // is an integrity and availability defect against a group the caller
+        // has no relationship with.
+        //
+        // The full write-side gate (`viewer.writable_bind()`'s SQL half, the
+        // fail-open scope sites, the MCP write tools) is 16b's territory and is
+        // NOT delivered here. This is the narrow refusal that keeps 16a's own
+        // tenancy rule from creating a primitive 16b would have to close: every
+        // group-visible source's owner must be a live group of the acting
+        // agent. It costs one query, and only on merges that actually touch a
+        // private claim — an all-public merge (`merged_owner == None`) skips it
+        // entirely.
+        //
+        // Membership, not write-role: role-granularity is `writable_bind`'s
+        // job and arrives with 16b. Refusing a non-member is strictly stronger
+        // than the nothing that stood here before.
+        let private_owners: Vec<Uuid> = source_tenancy
+            .iter()
+            .filter(|(_, v)| *v == epigraph_core::Visibility::Group)
+            .map(|(g, _)| *g)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !private_owners.is_empty() {
+            let member_of: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT group_id FROM group_memberships \
+                  WHERE agent_id = $1 AND group_id = ANY($2) AND revoked_at IS NULL",
+            )
+            .bind(acting_agent_id)
+            .bind(&private_owners)
+            .fetch_all(&mut *tx)
+            .await?;
+            let member_of: std::collections::HashSet<Uuid> = member_of.into_iter().collect();
+            if let Some(foreign) = private_owners.iter().find(|g| !member_of.contains(g)) {
+                // Same disclosure discipline as the cross-group refusal: the
+                // group id goes to the log, not to the caller.
+                tracing::warn!(
+                    owner_group_id = %foreign,
+                    acting_agent_id = %acting_agent_id,
+                    "consolidate refused: actor is not a live member of a source's owner group"
+                );
+                return Err(DbError::Conflict {
+                    reason: "consolidate: at least one source is private to a group you are \
+                             not a member of. Merging would write into that group's corpus \
+                             and retire its claims."
+                        .to_string(),
+                });
+            }
+        }
+
         let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
 
         // Post-107 (content_hash, agent_id) uniqueness: an identical merged
         // claim by this agent is returned rather than erroring (novelty-gate
         // style), so a retried merge is idempotent instead of fatal.
         if let Some(existing) = sqlx::query!(
-            "SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2",
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+             SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2"#,
             content_hash.as_slice(),
             acting_agent_id,
         )
@@ -4670,11 +8337,26 @@ impl ClaimRepository {
             });
         }
 
+        // ── The actor's own group, for the all-public case ──
+        //
+        // AFTER the idempotent-return branch above, deliberately: that branch
+        // ends in `tx.rollback()`, and resolving the group before it would make
+        // a no-op retry perform a `groups` upsert and a `group_memberships`
+        // upsert only to discard them.
+        //
+        // `personal_group_of` reads first and mints only if absent -- see its
+        // doc for why calling `ensure_personal_group` unconditionally here
+        // would revive a revoked membership as a side effect of a merge.
+        let decl = match merged_owner {
+            Some(g) => TenancyDecl::group(g),
+            None => TenancyDecl::public(Self::personal_group_of(&mut tx, acting_agent_id).await?),
+        };
+
         let merged_id = sqlx::query_scalar!(
             r#"
             INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current,
-                                labels, properties)
-            VALUES ($1, $2, $3, $4, true, $5, $6)
+                                labels, properties, visibility, owner_group_id)
+            VALUES ($1, $2, $3, $4, true, $5, $6, $7, $8)
             RETURNING id
             "#,
             merged_content,
@@ -4683,6 +8365,8 @@ impl ClaimRepository {
             acting_agent_id,
             &labels[..],
             merge_props,
+            decl.visibility_bind(),
+            decl.owner_group_bind(),
         )
         .fetch_one(&mut *tx)
         .await?;
@@ -4694,6 +8378,7 @@ impl ClaimRepository {
         // would collapse to merged→merged self-loops.
         let candidates = sqlx::query!(
             r#"
+            -- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT id, source_id, target_id, source_type, target_type,
                    relationship, created_at
             FROM edges
@@ -4798,12 +8483,12 @@ impl ClaimRepository {
         }
 
         // Retire sources. One statement: chk_deprecated_no_embedding (migration
-        // 052) is a per-statement CHECK, so is_current=false and embedding=NULL
-        // must land together.
+        // 052) is a per-statement CHECK, so is_current=false and both
+        // embedding=NULL / embedding_3072=NULL must land together.
         sqlx::query!(
             r#"
             UPDATE claims
-            SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW()
+            SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL, updated_at = NOW()
             WHERE id = ANY($2)
             "#,
             merged_id,
@@ -4844,6 +8529,24 @@ impl ClaimRepository {
     }
 }
 
+/// One grounded neighbour of a query vector, as
+/// [`ClaimRepository::grounded_neighborhood`] returns it.
+///
+/// `belief`, `plausibility` and `similarity` are `Option` because the columns
+/// are nullable and the caller supplies its own defaults — the shape the route
+/// layer already had, preserved so the move changes no arithmetic.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GroundedNeighbor {
+    /// `claims.id`.
+    pub id: Uuid,
+    /// `claims.belief`.
+    pub belief: Option<f64>,
+    /// `claims.plausibility`.
+    pub plausibility: Option<f64>,
+    /// `1 - cosine_distance(embedding, query_vector)`.
+    pub similarity: Option<f64>,
+}
+
 /// One near-duplicate neighbour of a seed claim.
 #[derive(Debug, Clone)]
 pub struct ClaimNeighbor {
@@ -4880,14 +8583,16 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool))]
-    pub async fn enumerate_current_embedded(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn enumerate_current_embedded<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         agent_scope: Option<&[Uuid]>,
         labels_scope: Option<&[String]>,
         offset: i64,
         limit: i64,
     ) -> Result<Vec<SweepCandidate>, DbError> {
+        // MACRO SITE — static three-bind spelling; see `get_by_id`.
         let rows = sqlx::query!(
             r#"
             SELECT id, truth_value, created_at
@@ -4899,6 +8604,7 @@ impl ClaimRepository {
               AND properties->>'level' IS NULL
               AND ($1::uuid[] IS NULL OR agent_id = ANY($1))
               AND ($2::text[] IS NULL OR labels @> $2)
+              AND ($5::bool OR visibility = 'public' OR owner_group_id = ANY($6::uuid[]))
             ORDER BY created_at, id
             LIMIT $3 OFFSET $4
             "#,
@@ -4906,8 +8612,10 @@ impl ClaimRepository {
             labels_scope,
             limit.clamp(1, 2000),
             offset.max(0),
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -4928,16 +8636,32 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool))]
-    pub async fn nearest_neighbors_of_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn nearest_neighbors_of_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         k: i64,
     ) -> Result<Vec<ClaimNeighbor>, DbError> {
+        // MACRO SITE — static three-bind spelling; see `get_by_id`.
+        //
+        // THREE predicates, not one. `c2` is the neighbour set, but the seed
+        // vector is read by TWO correlated subqueries (projection and ORDER BY)
+        // over `claims` on `$1`. Left unfiltered they make this function an
+        // existence-and-neighbourhood oracle: a scoped caller passes a claim id
+        // it cannot read and gets back a cosine ranking seeded from its content.
+        // An unreadable seed now yields a NULL embedding, so `distance` is NULL
+        // and the row is dropped by the `<=>` comparison being NULL — the query
+        // returns nothing rather than a ranking.
         let rows = sqlx::query!(
             r#"
             SELECT c2.id, c2.truth_value, c2.created_at,
-                   (c2.embedding <=> (SELECT embedding FROM claims WHERE id = $1)) AS "distance!"
+                   (c2.embedding <=> (
+                       SELECT cs.embedding FROM claims cs
+                       WHERE cs.id = $1
+                         AND ($3::bool OR cs.visibility = 'public'
+                              OR cs.owner_group_id = ANY($4::uuid[]))
+                   )) AS "distance!"
             FROM claims c2
             WHERE c2.is_current
               AND c2.embedding IS NOT NULL
@@ -4945,13 +8669,22 @@ impl ClaimRepository {
               AND c2.id != $1
               AND NOT (c2.labels @> ARRAY['telemetry']::text[])
               AND c2.properties->>'level' IS NULL
-            ORDER BY c2.embedding <=> (SELECT embedding FROM claims WHERE id = $1)
+              AND ($3::bool OR c2.visibility = 'public'
+                   OR c2.owner_group_id = ANY($4::uuid[]))
+            ORDER BY c2.embedding <=> (
+                SELECT cs.embedding FROM claims cs
+                WHERE cs.id = $1
+                  AND ($3::bool OR cs.visibility = 'public'
+                       OR cs.owner_group_id = ANY($4::uuid[]))
+            )
             LIMIT $2
             "#,
             claim_id,
             k.clamp(1, 50),
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -4971,19 +8704,27 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(pool, ids))]
-    pub async fn content_hashes_for(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn content_hashes_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, Vec<u8>>, DbError> {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        // MACRO SITE — static three-bind spelling; see `get_by_id`. A content
+        // hash is a content oracle: equality against a known plaintext confirms
+        // a claim's exact text without ever returning it.
         let rows = sqlx::query!(
-            "SELECT id, content_hash FROM claims WHERE id = ANY($1)",
+            "SELECT id, content_hash FROM claims \
+             WHERE id = ANY($1) \
+               AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))",
             ids,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
         Ok(rows.into_iter().map(|r| (r.id, r.content_hash)).collect())
     }

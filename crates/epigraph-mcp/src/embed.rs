@@ -141,8 +141,13 @@ impl McpEmbedder {
     /// vectors). This previously called `EvidenceRepository::search_by_embedding`
     /// = `evidence.embedding`, which is unpopulated, so the `recall` tool's
     /// semantic path always returned empty.
-    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<(uuid::Uuid, f64)>, String> {
-        self.search_scoped(query, limit, None, None).await
+    pub async fn search(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<(uuid::Uuid, f64)>, String> {
+        self.search_scoped(viewer, query, limit, None, None).await
     }
 
     /// Embedding search over current claims with optional scope pushed into
@@ -151,6 +156,7 @@ impl McpEmbedder {
     /// not restrict.
     pub async fn search_scoped(
         &self,
+        viewer: &epigraph_db::visibility::Viewer,
         query: &str,
         limit: i64,
         tags: Option<&[String]>,
@@ -160,7 +166,7 @@ impl McpEmbedder {
 
         let pgvec = format_pgvector(&embedding);
         let results = epigraph_db::ClaimRepository::search_by_embedding_scoped(
-            &self.pool, &pgvec, limit, tags, agent_id,
+            &self.pool, viewer, &pgvec, limit, tags, agent_id,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -176,6 +182,7 @@ impl McpEmbedder {
     /// fused hits; the caller (`recall`) degrades to lexical-only on `Err`.
     pub async fn search_hybrid_scoped(
         &self,
+        viewer: &epigraph_db::visibility::Viewer,
         query: &str,
         limit: i64,
         tags: Option<&[String]>,
@@ -185,6 +192,7 @@ impl McpEmbedder {
         let pgvec = format_pgvector(&embedding);
         epigraph_db::ClaimRepository::search_hybrid_scoped(
             &self.pool,
+            viewer,
             &pgvec,
             query,
             HYBRID_CANDIDATE_POOL,
@@ -263,26 +271,30 @@ impl EmbeddingService for McpEmbedder {
         Err(EmbeddingError::NotFound { claim_id })
     }
 
-    /// Find similar claims via `EvidenceRepository::search_by_embedding`.
+    /// **Unimplemented as of PR-06, deliberately.**
     ///
-    /// Converts `f64` similarity from the DB row to `f32` for `SimilarClaim`.
+    /// `EmbeddingService` lives in `epigraph-interfaces`, which does not depend
+    /// on `epigraph-db` and therefore cannot name a `Viewer`. PR-06 makes
+    /// `EvidenceRepository::search_by_embedding` require one, so this method has
+    /// no way to be tenancy-correct through this trait, and returning unfiltered
+    /// rows through a trait object would be the exact fail-open the PR exists to
+    /// close. It has no production caller — the MCP novelty and recall paths go
+    /// through [`McpEmbedder::search_scoped`] and
+    /// [`McpEmbedder::search_hybrid_scoped`], both of which take a viewer.
+    ///
+    /// Widening the trait is PR-09's call, when `mcp_viewer` gives every tool a
+    /// viewer to hand down.
     async fn similar(
         &self,
-        embedding: &[f32],
-        k: usize,
-        min_similarity: f32,
+        _embedding: &[f32],
+        _k: usize,
+        _min_similarity: f32,
     ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
-        let pgvec = format_pgvector(embedding);
-        let rows =
-            epigraph_db::EvidenceRepository::search_by_embedding(&self.pool, &pgvec, k as i64)
-                .await
-                .map_err(|e| EmbeddingError::DatabaseError(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| SimilarClaim::new(r.claim_id, r.similarity as f32))
-            .filter(|s| s.similarity >= min_similarity)
-            .collect())
+        Err(EmbeddingError::DatabaseError(
+            "McpEmbedder::similar is not tenancy-aware: EmbeddingService cannot carry a \
+             Viewer. Use McpEmbedder::search_scoped or ::search_hybrid_scoped."
+                .to_string(),
+        ))
     }
 
     /// `text-embedding-3-small` outputs 1536-dimensional vectors.

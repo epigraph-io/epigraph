@@ -5,6 +5,9 @@
 //! (the three tools added alongside it are reads), and that the default
 //! confidence never exceeds the best source.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::consolidate::consolidate_claims;
 use epigraph_mcp::types::ConsolidateClaimsParams;
 use sqlx::PgPool;
@@ -63,12 +66,13 @@ fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
 /// End-to-end merge through the tool, with the default confidence rule.
 #[sqlx::test(migrations = "../../migrations")]
 async fn tool_merges_and_caps_confidence_at_best_source(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let s1 = seed_claim(&pool, agent, "tool src one", 0.6).await;
     let s2 = seed_claim(&pool, agent, "tool src two", 0.9).await;
 
     let server = build_server(pool.clone(), false);
-    let out = consolidate_claims(&server, params(&[s1, s2], "tool merged", None))
+    let out = consolidate_claims(&server, &viewer, params(&[s1, s2], "tool merged", None))
         .await
         .expect("consolidate ok");
     let j = json_of(out);
@@ -114,6 +118,7 @@ fn consolidate_is_gated_as_a_write() {
 /// An unknown mode is a parameter error, not a 500.
 #[sqlx::test(migrations = "../../migrations")]
 async fn unknown_mode_is_rejected(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let s1 = seed_claim(&pool, agent, "mode a", 0.6).await;
     let s2 = seed_claim(&pool, agent, "mode b", 0.6).await;
@@ -121,7 +126,7 @@ async fn unknown_mode_is_rejected(pool: PgPool) {
     let server = build_server(pool, false);
     let mut p = params(&[s1, s2], "x", None);
     p.mode = "obliterate".to_string();
-    let err = consolidate_claims(&server, p)
+    let err = consolidate_claims(&server, &viewer, p)
         .await
         .expect_err("bad mode rejected");
     let msg = format!("{err:?}").to_lowercase();

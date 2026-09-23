@@ -141,6 +141,7 @@ pub fn build_analysis(
 #[cfg(feature = "db")]
 pub async fn analyze_independence(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     rows: &[(Uuid, Option<Uuid>, MassFunction)],
     max_lca_depth: i32,
 ) -> Result<IndependenceAnalysis, crate::errors::ApiError> {
@@ -192,13 +193,17 @@ pub async fn analyze_independence(
                 .copied()
                 .unwrap_or_else(Uuid::nil);
 
-            if let Some(lca) =
-                epigraph_db::LineageRepository::get_lca(pool, claim_a, claim_b, Some(max_lca_depth))
-                    .await
-                    .map_err(|e| crate::errors::ApiError::DatabaseError {
-                        message: format!("LCA query failed: {e}"),
-                    })?
-            {
+            if let Some(lca) = epigraph_db::LineageRepository::get_lca(
+                pool,
+                viewer,
+                claim_a,
+                claim_b,
+                Some(max_lca_depth),
+            )
+            .await
+            .map_err(|e| crate::errors::ApiError::DatabaseError {
+                message: format!("LCA query failed: {e}"),
+            })? {
                 dependent_pairs.push((i, j));
                 lca_findings.push(LcaFinding {
                     agent_a: agents[i],

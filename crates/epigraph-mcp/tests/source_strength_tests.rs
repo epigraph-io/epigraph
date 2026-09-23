@@ -6,6 +6,9 @@
 //! Sheaf cohomology stagnation (h1 frozen at the obstruction-rich extreme)
 //! is the visible symptom of the prior conflation.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -61,6 +64,7 @@ async fn seed_evidence(pool: &PgPool, claim_id: Uuid) -> Uuid {
 #[tokio::test]
 async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     let (agent_id, claim_id) = seed_agent_and_claim(&pool).await;
 
     // Confidence and weight differ so we can tell which one was stored.
@@ -70,6 +74,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
 
     tools::ds_auto::auto_wire_ds_update(
         &pool,
+        &viewer,
         claim_id,
         agent_id,
         confidence,
@@ -136,6 +141,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
 #[tokio::test]
 async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     let (agent_id, claim_id) = seed_agent_and_claim(&pool).await;
 
     // Two intra-cohort evidence rows: empirical (calibrated weight 1.0).
@@ -147,6 +153,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
 
     tools::ds_auto::auto_wire_ds_update(
         &pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,  // confidence
@@ -160,6 +167,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
 
     tools::ds_auto::auto_wire_ds_update(
         &pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,
@@ -212,6 +220,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     // call too to make sure THIS row goes through the helper as intra).
     tools::ds_auto::auto_wire_ds_update(
         &pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,
@@ -236,7 +245,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     // We can use a fresh call to auto_wire_ds_update with an additional
     // ev_id, but a cleaner path is to call recompute_claim_belief_binary
     // directly on the engine API.
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(&pool, claim_id)
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(&pool, &viewer, claim_id)
         .await
         .expect("recompute under factor 0.9");
 
@@ -255,7 +264,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     .await
     .expect("set per-frame factor to 0.05");
 
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(&pool, claim_id)
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(&pool, &viewer, claim_id)
         .await
         .expect("recompute under factor 0.05");
 

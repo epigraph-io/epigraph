@@ -28,6 +28,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
 
 // Cross-source matches reads two tables (edges, match_candidates) via raw
@@ -68,19 +69,48 @@ pub struct CrossSourceMatchesResponse {
     pub pending: Vec<PendingCandidate>,
 }
 
+/// # Tenancy (PR-09)
+///
+/// This is the HTTP twin of MCP `find_cross_source_matches`, and it carried the
+/// same two fail-opens: an unfiltered `CORROBORATES` edge scan (duplicated
+/// verbatim from the MCP tool) and an unfiltered `list_for_claim`. Both now go
+/// through `MatchCandidateRepo`, viewer-scoped, and the duplication is gone —
+/// one repo function serves both transports, which is what CLAUDE.md's "do not
+/// duplicate SQL between them" asks for.
+///
+/// That makes the two transports return identical row sets *by construction*,
+/// which is a structural argument and **not** a tested one. Plan §8.4 #16's
+/// parameterised MCP/HTTP parity suite does not exist in this tree and PR-09
+/// does not write it; the non-delivery is recorded in the PR-09 ledger entry as
+/// D-PR16-mcp-http-parity-suite. An earlier revision of this comment asserted
+/// the parity property as held. It is not asserted here, because nothing tests
+/// it — the same standard `no_inline_sql_in_tools.rs`'s module doc applies to
+/// its own acceptance line.
+///
+/// The existence probe is scoped too: a claim the viewer cannot read must 404
+/// exactly as a nonexistent one does (§8.5), or this endpoint is an existence
+/// oracle for every private claim id.
 #[cfg(feature = "db")]
 pub async fn get_cross_source_matches(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<CrossSourceMatchesResponse>, ApiError> {
-    // 404 if the claim doesn't exist. Using count(*) so we don't pay for the
-    // full row hydration we'd get from ClaimRepository::get_by_id.
-    let exists: (i64,) = map_sqlx(
-        sqlx::query_as("SELECT COUNT(*)::bigint FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(&state.db_pool)
-            .await,
-    )?;
+    // 404 if the claim doesn't exist *for this viewer*. Using count(*) so we
+    // don't pay for the full row hydration we'd get from
+    // ClaimRepository::get_by_id.
+    let exists_sql = viewer.splice(
+        "SELECT COUNT(*)::bigint FROM claims c
+             WHERE c.id = $1 /* {VISIBILITY:c} */",
+        2,
+    );
+    let mut exists_q = sqlx::query_as::<_, (i64,)>(&exists_sql).bind(claim_id);
+    // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders no predicate and
+    // would receive one bind more than the statement references.
+    if let Some(g) = viewer.group_bind() {
+        exists_q = exists_q.bind(g);
+    }
+    let exists: (i64,) = map_sqlx(exists_q.fetch_one(&state.db_pool).await)?;
     if exists.0 == 0 {
         return Err(ApiError::NotFound {
             entity: "claim".to_string(),
@@ -88,16 +118,8 @@ pub async fn get_cross_source_matches(
         });
     }
 
-    let edge_rows: Vec<(Uuid, Uuid, Uuid, serde_json::Value)> = map_sqlx(
-        sqlx::query_as(
-            "SELECT id, source_id, target_id, properties FROM edges
-             WHERE relationship = 'CORROBORATES'
-               AND (source_id = $1 OR target_id = $1)",
-        )
-        .bind(claim_id)
-        .fetch_all(&state.db_pool)
-        .await,
-    )?;
+    let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
+    let edge_rows = map_sqlx(repo.corroborates_edges_for_claim(&viewer, claim_id).await)?;
     let corroborates: Vec<CorroboratesEdge> = edge_rows
         .into_iter()
         .map(|(id, src, tgt, properties)| CorroboratesEdge {
@@ -108,8 +130,7 @@ pub async fn get_cross_source_matches(
         })
         .collect();
 
-    let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
-    let candidate_rows = map_sqlx(repo.list_for_claim(claim_id).await)?;
+    let candidate_rows = map_sqlx(repo.list_for_claim(&viewer, claim_id).await)?;
     let pending: Vec<PendingCandidate> = candidate_rows
         .into_iter()
         .filter(|r| r.status == "pending")
@@ -191,6 +212,7 @@ fn excerpt(content: Option<&String>) -> String {
 #[cfg(feature = "db")]
 pub async fn list_candidates(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Query(q): Query<ListCandidatesQuery>,
 ) -> Result<Json<Vec<PendingCandidateOut>>, ApiError> {
@@ -214,7 +236,7 @@ pub async fn list_candidates(
     };
 
     let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
-    let rows = map_sqlx(repo.list(status_ref, q.limit).await)?;
+    let rows = map_sqlx(repo.list(&viewer, status_ref, q.limit).await)?;
 
     let mut claim_ids: Vec<Uuid> = Vec::with_capacity(rows.len() * 2);
     for r in &rows {
@@ -224,13 +246,29 @@ pub async fn list_candidates(
     claim_ids.sort_unstable();
     claim_ids.dedup();
 
-    let content_rows: Vec<(Uuid, String)> = map_sqlx(
-        sqlx::query_as("SELECT id, content FROM claims WHERE id = ANY($1)")
-            .bind(&claim_ids)
-            .fetch_all(&state.db_pool)
-            .await,
-    )?;
-    let content_by_id: HashMap<Uuid, String> = content_rows.into_iter().collect();
+    // PR-09: was an inline unfiltered `SELECT id, content FROM claims`. The
+    // ids can now only come from candidates the viewer can already see, so this
+    // was defence-in-depth rather than a live leak — but a route-layer content
+    // read with no viewer is the exact shape `no_bypass_in_handlers.rs` and
+    // CLAUDE.md's "all SQL stays in repos" exist to keep out.
+    //
+    // `_any_version`, deliberately. The obvious call is `contents_by_ids`, and
+    // an earlier revision made it — but that function carries
+    // `COALESCE(is_current, true) = true`, a contract of the rerank pool it was
+    // written for. `match_candidates` rows outlive the claims they name:
+    // nothing prunes the queue when `supersede_claim` / `mark_duplicate` flips
+    // `is_current`, so every such pair would have rendered as the literal
+    // "(claim not found)" — a silent narrowing of an endpoint whose doc above
+    // promises verbatim excerpts, and actively false text, since the claim
+    // exists. The visibility predicate is identical between the two, so this is
+    // a version-scope choice, not a read-authority one.
+    let content_by_id: HashMap<Uuid, String> =
+        epigraph_db::ClaimRepository::contents_by_ids_any_version(
+            &state.db_pool,
+            &viewer,
+            &claim_ids,
+        )
+        .await?;
 
     let out = rows
         .into_iter()
@@ -265,6 +303,7 @@ pub struct DecideCandidateRequest {
 
 #[cfg(feature = "db")]
 pub async fn decide_candidate(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -299,13 +338,17 @@ pub async fn decide_candidate(
 
     // Decision provenance: prefer agent_id, fall back to client_id (sub).
     //
-    // OAuth *service* clients — notably the Telegram approval bridge — are
-    // created with `agent_id = NULL` (see `oauth/register.rs`) and nothing ever
-    // links one, so `auth.agent_id` is `None` for every decision they make.
-    // Writing that through unchanged recorded `decided_by = NULL`, silently
-    // dropping the identity behind a promotion that creates a real CORROBORATES
-    // edge. Falling back to the authenticated client keeps every decision
-    // attributable to *something* without rejecting these callers.
+    // HISTORICAL NOTE (corrected in PR-02): OAuth *service* clients — notably
+    // the Telegram approval bridge — were created with `agent_id = NULL` and
+    // nothing ever linked one, so `auth.agent_id` was `None` for every decision
+    // they made and `decided_by` was written as NULL, silently dropping the
+    // identity behind a promotion that creates a real CORROBORATES edge.
+    // `AgentRepository::ensure_for_client` now materialises a principal at every
+    // token-mint site, so `auth.agent_id` is populated for any token minted
+    // since. The fallback stays: tokens minted BEFORE PR-02 are still in
+    // circulation until they expire, and test helpers mint `agent_id: None`
+    // directly. Collapsing the ~20 `agent_id.or(client_id)` sites across
+    // claims/edges/belief/graph_query is PR-03/PR-06 work.
     //
     // `agents.id` and `oauth_clients.id` are disjoint UUID spaces, so a reader
     // can tell which kind of principal a `decided_by` names by looking it up;
@@ -406,6 +449,7 @@ pub async fn decide_candidate(
 
             let all_current = epigraph_db::ClaimRepository::are_all_current(
                 &state.db_pool,
+                &viewer,
                 &[row.claim_a, row.claim_b],
             )
             .await

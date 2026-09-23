@@ -17,6 +17,9 @@
 //! Requires the `db` feature: run with `--features db` (in `default`).
 #![cfg(feature = "db")]
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_cli::decompose::{run_decomposition_batches, BatchClaim};
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, MockLlmClient};
 use sqlx::PgPool;
@@ -85,6 +88,7 @@ async fn atoms_of(pool: &PgPool, parent: Uuid) -> Vec<String> {
 /// with no LLM call and no OAuth token.
 #[sqlx::test(migrations = "../../migrations")]
 async fn fixture_provider_writes_atoms_and_decomposes_to_edges(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent_a = insert_min_claim(&pool, agent, COMPOUND_A).await;
     let parent_b = insert_min_claim(&pool, agent, COMPOUND_B).await;
@@ -106,6 +110,7 @@ async fn fixture_provider_writes_atoms_and_decomposes_to_edges(pool: PgPool) {
     let pool_c = pool.clone();
     let totals = run_decomposition_batches(
         &pool,
+        &viewer,
         &claims,
         &llm,
         10,
@@ -151,6 +156,7 @@ async fn fixture_provider_writes_atoms_and_decomposes_to_edges(pool: PgPool) {
 /// between parents here while still reporting "4 atoms, 4 edges".
 #[sqlx::test(migrations = "../../migrations")]
 async fn atoms_follow_claim_text_not_batch_position(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent_a = insert_min_claim(&pool, agent, COMPOUND_A).await;
     let parent_b = insert_min_claim(&pool, agent, COMPOUND_B).await;
@@ -173,6 +179,7 @@ async fn atoms_follow_claim_text_not_batch_position(pool: PgPool) {
     let pool_c = pool.clone();
     let totals = run_decomposition_batches(
         &pool,
+        &viewer,
         &claims,
         &llm,
         10,
@@ -202,6 +209,7 @@ async fn atoms_follow_claim_text_not_batch_position(pool: PgPool) {
 /// the fixture never fabricates atoms for claims it was not given.
 #[sqlx::test(migrations = "../../migrations")]
 async fn claims_missing_from_the_fixture_are_left_untouched(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent_a = insert_min_claim(&pool, agent, COMPOUND_A).await;
     let unknown =
@@ -224,6 +232,7 @@ async fn claims_missing_from_the_fixture_are_left_untouched(pool: PgPool) {
     let pool_c = pool.clone();
     let totals = run_decomposition_batches(
         &pool,
+        &viewer,
         &claims,
         &llm,
         10,
@@ -250,6 +259,7 @@ async fn claims_missing_from_the_fixture_are_left_untouched(pool: PgPool) {
 /// it must stay exactly as it was.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mock_provider_writes_nothing(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent = insert_min_claim(&pool, agent, COMPOUND_A).await;
 
@@ -262,10 +272,18 @@ async fn mock_provider_writes_nothing(pool: PgPool) {
 
     let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let submitted_c = submitted.clone();
-    let totals = run_decomposition_batches(&pool, &claims, &llm, 10, None, move |_t, _g, _a| {
-        submitted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        async move { Ok(Uuid::new_v4()) }
-    })
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
+        &llm,
+        10,
+        None,
+        move |_t, _g, _a| {
+            submitted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok(Uuid::new_v4()) }
+        },
+    )
     .await
     .unwrap();
 

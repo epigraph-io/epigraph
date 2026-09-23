@@ -1,5 +1,8 @@
 //! `PaperRepository` integration tests.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod helpers;
 
 use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, PaperRepository, PgPool};
@@ -37,17 +40,21 @@ async fn find_by_doi_returns_none_for_unknown(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let paper_id =
         PaperRepository::get_or_create(&pool, "10.1234/has-pbe", Some("Has-PBE Paper"), None)
             .await
             .expect("create paper");
 
     // No edge yet → false.
-    assert!(
-        !PaperRepository::has_processed_by_edge(&pool, paper_id, "hierarchical_extraction_v1")
-            .await
-            .expect("query has_processed_by_edge")
-    );
+    assert!(!PaperRepository::has_processed_by_edge(
+        &pool,
+        &viewer,
+        paper_id,
+        "hierarchical_extraction_v1"
+    )
+    .await
+    .expect("query has_processed_by_edge"));
 
     // Edges enforce target existence via trigger_validate_edge_refs, so we
     // create a real agent + claim to use as the edge target.
@@ -56,7 +63,7 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
         .await
         .expect("create agent");
     let claim = make_claim(agent_row.id, "test claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim)
+    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create claim");
 
@@ -74,15 +81,18 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
     .await
     .expect("create edge");
 
-    assert!(
-        PaperRepository::has_processed_by_edge(&pool, paper_id, "hierarchical_extraction_v1")
-            .await
-            .expect("query has_processed_by_edge")
-    );
+    assert!(PaperRepository::has_processed_by_edge(
+        &pool,
+        &viewer,
+        paper_id,
+        "hierarchical_extraction_v1"
+    )
+    .await
+    .expect("query has_processed_by_edge"));
 
     // Different pipeline string → still false.
     assert!(
-        !PaperRepository::has_processed_by_edge(&pool, paper_id, "other_pipeline_v1")
+        !PaperRepository::has_processed_by_edge(&pool, &viewer, paper_id, "other_pipeline_v1")
             .await
             .expect("query has_processed_by_edge")
     );
@@ -94,10 +104,11 @@ async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
 /// ingestion (claim labelled, edge not yet written) still reads as non-zero.
 #[sqlx::test(migrations = "../../migrations")]
 async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let doi = "10.1234/label-count-test";
 
     assert_eq!(
-        PaperRepository::count_claims_by_doi_label(&pool, doi)
+        PaperRepository::count_claims_by_doi_label(&pool, &viewer, doi)
             .await
             .expect("count with no claims"),
         0
@@ -108,7 +119,7 @@ async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
         .await
         .expect("create agent");
     let claim = make_claim(agent_row.id, "orphan-labeled claim", 0.5);
-    let claim_row = ClaimRepository::create(&pool, &claim)
+    let claim_row = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create claim");
 
@@ -118,7 +129,7 @@ async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
         .expect("label claim");
 
     assert_eq!(
-        PaperRepository::count_claims_by_doi_label(&pool, doi)
+        PaperRepository::count_claims_by_doi_label(&pool, &viewer, doi)
             .await
             .expect("count after labeling"),
         1,

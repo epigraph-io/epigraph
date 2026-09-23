@@ -20,7 +20,7 @@ Episcience has a complete, 9-tool MCP server (`EpiscienceServer`: `synthesize`,
 `add_observation`, `countersign`, `list_countersignatures`, `attach_blob`) but it is
 **stdio-only and undeployed** — nothing serves it. We want episcience's tools
 available to MCP clients (claude.ai, `claude` CLI) alongside epigraph's ~78 tools,
-**through the one existing authenticated endpoint** (`https://5-78-124-36.nip.io/mcp`),
+**through the one existing authenticated endpoint** (the deployment's public MCP endpoint),
 without coupling the kernel to episcience.
 
 Piggybacking episcience tools *into* `epigraph-mcp` is rejected: `epigraph-mcp` does
@@ -137,7 +137,7 @@ when the static `tool_router` does not own the requested name.
   (`0o660`), sharing the episcience env (DB URL, JWT secret, embed/LLM providers,
   edge-writer client).
 - `epigraph-mcp` env gains `EPIGRAPH_MCP_EXTENSIONS=episcience=unix:/run/epigraph/episcience-mcp.sock;scope=episcience:tools`.
-- Rebuild + redeploy `epigraph-mcp-*` and add `episcience-mcp.service`. `nip.io/mcp`
+- Rebuild + redeploy `epigraph-mcp-*` and add `episcience-mcp.service`. that endpoint
   then serves kernel + episcience tools via one endpoint, one token.
 
 ## Session model (as built — the critical correction)

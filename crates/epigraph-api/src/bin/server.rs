@@ -1,10 +1,25 @@
+// UNSCOPED-POOL-EXEMPT: Boot and spawned long-lived tasks, in TWO different senses — see the
+// matching entry in `epigraph-db/tests/no_unscoped_pool.rs`, which is authoritative for the reason.
+// (a) Boot hydration and the metrics sampler: no principal exists at process start or inside the
+// sampler, so there is nothing to stamp a connection from. (b) The webhook-dispatcher handoff is
+// NOT of that kind: the dispatcher resolves a real `Viewer` per subscription downstream, so a
+// Viewer IS constructible there. The follow-up this used to be exempt-until — migration 086, which
+// repaired `ClaimRepository::hidden_claim_ids` by putting both arms of its set difference inside a
+// SECURITY DEFINER frame — has landed, and the exemption STANDS anyway: this pool is handed over
+// once at process start and travels as a `&PgPool` parameter into a detached task, and the probe it
+// feeds is now correct on an unstamped connection. Converting it is a separate decision, not a
+// consequence of 086.
 use epigraph_api::metrics::Metrics;
 use epigraph_api::routes::webhooks::{start_webhook_dispatcher, WebhookDeliveryConfig};
-use epigraph_api::{create_router, ApiConfig, AppState};
+use epigraph_api::{create_router, embedding_restore::EmbeddingProviderKind, ApiConfig, AppState};
 #[cfg(feature = "db")]
 use epigraph_jobs::{
-    cluster_graph::ClusterGraphHandler, theme_cluster_rebuild::ThemeClusterRebuildHandler,
-    JobQueue, JobRunner, PostgresJobQueue,
+    cluster_graph::ClusterGraphHandler,
+    privatization::{
+        PrivatizationApplyHandler, PrivatizationResealHandler, PrivatizationRevertHandler,
+    },
+    theme_cluster_rebuild::ThemeClusterRebuildHandler,
+    ConfigurableEmbeddingHandler, JobQueue, JobRunner, PostgresJobQueue,
 };
 use std::sync::Arc;
 #[cfg(feature = "db")]
@@ -26,7 +41,17 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// - `OPENAI_API_KEY`: OpenAI API key (primary — text embeddings)
 /// - `JINA_API_KEY`: Jina AI API key (multimodal figure embeddings only)
 /// - `EMBEDDING_DIMENSION`: Vector dimension (default: 1536)
-fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::EmbeddingService> {
+///
+/// Returns the service together with [`EmbeddingProviderKind`], because the
+/// fallthrough is silent and one caller — the `embedding_generation` job
+/// registration below — must NOT accept it. A mock or Jina vector is fine to
+/// rank a single query with and not fine to persist into `claims.embedding`,
+/// and the trait object carries no provider identity with which to tell them
+/// apart afterwards.
+fn create_embedding_service() -> (
+    std::sync::Arc<dyn epigraph_embeddings::EmbeddingService>,
+    EmbeddingProviderKind,
+) {
     let dimension: usize = std::env::var("EMBEDDING_DIMENSION")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -39,7 +64,7 @@ fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::Embeddi
             match epigraph_embeddings::OpenAiProvider::new(config, api_key) {
                 Ok(provider) => {
                     tracing::info!(dim = dimension, "Embedding service: OpenAI (text-only)");
-                    return std::sync::Arc::new(provider);
+                    return (std::sync::Arc::new(provider), EmbeddingProviderKind::OpenAi);
                 }
                 Err(e) => {
                     tracing::warn!("OpenAI provider init failed: {e}, trying Jina fallback");
@@ -60,7 +85,7 @@ fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::Embeddi
                         "Embedding service: Jina v4 (multimodal) — \
                          text queries may not match OpenAI-embedded claims"
                     );
-                    return std::sync::Arc::new(provider);
+                    return (std::sync::Arc::new(provider), EmbeddingProviderKind::Jina);
                 }
                 Err(e) => {
                     tracing::warn!("Jina provider init failed: {e}, falling back to mock");
@@ -76,7 +101,7 @@ fn create_embedding_service() -> std::sync::Arc<dyn epigraph_embeddings::Embeddi
         dim = dimension,
         "Embedding service: Mock (development only)"
     );
-    std::sync::Arc::new(provider)
+    (std::sync::Arc::new(provider), EmbeddingProviderKind::Mock)
 }
 
 #[tokio::main]
@@ -175,13 +200,18 @@ async fn main() {
 
     // Configure API settings.
     //
-    // `require_signatures` enables a packet-signature gate on the write path
-    // (`/api/v1/submit/packet`) that currently fails closed because the
-    // Ed25519 verifier is still TODO in `routes/submit.rs`. Until that lands,
-    // make it env-driven so deployments can opt out and continue recording
-    // provenance via OAuth2 Bearer auth alone. Default off; flip to `1`/`true`
-    // to re-enable the gate once the verifier ships.
-    let require_signatures = std::env::var("EPIGRAPH_REQUIRE_SIGNATURES")
+    // `require_packet_signatures` enables the Ed25519 **payload** signature gate
+    // on `POST /api/v1/submit/packet`. The verifier is implemented
+    // (`routes/submit.rs:689` onwards, keyed on `agents.key_kind = 'ed25519'`),
+    // so turning this on rejects unsigned and badly-signed packets rather than
+    // failing closed on everything.
+    //
+    // The flag gates ONLY payload-level packet signatures. The old
+    // request-signing middleware (`middleware::require_signature`) was deleted;
+    // transport authentication is OAuth2 Bearer, unconditionally.
+    //
+    // The operator-facing env var name is deliberately unchanged.
+    let require_packet_signatures = std::env::var("EPIGRAPH_REQUIRE_SIGNATURES")
         .ok()
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
@@ -190,58 +220,308 @@ async fn main() {
     // links. Defaults to localhost for local dev/CI.
     let public_base_url = std::env::var("EPIGRAPH_PUBLIC_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
+    // Re-open the pre-PR-02 allow-all identity posture. Default false: a
+    // provider with no `allowed_emails`/`allowed_domains` provisions NOBODY,
+    // and under EPIGRAPH_ENV=production that combination refuses to boot at all
+    // (see oauth::providers::build_registry).
+    //
+    // EPIGRAPH_ENV is introduced by PR-02. Read ONCE here and threaded into
+    // build_registry, rather than read inside the library: a hidden env read in
+    // a library function is untestable without mutating process state.
+    //
+    // UNSET means production. That is the whole point — EPIGRAPH_ENV is new, so
+    // it is unset in every deployment that exists today, which is exactly the
+    // population the boot assertion is for. Set it explicitly to "development" /
+    // "test" / "ci" / "local" (see providers::NON_PRODUCTION_ENVS) to downgrade
+    // the empty-allowlist abort to a warning so dev and CI still run.
+    let epigraph_env = std::env::var("EPIGRAPH_ENV").unwrap_or_default();
+    let allow_all_identities =
+        std::env::var("EPIGRAPH_ALLOW_ALL_IDENTITIES").as_deref() == Ok("true");
     let config = ApiConfig {
-        require_signatures,
+        require_packet_signatures,
         max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
         public_base_url,
+        allow_all_identities,
     };
 
+    // RFC 9728 resource-metadata URL, advertised in the `WWW-Authenticate`
+    // challenge on every 401.
+    //
+    // Defaults to the document this deployment already serves at
+    // `/.well-known/oauth-protected-resource`, derived from
+    // `EPIGRAPH_PUBLIC_BASE_URL`, so the URL named in the challenge and the URL
+    // that answers cannot drift. Override only when the metadata document is
+    // fronted by a different host.
+    //
+    // Fail fast rather than degrade: a value that cannot be embedded in a
+    // header (control characters, non-ASCII) would make every 401 silently drop
+    // the challenge, and a newline would let an operator inject a second
+    // header. Same shape as `epigraph-mcp`'s `--resource-metadata-url` check.
+    let resource_metadata_url = std::env::var("EPIGRAPH_RESOURCE_METADATA_URL")
+        .unwrap_or_else(|_| config.resource_metadata_url());
+    if let Err(e) = epigraph_api::errors::validate_resource_metadata_url(&resource_metadata_url) {
+        tracing::error!(
+            url = %resource_metadata_url,
+            error = %e,
+            "EPIGRAPH_RESOURCE_METADATA_URL is unusable; refusing to start"
+        );
+        std::process::exit(1);
+    }
+    epigraph_api::errors::init_resource_metadata_url(Some(resource_metadata_url.clone()));
+    tracing::info!(
+        resource_metadata_url = %resource_metadata_url,
+        "401 responses will advertise this resource-metadata URL"
+    );
+
     // Create embedding service for semantic search
-    let embedding_service = create_embedding_service();
+    let (embedding_service, embedding_provider) = create_embedding_service();
+    // Cloned BEFORE `embedding_service` is moved into `AppState` below. The
+    // job runner is constructed after that move, and the handler needs the same
+    // provider the query path uses — not a second one built from the same env.
+    #[cfg(feature = "db")]
+    let embedder_for_jobs = Arc::clone(&embedding_service);
+    // The kind is consumed only by the job registration, which is db-only.
+    #[cfg(not(feature = "db"))]
+    let _ = embedding_provider;
 
     // Create application state — connect to PostgreSQL when db feature is enabled
     #[cfg(feature = "db")]
-    let (state, job_pool) = {
+    let (state, job_pool, job_scoped) = {
         let database_url = std::env::var("DATABASE_URL")
             .expect("DATABASE_URL must be set when running with db feature");
         tracing::info!("Connecting to PostgreSQL...");
-        let pool = epigraph_db::PgPool::connect(&database_url)
+
+        // Constructed through ScopedPool, not `PgPool::connect`, and that is
+        // load-bearing rather than stylistic: `PgPoolOptions::after_release` —
+        // the hook that scrubs a released connection's tenancy GUCs, and the
+        // single mechanism standing between a recycled connection and a
+        // cross-tenant read — can only be installed at pool BUILD time, and
+        // `PgPool` exposes no setter for it. A pool built any other way cannot
+        // have the scrub retrofitted, so the control would exist only under
+        // test.
+        let guc_mode = epigraph_db::SessionGucMode::from_env(
+            std::env::var("EPIGRAPH_SESSION_GUC_MODE")
+                .unwrap_or_default()
+                .as_str(),
+        );
+        let scoped = epigraph_db::ScopedPool::connect(&database_url, guc_mode)
             .await
             .expect("Failed to connect to PostgreSQL");
+        // PR-06 stops discarding the `ScopedPool`. `AppState` now carries it
+        // alongside the inner `PgPool`, because `Viewer::system` requires a
+        // `MaintenanceLease` and `ScopedPool::unscoped_for_maintenance` is the
+        // only mint — a process that throws the `ScopedPool` away can never
+        // construct a bypass viewer for its own backfill routes. Most handlers
+        // still read the raw pool; the conversion target is `AppState::read_as`
+        // (reads) and `ScopedPool::begin_as` (writes) — NOT `acquire_as`, which
+        // hard-refuses `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler
+        // fallback this same file advertises to operators a few lines below.
+        // `epigraph-db/tests/no_unscoped_pool.rs` is the register of what
+        // remains. (This comment previously named `acquire_as` and PR-07/PR-17;
+        // both were stale.) PR-15 gave this pool a *sibling*: see the
+        // maintenance pool below, which is where `AppState::maintenance_viewer`
+        // now draws from.
+        let pool = scoped.inner().clone();
         tracing::info!("PostgreSQL connected");
 
-        epigraph_api::run_migrations(&pool)
-            .await
-            .expect("Failed to apply pending migrations");
-        tracing::info!("Migrations up to date");
+        // Plan §0.5 boot probe. Session-scoped `set_config` is the whole
+        // mechanism by which a request's group set reaches the RLS policies; if
+        // the deployment sits behind a transaction-mode pooler the GUCs silently
+        // vanish between statements and every policy collapses to
+        // `visibility = 'public'`. That is a fail-CLOSED data-loss shape, not an
+        // error, so it must be caught at boot rather than in production traffic.
+        //
+        // It lives on ScopedPool rather than on AppState because
+        // `AppState::with_db` is sync and receives a possibly-lazy pool — the
+        // same wall `load_entity_type_cache` exists to work around.
+        if guc_mode == epigraph_db::SessionGucMode::Transaction {
+            tracing::warn!(
+                "EPIGRAPH_SESSION_GUC_MODE=transaction — skipping the session-GUC probe. \
+                 Every scoped read will run inside begin_as, at a cost of two extra round \
+                 trips. Unset this variable on a session-mode endpoint."
+            );
+        } else {
+            scoped.probe_session_gucs().await.expect(
+                "FATAL: session GUCs do not survive between statements on one pooled connection. \
+                 This deployment is behind a transaction-mode pooler. Set \
+                 EPIGRAPH_SESSION_GUC_MODE=transaction to switch every read to begin_as, \
+                 or point DATABASE_URL at a session-mode endpoint.",
+            );
+            tracing::info!("Session-GUC probe passed");
+        }
+
+        // Migrations 074/075/084 are DESIGNED to RAISE when their tenancy
+        // preconditions do not hold, and this call site .expect()s — so an
+        // environment that ships them without an operator in the loop gets an
+        // api binary that panics on EVERY boot. Migrations now run only when
+        // explicitly asked for; `epigraph-migrate` (ExecStartPre=) is the
+        // supported path and is unchanged.
+        if epigraph_api::should_migrate_on_boot(
+            std::env::var("EPIGRAPH_MIGRATE_ON_BOOT").ok().as_deref(),
+        ) {
+            epigraph_api::run_migrations(&pool)
+                .await
+                .expect("Failed to apply pending migrations");
+            tracing::info!("Migrations up to date");
+        } else {
+            tracing::info!(
+                "EPIGRAPH_MIGRATE_ON_BOOT unset — skipping migrations; run `epigraph-migrate`"
+            );
+        }
 
         // Dedicated pool for background jobs with a per-connection
         // `statement_timeout`, so a runaway clustering query — or a backend
         // orphaned by a hard restart — self-aborts instead of grinding for
         // hours and saturating Postgres (incident 2026-05-29). Kept separate
         // from the API pool so the cap never affects request handling.
+        //
+        // PR-15 DISCHARGES THE OBLIGATION THIS COMMENT USED TO RECORD.
+        //
+        // The job pool is now a `ScopedPool`, so it carries the `after_release`
+        // scrub the comment above calls "the single mechanism standing between
+        // a recycled connection and a cross-tenant read" — a job pool that can
+        // be stamped but never scrubbed was the same defect the API pool was
+        // rebuilt to close. Routing it through `ScopedPool` was not a call-site
+        // swap: `ScopedPool::connect` hardcoded sizing and had no
+        // `after_connect`, so PR-15 added `ScopedPool::connect_with_options`
+        // rather than choose between the scrub and the timeout.
+        //
+        // It is also on the MAINTENANCE DSN. Background handlers run under a
+        // bypass viewer, which emits no predicate — so once RLS is FORCEd the
+        // *connection* decides what they see, and on the application DSN a
+        // corpus-wide job would read zero rows and write nowhere without
+        // erroring. `maintenance_database_url` falls back to `DATABASE_URL`
+        // with a WARN and refuses only if the two name different databases;
+        // `assert_maintenance_privilege` refuses outright once any table is
+        // FORCEd and this connection cannot bypass.
+        //
+        // THIS COUPLES REQUEST-PATH AVAILABILITY TO BACKGROUND-WRITER
+        // CONFIGURATION, and that is a deliberate trade, not an oversight. A
+        // `MAINTENANCE_DATABASE_URL` naming a different database — or a role
+        // that cannot bypass once RLS is active — now prevents the process from
+        // serving `/health` and the openapi document at all, not merely from
+        // running jobs. The alternative (log, skip the pools, boot anyway) is
+        // worse in the direction that matters: the API would come up healthy
+        // while every background write silently landed nowhere, which is the
+        // failure this whole PR exists to make impossible to ship. It is called
+        // out in `docs/deploy.md` §1c-bis so an operator meets it in the
+        // runbook rather than in an outage.
+        let (maintenance_url, maintenance_source) =
+            epigraph_db::maintenance_database_url(&database_url)
+                .expect("MAINTENANCE_DATABASE_URL is unusable; refusing to start");
+
         let job_statement_timeout = std::time::Duration::from_millis(
             std::env::var("EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(2_700_000), // 45 minutes
         );
-        let job_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(8)
-            .after_connect(move |conn, _meta| {
-                Box::pin(async move {
-                    epigraph_jobs::apply_job_connection_settings(conn, job_statement_timeout).await
-                })
-            })
-            .connect(&database_url)
-            .await
-            .expect("Failed to create background job pool");
+        let job_scoped = epigraph_db::ScopedPool::connect_with_options(
+            &maintenance_url,
+            guc_mode,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 8,
+                statement_timeout: Some(job_statement_timeout),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to create background job pool");
+        let job_pool = job_scoped.inner().clone();
+        // The SAME pool, kept as a `ScopedPool` rather than only as its inner
+        // `PgPool`, because the D4 privatization handlers need
+        // `unscoped_for_maintenance` — the only mint of the `MaintenanceLease`
+        // that `Viewer::system` requires, and therefore the only way the
+        // post-apply drift rescan can run unfiltered. The other two handlers
+        // take the bare pool and cannot obtain a bypass viewer at all, which is
+        // the right default.
+        let job_scoped = Arc::new(job_scoped);
+
+        // A THIRD, deliberately small pool, and not a reuse of `job_pool`.
+        //
+        // `AppState::maintenance_viewer` draws from this one. Every consumer
+        // runs its statement on the connection it leases from here, not on
+        // `state.db_pool`. That is what makes this pool load-bearing rather
+        // than decorative: acquiring a privileged connection and querying the
+        // application pool would be the same hybrid PR-15 deleted from the CLI
+        // fleet. (`grep -rn maintenance_viewer crates/epigraph-api/src` is the
+        // check; if that grep ever returns zero call sites, delete this pool
+        // rather than leaving it idling.)
+        //
+        // CONSUMERS: `routes/claims.rs::find_claims_needing_embeddings` (the
+        // `claims:admin` embedding-gap enumerator) and the whole of
+        // `routes/privatization.rs` — `create_plan` for the authorize/select/
+        // freeze span, `require_plan_authority` once per `get_plan`,
+        // `get_plan_items`, `approve`, `apply`, `abort`, `revert` and
+        // `get_audit`, and the one transaction each state-changing route runs
+        // its `security_events` row, state flip, audit row and enqueue in. That
+        // is a change of KIND as well as of number: it was an occasional
+        // operator-triggered read and it is now a caller-facing admin surface.
+        //
+        // THE SIZE WAS REVISITED IN PR-18's APPLY SLICE AND RAISED FROM 2 TO 4.
+        // It was deliberately NOT revisited in the preview slice, on the
+        // argument that a connection-budget change is an availability change to
+        // the request path and smuggling one inside a feature PR is an
+        // unreviewable second decision. That argument is why this one is
+        // written out here and in `docs/deploy.md` §1c-bis rather than left as a
+        // diff to a literal.
+        //
+        // What bounds the resize, and both properties are held in code:
+        //
+        //   * No request pins more than one of these at a time. Every D4
+        //     handler commits its application-pool transaction before acquiring
+        //     here, and the state-changing routes release the authority-check
+        //     connection before acquiring the one their transaction runs on.
+        //   * The privatization JOB HANDLERS do not draw from this pool at all.
+        //     They take `job_scoped` below, with its own 45-minute statement
+        //     timeout, so a running privatization consumes none of the four.
+        //
+        // Four admits four concurrent admin requests where two admitted two.
+        //
+        // Handing these routes the job pool instead would silently give them
+        // the 45-minute `EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`, which is a
+        // different availability change smuggled inside a pool-plumbing change
+        // — exactly what `ScopedPool::connect`'s own doc warns about.
+        //
+        // Connection budget at boot is therefore API(10) + jobs(8) +
+        // maintenance(4) = 22. See `docs/deploy.md` §1c-bis.
+        let maintenance_pool = epigraph_db::ScopedPool::connect_with_options(
+            &maintenance_url,
+            guc_mode,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to create maintenance pool");
+
+        // One probe for the DSN both pools share. Refuses to start if RLS is
+        // FORCEd and this connection cannot bypass — the condition under which
+        // every background write would silently become a no-op.
+        epigraph_db::assert_maintenance_privilege(
+            maintenance_pool.inner(),
+            maintenance_source,
+            "epigraph-api",
+        )
+        .await
+        .expect("maintenance connection is not privileged enough to run background writes");
+
         tracing::info!(
             statement_timeout_ms = job_statement_timeout.as_millis() as u64,
-            "Background job pool ready"
+            dsn_source = maintenance_source.as_str(),
+            "Background job pool ready on the maintenance DSN"
         );
 
-        let state = AppState::with_db(pool, config).with_embedding_service(embedding_service);
+        // Both handles are clones of a `ScopedPool`-built pool, so the
+        // `after_release` scrub travels with them: `PgPool` is a handle onto a
+        // shared, reference-counted pool whose options — including the scrub —
+        // were fixed at build time. Dropping the `ScopedPool` wrapper here does
+        // not drop the pool or uninstall the hook.
+        let scoped = scoped.with_maintenance_pool(maintenance_pool.inner().clone());
+
+        let state =
+            AppState::with_scoped_pool(scoped, config).with_embedding_service(embedding_service);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the
@@ -253,7 +533,44 @@ async fn main() {
             .expect("Failed to load entity_types registry cache");
         tracing::info!("entity_types registry cache loaded");
 
-        (state, job_pool)
+        // PR-16 boot assertions (plan §8.2 A5). Same placement and the same
+        // reason as the cache load above: `with_db` is sync and cannot SELECT.
+        //
+        // The trigger check REFUSES. After migration 074 there is no DEFAULT
+        // left to catch an undeclared write, so a disabled require-tenancy
+        // trigger is not a degraded mode — it is a corpus acquiring rows whose
+        // tenancy nobody declared, silently, until the NOT NULL backstop
+        // happens to fire.
+        state
+            .assert_tenancy_triggers_armed()
+            .await
+            .expect("refusing to serve: tenancy triggers are not armed");
+
+        // The connection-posture check WARNS. See its doc comment: making it
+        // fatal today would stop this binary booting in CI and in development,
+        // and PR-17 is the PR that repoints DATABASE_URL and can arm it.
+        if let Err(e) = state.warn_on_privileged_connection().await {
+            tracing::warn!(error = %e, "could not read the connection posture");
+        }
+
+        // PR-17's RLS posture assertion. It REFUSES, and it is STAGED on the
+        // connecting role: inert on every environment that has not performed
+        // plan §9.2 week 11d's credential split, fully armed the moment
+        // `current_user` is `epigraph_app`. `epigraph_api::state::rls_verdict`
+        // carries the whole argument, including why keying it on
+        // `relforcerowsecurity` — which is what PR-17's *Acceptance* line asks
+        // for — would brick step 11d, the 077→079 window and the documented
+        // `NO FORCE` rollback all at once.
+        //
+        // Placed AFTER `warn_on_privileged_connection` so a database whose
+        // posture is merely unusual is described in the log before this line
+        // decides whether it is fatal.
+        state
+            .assert_rls_posture()
+            .await
+            .expect("refusing to serve: RLS posture assertion failed");
+
+        (state, job_pool, job_scoped)
     };
 
     #[cfg(not(feature = "db"))]
@@ -266,8 +583,17 @@ async fn main() {
         let providers_path = std::env::var("EPIGRAPH_PROVIDERS_CONFIG")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("providers.toml"));
-        let providers = epigraph_api::oauth::providers::build_registry(providers_path.as_path())
-            .expect("failed to build providers registry");
+        // build_registry now returns Err (rather than only warning) when a
+        // provider has an empty identity allowlist, allow_all_identities is
+        // false and EPIGRAPH_ENV does not name a non-production environment.
+        // The existing .expect() turns that into a clean startup abort — no new
+        // panic site is needed.
+        let providers = epigraph_api::oauth::providers::build_registry(
+            providers_path.as_path(),
+            allow_all_identities,
+            &epigraph_env,
+        )
+        .expect("failed to build providers registry");
         state.with_providers(providers)
     };
 
@@ -299,6 +625,71 @@ async fn main() {
             Arc::clone(&handler_pool),
             Arc::clone(&queue_for_theme_cron),
         )));
+        // D4 privatization. BOTH must be registered, and the failure mode if one
+        // is not is silent and unbounded: `POST …/apply` has already returned
+        // `202` and flipped the plan to `applying`, so an unregistered job type
+        // leaves the plan mid-flight forever with no error anywhere. Nothing in
+        // the tree asserts handler/job-type parity, which is why they are
+        // registered next to the enqueue's own comment rather than filed under
+        // "add a handler when convenient".
+        //
+        // THIS BLOCK IS SKIPPED WHOLESALE WHEN `EPIGRAPH_DISABLE_JOBS=1`, which
+        // is a supported sidecar mode. A deployment that serves the D4 admin
+        // routes must not set it; `docs/deploy.md` §1c-bis carries the pairing.
+        runner.register_handler(Arc::new(PrivatizationApplyHandler::new(Arc::clone(
+            &job_scoped,
+        ))));
+        runner.register_handler(Arc::new(PrivatizationRevertHandler::new(Arc::clone(
+            &job_scoped,
+        ))));
+        // The third handler (§6.7 point 3). It is the ONLY thing that may clear
+        // `groups.reseal_required_at`, so an unregistered one leaves every
+        // rotated group flagged forever and the
+        // `epigraph_groups_reseal_required` gauge climbing with nothing able to
+        // bring it down.
+        runner.register_handler(Arc::new(PrivatizationResealHandler::new(Arc::clone(
+            &job_scoped,
+        ))));
+
+        // `embedding_generation`, which `unseal-commit` enqueues once per
+        // restored claim. It was the job type the comment above was written
+        // about and did not cover: `ConfigurableEmbeddingHandler` and its
+        // `EmbeddingJobService` trait have both existed for some time, but
+        // nothing in the workspace implemented the trait, so the handler was
+        // unconstructible and the enqueued row was a marker rather than a
+        // restoration.
+        //
+        // REGISTERED CONDITIONALLY, and the condition is the point. The
+        // provider chain above falls through to a mock without failing, which
+        // is correct for a query path and destructive for a write path: an
+        // unconditional registration would drain the backlog on the first boot
+        // after deploy and fill the live ANN column with vectors from whatever
+        // provider happened to be configured. `EmbeddingProviderKind` carries
+        // that decision out of `create_embedding_service`, which is the only
+        // place that knows the answer.
+        //
+        // Declining is the safe direction and leaves the position exactly as it
+        // was: `epigraph-cli reembed` remains the recovery path, and the
+        // CLAUDE.md audit's 24 h unseal window keeps explaining the gap.
+        if embedding_provider.may_restore_claim_embeddings() {
+            runner.register_handler(Arc::new(ConfigurableEmbeddingHandler::new(Arc::new(
+                epigraph_api::embedding_restore::ClaimEmbeddingJobService::new(
+                    Arc::clone(&job_scoped),
+                    embedder_for_jobs,
+                ),
+            ))));
+            tracing::info!(
+                provider = embedding_provider.as_str(),
+                "embedding_generation handler registered; unsealed claims regain claims.embedding"
+            );
+        } else {
+            tracing::warn!(
+                provider = embedding_provider.as_str(),
+                "embedding_generation NOT registered: this provider must not write \
+                 claims.embedding. Unsealed claims keep NULL vectors until \
+                 `epigraph-cli reembed` runs"
+            );
+        }
 
         tokio::spawn(async move {
             runner.start().await;
@@ -348,7 +739,47 @@ async fn main() {
         );
     }
 
+    // Hydrate the in-process webhook store from `webhook_subscriptions`
+    // (migration 085, PR-10). Before this table existed the store was empty on
+    // every boot, so every deploy silently unsubscribed everyone and the
+    // symptom — a webhook that stops firing — was indistinguishable from an idle
+    // corpus.
+    //
+    // A hydration failure is logged, not fatal. The server is useful without
+    // webhooks; refusing to boot because a delivery cache could not be filled
+    // would convert a degraded feature into an outage. It fails in the closed
+    // direction anyway: an empty store delivers nothing.
+    //
+    // The mapping itself lives in `epigraph_api::state::hydrate_webhook_store`
+    // rather than here, so it is reachable from a test. A block inside `main`
+    // can be reviewed but not executed, which is what
+    // `D-PR-bin-server-boot-hydration-test` recorded.
+    #[cfg(feature = "db")]
+    {
+        match epigraph_api::state::hydrate_webhook_store(&state.db_pool, &state.webhook_store).await
+        {
+            Ok(count) => {
+                tracing::info!(count, "webhook subscriptions hydrated");
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to hydrate webhook subscriptions; the fan-out will \
+                     deliver nothing until the next successful registration"
+                );
+            }
+        }
+    }
+
     // Start webhook dispatcher (subscribes to event bus for delivery)
+    #[cfg(feature = "db")]
+    let _webhook_sub = start_webhook_dispatcher(
+        &state.event_bus,
+        state.db_pool.clone(),
+        state.webhook_store.clone(),
+        WebhookDeliveryConfig::default(),
+    );
+    #[cfg(not(feature = "db"))]
     let _webhook_sub = start_webhook_dispatcher(
         &state.event_bus,
         state.webhook_store.clone(),
@@ -358,7 +789,137 @@ async fn main() {
 
     // Build router with all routes
     let metrics = Arc::new(Metrics::new());
-    let app = create_router(state).layer(axum::Extension(metrics));
+
+    // ---------------------------------------------------------------------
+    // Tenancy undeclared-write sampler (PR-12).
+    //
+    // Feeds `epigraph_tenancy_undeclared_writes`, the gauge plan §9.2's
+    // week-11b gate reads before migration 074 turns migration 070 arm (a)'s
+    // `RAISE WARNING` into a hard `23502`.
+    //
+    // WHY A TASK AND NOT A COLLECTOR. `prometheus_client` does expose
+    // `Registry::register_collector`, but `Collector::encode` is SYNCHRONOUS
+    // and cannot await an sqlx query, so the value has to be pushed in. That is
+    // the whole reason this lives in `bin/server.rs` and not in `metrics.rs`.
+    //
+    // WHY NOT IN A HANDLER. `no_bypass_in_handlers.rs` and
+    // `viewer_route_table_lint.rs` both police request handlers; more to the
+    // point, `public_router_allowlist.rs::metrics_is_not_registered_on_either_router`
+    // asserts `routes/mod.rs` mentions neither `/metrics` nor `metrics_router`.
+    // This adds no route at all — it writes into the same `Arc<Metrics>` the
+    // internal listener below already serves.
+    //
+    // It needs no `Viewer`: `tenancy_undeclared_writes` is an operational
+    // counter with no content and no `owner_group_id` (see
+    // `CorpusStatsRepository::undeclared_writes_today`).
+    //
+    // A sampling failure is logged and retried, never fatal: a database blip
+    // must not take the API down, and a stale gauge is visible in the
+    // scrape's staleness rather than silently reading zero.
+    #[cfg(feature = "db")]
+    {
+        let sampler_pool = state.db_pool.clone();
+        // PR-17's canary rides the SAME tick. `AppState` is cheap to clone
+        // (every field behind it is an `Arc` or a pool handle) and
+        // `sample_canary` needs the state, not the bare pool, so the probe and
+        // the boot assertion read through one definition
+        // (`AppState::rls_canary_visible`) rather than two copies of the SQL.
+        let canary_state = state.clone();
+        let sampler_metrics = metrics.clone();
+        let interval_secs: u64 = std::env::var("EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        // THE SAMPLER IS STATEFUL, which is why it is a type in
+        // `epigraph_api::tenancy_gauge` and not a closure here: a pass that
+        // writes only the rows its query returned can never take a series back
+        // DOWN, and `undeclared_writes_today` filters on `current_date`, so the
+        // day after an undeclared write the gauge would keep yesterday's value
+        // for the life of the process. See that module for the whole argument.
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+            let mut sampler = epigraph_api::tenancy_gauge::TenancyGaugeSampler::new();
+            loop {
+                ticker.tick().await;
+                if let Err(e) = sampler.sample(&sampler_pool, &sampler_metrics).await {
+                    tracing::warn!(
+                        error = %e,
+                        "tenancy undeclared-write sampler failed; gauge will go stale"
+                    );
+                }
+                // FINAL-PLAN §6.7's re-key backlog rides the same tick, for
+                // the same reason the canary does: one interval for an
+                // operator to keep in step, and no second pool of connections
+                // held for periodic work.
+                if let Err(e) = sampler
+                    .sample_reseal_required(&sampler_pool, &sampler_metrics)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "groups reseal-required sampler failed; gauge will go stale"
+                    );
+                }
+                // Returns no error by design: a canary probe that fails must
+                // export -1 ("unmeasured"), never the previous value and never
+                // zero. See `TenancyGaugeSampler::sample_canary`.
+                sampler.sample_canary(&canary_state, &sampler_metrics).await;
+            }
+        });
+        tracing::info!(
+            interval_secs,
+            "Tenancy undeclared-write gauge sampler started"
+        );
+    }
+
+    let app = create_router(state).layer(axum::Extension(metrics.clone()));
+
+    // ---------------------------------------------------------------------
+    // Internal metrics listener (PR-03, §10.3 Q1 option (a)).
+    //
+    // `/metrics` no longer exists on the application router. Prometheus text
+    // exposition is an operational surface: it enumerates counters that
+    // describe corpus activity, and with the application router now
+    // authenticated by default, leaving one unauthenticated route open to the
+    // internet would be the single exception that swallows the rule.
+    //
+    // It binds to 127.0.0.1 by default, so a scraper must be on the host or
+    // inside the network namespace. Set EPIGRAPH_METRICS_ADDR to widen it
+    // deliberately (e.g. "0.0.0.0:9090" inside a private network).
+    //
+    // SPAWNED HERE ON PURPOSE — before the `#[cfg(feature = "tls")]` block
+    // below, which `return`s from `main` when TLS is configured. Spawning after
+    // it would leave every TLS deployment with no metrics at all, and the
+    // failure would be silent.
+    //
+    // A bind failure is a warning, not an abort: losing metrics must not take
+    // the API down with it. It is logged loudly enough to alert on.
+    let metrics_addr =
+        std::env::var("EPIGRAPH_METRICS_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+    match tokio::net::TcpListener::bind(&metrics_addr).await {
+        Ok(metrics_listener) => {
+            tracing::info!(
+                addr = %metrics_addr,
+                "Internal metrics listener started — update the Prometheus \
+                 scrape target: /metrics is no longer on the application port"
+            );
+            let metrics_app = epigraph_api::metrics::metrics_router(metrics);
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+                    tracing::error!(error = %e, "Internal metrics listener stopped");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!(
+                addr = %metrics_addr,
+                error = %e,
+                "Failed to bind the internal metrics listener; metrics will not \
+                 be scrapeable. The API continues to serve."
+            );
+        }
+    }
 
     // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs.
     let port: u16 = std::env::var("EPIGRAPH_PORT")

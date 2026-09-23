@@ -26,6 +26,9 @@
 //!   DELTA_OUT=$SEED_DIR/data/interview-belief-delta.json \
 //!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_interview_merge -- --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{
@@ -71,7 +74,8 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
         .bind(claim).bind(frame).execute(pool).await.expect("assign");
 }
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
-    epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_engine::belief_query::get_perspective_belief(pool, &viewer, claim, frame, persp)
         .await
         .expect("belief")
         .pignistic_prob
@@ -163,11 +167,26 @@ async fn merge_interview_and_recompute() {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
-    let pkg_path = std::env::var("DISCOVERY_IN").expect("set DISCOVERY_IN");
-    let interview_path = std::env::var("INTERVIEW_IN").expect("set INTERVIEW_IN");
-    let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
-    let out = std::env::var("SNAPSHOT_OUT").expect("set SNAPSHOT_OUT");
-    let delta_out = std::env::var("DELTA_OUT").expect("set DELTA_OUT");
+    let Ok(pkg_path) = std::env::var("DISCOVERY_IN") else {
+        eprintln!("SKIP: DISCOVERY_IN not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(interview_path) = std::env::var("INTERVIEW_IN") else {
+        eprintln!("SKIP: INTERVIEW_IN not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(dir) = std::env::var("SEED_DIR") else {
+        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(out) = std::env::var("SNAPSHOT_OUT") else {
+        eprintln!("SKIP: SNAPSHOT_OUT not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(delta_out) = std::env::var("DELTA_OUT") else {
+        eprintln!("SKIP: DELTA_OUT not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 

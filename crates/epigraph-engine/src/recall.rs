@@ -37,8 +37,18 @@ pub struct RecallResult {
     pub claim_id: String,
     /// The claim's text content.
     pub content: String,
-    /// Bayesian truth value (0.0–1.0).
+    /// Bayesian truth value (0.0–1.0) — the claim's independently authored
+    /// scalar, reported unchanged. NOT what `min_truth` gates on; see
+    /// [`RecallResult::belief_score`].
     pub truth_value: f64,
+    /// The scalar `min_truth` was actually compared against (backlog
+    /// `14b98adc`): the Dempster–Shafer pignistic probability when the claim
+    /// carries a DS cache, and `truth_value` when it does not.
+    ///
+    /// `belief_score == truth_value` therefore means "this claim has no DS
+    /// state, the gate fell back"; a divergence means epistemic edges have
+    /// moved the claim away from its authored value.
+    pub belief_score: f64,
     /// Cosine similarity to the query embedding (0.0 if text-search fallback).
     pub similarity: f64,
     /// Number of `is_current` claims contesting this one via
@@ -70,13 +80,18 @@ fn format_pgvector(vec: &[f32]) -> String {
 /// - `embedder`  — embedding service; only `generate_query` is called
 /// - `query`     — natural-language query string
 /// - `limit`     — maximum number of results to return (clamped 1–50 by callers)
-/// - `min_truth` — minimum truth value threshold; results below are dropped
+/// - `min_truth` — minimum **belief** threshold; results below are dropped.
+///   Compared against [`RecallResult::belief_score`] — the DS pignistic
+///   probability when the claim carries a DS cache, else `truth_value` — NOT
+///   against the raw `claims.truth_value`, which no DS write path refreshes
+///   (backlog `14b98adc`).
 ///
 /// # Errors
 /// Returns `RecallError::Db` if the fallback text search fails.
 /// Embedding errors cause silent fallback, not a returned error.
 pub async fn recall(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn EmbeddingService,
     query: &str,
     limit: usize,
@@ -93,19 +108,35 @@ pub async fn recall(
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
         // downstream callers (episcience synthesis stage-1 seeding).
-        match ClaimRepository::search_by_embedding_current(pool, &pgvec, limit_i64).await {
+        match ClaimRepository::search_by_embedding_current(pool, viewer, &pgvec, limit_i64).await {
             Ok(hits) => {
+                // ONE round-trip for the whole page's DS state, resolved BEFORE
+                // the loop (backlog 14b98adc). Per-hit would re-introduce an
+                // N+1 on top of the get_by_id this loop already does.
+                let scores = effective_beliefs(
+                    pool,
+                    viewer,
+                    &hits.iter().map(|h| h.claim_id).collect::<Vec<_>>(),
+                )
+                .await;
                 let mut results = Vec::new();
                 for hit in hits {
                     if let Ok(Some(claim)) =
-                        ClaimRepository::get_by_id(pool, ClaimId::from_uuid(hit.claim_id)).await
+                        ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(hit.claim_id))
+                            .await
                     {
                         let tv = claim.truth_value.value();
-                        if tv >= min_truth {
+                        // Absent key == not visible to this viewer / deleted
+                        // mid-page. Fall back to the `truth_value` already in
+                        // hand so a claim with no DS state behaves exactly as
+                        // it did before this change.
+                        let score = scores.get(&hit.claim_id).copied().unwrap_or(tv);
+                        if score >= min_truth {
                             results.push(RecallResult {
                                 claim_id: hit.claim_id.to_string(),
                                 content: claim.content,
                                 truth_value: tv,
+                                belief_score: score,
                                 similarity: hit.similarity,
                                 // Annotated by the batched dispute post-pass
                                 // below, keyed by claim_id.
@@ -120,17 +151,17 @@ pub async fn recall(
             }
             Err(e) => {
                 tracing::warn!("embedding search failed, falling back to text search: {e}");
-                text_search_fallback(pool, query, limit_i64, min_truth).await?
+                text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
             }
         }
     } else {
         // Embedding generation failed (no API key, mock mode, etc.) — fall back
         // to text search. This matches the existing MCP behaviour.
-        text_search_fallback(pool, query, limit_i64, min_truth).await?
+        text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
     };
 
     let mut results = results;
-    annotate_disputes(pool, &mut results).await;
+    annotate_disputes(pool, viewer, &mut results).await;
 
     // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path — episcience
     // synthesis calls it directly, with no MCP request and therefore no auth
@@ -175,6 +206,11 @@ async fn log_recall_event(
         query_pgvector: pgvec.map(ToString::to_string),
         params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
         returned_claim_ids,
+        // No principal on this path — `agent_id` above is `None` for the same
+        // reason — so there is no personal group to own the row. See
+        // `RecallEventRepository::log` for why a memberless sentinel group
+        // cannot stand in and why the write is not refused instead.
+        owner_group_id: None,
     };
     if let Err(e) = epigraph_db::RecallEventRepository::log(pool, event).await {
         tracing::warn!(error = %e, "engine recall audit log failed; recall unaffected");
@@ -187,12 +223,16 @@ async fn log_recall_event(
 /// Best-effort by design: a dispute-lookup failure warns and serves the page
 /// unannotated rather than failing a recall that already has its results. The
 /// signal informs the caller; it never re-ranks and never gates retrieval.
-async fn annotate_disputes(pool: &PgPool, results: &mut [RecallResult]) {
+async fn annotate_disputes(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    results: &mut [RecallResult],
+) {
     let claim_ids: Vec<uuid::Uuid> = results
         .iter()
         .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
         .collect();
-    match ClaimRepository::dispute_batch(pool, &claim_ids).await {
+    match ClaimRepository::dispute_batch(pool, viewer, &claim_ids).await {
         Ok(mut by_claim) => {
             for r in results.iter_mut() {
                 let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -215,21 +255,59 @@ async fn annotate_disputes(pool: &PgPool, results: &mut [RecallResult]) {
     }
 }
 
+/// Batched DS-belief lookup for a page of claim ids (backlog `14b98adc`).
+///
+/// Best-effort by design, and it degrades the SAME way an absent key does: a
+/// failed lookup warns and yields an empty map, so every caller falls back to
+/// the `truth_value` it already holds and the gate behaves exactly as it did
+/// before this change. Failing the recall instead would trade a stale filter
+/// for no results at all.
+async fn effective_beliefs(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[uuid::Uuid],
+) -> std::collections::HashMap<uuid::Uuid, f64> {
+    match ClaimRepository::effective_belief_batch(pool, viewer, claim_ids).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
+            );
+            std::collections::HashMap::new()
+        }
+    }
+}
+
 /// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
 async fn text_search_fallback(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     query: &str,
     limit: i64,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let claims = ClaimRepository::list(pool, limit, 0, Some(query)).await?;
+    let claims = ClaimRepository::list(pool, viewer, limit, 0, Some(query)).await?;
+    // Same one-round-trip DS resolution the semantic leg does, so the two legs
+    // cannot gate on different columns (backlog 14b98adc).
+    let scores = effective_beliefs(
+        pool,
+        viewer,
+        &claims.iter().map(|c| c.id.as_uuid()).collect::<Vec<_>>(),
+    )
+    .await;
     Ok(claims
         .into_iter()
-        .filter(|c| c.truth_value.value() >= min_truth)
-        .map(|c| RecallResult {
+        .filter_map(|c| {
+            let tv = c.truth_value.value();
+            let score = scores.get(&c.id.as_uuid()).copied().unwrap_or(tv);
+            (score >= min_truth).then_some((c, tv, score))
+        })
+        .map(|(c, tv, score)| RecallResult {
             claim_id: c.id.as_uuid().to_string(),
             content: c.content,
-            truth_value: c.truth_value.value(),
+            truth_value: tv,
+            belief_score: score,
             similarity: 0.0,
             // Annotated by `annotate_disputes` once the caller has the page —
             // the fallback path returns into `recall`, which runs the pass.

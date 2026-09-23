@@ -34,9 +34,23 @@ Cross-agent **semantic** dedup of the `claims` table, driven by a
 precomputed embedding-similarity snapshot from
 `epigraph-gui/public/semantic-dedup.json`.
 
-Soft-marks duplicates with the `deduped` label and a `deduped_into`
-property pointer to the canonical claim, so the GUI's collapse-equivalents
-view stays coherent and any hard-delete sweep can come later.
+**Retracts** duplicates — `supersedes = canonical`, `is_current = false`,
+`embedding = NULL`, the same columns the canonical Rust path
+`ClaimRepository::mark_duplicate_with_repair` writes — and additionally marks
+them with the `deduped` label and a `deduped_into` property pointer, so the
+GUI's collapse-equivalents view stays coherent and any hard-delete sweep can
+come later.
+
+The retraction matters because `recall()` filters `WHERE c.embedding IS NOT
+NULL AND c.is_current`. Before 2026-09 this script only wrote the label and
+properties, so every duplicate it "merged" stayed current and kept answering
+recall alongside its canonical — a single-origin figure read as two-to-four-way
+corroboration (backlog c40ab067). Rows soft-marked by a pre-2026-09 run are
+still current and need a one-shot re-retraction; they are identifiable by
+`properties->>'deduped_by' = 'fuzzy_dedup_claims' AND is_current`.
+
+A duplicate that already carries a `supersedes` pointer is **refused**, not
+re-pointed, and reported as `duplicates_skipped_already_superseded`.
 
 This is the **S3 fuzzy** layer. It is *not* the S2 content-hash-keyed
 backfill that gates migration 107 (`UNIQUE (content_hash, agent_id)`).

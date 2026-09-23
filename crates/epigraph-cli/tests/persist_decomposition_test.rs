@@ -5,6 +5,9 @@
 //! Requires the `db` feature: run with `--features db`.
 #![cfg(feature = "db")]
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_cli::decompose::{persist_decomposition, Decomposition};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -35,6 +38,7 @@ async fn insert_min_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn persists_atoms_and_wires_parent_to_child_edges(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent = insert_min_claim(
         &pool,
@@ -51,11 +55,18 @@ async fn persists_atoms_and_wires_parent_to_child_edges(pool: PgPool) {
         generality: vec![0, 1],
     };
     let pool_c = pool.clone();
-    let outcome = persist_decomposition(&pool, parent, &decomp, None, move |atom_text, _gen| {
-        let pool_c = pool_c.clone();
-        let agent = agent;
-        async move { Ok(insert_min_claim(&pool_c, agent, &atom_text).await) }
-    })
+    let outcome = persist_decomposition(
+        &pool,
+        &viewer,
+        parent,
+        &decomp,
+        None,
+        move |atom_text, _gen| {
+            let pool_c = pool_c.clone();
+            let agent = agent;
+            async move { Ok(insert_min_claim(&pool_c, agent, &atom_text).await) }
+        },
+    )
     .await
     .unwrap();
 
@@ -103,6 +114,7 @@ async fn persists_atoms_and_wires_parent_to_child_edges(pool: PgPool) {
 /// (create_if_not_exists is idempotent; was_created=false on the second call).
 #[sqlx::test(migrations = "../../migrations")]
 async fn resubmit_with_existing_atom_id_is_idempotent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent = insert_min_claim(
         &pool,
@@ -127,13 +139,14 @@ async fn resubmit_with_existing_atom_id_is_idempotent(pool: PgPool) {
     let call_count_c = call_count.clone();
     // submit_via returns pre-existing IDs — mirrors if_not_exists=true returning
     // existing claim IDs from the API rather than creating new ones.
-    let outcome = persist_decomposition(&pool, parent, &decomp, None, move |_text, _gen| {
-        let idx = call_count_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let id = ids[idx];
-        async move { Ok(id) }
-    })
-    .await
-    .unwrap();
+    let outcome =
+        persist_decomposition(&pool, &viewer, parent, &decomp, None, move |_text, _gen| {
+            let idx = call_count_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = ids[idx];
+            async move { Ok(id) }
+        })
+        .await
+        .unwrap();
 
     assert_eq!(outcome.atom_claim_ids, vec![atom_a, atom_b]);
     // Edges are NEW because the parent->atom edge didn't exist yet.
@@ -144,13 +157,14 @@ async fn resubmit_with_existing_atom_id_is_idempotent(pool: PgPool) {
     let call_count2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let call_count2_c = call_count2.clone();
     let ids2 = [atom_a, atom_b];
-    let outcome2 = persist_decomposition(&pool, parent, &decomp, None, move |_text, _gen| {
-        let idx = call_count2_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let id = ids2[idx];
-        async move { Ok(id) }
-    })
-    .await
-    .unwrap();
+    let outcome2 =
+        persist_decomposition(&pool, &viewer, parent, &decomp, None, move |_text, _gen| {
+            let idx = call_count2_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = ids2[idx];
+            async move { Ok(id) }
+        })
+        .await
+        .unwrap();
 
     assert_eq!(outcome2.atom_claim_ids, vec![atom_a, atom_b]);
     // No new edges created — create_if_not_exists found the existing triple.
@@ -160,6 +174,7 @@ async fn resubmit_with_existing_atom_id_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn single_atom_decomposition_is_skipped(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let parent = insert_min_claim(&pool, agent, "already atomic single proposition here").await;
     let decomp = Decomposition {
@@ -168,7 +183,7 @@ async fn single_atom_decomposition_is_skipped(pool: PgPool) {
     };
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let calls_c = calls.clone();
-    let outcome = persist_decomposition(&pool, parent, &decomp, None, move |_t, _g| {
+    let outcome = persist_decomposition(&pool, &viewer, parent, &decomp, None, move |_t, _g| {
         calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move { Ok(Uuid::new_v4()) }
     })

@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n          (SELECT COUNT(*) FROM claims c\n             WHERE ($1::bool OR c.visibility = 'public'\n                    OR c.owner_group_id = ANY($2::uuid[]))) AS claims_total,\n          (SELECT COUNT(*) FROM claims c2\n             WHERE (c2.properties->>'level')::int = 2\n               AND ($1::bool OR c2.visibility = 'public'\n                    OR c2.owner_group_id = ANY($2::uuid[]))) AS paragraph_total,\n          -- VISIBILITY-EXEMPT: `papers` is not in migration 062's tier_a array\n          -- and carries no owner_group_id. A bibliographic-record count, not\n          -- claim content.\n          (SELECT COUNT(*) FROM papers) AS paper_total,\n          -- VISIBILITY-EXEMPT: `claim_themes` is the table plan §2.4 registers\n          -- as tenancy_exempt; it has no owner_group_id either, so no predicate\n          -- can be written here.\n          --\n          -- §2.4's stated control for that residual is viewer-scoped\n          -- clustering, and PR-09 DID NOT SHIP IT. `theme_cluster` still calls\n          -- `epigraph_engine::theme_kmeans::run_theme_kmeans`, which takes no\n          -- Viewer. An earlier revision of this comment asserted the control as\n          -- if it existed; an exemption whose written reason is false is worse\n          -- than an unannotated one, because `visibility_lint.rs` trains\n          -- reviewers to read exactly these lines.\n          --\n          -- Owner of the residual: the PR that threads a Viewer through\n          -- `theme_kmeans::run_theme_kmeans` must land BOTH callers together —\n          -- this tool and `epigraph-api/src/routes/crud.rs::build_themes_from_corpus`\n          -- — or MCP hardens while HTTP stays corpus-wide. Ledgered as\n          -- D-PR16-theme-cluster-viewer-scope in docs/tenancy/progress.json.\n          (SELECT COUNT(*) FROM claim_themes) AS themes_total\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "claims_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "paragraph_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "paper_total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "themes_total",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "babf5f37e28e65d9e77298dc5bddb90907e81a04b907e89c1bfdd2af1aa92018"
+}

@@ -1,5 +1,8 @@
 //! POST /oauth/revoke — Token revocation (RFC 7009).
 
+// UNSCOPED-POOL-EXEMPT: Pre-authentication. RFC 7009 revocation authenticates the token being revoked
+// rather than a session principal, and is reachable on the anonymous OAuth router.
+
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 

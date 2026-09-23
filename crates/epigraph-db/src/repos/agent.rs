@@ -66,6 +66,34 @@ pub struct CapabilityFilter {
     pub privileged_access: Option<bool>,
 }
 
+/// A Tier-B projection of one `agents` row, narrowed to what a given
+/// [`crate::visibility::Viewer`] may see.
+///
+/// See [`AgentRepository::get_public_profile`] for the rule. The four
+/// always-present fields are the ones authorship rendering needs; the three
+/// `Option` fields below are `None` when the viewer is not entitled to the
+/// agent's PII, which is **indistinguishable from the agent simply not having
+/// set them** — deliberately, so the projection is not itself an oracle for
+/// "this agent has a private profile".
+#[derive(Debug, Clone)]
+pub struct AgentPublicProfile {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    pub public_key: Vec<u8>,
+    /// `ed25519` or `derived` (migration 061). Always returned: a caller that
+    /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
+    /// placeholder to a signature check.
+    pub key_kind: String,
+    /// `public` or `group` (migration 062). Always returned so a caller can say
+    /// *why* the detail fields are empty without a second query.
+    pub profile_visibility: String,
+    /// `agents.properties` — `full_name`, `affiliations`, `email`. `None` when
+    /// the viewer is not entitled to it.
+    pub properties: Option<JsonValue>,
+    pub orcid: Option<String>,
+    pub ror_id: Option<String>,
+}
+
 /// Repository for Agent operations
 pub struct AgentRepository;
 
@@ -177,10 +205,50 @@ impl AgentRepository {
 
     /// Get an agent by ID
     ///
+    /// # Tenancy: takes an executor, and deliberately takes no `Viewer`
+    ///
+    /// Widened from `&PgPool` to `E: PgExecutor` by conversion shard 5 so that
+    /// the five `routes/political.rs` handlers which call it alongside a
+    /// viewer-spliced `PoliticalRepository` read can run BOTH statements on one
+    /// viewer-stamped connection. The SQL, its binds and the projected row shape
+    /// are unchanged; nothing else about this function was re-derived.
+    ///
+    /// **MOTIVATION IS NOT REACH, and the reach is wider than the motivation.**
+    /// Those five handlers are why the signature moved; they are not the whole
+    /// caller set. Ten other PRODUCTION call sites, across six files — four in
+    /// `routes/agents.rs`, two in `routes/crud.rs`, and one each in
+    /// `routes/claims.rs`, `routes/submit.rs`, `routes/webhooks.rs` (inside
+    /// `agent_principal_exists`, a file under a standing do-not-convert hold)
+    /// and `epigraph-engine/src/export/prov.rs` — were NOT touched and continue
+    /// to pass a `&PgPool`, which still satisfies `E: PgExecutor<'e>`. So no
+    /// caller changed behaviour and none needed editing; the count is stated
+    /// because this doc is the tree's explanation of why the signature moved,
+    /// and a motivation read as an inventory understates what the widening
+    /// reaches.
+    ///
+    /// It has no `Viewer` because there is nothing on `agents` for one to
+    /// narrow, and that is a deliberate schema decision rather than an
+    /// oversight. `migrations/077_rls_policies.sql` §9 creates
+    /// `agents_identity ON public.agents FOR SELECT TO PUBLIC USING (true)` and
+    /// states the reason in the migration itself: `agents.id` / `display_name` /
+    /// `public_key` "must render authorship on public claims, so the ROW is
+    /// universally readable and PostgreSQL has no column-level RLS to narrow
+    /// it." That migration names THIS function explicitly among the ones which
+    /// "take no `Viewer` and return the full row". The compensating projection —
+    /// `profile_visibility` gating `properties`, `orcid` and `ror_id` — lives in
+    /// exactly one function, [`Self::get_public_profile`], and the residual is
+    /// already on record as `D-PR17-agent-projection-enforced-at-one-call-site`.
+    /// Stamping the session GUCs on this read changes no row either way; the
+    /// value of the widening is entirely in the SIBLING statement it lets share
+    /// the connection.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: AgentId) -> Result<Option<Agent>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: AgentId,
+    ) -> Result<Option<Agent>, DbError> {
         let uuid: Uuid = id.into();
 
         let row = sqlx::query!(
@@ -191,7 +259,7 @@ impl AgentRepository {
             "#,
             uuid
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -998,6 +1066,366 @@ impl AgentRepository {
             ));
         }
         Ok(agents)
+    }
+
+    // =========================================================================
+    // OAuth principal identity (PR-02)
+    //
+    // Every one of the queries below uses the RUNTIME `sqlx::query`/`query_as`
+    // API rather than the `query!` macros. That is deliberate: they read and
+    // write `agents.key_kind`, which only exists once migration 061 has been
+    // applied, and a macro would demand a `.sqlx/` cache entry describing a
+    // column that a not-yet-migrated checkout cannot produce.
+    // =========================================================================
+
+    /// Idempotently materialise the `agents` row for an OAuth client, so
+    /// `AuthContext.agent_id` is never `None` on an authenticated request.
+    ///
+    /// This IS the "linked later" helper that
+    /// `crates/epigraph-api/src/oauth/register.rs` promised in a comment, named,
+    /// and never had. It is called at every token-mint site rather than at
+    /// registration time, so a client registered before this shipped acquires
+    /// its principal on its next token.
+    ///
+    /// Steps, all on the caller's connection so the caller may wrap them in one
+    /// transaction:
+    /// 1. `SELECT agent_id, client_id, client_type FROM oauth_clients ...
+    ///    FOR UPDATE` — early return when the client is already linked (the warm
+    ///    path: one indexed read). `client_type` is read from the LOCKED ROW
+    ///    rather than taken as a parameter, so a caller cannot pass one
+    ///    inconsistent with what is stored (`providers::provision` hardcoded
+    ///    `"human"`).
+    /// 2. **`client_type = 'agent'` first.** For an agent client the `client_id`
+    ///    IS the hex Ed25519 public key by construction
+    ///    (`oauth/register.rs` requires it; `oauth/token.rs` decodes it to
+    ///    verify the client assertion). Such a client already HAS a signing
+    ///    identity, and elsewhere the kernel resolves that identity by
+    ///    `agents.public_key` (`routes/policies.rs`, `routes/workflows.rs`). If
+    ///    a derived placeholder were minted instead, the token's `agent_id`
+    ///    would name a different row than the agent's own claims are authored
+    ///    under — so under PR-03/PR-07, where the JWT principal becomes the
+    ///    viewer identity, an agent's own claims would be invisible to its own
+    ///    token. So: if `client_id` decodes to 32 bytes and an `ed25519` agent
+    ///    holds that key, link to THAT row.
+    /// 3. Otherwise derive a 32-byte PLACEHOLDER public key from the client's
+    ///    row id. `agents.public_key` is `bytea NOT NULL CHECK (octet_length =
+    ///    32)` with a UNIQUE constraint, so a keyless principal cannot exist
+    ///    without one. It is recorded as `key_kind = 'derived'`; it is **not** a
+    ///    signature verifier and every signature path must filter
+    ///    `key_kind = 'ed25519'` (see [`Self::public_key_if_signer`]).
+    /// 4. insert the agent,
+    ///    `ON CONFLICT (public_key) DO UPDATE ... WHERE agents.key_kind =
+    ///    'derived' RETURNING`. `DO UPDATE` rather than `DO NOTHING` is
+    ///    load-bearing: `DO NOTHING` returns no row on the lost-race path, which
+    ///    would surface as intermittent 500s under concurrent first-mints. The
+    ///    `WHERE agents.key_kind = 'derived'` is a SECURITY predicate: without
+    ///    it, an unconditional `DO UPDATE` ADOPTS whatever row already holds
+    ///    that key, `key_kind = 'ed25519'` included, and the invariant
+    ///    [`Self::public_key_if_signer`] rests on — "an OAuth-principal agent is
+    ///    never a signer" — silently fails. It is reachable:
+    ///    `POST /api/v1/agents` accepts an arbitrary 32-byte `public_key` from
+    ///    any `agents:write` holder, and `oauth_clients.id` is exposed as the
+    ///    JWT `sub` and by the admin client listing, so pre-creating an agent at
+    ///    `blake3::derive_key("epigraph-oauth-client", <victim client uuid>)`
+    ///    with a key you hold the private half of would make you that client's
+    ///    principal, with a real verifier. Zero returned rows is therefore a
+    ///    hard error, not a retry.
+    /// 5. link the client (write-once; see
+    ///    `OAuthClientRepository::set_agent_id`).
+    /// 6. ensure the principal's personal group exists.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any statement fails,
+    /// `DbError::InvalidData` if `client_row_id` names no `oauth_clients` row,
+    /// and `DbError::DuplicateKey` if the derived key is squatted by a row that
+    /// is not a `derived` OAuth principal.
+    #[instrument(skip(conn))]
+    pub async fn ensure_for_client(
+        conn: &mut sqlx::PgConnection,
+        client_row_id: Uuid,
+    ) -> Result<AgentId, DbError> {
+        // 1. Lock the client row and check for an existing link.
+        let existing: Option<(Option<Uuid>, String, String)> = sqlx::query_as(
+            "SELECT agent_id, client_id, client_type FROM oauth_clients WHERE id = $1 FOR UPDATE",
+        )
+        .bind(client_row_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        let (client_id, client_type) = match existing {
+            Some((Some(agent_id), _, _)) => return Ok(AgentId::from_uuid(agent_id)),
+            Some((None, client_id, client_type)) => (client_id, client_type),
+            None => {
+                return Err(DbError::InvalidData {
+                    reason: format!("oauth_clients row {client_row_id} does not exist"),
+                })
+            }
+        };
+
+        // `agents.agent_type` has no CHECK, but the kernel's vocabulary is
+        // human | software_agent. Map the OAuth client_type onto it.
+        let agent_type = match client_type.as_str() {
+            "human" => "human",
+            _ => "software_agent", // "agent" and "service"
+        };
+        let display_name = format!("oauth:{client_row_id}");
+
+        // 2. An agent client's client_id IS its Ed25519 public key. Adopt the
+        //    real signer row when one exists rather than minting a second,
+        //    derived principal beside it.
+        let real_signer: Option<Uuid> = if client_type == "agent" {
+            match hex::decode(&client_id) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let row: Option<(Uuid,)> = sqlx::query_as(
+                        "SELECT id FROM agents WHERE public_key = $1 AND key_kind = 'ed25519'",
+                    )
+                    .bind(bytes.as_slice())
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                    row.map(|r| r.0)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let agent_id = if let Some(id) = real_signer {
+            id
+        } else {
+            // 3. Derive the placeholder key.
+            let derived = blake3::derive_key("epigraph-oauth-client", client_row_id.as_bytes());
+
+            // 4. Insert (or re-find) the agent — but ONLY ever a derived one.
+            //
+            // The upsert itself is `public.epigraph_provision_oauth_agent()`
+            // (migration 077), a SECURITY DEFINER writer, for the same reason
+            // `ensure_personal_group` delegates: this runs pre-authentication,
+            // so the only policy arm that could admit it is one keyed on "the
+            // session proved nothing" — and because the request path never
+            // stamps the session GUCs, that is an app connection's steady state,
+            // not a pre-authentication instant. Such an arm was live on every
+            // statement and reached every `key_kind = 'derived'` row.
+            //
+            // The function wraps the SAME statement, `WHERE agents.key_kind =
+            // 'derived'` guard included. A `RETURNS uuid` function always yields
+            // exactly one row, so the zero-rows case that used to arrive as
+            // `None` from `fetch_optional` now arrives as an inner `NULL` — the
+            // binding is `(Option<Uuid>,)` and the refusal below is driven off
+            // that inner `Option`. Reading it as "a row came back, therefore it
+            // worked" would silently drop the guard.
+            let (row,): (Option<Uuid>,) =
+                sqlx::query_as("SELECT public.epigraph_provision_oauth_agent($1, $2, $3)")
+                    .bind(derived.as_slice())
+                    .bind(&display_name)
+                    .bind(agent_type)
+                    .fetch_one(&mut *conn)
+                    .await?;
+
+            row.ok_or_else(|| DbError::DuplicateKey {
+                entity: format!(
+                    "agents.public_key derived for oauth_clients {client_row_id} is held by a \
+                     non-derived agent; refusing to adopt it as an OAuth principal"
+                ),
+            })?
+        };
+
+        // 5. Link the client (write-once).
+        crate::repos::oauth_client::OAuthClientRepository::set_agent_id(
+            &mut *conn,
+            client_row_id,
+            agent_id,
+        )
+        .await?;
+
+        // 6. Personal group, so D2's derivation is total from the first token.
+        Self::ensure_personal_group(&mut *conn, agent_id).await?;
+
+        Ok(AgentId::from_uuid(agent_id))
+    }
+
+    /// Idempotently create the agent's personal group and its own live
+    /// `role='admin'` membership in it. Returns the group id.
+    ///
+    /// **The two statements live in `public.epigraph_ensure_personal_group()`
+    /// (migration 077), not here.** They are a bootstrap: the mint runs before
+    /// any principal exists, so no membership-keyed policy on `groups` or
+    /// `group_memberships` can admit them. Expressing that as a policy arm was
+    /// tried and was wrong — the only predicate available to a policy is the
+    /// row's own shape, and `did_key` is derived from `created_by_agent_id`, so
+    /// such an arm references no session state and grants every connection read
+    /// of every personal group and every personal-group membership row,
+    /// `wrapped_key_share` included. A `SECURITY DEFINER` writer confines the
+    /// bootstrap to the two statements that need it and leaves the policies with
+    /// no personal-group arm in either direction. The behaviour, the
+    /// deterministic `did:epigraph:personal:<uuid>` key and the
+    /// revive-on-conflict semantics described below are unchanged; see the
+    /// migration for why the composite `(group_id, agent_id, epoch)` target is
+    /// the correct one.
+    ///
+    /// Idempotency comes from a deterministic `did_key`
+    /// (`did:epigraph:personal:<agent_uuid>`) against the existing
+    /// `groups_did_key_key UNIQUE`, so no extra column on `agents` is needed to
+    /// remember it.
+    ///
+    /// `public_key = ''::bytea` is mandatory, not a shortcut:
+    /// `groups_public_key_shape` (migration 060) requires
+    /// `octet_length(public_key) = 0` for every `kind <> 'team'`. A personal
+    /// group carries no key material at all, so no `group_key_epochs` row is
+    /// created either — `group_memberships` has no FK to it, and the
+    /// membership's `wrapped_key_share` is empty for the same reason.
+    ///
+    /// The membership insert targets the composite
+    /// `(group_id, agent_id, epoch)` UNIQUE and **revives** on conflict. An
+    /// untargeted `ON CONFLICT DO NOTHING` was wrong: if the epoch-0 row exists
+    /// with `revoked_at` set, the partial index `group_memberships_one_live`
+    /// does not conflict but the composite UNIQUE does, so the insert silently
+    /// no-ops and the agent has NO live membership in its own personal group —
+    /// permanently, since every later mint hits the same conflict. Targeting the
+    /// composite is safe here precisely because a personal group has exactly one
+    /// member at exactly one epoch, so no OTHER live row can exist for the
+    /// partial index to trip over.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if either statement fails.
+    #[instrument(skip(conn))]
+    pub async fn ensure_personal_group(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Uuid, DbError> {
+        let (group_id,): (Uuid,) =
+            sqlx::query_as("SELECT public.epigraph_ensure_personal_group($1)")
+                .bind(agent_id)
+                .fetch_one(&mut *conn)
+                .await?;
+
+        Ok(group_id)
+    }
+
+    /// Tier-B projection of one agent, filtered by what `viewer` may see.
+    ///
+    /// `agents` is deliberately **not** a tenancy-partitioned table: authorship
+    /// must render on a public claim, so the row itself stays readable and
+    /// migration 077's policy on it is `USING (true)` with an explicit
+    /// `-- VISIBILITY-EXEMPT:` marker. What is *not* universally readable is the
+    /// PII the row carries — `agents.properties` holds `full_name`, `orcid`,
+    /// `affiliations` and `email` (migration 001).
+    ///
+    /// PostgreSQL has no column-level RLS, so the narrowing is a **repo-layer
+    /// projection**: `id`, `display_name`, `public_key` and `key_kind` are
+    /// always returned; [`AgentPublicProfile::properties`], `orcid` and `ror_id`
+    /// are `None` unless one of three things holds —
+    ///
+    /// 1. `profile_visibility = 'public'` (migration 062's default), or
+    /// 2. the viewer **is** this agent, or
+    /// 3. the viewer shares a live group with it.
+    ///
+    /// A bypass viewer sees everything, as everywhere else.
+    ///
+    /// The decision is made in SQL, in the same round trip as the row, so there
+    /// is no window in which the caller holds the PII and has not yet decided
+    /// whether it may show it.
+    ///
+    /// Runtime `sqlx::query_as`, like every other query in this file, so no
+    /// `.sqlx/` cache entry is needed. `schema_contract.rs` is what pins the
+    /// columns it names.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_public_profile<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<AgentPublicProfile>, DbError> {
+        type Row = (
+            Uuid,
+            Option<String>,
+            Vec<u8>,
+            String,
+            String,
+            bool,
+            JsonValue,
+            Option<String>,
+            Option<String>,
+        );
+
+        let row: Option<Row> = sqlx::query_as(
+            r#"
+            SELECT a.id,
+                   a.display_name,
+                   a.public_key,
+                   a.key_kind,
+                   a.profile_visibility,
+                   (   $4::bool
+                    OR a.profile_visibility = 'public'
+                    OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
+                    OR EXISTS (SELECT 1 FROM group_memberships gm
+                                WHERE gm.agent_id = a.id
+                                  AND gm.revoked_at IS NULL
+                                  AND gm.group_id = ANY($3::uuid[]))
+                   ) AS may_see_details,
+                   a.properties,
+                   a.orcid,
+                   a.ror_id
+            FROM agents a
+            WHERE a.id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(viewer.principal())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .bind(viewer.is_bypass())
+        .fetch_optional(executor)
+        .await?;
+
+        Ok(row.map(
+            |(
+                id,
+                display_name,
+                public_key,
+                key_kind,
+                profile_visibility,
+                may_see_details,
+                properties,
+                orcid,
+                ror_id,
+            )| AgentPublicProfile {
+                id,
+                display_name,
+                public_key,
+                key_kind,
+                profile_visibility,
+                properties: may_see_details.then_some(properties),
+                orcid: if may_see_details { orcid } else { None },
+                ror_id: if may_see_details { ror_id } else { None },
+            },
+        ))
+    }
+
+    /// The agent's public key, but **only** when it is a real Ed25519 verifier.
+    ///
+    /// Returns `None` both for an unknown agent and for one whose `public_key`
+    /// is the `key_kind = 'derived'` placeholder written by
+    /// [`Self::ensure_for_client`]. A derived key is a BLAKE3 output — nobody
+    /// knows a private key for it, so feeding it to an Ed25519 verifier would
+    /// merely fail; but it is indistinguishable from a real key to any reader
+    /// that does not filter, so signature paths call THIS, never a bare
+    /// `SELECT public_key FROM agents`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn public_key_if_signer(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<Option<Vec<u8>>, DbError> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT public_key FROM agents WHERE id = $1 AND key_kind = 'ed25519'")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        Ok(row.map(|r| r.0))
     }
 }
 

@@ -68,58 +68,54 @@ pub struct SecurityEventFilter {
 pub struct SecurityEventRepository;
 
 impl SecurityEventRepository {
-    /// Insert a new security event row.
+    /// Insert a new security event row. Returns the row as written.
+    ///
+    /// **The statement deliberately has no `RETURNING` clause.** PostgreSQL
+    /// applies a table's SELECT policy to the rows a `RETURNING` produces, so
+    /// once migration 077 gives `security_events` a principal-keyed
+    /// `security_events_read`, an `INSERT … RETURNING` of an event whose
+    /// `agent_id` is not the session principal is refused `42501 new row
+    /// violates row-level security policy` — while the identical INSERT without
+    /// `RETURNING` succeeds. That would have defeated the whole point of
+    /// `security_events_append` being permissive, which exists so that an actor
+    /// can never suppress its own audit record by failing a predicate. Both call
+    /// sites (`middleware/rate_limit.rs` and `oauth/providers/provision.rs`)
+    /// spawn this and discard the returned value behind a `tracing::warn!`, so
+    /// the failure would not have surfaced as a 500 — the OAuth provisioning
+    /// audit trail would simply have stopped being written. It is invisible to
+    /// CI, which connects as a `BYPASSRLS` superuser.
+    ///
+    /// Echoing the input back is exact: every column is bound from `row`, and
+    /// the database defaults nothing here.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the INSERT fails.
     #[instrument(skip(pool, row))]
     pub async fn log(pool: &PgPool, row: SecurityEventRow) -> Result<SecurityEventRow, DbError> {
         // ip_address is passed as text and cast to INET in the query.
-        // On RETURNING we cast back to text so sqlx maps it as String rather
-        // than the pgvector INET custom type which is not available here.
-        let stored = sqlx::query!(
+        sqlx::query!(
             r#"
             INSERT INTO security_events (
                 id, event_type, agent_id, success, details,
                 ip_address, user_agent, correlation_id, created_at
             )
             VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9)
-            RETURNING
-                id,
-                event_type,
-                agent_id,
-                success,
-                details,
-                ip_address::text AS ip_address,
-                user_agent,
-                correlation_id,
-                created_at
             "#,
             row.id,
             row.event_type,
             row.agent_id,
             row.success,
             row.details,
-            row.ip_address as Option<String>,
+            row.ip_address.clone() as Option<String>,
             row.user_agent,
             row.correlation_id,
             row.created_at,
         )
-        .fetch_one(pool)
+        .execute(pool)
         .await
         .map_err(DbError::from)?;
 
-        Ok(SecurityEventRow {
-            id: stored.id,
-            event_type: stored.event_type,
-            agent_id: stored.agent_id,
-            success: stored.success,
-            details: stored.details,
-            ip_address: stored.ip_address,
-            user_agent: stored.user_agent,
-            correlation_id: stored.correlation_id,
-            created_at: stored.created_at,
-        })
+        Ok(row)
     }
 
     /// Query security events matching optional filter criteria.
@@ -217,6 +213,116 @@ impl SecurityEventRepository {
         .map_err(DbError::from)?;
 
         Ok(row.count)
+    }
+
+    /// Append a security event on a CALLER-SUPPLIED connection.
+    ///
+    /// [`Self::log`] takes a `&PgPool` and is right for the two call sites that
+    /// fire-and-forget from a middleware. This one exists because FINAL-PLAN
+    /// §6.5.5's sixth re-validation condition requires the event and the plan
+    /// state flip to be the SAME transaction: the handler refuses to dispatch
+    /// unless `dispatched_by` matches the `agent_id` on the `security_events`
+    /// row the HTTP layer wrote for this `correlation_id`, and an event written
+    /// on a separate pool connection can commit while the flip rolls back —
+    /// leaving a correlation id that authorises a plan nobody dispatched.
+    ///
+    /// No `RETURNING`, for the reason [`Self::log`] gives at length: PostgreSQL
+    /// applies the SELECT policy to a `RETURNING` projection, so an event whose
+    /// `agent_id` is not the session principal would be refused `42501` while
+    /// the identical INSERT without it succeeds.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the INSERT fails.
+    pub async fn log_conn(
+        conn: &mut sqlx::PgConnection,
+        row: &SecurityEventRow,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"
+            INSERT INTO security_events (
+                id, event_type, agent_id, success, details,
+                ip_address, user_agent, correlation_id, created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6::inet, $7, $8, $9)
+            "#,
+        )
+        .bind(row.id)
+        .bind(&row.event_type)
+        .bind(row.agent_id)
+        .bind(row.success)
+        .bind(&row.details)
+        .bind(row.ip_address.as_deref())
+        .bind(row.user_agent.as_deref())
+        .bind(row.correlation_id.as_deref())
+        .bind(row.created_at)
+        .execute(&mut *conn)
+        .await
+        .map_err(DbError::from)
+        .map(|_| ())
+    }
+
+    /// Does a `security_events` row of this `event_type` and `correlation_id`
+    /// exist, attributed to this agent AND to this subject?
+    ///
+    /// The machine form of FINAL-PLAN §6.5.5's sixth condition. It is written as
+    /// an `EXISTS` rather than as "fetch the row and compare" so that the
+    /// no-such-row case and the wrong-agent case are the SAME answer — `false` —
+    /// and neither can be mistaken for the other by a caller that forgets to
+    /// handle an `Option`. A job payload whose correlation id names no event is
+    /// exactly the hand-enqueued job this condition exists to refuse, and it must
+    /// fail CLOSED.
+    ///
+    /// `agent_id IS NOT DISTINCT FROM $3` rather than `=`, because `agent_id` is
+    /// nullable and `NULL = <uuid>` is `NULL`, which an `EXISTS` reads as false
+    /// — the right answer here, but by accident rather than by statement.
+    ///
+    /// # `subject_key` / `subject` bind the row to what it authorises
+    ///
+    /// §6.5.5's wording is "the `security_events` row the HTTP layer wrote for
+    /// THIS `correlation_id`" for THIS dispatch. Without the subject predicate
+    /// the question degrades to "did this agent ever dispatch SOMETHING under
+    /// this correlation id", and a correlation id issued for one plan would
+    /// satisfy the condition for a job naming another plan of the same
+    /// dispatcher. The dispatching route already writes the subject into
+    /// `details`, so binding it costs one comparison. A row missing the key, or
+    /// carrying a different value, is `false` — the same fail-closed answer as
+    /// no row at all.
+    ///
+    /// # Which connection
+    ///
+    /// The MAINTENANCE one. Migration 077's `security_events_read` is keyed on
+    /// the session principal, and a job handler has no principal, so on an app
+    /// connection this returns `false` for every correlation id and the handler
+    /// refuses every plan.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn correlation_is_attributed_to_conn(
+        conn: &mut sqlx::PgConnection,
+        event_type: &str,
+        correlation_id: &str,
+        agent_id: Uuid,
+        subject: (&str, Uuid),
+    ) -> Result<bool, DbError> {
+        let (subject_key, subject_id) = subject;
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM security_events e
+                 WHERE e.event_type = $1
+                   AND e.correlation_id = $2
+                   AND e.agent_id IS NOT DISTINCT FROM $3
+                   AND (e.details ->> $4) = $5::text)
+            "#,
+        )
+        .bind(event_type)
+        .bind(correlation_id)
+        .bind(agent_id)
+        .bind(subject_key)
+        .bind(subject_id.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(DbError::from)
     }
 }
 

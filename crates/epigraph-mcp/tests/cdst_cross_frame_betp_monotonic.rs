@@ -12,6 +12,9 @@
 //! legacy binary frame, computes their combined BetP (betp0), then adds one
 //! more supporting BBA via `update_with_evidence` and asserts betp1 >= betp0.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 use common::*;
@@ -35,6 +38,7 @@ async fn cached_betp(pool: &sqlx::PgPool, claim_id: Uuid) -> f64 {
 #[tokio::test]
 async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
 
     let claim_id = seed_claim(
         &pool,
@@ -96,9 +100,10 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     .expect("construct legacy frame");
 
     let calibration = CalibrationConfig::default_for_phase2_fallback();
-    let legacy_rows = MassFunctionRepository::get_for_claim_frame(&pool, claim_id, legacy_frame_id)
-        .await
-        .expect("get legacy BBAs");
+    let legacy_rows =
+        MassFunctionRepository::get_for_claim_frame(&pool, &viewer, claim_id, legacy_frame_id)
+            .await
+            .expect("get legacy BBAs");
     assert_eq!(legacy_rows.len(), 5, "should have exactly 5 legacy BBAs");
 
     let mut mass_fns = Vec::with_capacity(legacy_rows.len());
@@ -119,11 +124,14 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     MassFunctionRepository::update_claim_belief(
         &pool,
         claim_id,
-        measures::belief(&legacy_combined, &true_fe),
-        measures::plausibility(&legacy_combined, &true_fe),
-        legacy_combined.mass_of_conflict(),
-        Some(betp0),
-        legacy_combined.mass_of_missing(),
+        epigraph_db::CachedBelief {
+            belief: measures::belief(&legacy_combined, &true_fe),
+            plausibility: measures::plausibility(&legacy_combined, &true_fe),
+            mass_on_empty: legacy_combined.mass_of_conflict(),
+            pignistic_prob: Some(betp0),
+            mass_on_missing: legacy_combined.mass_of_missing(),
+            belief_frame_id: None,
+        },
     )
     .await
     .expect("write initial belief from legacy BBAs");
@@ -138,6 +146,7 @@ async fn cross_frame_supporting_evidence_does_not_drop_betp() {
     let server = build_test_server(pool.clone());
     let res = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

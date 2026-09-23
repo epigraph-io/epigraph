@@ -1,3 +1,77 @@
+//! Claim CRUD and query handlers.
+//!
+//! # Tenancy: 4 of this file's 25 raw-pool sites are converted
+//!
+//! Conversion shard 7. `get_claim`, `list_claims`, `list_claim_evidence` and
+//! `list_by_labels` each read through a viewer-stamped connection from
+//! [`AppState::read_as`]. For `get_claim` and `list_claims` that connection
+//! REPLACES an explicit read-only `db_pool.begin()`, and the rollback-on-drop
+//! the old site comments documented as load-bearing for GUC hygiene still holds
+//! — under `SessionGucMode::Transaction` a `ScopedRead` IS a transaction rolled
+//! back on drop, and under `Session` the settings are removed by the pool's
+//! `after_release` scrub. The comments are rewritten at the sites rather than
+//! deleted, so neither becomes a false claim.
+//!
+//! **FOUR converted sites, not six, and the two declines are SITE-level rather
+//! than HANDLER-level — the first of that kind in this series.** `get_claim` and
+//! `list_claims` each open with a
+//! `GroupMembershipRepository::is_member` AUTHORIZATION gate that runs to
+//! completion and returns 403 before any content read begins. Threading the
+//! stamped connection into it would require widening a concrete `&PgPool`
+//! signature and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER` row that
+//! no truthful wording fits, because `group_memberships` DOES carry a narrowing
+//! RLS policy; and the alternative — splicing a `Viewer` into a membership
+//! EXISTENCE check — would make an authorization answer a function of
+//! visibility. The full argument, including a hazard a reviewer will look for
+//! and which is NOT present, is written at the site.
+//!
+//! **THE SITE-LEVEL DECLINE HAS AN EXPIRY, AND IT IS NAMED RATHER THAN LEFT
+//! FOR A LATER READER TO REDISCOVER.** `is_member` still reads
+//! `group_memberships` through `state.db_pool` while every content statement
+//! moved to `read_as`. Migration 077's `group_memberships_tenancy` USING clause
+//! admits a row only via a bypass, a session-group match, a principal match or
+//! the group-creator predicate — none of which an UNSTAMPED session can satisfy
+//! if its role is subject to RLS. So the gate is correct today because
+//! `AppState.db_pool` runs as an RLS-exempt role, which is precisely the
+//! property this programme exists to remove. Downgrading `db_pool` turns the
+//! gate into a blanket 403 for legitimate group members — fail-closed, not a
+//! leak, but the decline must be revisited at that point rather than inherited.
+//!
+//! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
+//! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and
+//! `routes/crud.rs` state that rule; three statements in this file do not follow
+//! it. `get_claim`'s inline label read and `list_claims`' batched label read
+//! both keep `.unwrap_or_default()`, and `list_claims`' per-item encryption
+//! lookup keeps `if let Ok(Some(enc))`. The rule was applied only where this
+//! shard changed the statement anyway; these three ALREADY shared a connection
+//! via the `db_pool.begin()` transaction the conversion replaced, so nothing
+//! about their sharing changed, they cover a non-tenancy-bearing projection
+//! (labels, encryption metadata) rather than the rows the viewer predicate
+//! selects, and the direction of failure is safe — a swallowed error drops a
+//! field from the response and can never add a row. One consequence is worth
+//! writing down: `claim_encryption` DOES carry a narrowing policy at head 92, so
+//! at step 11d that `if let Ok(Some(enc))` becomes the branch that absorbs a
+//! policy denial and answers 200 with the field simply missing, indistinguishable
+//! from an unencrypted claim. Changing it is not this batch's.
+//!
+//! The other 19 sites sit in WRITE handlers — `create_claim` (9),
+//! `update_claim` (6), `patch_claim` (2), `update_labels` (2), which with the
+//! two site-level gates above accounts for all 21 the register carries.
+//! [`AppState::read_as`] is documented
+//! read-only and a write routed through a `ScopedRead` is rolled back on drop
+//! under `SessionGucMode::Transaction` while still type-checking; their owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! `viewer_route_table_lint.rs::TEST_ONLY_INLINE_READS` still carries
+//! `("claims.rs", 3)` and `ROUTE_LAYER_WRITES` `("claims.rs", 4)`; no inline
+//! statement was relocated by this shard. Two open entries brush this file and
+//! are neither discharged nor worsened by an executor swap —
+//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`) and
+//! `F-get-by-id-conn-duplicates-get-by-id`. Analysis held outside this
+//! repository.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -17,11 +91,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[cfg(feature = "db")]
-use crate::access_control::{check_content_access, ContentAccess};
+use crate::middleware::bearer::ViewerExtractor;
 use crate::{errors::ApiError, state::AppState};
-// set_group_context (from epigraph-privacy) is an enterprise extension.
-// Add epigraph-privacy as a dep (epigraph-enterprise repo) and enable the enterprise
-// feature to restore RLS group context scoping.
 
 // =============================================================================
 // PAGINATION CONSTANTS
@@ -57,7 +128,12 @@ pub struct CreateClaimRequest {
     pub properties: Option<serde_json::Value>,
     /// Optional evidence ID — if provided, creates a DERIVED_FROM edge (claim→evidence)
     pub evidence_id: Option<Uuid>,
-    /// Privacy tier: "public" (default), "encrypted_content", or "fully_private"
+    /// Privacy tier: "public" (default) or "fully_private".
+    ///
+    /// The former `encrypted_content` tier is rejected: it stored the plaintext
+    /// in `claims.content` alongside the ciphertext, feeding `content_tsv` and
+    /// the BLAKE3 `content_hash`. Migration 060 enforces this with
+    /// `claim_encryption_privacy_tier_check`.
     #[serde(default)]
     pub privacy_tier: Option<String>,
     /// Group ID — required when privacy_tier is not "public"
@@ -66,7 +142,8 @@ pub struct CreateClaimRequest {
     /// Base64-encoded ciphertext (client-encrypted content)
     #[serde(default)]
     pub encrypted_content: Option<String>,
-    /// Encryption epoch — must match an active epoch for the group
+    /// Encryption epoch — must match the group's current epoch (`active`, or
+    /// `rotating` while a removal's re-key obligation is outstanding)
     #[serde(default)]
     pub encryption_epoch: Option<i32>,
     /// Optional labels to assign on creation (e.g., ["ndi-roadmap", "fet-sensing"])
@@ -146,10 +223,17 @@ pub struct PaginationParams {
     /// Optional search string to match against claim content
     #[serde(default)]
     pub search: Option<String>,
-    /// Optional requester agent ID for partition-aware content filtering
+    /// Accepted for wire compatibility and DELIBERATELY IGNORED — `list_claims`
+    /// never reads it. Identical in kind to [`GetClaimQuery::agent_id`]: the
+    /// requester's identity comes from the bearer token, never from a query
+    /// parameter.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
-    /// Group ID for RLS context
+    /// A membership ASSERTION `list_claims` verifies, not a visibility grant
+    /// and not an RLS context. The session GUCs migration 077's policies read
+    /// are stamped from the token-derived viewer, not from this field; supplying
+    /// it can only 403 a request that would otherwise have succeeded. See
+    /// [`GetClaimQuery::group_id`].
     #[serde(default)]
     pub group_id: Option<Uuid>,
 }
@@ -218,12 +302,16 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
     let tier = req.privacy_tier.as_deref().unwrap_or("public");
 
     match tier {
-        "public" | "encrypted_content" | "fully_private" => {}
+        // Narrowed to match migration 060's
+        // `claim_encryption_privacy_tier_check CHECK (privacy_tier = 'fully_private')`.
+        // Accepting `encrypted_content` here would bind straight through to
+        // `ClaimEncryptionRepository::insert_conn` and surface as a 23514 → 500.
+        "public" | "fully_private" => {}
         other => {
             return Err(ApiError::ValidationError {
                 field: "privacy_tier".to_string(),
                 reason: format!(
-                    "Unknown privacy tier '{}'. Must be: public, encrypted_content, fully_private",
+                    "Unknown privacy tier '{}'. Must be: public, fully_private",
                     other
                 ),
             });
@@ -283,16 +371,21 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 /// - Valid trace_id (existing reasoning trace)
 /// - Optional initial_truth in [0.0, 1.0] (defaults to 0.5)
 ///
-/// For encrypted claims (privacy_tier != "public"):
+/// For encrypted claims (privacy_tier == "fully_private"):
 /// - group_id, encrypted_content, and encryption_epoch are required
 /// - Agent must be a member of the specified group
-/// - encryption_epoch must match the group's active epoch
+/// - encryption_epoch must match the group's current epoch
 /// - Claim + encryption metadata are written atomically in a transaction
 #[cfg(feature = "db")]
 pub async fn create_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    // Still `Option<Extension<..>>` rather than a required extractor: PR-07
+    // replaces the whole `Option<AuthContext>` idiom with `ViewerExtractor`
+    // across all 39 sites at once. Until then the handler rejects `None`
+    // explicitly below rather than falling open, which is the behavioural half
+    // of that change without the mechanical half.
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    verified_agent: Option<axum::Extension<crate::middleware::auth::VerifiedAgent>>,
     Json(request): Json<CreateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
     // Enforce scope when OAuth2-authenticated
@@ -328,6 +421,19 @@ pub async fn create_claim(
         });
     }
 
+    // Refuse labels-at-creation carrying an unexpanded shell variable. Checked
+    // here with the other 400s rather than at the `UPDATE claims SET labels`
+    // below, so the request is refused before the claim row is written.
+    epigraph_db::reject_unexpanded_labels(&request.labels).map_err(|e| {
+        ApiError::ValidationError {
+            field: "labels".to_string(),
+            reason: match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            },
+        }
+    })?;
+
     // If encrypted, validate group membership and epoch
     if privacy_tier != "public" {
         let group_id = request.group_id.unwrap(); // safe: validated above
@@ -354,28 +460,33 @@ pub async fn create_claim(
             });
         }
 
-        // Verify epoch is active
-        let active_epoch = GroupKeyEpochRepository::get_active_epoch(&state.db_pool, group_id)
+        // Verify the claim is sealed under the group's CURRENT epoch, which is
+        // `active` or — while a removal's re-key obligation is outstanding —
+        // `rotating`. The strings below say "current" rather than "active"
+        // because the row this accepts may be either, and an error that names
+        // the wrong status sends the caller looking for a state the database
+        // does not report.
+        let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
             .await
             .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to query active epoch: {e}"),
+                message: format!("Failed to query current epoch: {e}"),
             })?;
-        let active_epoch_num = match active_epoch {
+        let current_epoch_num = match current_epoch {
             Some(e) => e.epoch,
             None => {
                 return Err(ApiError::ValidationError {
                     field: "encryption_epoch".to_string(),
-                    reason: "No active epoch found for this group".to_string(),
+                    reason: "No current epoch found for this group".to_string(),
                 });
             }
         };
-        if request.encryption_epoch.unwrap() != active_epoch_num {
+        if request.encryption_epoch.unwrap() != current_epoch_num {
             return Err(ApiError::ValidationError {
                 field: "encryption_epoch".to_string(),
                 reason: format!(
-                    "Epoch {} is not the active epoch (active: {})",
+                    "Epoch {} is not the group's current epoch (current: {})",
                     request.encryption_epoch.unwrap(),
-                    active_epoch_num,
+                    current_epoch_num,
                 ),
             });
         }
@@ -388,23 +499,49 @@ pub async fn create_claim(
         reason: "Truth value must be between 0.0 and 1.0".to_string(),
     })?;
 
-    // Resolve public key: OAuth2 AuthContext → legacy VerifiedAgent → zero fallback
-    let public_key = if let Some(axum::Extension(ctx)) = &auth_ctx {
-        if let Some(agent_id) = ctx.agent_id {
-            epigraph_db::AgentRepository::get_by_id(&state.db_pool, AgentId::from_uuid(agent_id))
-                .await
-                .ok()
-                .flatten()
-                .map(|a| a.public_key)
-                .unwrap_or([0u8; 32])
-        } else {
-            [0u8; 32]
-        }
-    } else if let Some(axum::Extension(va)) = &verified_agent {
-        va.public_key
-    } else {
-        [0u8; 32]
+    // Resolve the author's public key from the OAuth2 AuthContext. One source,
+    // no fallbacks.
+    //
+    // This chain used to have three more arms, each of which produced a claim
+    // whose recorded author key was a lie:
+    //
+    //   * `verified_agent.public_key` — the legacy Ed25519 request-signing
+    //     path. Its only writer (`middleware::require_signature`) is deleted.
+    //   * `[0u8; 32]` when the token carried no `agent_id`.
+    //   * `[0u8; 32]` when there was no credential at all.
+    //
+    // and a fourth that survived unremarked: `.unwrap_or([0u8; 32])` when the
+    // `agent_id` named no row in `agents`. A zero public key is precisely the
+    // served-with-no-principal shape this PR exists to remove — it is a valid
+    // 32-byte value that no private key can ever sign for, so a claim carrying
+    // one is permanently unverifiable and indistinguishable from every other
+    // such claim.
+    //
+    // Every arm now resolves to 401. That is the right code rather than 403 or
+    // 500 in all three cases: no credential, a credential with no principal,
+    // and a credential naming a principal that does not exist are all "re-mint
+    // your token", which is what RFC 6750 `invalid_token` means.
+    let Some(axum::Extension(ctx)) = &auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required to create a claim".to_string(),
+        });
     };
+    let Some(author_agent_id) = ctx.agent_id else {
+        return Err(ApiError::Unauthorized {
+            reason: "token carries no agent_id; re-authenticate to obtain a \
+                     token bound to a principal"
+                .to_string(),
+        });
+    };
+    let public_key = epigraph_db::AgentRepository::get_by_id(
+        &state.db_pool,
+        AgentId::from_uuid(author_agent_id),
+    )
+    .await?
+    .ok_or_else(|| ApiError::Unauthorized {
+        reason: format!("token names agent {author_agent_id}, which does not exist"),
+    })?
+    .public_key;
 
     // For fully_private tier, override content to "[private]" (spec §5)
     let content_for_db = if privacy_tier == "fully_private" {
@@ -413,6 +550,31 @@ pub async fn create_claim(
         request.content.clone()
     };
 
+    // KNOWN AND DELIBERATELY UNCHANGED HERE: `claims.agent_id` comes from the
+    // request BODY while `claims.public_key` comes from the TOKEN, so a caller
+    // can record `(agent_id = X, public_key = key(Y))` — a pairing that looks
+    // like a well-formed attribution to X but carries Y's key.
+    //
+    // This decoupling is older than PR-03: the pre-existing chain also read the
+    // key from `ctx.agent_id` and the author from `request.agent_id`. PR-03
+    // strictly reduces the number of lying shapes (it deletes the four
+    // `[0u8; 32]` arms); it does not introduce this one and does not close it.
+    //
+    // Closing it is a wire-behaviour change with an in-repo consumer:
+    // `crates/epigraph-cli/src/bin/decompose_claims.rs:243` posts atoms with
+    // `agent_id = parent_agent_id` — the *parent claim's* author, not its own
+    // principal — and it holds an opaque `EPIGRAPH_TOKEN` from which it cannot
+    // learn its own agent id. Rejecting the mismatch here (403) breaks it with
+    // no client-side remedy; silently overriding the field changes what that
+    // tool records without telling it. Either is a decision about delegated
+    // authorship, which is what `ownership` and the `Viewer` write half are
+    // for, and it belongs with them rather than smuggled into a router
+    // inversion.
+    //
+    // Until then: the body's `agent_id` is NOT a credential and never was, and
+    // nothing downstream may treat it as one. What PR-03 does guarantee is that
+    // the *key* is now always a real agent's key, resolved from an
+    // authenticated principal.
     let claim = if let Some(trace_uuid) = request.trace_id {
         Claim::new_with_trace(
             content_for_db,
@@ -439,9 +601,74 @@ pub async fn create_claim(
             message: format!("Failed to begin transaction: {e}"),
         })?;
 
+    // ── Tenancy declaration (PR-16) ──
+    //
+    // THIS SURFACE ALREADY HAS A PRIVACY CHOICE, and the declaration must
+    // follow it. `privacy_tier = "fully_private"` requires `group_id`, and the
+    // block above has already verified — against the AUTHENTICATED identity,
+    // never the request body — that the caller is a live member of that group
+    // and that the group has an active key epoch.
+    //
+    // Declaring `('public', <author's personal group>)` on that path would be a
+    // disclosure, not a cosmetic mismatch: the row would carry
+    // `visibility = 'public'` while a `claim_encryption` row is written for it
+    // a few lines below, so every authenticated agent could read the sealed
+    // claim's labels, properties and existence. And it would be UNFIXABLE
+    // in place — migration 074's `claims_block_widening` refuses to make a
+    // sealed claim public on UPDATE, but it is a BEFORE UPDATE trigger and
+    // cannot see an INSERT that starts out public. The row would have to be
+    // unsealed to be corrected.
+    //
+    // For the public tier the declaration is the AUTHENTICATED PRINCIPAL's own
+    // personal group, publicly visible: what the row carried before migration
+    // 074 dropped the defaults, minus the world ownership §8.2 A4 forbids.
+    //
+    // NOT `claim.agent_id`, and that is a correction made in review. The block
+    // above spells out at length that `claims.agent_id` comes from the request
+    // BODY and is NOT a credential — `decompose_claims` deliberately posts
+    // atoms under the parent claim's author — and that nothing downstream may
+    // treat it as one. Deriving `owner_group_id` from it would have done
+    // exactly that, and `owner_group_id` is the column PR-17's RLS predicate
+    // keys on. Two concrete consequences of the body-derived version:
+    //
+    //   * a caller could place rows into a group it is not a member of, which
+    //     is inert while the rows are `public` and becomes a disclosure the
+    //     moment that group privatizes its corpus and the injected rows ride
+    //     along;
+    //   * `personal_group_of` MINTS a `groups` row and an admin
+    //     `group_memberships` row when none exists, so a third-party agent
+    //     could be provisioned as a side effect of an unrelated claim write.
+    //
+    // `author_agent_id` above is `ctx.agent_id`, already required, already
+    // resolved against `agents`, and already the only identity this handler
+    // trusts for the encrypted-tier membership check a few lines up. It also
+    // cannot mint: PR-02's token mint has provisioned its personal group.
+    //
+    // Authorship and ownership can now disagree on a delegated write. That is
+    // the correct direction of the two: `agent_id` records WHO SAID IT,
+    // `owner_group_id` records WHO IS ACCOUNTABLE FOR THE ROW, and only the
+    // second is a security decision. Closing the authorship half — checking the
+    // caller MAY author as `request.agent_id` — is the write-side gate's, and
+    // is recorded as `D-PR16-claim-authorship-is-not-a-credential`.
+    //
+    // Resolved inside the same transaction as the insert, so a rollback takes
+    // any minted personal group with it.
+    let decl = if privacy_tier == "public" {
+        ClaimRepository::default_decl_for_author(&mut tx, author_agent_id).await?
+    } else {
+        // `validate_privacy_fields` above rejects a non-public tier with no
+        // `group_id`, and the membership check has already run against it.
+        epigraph_core::TenancyDecl::group(request.group_id.ok_or_else(|| {
+            ApiError::ValidationError {
+                field: "group_id".to_string(),
+                reason: "group_id required for encrypted/private claims".to_string(),
+            }
+        })?)
+    };
+
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
     let (created_claim, was_created) = if request.if_not_exists {
-        ClaimRepository::create_or_get(&mut tx, &claim).await?
+        ClaimRepository::create_or_get(&mut tx, &viewer, &claim, decl).await?
     } else {
         // The (content_hash, agent_id) UNIQUE constraint that create_strict's
         // 409-on-duplicate contract relied on was dropped (migration 107), so
@@ -460,6 +687,7 @@ pub async fn create_claim(
         };
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,
+            &viewer,
             content_hash.as_slice(),
             agent_uuid,
         )
@@ -468,7 +696,7 @@ pub async fn create_claim(
         {
             return Err(dup_conflict());
         }
-        match ClaimRepository::create_strict(&mut tx, &claim).await {
+        match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
             // Belt-and-suspenders: if the UNIQUE constraint is ever restored, or
             // a concurrent writer wins the race between the check above and this
@@ -520,8 +748,16 @@ pub async fn create_claim(
         })?;
     }
 
-    // Apply optional labels within the same transaction
-    if !request.labels.is_empty() {
+    // Apply optional labels within the same transaction.
+    //
+    // Guarded on `was_created` for the same reason the content_hash/properties
+    // write above is: on an `if_not_exists` dedup hit this handler returns a row
+    // it did not create, and a caller-supplied label array must not rewrite that
+    // row's labels. `policies.rs` uses `'policy:active' = ANY(labels)` as an
+    // UPDATE predicate, so an unguarded write here silently detaches a policy
+    // claim from its own state machine. Mirrors `submit.rs`, which already
+    // guards the identical statement with `was_created && !labels.is_empty()`.
+    if was_created && !request.labels.is_empty() {
         sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
             .bind(&request.labels)
             .bind(claim_uuid)
@@ -765,13 +1001,27 @@ pub async fn create_claim(
     Ok(Json(response))
 }
 
-/// Query parameters for get_claim (optional agent_id for partition filtering)
+/// Query parameters for `get_claim`.
+///
+/// NEITHER FIELD WIDENS WHAT THE CALLER MAY SEE. Both are named for a
+/// post-fetch filtering pass that no longer exists; the doc is corrected here
+/// rather than the fields removed, because removing them is a wire-contract
+/// change with its own acceptance.
 #[derive(Deserialize, Debug, Default)]
 pub struct GetClaimQuery {
-    /// Optional requester agent ID for partition-aware content filtering
+    /// Accepted for wire compatibility and DELIBERATELY IGNORED — the handler
+    /// never reads it. The requester's identity comes from the bearer token
+    /// (see the `SECURITY:` comment in `get_claim`), so a query parameter can
+    /// neither select nor widen a principal.
     #[serde(default)]
     pub agent_id: Option<Uuid>,
-    /// Group ID for RLS context — enables visibility of fully_private claims
+    /// A membership ASSERTION the handler verifies, not a visibility grant.
+    /// When present, `get_claim` checks that the authenticated principal
+    /// belongs to this group and returns 403 otherwise; it grants no additional
+    /// visibility, because the viewer's group set is resolved from the token by
+    /// `Viewer::resolve` and never from this parameter. Its only reachable
+    /// effect is to narrow — supplying it can 403 a request that would
+    /// otherwise have succeeded.
     #[serde(default)]
     pub group_id: Option<Uuid>,
 }
@@ -781,10 +1031,15 @@ pub struct GetClaimQuery {
 /// GET /claims/:id
 ///
 /// Returns the claim if found, or 404 if not found.
-/// If the claim is in a `private` or `community` partition and the requester
-/// does not have access, the content field is redacted.
+///
+/// THERE IS NO CONTENT-REDACTION PASS. Filtering happens inside
+/// `ClaimRepository::get_by_id_conn`'s spliced viewer predicate, so a claim the
+/// caller may not read is 404 — never a 200 whose `content` has been blanked.
+/// (The post-fetch pass this doc used to describe was deleted with
+/// `access_control` in PR-14; see the comment at the end of the handler body.)
 #[cfg(feature = "db")]
 pub async fn get_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(params): Query<GetClaimQuery>,
@@ -818,26 +1073,69 @@ pub async fn get_claim(
         }
     }
 
-    // Set RLS context within a TRANSACTION to scope set_config and prevent pool leak
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
-    // enterprise: set_group_context(&mut *tx, params.group_id) — add epigraph-privacy dep to enable
+    // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL, AND THE DECLINE IS
+    // SITE-LEVEL RATHER THAN HANDLER-LEVEL.
+    //
+    // Conversion shard 7's rule is that a handler converts as a whole, because
+    // splitting one READ across two connections defeats the point. This is not
+    // that: `is_member` is an AUTHORIZATION gate that runs to completion and
+    // returns 403 before any content read begins, and the three content reads
+    // below — which ARE all on one connection with each other — are the only
+    // ones the response is built from. Nothing that answers the request is
+    // split.
+    //
+    // `GroupMembershipRepository::is_member` takes a concrete `&PgPool`, so
+    // threading the stamped connection into it would mean widening it to
+    // `E: PgExecutor` and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`
+    // row. Every existing row in that register argues one of two things: the
+    // relation carries no RLS, or it carries RLS whose SELECT policy does not
+    // narrow. `group_memberships` is neither — migration 077 gives it a
+    // narrowing SELECT policy — so no truthful row exists in the register's
+    // current form, and the alternative (splicing a `Viewer` into a membership
+    // EXISTENCE check) would make an authorization answer a function of
+    // visibility. Both repairs are worse than leaving the gate where it is.
+    //
+    // A hazard a reviewer will look for and which is NOT present: the
+    // `.or(Some(ctx.client_id))` fallback above cannot diverge from the
+    // principal `read_as` stamps, because `middleware/bearer.rs`'s
+    // `ViewerExtractor` — which this handler carries — rejects with 401 when
+    // `auth.agent_id` is `None`, so that arm is unreachable on this route.
 
-    // Query claim on the same transaction (RLS applied when enterprise feature is active)
-    let claim = ClaimRepository::get_by_id_conn(&mut tx, claim_id)
+    // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
+    // three statements below still share one connection, and now that
+    // connection also carries the session GUCs migration 077's `claims` and
+    // `claim_encryption` policies read, so the policy and the in-query `$V`
+    // predicate describe the same group set instead of disagreeing.
+    //
+    // THE GUC-HYGIENE PROPERTY THE OLD COMMENT CLAIMED STILL HOLDS, BY A
+    // DIFFERENT MECHANISM, AND THE COMMENT IS REWRITTEN RATHER THAN DELETED SO
+    // IT DOES NOT BECOME A FALSE CLAIM. `ScopedRead` is a transaction under
+    // `SessionGucMode::Transaction` (rolled back on drop, exactly as before) and
+    // a pooled connection under `Session`, where the settings are removed by the
+    // pool's `after_release` scrub, installed at pool construction. Neither arm
+    // can leak a setting to the next borrower. No `commit()` is needed on
+    // either: this is a read.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_claim",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let claim = ClaimRepository::get_by_id_conn(&mut read, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),
             id: id.to_string(),
         })?;
 
-    // Encryption metadata query also within transaction
-    let encryption = ClaimEncryptionRepository::get_by_claim_id_conn(&mut tx, id)
+    // Encryption metadata, on the same stamped connection
+    let encryption = ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query claim encryption: {e}"),
@@ -846,13 +1144,11 @@ pub async fn get_claim(
     // Fetch labels from DB (not part of Claim domain model)
     let labels: Vec<String> = sqlx::query_scalar("SELECT unnest(labels) FROM claims WHERE id = $1")
         .bind(id)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *read)
         .await
         .unwrap_or_default();
 
-    // Transaction auto-rolls-back on drop (read-only, no commit needed)
-    // This is intentional: dropping resets set_config local settings, preventing pool leak
-    drop(tx);
+    drop(read);
 
     let mut response: ClaimResponse = claim.into();
     response.labels = labels;
@@ -865,17 +1161,12 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    // SECURITY (A3): derive the requester from the authenticated AuthContext
-    // (agent_id, falling back to client_id), NEVER the spoofable
-    // params.agent_id wire value. params.agent_id stays parsed-but-ignored.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    let access = check_content_access(&state.db_pool, id, requester).await;
-    if access == ContentAccess::Redacted {
-        crate::access_control::redact_claim_content(&mut response.content);
-    }
-
+    // No redaction pass. `get_by_id_conn` above already ran under `&viewer`,
+    // so reaching this line means the claim is readable; the post-pass that
+    // used to overwrite `response.content` here could only ever downgrade a row
+    // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking
+    // disagreement with the `ok_or_else` 404 four lines up is exactly the
+    // confirmation oracle PR-14 removes.
     Ok(Json(response))
 }
 
@@ -918,6 +1209,7 @@ pub async fn get_claim(
 /// Returns a paginated list of claims ordered by creation date (newest first).
 #[cfg(feature = "db")]
 pub async fn list_claims(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -950,25 +1242,48 @@ pub async fn list_claims(
         }
     }
 
-    // Set RLS context within a TRANSACTION to scope set_config and prevent pool leak
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
-    // enterprise: set_group_context(&mut *tx, params.group_id) — add epigraph-privacy dep to enable
+    // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL — the SITE-level decline
+    // documented at length on `get_claim`, which runs the identical gate. The
+    // short form: `is_member` is an authorization check that completes before
+    // any content read starts, so nothing is split across two connections;
+    // widening it to take the stamped connection would require an
+    // `EXECUTOR_WITHOUT_VIEWER` row no truthful wording fits, because
+    // `group_memberships` DOES carry a narrowing RLS policy; and splicing a
+    // `Viewer` into a membership existence check would make an authorization
+    // answer a function of visibility.
 
-    // Fetch on the same transaction (RLS applied when enterprise feature is active)
+    // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
+    // statements below still share one connection, and that connection now
+    // carries the session GUCs migration 077's policies read, so the policy and
+    // the in-query `$V` predicate describe the same group set. The
+    // rollback-on-drop the previous comment relied on for GUC hygiene still
+    // holds and is restated on `get_claim`; it is not deleted silently.
+    //
+    // THE LIST AND THE COUNT SHARING ONE CONNECTION IS NOW LOAD-BEARING FOR
+    // MORE THAN STYLE: they are two separate statements feeding one paginated
+    // answer, and a `total` computed under a different tenancy stamp from
+    // `items` would produce a page count the page itself contradicts.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claims",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let claims = ClaimRepository::list_conn(
-        &mut tx,
+        &mut read,
+        &viewer,
         pagination.limit,
         pagination.offset,
         params.search.as_deref(),
     )
     .await?;
-    let total = ClaimRepository::count_conn(&mut tx, params.search.as_deref()).await?;
+    let total = ClaimRepository::count_conn(&mut read, &viewer, params.search.as_deref()).await?;
 
     let mut items: Vec<ClaimResponse> = claims.into_iter().map(Into::into).collect();
 
@@ -979,7 +1294,7 @@ pub async fn list_claims(
             "SELECT id, unnest(labels) FROM claims WHERE id = ANY($1) AND labels != '{}'",
         )
         .bind(&claim_ids)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *read)
         .await
         .unwrap_or_default();
 
@@ -992,11 +1307,12 @@ pub async fn list_claims(
         }
     }
 
-    // Fetch encryption metadata INSIDE the transaction (RLS context still active)
+    // Fetch encryption metadata on the SAME stamped connection, so the tenancy
+    // context that selected `items` is still the one in force.
     if !items.is_empty() {
         for item in &mut items {
             if let Ok(Some(enc)) =
-                ClaimEncryptionRepository::get_by_claim_id_conn(&mut tx, item.id).await
+                ClaimEncryptionRepository::get_by_claim_id_conn(&mut read, item.id).await
             {
                 item.privacy_tier = Some(enc.privacy_tier);
                 item.encrypted_content =
@@ -1007,20 +1323,10 @@ pub async fn list_claims(
         }
     }
 
-    // Transaction auto-rolls-back on drop (read-only, no commit needed)
-    drop(tx);
+    drop(read);
 
-    // SECURITY (A3): use the authenticated requester, not params.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for item in &mut items {
-        let access = check_content_access(&state.db_pool, item.id, requester).await;
-        if access == ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut item.content);
-        }
-    }
-
+    // No redaction pass: `ClaimRepository::list_conn` was already spliced with
+    // `&viewer`, so a row the caller may not read is not in `items` at all.
     Ok(Json(PaginatedResponse {
         items,
         total,
@@ -1070,11 +1376,24 @@ pub struct EvidenceResponse {
 /// GET /api/v1/claims/:id/evidence
 #[cfg(feature = "db")]
 pub async fn list_claim_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Vec<EvidenceResponse>>, ApiError> {
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_claim_evidence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let evidence_list =
-        EvidenceRepository::get_by_claim(&state.db_pool, ClaimId::from_uuid(claim_id)).await?;
+        EvidenceRepository::get_by_claim(&mut *read, &viewer, ClaimId::from_uuid(claim_id)).await?;
 
     let responses: Vec<EvidenceResponse> = evidence_list
         .into_iter()
@@ -1127,13 +1446,52 @@ pub struct NeedingEmbeddingsQuery {
 ///
 /// Returns claims with NULL embeddings for the caller to process
 /// through an embedding service and write back.
+///
+/// # Authorization
+///
+/// Requires `claims:admin`. This is a **maintenance** endpoint: it enumerates
+/// claim ids AND raw content corpus-wide, ordered by an internal invariant
+/// (which rows the embedder has not reached yet), and it sat in the anonymous
+/// router until PR-03. `claims:read` is not enough — the result set is a
+/// worklist for an operator's backfill job, not a query anyone would ask.
 #[cfg(feature = "db")]
 pub async fn find_claims_needing_embeddings(
     State(state): State<AppState>,
+    _admin: crate::middleware::bearer::RequireScopeAdmin,
     Query(params): Query<NeedingEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let limit = params.limit.unwrap_or(100).min(500);
-    let claims = ClaimRepository::find_claims_needing_embeddings(&state.db_pool, limit)
+    // MAINTENANCE ROUTE, not a content read. A `ViewerExtractor` here would be
+    // wrong in the dangerous direction: the caller's group set would decide
+    // which rows the embedder is told about, so every claim outside the
+    // operator's own groups would stay unembedded forever and semantic recall
+    // would go quietly blind for those tenants. `claims:admin` is the gate; the
+    // read itself runs under `SystemReason::EmbeddingBackfill`.
+    //
+    // The lease comes from `AppState::maintenance_viewer` rather than being
+    // minted here, because `tests/no_bypass_in_handlers.rs` bans the literals
+    // `Viewer::system(` and `MaintenanceLease` under `routes/` — correctly.
+    //
+    // THE STATEMENT RUNS ON `maint_conn`, NOT ON `state.db_pool`. That is the
+    // whole substance of this call site. A bypass viewer emits no predicate, so
+    // once RLS is active the connection decides what the enumerator sees;
+    // holding the privileged connection and then querying the application pool
+    // would return an empty worklist and HTTP 200 — the silent no-op shape,
+    // with the operator's backfill quietly told there is nothing to embed. It
+    // is also the exact privileged-viewer/ordinary-pool hybrid PR-15 deleted
+    // from the CLI fleet, which is why the repo method takes an executor rather
+    // than a `&PgPool`.
+    let mut session = state
+        .maintenance_viewer(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: e.to_string(),
+        })?;
+    // `split` and not two separate accessors: the repo call needs the connection
+    // mutably and the viewer immutably at the same moment, which one `&mut`
+    // borrow of the session cannot otherwise express.
+    let (maint_conn, viewer) = session.split();
+    let claims = ClaimRepository::find_claims_needing_embeddings(&mut *maint_conn, viewer, limit)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -1150,6 +1508,7 @@ pub async fn find_claims_needing_embeddings(
 #[cfg(not(feature = "db"))]
 pub async fn find_claims_needing_embeddings(
     State(_state): State<AppState>,
+    _admin: crate::middleware::bearer::RequireScopeAdmin,
     Query(_params): Query<NeedingEmbeddingsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(serde_json::json!({
@@ -1214,6 +1573,7 @@ impl PatchClaimRequest {
 /// superseding claim instead). Truth value and trace_id can be updated.
 #[cfg(feature = "db")]
 pub async fn update_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -1230,7 +1590,7 @@ pub async fn update_claim(
     let claim_id = ClaimId::from_uuid(id);
 
     // Verify claim exists (404 if not found)
-    let mut current = ClaimRepository::get_by_id(&state.db_pool, claim_id)
+    let mut current = ClaimRepository::get_by_id(&state.db_pool, &viewer, claim_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Claim".to_string(),
@@ -1348,6 +1708,7 @@ pub async fn update_claim(
     tag = "claims"
 )]
 pub async fn patch_claim(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
@@ -1418,6 +1779,13 @@ pub async fn patch_claim(
                     entity: "Claim".to_string(),
                     id: eid.to_string(),
                 },
+                // Same 400-not-500 reason as the PATCH /labels handler:
+                // `update_labels_conn` refuses an `add_labels` entry carrying
+                // an unexpanded shell variable with `InvalidData`.
+                epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+                    field: "add_labels".to_string(),
+                    reason,
+                },
                 other => ApiError::DatabaseError {
                     message: other.to_string(),
                 },
@@ -1431,7 +1799,7 @@ pub async fn patch_claim(
     let after_trace = diff.after_trace;
 
     // ── 8. Re-fetch updated claim (for response) ─────────────────────────────
-    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, claim_id)
+    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -1603,6 +1971,13 @@ pub async fn update_labels(
                 entity: "Claim".to_string(),
                 id: id.to_string(),
             },
+            // A refused label is caller error, not a database fault. Without
+            // this arm the `other =>` catch-all below would report the
+            // unexpanded-shell-variable rejection as a 500.
+            epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+                field: "add".to_string(),
+                reason,
+            },
             other => ApiError::DatabaseError {
                 message: other.to_string(),
             },
@@ -1674,10 +2049,16 @@ pub struct ClaimByLabelsResponse {
 ///
 /// Mirrors the MCP `query_claims_by_label` tool over plain HTTP so the
 /// backlog cleanup + reconciler Python scripts can read without direct DB
-/// access. Public (no auth) — these are read-only queries over public claim
-/// metadata, same as `GET /api/v1/claims` and `GET /api/v1/claims/by-belief`.
+/// access.
+///
+/// NOT public, despite what this doc said until conversion shard 7 corrected
+/// it: the handler carries a `ViewerExtractor`, which 401s an unauthenticated
+/// caller, and as of this shard the read runs on a viewer-stamped connection,
+/// so the rows returned are the caller's own visible set rather than "public
+/// claim metadata". The scripts named above authenticate.
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(q): Query<ClaimsByLabelsQuery>,
 ) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
@@ -1709,14 +2090,29 @@ pub async fn list_by_labels(
         .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_by_labels",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     let rows = ClaimRepository::list_by_labels(
-        &state.db_pool,
-        &labels,
-        &exclude_labels,
-        current_only,
-        min_truth,
-        limit,
-        offset,
+        &mut *read,
+        &viewer,
+        epigraph_db::LabelQuery {
+            labels: &labels,
+            exclude_labels: &exclude_labels,
+            current_only,
+            min_truth,
+            limit,
+            offset,
+        },
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -2080,7 +2476,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2129,7 +2525,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2173,7 +2569,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2240,7 +2636,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2285,7 +2681,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2338,7 +2734,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2382,7 +2778,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2408,7 +2804,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2451,7 +2847,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2482,7 +2878,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2512,7 +2908,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );
@@ -2551,7 +2947,7 @@ mod db_tests {
         let state = AppState::with_db(
             pool.clone(),
             ApiConfig {
-                require_signatures: false,
+                require_packet_signatures: false,
                 ..Default::default()
             },
         );

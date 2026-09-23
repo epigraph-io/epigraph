@@ -51,13 +51,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import os
 import subprocess
 import sys
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
+
+from maintenance_dsn import maintenance_dsn
 
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
@@ -267,7 +268,7 @@ def seed_one(section: dict, args: argparse.Namespace) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--database-url", default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL))
+    ap.add_argument("--database-url", default=maintenance_dsn(DEFAULT_DATABASE_URL))
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--drop-auto-after", action="store_true",
