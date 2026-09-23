@@ -253,3 +253,17 @@ async fn agent_keys_rs_refuses_without_auth() {
     ];
     assert_refused(router, &cases).await;
 }
+
+#[tokio::test]
+async fn papers_rs_refuses_without_auth() {
+    let router = Router::new()
+        .route("/api/v1/papers", post(routes::papers::create_paper))
+        .with_state(unreachable_state());
+    let cases = [case(
+        "papers.rs::create_paper",
+        Method::POST,
+        "/api/v1/papers".into(),
+        Some(json!({"doi": "10.1234/example"})),
+    )];
+    assert_refused(router, &cases).await;
+}

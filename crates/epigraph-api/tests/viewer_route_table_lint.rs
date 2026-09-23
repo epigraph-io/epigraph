@@ -337,7 +337,9 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // register, where the count stays 4.
     ("crud.rs", 6),
     ("edges.rs", 5),
-    ("papers.rs", 1),
+    // `("papers.rs", 1)` REMOVED by the fail-open-scope-sites conversion:
+    // `create_paper` refuses 401 without an `AuthContext` and checks
+    // `claims:write` unconditionally.
     // `("tasks.rs", 6)` REMOVED by the fail-open-scope-sites conversion: all
     // six handlers now take the `let Some(..) = auth_ctx else { return
     // Err(Unauthorized) }` shape and check `tasks:read`/`tasks:write`
