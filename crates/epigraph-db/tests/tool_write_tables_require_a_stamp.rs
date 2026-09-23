@@ -406,3 +406,143 @@ async fn a_mass_function_insert_lands_when_the_session_carries_the_claims_group(
     assert!(out.is_ok(), "stamped BBA store must land: {out:?}");
     assert_eq!(mass_function_count(&pool, claim).await, 1);
 }
+
+// ===========================================================================
+// `update_labels`' RESIDUAL: relabelling a FOREIGN agent's claim.
+//
+// `tools/claims.rs::update_labels` stamps `begin_author_stamped_tx(server,
+// server.agent_id(), …)` — the MCP process's own agent, deliberately narrower
+// than author-stamping, because `server.rs::agent_id` ensures a personal group
+// for that agent and nothing else, so the writable set is exactly one group.
+// Its own comment concedes the consequence: a `claims:admin` HTTP caller
+// relabelling ANOTHER agent's claim is still refused on a cleanly-migrated
+// schema.
+//
+// That concession had no measurement behind it. The MCP-level arm that looks
+// like it measures it — `epigraph-mcp/tests/retirement_label_ownership.rs::
+// update_labels_admin_scope_passes_the_retirement_authz_gate` — runs on the
+// `#[sqlx::test]` superuser, so its write half is vacuous: it passes identically
+// whatever the policies say. What that arm legitimately pins is issue #374's
+// AUTHZ gate (does `claims:admin` satisfy `require_owner_or_admin`); the tenancy
+// half is measured here, on the non-bypassing role, in both directions.
+//
+// This matters operationally rather than academically. `gate_retirement_label`'s
+// own doc records that epiclaw's baked `CLAUDE.md` instructs every scheduled
+// agent to retire cross-agent backlog items with
+// `update_labels(original_id, add=["resolved"])` precisely BECAUSE
+// `resolve_backlog_item` refuses them — and a cross-agent backlog item is a
+// foreign claim by definition. So the sanctioned ops path is the one the arm
+// below shows is refused once the orphan `claims_privacy` policy is dropped.
+// Registered, not fixed: the fix is a tenancy-model decision (may an admin scope
+// carry write authority into a group it is not a member of?), not a stamping one,
+// and the same residual applies to `challenge_claim` above and to
+// `update_with_evidence`'s `update_truth_value` / `update_labels` on a foreign
+// claim.
+// ===========================================================================
+
+async fn labels_of(pool: &PgPool, claim: Uuid) -> Vec<String> {
+    sqlx::query_scalar::<_, Vec<String>>(
+        "SELECT COALESCE(labels, ARRAY[]::text[]) FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("read labels")
+}
+
+/// **The residual.** A session stamped from agent A's writable set — which is
+/// what `update_labels` stamps, whatever the HTTP caller's scope — cannot add a
+/// label to a claim owned by agent B's personal group. `claims_tenancy`'s
+/// `WITH CHECK` asks `owner_group_id = ANY(epigraph_writable_groups())` about the
+/// NEW row, and the UPDATE does not change `owner_group_id`, so the foreign group
+/// is still the group being asked about.
+#[sqlx::test(migrations = "../../migrations")]
+async fn relabelling_a_foreign_groups_claim_is_refused_on_a_stamped_app_session(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "label-owner").await;
+    let (server_agent, server_group) = fixture::seed_agent_with_group(&pool, "label-server").await;
+    let claim =
+        seed_author_owned_public_claim(&pool, owner, owner_group, "update_labels gate: foreign")
+            .await;
+    assert_app_role_does_not_bypass(&pool).await;
+    assert_ne!(
+        owner_group, server_group,
+        "the two groups must differ or this arm measures nothing"
+    );
+
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(
+            &mut conn,
+            &server_group.to_string(),
+            &server_group.to_string(),
+            &server_agent.to_string(),
+        )
+        .await;
+        let out = epigraph_db::ClaimRepository::update_labels_conn(
+            &mut conn,
+            claim,
+            &["resolved".to_string()],
+            &[],
+        )
+        .await;
+        (conn, out)
+    })
+    .await;
+
+    let msg = out
+        .expect_err(
+            "a session carrying only the MCP server agent's own group must not be able to \
+             relabel a claim owned by another agent's group. If this now succeeds, either the \
+             policies were widened (which migration 077 §2 names as the failure it exists to \
+             prevent) or `update_labels` changed whose viewer it stamps — both require editing \
+             the comment at that call site.",
+        )
+        .to_string();
+    assert!(
+        msg.contains("42501") || msg.to_lowercase().contains("row-level security"),
+        "the refusal must be the row-level security one, not an unrelated failure: {msg}"
+    );
+    assert!(
+        !labels_of(&pool, claim).await.contains(&"resolved".to_string()),
+        "nothing may be written on the refused path"
+    );
+}
+
+/// **The calibration.** Same role, same function, same claim shape — stamped
+/// with the CLAIM's own owning group, the relabel lands. Without this arm the
+/// refusal above could be an unrelated failure (a rejected label, a missing row)
+/// and nothing would tell the difference.
+#[sqlx::test(migrations = "../../migrations")]
+async fn relabelling_lands_when_the_session_carries_the_claims_own_group(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "label-self").await;
+    let claim =
+        seed_author_owned_public_claim(&pool, owner, owner_group, "update_labels gate: own group")
+            .await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(
+            &mut conn,
+            &owner_group.to_string(),
+            &owner_group.to_string(),
+            &owner.to_string(),
+        )
+        .await;
+        let out = epigraph_db::ClaimRepository::update_labels_conn(
+            &mut conn,
+            claim,
+            &["resolved".to_string()],
+            &[],
+        )
+        .await;
+        (conn, out)
+    })
+    .await;
+
+    assert!(
+        out.is_ok(),
+        "a session stamped with the claim's own owning group must be able to relabel it: {out:?}"
+    );
+    assert!(labels_of(&pool, claim)
+        .await
+        .contains(&"resolved".to_string()));
+}
