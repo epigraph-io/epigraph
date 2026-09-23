@@ -228,6 +228,14 @@ async fn wire_ds_after_ingest(
 /// see that function for the canonical persistence semantics. Does NOT embed
 /// — embedding happens in the MCP entry point [`do_ingest_workflow`], which
 /// has access to `server.embedder`.
+///
+/// **The walk runs in ONE transaction, as production's does.** Unstamped is a
+/// deliberate difference from production; autocommit was not. On a bare pooled
+/// checkout every statement got its own `NOW()`, so the fixture's plan got
+/// strictly increasing `created_at` values that production's never has — and a
+/// reader ordering a workflow's steps by `created_at` passed every test built on
+/// this fixture while it returned steps in UUID order on the server. A fixture
+/// that differs from production on the very property under test cannot see it.
 pub async fn do_ingest_workflow_via_pool(
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -235,13 +243,25 @@ pub async fn do_ingest_workflow_via_pool(
 ) -> Result<IngestWorkflowResponse, McpError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
     let result = {
-        let mut conn = pool
-            .acquire()
+        // Named `unstamped_tx`, not `tx`: `residual_unstamped_writes.rs`'s
+        // executor-call register counts calls spelled `&mut tx` as STAMPED, and
+        // this one is not.
+        let mut unstamped_tx = pool
+            .begin()
             .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not acquire: {e}")))?;
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, &plan, extraction)
+            .map_err(|e| internal_error(format!("workflow ingest: could not begin: {e}")))?;
+        let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+            &mut unstamped_tx,
+            &plan,
+            extraction,
+        )
+        .await
+        .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
+        unstamped_tx
+            .commit()
             .await
-            .map_err(|e| internal_error(format!("workflow ingest: {e}")))?
+            .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
+        result
     };
     {
         let mut ds_conn = pool

@@ -664,7 +664,13 @@ impl WorkflowRepository {
         }
 
         // ── Round-trip 1: fetch all step seeds (level=2) for all workflow IDs. ──
-        // Order matches the single-workflow function: (e.created_at ASC, c.id ASC).
+        // Order matches the single-workflow function: the `plan_index` ordinal
+        // first, `(e.created_at ASC, c.id ASC)` only as the fallback for edges
+        // that predate it. This batched twin was left on the bare `created_at`
+        // key when `resolve_steps_to_heads` was moved to `plan_index`, so once a
+        // plan's edges were written in one transaction (one shared `NOW()`), the
+        // `step_index` it assigns below followed `c.id` — a content-derived UUID
+        // — while its single-workflow sibling followed the plan.
         #[derive(sqlx::FromRow)]
         struct StepSeedRow {
             workflow_id: Uuid,
@@ -683,7 +689,11 @@ impl WorkflowRepository {
                AND e.relationship = 'executes' \
                AND (c.properties->>'level')::int = 2 \
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
-             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+             ORDER BY e.source_id, \
+                      CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut sq = sqlx::query_as::<_, StepSeedRow>(&seed_sql).bind(workflow_ids);
@@ -702,7 +712,7 @@ impl WorkflowRepository {
         }
 
         // Build per-workflow step lists and collect the set of lineage_ids to query.
-        // Preserve ordering: seeds are already in (workflow_id, e.created_at, c.id) order.
+        // Preserve ordering: seeds are already in (workflow_id, plan order) order.
         // We need per-workflow sequential step_index, so we track a counter per workflow.
         let mut step_index_counter: HashMap<Uuid, usize> = HashMap::new();
 
@@ -1062,9 +1072,12 @@ impl WorkflowRepository {
     /// steps" received `[]`, fell back to a bare `theme_cluster` with
     /// `wipe_first=true`, and destroyed 76 themes.
     ///
-    /// Ordering is `(edge created_at ASC, claim id ASC)` — the same plan order
-    /// [`Self::resolve_steps_to_heads`] and `do_report_hierarchical_outcome`
-    /// use, so step N means the same step in all three.
+    /// Ordering is the `executes` edge's `plan_index` ordinal, falling back to
+    /// `(edge created_at ASC, claim id ASC)` for edges that predate it — the
+    /// same plan order [`Self::resolve_steps_to_heads`],
+    /// [`Self::resolve_steps_to_heads_batched`] and both
+    /// `report_hierarchical_outcome` handlers (MCP and HTTP) use, so step N
+    /// means the same step in all of them.
     ///
     /// Returns the FROZEN step claims attached to the workflow, not lineage
     /// heads. `find_workflow` advertises the workflow as stored; callers that

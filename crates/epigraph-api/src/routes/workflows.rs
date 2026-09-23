@@ -1209,14 +1209,24 @@ pub async fn report_hierarchical_outcome(
         })?;
 
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
-    //    sorted by claim level=2 (steps), in plan order. Plan order is the
-    //    insertion order of `executes` edges; we use edges.created_at as proxy.
+    //    restricted to level=2 (steps), in PLAN order: the `plan_index` ordinal
+    //    the ingest executor records on each edge, with `e.created_at` only as
+    //    the fallback for edges that predate it. `created_at` alone stopped
+    //    being a usable proxy when the executor began writing a plan in ONE
+    //    transaction — `NOW()` is transaction-start time, every edge ties, and
+    //    the tiebreak `c.id` is a content-derived UUID. Same key as
+    //    `epigraph_mcp::tools::workflow_hierarchical` and
+    //    `WorkflowRepository::resolve_steps_to_heads`, so step N is one step on
+    //    both transports.
     let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT c.id \
          FROM edges e \
          JOIN claims c ON c.id = e.target_id \
          WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY e.created_at ASC, c.id ASC",
+         ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                       THEN (e.properties->>'plan_index')::int \
+                       ELSE 2147483647 END, \
+                  e.created_at ASC, c.id ASC",
     )
     .bind(workflow_id)
     .fetch_all(&state.db_pool)

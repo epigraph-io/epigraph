@@ -95,47 +95,73 @@ pub async fn find_workflow_head(
     row.ok_or_else(|| StepOpError::WorkflowNotFound(canonical_name.to_string()))
 }
 
-/// First level-1 phase claim under a workflow (migrate convention: one phase).
+/// SQL `ORDER BY` key for a workflow's `executes` edges in PLAN order.
+///
+/// The `plan_index` ordinal `execute_workflow_ingest_plan` records on each edge,
+/// then `(c.created_at, c.id)` for edges that carry none (written before the
+/// ordinal existed, or by [`add_step`]). `c.created_at` cannot lead: the
+/// executor writes a whole plan in ONE transaction, so every claim and every
+/// edge of it shares one `NOW()`, and the order would fall through to `c.id` — a
+/// content-derived UUID. See the comment on the `executes` loop in
+/// `workflow.rs`.
+const PLAN_ORDER: &str = "CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                               THEN (e.properties->>'plan_index')::int \
+                               ELSE 2147483647 END, \
+                          c.created_at ASC, c.id ASC";
+
+/// First level-1 phase claim under a workflow, in PLAN order (migrate
+/// convention: one phase; for a multi-phase workflow, the plan's first).
+///
+/// Ordered by [`PLAN_ORDER`], not `c.created_at` alone. A multi-phase
+/// workflow's phases are written in one transaction and tie on `created_at`, so
+/// `ORDER BY c.created_at LIMIT 1` picked whichever phase had the smaller UUID
+/// and `add_step` attached the new step under it.
 pub async fn find_phase(
     conn: &mut sqlx::PgConnection,
     workflow_id: Uuid,
 ) -> Result<Uuid, StepOpError> {
-    let row: Option<Uuid> = sqlx::query_scalar(
+    let sql = format!(
         "SELECT c.id FROM claims c \
          JOIN edges e ON e.target_id = c.id AND e.source_type = 'workflow' \
                       AND e.relationship = 'executes' \
          WHERE e.source_id = $1 \
            AND (c.properties->>'level')::int = 1 \
-         ORDER BY c.created_at ASC LIMIT 1",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&mut *conn)
-    .await?;
+         ORDER BY {PLAN_ORDER} LIMIT 1"
+    );
+    let row: Option<Uuid> = sqlx::query_scalar(&sql)
+        .bind(workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
     row.ok_or(StepOpError::PhaseMissing)
 }
 
 /// Level-2 step claims under a workflow, ordered by walking `step_follows`
 /// from the head. Unreachable orphans (broken chain or no edges) are
-/// appended in `created_at` order.
+/// appended in plan order ([`PLAN_ORDER`]), and when several steps could be
+/// the head the earliest in plan order wins.
+///
+/// Both of those used to be `c.created_at`, which ties for every step of a plan
+/// written in one transaction.
 pub async fn ordered_steps(
     conn: &mut sqlx::PgConnection,
     workflow_id: Uuid,
 ) -> Result<Vec<Uuid>, StepOpError> {
-    let all: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT c.id, c.created_at FROM claims c \
+    let sql = format!(
+        "SELECT c.id FROM claims c \
          JOIN edges e ON e.target_id = c.id AND e.source_type = 'workflow' \
                       AND e.relationship = 'executes' \
          WHERE e.source_id = $1 \
            AND (c.properties->>'level')::int = 2 \
-         ORDER BY c.created_at ASC",
-    )
-    .bind(workflow_id)
-    .fetch_all(&mut *conn)
-    .await?;
+         ORDER BY {PLAN_ORDER}"
+    );
+    let all: Vec<Uuid> = sqlx::query_scalar(&sql)
+        .bind(workflow_id)
+        .fetch_all(&mut *conn)
+        .await?;
     if all.is_empty() {
         return Ok(vec![]);
     }
-    let id_set: Vec<Uuid> = all.iter().map(|(id, _)| *id).collect();
+    let id_set: Vec<Uuid> = all.clone();
 
     let head_candidates: Vec<Uuid> = sqlx::query_scalar(
         "SELECT ws.id FROM unnest($1::uuid[]) AS ws(id) \
@@ -149,10 +175,8 @@ pub async fn ordered_steps(
     .fetch_all(&mut *conn)
     .await?;
 
-    // Pick the head with the earliest created_at among candidates.
-    let head = head_candidates
-        .into_iter()
-        .min_by_key(|id| all.iter().find(|(i, _)| i == id).map(|(_, t)| *t));
+    // Pick the head that comes earliest in plan order among the candidates.
+    let head = all.iter().copied().find(|id| head_candidates.contains(id));
 
     let mut chain: Vec<Uuid> = Vec::with_capacity(all.len());
     let mut visited: HashSet<Uuid> = HashSet::new();
@@ -177,7 +201,7 @@ pub async fn ordered_steps(
             }
         }
     }
-    for (id, _) in &all {
+    for id in &all {
         if !visited.contains(id) {
             chain.push(*id);
         }

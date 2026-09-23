@@ -409,11 +409,32 @@ pub async fn execute_workflow_ingest_plan(
 
     // ── 6. workflow —executes→ claim edges ──────────────────────────────
     //
-    // `plan_index` IS LOAD-BEARING AND IT IS NEW. Every reader that renders a
-    // hierarchical workflow's steps in "plan order" — `resolve_steps_to_heads`
-    // and `steps_for_workflows` in `epigraph-db/src/repos/workflow.rs` — ordered
-    // by `e.created_at ASC, c.id ASC`, and that worked only because each edge was
-    // inserted on its OWN pool checkout and so got its own `NOW()`.
+    // `plan_index` IS LOAD-BEARING AND IT IS NEW. Every reader that maps a
+    // hierarchical workflow's steps to "plan order" ordered by `e.created_at
+    // ASC, c.id ASC`, and that worked only because each edge was inserted on its
+    // OWN pool checkout and so got its own `NOW()`. The readers, all now keyed on
+    // this ordinal with `created_at` as the fallback:
+    //
+    // * `WorkflowRepository::resolve_steps_to_heads`, `::resolve_steps_to_heads_batched`
+    //   and `::step_texts_for_hierarchical` (`epigraph-db/src/repos/workflow.rs`);
+    // * the two `report_hierarchical_outcome` handlers that turn a caller's
+    //   `step_index` into a `behavioral_executions.step_claim_id` —
+    //   `epigraph-mcp/src/tools/workflow_hierarchical.rs` and
+    //   `epigraph-api/src/routes/workflows.rs`;
+    // * `workflow_steps::find_phase` and `workflow_steps::ordered_steps`'s
+    //   fallback ordering in this crate.
+    //
+    // The first revision of this comment claimed "every reader" after moving
+    // only two of them. The report handlers were among those left behind, and
+    // they failed SILENTLY: MEASURED on the real binary as `epigraph_app`, a
+    // 6-step workflow reported with step_index 0..5 attached 4 of the 6
+    // `behavioral_executions` rows to the WRONG step claim, on both schema
+    // configurations, with `isError: false`.
+    // `epigraph-mcp/tests/plan_order_under_one_transaction.rs` pins it.
+    //
+    // `claims.created_at` ties the same way — every claim in the plan is written
+    // in this transaction — so a reader choosing among a workflow's claims by
+    // `c.created_at` needs this ordinal too, not just the edge readers.
     //
     // Inside one transaction `NOW()` is TRANSACTION-start time in PostgreSQL, so
     // every edge in a plan shares it exactly, the tiebreak falls through to
