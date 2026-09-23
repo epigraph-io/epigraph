@@ -907,6 +907,103 @@ pub async fn create_frame(
     Ok((StatusCode::CREATED, Json(frame_to_response(row))))
 }
 
+/// G8 contradiction pre-screen for [`submit_evidence`]: would evidence of
+/// `reliability` supporting `claim_id` introduce a new contradiction among the
+/// claim's IN-FORCE edges?
+///
+/// Belief-bearing, so it reads only edges in force, unconditionally (no
+/// opt-in): a `contradicts`/`refutes` edge that was deleted (retracted — MCP
+/// `delete_edge`, `DELETE /api/v1/edges/:id`) must not keep predicting a
+/// contradiction. It read the unfiltered `get_by_source`/`get_by_target`
+/// until the display-tier pass (`docs/architecture/edge-retraction-tiers.md`).
+///
+/// Extracted from the handler unchanged apart from those two reads, so it can
+/// be exercised without assembling a frame and a BBA.
+#[cfg(feature = "db")]
+async fn predict_contradiction(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::Viewer,
+    claim_id: Uuid,
+    reliability: f64,
+) -> Option<epigraph_engine::reasoning::Contradiction> {
+    use epigraph_engine::reasoning::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
+
+    // Load in-force edges where this claim is source or target
+    let source_edges =
+        epigraph_db::EdgeRepository::get_by_source_in_force(pool, viewer, claim_id, "claim")
+            .await
+            .unwrap_or_default();
+    let target_edges =
+        epigraph_db::EdgeRepository::get_by_target_in_force(pool, viewer, claim_id, "claim")
+            .await
+            .unwrap_or_default();
+
+    let all_edges: Vec<_> = source_edges.iter().chain(target_edges.iter()).collect();
+    if all_edges.is_empty() {
+        return None;
+    }
+
+    // Collect neighbor claim IDs
+    let mut neighbor_ids: Vec<Uuid> = all_edges
+        .iter()
+        .flat_map(|e| [e.source_id, e.target_id])
+        .filter(|id| *id != claim_id)
+        .collect();
+    neighbor_ids.sort();
+    neighbor_ids.dedup();
+
+    // Load truth values for neighbors + this claim
+    let mut claim_ids = neighbor_ids.clone();
+    claim_ids.push(claim_id);
+
+    let claim_rows: Vec<(Uuid, Option<f64>)> =
+        sqlx::query_as("SELECT id, truth_value FROM claims WHERE id = ANY($1)")
+            .bind(&claim_ids)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+    let reasoning_claims: Vec<ReasoningClaim> = claim_rows
+        .iter()
+        .map(|(id, tv)| ReasoningClaim {
+            id: *id,
+            truth_value: tv.unwrap_or(0.5),
+        })
+        .collect();
+
+    let reasoning_edges: Vec<ReasoningEdge> = all_edges
+        .iter()
+        .map(|e| ReasoningEdge {
+            source_id: e.source_id,
+            target_id: e.target_id,
+            relationship: e.relationship.clone(),
+            strength: e
+                .properties
+                .get("strength")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.5),
+        })
+        .collect();
+
+    // Model the new evidence as a pseudo-node supporting the claim
+    let pseudo_id = Uuid::new_v4();
+    let new_edge = ReasoningEdge {
+        source_id: pseudo_id,
+        target_id: claim_id,
+        relationship: "supports".to_string(),
+        strength: reliability,
+    };
+
+    // Extend claims to include the pseudo-evidence node
+    let mut extended_claims = reasoning_claims;
+    extended_claims.push(ReasoningClaim {
+        id: pseudo_id,
+        truth_value: reliability,
+    });
+
+    ReasoningEngine::would_contradict(&extended_claims, &reasoning_edges, &new_edge)
+}
+
 /// Submit mass function evidence for a claim in a frame
 ///
 /// Pipeline: discount → store → retrieve all → combine → update claim → emit events → compute divergence
@@ -1104,102 +1201,26 @@ pub async fn submit_evidence(
     // 4e. Pre-screen for contradiction potential (G8)
     //     Load the claim's edge neighborhood and check if the new evidence
     //     would introduce a contradiction via the Ascent reasoning engine.
+    if let Some(contradiction) =
+        predict_contradiction(pool, &viewer, request.claim_id, request.reliability).await
     {
-        use epigraph_engine::reasoning::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
-
-        // Load edges where this claim is source or target
-        let source_edges =
-            epigraph_db::EdgeRepository::get_by_source(pool, &viewer, request.claim_id, "claim")
-                .await
-                .unwrap_or_default();
-        let target_edges =
-            epigraph_db::EdgeRepository::get_by_target(pool, &viewer, request.claim_id, "claim")
-                .await
-                .unwrap_or_default();
-
-        let all_edges: Vec<_> = source_edges.iter().chain(target_edges.iter()).collect();
-
-        if !all_edges.is_empty() {
-            // Collect neighbor claim IDs
-            let mut neighbor_ids: Vec<Uuid> = all_edges
-                .iter()
-                .flat_map(|e| [e.source_id, e.target_id])
-                .filter(|id| *id != request.claim_id)
-                .collect();
-            neighbor_ids.sort();
-            neighbor_ids.dedup();
-
-            // Load truth values for neighbors + this claim
-            let mut claim_ids = neighbor_ids.clone();
-            claim_ids.push(request.claim_id);
-
-            let claim_rows: Vec<(Uuid, Option<f64>)> =
-                sqlx::query_as("SELECT id, truth_value FROM claims WHERE id = ANY($1)")
-                    .bind(&claim_ids)
-                    .fetch_all(pool)
-                    .await
-                    .unwrap_or_default();
-
-            let reasoning_claims: Vec<ReasoningClaim> = claim_rows
-                .iter()
-                .map(|(id, tv)| ReasoningClaim {
-                    id: *id,
-                    truth_value: tv.unwrap_or(0.5),
-                })
-                .collect();
-
-            let reasoning_edges: Vec<ReasoningEdge> = all_edges
-                .iter()
-                .map(|e| ReasoningEdge {
-                    source_id: e.source_id,
-                    target_id: e.target_id,
-                    relationship: e.relationship.clone(),
-                    strength: e
-                        .properties
-                        .get("strength")
-                        .and_then(serde_json::Value::as_f64)
-                        .unwrap_or(0.5),
-                })
-                .collect();
-
-            // Model the new evidence as a pseudo-node supporting the claim
-            let pseudo_id = Uuid::new_v4();
-            let new_edge = ReasoningEdge {
-                source_id: pseudo_id,
-                target_id: request.claim_id,
-                relationship: "supports".to_string(),
-                strength: request.reliability,
-            };
-
-            // Extend claims to include the pseudo-evidence node
-            let mut extended_claims = reasoning_claims;
-            extended_claims.push(ReasoningClaim {
-                id: pseudo_id,
-                truth_value: request.reliability,
-            });
-
-            if let Some(contradiction) =
-                ReasoningEngine::would_contradict(&extended_claims, &reasoning_edges, &new_edge)
-            {
-                let event_store = super::events::global_event_store();
-                event_store
-                    .push(
-                        "contradiction.predicted".to_string(),
-                        request.agent_id,
-                        serde_json::json!({
-                            "claim_id": request.claim_id,
-                            "contradicting_claims": [
-                                contradiction.claim_a.to_string(),
-                                contradiction.claim_b.to_string(),
-                            ],
-                            "target": contradiction.target.to_string(),
-                            "support_strength": contradiction.support_strength,
-                            "refute_strength": contradiction.refute_strength,
-                        }),
-                    )
-                    .await;
-            }
-        }
+        let event_store = super::events::global_event_store();
+        event_store
+            .push(
+                "contradiction.predicted".to_string(),
+                request.agent_id,
+                serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "contradicting_claims": [
+                        contradiction.claim_a.to_string(),
+                        contradiction.claim_b.to_string(),
+                    ],
+                    "target": contradiction.target.to_string(),
+                    "support_strength": contradiction.support_strength,
+                    "refute_strength": contradiction.refute_strength,
+                }),
+            )
+            .await;
     }
 
     // 5. Store the individual BBA (with optional perspective)
@@ -3472,6 +3493,85 @@ mod tests {
         assert!(
             msg.contains("not found"),
             "Error should indicate not found: {msg}"
+        );
+    }
+
+    // ── G8 contradiction pre-screen reads only edges in force ──
+
+    /// A `refutes` edge that was deleted (retracted) must stop predicting a
+    /// contradiction. The in-force `supports` edge beside it keeps the edge
+    /// set non-empty in both states, so the `None` after retraction is the
+    /// engine's verdict on the in-force graph, not the empty-neighbourhood
+    /// early return.
+    #[cfg(feature = "db")]
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn predict_contradiction_ignores_a_retracted_refutes_edge(pool: sqlx::PgPool) {
+        let world: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("world group");
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) \
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'g8-test') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("agent");
+        let claim = |content: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO claims (content, content_hash, truth_value, agent_id, \
+                                         is_current, visibility, owner_group_id) \
+                     VALUES ($1, sha256($1::bytea), 0.8, $2, true, 'public', $3) RETURNING id",
+                )
+                .bind(content)
+                .bind(agent)
+                .bind(world)
+                .fetch_one(&pool)
+                .await
+                .expect("claim")
+            }
+        };
+        let x = claim("g8 target X").await;
+        let m = claim("g8 supporter M").await;
+        let n = claim("g8 refuter N").await;
+        let edge = |source: Uuid, relationship: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                     VALUES ($1, 'claim', $2, 'claim', $3) RETURNING id",
+                )
+                .bind(source)
+                .bind(x)
+                .bind(relationship)
+                .fetch_one(&pool)
+                .await
+                .expect("edge")
+            }
+        };
+        edge(m, "supports").await;
+        let refutes = edge(n, "refutes").await;
+        let viewer = epigraph_db::Viewer::resolve(&pool, Uuid::nil())
+            .await
+            .expect("public viewer");
+
+        let before = predict_contradiction(&pool, &viewer, x, 0.9).await;
+        assert_eq!(
+            before.map(|c| (c.claim_b, c.target)),
+            Some((n, x)),
+            "precondition: with N refuting X in force, supporting evidence for X is \
+             predicted to contradict N"
+        );
+
+        epigraph_db::EdgeRepository::retract(&pool, &[refutes])
+            .await
+            .expect("retract");
+        let after = predict_contradiction(&pool, &viewer, x, 0.9).await;
+        assert!(
+            after.is_none(),
+            "the refutes edge was deleted; it must not predict a contradiction. Got {after:?}"
         );
     }
 }

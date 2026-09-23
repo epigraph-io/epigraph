@@ -437,12 +437,6 @@ fn the_in_force_scanner_is_not_vacuous() {
 /// this is the ratchet that can.
 const UNFILTERED_ENDPOINT_READERS: &[(&str, &str, &str)] = &[
     (
-        "crates/epigraph-api/src/routes/belief.rs",
-        "submit_evidence",
-        "PENDING: the G8 contradiction pre-screen is belief-bearing and is \
-         converted by a later commit in this series",
-    ),
-    (
         "crates/epigraph-api/src/routes/edges.rs",
         "neighborhood_hop",
         "OPT-IN: the `?include_retracted=true` branch of GET \

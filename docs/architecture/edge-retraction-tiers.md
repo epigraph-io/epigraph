@@ -47,6 +47,11 @@ itself on the next recompute.
 | Sheaf epistemic scan | `SheafRepository::get_epistemic_edge_pairs` |
 | Matcher `graph_overlap` | `epigraph-engine/src/matching/scorer.rs` |
 | Frame silence alarm (CONTRADICTS count) | `epigraph-api/src/routes/belief.rs` |
+| G8 contradiction pre-screen on `POST /api/v1/frames/:id/evidence` | `predict_contradiction` in `epigraph-api/src/routes/belief.rs` (in-force endpoint reads) |
+
+The G8 pre-screen was missed by 7e870b69 and read the unfiltered endpoint
+reads until the display-tier pass: a deleted `refutes` edge kept emitting
+`contradiction.predicted`.
 
 ### 2. Display — hidden by default, opt-in where an audit view is useful
 
