@@ -345,6 +345,24 @@ impl EdgeRepository {
     /// (invisible), and through the one caller by
     /// `epigraph-mcp/tests/link_alternative_smoke.rs`.
     ///
+    /// ONLY EDGES IN FORCE COUNT, AND THIS IS WHERE IT DIFFERS FROM
+    /// [`Self::create_symmetric_if_absent`], ON PURPOSE. The guard and the probe
+    /// both carry [`EDGE_IN_FORCE_UNALIASED`], so a pair whose `alternative_of`
+    /// edge was retracted (MCP `delete_edge`, `DELETE /api/v1/edges/:id`) can be
+    /// linked again, and the dedup hit names the live row rather than whichever
+    /// row `LIMIT 1` meets first. Before this, a relink after `delete_edge`
+    /// returned the retracted id with `false` and wrote nothing, and no tool
+    /// could restore the pair. That was a regression: a6adf739 turned removal
+    /// into retraction after `link_alternative` shipped, and 091 already states
+    /// the rule this now follows, that a retracted row must not occupy a
+    /// uniqueness slot. The filter is `EDGE_IN_FORCE`, not the index's
+    /// `valid_to IS NULL`: a future-dated `valid_to` is still in force and
+    /// outside the index, so the guard is the only thing that dedups it.
+    /// The matcher's writer keeps its wider guard, per migration 090. It must
+    /// not revive an edge a human retracted, and
+    /// `edge_repo_tests.rs::create_symmetric_if_absent_still_refuses_to_relink_a_retracted_pair`
+    /// pins that the two differ.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails. On the
     /// dedup-hit branch that includes the case where the conflicting edge is not
@@ -362,7 +380,7 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
-        let inserted: Option<Uuid> = sqlx::query_scalar(
+        let insert = format!(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
              SELECT $1, 'claim', $2, 'claim', $3, $4
@@ -371,36 +389,40 @@ impl EdgeRepository {
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
                    AND relationship = $3
+                   AND {EDGE_IN_FORCE_UNALIASED}
              )
              ON CONFLICT DO NOTHING
-             RETURNING id",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .bind(Json(properties))
-        .fetch_optional(pool)
-        .await?;
+             RETURNING id"
+        );
+        let inserted: Option<Uuid> = sqlx::query_scalar(&insert)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .bind(Json(properties))
+            .fetch_optional(pool)
+            .await?;
 
         if let Some(id) = inserted {
             return Ok((id, true));
         }
 
         // Dedup hit — surface the id of the existing symmetric edge.
-        let existing: Uuid = sqlx::query_scalar(
+        let probe = format!(
             "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
              -- same reasoning as `create_or_get`'s.
              SELECT id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
                AND relationship = $3
-             LIMIT 1",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .fetch_one(pool)
-        .await?;
+               AND {EDGE_IN_FORCE_UNALIASED}
+             LIMIT 1"
+        );
+        let existing: Uuid = sqlx::query_scalar(&probe)
+            .bind(a)
+            .bind(b)
+            .bind(relationship)
+            .fetch_one(pool)
+            .await?;
 
         Ok((existing, false))
     }

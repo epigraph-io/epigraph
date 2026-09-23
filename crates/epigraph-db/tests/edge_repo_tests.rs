@@ -420,3 +420,173 @@ async fn create_symmetric_if_absent_returning_resolves_a_concurrent_duplicate_th
         "exactly one alternative_of row for the pair"
     );
 }
+
+/// In-force and total `alternative_of` rows for the unordered pair.
+async fn alternative_of_rows(pool: &PgPool, a: uuid::Uuid, b: uuid::Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE valid_to IS NULL OR valid_to > now()), count(*)
+           FROM edges
+          WHERE relationship = 'alternative_of'
+            AND ((source_id = $1 AND target_id = $2)
+              OR (source_id = $2 AND target_id = $1))",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .expect("count alternative_of rows")
+}
+
+/// A RETRACTED `alternative_of` edge does not block re-linking the pair.
+///
+/// Edge removal is a retraction (`valid_to = now()`, a6adf739), and migration
+/// 091 narrowed `edges_alternative_of_symmetric_uniq` to `valid_to IS NULL` on
+/// the rule that "any uniqueness constraint over edges must exclude retracted
+/// rows or retraction silently becomes a weaker operation than deletion". This
+/// writer's guard and probe did not follow it. After `delete_edge`, a relink
+/// returned the RETRACTED edge's id with `created = false` and wrote nothing, so
+/// no tool could restore the pair.
+///
+/// The third call checks the probe as well as the guard. With both a retracted
+/// and a live row for the pair, a probe without the in-force filter could
+/// return either one from its `LIMIT 1`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_symmetric_if_absent_returning_relinks_a_retracted_pair(pool: PgPool) {
+    let (a, b) = two_claims(&pool, "ret-relink").await;
+
+    let (first, created) = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        a,
+        b,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("first link");
+    assert!(created);
+    assert_eq!(
+        EdgeRepository::retract(&pool, &[first]).await.unwrap(),
+        vec![first],
+        "the first edge must retract"
+    );
+
+    let (second, relinked) = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        b,
+        a,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("relink after retraction");
+    assert!(
+        relinked && second != first,
+        "a relink after retraction must write a NEW live edge; got ({second}, {relinked}) \
+         where the retracted edge is {first}"
+    );
+
+    let third = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        a,
+        b,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("dedup against the live edge");
+    assert_eq!(
+        third,
+        (second, false),
+        "with a retracted and a live row for the pair, the dedup hit must name the LIVE one"
+    );
+    assert_eq!(
+        alternative_of_rows(&pool, a, b).await,
+        (1, 2),
+        "one live edge, and the retracted one kept for audit"
+    );
+}
+
+/// A FUTURE-dated `valid_to` is still in force, and it still dedups.
+///
+/// Such a row (written by `patch_edge` / `PATCH /edges/:id` with a future
+/// `valid_to`) is outside 091's index, whose predicate can only say
+/// `valid_to IS NULL`. The guard is the only thing that stops a second row
+/// here, so narrowing the guard to `valid_to IS NULL` to match the index would
+/// let a duplicate land.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_symmetric_if_absent_returning_dedups_against_a_future_dated_edge(pool: PgPool) {
+    let (a, b) = two_claims(&pool, "ret-future").await;
+
+    let (first, _) = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        a,
+        b,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("first link");
+    sqlx::query("UPDATE edges SET valid_to = now() + interval '1 day' WHERE id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect("future-date the edge");
+
+    let again = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        b,
+        a,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("dedup against a future-dated edge");
+    assert_eq!(
+        again,
+        (first, false),
+        "an edge that is still in force must dedup even outside the index"
+    );
+    assert_eq!(alternative_of_rows(&pool, a, b).await, (1, 1));
+}
+
+/// `create_symmetric_if_absent`, the cross-source matcher's writer, still
+/// treats a RETRACTED edge as "already linked".
+///
+/// Migration 090 kept that guard wider than its index on purpose: narrowing it
+/// "would change what re-linking a retracted pair does, which is a production
+/// behaviour question no obligation in this batch asks". For the matcher, the
+/// wide guard means a re-run cannot bring back an edge a human retracted. The
+/// `_returning` variant's guard is now in-force only, because its one caller is
+/// an explicit operator relink. This test pins that the two functions differ ON
+/// PURPOSE. Harmonising them has to be a decision that edits this test, not a
+/// side effect.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_symmetric_if_absent_still_refuses_to_relink_a_retracted_pair(pool: PgPool) {
+    let (a, b) = two_claims(&pool, "sym-retracted").await;
+    let props = serde_json::json!({"source": "cross_source_matcher"});
+
+    assert!(
+        EdgeRepository::create_symmetric_if_absent(&pool, a, b, "CORROBORATES", props.clone())
+            .await
+            .expect("first link")
+    );
+    let (id,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = 'CORROBORATES'",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    EdgeRepository::retract(&pool, &[id]).await.unwrap();
+
+    let relinked =
+        EdgeRepository::create_symmetric_if_absent(&pool, b, a, "CORROBORATES", props.clone())
+            .await
+            .expect("matcher re-run");
+    assert!(
+        !relinked,
+        "the matcher's writer must NOT revive a retracted pair (migration 090's decision)"
+    );
+    assert_eq!(incident_edge_count(&pool, a, b, "CORROBORATES").await, 1);
+}

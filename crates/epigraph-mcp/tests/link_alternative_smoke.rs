@@ -443,3 +443,75 @@ async fn an_invisible_conflicting_edge_is_refused_without_a_duplicate_or_its_id(
         "the calibration link must insert"
     );
 }
+
+/// `delete_edge` then `link_alternative` restores the pair with a NEW live edge.
+///
+/// `delete_edge` retracts (`valid_to = now()`), and the row stays. Before the
+/// writer's guard and probe were limited to in-force rows, the relink answered
+/// `created = false` with the RETRACTED edge's id and wrote nothing. The pair
+/// could not be linked again by any tool.
+#[sqlx::test(migrations = "../../migrations")]
+async fn relinking_after_delete_edge_writes_a_new_live_edge(pool: PgPool) {
+    use epigraph_mcp::tools::edge_mutation::do_delete_edge;
+    use epigraph_mcp::types::DeleteEdgeParams;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone());
+    let (a, b) = two_public_claims(&pool, "alt-relink").await;
+
+    let first = parse_response(
+        &do_link_alternative(&server, &viewer, params(a, b))
+            .await
+            .expect("first link"),
+    );
+    assert!(first.created);
+    do_delete_edge(
+        &server,
+        DeleteEdgeParams {
+            edge_id: first.edge_id.clone(),
+        },
+    )
+    .await
+    .expect("delete_edge retracts the link");
+
+    let relinked = parse_response(
+        &do_link_alternative(&server, &viewer, params(b, a))
+            .await
+            .expect("relink after delete_edge"),
+    );
+    assert!(
+        relinked.created && relinked.edge_id != first.edge_id,
+        "a relink after delete_edge must write a NEW live edge; got edge_id={} created={} \
+         where the deleted edge is {}",
+        relinked.edge_id,
+        relinked.created,
+        first.edge_id
+    );
+
+    let again = parse_response(
+        &do_link_alternative(&server, &viewer, params(a, b))
+            .await
+            .expect("dedup against the relinked edge"),
+    );
+    assert_eq!(
+        (again.edge_id.as_str(), again.created),
+        (relinked.edge_id.as_str(), false),
+        "the dedup hit must name the LIVE edge, not the retracted one"
+    );
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+           AND relationship = 'alternative_of' AND valid_to IS NULL",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "exactly one live alternative_of edge");
+    assert_eq!(
+        pair_count(&pool, a, b).await,
+        2,
+        "the retracted edge is kept for audit"
+    );
+}
