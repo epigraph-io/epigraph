@@ -48,6 +48,29 @@
 //! the branch's inherited inventory undercounted. Those live in the brief's D4,
 //! not here. It is also purely syntactic: it says which call sites take the
 //! unstamped pool, never whether the statement they run would be refused.
+//!
+//! # The axis it pins, and the axis it does not
+//!
+//! VERIFIED that it pins the first: reverting `challenge_claim`'s converted call
+//! site from `&mut *tx` back to `&server.pool` makes
+//! [`the_tool_layers_unstamped_writes_are_exactly_the_registered_set`] FAIL, naming
+//! the exact new tuple `("tools/challenges.rs", "ChallengeRepository::create", 1)`;
+//! restoring it returns the file to 6/6. So the reviewer's concern that "a future
+//! edit reverting any tool to `&server.pool` would compile and pass the entire
+//! suite" is answered — measured, not asserted. That is also why no
+//! `server_without_scoped(...)` arms were added per converted tool: they would
+//! catch the same revert this scan already catches, at six times the surface.
+//!
+//! IT DOES NOT PIN THE SECOND: a site can be stamped, and stamped from the WRONG
+//! AUTHOR. That is invisible to a syntactic scan — the call reads `&mut *tx`
+//! either way — and it is the axis on which a conversion actually fails, because
+//! every tier-A `WITH CHECK` asks about the ROW's `owner_group_id` rather than the
+//! caller's identity. `scripts/e2e/probe-workflow.sh` is currently the only
+//! instrument for it: it reaches the real `epigraph_app` role (`rolbypassrls =
+//! false`), seeds the SAME claim in the server agent's own group and in a foreign
+//! one, and reports which writes land. A green run HERE means "no tool-layer write
+//! takes the unstamped pool except the registered ones" — never "the converted
+//! tools stamp from the right viewer".
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
