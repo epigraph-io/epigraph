@@ -74,12 +74,13 @@
 //!   `MaintenanceConn`, which is why the repo method takes an executor); and
 //!   `epigraph-jobs/src/db_reputation_service.rs::get_claim_outcomes` still has
 //!   it — it mints a viewer from `self.scoped` and queries `self.pool` — but has
-//!   no production constructor. A second lint keyed on that shape, with those
-//!   two files as its calibration cases, is recorded as
-//!   `D-PR17-hybrid-shape-lint` in `docs/tenancy/progress.json`. Until it
-//!   exists, a green run here means "no scanned file builds an unmaintained
-//!   pool", not "no scanned file spends a bypass on an unprivileged
-//!   connection".
+//!   no production constructor. The second lint keyed on that shape, with those
+//!   two files as its calibration cases, is `no_hybrid_bypass_spend.rs`
+//!   (`D-PR17-hybrid-shape-lint` in `docs/tenancy/progress.json`); it follows a
+//!   bypass across function and file boundaries too. A green run HERE still
+//!   means only "no scanned file builds an unmaintained pool", not "no scanned
+//!   file spends a bypass on an unprivileged connection" — that is the other
+//!   lint's claim.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

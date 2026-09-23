@@ -155,7 +155,9 @@ listed refusals are armed. Arm the sixth, or amend the acceptance line to say wh
 **2.2.4 `D-PR17-maintenance-lease-coupling-is-a-convention`** — see §1. Make the coupling
 between a bypass `Viewer` and the maintenance connection structural rather than a call-site
 convention. Companion: `D-PR17-hybrid-shape-lint`, a lint for the hybrid shape (minting a
-bypass viewer and spending it on a non-maintenance pool).
+bypass viewer and spending it on a non-maintenance pool). **Lint DISCHARGED 2026-09-22**:
+`no_hybrid_bypass_spend.rs` follows the bypass across function and file boundaries
+(`D-PR17-hybrid-shape-lint.cross_function_pass_2026_09_22`); one registered row remains.
 
 **2.2.5 Remaining FORCE-correctness obligations**, each small and independently landable:
 `D-PR17-creator-arm-outlives-membership`,

@@ -192,6 +192,13 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   (still has the shape; no production constructor) and
   `epigraph-api/src/routes/claims.rs::find_claims_needing_embeddings` (had it,
   fixed in PR-15 by making the repo method executor-generic).
+  **DISCHARGED 2026-09-22** (deferred-commitment screen,
+  `hybrid-lint-cross-function-blind-spot`): `no_hybrid_bypass_spend.rs` shipped
+  function-granular and now also follows the bypass across function and file
+  boundaries — run against the pre-fix tree (`ba6f6d68`) it reports the three
+  `epigraph-mcp` tools it could not see before. `db_reputation_service.rs::get_claim_outcomes`
+  stays a registered row with its owner; see
+  `D-PR17-hybrid-shape-lint.cross_function_pass_2026_09_22`.
 - **PR-17 owes** an answer on DERIVED-ROW visibility. `ClusterGraphHandler` and
   `ThemeClusterRebuildHandler` now run on the maintenance DSN with no `Viewer`
   at all, and they persist rows computed over group-private claims. What

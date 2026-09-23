@@ -1103,8 +1103,10 @@ impl AppState {
     /// unprivileged connection — an empty result and a 200.
     /// `routes/claims.rs::find_claims_needing_embeddings` is the one call site
     /// and it takes both halves from [`epigraph_db::MaintenanceSession::split`].
-    /// That residual is `D-PR17-hybrid-shape-lint`, which is a lint's job rather
-    /// than a lifetime's.
+    /// That residual is a lint's job rather than a lifetime's:
+    /// `crates/epigraph-db/tests/no_hybrid_bypass_spend.rs`
+    /// (`D-PR17-hybrid-shape-lint`) fails on a session holder that names
+    /// `db_pool`, and on any function it hands the viewer to that does.
     ///
     /// # Errors
     /// `DbError::InvalidData` when this `AppState` was not built from a
