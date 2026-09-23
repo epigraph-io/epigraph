@@ -1,0 +1,39 @@
+{
+  "source": {
+    "title": "Axis Round Trip Paper",
+    "doi": "10.1234/axis-roundtrip",
+    "source_type": "Paper",
+    "authors": [
+      {"name": "Ada Axis", "affiliations": [], "roles": ["author"]}
+    ]
+  },
+  "thesis": "Anxiolytic potency varies across compounds",
+  "thesis_derivation": "TopDown",
+  "sections": [{
+    "title": "Results",
+    "paragraphs": [
+      {
+        "text": "Compound A was mild, compound B moderate, and compound C strong.",
+        "atoms": [
+          "Compound A shows mild anxiolytic potency",
+          "Compound B shows moderate anxiolytic potency",
+          "Compound C shows strong anxiolytic potency"
+        ],
+        "generality": [3, 3, 3],
+        "confidence": 0.8,
+        "axis": {
+          "frame": "anxiolytic_potency",
+          "hypotheses": ["ineffective", "mild", "moderate", "strong"],
+          "label": "moderate"
+        },
+        "axis_labels": ["mild", "", "strong"]
+      },
+      {
+        "text": "All three compounds were well tolerated.",
+        "atoms": ["All three compounds were well tolerated"],
+        "generality": [3],
+        "confidence": 0.8
+      }
+    ]
+  }]
+}

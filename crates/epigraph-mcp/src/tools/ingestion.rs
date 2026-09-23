@@ -180,16 +180,19 @@ pub async fn ingest_document(
     // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
     // over-reading is wrong: it constrains the VIEWER the detached task holds,
     // not the task's database reach. `do_ingest_document` takes this `&Viewer`
-    // and spends it at two places; its remaining statements run on
-    // `&server.pool` with no viewer at all. Those are the registered
-    // `epigraph-mcp` limit in `no_unscoped_pool.rs` (a `PgPool`-mention count,
-    // not a converted crate), pre-existing and untouched here — this refusal
-    // does not cover them and must not be read as covering them.
+    // and spends it at three places (the stored-frame read in
+    // `preflight_document`, the edge auto-wire and the DS batch wire), and
+    // this entry point spends it once more on that same preflight read before
+    // detaching. The core's remaining statements run on `&server.pool` with
+    // no viewer at all. Those are the registered `epigraph-mcp` limit in
+    // `no_unscoped_pool.rs` (a `PgPool`-mention count, not a converted crate),
+    // pre-existing and untouched here — this refusal does not cover them and
+    // must not be read as covering them.
     //
     // ABOVE `ensure_paper_node`, not below it, which is the file's own stated
-    // convention two guards up in `do_ingest_document`: fail closed BEFORE any
-    // DB write. On the refusal arm nothing has been written, so no `papers` row
-    // survives an ingest that was refused. `request_viewer` resolves an
+    // convention in `preflight_document`: fail closed BEFORE any DB write. On
+    // the refusal arm nothing has been written, so no `papers` row survives an
+    // ingest that was refused. `request_viewer` resolves an
     // `agents.id` on both transports, so the arm is not reachable today — it is
     // written as a refusal rather than an `expect` because the state it would
     // represent is a widening, and those fail closed. `invalid_request` rather
@@ -202,6 +205,11 @@ pub async fn ingest_document(
             None,
         )
     })?;
+
+    // Also above `ensure_paper_node` and the spawn: a document the core would
+    // refuse must fail THIS call, not a detached task the caller never hears
+    // from, and must leave no `papers` row. See `preflight_document`.
+    preflight_document(&server.pool, &viewer, &extraction).await?;
 
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
@@ -241,6 +249,9 @@ pub async fn ingest_document_inline(
             None,
         )
     })?;
+
+    // Same preflight, same placement and same reason as `ingest_document`.
+    preflight_document(&server.pool, &viewer, &extraction).await?;
 
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
@@ -394,38 +405,49 @@ pub async fn ingest_document_spine(
     do_ingest_document_spine(server, &params.extraction).await
 }
 
-/// Core ingestion logic factored out so integration tests can drive a parsed
-/// `DocumentExtraction` without round-tripping through the file-path validation
-/// in `ingest_document`.
-#[allow(clippy::too_many_lines)]
-pub async fn do_ingest_document(
-    server: &EpiGraphMcpFull,
+/// Every refusal an ingest can make from the extraction plus a read of stored
+/// frames, run BEFORE any DB write. Returns the plan it had to build for the
+/// stored-frame check, so the core does not build it twice.
+///
+/// It exists as one helper because the MCP entry points must run it too, not
+/// only [`do_ingest_document`]. `ingest_document` and `ingest_document_inline`
+/// write the `papers` row synchronously and then hand the ingest to a
+/// DETACHED task, returning `status: "queued"`. A refusal raised only inside
+/// that task reaches a `tracing::warn!` and never the caller, and the paper
+/// node is already written by then. So each entry point calls this first, and
+/// a refused document fails the call itself with nothing written.
+///
+/// The three guards, in order:
+/// 1. D9 writer-side verbatim re-verification. When the extraction carries
+///    `source_text`, every span-backed paragraph's stored `text` must equal the
+///    bytes its span points at, so paraphrase drift can never reach a
+///    verbatim_v2 node. No-op for Tier 2 (no `source_text`).
+/// 2. Declared-axis guard, in-document half (issue #222). Fail closed:
+///    silently degrading to the binary frame would record a belief about TRUE
+///    for a claim the caller placed on a labeled hypothesis. It must also
+///    precede [`build_ingest_plan`], which assumes validated axes.
+/// 3. Declared-axis guard, stored-frame half (issue #222). `validate_axes`
+///    sees only this document, so a frame an EARLIER ingest stored under the
+///    same name over a different list used to surface only inside
+///    `auto_wire_ds_batch`, which logs and skips: the atoms were persisted
+///    with no mass function. Scoped to atoms (level 3), the only DS-wired
+///    claims, so it refuses exactly what the wire would otherwise skip.
+///
+/// Read-only. A frame created by a concurrent ingest after this check is still
+/// refused per atom by `ensure_axis_frame` at wire time; that is the backstop,
+/// not the normal path.
+pub async fn preflight_document(
+    pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
-) -> Result<CallToolResult, McpError> {
-    // D9 writer-side verbatim re-verification: when the extraction carries
-    // `source_text`, every span-backed paragraph's stored `text` must equal the
-    // bytes its span points at. Fail closed before any DB write so paraphrase
-    // drift can never reach a verbatim_v2 node. No-op for Tier 2 (no source_text).
+) -> Result<epigraph_ingest::builder::IngestPlan, McpError> {
     epigraph_ingest::document::structure::verify_extraction_verbatim(extraction)
         .map_err(|e| invalid_params(format!("verbatim guard failed: {e}")))?;
 
-    // Declared-axis guard (issue #222): reject a malformed axis before any DB
-    // write. Fail closed — silently degrading to the binary frame would record a
-    // belief about TRUE for a claim the caller placed on a labeled hypothesis.
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
 
     let plan = build_ingest_plan(extraction);
-    let pool = &server.pool;
-
-    // Declared-axis guard, stored-frame half (issue #222). `validate_axes`
-    // checks the document against itself. This check runs against frames that
-    // already exist, and it must also run before any write. Without it, a name
-    // clash surfaced only inside `auto_wire_ds_batch`, which logs and skips.
-    // The call then succeeded with the clashing atoms persisted but carrying no
-    // mass function. Scoped to atoms (level 3), the only claims that are
-    // DS-wired, so this refuses exactly what the wire would otherwise skip.
     let declared_axes: Vec<&epigraph_ingest::common::plan::PlannedAxis> = plan
         .claims
         .iter()
@@ -435,6 +457,27 @@ pub async fn do_ingest_document(
     ds_auto::check_axes_against_stored_frames(pool, viewer, &declared_axes)
         .await
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+
+    Ok(plan)
+}
+
+/// Core ingestion logic factored out so integration tests can drive a parsed
+/// `DocumentExtraction` without round-tripping through the file-path validation
+/// in `ingest_document`.
+#[allow(clippy::too_many_lines)]
+pub async fn do_ingest_document(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+) -> Result<CallToolResult, McpError> {
+    // Every refusal that needs only the extraction and a read of stored frames
+    // runs here, before any DB write. The two MCP entry points run the same
+    // preflight before they write the `papers` row and detach this function;
+    // it runs again here because the CLI `ingest_document` bin calls this core
+    // directly, and because a frame can be created by a concurrent ingest in
+    // the window between an entry point's preflight and this task.
+    let plan = preflight_document(&server.pool, viewer, extraction).await?;
+    let pool = &server.pool;
 
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);

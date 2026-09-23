@@ -134,3 +134,51 @@ async fn structure_then_ingest_yields_verbatim_spine(pool: PgPool) {
         "two sections -> exactly one section_follows edge"
     );
 }
+
+/// The verbatim guard runs in the MCP call itself, not only in the detached
+/// ingest (`ingestion::preflight_document`). `ingest_document_inline` writes
+/// the `papers` row and then returns `queued`, so a guard that ran only in the
+/// background task refused a drifted paragraph where the caller never saw it,
+/// with the paper node already written. The call must now fail with
+/// INVALID_PARAMS and leave no `papers` row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verbatim_drift_fails_the_inline_call_before_the_paper_node(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone());
+    let src = "# Intro\n\nAlpha is a fact.\n\n## Body\n\nBeta follows alpha.";
+
+    let sp = StructureSourceParams {
+        text: src.to_string(),
+        source: serde_json::from_value(
+            serde_json::json!({ "title": "E2E drift", "doi": "10.1/e2e-drift" }),
+        )
+        .unwrap(),
+        format: "markdown".to_string(),
+        segmentation: None,
+    };
+    let structured = structure_source(&server, sp).await.unwrap();
+    let mut extraction: DocumentExtraction =
+        serde_json::from_str(&result_text(&structured)).unwrap();
+    extraction.sections[0].paragraphs[0].atoms = vec!["Alpha is a fact".to_string()];
+    extraction.sections[1].paragraphs[0].atoms = vec!["Beta follows alpha".to_string()];
+    // Paraphrase drift: the stored text no longer equals the bytes its span
+    // points at in `source_text`.
+    extraction.sections[0].paragraphs[0].text = "Alpha is a known fact.".to_string();
+
+    let err = ingest_document_inline(&server, &viewer, IngestDocumentInlineParams { extraction })
+        .await
+        .expect_err("a drifted paragraph must fail the call itself, not return queued");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(
+        err.message.contains("verbatim guard failed"),
+        "the error must name the guard: {}",
+        err.message
+    );
+
+    let papers: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = '10.1/e2e-drift'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(papers, 0, "no paper may be written by a refused ingest");
+}

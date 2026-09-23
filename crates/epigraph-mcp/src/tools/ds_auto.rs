@@ -145,7 +145,9 @@ pub async fn ensure_axis_frame(
 /// skips the claim. So the ingest call used to succeed with those atoms carrying
 /// no mass function, although the tool contract says an inconsistent axis
 /// fails the call. Run this before any write, and the whole ingest is refused
-/// instead.
+/// instead. Its caller is `ingestion::preflight_document`, which both MCP
+/// ingest entry points run before they write the `papers` row and detach the
+/// ingest, so the refusal reaches the caller rather than a background log.
 ///
 /// A frame that does not exist yet passes: `ensure_axis_frame` will create it.
 /// A clash created by a concurrent ingest between this check and the wire is
