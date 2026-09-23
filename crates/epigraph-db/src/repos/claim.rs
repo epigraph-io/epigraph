@@ -646,13 +646,36 @@ impl ClaimRepository {
     /// authenticated principal at token mint (PR-02), so on a live path this is
     /// a lookup, not a write.
     ///
+    /// # An OPERATED author writes into its operator's group (migration 102)
+    ///
+    /// When `agent_id` has exactly one live operator link
+    /// ([`AgentRepository::operator_of`](crate::repos::AgentRepository::operator_of)),
+    /// the declaration is `('public', <the OPERATOR's personal group>)`. The
+    /// agent holds `writer` there, so the author-stamped transaction it writes
+    /// in (`epigraph_mcp::claim_helper::begin_author_stamped_tx`) can write the
+    /// claim and every claim-derived row, and the operator — and every other
+    /// agent it operates — owns what it wrote. Model upgrades mint new agent
+    /// identities (`keypair_from_llm_agent`), so this is what keeps a job's work
+    /// in one place across them.
+    ///
+    /// The operator lookup runs FIRST and goes through a `SECURITY DEFINER`
+    /// read, so it answers correctly on an unstamped `epigraph_app` session,
+    /// where `groups_tenancy` hides every row and a read-first lookup here
+    /// would be blind. An unlinked, revoked or ambiguous author falls through
+    /// to [`Self::personal_group_of`] exactly as before.
+    ///
     /// # Errors
     /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
-    /// `DbError::QueryFailed` for other database failures.
+    /// `DbError::QueryFailed` for other database failures — including a
+    /// database that has not applied migration 102, which fails CLOSED here
+    /// rather than authoring as if the author had no operator.
     pub async fn default_decl_for_author(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
     ) -> Result<TenancyDecl, DbError> {
+        if let Some(link) = crate::repos::AgentRepository::operator_of(conn, agent_id).await? {
+            return Ok(TenancyDecl::public(link.operator_group_id));
+        }
         Ok(TenancyDecl::public(
             Self::personal_group_of(conn, agent_id).await?,
         ))

@@ -15,7 +15,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::{AgentRepository, GroupMembershipRepository};
+use epigraph_db::{AgentRepository, ClaimRepository, GroupMembershipRepository, Viewer};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -64,6 +64,13 @@ async fn membership_rows(pool: &PgPool, group: Uuid, agent: Uuid) -> Vec<(String
     .fetch_all(pool)
     .await
     .expect("read memberships")
+}
+
+fn owner_of(decl: epigraph_core::TenancyDecl) -> Uuid {
+    match decl {
+        epigraph_core::TenancyDecl::Declared { owner_group_id, .. } => owner_group_id,
+        epigraph_core::TenancyDecl::Inherited => panic!("default_decl_for_author declared nothing"),
+    }
 }
 
 fn sqlstate(e: &sqlx::Error) -> Option<String> {
@@ -329,4 +336,204 @@ async fn an_auth_lineage_edge_alone_is_not_an_operator_link(pool: PgPool) {
         .await
         .expect("links")
         .is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constraint 4 and the authoring path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// On an UNSTAMPED `epigraph_app` session, `default_decl_for_author` for an
+/// operated agent returns the OPERATOR's group — and writes nothing.
+///
+/// On that session `groups_tenancy` hides every row, so a read-first lookup is
+/// blind and a read-then-mint helper becomes an unconditional re-mint. The
+/// operator lookup must therefore go through a SECURITY DEFINER read. The
+/// row counts are the half the superuser harness can never see: a mint there
+/// is invisible because the read it follows is not blind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn operator_lookup_works_on_an_unstamped_app_session_and_mints_nothing(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (agent, own_group) = fixture::seed_agent_with_group(&pool, "agent").await;
+    link(&pool, agent, operator).await;
+    let op_group = operator_group(&pool, operator).await;
+
+    let counts = |pool: PgPool| async move {
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT (SELECT count(*) FROM groups), (SELECT count(*) FROM group_memberships)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("counts")
+    };
+    let before = counts(pool.clone()).await;
+
+    let decl = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let blind: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(operator)
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("inline read");
+        assert_eq!(
+            blind, None,
+            "PREMISE: an inline groups read on an unstamped app session must be blind, or this \
+             test cannot tell a definer read from an ordinary one"
+        );
+        let d = ClaimRepository::default_decl_for_author(&mut conn, agent).await;
+        (conn, d)
+    })
+    .await
+    .expect("default_decl_for_author on an unstamped app session");
+
+    assert_eq!(
+        owner_of(decl),
+        op_group,
+        "an operated agent's new claims must be owned by the OPERATOR's personal group (its own \
+         is {own_group})"
+    );
+    assert_eq!(
+        counts(pool.clone()).await,
+        before,
+        "the lookup wrote groups/memberships: a read-then-mint on a blind session"
+    );
+}
+
+/// An operated agent, stamped from ITS OWN viewer, can write a claim owned by
+/// the operator's group AND the claim-derived rows (trace, evidence) as
+/// `epigraph_app`. An agent with NO link, stamped from its own viewer, is
+/// refused the same writes — the refusal path is unchanged.
+///
+/// The GUCs come from a real `Viewer::resolve` on the SUPERUSER pool (resolve
+/// first, downgrade second), so the writable set is the one the writer
+/// membership actually produces — not a hand-typed group id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_writes_claim_derived_rows_into_the_operator_group(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
+    let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    link(&pool, agent, operator).await;
+    let op_group = operator_group(&pool, operator).await;
+
+    let agent_viewer = Viewer::resolve(&pool, agent).await.expect("resolve agent");
+    let unlinked_viewer = Viewer::resolve(&pool, unlinked)
+        .await
+        .expect("resolve unlinked");
+    assert!(
+        agent_viewer.writable_groups().contains(&op_group),
+        "the writer membership must put the operator's group in the agent's writable set"
+    );
+    assert!(!unlinked_viewer.writable_groups().contains(&op_group));
+
+    let (linked_result, unlinked_result) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let linked = write_claim_trace_evidence(&mut conn, &agent_viewer, agent).await;
+            let unlinked =
+                write_claim_trace_evidence_into(&mut conn, &unlinked_viewer, unlinked, op_group)
+                    .await;
+            (conn, (linked, unlinked))
+        })
+        .await;
+
+    let claim = linked_result.expect(
+        "an operated agent stamped from its own viewer must write the claim, its trace and its \
+         evidence into the operator's group as epigraph_app",
+    );
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("owner");
+    assert_eq!(owner, op_group);
+    let (traces, evidence): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM reasoning_traces WHERE claim_id = $1 AND owner_group_id = $2), \
+                (SELECT count(*) FROM evidence WHERE claim_id = $1 AND owner_group_id = $2)",
+    )
+    .bind(claim)
+    .bind(op_group)
+    .fetch_one(&pool)
+    .await
+    .expect("derived rows");
+    assert_eq!((traces, evidence), (1, 1));
+
+    let err = unlinked_result.expect_err(
+        "an agent with NO operator link wrote into the operator's group: the writer membership \
+         must be what confers this, not the stamp",
+    );
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
+}
+
+async fn set_gucs_from(conn: &mut sqlx::PgConnection, v: &Viewer) {
+    let join = |ids: Option<&[Uuid]>| {
+        ids.unwrap_or(&[])
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(join(v.group_bind()))
+    .bind(join(v.writable_bind()))
+    .bind(v.principal().map(|p| p.to_string()).unwrap_or_default())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp GUCs");
+}
+
+/// The claim is owned by whatever `default_decl_for_author` chooses.
+async fn write_claim_trace_evidence(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    author: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    set_gucs_from(conn, viewer).await;
+    let decl = ClaimRepository::default_decl_for_author(conn, author)
+        .await
+        .expect("decl");
+    write_claim_trace_evidence_into(conn, viewer, author, owner_of(decl)).await
+}
+
+async fn write_claim_trace_evidence_into(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    author: Uuid,
+    group: Uuid,
+) -> Result<Uuid, sqlx::Error> {
+    set_gucs_from(conn, viewer).await;
+    let claim = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'operated agent claim', $2, 0.8, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(hash32(claim))
+    .bind(author)
+    .bind(group)
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "INSERT INTO reasoning_traces (claim_id, reasoning_type, confidence, explanation) \
+         VALUES ($1, 'deductive', 0.9, 'operated agent trace')",
+    )
+    .bind(claim)
+    .execute(&mut *conn)
+    .await?;
+    let ev = Uuid::new_v4();
+    sqlx::query("INSERT INTO evidence (claim_id, evidence_type, content_hash) VALUES ($1, 'observation', $2)")
+        .bind(claim)
+        .bind(hash32(ev))
+        .execute(&mut *conn)
+        .await?;
+    Ok(claim)
 }
