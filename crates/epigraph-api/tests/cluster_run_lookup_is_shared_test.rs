@@ -14,8 +14,17 @@
 //! Scope is deliberately narrow: the two route modules that serve the expand
 //! family. `routes/clusters.rs` writes and prunes `graph_cluster_runs` rows
 //! and legitimately names the table; it is not in scope here.
+//!
+//! The source is read through `lint_text::strip_comments`, the same helper
+//! `no_redaction_sentinel.rs` uses. A raw `contains` failed on both files even
+//! after a perfect refactor, because each names `graph_cluster_runs` in a
+//! comment EXPLAINING that the table carries no tenancy columns — prose the
+//! lint has no business forbidding.
 
 use std::path::PathBuf;
+
+mod lint_text;
+use lint_text::strip_comments;
 
 /// The route modules that must not know the shape of `graph_cluster_runs`.
 const EXPAND_ROUTE_FILES: &[&str] = &["src/routes/graph.rs", "src/routes/graph_neighborhood.rs"];
@@ -50,7 +59,7 @@ fn body_of(src: &str, signature: &str) -> String {
 #[test]
 fn no_expand_route_inlines_the_latest_run_lookup() {
     for file in EXPAND_ROUTE_FILES {
-        let src = read(file);
+        let src = strip_comments(&read(file));
         assert!(
             !src.contains("graph_cluster_runs"),
             "{file} still names `graph_cluster_runs` in its own SQL. The latest-run \
@@ -64,7 +73,7 @@ fn no_expand_route_inlines_the_latest_run_lookup() {
 #[test]
 fn every_run_resolving_handler_calls_the_shared_lookup() {
     for (file, signature) in RUN_RESOLVING_HANDLERS {
-        let body = body_of(&read(file), signature);
+        let body = body_of(&strip_comments(&read(file)), signature);
         assert!(
             body.contains("ClusterRunRepository::latest"),
             "{file} `{signature}` does not call `ClusterRunRepository::latest`; \
