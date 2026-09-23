@@ -12,7 +12,7 @@
 //! - `DELETE /api/v1/workflows/:id`            - Deprecate workflow
 //! - `POST   /api/v1/workflows/:id/behavioral-executions` - Record behavioral execution
 //!
-//! # Tenancy: 18 of this file's 40 raw-pool sites are converted or removed
+//! # Tenancy: 19 of this file's 40 raw-pool sites are converted or removed
 //!
 //! Conversion shard 7 — the last read shard. `search_workflows` (6 sites),
 //! `find_workflow_hierarchical` (3) and `list_workflows` (1) each assemble their
@@ -100,9 +100,18 @@
 //! re-read is gone (the gate already returned the content). A flat workflow
 //! the caller cannot read is 404 on both routes.
 //!
-//! The other 22 sites are NOT converted, and all 22 sit in WRITE handlers
+//! One more is `report_hierarchical_outcome`'s step lookup, also a READ in a
+//! WRITE handler. It resolves each reported `step_index` through
+//! `WorkflowRepository::step_seeds` (edge and claim marked) on a `read_as`
+//! connection released before the writes. That is the statement
+//! `find_workflow_hierarchical` resolves steps with, so an index the caller
+//! learned there lands on the same step here. Its unfiltered inline copy both
+//! read steps the caller could not see and shifted every later index for a
+//! caller who could not see them all.
+//!
+//! The other 21 sites are NOT converted, and all 21 sit in WRITE handlers
 //! (`store_workflow`, `report_outcome`'s writes, `deprecate_workflow`'s event,
-//! `report_hierarchical_outcome`, `ingest_workflow`,
+//! `report_hierarchical_outcome`'s writes, `ingest_workflow`,
 //! `record_behavioral_execution`, `evolve_step`, `add_step`, `delete_step`):
 //! [`AppState::read_as`] is documented read-only, and a write routed through a
 //! `ScopedRead` is rolled back on drop under `SessionGucMode::Transaction` while
@@ -121,10 +130,10 @@
 //! here. It is the open finding `F-DEFERRED-0922-A1` in
 //! `docs/tenancy/progress.json`.
 //!
-//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` carries
-//! `("workflows.rs", 1)`, down from 4: the three statements above moved into
-//! the repo layer. The one left is `report_hierarchical_outcome`'s step lookup.
-//! `ROUTE_LAYER_WRITES` still carries `("workflows.rs", 4)`; no write moved.
+//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` no longer carries
+//! this file; it was `("workflows.rs", 4)`, and the four statements above moved
+//! into the repo layer. `ROUTE_LAYER_WRITES` still carries
+//! `("workflows.rs", 4)`; no write moved.
 //! (`deprecate_workflow`'s inline `SELECT id` existence probe had already moved
 //! into the repo layer. It projected no content column and wrote nothing, so it
 //! was in neither count.)
@@ -1181,6 +1190,11 @@ pub async fn find_workflow_hierarchical(
 ///
 /// Returns 404 if the id does not correspond to a `workflows` row. Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
+///
+/// `step_index` is resolved against the steps the caller can read, in plan
+/// order (`WorkflowRepository::step_seeds`, the list `find_workflow_hierarchical`
+/// returns). A step the caller cannot read is not resolved. The `workflows`
+/// row itself carries no tenancy, so this route cannot filter it.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1196,6 +1210,7 @@ pub async fn find_workflow_hierarchical(
     tag = "workflows"
 )]
 pub async fn report_hierarchical_outcome(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
@@ -1273,20 +1288,33 @@ pub async fn report_hierarchical_outcome(
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
     //    sorted by claim level=2 (steps), in plan order. Plan order is the
     //    insertion order of `executes` edges; we use edges.created_at as proxy.
-    let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT c.id \
-         FROM edges e \
-         JOIN claims c ON c.id = e.target_id \
-         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY e.created_at ASC, c.id ASC",
-    )
-    .bind(workflow_id)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("step lookup failed: {e}"),
-    })?;
-    let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
+    //
+    //    Viewer-filtered, on a stamped connection released before the writes
+    //    below: the same statement `find_workflow_hierarchical` resolves steps
+    //    with, so a `step_index` the caller learned there maps to the same
+    //    step here. A step the caller cannot read is neither resolved nor
+    //    counted.
+    let step_claim_ids: Vec<Uuid> = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "report_hierarchical_outcome",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        epigraph_db::WorkflowRepository::step_seeds(&mut *read, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("step lookup failed: {e}"),
+            })?
+            .into_iter()
+            .map(|(id, _lineage)| id)
+            .collect()
+    };
 
     // 5. Write per-step behavioral_executions rows. Capture timestamp once so
     //    rows from a single outcome report group cleanly downstream.

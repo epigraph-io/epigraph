@@ -851,3 +851,103 @@ async fn report_outcome_gates_on_a_workflow_the_viewer_can_read(pool: PgPool) {
         "before_truth comes from the gate's own read of the private row"
     );
 }
+
+/// `POST /workflows/hierarchical/:id/outcome` resolves each reported
+/// `step_index` against the steps the CALLER can read, in plan order — the same
+/// list `find_workflow_hierarchical` gave it.
+///
+/// Three steps in plan order: public, the stranger's private step (its
+/// `executes` edge forced PUBLIC, so only the `claims` predicate hides it), and
+/// the viewer's own private step. The viewer sees `[public, mine]`, so it
+/// reports indices 0 and 1 and they must land on those two claims. Unfiltered,
+/// index 1 would land on the stranger's step; on the unstamped raw pool the
+/// viewer's own step is hidden and index 1 resolves to nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_hierarchical_outcome_resolves_steps_the_viewer_can_read(pool: PgPool) {
+    let p = plant(&pool, "wf-hier").await;
+    let world: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("world group");
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        &format!("inline-reads-hier-{workflow_id}"),
+        0,
+        "hierarchical outcome probe",
+        None,
+        serde_json::json!({}),
+    )
+    .await
+    .expect("seed workflow root");
+
+    for (offset, (step, visibility, group)) in [
+        (p.public, "public", world),
+        (p.theirs, "public", world),
+        (p.mine, "group", p.viewer_group),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        set_properties(&pool, step, serde_json::json!({ "level": 2 })).await;
+        let edge: Uuid = sqlx::query_scalar(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, \
+                                relationship, created_at) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', \
+                     now() - make_interval(secs => $3)) \
+             RETURNING id",
+        )
+        .bind(workflow_id)
+        .bind(step)
+        .bind(f64::from(10 - i32::try_from(offset).expect("small")))
+        .fetch_one(&pool)
+        .await
+        .expect("seed executes edge");
+        force_tenancy(&pool, "edges", edge, visibility, group).await;
+    }
+
+    let step = |i: usize| epigraph_api::routes::workflows::StepExecution {
+        step_index: i,
+        planned: format!("step {i}"),
+        actual: format!("step {i} done"),
+        deviated: false,
+        deviation_reason: None,
+    };
+    let state = split_state(&pool).await;
+    let served = epigraph_api::routes::workflows::report_hierarchical_outcome(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state),
+        axum::extract::Path(workflow_id),
+        Json(epigraph_api::routes::workflows::ReportOutcomeRequest {
+            success: true,
+            outcome_details: "probe".to_string(),
+            quality: Some(1.0),
+            step_executions: Some(vec![step(0), step(1)]),
+            goal_text: None,
+        }),
+    )
+    .await
+    .expect("report_hierarchical_outcome")
+    .0;
+    assert_eq!(served["use_count"].as_i64(), Some(1));
+
+    let attributed: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT tool_pattern[1], step_claim_id FROM behavioral_executions \
+         WHERE workflow_id = $1 ORDER BY tool_pattern[1]",
+    )
+    .bind(workflow_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read behavioral_executions");
+    assert_eq!(
+        attributed,
+        vec![
+            ("step 0".to_string(), Some(p.public)),
+            ("step 1".to_string(), Some(p.mine)),
+        ],
+        "index 1 must resolve to the viewer's own step, the second step it can \
+         read — not to the stranger's step (predicate missing) and not to \
+         nothing (read on the unstamped raw pool)"
+    );
+}

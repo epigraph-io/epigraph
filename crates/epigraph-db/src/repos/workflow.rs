@@ -636,20 +636,28 @@ impl WorkflowRepository {
         Ok(parent.map(|(id,)| id))
     }
 
-    /// For each `executes`-edge from the workflow root, walk supersedes/revises
-    /// edges to the latest head claim. Mirrors the resolution logic that
-    /// previously lived in `epigraph-mcp::tools::workflow_hierarchical::build_resolved_steps`.
+    /// The level=2 step claims under hierarchical workflow `workflow_id`, with
+    /// their `step_lineage_id`, in plan order (`executes` edge `created_at`,
+    /// then claim id). Viewer-filtered on both the edge and the claim.
+    ///
+    /// The position of a step in this list IS its `step_index`. That is why
+    /// [`Self::resolve_steps_to_heads`] and `POST
+    /// /api/v1/workflows/hierarchical/:id/outcome` share this one statement: a
+    /// caller reports `step_index` values it learned from the resolved step
+    /// list, so the outcome route must resolve them against the SAME
+    /// viewer-filtered ordering or it attributes an outcome to the wrong step.
+    /// The outcome route used to run its own unfiltered copy of this statement
+    /// inline (`F-inline-claim-content-reads`), which both read steps the
+    /// caller cannot see and, for a caller who could not see all of them,
+    /// shifted every index after the first hidden one.
     ///
     /// # Errors
-    /// Returns `DbError` if the database query fails.
-    pub async fn resolve_steps_to_heads(
-        pool: &PgPool,
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn step_seeds<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
-    ) -> Result<Vec<ResolvedStep>, DbError> {
-        // Pull all level=2 step claims under this workflow with their
-        // step_lineage_id, ordered by edge created_at + claim id (matches
-        // do_report_hierarchical_outcome_via_pool).
+    ) -> Result<Vec<(Uuid, Option<Uuid>)>, DbError> {
         let sql = viewer.splice(
             "SELECT c.id, c.step_lineage_id \
              FROM edges e \
@@ -663,8 +671,21 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             sq = sq.bind(g);
         }
-        let step_rows: Vec<(Uuid, Option<Uuid>)> =
-            sq.fetch_all(pool).await.map_err(DbError::from)?;
+        sq.fetch_all(executor).await.map_err(DbError::from)
+    }
+
+    /// For each `executes`-edge from the workflow root, walk supersedes/revises
+    /// edges to the latest head claim. Mirrors the resolution logic that
+    /// previously lived in `epigraph-mcp::tools::workflow_hierarchical::build_resolved_steps`.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the database query fails.
+    pub async fn resolve_steps_to_heads(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<ResolvedStep>, DbError> {
+        let step_rows = Self::step_seeds(pool, viewer, workflow_id).await?;
 
         let head_futures = step_rows.iter().map(|(_, step_lineage_id)| async move {
             if let Some(lineage_id) = *step_lineage_id {
