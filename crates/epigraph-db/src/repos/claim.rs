@@ -1349,9 +1349,12 @@ impl ClaimRepository {
     /// invariant into one this statement enforces. Once RLS is live on the
     /// request path the stamped connection enforces it a third time.
     ///
-    /// `claim_cluster_membership` and `graph_cluster_runs` carry no tenancy
-    /// columns, so the cluster subquery is not marked. It only looks up a
-    /// cluster id for a claim that already passed the `claims` predicate.
+    /// The cluster subquery marks `claim_cluster_membership`, which IS in
+    /// migration 062's `tier_a` array and carries its own tenancy (the same
+    /// reason every `GraphViewRepository` join over it is marked): a membership
+    /// row the viewer cannot read must not name the claim's cluster, even for a
+    /// claim the viewer can read. `graph_cluster_runs` has no tenancy columns
+    /// and only orders the runs.
     ///
     /// `embedding_col` must be `"embedding"` or `"embedding_3072"`; anything
     /// else is rejected rather than interpolated.
@@ -1385,6 +1388,7 @@ impl ClaimRepository {
                            FROM claim_cluster_membership m
                            JOIN graph_cluster_runs r ON r.run_id = m.run_id
                            WHERE m.claim_id = c.id
+                             /* {{VISIBILITY:m}} */
                            ORDER BY r.completed_at DESC
                            LIMIT 1
                        ) AS cluster_id,

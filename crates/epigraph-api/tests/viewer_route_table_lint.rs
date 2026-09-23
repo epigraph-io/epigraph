@@ -271,7 +271,8 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `ClaimThemeRepository::claims_in_themes_at_dim_since`. That derivation
     // was sound, but nothing enforced it, which is why it stayed registered.
     // The statement is now `ClaimRepository::semantic_search_selected`, marking
-    // `claims`, so the invariant is enforced in the statement, and by RLS as
+    // `claims` (and `claim_cluster_membership` in its cluster subquery), so the
+    // invariant is enforced in the statement, and by RLS as
     // well once the request path runs as `epigraph_app` (it already runs on a
     // stamped `ScopedRead`).
     // `workflows.rs` was 4 until `F-inline-claim-content-reads` was

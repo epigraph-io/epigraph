@@ -706,6 +706,58 @@ async fn semantic_search_selected_drops_ids_the_viewer_cannot_read(pool: PgPool)
         set_claim_embedding(&pool, claim, &pgvec).await;
     }
 
+    // Cluster memberships, which carry their own tenancy: the PUBLIC claim's
+    // membership is private to the stranger's group, so its cluster must not
+    // be named; the viewer's own claim's membership is the viewer's own.
+    let run_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded, algo) \
+         VALUES ($1, 2, FALSE, 'louvain')",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .expect("seed run");
+    let mut cluster_of = std::collections::HashMap::new();
+    for (claim, visibility, group) in [
+        (p.public, "group", p.stranger_group),
+        (p.mine, "group", p.viewer_group),
+    ] {
+        let cluster = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO graph_clusters \
+             (id, run_id, label, size, mean_betp, dominant_type, dominant_frame_id, degraded) \
+             VALUES ($1, $2, 'probe', 1, NULL, 'claim', NULL, FALSE)",
+        )
+        .bind(cluster)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("seed cluster");
+        sqlx::query(
+            "INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(claim)
+        .bind(cluster)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("seed membership");
+        sqlx::query(
+            "UPDATE claim_cluster_membership SET visibility = $3, owner_group_id = $4 \
+             WHERE claim_id = $1 AND run_id = $2",
+        )
+        .bind(claim)
+        .bind(run_id)
+        .bind(visibility)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("force membership tenancy");
+        cluster_of.insert(claim, cluster);
+    }
+
     let viewer = viewer_for(&pool, p.viewer_agent).await;
     let state = split_state(&pool).await;
     let mut read = state.read_as(&viewer).await.expect("read_as");
@@ -735,6 +787,20 @@ async fn semantic_search_selected_drops_ids_the_viewer_cannot_read(pool: PgPool)
         (mine.similarity - 1.0).abs() < 1e-6,
         "CALIBRATION: an identical vector has similarity 1.0, got {}",
         mine.similarity
+    );
+    assert_eq!(
+        mine.cluster_id,
+        cluster_of.get(&p.mine).copied(),
+        "the viewer's own cluster membership must name its cluster"
+    );
+    let public = rows
+        .iter()
+        .find(|r| r.claim_id == p.public)
+        .expect("public");
+    assert_eq!(
+        public.cluster_id, None,
+        "a membership row private to another group must not name the public \
+         claim's cluster"
     );
 }
 
