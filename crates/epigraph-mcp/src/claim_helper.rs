@@ -228,6 +228,27 @@ pub async fn begin_author_stamped_tx<'p>(
 /// the SAME author that owns the row, and passing `server.agent_id()` there
 /// would render a `{WRITABLE:c}` predicate no row satisfies.
 ///
+///
+/// # RESIDUAL, stated so the R3 policy drop is not read as closing it
+///
+/// This stamps the transaction with the SYSTEM agent's authority, and nothing on
+/// this path asks whether the CALLER has any authority over the workflow it
+/// names. `add_step`, `delete_step`, `ingest_workflow` and
+/// `improve_workflow_hierarchy` (MCP), and `POST /api/v1/workflows/steps` and
+/// `/steps/delete` (HTTP, gated only by the `claims:write` scope) reach this on
+/// caller-supplied input (`canonical_name`, `step_lineage_id`). So any
+/// `claims:write` caller can mutate any system-owned workflow — the harness's
+/// `delete_step` arm drives a step's truth to 0.05 with no ownership relation
+/// between caller and workflow. MEASURED by review; not a regression: config B
+/// (production today) admits the same writes through the orphan `*_privacy`
+/// policies, and main behaves the same there.
+///
+/// What it means for R3: dropping the orphan policies does NOT tighten workflow
+/// mutation at all, because these writes no longer depend on them. Tightening
+/// needs a caller-side check against the TARGET workflow before the stamp, and
+/// a decision about who "owns" a workflow the system agent authored — neither
+/// of which is a mechanical conversion. Tracked as open work, not fixed here.
+///
 /// # Errors
 /// * `McpError::internal_error` if the system agent has no write authority (see
 ///   `system_agent_write_authority`) — a loud refusal, nothing written.

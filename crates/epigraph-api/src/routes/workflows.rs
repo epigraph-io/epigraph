@@ -1648,6 +1648,28 @@ pub async fn ingest_workflow(
 /// reason `server.agent_id()` is on the MCP side — see
 /// `epigraph_ingest_executor::system_agent_write_authority` for the measurement.
 ///
+///
+/// # RESIDUAL, stated so the R3 policy drop is not read as closing it
+///
+/// This stamps the transaction with the SYSTEM agent's authority, and nothing on
+/// this path asks whether the CALLER has any authority over the workflow it
+/// names. `add_step`, `delete_step`, `ingest_workflow` and
+/// `improve_workflow_hierarchy` (MCP), and `POST /api/v1/workflows/steps` and
+/// `/steps/delete` (HTTP, gated only by the `claims:write` scope) reach this on
+/// caller-supplied input (`canonical_name`, `step_lineage_id`). So any
+/// `claims:write` caller can mutate any system-owned workflow — the harness's
+/// `delete_step` arm drives a step's truth to 0.05 with no ownership relation
+/// between caller and workflow. Same residual as `epigraph_mcp::claim_helper::begin_system_ingest_stamped_tx`,
+/// which carries the MCP half. MEASURED by review; not a regression: config B
+/// (production today) admits the same writes through the orphan `*_privacy`
+/// policies, and main behaves the same there.
+///
+/// What it means for R3: dropping the orphan policies does NOT tighten workflow
+/// mutation at all, because these writes no longer depend on them. Tightening
+/// needs a caller-side check against the TARGET workflow before the stamp, and
+/// a decision about who "owns" a workflow the system agent authored — neither
+/// of which is a mechanical conversion. Tracked as open work, not fixed here.
+///
 /// # Errors
 /// `ApiError::InternalError` if the system agent has no write authority, if the
 /// process was not built through `AppState::with_scoped_pool`, or if the stamp
