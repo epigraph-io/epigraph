@@ -116,23 +116,6 @@ async fn landing(State(state): State<AppState>, user: SignedIn) -> Result<Html<S
     })
 }
 
-/// The OG card for a sessionless request: claim text from an anonymous
-/// upstream read when `PUBLIC_UNFURL=true`; otherwise (or on any upstream
-/// failure) a generic card, with no upstream call at all when unfurling is
-/// off.
-async fn anonymous_og(state: &AppState, caller: &Caller, id: Uuid, canonical: String) -> Og {
-    if !state.config.public_unfurl {
-        return og_generic(canonical);
-    }
-    match caller.api(state).claim(id).await {
-        Ok(c) => og_for_claim(&c, None, canonical),
-        Err(e) => {
-            tracing::debug!(error = %e, "anonymous unfurl read failed; generic card");
-            og_generic(canonical)
-        }
-    }
-}
-
 /// Per-viewer TTL cache in front of an upstream call. Only successes are
 /// cached; the key must carry `RequestAuth::cache_key` (upstream visibility
 /// differs per viewer, so two viewers get different result sets from the
@@ -325,7 +308,9 @@ async fn claim(
     let canonical = state.links.absolute(&state.links.claim(id));
 
     if !caller.auth.is_signed_in() {
-        let og = anonymous_og(&state, &caller, id, canonical).await;
+        // No upstream call: under tenancy an anonymous read 401s, so there is
+        // nothing an unfurl could learn about this claim.
+        let og = og_generic(canonical);
         return render(&ClaimAnonPage {
             ctx: caller.ctx,
             id,

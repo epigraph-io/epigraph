@@ -12,9 +12,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::Router;
 use common::{spawn, spawn_with, TestApp};
-use epigraph_explorer::config::{
-    ENV_DEV_BEARER, ENV_PUBLIC_BASE_URL, ENV_PUBLIC_UNFURL, ENV_UPSTREAM_TIMEOUT_MS,
-};
+use epigraph_explorer::config::{ENV_DEV_BEARER, ENV_PUBLIC_BASE_URL, ENV_UPSTREAM_TIMEOUT_MS};
 use serde_json::{json, Value};
 use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -723,7 +721,7 @@ async fn bad_or_unknown_claim_ids_are_404_pages() {
 // ---- anonymous /claim/:id and OG ----------------------------------------------------------
 
 #[tokio::test]
-async fn anonymous_claim_gets_a_generic_card_without_public_unfurl() {
+async fn anonymous_claim_gets_a_generic_card() {
     let app = spawn().await;
     let res = app.get(&format!("/explorer/claim/{CLAIM}")).await;
     assert_eq!(res.status, StatusCode::OK);
@@ -744,50 +742,11 @@ async fn anonymous_claim_gets_a_generic_card_without_public_unfurl() {
 }
 
 #[tokio::test]
-async fn anonymous_claim_unfurls_from_an_anonymous_read_when_enabled() {
-    let app = spawn_with(&[(ENV_PUBLIC_UNFURL, "true")], Router::new()).await;
-    Mock::given(method("GET"))
-        .and(path(claim_path("")))
-        .and(|req: &wiremock::Request| !req.headers.contains_key("authorization"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(claim_json(CONTENT, &["physics"])))
-        .expect(1)
-        .mount(&app.upstream)
-        .await;
-    let res = app.get(&format!("/explorer/claim/{CLAIM}")).await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert!(res.body.contains("Sign in to read this claim"));
-    assert!(res.body.contains(&format!(
-        "<meta property=\"og:title\" content=\"{CONTENT}\">"
-    )));
-    assert!(res.body.contains(
-        "<meta property=\"og:description\" content=\"Truth value 0.80 · Labels: physics\">"
-    ));
-    assert_eq!(
-        upstream_paths(&app).await,
-        vec![claim_path("")],
-        "no content-bearing sub-calls"
-    );
-}
-
-#[tokio::test]
-async fn anonymous_unfurl_of_a_failing_read_is_generic() {
-    let app = spawn_with(&[(ENV_PUBLIC_UNFURL, "true")], Router::new()).await;
-    Mock::given(method("GET"))
-        .and(path(claim_path("")))
-        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-        .mount(&app.upstream)
-        .await;
-    let res = app.get(&format!("/explorer/claim/{CLAIM}")).await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert!(res
-        .body
-        .contains("<meta property=\"og:title\" content=\"A claim in EpiGraph\">"));
-}
-
-#[tokio::test]
 async fn og_tags_escape_hostile_content_and_cut_multibyte_text_safely() {
+    // Only a signed-in read can put claim text into OG at all: an anonymous
+    // request never calls upstream, so its card is always the generic one.
     let hostile = "\"><script>alert(1)</script><meta x=\"";
-    let app = spawn_with(&[(ENV_PUBLIC_UNFURL, "true")], Router::new()).await;
+    let app = spawn().await;
     mount_get(
         &app,
         &claim_path(""),
@@ -799,29 +758,14 @@ async fn og_tags_escape_hostile_content_and_cut_multibyte_text_safely() {
     mount_sub_calls(&app, 1).await;
     let sid = app.sign_in("tok");
 
-    for res in [
-        app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await,
-        {
-            // The anonymous unfurl path renders the same text into OG.
-            Mock::given(method("GET"))
-                .and(path(claim_path("")))
-                .and(|req: &wiremock::Request| !req.headers.contains_key("authorization"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(claim_json(hostile, &["<b>l</b>"])),
-                )
-                .mount(&app.upstream)
-                .await;
-            app.get(&format!("/explorer/claim/{CLAIM}")).await
-        },
-    ] {
-        assert_eq!(res.status, StatusCode::OK);
-        assert!(!res.body.contains("<script>alert(1)"), "content is escaped");
-        assert!(!res.body.contains("<b>l</b>"), "labels are escaped");
-        assert!(!res.body.contains("<meta x="), "no attribute breakout");
-        assert!(res.body.contains(
-            "<meta property=\"og:title\" content=\"&#34;&#62;&#60;script&#62;alert(1)&#60;/script&#62;&#60;meta x=&#34;\">"
-        ));
-    }
+    let res = app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(!res.body.contains("<script>alert(1)"), "content is escaped");
+    assert!(!res.body.contains("<b>l</b>"), "labels are escaped");
+    assert!(!res.body.contains("<meta x="), "no attribute breakout");
+    assert!(res.body.contains(
+        "<meta property=\"og:title\" content=\"&#34;&#62;&#60;script&#62;alert(1)&#60;/script&#62;&#60;meta x=&#34;\">"
+    ));
 
     // Multi-byte text is cut on a char boundary (100 chars + …).
     let app = spawn().await;
