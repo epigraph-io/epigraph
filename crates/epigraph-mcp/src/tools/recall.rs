@@ -14,37 +14,92 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-pub async fn paragraph_3072_population(pool: &sqlx::PgPool) -> Result<f64, sqlx::Error> {
+/// Fraction of level-2 paragraphs carrying a 3072-d embedding, viewer-scoped.
+///
+/// PR-09: took a bare pool. The ratio itself is not the disclosure — the
+/// denominator is: `COUNT(*) FROM claims WHERE level = 2` told any caller the
+/// exact paragraph population of the whole corpus, and the result is surfaced
+/// through `recall_with_context`'s `corpus_scope`. Scoped, both counts are the
+/// reader's own, and the auto-detect decision is made on the corpus the reader
+/// will actually search — which is also the more correct answer.
+pub async fn paragraph_3072_population(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<f64, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) FILTER (WHERE embedding_3072 IS NOT NULL)::float8
+            COUNT(*) FILTER (WHERE c.embedding_3072 IS NOT NULL)::float8
               / NULLIF(COUNT(*), 0)::float8 AS frac_3072
-        FROM claims
-        WHERE (properties->>'level')::int = 2
-        "#
+        FROM claims c
+        WHERE (c.properties->>'level')::int = 2
+          AND ($1::bool OR c.visibility = 'public'
+               OR c.owner_group_id = ANY($2::uuid[]))
+        "#,
+        viewer.bypass_bind(),
+        viewer.group_bind().unwrap_or(&[])
     )
     .fetch_one(pool)
     .await?;
     Ok(row.frac_3072.unwrap_or(0.0))
 }
 
-async fn detect_centroid_dim(pool: &sqlx::PgPool) -> Result<u32, sqlx::Error> {
-    let frac = paragraph_3072_population(pool).await?;
+async fn detect_centroid_dim(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<u32, sqlx::Error> {
+    let frac = paragraph_3072_population(pool, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
 }
 
-async fn compute_corpus_scope(pool: &sqlx::PgPool) -> Result<CorpusScope, sqlx::Error> {
+/// Corpus cardinality reported alongside every `recall_with_context` response.
+///
+/// PR-09: three of the four counts are viewer-scoped. `papers` and
+/// `claim_themes` are NOT in migration 062's `tier_a` array and have no
+/// `owner_group_id`, so there is nothing to filter on; `claim_themes` is the
+/// table plan §2.4 registers as `tenancy_exempt` with theme clustering as its
+/// control. Both are annotated in the SQL rather than left silent.
+async fn compute_corpus_scope(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<CorpusScope, sqlx::Error> {
     // Per spec §3.1 / Locked-in 5.5: corpus_scope always populated on success.
     // One round-trip with subselects to avoid four separate COUNT queries.
     let row = sqlx::query!(
         r#"
         SELECT
-          (SELECT COUNT(*) FROM claims) AS claims_total,
-          (SELECT COUNT(*) FROM claims WHERE (properties->>'level')::int = 2) AS paragraph_total,
+          (SELECT COUNT(*) FROM claims c
+             WHERE ($1::bool OR c.visibility = 'public'
+                    OR c.owner_group_id = ANY($2::uuid[]))) AS claims_total,
+          (SELECT COUNT(*) FROM claims c2
+             WHERE (c2.properties->>'level')::int = 2
+               AND ($1::bool OR c2.visibility = 'public'
+                    OR c2.owner_group_id = ANY($2::uuid[]))) AS paragraph_total,
+          -- VISIBILITY-EXEMPT: `papers` is not in migration 062's tier_a array
+          -- and carries no owner_group_id. A bibliographic-record count, not
+          -- claim content.
           (SELECT COUNT(*) FROM papers) AS paper_total,
+          -- VISIBILITY-EXEMPT: `claim_themes` is the table plan §2.4 registers
+          -- as tenancy_exempt; it has no owner_group_id either, so no predicate
+          -- can be written here.
+          --
+          -- §2.4's stated control for that residual is viewer-scoped
+          -- clustering, and PR-09 DID NOT SHIP IT. `theme_cluster` still calls
+          -- `epigraph_engine::theme_kmeans::run_theme_kmeans`, which takes no
+          -- Viewer. An earlier revision of this comment asserted the control as
+          -- if it existed; an exemption whose written reason is false is worse
+          -- than an unannotated one, because `visibility_lint.rs` trains
+          -- reviewers to read exactly these lines.
+          --
+          -- Owner of the residual: the PR that threads a Viewer through
+          -- `theme_kmeans::run_theme_kmeans` must land BOTH callers together —
+          -- this tool and `epigraph-api/src/routes/crud.rs::build_themes_from_corpus`
+          -- — or MCP hardens while HTTP stays corpus-wide. Ledgered as
+          -- D-PR16-theme-cluster-viewer-scope in docs/tenancy/progress.json.
           (SELECT COUNT(*) FROM claim_themes) AS themes_total
-        "#
+        "#,
+        viewer.bypass_bind(),
+        viewer.group_bind().unwrap_or(&[])
     )
     .fetch_one(pool)
     .await?;
@@ -65,6 +120,11 @@ pub struct RecallWithContextParams {
     pub paper_doi_filter: Option<String>,
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
+    /// Max epistemic-edge neighbours returned **per relationship** per hit
+    /// (supports / refutes / contradicts / specializes / elaborates / cites).
+    /// Default 4. Per-relationship rather than per-hit so a claim with many
+    /// `supports` edges cannot crowd out its single `refutes`.
+    pub epistemic_limit: Option<u32>,
     pub neighbor_paragraphs_limit: Option<u32>,
     /// When `true`, run the diverse retrieval pipeline before structural
     /// enrichment: pull candidates from the most-similar themes and use
@@ -168,6 +228,65 @@ pub struct RecallWithContextParams {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Why a recall audit row has no owner — and therefore must not be written.
+///
+/// **Every variant is a DROP, and that is the whole point of the type.** It has
+/// no shape meaning "write it instance-wide", so the widening is unreachable
+/// from a caller that handles the failure sloppily. The earlier spelling —
+/// `Result<Option<Uuid>, DbError>` — did have such a shape: `Ok(None)` selected
+/// `TenancyDecl::instance_wide()`, and a caller that reached it through an
+/// `.ok()` on a fallible identity lookup turned a transient failure into a
+/// world-readable row carrying the querying agent's raw query text. The `Err`
+/// arm failed closed and the `None` arm failed open; only the type can keep
+/// those from drifting apart again.
+///
+/// A retrieval that is not audited is recoverable from the request log; a
+/// disclosure is not.
+///
+/// Shared by both MCP recall surfaces so the rule has one spelling.
+#[derive(Debug)]
+pub(crate) enum AuditOwnerUnresolved {
+    /// The surface produced no principal at all. On the MCP transports this is
+    /// a bypass viewer, which `request_viewer` never returns — so it is a
+    /// defensive arm, and it drops rather than widening for the same reason the
+    /// lookup failure does.
+    NoPrincipal,
+    /// There IS a principal and its personal group could not be resolved.
+    Lookup(epigraph_db::DbError),
+}
+
+impl std::fmt::Display for AuditOwnerUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPrincipal => f.write_str("the call carried no principal"),
+            Self::Lookup(e) => write!(f, "the principal's personal group could not be read: {e}"),
+        }
+    }
+}
+
+/// The group that will own a recall audit row: **the request principal's**
+/// personal group.
+///
+/// `principal` is [`Viewer::principal`](epigraph_db::Viewer::principal), not
+/// `EpiGraphMcpFull::agent_id`, and the distinction is the security property.
+/// `agent_id` resolves the agent for the *signer's public key* — one agent per
+/// process — while `get_recall_events` filters with the viewer built from the
+/// *per-request* `AuthContext`. On stdio the two are the same value. On the
+/// HTTP transport they are not, and owning the row from the process identity
+/// would both misattribute it and suppress it from the agent that authored it.
+///
+/// # Errors
+/// [`AuditOwnerUnresolved`] — see that type: every variant means drop the row.
+pub(crate) async fn recall_audit_owner_group(
+    pool: &sqlx::PgPool,
+    principal: Option<Uuid>,
+) -> Result<Uuid, AuditOwnerUnresolved> {
+    let principal = principal.ok_or(AuditOwnerUnresolved::NoPrincipal)?;
+    epigraph_db::ClaimRepository::personal_group_of_pool(pool, principal)
+        .await
+        .map_err(AuditOwnerUnresolved::Lookup)
+}
+
 /// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
 ///
 /// Shared by the empty-result early return and the main path so the two
@@ -180,23 +299,43 @@ pub struct RecallWithContextParams {
 fn spawn_recall_audit(
     server: &EpiGraphMcpFull,
     event_id: Uuid,
-    agent_id: Option<Uuid>,
+    principal: Option<Uuid>,
     query: &str,
     pgvec: &str,
     params_json: serde_json::Value,
     returned_claim_ids: Vec<Uuid>,
 ) {
-    let event = epigraph_db::NewRecallEvent {
-        id: event_id,
-        agent_id,
-        tool: "recall_with_context".to_string(),
-        query_text: query.to_string(),
-        query_pgvector: Some(pgvec.to_string()),
-        params: params_json,
-        returned_claim_ids,
-    };
+    let query = query.to_string();
+    let pgvec = pgvec.to_string();
     let pool = server.pool.clone();
     tokio::spawn(async move {
+        // Resolved inside the spawn: everything this needs is an owned `Uuid`,
+        // so nothing here borrows the request, and the group lookup — a pool
+        // acquire, a SELECT, and on an agent's first recall a personal-group
+        // mint — stays off the response path. `058_recall_events.sql`'s own
+        // table comment is the contract: "never blocks a recall".
+        let owner_group_id = match recall_audit_owner_group(&pool, principal).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(
+                    reason = %e,
+                    "recall_with_context audit skipped rather than widened"
+                );
+                return;
+            }
+        };
+        let event = epigraph_db::NewRecallEvent {
+            id: event_id,
+            // The REQUEST principal, not the process identity. See
+            // `recall_audit_owner_group`.
+            agent_id: principal,
+            tool: "recall_with_context".to_string(),
+            query_text: query,
+            query_pgvector: Some(pgvec),
+            params: params_json,
+            returned_claim_ids,
+            owner_group_id: Some(owner_group_id),
+        };
         if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
             tracing::warn!(error = %e, "recall_with_context audit log failed; recall unaffected");
         }
@@ -310,7 +449,10 @@ pub struct CorroboratesEdge {
 
 /// Epistemic relationship types carried through structural context assembly
 /// (in addition to the corroborates edges handled separately above).
-#[allow(dead_code)]
+///
+/// Deliberately excludes `decomposes_to` and `continues_argument`: those are
+/// document-skeleton structure, already carried by their own context fields,
+/// and counting them here would double-report the skeleton as argument.
 const EPISTEMIC_EDGE_RELATIONSHIPS: &[&str] = &[
     "supports",
     "refutes",
@@ -372,12 +514,14 @@ pub struct CorpusScope {
 
 pub async fn recall_with_context(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecallWithContextParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let min_truth = params.min_truth.unwrap_or(0.3);
     let siblings_limit = params.siblings_limit.unwrap_or(8);
     let corroborates_limit = params.corroborates_limit.unwrap_or(4);
+    let epistemic_limit = params.epistemic_limit.unwrap_or(4);
     let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
 
     // Stage 1: pick centroid_dim (request hint OR auto-detect via population threshold).
@@ -388,7 +532,7 @@ pub async fn recall_with_context(
                 "centroid_dim must be 1536 or 3072 (got {d})"
             )));
         }
-        None => detect_centroid_dim(&server.pool)
+        None => detect_centroid_dim(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("auto-detect centroid_dim: {e}")))?,
     };
@@ -396,7 +540,7 @@ pub async fn recall_with_context(
     // Spec §3.4: explicit 3072 against an unpopulated column must error
     // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
     if matches!(params.centroid_dim, Some(3072)) {
-        let frac = paragraph_3072_population(&server.pool)
+        let frac = paragraph_3072_population(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
         if frac == 0.0 {
@@ -423,11 +567,13 @@ pub async fn recall_with_context(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id).await?;
+        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+            .await?;
     }
 
     recall_with_context_post_embed(
         server,
+        viewer,
         &params,
         centroid_dim,
         &pgvec,
@@ -435,6 +581,7 @@ pub async fn recall_with_context(
         min_truth,
         siblings_limit,
         corroborates_limit,
+        epistemic_limit,
         neighbor_paragraphs_limit,
         lens,
     )
@@ -481,6 +628,7 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    one query per claim.
 async fn apply_graph_expansion(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     seeds: Vec<epigraph_db::ClaimEmbeddingHit>,
     depth: u32,
     since: Option<chrono::DateTime<chrono::Utc>>,
@@ -495,10 +643,11 @@ async fn apply_graph_expansion(
     // walk itself is not pruned (an old claim may bridge to a new one); only
     // the emitted destinations are, and only in-window destinations consume
     // the expansion budget.
-    let expansion =
-        epigraph_db::ClaimRepository::graph_expand_seeds_since(pool, &seed_ids, depth, since)
-            .await
-            .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds_since(
+        pool, viewer, &seed_ids, depth, since,
+    )
+    .await
+    .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
 
     // Best (highest) decayed score per expanded claim, in case it's
     // reachable from more than one seed at different hop counts / seed
@@ -536,7 +685,7 @@ async fn apply_graph_expansion(
     }
 
     let all_ids: Vec<Uuid> = combined.iter().map(|h| h.claim_id).collect();
-    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, &all_ids)
+    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, viewer, &all_ids)
         .await
         .map_err(|e| internal_error(format!("in_epistemic_degree_batch: {e}")))?;
 
@@ -562,6 +711,7 @@ async fn apply_graph_expansion(
 #[allow(clippy::too_many_arguments)]
 async fn recall_with_context_post_embed(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: &RecallWithContextParams,
     centroid_dim: u32,
     pgvec: &str,
@@ -569,6 +719,7 @@ async fn recall_with_context_post_embed(
     min_truth: f64,
     siblings_limit: u32,
     corroborates_limit: u32,
+    epistemic_limit: u32,
     neighbor_paragraphs_limit: u32,
     lens: Option<(Uuid, Uuid)>,
 ) -> Result<CallToolResult, McpError> {
@@ -632,10 +783,14 @@ async fn recall_with_context_post_embed(
             // silently ignore `since`.
             since: params.since,
         };
-        let selected =
-            epigraph_engine::diverse_retrieval::run_diverse_pipeline(&server.pool, pgvec, config)
-                .await
-                .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
+        let selected = epigraph_engine::diverse_retrieval::run_diverse_pipeline(
+            &server.pool,
+            viewer,
+            pgvec,
+            config,
+        )
+        .await
+        .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
 
         if selected.is_empty() {
             // No themes (or no candidates in themes) — fall back to flat ANN
@@ -643,6 +798,7 @@ async fn recall_with_context_post_embed(
             // unclustered corpus. Matches the REST diverse-mode fallback.
             epigraph_db::ClaimRepository::search_by_embedding_since(
                 &server.pool,
+                viewer,
                 pgvec,
                 centroid_dim,
                 flat_limit,
@@ -666,6 +822,7 @@ async fn recall_with_context_post_embed(
         // Flat paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).
         epigraph_db::ClaimRepository::search_by_embedding_since(
             &server.pool,
+            viewer,
             pgvec,
             centroid_dim,
             flat_limit,
@@ -678,14 +835,14 @@ async fn recall_with_context_post_embed(
 
     if raw_hits.is_empty() {
         // Empty result still returns corpus_scope (#52 Finding 2).
-        let corpus_scope = compute_corpus_scope(&server.pool)
+        let corpus_scope = compute_corpus_scope(&server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
         let event_id = Uuid::new_v4();
         spawn_recall_audit(
             server,
             event_id,
-            server.agent_id().await.ok(),
+            viewer.principal(),
             &params.query,
             pgvec,
             // `since` is recorded on the EMPTY path too: "this window
@@ -721,7 +878,8 @@ async fn recall_with_context_post_embed(
     // ANN seeds — matching "expand seeds, then rank" rather than "rank seeds,
     // then expand the winners".
     if let Some(depth) = params.graph_expansion_depth {
-        raw_hits = apply_graph_expansion(&server.pool, raw_hits, depth, params.since).await?;
+        raw_hits =
+            apply_graph_expansion(&server.pool, viewer, raw_hits, depth, params.since).await?;
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
@@ -734,7 +892,7 @@ async fn recall_with_context_post_embed(
     > = std::collections::HashMap::new();
     if params.rerank.unwrap_or(false) {
         let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
-        let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, &ids)
+        let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, viewer, &ids)
             .await
             .map_err(|e| internal_error(format!("rerank content fetch: {e}")))?;
         let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
@@ -824,9 +982,11 @@ async fn recall_with_context_post_embed(
     let paragraph_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
     let ctx = fetch_batched_context(
         &server.pool,
+        viewer,
         &paragraph_ids,
         siblings_limit,
         corroborates_limit,
+        epistemic_limit,
     )
     .await
     .map_err(|e| internal_error(format!("batch fetch: {e}")))?;
@@ -943,6 +1103,7 @@ async fn recall_with_context_post_embed(
         let claim_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
         match epigraph_engine::belief_query::get_perspective_belief_batch(
             &server.pool,
+            viewer,
             &claim_ids,
             frame_id,
             perspective_id,
@@ -999,7 +1160,9 @@ async fn recall_with_context_post_embed(
     // dispute status can recall it as a hit in its own right.
     {
         let paragraph_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
-        match epigraph_db::ClaimRepository::dispute_batch(&server.pool, &paragraph_ids).await {
+        match epigraph_db::ClaimRepository::dispute_batch(&server.pool, viewer, &paragraph_ids)
+            .await
+        {
             Ok(mut by_claim) => {
                 for hit in &mut results {
                     // Absent key == uncontested, per the repo contract.
@@ -1028,7 +1191,7 @@ async fn recall_with_context_post_embed(
         }
     }
 
-    let corpus_scope = compute_corpus_scope(&server.pool)
+    let corpus_scope = compute_corpus_scope(&server.pool, viewer)
         .await
         .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
 
@@ -1040,7 +1203,7 @@ async fn recall_with_context_post_embed(
     spawn_recall_audit(
         server,
         event_id,
-        server.agent_id().await.ok(),
+        viewer.principal(),
         &params.query,
         pgvec,
         serde_json::json!({
@@ -1099,12 +1262,51 @@ pub struct BatchedContext {
     pub paragraphs_by_atom: std::collections::HashMap<Uuid, Vec<Uuid>>,
 }
 
+/// Batched structural context for a set of paragraph hits.
+///
+/// # Tenancy (PR-09)
+///
+/// This function is the single largest fail-open the MCP surface had. It took a
+/// bare `&sqlx::PgPool` and no `Viewer`, and it is called from
+/// `recall_with_context_post_embed` — which *does* hold a `&Viewer` and passes
+/// it to seven other calls. So a viewer-scoped seed set was enriched with
+/// unscoped neighbours: the tenancy filter applied to the hits and was then
+/// bypassed for the section text, sibling paragraphs, atom children,
+/// CORROBORATES neighbours and paper attribution returned alongside them. Four
+/// of the ten statements selected `c.content` directly.
+///
+/// Every one of the ten now carries the static three-bind visibility form
+/// (`$N::bool OR <alias>.visibility = 'public' OR <alias>.owner_group_id =
+/// ANY($M::uuid[])`) rather than `Viewer::splice`, because `sqlx::query!` needs
+/// a compile-time literal of fixed arity and cannot take a spliced string —
+/// the same reason `repos/claim.rs`'s four macro read sites use that spelling.
+/// `visibility.rs`'s module doc names it as the accepted equivalent.
+///
+/// Three of the ten (`bridge_to_paragraphs`, `continues_argument`,
+/// `atom_b -> parent paragraphs`) previously touched only `edges` and returned
+/// bare claim ids. They gained a `JOIN claims` purely so there is something to
+/// filter on: an id is a disclosure, and the neighbour ids feed
+/// `all_paragraph_ids`, which the last two statements then hydrate into content.
+///
+/// # A deliberate deviation, recorded
+///
+/// The SQL stays in `crates/epigraph-mcp/src/tools/` rather than moving to
+/// `crates/epigraph-db/src/repos/` as CLAUDE.md requires. Ten `sqlx::query!`
+/// macros, six anonymous row shapes and the `BatchedContext` type would have to
+/// move together, and `recall.rs` is the one caller. The security property —
+/// the filter — is delivered here; the relocation is recorded as outstanding in
+/// `crates/epigraph-mcp/tests/no_inline_sql_in_tools.rs`'s expected set, which
+/// is an exact-set ratchet, so it cannot quietly grow.
 pub async fn fetch_batched_context(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     paragraph_ids: &[Uuid],
     siblings_limit: u32,
     corroborates_limit: u32,
+    epistemic_limit: u32,
 ) -> Result<BatchedContext, sqlx::Error> {
+    let v_bypass = viewer.bypass_bind();
+    let v_groups: &[Uuid] = viewer.group_bind().unwrap_or(&[]);
     let mut paragraph_meta: std::collections::HashMap<Uuid, ParagraphCore> = Default::default();
     let mut paper_meta: std::collections::HashMap<Uuid, PaperMeta> = Default::default();
     let mut paragraph_to_section: std::collections::HashMap<Uuid, Uuid> = Default::default();
@@ -1120,9 +1322,11 @@ pub async fn fetch_batched_context(
         Default::default();
     let mut corroborates_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
         Default::default();
-    let epistemic_edges_by_paragraph: std::collections::HashMap<Uuid, Vec<EpistemicEdgeNeighbor>> =
-        Default::default();
-    let epistemic_edges_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
+    let mut epistemic_edges_by_paragraph: std::collections::HashMap<
+        Uuid,
+        Vec<EpistemicEdgeNeighbor>,
+    > = Default::default();
+    let mut epistemic_edges_total_by_paragraph: std::collections::HashMap<Uuid, usize> =
         Default::default();
     let mut continues_argument_by_paragraph: std::collections::HashMap<Uuid, Vec<Uuid>> =
         Default::default();
@@ -1160,8 +1364,12 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1)
               AND e.relationship = 'decomposes_to'
               AND (c.properties->>'level')::int = 1
+              AND ($2::bool OR c.visibility = 'public'
+                   OR c.owner_group_id = ANY($3::uuid[]))
             "#,
-            paragraph_ids
+            paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1195,6 +1403,8 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 3
+                  AND ($3::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($4::uuid[]))
             )
             SELECT
                 paragraph_id AS "paragraph_id!",
@@ -1206,7 +1416,9 @@ pub async fn fetch_batched_context(
             WHERE rn <= $2
             "#,
             paragraph_ids,
-            atoms_per_paragraph_cap
+            atoms_per_paragraph_cap,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1235,12 +1447,17 @@ pub async fn fetch_batched_context(
         if !atom_ids.is_empty() {
             let rows = sqlx::query!(
                 r#"
-                SELECT e.target_id AS atom_id, e.source_id AS parent_paragraph_id
+                SELECT e.target_id AS "atom_id!", e.source_id AS "parent_paragraph_id!"
                 FROM edges e
+                JOIN claims cp ON cp.id = e.source_id
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
+                  AND ($2::bool OR cp.visibility = 'public'
+                       OR cp.owner_group_id = ANY($3::uuid[]))
                 "#,
-                &atom_ids
+                &atom_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1281,8 +1498,12 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND ($2::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($3::uuid[]))
                 "#,
-                &section_ids
+                &section_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1341,7 +1562,10 @@ pub async fn fetch_batched_context(
                     c.content, c.truth_value,
                     p.doi AS paper_doi
                 FROM neighbors n
-                JOIN claims c ON c.id = n.neighbor_id
+                JOIN claims c
+                  ON c.id = n.neighbor_id
+                 AND ($3::bool OR c.visibility = 'public'
+                      OR c.owner_group_id = ANY($4::uuid[]))
                 LEFT JOIN edges asserts_e
                   ON asserts_e.target_id = c.id
                   AND asserts_e.relationship = 'asserts'
@@ -1366,7 +1590,9 @@ pub async fn fetch_batched_context(
             WHERE rn <= $2
             "#,
             paragraph_ids,
-            i64::from(corroborates_limit)
+            i64::from(corroborates_limit),
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1386,19 +1612,115 @@ pub async fn fetch_batched_context(
         }
     }
 
+    // 7b. Epistemic-edge neighbours — bidirectional, per-relationship capped.
+    //
+    // Carries the same static three-bind visibility form as the other ten queries in
+    // this function. It was authored on a branch where `Viewer` did not exist, so it
+    // arrived here without one — and because both branches merely ADDED a parameter to
+    // this function, git conflicted only on the test call sites. Resolving those the
+    // obvious way produces a tree that compiles, passes, and returns epistemic-edge
+    // neighbours across tenancy boundaries. See ops note
+    // 2026-09-18-tenancy-epistemic-edge-viewer-gap.md and claim 76df5e6e.
+    //
+    // Direction is part of the payload because it carries the meaning: an
+    // incoming `refutes` means "is refuted by", which is the opposite claim
+    // about credibility from an outgoing one.
+    {
+        let relationships: Vec<String> = EPISTEMIC_EDGE_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let rows = sqlx::query!(
+            r#"
+            WITH neighbors AS (
+                SELECT e.source_id AS paragraph_id, e.target_id AS neighbor_id,
+                       e.relationship, 'outgoing' AS direction
+                FROM edges e
+                WHERE e.source_id = ANY($1) AND e.relationship = ANY($3)
+                UNION ALL
+                SELECT e.target_id AS paragraph_id, e.source_id AS neighbor_id,
+                       e.relationship, 'incoming' AS direction
+                FROM edges e
+                WHERE e.target_id = ANY($1) AND e.relationship = ANY($3)
+            ),
+            joined AS (
+                SELECT n.paragraph_id, n.neighbor_id, n.relationship, n.direction,
+                       c.content, c.truth_value
+                FROM neighbors n
+                JOIN claims c ON c.id = n.neighbor_id
+                  AND ($4::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($5::uuid[]))
+            ),
+            ranked AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY paragraph_id, relationship
+                        ORDER BY truth_value DESC, neighbor_id
+                    ) AS rn,
+                    COUNT(*) OVER (PARTITION BY paragraph_id) AS total
+                FROM joined
+            )
+            SELECT
+                paragraph_id AS "paragraph_id!",
+                neighbor_id AS "neighbor_id!",
+                content AS "content!",
+                relationship AS "relationship!",
+                direction AS "direction!",
+                truth_value AS "truth_value!",
+                total AS "total!"
+            FROM ranked
+            WHERE rn <= $2
+            "#,
+            paragraph_ids,
+            i64::from(epistemic_limit),
+            &relationships,
+            v_bypass,
+            v_groups
+        )
+        .fetch_all(pool)
+        .await?;
+        for r in rows {
+            epistemic_edges_total_by_paragraph
+                .entry(r.paragraph_id)
+                .or_insert_with(|| r.total.max(0) as usize);
+            epistemic_edges_by_paragraph
+                .entry(r.paragraph_id)
+                .or_default()
+                .push(EpistemicEdgeNeighbor {
+                    claim_id: r.neighbor_id,
+                    content: r.content,
+                    relationship: r.relationship,
+                    direction: if r.direction == "incoming" {
+                        EdgeDirection::Incoming
+                    } else {
+                        EdgeDirection::Outgoing
+                    },
+                    truth_value: r.truth_value,
+                });
+        }
+    }
+
     // 8. continues_argument neighbors (Query A) — bidirectional.
     {
         let rows = sqlx::query!(
             r#"
             SELECT e.source_id AS "paragraph_id!", e.target_id AS "neighbor_id!"
             FROM edges e
+            JOIN claims cn ON cn.id = e.target_id
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND ($2::bool OR cn.visibility = 'public'
+                   OR cn.owner_group_id = ANY($3::uuid[]))
             UNION ALL
             SELECT e.target_id AS "paragraph_id!", e.source_id AS "neighbor_id!"
             FROM edges e
+            JOIN claims cn ON cn.id = e.source_id
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND ($2::bool OR cn.visibility = 'public'
+                   OR cn.owner_group_id = ANY($3::uuid[]))
             "#,
-            paragraph_ids
+            paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1430,6 +1752,8 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND ($2::bool OR cb.visibility = 'public'
+                           OR cb.owner_group_id = ANY($3::uuid[]))
                 ),
                 backward AS (
                     SELECT e.target_id AS atom_a, e.source_id AS atom_b, e.relationship
@@ -1440,6 +1764,8 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND ($2::bool OR cb.visibility = 'public'
+                           OR cb.owner_group_id = ANY($3::uuid[]))
                 )
                 SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
                 FROM forward
@@ -1447,7 +1773,9 @@ pub async fn fetch_batched_context(
                 SELECT atom_a AS "atom_a!", atom_b AS "atom_b!", relationship AS "relationship!"
                 FROM backward
                 "#,
-                &our_atom_ids
+                &our_atom_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1476,8 +1804,12 @@ pub async fn fetch_batched_context(
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND ($2::bool OR c.visibility = 'public'
+                       OR c.owner_group_id = ANY($3::uuid[]))
                 "#,
-                &atom_b_ids
+                &atom_b_ids,
+                v_bypass,
+                v_groups
             )
             .fetch_all(pool)
             .await?;
@@ -1518,8 +1850,13 @@ pub async fn fetch_batched_context(
     //    recent hit. The filtering happens on the candidate surfaces upstream.
     {
         let rows = sqlx::query!(
-            "SELECT id, content, truth_value, created_at FROM claims WHERE id = ANY($1)",
-            &all_paragraph_ids
+            "SELECT c.id, c.content, c.truth_value, c.created_at FROM claims c \
+             WHERE c.id = ANY($1) \
+               AND ($2::bool OR c.visibility = 'public' \
+                    OR c.owner_group_id = ANY($3::uuid[]))",
+            &all_paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1546,11 +1883,16 @@ pub async fn fetch_batched_context(
                 COALESCE(p.title, '') AS "title!"
             FROM edges e
             JOIN papers p ON p.id = e.source_id
+            JOIN claims c ON c.id = e.target_id
             WHERE e.target_id = ANY($1)
               AND e.relationship = 'asserts'
               AND e.source_type = 'paper'
+              AND ($2::bool OR c.visibility = 'public'
+                   OR c.owner_group_id = ANY($3::uuid[]))
             "#,
-            &all_paragraph_ids
+            &all_paragraph_ids,
+            v_bypass,
+            v_groups
         )
         .fetch_all(pool)
         .await?;
@@ -1749,6 +2091,7 @@ pub mod __test_only {
     /// `recall_with_context` runs after `embedder.generate_at_dim`.
     pub async fn recall_with_context_with_pgvec(
         server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
         params: RecallWithContextParams,
         centroid_dim: u32,
         pgvec: &str,
@@ -1757,6 +2100,7 @@ pub mod __test_only {
         let min_truth = params.min_truth.unwrap_or(0.3);
         let siblings_limit = params.siblings_limit.unwrap_or(8);
         let corroborates_limit = params.corroborates_limit.unwrap_or(4);
+        let epistemic_limit = params.epistemic_limit.unwrap_or(4);
         let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
         // Mirror the real entry: resolve + existence-check the lens up front so
         // integration tests exercise the same validation path.
@@ -1765,11 +2109,17 @@ pub mod __test_only {
             params.perspective_id.as_deref(),
         )?;
         if let Some((frame_id, perspective_id)) = lens {
-            crate::tools::lens::validate_lens_exists(&server.pool, frame_id, perspective_id)
-                .await?;
+            crate::tools::lens::validate_lens_exists(
+                &server.pool,
+                viewer,
+                frame_id,
+                perspective_id,
+            )
+            .await?;
         }
         recall_with_context_post_embed(
             server,
+            viewer,
             &params,
             centroid_dim,
             pgvec,
@@ -1777,9 +2127,88 @@ pub mod __test_only {
             min_truth,
             siblings_limit,
             corroborates_limit,
+            epistemic_limit,
             neighbor_paragraphs_limit,
             lens,
         )
         .await
+    }
+}
+
+/// Unit tests for the recall audit owner helper.
+///
+/// **The module MUST be named `tests`.** `no_inline_sql_in_tools.rs`'s
+/// `the_cfg_test_boundary_is_the_last_item_in_every_file_that_has_one` splits
+/// production from test sites on the first test-cfg attribute in a file and
+/// refuses any other module name, because a differently-named module would make
+/// that split wrong for every site below it. That lint finds the boundary with
+/// a plain substring search, so this comment deliberately does NOT spell the
+/// attribute out — a mention inside a doc comment IS the first match.
+#[cfg(test)]
+mod tests {
+    use super::{recall_audit_owner_group, AuditOwnerUnresolved};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// The DROP arms, asserted directly rather than through a handler.
+    ///
+    /// A handler-level version of this — "poll for a second and assert no row
+    /// appeared" — would pass whenever the spawned write is merely slow, which
+    /// is the false-green shape this suite rejects elsewhere. At the helper the
+    /// answer is a value, not a race.
+    ///
+    /// Both arms exist because they used to be one: the earlier
+    /// `Result<Option<Uuid>, DbError>` spelling made "no principal" a
+    /// SUCCESS that selected the instance-wide declaration, so the two failure
+    /// modes disagreed about whether to publish the row.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unresolvable_principal_is_an_error_not_a_widening(pool: PgPool) {
+        assert!(
+            matches!(
+                recall_audit_owner_group(&pool, None).await,
+                Err(AuditOwnerUnresolved::NoPrincipal)
+            ),
+            "no principal must be an error the caller has to handle, never an \
+             owner-less row"
+        );
+
+        // A uuid that is not an `agents` row: the group cannot be resolved and
+        // cannot be minted either.
+        assert!(
+            matches!(
+                recall_audit_owner_group(&pool, Some(Uuid::new_v4())).await,
+                Err(AuditOwnerUnresolved::Lookup(_))
+            ),
+            "a principal whose group cannot be resolved must take the same drop \
+             path as no principal at all"
+        );
+    }
+
+    /// The positive direction, on the same plant: a real agent resolves, and
+    /// resolves to the SAME group on the second call — `personal_group_of` is
+    /// mint-if-absent, and a helper that minted a fresh group per recall would
+    /// scatter one agent's history across groups instead of scoping it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_real_principal_resolves_to_one_stable_group(pool: PgPool) {
+        // Seeded through the repo layer, not an inline INSERT: `recall.rs` is
+        // registered in `no_inline_sql_in_tools.rs` at zero cfg(test) SQL
+        // sites, and a fixture is not a reason to move that number.
+        let pk: [u8; 32] = *Uuid::new_v4().as_bytes().repeat(2).first_chunk().unwrap();
+        let agent = epigraph_db::AgentRepository::create(
+            &pool,
+            &epigraph_core::Agent::new(pk, Some("audit-owner-fixture".to_string())),
+        )
+        .await
+        .expect("seed agent")
+        .id
+        .as_uuid();
+
+        let first = recall_audit_owner_group(&pool, Some(agent))
+            .await
+            .expect("a real principal resolves");
+        let second = recall_audit_owner_group(&pool, Some(agent))
+            .await
+            .expect("and resolves again");
+        assert_eq!(first, second, "one agent, one personal group, every call");
     }
 }

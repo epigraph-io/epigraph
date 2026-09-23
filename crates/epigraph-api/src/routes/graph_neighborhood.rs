@@ -17,9 +17,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::middleware::bearer::ViewerExtractor;
 use crate::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -126,39 +126,48 @@ pub struct CompoundGroup {
     pub member_atom_ids: Vec<Uuid>,
 }
 
-/// Expand one neighborhood of the latest run.
+/// Expand a precomputed neighborhood.
 ///
-/// Every `label` in either mode is `claims.content`, so both response shapes
-/// carry the same partition restrictions `GET /claims/:id` enforces: labels
-/// the requester may not read become `"[REDACTED]"` (§2.6). This route is on
-/// the protected router, so the bearer is required and `auth_ctx` is always
-/// present; it stays `Option` to match every other redacting handler and to
-/// fail closed if the layering ever changes.
+/// Atomic mode's node projection is read as the caller's `Viewer` — its
+/// `label` is `claims.content`. The neighborhood/run metadata and the `edges`
+/// traversals are not viewer-filtered; see `GraphViewRepository`'s module docs
+/// for why, and the PR-07 report for the residual that leaves.
 pub async fn expand(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(neighborhood_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<NeighborhoodExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
-    // The same lookup `graph::expand` and `GET /claims/:id/placement` use; a
-    // missing run leaves `exists` None and answers the same 404 the inlined
-    // subquery did.
-    let latest = epigraph_db::ClusterRunRepository::latest(pool)
-        .await
-        .map_err(internal)?;
-    let exists: Option<(Uuid,)> = match &latest {
-        Some(run) => {
-            sqlx::query_as("SELECT id FROM graph_neighborhoods WHERE id = $1 AND run_id = $2")
-                .bind(neighborhood_id)
-                .bind(run.run_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(internal)?
-        }
-        None => None,
-    };
+    // Conversion shard 5. ONE viewer-stamped connection for the whole response.
+    //
+    // The existence probe immediately below reads `graph_neighborhoods` and
+    // `graph_cluster_runs`; measured at migration head 92 NEITHER carries row
+    // level security (`pg_class.relrowsecurity` is false on both, and no policy
+    // exists on either), so stamping this statement narrows nothing and this
+    // probe is NOT made viewer-filtered by the change. What the stamp is for is
+    // the node projections in `atomic_response` / `compound_response`, which
+    // read `claims`, `edges` and `claim_neighborhood_membership`.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "expand",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to acquire a scoped connection".to_string(),
+        )
+    })?;
+    let exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM graph_neighborhoods WHERE id = $1 \
+         AND run_id = (SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1)",
+    )
+    .bind(neighborhood_id)
+    .fetch_optional(&mut *read)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if exists.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -166,65 +175,43 @@ pub async fn expand(
         ));
     }
 
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
     match params.mode.as_str() {
         "atomic" => Ok(Json(NeighborhoodExpandResponse::Atomic(
-            atomic_response(pool, neighborhood_id, params.budget, requester).await?,
+            atomic_response(&mut read, &viewer, neighborhood_id, params.budget).await?,
         ))),
         _ => Ok(Json(NeighborhoodExpandResponse::Compound(
-            compound_response(pool, neighborhood_id, params.budget, requester).await?,
+            compound_response(&mut read, &viewer, neighborhood_id, params.budget).await?,
         ))),
     }
 }
 
+/// Conversion shard 5 took this from `pool: &PgPool` to a borrowed connection so
+/// that its four statements run on the caller's ONE viewer-stamped connection
+/// rather than on four arbitrary raw-pool checkouts. `&mut PgConnection` rather
+/// than a by-value `E: PgExecutor`, because a by-value executor is MOVED by its
+/// first use and this body has four; `&mut *conn` is reborrowed per call.
 async fn compound_response(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
     neighborhood_id: Uuid,
     _budget: i64,
-    requester: Option<Uuid>,
 ) -> Result<CompoundResponse, (axum::http::StatusCode, String)> {
-    let mut nodes: Vec<CompoundNode> = sqlx::query_as::<_, (Uuid, String, String, i32, Option<f64>, Option<Uuid>)>(
-        r#"
-        WITH atoms AS (
-            SELECT m.claim_id
-            FROM claim_neighborhood_membership m
-            WHERE m.neighborhood_id = $1
-        ),
-        compound_to_atoms AS (
-            SELECT e.source_id AS compound_id, e.target_id AS atom_id
-            FROM edges e
-            JOIN atoms a ON a.claim_id = e.target_id
-            WHERE e.relationship = 'decomposes_to'
-        ),
-        compound_nodes AS (
-            SELECT cta.compound_id AS id, COUNT(*)::int AS atom_count
-            FROM compound_to_atoms cta
-            GROUP BY cta.compound_id
-        ),
-        standalone_nodes AS (
-            SELECT a.claim_id AS id
-            FROM atoms a
-            WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = a.claim_id AND e.relationship = 'decomposes_to')
-              AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = a.claim_id AND e.relationship = 'decomposes_to')
-        )
-        SELECT c.id, COALESCE(c.content, c.id::text) AS label, 'compound'::text AS kind,
-               cn.atom_count, c.pignistic_prob,
-               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id
-        FROM compound_nodes cn JOIN claims c ON c.id = cn.id
-        UNION ALL
-        SELECT c.id, COALESCE(c.content, c.id::text), 'standalone'::text, 0, c.pignistic_prob,
-               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1)
-        FROM standalone_nodes s JOIN claims c ON c.id = s.id
-        "#,
+    let nodes: Vec<CompoundNode> = epigraph_db::GraphViewRepository::neighborhood_compound_nodes(
+        &mut *conn,
+        viewer,
+        neighborhood_id,
     )
-    .bind(neighborhood_id)
-    .fetch_all(pool).await
+    .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
-    .map(|(id, label, kind, atom_count, pp, fid)| CompoundNode { id, label, kind, atom_count, pignistic_prob: pp, frame_id: fid })
+    .map(|r| CompoundNode {
+        id: r.id,
+        label: r.label,
+        kind: r.kind,
+        atom_count: r.atom_count,
+        pignistic_prob: r.pignistic_prob,
+        frame_id: r.frame_id,
+    })
     .collect();
 
     let induced_edges: Vec<InducedEdge> = sqlx::query_as::<_, (Uuid, Uuid, String, f64, i32)>(
@@ -255,7 +242,7 @@ async fn compound_response(
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
@@ -297,7 +284,7 @@ async fn compound_response(
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool).await
+    .fetch_all(&mut *conn).await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
     .map(|(source, target, relationship)| DirectEdge { source, target, relationship })
@@ -355,7 +342,7 @@ async fn compound_response(
         "#,
     )
     .bind(neighborhood_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
@@ -367,14 +354,33 @@ async fn compound_response(
     })
     .collect();
 
-    // `label` is `COALESCE(c.content, c.id::text)` for both compound and
-    // standalone nodes; one ownership lookup covers the whole node set.
-    crate::access_control::redact_claim_fields(
-        pool,
-        requester,
-        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
-    )
-    .await;
+    // PR-07: `nodes` is viewer-filtered; the three edge projections above are
+    // not. Before PR-07 nodes and edges were drawn from the same unfiltered
+    // set, so the payload was at least internally consistent. Filtering only
+    // the nodes broke that: the edge arrays would still name the ids of
+    // compounds that were never viewer-checked, which is an id-enumeration
+    // oracle feeding every other by-id endpoint, and a graph client indexing
+    // edges against the node map would synthesize phantom label-less nodes.
+    //
+    // Constraining each edge to endpoints that survived the node filter
+    // restores the invariant "every edges[].source/target appears in
+    // nodes[].id" and removes the oracle. This mirrors what `graph.rs::expand`
+    // already does by deriving its edge query's id set from the filtered nodes;
+    // it is done in Rust here because these three statements are structural
+    // aggregates whose endpoints are computed, not selected.
+    let visible: std::collections::HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
+    let induced_edges: Vec<InducedEdge> = induced_edges
+        .into_iter()
+        .filter(|e| visible.contains(&e.source) && visible.contains(&e.target))
+        .collect();
+    let direct_edges: Vec<DirectEdge> = direct_edges
+        .into_iter()
+        .filter(|e| visible.contains(&e.source) && visible.contains(&e.target))
+        .collect();
+    let structural_edges: Vec<StructuralEdge> = structural_edges
+        .into_iter()
+        .filter(|e| visible.contains(&e.source) && visible.contains(&e.target))
+        .collect();
 
     Ok(CompoundResponse {
         neighborhood_id,
@@ -386,29 +392,29 @@ async fn compound_response(
     })
 }
 
+/// Conversion shard 5 took this from `pool: &PgPool` to a borrowed connection,
+/// for the reason given on [`compound_response`].
 async fn atomic_response(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
     neighborhood_id: Uuid,
     _budget: i64,
-    requester: Option<Uuid>,
 ) -> Result<AtomicResponse, (axum::http::StatusCode, String)> {
-    let mut nodes: Vec<AtomicNode> = sqlx::query_as::<_, (Uuid, String, Option<Uuid>, Option<f64>, Option<Uuid>)>(
-        r#"
-        SELECT c.id,
-               COALESCE(c.content, c.id::text) AS label,
-               (SELECT e.source_id FROM edges e
-                WHERE e.target_id = c.id AND e.relationship = 'decomposes_to' LIMIT 1) AS compound_id,
-               c.pignistic_prob,
-               (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id
-        FROM claim_neighborhood_membership m
-        JOIN claims c ON c.id = m.claim_id
-        WHERE m.neighborhood_id = $1
-        "#,
+    let nodes: Vec<AtomicNode> = epigraph_db::GraphViewRepository::neighborhood_atomic_nodes(
+        &mut *conn,
+        viewer,
+        neighborhood_id,
     )
-    .bind(neighborhood_id).fetch_all(pool).await
+    .await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
-    .map(|(id, label, compound_id, pp, fid)| AtomicNode { id, label, compound_id, pignistic_prob: pp, frame_id: fid })
+    .map(|r| AtomicNode {
+        id: r.id,
+        label: r.label,
+        compound_id: r.compound_id,
+        pignistic_prob: r.pignistic_prob,
+        frame_id: r.frame_id,
+    })
     .collect();
 
     let edges: Vec<AtomicEdge> = sqlx::query_as::<_, (Uuid, Uuid, String)>(
@@ -422,49 +428,50 @@ async fn atomic_response(
           AND ft.forward_strength > 0
         "#,
     )
-    .bind(neighborhood_id).fetch_all(pool).await
+    .bind(neighborhood_id).fetch_all(&mut *conn).await
     .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     .into_iter()
     .map(|(source, target, relationship)| AtomicEdge { source, target, relationship })
     .collect();
 
-    let mut compound_groups: Vec<CompoundGroup> = sqlx::query_as::<_, (Uuid, String, Vec<Uuid>)>(
-        r#"
-        SELECT e.source_id AS compound_id,
-               COALESCE(c.content, c.id::text) AS label,
-               array_agg(e.target_id ORDER BY e.target_id) AS member_atom_ids
-        FROM edges e
-        JOIN claims c ON c.id = e.source_id
-        JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id AND m.neighborhood_id = $1
-        WHERE e.relationship = 'decomposes_to'
-        GROUP BY 1, 2
-        "#,
-    )
-    .bind(neighborhood_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .into_iter()
-    .map(|(compound_id, label, member_atom_ids)| CompoundGroup {
-        compound_id,
-        label,
-        member_atom_ids,
-    })
-    .collect();
-
-    // Atom labels and compound-group labels are both `claims.content`, and a
-    // group's parent compound is generally not among `nodes`, so both sets go
-    // into the same single lookup.
-    let redact_targets: Vec<(Uuid, &mut String)> = nodes
-        .iter_mut()
-        .map(|n| (n.id, &mut n.label))
-        .chain(
-            compound_groups
-                .iter_mut()
-                .map(|g| (g.compound_id, &mut g.label)),
+    let compound_groups: Vec<CompoundGroup> =
+        epigraph_db::GraphViewRepository::neighborhood_compound_groups(
+            &mut *conn,
+            viewer,
+            neighborhood_id,
         )
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .map(|r| CompoundGroup {
+            compound_id: r.compound_id,
+            label: r.label,
+            member_atom_ids: r.member_atom_ids,
+        })
         .collect();
-    crate::access_control::redact_claim_fields(pool, requester, redact_targets).await;
+
+    // PR-07: same node/edge consistency fix as `compound_response`. `edges`
+    // and each group's `member_atom_ids` are aggregated from unfiltered
+    // `edges`/membership rows, so both are constrained to the ids that
+    // survived the viewer-filtered node projection. A group left with no
+    // visible members is dropped rather than returned empty — an empty group
+    // still discloses that a compound exists and parents something here.
+    let visible: std::collections::HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
+    let edges: Vec<AtomicEdge> = edges
+        .into_iter()
+        .filter(|e| visible.contains(&e.source) && visible.contains(&e.target))
+        .collect();
+    let compound_groups: Vec<CompoundGroup> = compound_groups
+        .into_iter()
+        .filter_map(|mut g| {
+            g.member_atom_ids.retain(|id| visible.contains(id));
+            if g.member_atom_ids.is_empty() {
+                None
+            } else {
+                Some(g)
+            }
+        })
+        .collect();
 
     Ok(AtomicResponse {
         neighborhood_id,
@@ -525,38 +532,45 @@ pub struct CompoundNeighborEdge {
     pub total_strength: f64,
 }
 
-/// Project one claim's 1-hop neighbourhood onto the compound layer.
+/// Compound-level neighborhood of a single claim.
 ///
-/// Every `label` here — the centre's and every neighbour's — is `claims.content`,
-/// so this response carries the same partition restrictions `GET /claims/:id`
-/// enforces: labels the requester may not read become `"[REDACTED]"` (§2.6).
-/// Unlike the other two expand routes this one is on the **public** router, so
-/// `auth_ctx` is genuinely absent for an anonymous caller and the requester is
-/// then `None` — public content only, which is the fail-closed default.
+/// Both the centre's content and every neighbour's content are read as the
+/// caller's `Viewer`. Before PR-07 this handler ran
+/// `SELECT content FROM claims WHERE id = $1` with no predicate — a bare
+/// content-and-existence oracle for any claim id — and then returned every
+/// adjacent compound's `content` alongside it.
 pub async fn claim_compound_neighborhood(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<CompoundNeighborhoodParams>,
 ) -> Result<Json<CompoundNeighborhoodResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
+    // Conversion shard 5: one viewer-stamped connection across all four
+    // statements, so the centre's visibility check and the neighbour
+    // aggregation describe the same corpus.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_compound_neighborhood",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to acquire a scoped connection".to_string(),
+        )
+    })?;
     let budget = params.budget.clamp(1, 200);
 
-    // SECURITY: requester from the validated bearer only; the `get_claim`
-    // convention (`agent_id`, falling back to `client_id`), shared by every
-    // handler in the §2.6 sweep.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
-    // Fetch center claim content + verify it exists.
-    let center: Option<(String,)> = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
-        .bind(claim_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(internal)?;
-    let Some((center_content,)) = center else {
+    // Fetch center claim content + verify the VIEWER can see it. A claim the
+    // viewer cannot read is reported as absent, identically to one that does
+    // not exist.
+    let center =
+        epigraph_db::GraphViewRepository::compound_center_content(&mut *read, &viewer, claim_id)
+            .await
+            .map_err(internal)?;
+    let Some(center_content) = center else {
         return Err((StatusCode::NOT_FOUND, "claim not found".into()));
     };
 
@@ -564,65 +578,12 @@ pub async fn claim_compound_neighborhood(
     // Both endpoints of every epistemic edge are projected to their parent
     // compound (or themselves if standalone). The center claim's projection
     // is filtered out so we don't return self-loops.
-    let rows: Vec<(Uuid, String, String, i64, f64, Option<f64>)> = sqlx::query_as(
-        r#"
-        WITH seed AS (
-            SELECT $1::uuid AS center
-        ),
-        center_atoms AS (
-            -- Atoms of the center compound (if it has children)
-            SELECT e.target_id AS atom_id
-            FROM edges e, seed
-            WHERE e.source_id = seed.center AND e.relationship = 'decomposes_to'
-            UNION
-            -- Or the center itself if it's atomic / standalone (no children)
-            SELECT seed.center FROM seed
-            WHERE NOT EXISTS (
-                SELECT 1 FROM edges WHERE source_id = (SELECT center FROM seed)
-                AND relationship = 'decomposes_to'
-            )
-        ),
-        epistemic_edges AS (
-            -- Positive-weight epistemic edges with one endpoint in center_atoms.
-            SELECT
-                CASE WHEN ca.atom_id = e.source_id THEN e.target_id ELSE e.source_id END AS other_atom_id,
-                e.relationship,
-                ft.forward_strength
-            FROM edges e
-            JOIN edge_to_factor_type(e.relationship) ft ON ft.forward_strength > 0
-            JOIN center_atoms ca
-                ON ca.atom_id = e.source_id OR ca.atom_id = e.target_id
-            WHERE e.source_id != e.target_id
-        ),
-        projected AS (
-            -- Resolve each "other_atom" to its parent compound (or itself).
-            SELECT
-                COALESCE(d.source_id, ee.other_atom_id) AS compound_id,
-                ee.relationship,
-                ee.forward_strength
-            FROM epistemic_edges ee
-            LEFT JOIN edges d
-                ON d.target_id = ee.other_atom_id
-                AND d.relationship = 'decomposes_to'
-        )
-        SELECT
-            c.id,
-            c.content,
-            p.relationship,
-            COUNT(*)::bigint AS atom_edge_count,
-            SUM(p.forward_strength)::double precision AS total_strength,
-            c.pignistic_prob
-        FROM projected p
-        JOIN claims c ON c.id = p.compound_id
-        WHERE p.compound_id != $1::uuid
-        GROUP BY c.id, c.content, p.relationship, c.pignistic_prob
-        ORDER BY atom_edge_count DESC, c.id
-        LIMIT $2
-        "#,
+    let rows = epigraph_db::GraphViewRepository::compound_neighbors(
+        &mut *read,
+        &viewer,
+        claim_id,
+        budget + 1, // +1 so we can detect truncation
     )
-    .bind(claim_id)
-    .bind(budget + 1) // +1 so we can detect truncation
-    .fetch_all(pool)
     .await
     .map_err(internal)?;
 
@@ -635,7 +596,7 @@ pub async fn claim_compound_neighborhood(
         "SELECT COUNT(*)::bigint FROM edges WHERE source_id = $1 AND relationship = 'decomposes_to'",
     )
     .bind(claim_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *read)
     .await
     .map_err(internal)?
         > 0;
@@ -643,7 +604,7 @@ pub async fn claim_compound_neighborhood(
         "SELECT COUNT(*)::bigint FROM edges WHERE target_id = $1 AND relationship = 'decomposes_to'",
     )
     .bind(claim_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *read)
     .await
     .map_err(internal)?
         > 0;
@@ -656,7 +617,15 @@ pub async fn claim_compound_neighborhood(
     let mut nodes_by_id: std::collections::HashMap<Uuid, CompoundNeighborNode> =
         std::collections::HashMap::new();
     let mut edges: Vec<CompoundNeighborEdge> = Vec::new();
-    for (id, content, relationship, atom_edge_count, total_strength, pignistic_prob) in kept {
+    for epigraph_db::CompoundNeighborRow {
+        id,
+        content,
+        relationship,
+        atom_edge_count,
+        total_strength,
+        pignistic_prob,
+    } in kept
+    {
         let entry = nodes_by_id
             .entry(id)
             .or_insert_with(|| CompoundNeighborNode {
@@ -689,15 +658,6 @@ pub async fn claim_compound_neighborhood(
             pignistic_prob: None,
         },
     );
-
-    // Centre and neighbours alike are `claims.content`; one ownership lookup
-    // covers the whole node set, matching the cost of the other swept routes.
-    crate::access_control::redact_claim_fields(
-        pool,
-        requester,
-        nodes.iter_mut().map(|n| (n.id, &mut n.label)),
-    )
-    .await;
 
     Ok(Json(CompoundNeighborhoodResponse {
         center_id: claim_id,

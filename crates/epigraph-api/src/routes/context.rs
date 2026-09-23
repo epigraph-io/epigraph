@@ -6,10 +6,31 @@
 //! - `GET /api/v1/contexts/active` — list currently active contexts
 //! - `GET /api/v1/frames/:id/contexts` — list contexts applicable to a frame
 //!
+//! # Tenancy: 4 of this file's 5 raw-pool sites are converted
+//!
+//! Conversion shard 5. `list_contexts`, `get_context`, `list_active_contexts`
+//! and `frame_contexts` each read through one viewer-stamped connection taken
+//! from [`AppState::read_as`]; `ContextRepository` already spliced the viewer
+//! into every one of those statements, so what changed is which connection
+//! carries the session GUCs the RLS policy on `contexts` reads.
+//!
+//! `create_context` is NOT converted: it WRITES, `read_as` is documented
+//! read-only, and `ContextRepository::create` takes no `Viewer`. Its owner is
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`.
+//!
+//! These four sites carry no new behavioural assertion of their own.
+//! `crates/epigraph-db/tests/viewer_fixture.rs` has no `contexts` seeder, and
+//! authoring one was outside this shard's shape; the shard's mutation proof is
+//! carried by `routes/structural.rs`, over relations the fixture can already
+//! reach. Recorded rather than glossed.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+//!
 //! Protected (POST):
 //! - `POST /api/v1/contexts` — create a context
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -176,11 +197,24 @@ pub async fn create_context(
 /// `GET /api/v1/contexts`
 #[cfg(feature = "db")]
 pub async fn list_contexts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListContextsQuery>,
 ) -> Result<Json<Vec<ContextResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::ContextRepository::list(pool, params.limit, params.offset).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_contexts",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows =
+        epigraph_db::ContextRepository::list(&mut *read, &viewer, params.limit, params.offset)
+            .await?;
     Ok(Json(rows.into_iter().map(context_to_response).collect()))
 }
 
@@ -189,11 +223,22 @@ pub async fn list_contexts(
 /// `GET /api/v1/contexts/:id`
 #[cfg(feature = "db")]
 pub async fn get_context(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ContextResponse>, ApiError> {
-    let pool = &state.db_pool;
-    let row = epigraph_db::ContextRepository::get_by_id(pool, id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_context",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let row = epigraph_db::ContextRepository::get_by_id(&mut *read, &viewer, id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "context".to_string(),
@@ -207,10 +252,21 @@ pub async fn get_context(
 /// `GET /api/v1/contexts/active`
 #[cfg(feature = "db")]
 pub async fn list_active_contexts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ContextResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::ContextRepository::list_active(pool).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_active_contexts",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows = epigraph_db::ContextRepository::list_active(&mut *read, &viewer).await?;
     Ok(Json(rows.into_iter().map(context_to_response).collect()))
 }
 
@@ -219,11 +275,23 @@ pub async fn list_active_contexts(
 /// `GET /api/v1/frames/:id/contexts`
 #[cfg(feature = "db")]
 pub async fn frame_contexts(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<Vec<ContextResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::ContextRepository::list_for_frame(pool, frame_id).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "frame_contexts",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows =
+        epigraph_db::ContextRepository::list_for_frame(&mut *read, &viewer, frame_id).await?;
     Ok(Json(rows.into_iter().map(context_to_response).collect()))
 }
 

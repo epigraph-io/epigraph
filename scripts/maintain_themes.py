@@ -18,10 +18,19 @@ Usage:
 
 Environment:
     EPIGRAPH_API_URL  - API base URL (default: http://127.0.0.1:8080)
-    EPIGRAPH_TOKEN    - Bearer token for write endpoints. Mint via
-                        scripts/mint_epigraph_token.py (requires claims:write,
-                        and claims:admin for reassign flows that cross owners).
-                        Read-only endpoints work without a token.
+    EPIGRAPH_TOKEN    - Bearer token. REQUIRED (PR-03). Needs claims:write, and
+                        claims:admin for reassign flows that cross owners.
+    EPIGRAPH_AGENT_ID - agents.id to mint the token's `agent_id` claim from.
+
+    Mint with `scripts/_api_client.py::mint_bearer_token`. (Earlier revisions of
+    this docstring pointed at `scripts/mint_epigraph_token.py`, which does not
+    exist in this repo.)
+
+    The token is no longer optional. Every theme endpoint this script reads —
+    `/api/v1/clusters/boundary-claims`, `/api/v1/themes/split-candidates`,
+    `/api/v1/themes/{id}/embeddings`, `/api/v1/themes/distant-claims` — was on
+    the anonymous router and is now authenticated, so a tokenless run 401s on
+    its very first request rather than doing useful read-only work.
 """
 
 import json
@@ -43,18 +52,27 @@ for i, arg in enumerate(sys.argv):
 
 DRY_RUN = "--dry-run" in sys.argv
 
-# Public-repo auth convention: bearer token in EPIGRAPH_TOKEN env var
-# (mint with scripts/mint_epigraph_token.py — see header docstring).
-# V2 shelled out to epigraph-login.py; that script doesn't ship with public.
+# Bearer token in EPIGRAPH_TOKEN. Mandatory since PR-03 — see header docstring.
 TOKEN = os.environ.get("EPIGRAPH_TOKEN")
+if not TOKEN:
+    sys.exit(
+        "EPIGRAPH_TOKEN is required.\n"
+        "  Every theme endpoint this script uses is authenticated (PR-03).\n"
+        "  Mint one with scripts/_api_client.py::mint_bearer_token, e.g.\n"
+        "    EPIGRAPH_AGENT_ID=<agents.id> python3 -c \\\n"
+        "      \"import sys; sys.path.insert(0,'scripts'); from _api_client \\\n"
+        "        import mint_bearer_token; \\\n"
+        "        print(mint_bearer_token(['claims:write','claims:admin']))\"\n"
+        "  The token must carry a non-null agent_id claim."
+    )
 
 
 def get_auth_headers():
-    """Build request headers, attaching bearer token when available."""
-    headers = {"Content-Type": "application/json"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    return headers
+    """Build request headers with the (mandatory) bearer token."""
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TOKEN}",
+    }
 
 
 def api_get(path, params=None, timeout=60):
@@ -207,7 +225,12 @@ def auto_split_theme(theme_id, theme_label, n_clusters=3, min_claims=500):
         return []
 
     ids = [c["id"] for c in claims]
-    embeddings = np.array([c["embedding"] for c in claims])
+    # PR-07: the endpoint returns a deterministic 2-D PCA projection, not raw
+    # 1536-d vectors (plan section 4.9 row 4 -- embeddings are approximately
+    # invertible to claim content, and this endpoint returned 5000 of them at
+    # claims:read). The projection preserves the dominant separating axis, which
+    # is all k-means needs to decide which claim goes in which half.
+    embeddings = np.array([c["projection"] for c in claims])
 
     km = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, batch_size=min(1000, len(claims)))
     labels = km.fit_predict(embeddings)
@@ -219,14 +242,15 @@ def auto_split_theme(theme_id, theme_label, n_clusters=3, min_claims=500):
         if count < 50:
             continue
 
-        centroid = km.cluster_centers_[c].tolist()
         cluster_ids = [ids[i] for i in np.where(mask)[0]]
         sub_label = f"{theme_label} (sub-{c + 1})"
 
+        # `centroid` is omitted deliberately. km.cluster_centers_ is now a 2-D
+        # point in projection space, which is NOT a valid 1536-d theme centroid.
+        # The server averages the real embeddings of `claim_ids` instead.
         result = api_post("/api/v1/themes/create-with-centroid", {
             "label": sub_label,
             "description": f"Auto-split from '{theme_label}'.",
-            "centroid": centroid,
             "claim_ids": cluster_ids,
         })
 

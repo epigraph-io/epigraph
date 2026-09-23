@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, content, truth_value, labels, is_current\n            FROM claims\n            WHERE id = ANY($1)\n              AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "content",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "truth_value",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "labels",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 4,
+        "name": "is_current",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c433f1454760b3823a25fee1065bb2654ca577ba36d13cd0e0098e56a2e018e9"
+}

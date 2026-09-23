@@ -176,7 +176,27 @@ pub fn unauthorized(resource_metadata_url: Option<&str>, error: &str) -> Respons
 /// *everything* with "no auth context", rendering the flag misleading (backlog
 /// bug `be2a3391`). Injecting this permissive context lets calls through, which
 /// is exactly what the operator asked for.
-pub fn unauthenticated_context() -> AuthContext {
+///
+/// # Tenancy (PR-09)
+///
+/// `agent_id` now carries `server_agent_id` — the server's own `agents.id` —
+/// instead of `None`. Plan §4.12 assigns this change to PR-09, and it is
+/// required for the flag to keep working now that
+/// `tools::viewer::request_viewer` refuses an `AuthContext` with no agent
+/// principal: with `None` here, every content tool on this listener would
+/// return the "token carries no agent principal" error and the flag would be
+/// misleading in a *new* way.
+///
+/// **Call it a widening, because it is one.** Before, `request_viewer` mapped
+/// this context's nil `client_id` to `Viewer::resolve(pool, nil)` — an empty
+/// group set, public rows only, fail-closed by accident. Now every holder of
+/// this listener's credential (in production, one shared bearer token in front
+/// of a unix socket) reads with the server agent's group set. On today's corpus
+/// the two are identical, because migration 062 defaults `visibility` to
+/// `'public'` and backfills nothing; the difference appears the moment PR-12's
+/// backfill writes the first `'group'` row. Operators who do not want that
+/// should not be running `--allow-unauthenticated-http`.
+pub fn unauthenticated_context(server_agent_id: Option<uuid::Uuid>) -> AuthContext {
     let mut scopes: Vec<String> = crate::scope_map::SCOPE_MAP
         .iter()
         .map(|(_, scope)| (*scope).to_string())
@@ -185,11 +205,222 @@ pub fn unauthenticated_context() -> AuthContext {
     scopes.dedup();
     AuthContext {
         client_id: uuid::Uuid::nil(),
-        agent_id: None,
+        agent_id: server_agent_id,
         owner_id: None,
         client_type: epigraph_auth::ClientType::Service,
         scopes,
         jti: uuid::Uuid::nil(),
+    }
+}
+
+/// Something that can resolve the server's own `agents.id`, retrying on failure.
+///
+/// Implemented by `server::EpiGraphMcpFull`, whose `agent_id()` caches only on
+/// success (`agent_db_id: Arc<Mutex<Option<Uuid>>>` is written in the `Ok` arm
+/// and left untouched on `Err`), so a real implementation is already
+/// resolve-once-then-cheap without any further caching here.
+///
+/// A trait rather than the concrete type so this module does not depend on the
+/// server, and so the retry behaviour can be driven deterministically in a test
+/// without a database.
+#[async_trait::async_trait]
+pub trait ServerPrincipalSource: Send + Sync {
+    /// The server's own `agents.id`, or a displayable reason it could not be
+    /// determined *this time*.
+    async fn resolve_server_agent_id(&self) -> Result<uuid::Uuid, String>;
+}
+
+/// The principal injected on the `--allow-unauthenticated-http` listener.
+///
+/// # Why this is not an `Option<Uuid>`
+///
+/// It was one. `main.rs` resolved the server agent id once, at boot, before
+/// layering the middleware, and stored the result — including `None` — as the
+/// middleware's state. A database that was briefly unreachable during startup
+/// therefore disabled every content tool on that listener for the **life of the
+/// process**: `tools::viewer::request_viewer` refuses an `AuthContext` carrying
+/// no agent principal, correctly, and nothing ever re-attempted the resolution.
+/// The symptom is the same error from every tool, which does not point at a
+/// boot-time blip, and this deployment reboots into a Postgres address race
+/// often enough for the window to be reachable in practice.
+///
+/// The fail-closed half of that behaviour is right and is unchanged: while the
+/// id is unresolved, [`Self::agent_id`] yields `None`, the injected context
+/// carries no principal, and content tools refuse. What changes is that "while"
+/// is now a state rather than a verdict.
+///
+/// # Shape
+///
+/// * `warm` is the boot-time attempt, kept as a **warm-up**: on success it is
+///   the answer and no further round trip is made; on failure it is `None` and
+///   says nothing about later requests.
+/// * `source` is consulted whenever `warm` is `None`. Absent it, the principal
+///   can never resolve — which is the honest state for a listener whose pool is
+///   deliberately unreachable, as in this crate's HTTP auth tests.
+/// * `cooldown` + `last_attempt` bound how often the source may be consulted
+///   while unresolved. See "Retrying is not free" below.
+///
+/// # Retrying is not free, so the RATE is bounded
+///
+/// Re-attempting per request, unbounded, would trade one defect for another.
+/// `server::EpiGraphMcpFull::agent_id` — the production source — takes
+/// `agent_db_id: Mutex` and holds that guard across every database await inside
+/// it, and its not-found arm *writes* (`AgentRepository::create`,
+/// `set_llm_properties`, `ensure_personal_group`). So during exactly the outage
+/// this type exists to survive, N concurrent requests on the unauthenticated
+/// listener would queue behind one mutex, each paying a full pool-acquire
+/// timeout, and tail latency would be N × timeout rather than one timeout. The
+/// pre-fix behaviour at least answered instantly.
+///
+/// `last_attempt` is stamped **before** the source is consulted and cleared on
+/// success, so concurrent callers during an outage collapse to roughly one
+/// attempt per `cooldown` rather than one per request, and a healthy resolver is
+/// never throttled. [`DEFAULT_RESOLUTION_COOLDOWN`] is short enough that a boot
+/// blip still recovers within a request or two.
+///
+/// The fail-closed verdict is untouched by any of this: a throttled request
+/// yields `None`, which is what an unresolved principal yielded anyway.
+///
+/// `Default` is derived deliberately and is safe here, which is worth saying
+/// because `Default` on an auth-adjacent type is exactly the shape
+/// `epigraph-db`'s `no_anonymous_viewer.rs` bans for `Viewer`. The reason that
+/// ban exists is that a defaulted `Viewer` would be a *permissive* value
+/// conjured without a principal. This type's default is the opposite: no warm-up
+/// and no source, i.e. the state in which every request carries no principal and
+/// every content tool refuses. Defaulting it cannot widen anything.
+#[derive(Clone, Default)]
+pub struct UnauthenticatedPrincipal {
+    warm: Option<uuid::Uuid>,
+    source: Option<std::sync::Arc<dyn ServerPrincipalSource>>,
+    cooldown: std::time::Duration,
+    /// When the source was last consulted *and did not succeed*. Shared across
+    /// the clone axum makes per request, which is the whole point: a per-request
+    /// copy would bound nothing.
+    last_attempt: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+/// How long an unresolved principal waits before consulting the source again.
+///
+/// Short enough that a Postgres address race at boot recovers within a request
+/// or two; long enough that a sustained outage costs one attempt per interval
+/// instead of one per request.
+pub const DEFAULT_RESOLUTION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl std::fmt::Debug for UnauthenticatedPrincipal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnauthenticatedPrincipal")
+            .field("warm", &self.warm)
+            .field("has_source", &self.source.is_some())
+            .finish()
+    }
+}
+
+impl UnauthenticatedPrincipal {
+    /// A principal that can never resolve. Every request on this listener
+    /// carries no agent id, so every content tool refuses.
+    #[must_use]
+    pub fn unresolvable() -> Self {
+        Self::default()
+    }
+
+    /// A principal backed by `source`, with no boot-time warm-up yet and the
+    /// production retry cooldown.
+    #[must_use]
+    pub fn lazily_from(source: std::sync::Arc<dyn ServerPrincipalSource>) -> Self {
+        Self {
+            warm: None,
+            source: Some(source),
+            cooldown: DEFAULT_RESOLUTION_COOLDOWN,
+            last_attempt: std::sync::Arc::default(),
+        }
+    }
+
+    /// Override the retry cooldown. `Duration::ZERO` disables the bound, which
+    /// is what a test wanting to observe one attempt per request asks for.
+    #[must_use]
+    pub fn with_cooldown(mut self, cooldown: std::time::Duration) -> Self {
+        self.cooldown = cooldown;
+        self
+    }
+
+    /// Record a successful boot-time resolution. Purely an optimisation: it
+    /// spares the first request a round trip.
+    #[must_use]
+    pub fn warmed_with(mut self, id: uuid::Uuid) -> Self {
+        self.warm = Some(id);
+        self
+    }
+
+    /// May the source be consulted right now? Stamps the attempt if so.
+    ///
+    /// The stamp is taken BEFORE the round trip, not after a failure, so a burst
+    /// of concurrent callers during an outage collapses to one attempt rather
+    /// than all of them observing a stale timestamp and proceeding together.
+    ///
+    /// The guard is released before this returns; nothing is held across an
+    /// await, so a `std::sync::Mutex` is the right lock here.
+    fn claim_attempt(&self) -> bool {
+        if self.cooldown.is_zero() {
+            return true;
+        }
+        let Ok(mut slot) = self.last_attempt.lock() else {
+            // A poisoned lock means a previous holder panicked. Consulting the
+            // source is the fail-closed-compatible choice: the worst case is an
+            // unthrottled retry, never a widened verdict.
+            return true;
+        };
+        if let Some(at) = *slot {
+            if at.elapsed() < self.cooldown {
+                return false;
+            }
+        }
+        *slot = Some(std::time::Instant::now());
+        true
+    }
+
+    /// Forget the throttle after a success, so a healthy resolver is never
+    /// rate-limited.
+    fn clear_attempt(&self) {
+        if let Ok(mut slot) = self.last_attempt.lock() {
+            *slot = None;
+        }
+    }
+
+    /// The server's `agents.id`, or `None` if it cannot be determined right now.
+    ///
+    /// `None` is not sticky. That is the entire point of this type.
+    pub async fn agent_id(&self) -> Option<uuid::Uuid> {
+        // The boot snapshot is a WARM-UP, not the answer. When it is absent the
+        // source is consulted again — which is the fix. Collapsing this to
+        // `return self.warm;` restores the once-only defect exactly.
+        if let Some(id) = self.warm {
+            return Some(id);
+        }
+        let source = self.source.as_ref()?;
+        if !self.claim_attempt() {
+            // Throttled, not decided: the verdict is the same `None` an
+            // unresolved principal already yields, so nothing widens and nothing
+            // new is refused. Deliberately not logged — the failure that opened
+            // the cooldown was logged at error, and logging every suppressed
+            // retry would turn an outage into a log flood.
+            return None;
+        }
+        match source.resolve_server_agent_id().await {
+            Ok(id) => {
+                self.clear_attempt();
+                Some(id)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    cooldown_secs = self.cooldown.as_secs(),
+                    "could not resolve the server agent id for \
+                     --allow-unauthenticated-http; content tools on that listener \
+                     will refuse (no agent principal) until it resolves"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -198,8 +429,20 @@ pub fn unauthenticated_context() -> AuthContext {
 /// scope gate passes. Mirrors how [`bearer_auth_middleware`] inserts a
 /// *validated* `AuthContext`, minus the validation. Attach this ONLY when the
 /// operator passed `--allow-unauthenticated-http` (enforced in `main.rs`).
-pub async fn inject_unauthenticated_context(mut req: Request, next: Next) -> Response {
-    req.extensions_mut().insert(unauthenticated_context());
+///
+/// The state is an [`UnauthenticatedPrincipal`] rather than an `Option<Uuid>` so
+/// that an unresolved principal is re-attempted per request instead of being a
+/// process-lifetime verdict. `tools::viewer::request_viewer` is untouched: it
+/// still refuses an `AuthContext` with no agent principal, and it must, because
+/// it cannot tell that case from a real Bearer token that carries none.
+pub async fn inject_unauthenticated_context(
+    axum::extract::State(principal): axum::extract::State<UnauthenticatedPrincipal>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let server_agent_id = principal.agent_id().await;
+    req.extensions_mut()
+        .insert(unauthenticated_context(server_agent_id));
     next.run(req).await
 }
 
@@ -207,6 +450,236 @@ pub async fn inject_unauthenticated_context(mut req: Request, next: Next) -> Res
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    // ── The unauthenticated listener's principal is re-resolved, not frozen ──
+
+    /// A source that fails `fail_first` times and then succeeds, counting calls.
+    ///
+    /// Stands in for a database that is unreachable when the process boots and
+    /// reachable shortly afterwards — the condition the fix exists for, and one
+    /// no fixture in this workspace can produce against a real pool.
+    struct FlakySource {
+        id: uuid::Uuid,
+        fail_first: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakySource {
+        fn new(fail_first: usize) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                id: uuid::Uuid::new_v4(),
+                fail_first,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ServerPrincipalSource for FlakySource {
+        async fn resolve_server_agent_id(&self) -> Result<uuid::Uuid, String> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_first {
+                Err("database unreachable".to_string())
+            } else {
+                Ok(self.id)
+            }
+        }
+    }
+
+    /// Echo the `agent_id` the middleware injected, so the assertion is on the
+    /// EFFECT — what a downstream tool would see in its `AuthContext` — rather
+    /// than on the return value of the resolver.
+    async fn echo_injected_agent_id(req: Request) -> Response {
+        let body = match req.extensions().get::<AuthContext>() {
+            Some(ctx) => match ctx.agent_id {
+                Some(id) => id.to_string(),
+                None => "none".to_string(),
+            },
+            None => "no-context".to_string(),
+        };
+        body.into_response()
+    }
+
+    async fn injected_agent_id(router: &axum::Router) -> String {
+        use tower::ServiceExt;
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A boot-time resolution failure must not disable the listener for the life
+    /// of the process.
+    ///
+    /// The first request sees no principal — fail-closed, which is correct and is
+    /// asserted here so a fix that widened instead of retrying would be caught.
+    /// The second request, with the source now healthy, sees the real agent id.
+    /// Before this, the boot-time `None` was the middleware's state and every
+    /// request for the life of the process carried no principal.
+    ///
+    /// Run with the cooldown disabled, so what is observed is the retry itself
+    /// and not the rate bound. The bound has its own tests below.
+    #[tokio::test]
+    async fn an_unresolved_boot_snapshot_is_retried_on_the_next_request() {
+        let source = FlakySource::new(1);
+        let principal = UnauthenticatedPrincipal::lazily_from(
+            source.clone() as std::sync::Arc<dyn ServerPrincipalSource>
+        )
+        .with_cooldown(std::time::Duration::ZERO);
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_injected_agent_id))
+            .layer(axum::middleware::from_fn_with_state(
+                principal,
+                inject_unauthenticated_context,
+            ));
+
+        assert_eq!(
+            injected_agent_id(&router).await,
+            "none",
+            "while the id is unresolved the injected context must carry no \
+             principal, so content tools refuse"
+        );
+        assert_eq!(
+            injected_agent_id(&router).await,
+            source.id.to_string(),
+            "the next request must re-attempt the resolution rather than \
+             inheriting the boot-time failure"
+        );
+        assert_eq!(
+            source.calls(),
+            2,
+            "with the rate bound disabled, one attempt per request while unresolved"
+        );
+    }
+
+    /// The rate bound: a burst of requests during an outage must not become a
+    /// burst of resolution attempts.
+    ///
+    /// This is the half that keeps the retry from trading one defect for
+    /// another. The production source holds a mutex across its database awaits
+    /// and writes on its not-found arm, so an unbounded per-request retry would
+    /// turn an unreachable Postgres into a serialized queue of pool-acquire
+    /// timeouts driven by unauthenticated callers.
+    ///
+    /// The verdict is asserted alongside the count: throttling must keep
+    /// answering `"none"`, never start answering something permissive.
+    #[tokio::test]
+    async fn a_failed_resolution_is_not_retried_again_within_the_cooldown() {
+        let source = FlakySource::new(usize::MAX); // never succeeds
+        let principal = UnauthenticatedPrincipal::lazily_from(
+            source.clone() as std::sync::Arc<dyn ServerPrincipalSource>
+        )
+        .with_cooldown(std::time::Duration::from_secs(3600));
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_injected_agent_id))
+            .layer(axum::middleware::from_fn_with_state(
+                principal,
+                inject_unauthenticated_context,
+            ));
+
+        for _ in 0..20 {
+            assert_eq!(
+                injected_agent_id(&router).await,
+                "none",
+                "a throttled request must still carry no principal — the bound is \
+                 on the retry RATE, never on the verdict"
+            );
+        }
+        assert_eq!(
+            source.calls(),
+            1,
+            "twenty requests inside one cooldown window must cost one resolution \
+             attempt, not twenty"
+        );
+    }
+
+    /// The positive control for the bound: a resolver that answers is never
+    /// rate-limited, however long the cooldown is.
+    ///
+    /// Without this, a throttle that simply stopped consulting the source after
+    /// the first attempt would pass the test above while disabling the listener
+    /// for `cooldown` at a time — over-suppression, which is silent.
+    #[tokio::test]
+    async fn a_succeeding_resolution_is_never_throttled() {
+        let source = FlakySource::new(0); // always succeeds
+        let id = source.id;
+        let principal = UnauthenticatedPrincipal::lazily_from(
+            source.clone() as std::sync::Arc<dyn ServerPrincipalSource>
+        )
+        .with_cooldown(std::time::Duration::from_secs(3600));
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_injected_agent_id))
+            .layer(axum::middleware::from_fn_with_state(
+                principal,
+                inject_unauthenticated_context,
+            ));
+
+        for _ in 0..5 {
+            assert_eq!(
+                injected_agent_id(&router).await,
+                id.to_string(),
+                "a healthy source must answer every request; the cooldown applies \
+                 only to attempts that did not succeed"
+            );
+        }
+        assert_eq!(
+            source.calls(),
+            5,
+            "success clears the throttle, so no request is suppressed by it"
+        );
+    }
+
+    /// The positive control: a boot-time success is used as-is and costs no
+    /// further round trip. Without this, "retry every request" would pass the
+    /// test above while turning one boot resolution into one per request.
+    #[tokio::test]
+    async fn a_warm_boot_snapshot_is_used_without_re_resolving() {
+        let source = FlakySource::new(0);
+        let id = source.id;
+        let principal = UnauthenticatedPrincipal::lazily_from(
+            source.clone() as std::sync::Arc<dyn ServerPrincipalSource>
+        )
+        .warmed_with(id);
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_injected_agent_id))
+            .layer(axum::middleware::from_fn_with_state(
+                principal,
+                inject_unauthenticated_context,
+            ));
+
+        assert_eq!(injected_agent_id(&router).await, id.to_string());
+        assert_eq!(injected_agent_id(&router).await, id.to_string());
+        assert_eq!(
+            source.calls(),
+            0,
+            "a warm boot snapshot must answer without consulting the source"
+        );
+    }
+
+    /// A listener with no source can never resolve, and says so every time
+    /// rather than pretending. This is the shape `tests/http_auth_test.rs` boots.
+    #[tokio::test]
+    async fn a_principal_with_no_source_never_resolves() {
+        let router = axum::Router::new()
+            .route("/probe", axum::routing::get(echo_injected_agent_id))
+            .layer(axum::middleware::from_fn_with_state(
+                UnauthenticatedPrincipal::unresolvable(),
+                inject_unauthenticated_context,
+            ));
+        assert_eq!(injected_agent_id(&router).await, "none");
+        assert_eq!(injected_agent_id(&router).await, "none");
+    }
 
     #[test]
     fn unauthorized_response_advertises_resource_metadata() {

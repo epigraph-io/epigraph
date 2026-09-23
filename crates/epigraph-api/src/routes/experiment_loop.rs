@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 
@@ -209,6 +210,7 @@ pub async fn add_measurements(
 /// (which triggers shared_evidence factor if multi-hypothesis).
 #[cfg(feature = "db")]
 pub async fn analyze_result(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path((experiment_id, result_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<AnalyzeRequest>,
@@ -261,6 +263,7 @@ pub async fn analyze_result(
                 // Check if source claim is grounded
                 let grounded = epigraph_db::ClaimRepository::has_grounded_evidence(
                     &state.db_pool,
+                    &viewer,
                     source_claim_id,
                 )
                 .await

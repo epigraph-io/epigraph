@@ -9,6 +9,9 @@
 //! buried under many newer high-truth claims is still returned. This test pins
 //! exactly that scenario: it would fail under the old fetch-then-filter path.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -51,6 +54,7 @@ async fn seed_claim(pool: &PgPool, agent_id: Uuid, truth: f64, created_at: &str)
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn truth_range_filter_finds_matches_outside_recent_window(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     // 25 RECENT claims with high truth (0.95) — these crowd out the top-`limit`
@@ -63,7 +67,7 @@ async fn truth_range_filter_finds_matches_outside_recent_window(pool: PgPool) {
     // is the *oldest* row, so a fetch-recent-then-filter strategy never sees it.
     seed_claim(&pool, agent, 0.50, "2026-01-01T00:00:00Z").await;
 
-    let results = ClaimRepository::list_by_truth_range(&pool, 0.0, 0.75, 20, 0)
+    let results = ClaimRepository::list_by_truth_range(&pool, &viewer, 0.0, 0.75, 20, 0)
         .await
         .unwrap();
 
@@ -81,7 +85,7 @@ async fn truth_range_filter_finds_matches_outside_recent_window(pool: PgPool) {
     );
 
     // And a high-truth query still excludes it.
-    let high = ClaimRepository::list_by_truth_range(&pool, 0.9, 1.0, 20, 0)
+    let high = ClaimRepository::list_by_truth_range(&pool, &viewer, 0.9, 1.0, 20, 0)
         .await
         .unwrap();
     assert!(

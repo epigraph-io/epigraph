@@ -49,16 +49,23 @@ pub trait ExternalIdentityProvider: Send + Sync {
     fn default_scopes(&self) -> &[String];
 
     /// Exact email addresses permitted to auto-provision through this provider.
-    /// An empty slice together with an empty [`Self::allowed_domains`] means
-    /// allow-all (the gate is opt-in). Default impl returns `&[]` so existing
-    /// and test providers keep compiling without edits.
+    ///
+    /// **An empty slice together with an empty [`Self::allowed_domains`] now
+    /// DENIES all provisioning** unless `ApiConfig.allow_all_identities` is
+    /// explicitly `true` (PR-02; it used to mean allow-all). The default impl
+    /// returning `&[]` is kept only so third-party and test providers keep
+    /// compiling — it now means "provisions nothing by default", which is the
+    /// right default for a provider that has not thought about the question.
     fn allowed_emails(&self) -> &[String] {
         &[]
     }
 
     /// Email domains (the part after the last `@`) permitted to auto-provision
-    /// through this provider. Empty together with [`Self::allowed_emails`] means
-    /// allow-all. Default impl returns `&[]`.
+    /// through this provider.
+    ///
+    /// Empty together with [`Self::allowed_emails`] DENIES all provisioning
+    /// unless `ApiConfig.allow_all_identities` is explicitly `true`. The default
+    /// impl returns `&[]`, i.e. "provisions nothing by default".
     fn allowed_domains(&self) -> &[String] {
         &[]
     }

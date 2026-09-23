@@ -1,3 +1,6 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 // Regression tests for the C-1 FK violation
 // (mass_functions_perspective_id_fkey).
 //
@@ -54,6 +57,7 @@ async fn seed_frame(pool: &PgPool) -> sqlx::Result<Uuid> {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn ensure_evidence_perspective_creates_row(pool: PgPool) -> sqlx::Result<()> {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent_id = seed_agent(&pool, 0xAA).await?;
     let evidence_id = Uuid::new_v4();
 
@@ -61,7 +65,7 @@ async fn ensure_evidence_perspective_creates_row(pool: PgPool) -> sqlx::Result<(
         .await
         .expect("ensure_evidence_perspective should succeed");
 
-    let row = PerspectiveRepository::get_by_id(&pool, evidence_id)
+    let row = PerspectiveRepository::get_by_id(&pool, &viewer, evidence_id)
         .await
         .expect("get_by_id should succeed")
         .expect("perspective row should exist after ensure");

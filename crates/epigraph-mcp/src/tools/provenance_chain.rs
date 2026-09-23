@@ -48,6 +48,7 @@ struct ChainResponse {
 
 pub async fn get_provenance_chain(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetProvenanceChainParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
@@ -55,6 +56,7 @@ pub async fn get_provenance_chain(
 
     let chain = ProvenanceChainRepository::chain(
         &server.pool,
+        viewer,
         claim_id,
         max_depth,
         params.relationships.as_deref(),

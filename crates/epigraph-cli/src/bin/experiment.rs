@@ -99,15 +99,34 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("experiment")
+        .await
+        .expect("maintenance pool");
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance viewer");
+    let viewer = session.viewer();
+    if let Err(e) = run(cli, maint.pool().clone(), viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = epigraph_cli::db_connect().await?;
-
+async fn run(
+    cli: Cli,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Create {
             hypothesis_id,
@@ -156,7 +175,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Err("protocol_gen failed".into());
                 }
             } else {
-                design_skeleton(&pool, hypothesis_id).await?;
+                design_skeleton(&pool, viewer, hypothesis_id).await?;
             }
             Ok(())
         }
@@ -200,6 +219,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             analyze(
                 &pool,
+                viewer,
                 result_id,
                 &direction,
                 agent_id,
@@ -213,6 +233,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn design_skeleton(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     hypothesis_id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (statement,): (String,) = sqlx::query_as("SELECT content FROM claims WHERE id = $1")
@@ -231,10 +252,11 @@ async fn design_skeleton(
         if let Some(method_ids) = &exp.method_ids {
             for mid in method_ids {
                 if let Some(method) = epigraph_db::MethodRepository::get(pool, *mid).await? {
-                    let evidence =
-                        epigraph_db::MethodRepository::get_evidence_strength(pool, method.id)
-                            .await
-                            .ok();
+                    let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+                        pool, viewer, method.id,
+                    )
+                    .await
+                    .ok();
                     let score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
                     let gap = if score < 0.3 { " [GAP]" } else { "" };
                     println!(
@@ -344,6 +366,7 @@ async fn add_measurements(
 
 async fn analyze(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     result_id: Uuid,
     direction: &str,
     agent_id: Uuid,
@@ -376,9 +399,10 @@ async fn analyze(
                     .into());
                 }
                 // Use same grounding check as API: ClaimRepository::has_grounded_evidence
-                let grounded = epigraph_db::ClaimRepository::has_grounded_evidence(pool, src_uuid)
-                    .await
-                    .unwrap_or(false);
+                let grounded =
+                    epigraph_db::ClaimRepository::has_grounded_evidence(pool, viewer, src_uuid)
+                        .await
+                        .unwrap_or(false);
                 if !grounded {
                     return Err(format!(
                         "Measurement source {src_uuid} lacks grounded evidence \

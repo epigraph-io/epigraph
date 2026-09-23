@@ -211,6 +211,15 @@ pub async fn execute_workflow_ingest_plan(
     let mut inserted: Vec<(Uuid, String)> = Vec::new();
     let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
 
+    // Tenancy declaration (PR-16). One lookup for the whole plan: every claim
+    // in a workflow ingest is authored by the same system agent, and resolving
+    // it per claim would be N identical round trips. The executor is pure-DB
+    // and its callers do not choose a group -- `store_workflow`,
+    // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
+    // instance-wide workflow content -- so the system agent's own group is the
+    // declaration, publicly visible.
+    let decl = ClaimRepository::default_decl_for_author_pool(pool, system_agent_id).await?;
+
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let raw_truth = confidence.clamp(0.01, 0.99);
@@ -232,6 +241,7 @@ pub async fn execute_workflow_ingest_plan(
             system_agent_id,
             truth,
             &labels,
+            decl,
         )
         .await?;
 

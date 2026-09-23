@@ -2,6 +2,9 @@
 //! hybrid embed leg fails, so `recall` must serve scope-honoring lexical-only
 //! results (the regression that previously returned [] for scoped queries).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_mcp::tools::memory::recall;
 use epigraph_mcp::types::RecallParams;
 use sqlx::PgPool;
@@ -39,6 +42,7 @@ fn parse_results(result: rmcp::model::CallToolResult) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_falls_back_to_scope_honoring_lexical_when_embedder_down(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let h = |tag: u8| {
         let mut x = vec![0u8; 32];
@@ -69,7 +73,7 @@ async fn recall_falls_back_to_scope_honoring_lexical_when_embedder_down(pool: Pg
         exclude_contested: false,
         since: None,
     };
-    let out = recall(&server, params).await.expect("recall ok");
+    let out = recall(&server, &viewer, params).await.expect("recall ok");
     let arr = parse_results(out);
     let arr = arr.as_array().expect("array");
 

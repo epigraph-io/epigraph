@@ -6,6 +6,9 @@
 //! restores it (the 50ea636e ingest-initial-asymmetry use case), plus check
 //! the target-selection, truncation, and no-BBA-skip reporting.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::types::RecomputeBeliefsParams;
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
@@ -67,8 +70,10 @@ async fn insert_claim_with_label(pool: &PgPool, agent: Uuid, content: &str, labe
 
 /// Give `claim_id` a real binary-frame BBA + cached belief.
 async fn wire_bba(pool: &PgPool, claim_id: Uuid, agent_id: Uuid) {
+    let viewer = fixture::public_viewer(pool).await;
     tools::ds_auto::auto_wire_ds_update(
         pool,
+        &viewer,
         claim_id,
         agent_id,
         0.9,  // confidence
@@ -93,6 +98,10 @@ async fn pignistic(pool: &PgPool, claim_id: Uuid) -> f64 {
 /// correct combine result and reports accurate counts.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-stale").await;
     let claim = insert_claim(&pool, agent, &format!("recompute-stale-{}", Uuid::new_v4())).await;
@@ -109,6 +118,7 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -140,12 +150,17 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 /// A claim with no BBAs is counted as skipped, not recomputed, and is not an error.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_skips_claim_without_bbas(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-nobba").await;
     let bare = insert_claim(&pool, agent, &format!("recompute-nobba-{}", Uuid::new_v4())).await;
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![bare.to_string()]),
             labels: None,
@@ -168,6 +183,10 @@ async fn recompute_skips_claim_without_bbas(pool: PgPool) {
 /// `truncated=true` when `limit` is smaller than the population.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-bulk").await;
     // Two claims with BBAs; ephemeral DB so the bulk population is exactly 2.
@@ -183,6 +202,7 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -201,6 +221,7 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     // Page 2 picks up the remaining claim and is not truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -220,6 +241,10 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 /// claims exist and none remain (the bug the limit+1 fetch fixes).
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_labels_truncation_is_exact(pool: PgPool) {
+    // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
+    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // other tenant's cached beliefs stale. Hold the ScopedPool.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-lbl").await;
     let label = format!("rb-lbl-{}", Uuid::new_v4());
@@ -237,6 +262,7 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // limit=1 over 2 labeled claims → one remains → truncated.
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label.clone()]),
@@ -254,6 +280,7 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // limit=2 over exactly 2 labeled claims → none remain → NOT truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
         &server,
+        &viewer,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label]),
@@ -268,5 +295,132 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     assert_eq!(
         j2["truncated"], false,
         "exactly limit claims, none remain — must not false-positive"
+    );
+}
+
+/// Backlog 696d3a1c: `recompute_beliefs` reverted edge-derived belief.
+///
+/// The claim hypothesised the edge mass was never persisted, or persisted in a
+/// form the enumeration could not read. Neither: it IS persisted on
+/// `binary_truth` and it IS read. It is then OVERWRITTEN.
+///
+/// `recompute_claim_belief_on_frame` persists nothing per-frame — it writes only
+/// the five SHARED `claims.{belief, plausibility, mass_on_empty, pignistic_prob,
+/// mass_on_missing}` columns. `recompute_beliefs` calls it once per frame the
+/// claim has BBAs on, over `list_frames_for_claim`'s `ORDER BY f.name`. So with
+/// N frames the cache ends up holding the ALPHABETICALLY LAST frame's numbers.
+///
+/// `binary_truth` sorts first (b < c < f < p < t), so the edge-derived values it
+/// owns are written first and clobbered by every other frame — typically a
+/// `paper_validity_*` or `textbook_veracity_*` frame carrying the PRE-EDGE
+/// intrinsic assessment. That is exactly the reported symptom: ee862955 reset to
+/// "exactly the claim's pre-edge intrinsic BBA", with `errors=[]`.
+///
+/// Deterministic rather than racy, which makes it worse: it reverts the same way
+/// every run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool: PgPool) {
+    // Same reason as the sibling tests: recompute_beliefs enumerates via
+    // `list_claim_ids`, whose debug_assert requires a Bypass viewer. Hold the
+    // ScopedPool for the duration.
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let server = make_server(pool.clone());
+    let agent = insert_agent(&pool, "696d3a1c-multiframe").await;
+    let claim = insert_claim(&pool, agent, &format!("696d3a1c-{}", Uuid::new_v4())).await;
+
+    // Canonical binary_truth BBA — this is what the link_epistemic wiring path
+    // writes, and what unframed get_belief is documented to serve.
+    wire_bba(&pool, claim, agent).await;
+    let canonical = pignistic(&pool, claim).await;
+
+    // A second frame whose name sorts AFTER "binary_truth", carrying a clearly
+    // different opinion. "zz_" makes the ordering explicit rather than relying on
+    // a realistic name that happens to sort later.
+    let other_frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, description, hypotheses)
+         VALUES ($1, 'sorts after binary_truth', ARRAY['TRUE','FALSE'])
+         RETURNING id",
+    )
+    .bind(format!("zz_other_frame_{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("insert second frame");
+
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
+         VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
+    )
+    .bind(claim)
+    .bind(other_frame)
+    .execute(&pool)
+    .await
+    .expect("assign claim to second frame");
+
+    let other_agent = insert_agent(&pool, "696d3a1c-other").await;
+    sqlx::query(
+        "INSERT INTO mass_functions
+           (id, claim_id, frame_id, source_agent_id, masses, conflict_k,
+            combination_method, source_strength, evidence_type, locality_tag)
+         VALUES (gen_random_uuid(), $1, $2, $3, '{\"1\":0.85,\"0,1\":0.15}'::jsonb,
+                 0.0, 'auto_wire', 0.9, 'empirical', 'intra_self_cite')",
+    )
+    .bind(claim)
+    .bind(other_frame)
+    .bind(other_agent)
+    .execute(&pool)
+    .await
+    .expect("insert second-frame BBA");
+
+    let out = tools::cdst_maintenance::recompute_beliefs(
+        &server,
+        &viewer,
+        RecomputeBeliefsParams {
+            claim_ids: Some(vec![claim.to_string()]),
+            labels: None,
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("recompute_beliefs");
+    let json = result_json(out);
+
+    assert_eq!(
+        json["errors"].as_array().map(Vec::len),
+        Some(0),
+        "the clobber is the happy path — it must not be masked by an error: {json}"
+    );
+
+    let after = pignistic(&pool, claim).await;
+    assert!(
+        (after - canonical).abs() < 1e-9,
+        "recompute_beliefs must leave the canonical binary_truth belief intact, \
+         not overwrite it with a non-canonical frame's opinion. \
+         canonical(binary_truth)={canonical}, after recompute={after}. \
+         The second frame sorts after 'binary_truth' and won the shared \
+         claims.pignistic_prob cache — this is backlog 696d3a1c, and it is what \
+         silently reverts every contradicts/refutes edge written since the last \
+         recompute."
+    );
+
+    // The cache must also SAY which frame it summarizes. `claims` carries six
+    // belief columns and, before migration 092, no frame reference — so the number
+    // looked authoritative while silently describing one of N contexts. Multi-frame
+    // claims are intended (claim_frames is PK (claim_id, frame_id)), which is
+    // exactly why the cache has to be self-describing.
+    let cached_frame: Option<Uuid> =
+        sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("belief_frame_id");
+    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
+        .await
+        .expect("ensure_binary_frame");
+    assert_eq!(
+        cached_frame,
+        Some(binary),
+        "claims.belief_frame_id must name the frame the cached scalars summarize, \
+         so a reader can tell which context the number describes"
     );
 }

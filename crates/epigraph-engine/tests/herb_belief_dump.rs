@@ -14,6 +14,9 @@
 //!   MODE=ingest DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_anxiety_ingest_dev \
 //!     SQLX_OFFLINE=true cargo test -p epigraph-engine --test herb_belief_dump -- --ignored --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::BTreeMap;
 
 use epigraph_db::PgPool;
@@ -23,9 +26,16 @@ use uuid::Uuid;
 #[tokio::test]
 #[ignore = "operator-driven: needs DATABASE_URL + MODE"]
 async fn herb_belief_dump() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-    let mode = std::env::var("MODE").expect("MODE=demo|ingest");
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        eprintln!("SKIP: DATABASE_URL not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(mode) = std::env::var("MODE") else {
+        eprintln!("SKIP: MODE not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
+    let viewer = fixture::public_viewer(&pool).await;
 
     let perspectives: Vec<(String, Uuid)> =
         sqlx::query_as("SELECT name, id FROM perspectives ORDER BY name")
@@ -69,7 +79,7 @@ async fn herb_belief_dump() {
         for (cid, content) in &claims {
             let herb = content.split_whitespace().next().unwrap_or("?").to_string();
             for (pname, pid) in &perspectives {
-                let bi = get_perspective_belief(&pool, *cid, frame_id, *pid)
+                let bi = get_perspective_belief(&pool, &viewer, *cid, frame_id, *pid)
                     .await
                     .expect("belief");
                 let e = acc.entry((herb.clone(), pname.clone())).or_insert((0.0, 0));

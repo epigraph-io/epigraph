@@ -270,13 +270,23 @@ async fn rag_context() {}
 /// System statistics
 ///
 /// Returns comprehensive system health and operational metrics
-/// from all major subsystems.
+/// from all major subsystems. Requires the `claims:admin` scope.
+///
+/// The `security(...)` block this path does not carry is a deliberate and
+/// separate matter: five of this document's paths lack one, and adding it to
+/// exactly the path that changed would make the inconsistency look like a rule.
+/// The response set below is not in that category — without the 401/403 arms a
+/// generated client is told 200 is the only outcome of a route that refuses
+/// every non-admin token, which is a false contract rather than an incomplete
+/// one.
 #[utoipa::path(
     get,
     path = "/api/v1/admin/stats",
     tag = "admin",
     responses(
         (status = 200, description = "System statistics snapshot", body = SystemStats),
+        (status = 401, description = "Missing or invalid Bearer token"),
+        (status = 403, description = "Token does not carry the `claims:admin` scope"),
     )
 )]
 async fn system_stats() {}

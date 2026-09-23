@@ -5,6 +5,9 @@
 //! whether it logs the ids it really returned. A recall that silently writes
 //! nothing would pass every repo test.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use chrono::TimeZone;
 use epigraph_mcp::tools::memory::recall;
 use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
@@ -20,6 +23,23 @@ fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
     EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false)
+}
+
+/// A viewer for a REAL principal — an agent row with a personal group.
+///
+/// `fixture::public_viewer` resolves the NIL uuid, which is not an agent and
+/// therefore has no group that could own an audit row. That was harmless while
+/// the row's owner came from the MCP process identity; it is not harmless now
+/// that the owner comes from the request principal, and the audit write
+/// correctly DROPS rather than widening when the principal cannot own anything.
+/// `tools/viewer.rs::request_viewer` never produces a nil principal on either
+/// transport, so this fixture is the realistic one and the nil viewer was
+/// modelling an unreachable state.
+async fn principal_viewer(pool: &PgPool) -> epigraph_db::Viewer {
+    let (principal, _group) = fixture::seed_agent_with_group(pool, "audit-wiring").await;
+    epigraph_db::Viewer::resolve(pool, principal)
+        .await
+        .expect("resolve the request principal")
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
@@ -62,11 +82,12 @@ fn params(query: &str) -> RecallParams {
 /// Polls briefly because the write is intentionally spawned, not awaited.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_logs_the_claim_ids_it_returned(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let hit = seed_claim(&pool, agent, "wextonium audit fixture").await;
 
     let server = build_test_server(pool.clone());
-    let out = recall(&server, params("wextonium"))
+    let out = recall(&server, &viewer, params("wextonium"))
         .await
         .expect("recall ok");
 
@@ -114,6 +135,7 @@ async fn recall_logs_the_claim_ids_it_returned(pool: PgPool) {
 /// dropped the log write fails, and recall must still serve its results.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_survives_a_failing_audit_write(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let hit = seed_claim(&pool, agent, "brentalix resilience fixture").await;
 
@@ -124,7 +146,7 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
         .expect("drop");
 
     let server = build_test_server(pool.clone());
-    let out = recall(&server, params("brentalix"))
+    let out = recall(&server, &viewer, params("brentalix"))
         .await
         .expect("recall must succeed even when the audit log is unwritable");
 
@@ -159,6 +181,7 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
 /// `since_is_recorded_on_the_empty_recall_with_context_audit_row` below.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     seed_claim(&pool, agent, "quorbiline audit window fixture").await;
 
@@ -170,7 +193,7 @@ async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let mut p = params("quorbiline");
     p.since = Some(since.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
-    recall(&server, p).await.expect("recall ok");
+    recall(&server, &viewer, p).await.expect("recall ok");
 
     // Fire-and-forget write: poll rather than assume.
     let mut logged: Option<serde_json::Value> = None;
@@ -293,6 +316,7 @@ fn context_params(since: chrono::DateTime<chrono::Utc>) -> RecallWithContextPara
 /// The `recall_with_context` main-path audit literal records the window.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let pgvec = pgvec_bucket0();
     // Created now, so it is comfortably inside the 2025-06-01 window and the
@@ -300,10 +324,15 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
     seed_paragraph(&pool, agent, "quorbiline context window fixture", &pgvec).await;
 
     let server = build_test_server(pool.clone());
-    let out =
-        recall_with_context_with_pgvec(&server, context_params(since_fixture()), 1536, &pgvec)
-            .await
-            .expect("recall_with_context ok");
+    let out = recall_with_context_with_pgvec(
+        &server,
+        &viewer,
+        context_params(since_fixture()),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
     let text = out
         .content
         .iter()
@@ -335,6 +364,7 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
 /// cover it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let pgvec = pgvec_bucket0();
     // Seeded, but OUTSIDE the window — so the window itself is what empties
@@ -348,10 +378,15 @@ async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPo
         .expect("backdate");
 
     let server = build_test_server(pool.clone());
-    let out =
-        recall_with_context_with_pgvec(&server, context_params(since_fixture()), 1536, &pgvec)
-            .await
-            .expect("recall_with_context ok");
+    let out = recall_with_context_with_pgvec(
+        &server,
+        &viewer,
+        context_params(since_fixture()),
+        1536,
+        &pgvec,
+    )
+    .await
+    .expect("recall_with_context ok");
     let text = out
         .content
         .iter()
@@ -383,4 +418,95 @@ async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPo
         since_fixture(),
         "the audit row must record the window that produced the empty result"
     );
+}
+
+// ── WHOSE identity does the audit row carry? ──────────────────────────────
+//
+// Every test above drives the handler with a viewer and then asserts something
+// about the row's CONTENT — the ids, the window — so all of them pass whether
+// the row is stamped with the request principal or with the process's own
+// agent. `epigraph-db/tests/recall_event_test.rs` cannot see the difference
+// either: it hand-builds the declaration by calling `personal_group_of_pool`
+// directly, which is the identity the production path did not construct. The
+// test below is the one that discriminates, and it drives the real handler.
+
+/// The audit row is owned by the REQUEST PRINCIPAL, not by the MCP process.
+///
+/// `EpiGraphMcpFull::agent_id` resolves the agent for the signer's public key —
+/// one agent per process — while `get_recall_events` reads through the viewer
+/// built from the per-request auth context. Those are the same value on stdio
+/// and different values on the HTTP transport, so an owner taken from the
+/// process identity both misattributes the row and hides it from the agent that
+/// authored it. The precondition assertion below is what keeps this test honest
+/// on a tree where the two identities happen to coincide.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_audit_row_is_owned_by_the_request_principal_not_the_process(pool: PgPool) {
+    let (principal, principal_group) =
+        fixture::seed_agent_with_group(&pool, "audit-request-principal").await;
+    let viewer = epigraph_db::Viewer::resolve(&pool, principal)
+        .await
+        .expect("resolve the request principal");
+    let hit = seed_claim(&pool, principal, "zelmaraq principal fixture").await;
+
+    let server = build_test_server(pool.clone());
+    let process_agent = server
+        .server_agent_id()
+        .await
+        .expect("the process resolves its own agent");
+    assert_ne!(
+        process_agent, principal,
+        "precondition: the process identity and the request principal must differ, \
+         or this test cannot tell them apart"
+    );
+
+    recall(&server, &viewer, params("zelmaraq"))
+        .await
+        .expect("recall ok");
+
+    // Fire-and-forget: poll rather than assume.
+    let mut row: Option<(Option<Uuid>, Option<Uuid>, String)> = None;
+    for _ in 0..50 {
+        if let Some(r) = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>, String)>(
+            "SELECT agent_id, owner_group_id, visibility FROM recall_events \
+             WHERE tool = 'recall' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        {
+            row = Some(r);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (agent_id, owner_group_id, visibility) = row.expect("recall must write an audit row");
+
+    assert_eq!(
+        agent_id,
+        Some(principal),
+        "the row records WHO ASKED, and that is the request principal"
+    );
+    assert_eq!(
+        owner_group_id,
+        Some(principal_group),
+        "the row must be owned by the request principal's personal group; owning it \
+         from the process agent's group is what suppressed the author's own history"
+    );
+    assert_eq!(
+        visibility, "group",
+        "the visibility is the load-bearing half — a 'public' row satisfies the read \
+         predicate's middle disjunct whatever it is owned by"
+    );
+
+    // Positive direction, on the same plant: the principal can read the row
+    // back through the same predicate `get_recall_events` uses.
+    let mine =
+        epigraph_db::RecallEventRepository::list(&pool, &viewer, None, None, None, None, 10, 0)
+            .await
+            .expect("list");
+    assert!(
+        mine.iter().any(|e| e.query_text == "zelmaraq"),
+        "over-suppression is silent and permanent: the author must still read its own row"
+    );
+    let _ = hit;
 }

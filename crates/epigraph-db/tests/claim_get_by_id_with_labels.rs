@@ -8,34 +8,13 @@
 //! reads both from a single SQL statement, which is inherently consistent
 //! under Postgres MVCC.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{AgentId, Claim, TruthValue};
 use epigraph_db::ClaimRepository;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-async fn try_test_pool() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(3)
-        .connect(&url)
-        .await
-        .ok()?;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
-    Some(pool)
-}
-
-macro_rules! test_pool_or_skip {
-    () => {{
-        match try_test_pool().await {
-            Some(p) => p,
-            None => {
-                eprintln!("Skipping DB test: DATABASE_URL not set or unreachable");
-                return;
-            }
-        }
-    }};
-}
 
 async fn insert_test_agent(pool: &PgPool, agent_id: Uuid) {
     sqlx::query(
@@ -58,25 +37,54 @@ fn make_claim(content: &str, agent_id: Uuid) -> Claim {
     )
 }
 
-#[tokio::test]
-async fn get_by_id_with_labels_returns_none_when_no_row() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_id_with_labels_returns_none_when_no_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
 
-    let found = ClaimRepository::get_by_id_with_labels(&pool, epigraph_core::ClaimId::new())
-        .await
-        .expect("query call");
+    // Seed a DECOY that must NOT be returned. On the shared database this arm
+    // used to run against, some sibling arm's rows happened to supply this
+    // role; that discrimination was an accident of execution order, not a
+    // property of the test. `#[sqlx::test]` hands us an empty table, so without
+    // an explicit decoy `is_none()` would be satisfied by there being nothing
+    // to return at all — deleting the `WHERE id = $1` predicate from
+    // `get_by_id_with_labels` would still pass. The decoy makes the predicate
+    // the only reason the result is None.
+    let decoy_agent = Uuid::new_v4();
+    insert_test_agent(&pool, decoy_agent).await;
+    let decoy = ClaimRepository::create(
+        &pool,
+        &make_claim(&format!("decoy {}", Uuid::new_v4()), decoy_agent),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create decoy");
+
+    let found =
+        ClaimRepository::get_by_id_with_labels(&pool, &viewer, epigraph_core::ClaimId::new())
+            .await
+            .expect("query call");
 
     assert!(found.is_none(), "expected None, got {:?}", found.is_some());
+
+    // The decoy is real, visible to this viewer, and would have been returned
+    // by an unfiltered query — otherwise the assertion above proves nothing.
+    assert!(
+        ClaimRepository::get_by_id_with_labels(&pool, &viewer, decoy.id)
+            .await
+            .expect("query call")
+            .is_some(),
+        "decoy must be retrievable by its own id, or it cannot discriminate"
+    );
 }
 
-#[tokio::test]
-async fn get_by_id_with_labels_matches_separate_calls() {
-    let pool = test_pool_or_skip!();
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_id_with_labels_matches_separate_calls(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent_id = Uuid::new_v4();
     insert_test_agent(&pool, agent_id).await;
 
     let claim = make_claim(&format!("atomic read {}", Uuid::new_v4()), agent_id);
-    let created = ClaimRepository::create(&pool, &claim)
+    let created = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create");
 
@@ -89,16 +97,35 @@ async fn get_by_id_with_labels_matches_separate_calls() {
     .await
     .expect("seed labels");
 
-    let (via_new, labels_via_new) = ClaimRepository::get_by_id_with_labels(&pool, created.id)
+    // Seed a second LABELLED claim under a different agent. Without it the
+    // per-test database holds exactly one labelled claim, so dropping the
+    // claim_id predicate from `get_labels` would return that same row's labels
+    // and the `new_sorted == ["atomic", "backlog"]` assertion would still pass.
+    // The decoy's labels are disjoint, so any leak changes the result.
+    let decoy_agent = Uuid::new_v4();
+    insert_test_agent(&pool, decoy_agent).await;
+    let decoy = ClaimRepository::create(
+        &pool,
+        &make_claim(&format!("decoy labels {}", Uuid::new_v4()), decoy_agent),
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("create decoy");
+    ClaimRepository::update_labels(&pool, decoy.id.as_uuid(), &["decoy-label".to_string()], &[])
         .await
-        .expect("get_by_id_with_labels")
-        .expect("claim exists");
+        .expect("seed decoy labels");
 
-    let via_old = ClaimRepository::get_by_id(&pool, created.id)
+    let (via_new, labels_via_new) =
+        ClaimRepository::get_by_id_with_labels(&pool, &viewer, created.id)
+            .await
+            .expect("get_by_id_with_labels")
+            .expect("claim exists");
+
+    let via_old = ClaimRepository::get_by_id(&pool, &viewer, created.id)
         .await
         .expect("get_by_id")
         .expect("claim exists");
-    let labels_via_old = ClaimRepository::get_labels(&pool, created.id)
+    let labels_via_old = ClaimRepository::get_labels(&pool, &viewer, created.id)
         .await
         .expect("get_labels");
 

@@ -68,11 +68,12 @@ expected columns. If the schema doesn't match Phase 1a (locality_tag)
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from typing import Dict
 
 import psycopg2  # type: ignore[import-untyped]
+
+from maintenance_dsn import maintenance_dsn
 
 # Rename existing 'intra' rows to the more specific 'intra_self_cite' tag.
 # The Phase 1a/1b detection was DOI-match → self-cite by definition.
@@ -101,7 +102,7 @@ def main() -> int:
     parser.add_argument("--execute", action="store_true", help="commit the migration (default: dry-run)")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL"),
+        default=maintenance_dsn(),
         help="postgres DSN (default: $DATABASE_URL)",
     )
     args = parser.parse_args()

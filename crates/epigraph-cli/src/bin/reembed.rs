@@ -54,14 +54,15 @@ async fn main() {
         }
     };
 
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        eprintln!("DATABASE_URL required");
-        std::process::exit(2);
-    });
-    let pool = sqlx::PgPool::connect(&url).await.unwrap_or_else(|e| {
-        eprintln!("connect failed: {e}");
-        std::process::exit(1);
-    });
+    // Corpus-wide backfill of `embedding_3072`, and it writes.
+    // See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect("reembed")
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("connect failed: {e}");
+            std::process::exit(1);
+        });
+    let pool = maint.pool().clone();
 
     let provider = build_3072d_provider();
 

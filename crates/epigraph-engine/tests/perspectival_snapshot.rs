@@ -9,6 +9,9 @@
 //!   SEED_DIR=$SEED_DIR SNAPSHOT_OUT=$SEED_DIR/data/snapshot.json \
 //!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_snapshot -- --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{
@@ -57,7 +60,8 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
         .bind(claim).bind(frame).execute(pool).await.expect("assign");
 }
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
-    epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_engine::belief_query::get_perspective_belief(pool, &viewer, claim, frame, persp)
         .await
         .expect("belief")
         .pignistic_prob
@@ -114,8 +118,14 @@ async fn generate_snapshot() {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
-    let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
-    let out = std::env::var("SNAPSHOT_OUT").expect("set SNAPSHOT_OUT");
+    let Ok(dir) = std::env::var("SEED_DIR") else {
+        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
+        return;
+    };
+    let Ok(out) = std::env::var("SNAPSHOT_OUT") else {
+        eprintln!("SKIP: SNAPSHOT_OUT not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 
