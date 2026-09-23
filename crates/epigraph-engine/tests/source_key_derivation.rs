@@ -99,7 +99,6 @@ async fn derive_extracts_paper_doi_from_asserts_edge(pool: PgPool) {
     let key = derive_source_key(&pool, claim_id).await.expect("derive");
     assert_eq!(key.paper_doi.as_deref(), Some("10.1/regression"));
     assert_eq!(key.agent_id, agent_id);
-    assert_eq!(key.ingestion_run_id, None);
     assert_eq!(key.derivation_root, None);
 }
 

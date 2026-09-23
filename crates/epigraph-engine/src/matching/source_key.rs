@@ -6,17 +6,22 @@ use uuid::Uuid;
 
 /// Provenance identity of a claim. Two claims are "same source" iff any
 /// non-null component matches — see [`is_same_source`].
+///
+/// There is deliberately no ingestion-run component. The design spec's
+/// `ingestion_run_id` was read from `claims.properties->>'ingestion_run_id'`,
+/// which no write path ever sets, so it could never match; it was removed
+/// rather than kept as a branch that looks like a control. Making it real needs
+/// a recorded non-paper provenance signal on ingest (backlog c618e4fc).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceKey {
     pub paper_doi: Option<String>,
     pub agent_id: Uuid,
-    pub ingestion_run_id: Option<Uuid>,
     pub derivation_root: Option<Uuid>,
 }
 
 /// Configurable rule for what counts as "same source".
 ///
-/// Default: provenance-only (paper / ingestion / derivation). Set
+/// Default: provenance-only (paper / derivation). Set
 /// `include_agent_id = true` to also treat claims from the same agent as
 /// same-source (stricter — filters out e.g. two papers by the same author).
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -34,9 +39,6 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     if both_eq(&a.paper_doi, &b.paper_doi) {
         return true;
     }
-    if both_eq(&a.ingestion_run_id, &b.ingestion_run_id) {
-        return true;
-    }
     if both_eq(&a.derivation_root, &b.derivation_root) {
         return true;
     }
@@ -49,11 +51,10 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
 /// Look up a claim's [`SourceKey`] by querying its row and chasing the
 /// `derived_from` edge chain to a root (acyclic, capped at depth 32).
 pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKey, sqlx::Error> {
-    let (agent_id, props): (Uuid, serde_json::Value) =
-        sqlx::query_as("SELECT agent_id, properties FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(pool)
-            .await?;
+    let agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await?;
 
     // Canonical paper provenance is relational: paper -asserts-> claim, with
     // the DOI on the papers row. The properties->>'paper_doi' JSON field is
@@ -76,11 +77,6 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     .fetch_optional(pool)
     .await?
     .flatten();
-
-    let ingestion_run_id = props
-        .get("ingestion_run_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok());
 
     // Walk the derived_from chain. Stop when there's no parent, when we
     // detect a cycle (parent == current), or when we hit the depth cap.
@@ -112,7 +108,6 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     Ok(SourceKey {
         paper_doi,
         agent_id,
-        ingestion_run_id,
         derivation_root,
     })
 }
@@ -121,11 +116,10 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
 mod tests {
     use super::*;
 
-    fn k(p: Option<&str>, a: Uuid, ir: Option<Uuid>, dr: Option<Uuid>) -> SourceKey {
+    fn k(p: Option<&str>, a: Uuid, dr: Option<Uuid>) -> SourceKey {
         SourceKey {
             paper_doi: p.map(str::to_string),
             agent_id: a,
-            ingestion_run_id: ir,
             derivation_root: dr,
         }
     }
@@ -134,24 +128,24 @@ mod tests {
     fn same_paper_doi_is_same_source() {
         let a1 = Uuid::new_v4();
         let a2 = Uuid::new_v4();
-        let l = k(Some("10.1/x"), a1, None, None);
-        let r = k(Some("10.1/x"), a2, None, None);
+        let l = k(Some("10.1/x"), a1, None);
+        let r = k(Some("10.1/x"), a2, None);
         assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 
     #[test]
     fn different_paper_same_agent_is_cross_source_by_default() {
         let a = Uuid::new_v4();
-        let l = k(Some("10.1/x"), a, None, None);
-        let r = k(Some("10.1/y"), a, None, None);
+        let l = k(Some("10.1/x"), a, None);
+        let r = k(Some("10.1/y"), a, None);
         assert!(!is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 
     #[test]
     fn different_paper_same_agent_is_same_source_with_strict_flag() {
         let a = Uuid::new_v4();
-        let l = k(Some("10.1/x"), a, None, None);
-        let r = k(Some("10.1/y"), a, None, None);
+        let l = k(Some("10.1/x"), a, None);
+        let r = k(Some("10.1/y"), a, None);
         assert!(is_same_source(
             &l,
             &r,
@@ -165,16 +159,16 @@ mod tests {
     fn null_paper_doesnt_match_null_paper() {
         let a1 = Uuid::new_v4();
         let a2 = Uuid::new_v4();
-        let l = k(None, a1, None, None);
-        let r = k(None, a2, None, None);
+        let l = k(None, a1, None);
+        let r = k(None, a2, None);
         assert!(!is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 
     #[test]
     fn shared_derivation_root_is_same_source() {
         let root = Uuid::new_v4();
-        let l = k(None, Uuid::new_v4(), None, Some(root));
-        let r = k(None, Uuid::new_v4(), None, Some(root));
+        let l = k(None, Uuid::new_v4(), Some(root));
+        let r = k(None, Uuid::new_v4(), Some(root));
         assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 }
