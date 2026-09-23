@@ -358,9 +358,74 @@ mod tests {
 
     // ── Test scaffolding ──
 
-    /// Build a minimal AppState backed by the given pool.
-    fn test_state(pool: PgPool) -> AppState {
-        AppState::with_db(pool, ApiConfig::default())
+    /// Rebuild a connection URL for the database `pool` is connected to.
+    ///
+    /// `#[sqlx::test]` hands each arm a randomly-named private database but no
+    /// URL, and [`test_state`] needs one to build its `ScopedPool`. Duplicated
+    /// from `routes/workflows.rs::tests::database_url_for` because an in-crate
+    /// `#[cfg(test)]` module cannot reach the integration-test fixture. Without
+    /// it the arm would seed the private database and the handler would read
+    /// the SHARED one — a silent vacuous pass.
+    async fn database_url_for(pool: &PgPool) -> String {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .expect("current_database()");
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        // Strip the query string before touching the path, or `?sslmode=require`
+        // would be mistaken for part of the database name.
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        }
+    }
+
+    /// An `AppState` whose `scoped` pool is populated.
+    ///
+    /// `list_network_policies` and `get_challenge` read through
+    /// [`AppState::read_as`] since the `F-inline-claim-content-reads`
+    /// discharge, and `read_as` HARD-REFUSES a state whose `scoped` is `None`
+    /// (what `AppState::with_db` builds). That refusal is the fail-closed
+    /// behaviour the conversion exists to establish, so the arms build the
+    /// state the production server builds instead of routing around it.
+    ///
+    /// NOT A CONVERSION CONTROL: `with_scoped_pool` points `db_pool` at the same
+    /// pool, so these arms pin the handlers' happy/404 paths, not that the read
+    /// is viewer-filtered. `tests/inline_reads_viewer_filtered.rs` is the
+    /// instrument for that.
+    ///
+    /// [`AppState::read_as`]: crate::AppState::read_as
+    async fn test_state(pool: &PgPool) -> AppState {
+        let url = database_url_for(pool).await;
+        let scoped = epigraph_db::ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+            .await
+            .expect("connect a scoped pool");
+        AppState::with_scoped_pool(scoped, ApiConfig::default())
+    }
+
+    /// `ViewerExtractor` requires an `AuthContext`, which the bearer
+    /// middleware installs in production. A bare `Router::new()` carries none,
+    /// so without this layer every viewer-converted route answers 401 before
+    /// reaching the handler.
+    fn test_auth() -> crate::middleware::bearer::AuthContext {
+        let id = Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: id,
+            agent_id: Some(id),
+            owner_id: Some(id),
+            client_type: crate::middleware::bearer::ClientType::Service,
+            scopes: vec!["claims:read".to_string()],
+            jti: Uuid::new_v4(),
+        }
     }
 
     /// Build a router exposing the policy routes under test.
@@ -375,6 +440,7 @@ mod tests {
                 "/api/v1/policy-challenges/:id/resolve",
                 post(resolve_challenge),
             )
+            .layer(axum::Extension(test_auth()))
             .with_state(state)
     }
 
@@ -461,7 +527,7 @@ mod tests {
     async fn list_network_policies_returns_active_policies_above_min_truth(pool: PgPool) {
         seed_policy(&pool, "example.com", 443, "https", 0.92, false).await;
         seed_policy(&pool, "blocked.com", 443, "https", 0.10, false).await;
-        let state = test_state(pool.clone());
+        let state = test_state(&pool).await;
 
         let router = policy_router(state);
         let response = router
@@ -483,7 +549,7 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_challenge_returns_404_when_not_a_challenge(pool: PgPool) {
         let claim_id = seed_plain_claim(&pool, "not a challenge").await;
-        let state = test_state(pool.clone());
+        let state = test_state(&pool).await;
         let router = policy_router(state);
         let response = router
             .oneshot(

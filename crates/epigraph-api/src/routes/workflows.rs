@@ -2023,15 +2023,18 @@ mod tests {
 
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
-    /// Build a minimal AppState backed by the given pool.
-    fn test_state(pool: PgPool) -> AppState {
-        AppState::with_db(pool, ApiConfig::default())
-    }
-
     /// Build a router exposing just the workflow GET-by-id route under test.
+    ///
+    /// `get_workflow` takes a `ViewerExtractor` and reads on
+    /// [`AppState::read_as`], so callers pass [`scoped_test_state`] and the
+    /// router carries [`test_auth`]; without either the arm answers 401/500
+    /// before reaching the handler.
+    ///
+    /// [`AppState::read_as`]: crate::AppState::read_as
     fn workflow_router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/workflows/:id", get(get_workflow))
+            .layer(axum::Extension(test_auth()))
             .with_state(state)
     }
 
@@ -2181,7 +2184,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_workflow_returns_single_workflow(pool: PgPool) {
-        let state = test_state(pool.clone());
+        let state = scoped_test_state(&pool).await;
         let workflow_id = seed_test_workflow(&pool, "deploy-canary", &["step1", "step2"]).await;
 
         let router = workflow_router(state);
@@ -2204,7 +2207,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_workflow_returns_404_for_non_workflow_claim(pool: PgPool) {
-        let state = test_state(pool.clone());
+        let state = scoped_test_state(&pool).await;
         let claim_id = seed_plain_claim(&pool, "not a workflow").await;
 
         let router = workflow_router(state);
@@ -2239,7 +2242,7 @@ mod tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = scoped_test_state(&pool).await;
         let router = workflow_router(state);
         let response = router
             .oneshot(
@@ -2315,13 +2318,13 @@ mod tests {
         .unwrap();
 
         // Build a minimal axum app with just the outcome route.
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
                 axum::routing::post(report_hierarchical_outcome),
             )
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let body = serde_json::json!({
@@ -2357,13 +2360,13 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
                 axum::routing::post(report_hierarchical_outcome),
             )
+            .layer(axum::Extension(test_auth()))
             .with_state(state);
 
         let body = serde_json::json!({"success": true, "outcome_details": "ok"});
@@ -2420,9 +2423,10 @@ mod tests {
     /// Conversion shard 7 moved `find_workflow_hierarchical` onto
     /// [`AppState::read_as`], which HARD-REFUSES a state whose `scoped` is
     /// `None` — that refusal is the fail-closed behaviour the conversion exists
-    /// to establish, not an inconvenience to route around. [`test_state`] above
-    /// calls `AppState::with_db`, which leaves `scoped: None`, so the arm below
-    /// would have started answering 500.
+    /// to establish, not an inconvenience to route around. `AppState::with_db`
+    /// leaves `scoped: None`, so an arm built on it answers 500. `get_workflow`
+    /// and `report_hierarchical_outcome` moved onto `read_as` the same way, so
+    /// their arms use this state too.
     ///
     /// THIS IS NOT A CONVERSION CONTROL. `with_scoped_pool` sets
     /// `db_pool = scoped.inner().clone()`, so the converted and the unconverted
