@@ -367,7 +367,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default()
             .as_str(),
     );
-    let scoped = epigraph_db::ScopedPool::connect(&cli.database_url, guc_mode).await?;
+    // `connect_with_options`, not `connect`, and the ONLY reason is to preserve
+    // the pool sizing this process already had. MEASURED, both sides:
+    // `create_pool` used `max_connections(10).acquire_timeout(5s)`;
+    // `ScopedPoolOptions::default()` is `max_connections: 10,
+    // acquire_timeout: 30s`. The connection CAP is identical, so capacity does
+    // not change — but the plain `connect` would have moved the acquire timeout
+    // 5s -> 30s, so a saturated MCP would start queueing requests for half a
+    // minute instead of failing fast. That is a latency regression no test in
+    // this workspace can observe, and it is not what this change is for.
+    // `ScopedPool::connect_with_options` exists for exactly this (PR-15 added it
+    // so the job pool could keep its own sizing). `statement_timeout: None`
+    // matches `create_pool`, which set none.
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        &cli.database_url,
+        guc_mode,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 10,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            statement_timeout: None,
+        },
+    )
+    .await?;
     // The §0.5 boot probe, same as `epigraph-api/src/bin/server.rs`. Behind a
     // transaction-mode pooler a session-scoped `set_config` silently vanishes
     // between statements, so every policy collapses and the write path's
