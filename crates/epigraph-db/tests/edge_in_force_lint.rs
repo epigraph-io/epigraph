@@ -54,7 +54,17 @@ const DISPLAY_TIER_FILES: &[&str] = &[
 
 /// Workspace-relative `(file, fn)` display-tier functions in files that also
 /// hold structural reads (which must stay unfiltered — see the tiering doc).
-const DISPLAY_TIER_FNS: &[(&str, &str)] = &[];
+const DISPLAY_TIER_FNS: &[(&str, &str)] = &[
+    // The in-force endpoint reads behind MCP get_neighborhood / traverse.
+    (
+        "crates/epigraph-db/src/repos/edge.rs",
+        "get_by_source_in_force",
+    ),
+    (
+        "crates/epigraph-db/src/repos/edge.rs",
+        "get_by_target_in_force",
+    ),
+];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -395,4 +405,203 @@ fn the_in_force_scanner_is_not_vacuous() {
     let got =
         edges_reads("fn outer() {}\nfn inner_one() { sqlx::query(\"SELECT 1 FROM edges e\"); }");
     assert_eq!(got[0].1, "inner_one");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Callers of the UNFILTERED endpoint reads
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Every non-test caller of `EdgeRepository::get_by_source` /
+/// `get_by_target` — the endpoint reads that return retracted edges — keyed
+/// `(workspace-relative file, enclosing fn)`, each with the reason it is not
+/// display-tier. An EXACT set: a new caller fails, and so does an entry whose
+/// call has been switched to `get_by_{source,target}_in_force` or removed. The
+/// MCP / HTTP neighbourhood walks reach `edges` through these Rust calls, not
+/// SQL text, so [`every_display_tier_edges_read_is_in_force`] cannot see them;
+/// this is the ratchet that can.
+const UNFILTERED_ENDPOINT_READERS: &[(&str, &str, &str)] = &[
+    (
+        "crates/epigraph-api/src/routes/belief.rs",
+        "submit_evidence",
+        "PENDING: the G8 contradiction pre-screen is belief-bearing and is \
+         converted by a later commit in this series",
+    ),
+    (
+        "crates/epigraph-api/src/routes/edges.rs",
+        "claim_neighborhood",
+        "PENDING: display tier, converted by a later commit in this series",
+    ),
+    (
+        "crates/epigraph-db/src/repos/claim.rs",
+        "graph_expand_seeds_since",
+        "PENDING: recall graph expansion, converted by a later commit in this series",
+    ),
+    (
+        "crates/epigraph-engine/src/export/prov.rs",
+        "export_provenance_prov_o",
+        "STRUCTURAL: provenance export must keep every assertion, retracted or not \
+         (tiering doc, structural tier)",
+    ),
+    (
+        "crates/epigraph-mcp/src/tools/graph.rs",
+        "incoming",
+        "OPT-IN: the `include_retracted: true` branch of get_neighborhood, whose \
+         rows are flagged `retracted`",
+    ),
+    (
+        "crates/epigraph-mcp/src/tools/graph.rs",
+        "outgoing",
+        "OPT-IN: the `include_retracted: true` branch of get_neighborhood / \
+         traverse, whose rows are flagged `retracted`",
+    ),
+    (
+        "crates/epigraph-mcp/src/tools/workflows.rs",
+        "deprecate_workflow",
+        "STRUCTURAL: the variant_of / supersedes lineage cascade; a6adf739 keeps \
+         workflow lineage readers unfiltered",
+    ),
+];
+
+/// Every `.rs` file under `crates/*/src`, workspace-relative, with contents.
+fn crate_sources() -> Vec<(String, String)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, std::fs::read_to_string(&path).expect("read source")));
+            }
+        }
+    }
+    let root = workspace_root()
+        .canonicalize()
+        .expect("canonical workspace root");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root.join("crates")).expect("read crates/") {
+        let src = entry.expect("crate dir").path().join("src");
+        walk(&src, &root, &mut out);
+    }
+    out.sort();
+    out
+}
+
+/// `(line, enclosing fn)` of every unfiltered endpoint-read call in `src`,
+/// skipping comment lines and a trailing `#[cfg(test)] mod` block.
+fn unfiltered_endpoint_calls(src: &str) -> Vec<(usize, String)> {
+    const CALLS: &[&str] = &[
+        "EdgeRepository::get_by_source(",
+        "EdgeRepository::get_by_target(",
+    ];
+    let mut out = Vec::new();
+    let mut in_tests = false;
+    let mut current_fn = "?".to_string();
+    let lines: Vec<&str> = src.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        if !in_tests && t.starts_with("#[cfg(test)]") {
+            let next = lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            if next.starts_with("mod ") || next.starts_with("pub mod ") {
+                in_tests = true;
+            }
+        }
+        if in_tests || t.starts_with("//") {
+            continue;
+        }
+        // A `fn` item: `fn` as a whole word followed by a name.
+        if let Some(k) = line
+            .match_indices("fn ")
+            .map(|(k, _)| k)
+            .find(|&k| k == 0 || line.as_bytes()[k - 1].is_ascii_whitespace())
+        {
+            let name: String = line[k + 3..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                current_fn = name;
+            }
+        }
+        for call in CALLS {
+            out.extend(std::iter::repeat_n(
+                (i + 1, current_fn.clone()),
+                line.matches(call).count(),
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn unfiltered_endpoint_reads_are_confined_to_reviewed_callers() {
+    let mut found: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let sources = crate_sources();
+    assert!(
+        sources.len() > 200,
+        "expected the workspace's crate sources, found {} files — the walker is \
+         looking in the wrong place and would pass vacuously",
+        sources.len()
+    );
+    for (file, src) in &sources {
+        for (line, func) in unfiltered_endpoint_calls(src) {
+            found.entry((file.clone(), func)).or_default().push(line);
+        }
+    }
+
+    let expected: std::collections::BTreeSet<(String, String)> = UNFILTERED_ENDPOINT_READERS
+        .iter()
+        .map(|(f, n, _)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    let actual: std::collections::BTreeSet<(String, String)> = found.keys().cloned().collect();
+
+    let new: Vec<String> = actual
+        .difference(&expected)
+        .map(|k| format!("  (\"{}\", \"{}\") — lines {:?}", k.0, k.1, found[k]))
+        .collect();
+    let stale: Vec<String> = expected
+        .difference(&actual)
+        .map(|k| format!("  (\"{}\", \"{}\")", k.0, k.1))
+        .collect();
+    assert!(
+        new.is_empty() && stale.is_empty(),
+        "\n\nNew callers of the UNFILTERED EdgeRepository::get_by_source/get_by_target:\n{}\n\n\
+         Stale entries (the call was converted or removed — delete the entry):\n{}\n\n\
+         These reads return RETRACTED edges (anything removed with delete_edge). A read \
+         that displays or walks the graph wants get_by_source_in_force / \
+         get_by_target_in_force; a structural reader (lineage, provenance) belongs in \
+         UNFILTERED_ENDPOINT_READERS with its reason. See \
+         docs/architecture/edge-retraction-tiers.md.\n",
+        new.join("\n"),
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn the_endpoint_call_scanner_is_not_vacuous() {
+    let got = unfiltered_endpoint_calls(
+        "async fn walk() {\n    let a = EdgeRepository::get_by_source(p, v, id, \"claim\");\n    \
+         let b = epigraph_db::EdgeRepository::get_by_target(p, v, id, \"claim\");\n    \
+         let c = EdgeRepository::get_by_source_in_force(p, v, id, \"claim\");\n}\n\
+         // EdgeRepository::get_by_source( in a comment\n\
+         #[cfg(test)]\nmod tests { fn t() { EdgeRepository::get_by_target(p, v, id, \"claim\"); } }\n",
+    );
+    assert_eq!(
+        got,
+        vec![(2, "walk".to_string()), (3, "walk".to_string())],
+        "both unfiltered calls are found, the in-force call, the comment and the \
+         test module are not"
+    );
 }

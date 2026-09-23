@@ -395,7 +395,12 @@ impl EdgeRepository {
         Ok((existing, false))
     }
 
-    /// Get edges by source entity
+    /// Get edges by source entity — INCLUDING retracted ones.
+    ///
+    /// Structural read: `valid_to` is returned but not filtered, so an edge
+    /// removed by `retract_by_id` (MCP `delete_edge`, `DELETE /api/v1/edges/:id`)
+    /// is still here. Anything that displays or walks the graph wants
+    /// [`Self::get_by_source_in_force`] instead.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -419,6 +424,73 @@ impl EdgeRepository {
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND source_type = $2
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
+            ORDER BY created_at DESC
+            "#,
+            source_id,
+            source_type,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
+        )
+        .fetch_all(executor)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
+    /// [`Self::get_by_source`] restricted to edges IN FORCE — the display and
+    /// traversal read.
+    ///
+    /// Edge removal is a retraction (`valid_to` set, row kept), so the
+    /// unfiltered [`Self::get_by_source`] also returns every edge that has been
+    /// deleted. That is right for its structural callers (workflow lineage,
+    /// PROV export) and wrong for anything that renders or walks the graph —
+    /// MCP `get_neighborhood` / `traverse`, the HTTP claim-neighbourhood BFS,
+    /// recall's graph expansion and the G8 contradiction pre-screen. See
+    /// `docs/architecture/edge-retraction-tiers.md`.
+    ///
+    /// A separate function rather than a flag on [`Self::get_by_source`], so neither
+    /// default can be flipped by accident at a call site, and so
+    /// `tests/edge_in_force_lint.rs` can pin exactly which callers still use
+    /// the unfiltered read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_source_in_force<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        source_id: Uuid,
+        source_type: &str,
+    ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE. The visibility term is `get_by_source`'s static transcription
+        // of `Viewer::edge_predicate_fragment` (PR-13), copied unchanged: the
+        // co-ownership INTERSECTION with the same two binds. The added conjunct
+        // is the static spelling of `EDGE_IN_FORCE_UNALIASED` (`sqlx::query!`
+        // needs a literal); `edge_in_force_lint.rs` derives the expected text
+        // from the constant, so the two cannot drift apart.
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
+            WHERE source_id = $1 AND source_type = $2
+              AND (valid_to IS NULL OR valid_to > now())
               AND ($3::bool OR visibility = 'public'
                    OR (owner_group_id = ANY($4::uuid[])
                        AND (co_owner_group_id IS NULL
@@ -582,7 +654,10 @@ impl EdgeRepository {
         Ok(found.unwrap_or(false))
     }
 
-    /// Get edges by target entity
+    /// Get edges by target entity — INCLUDING retracted ones.
+    ///
+    /// Structural read; see [`Self::get_by_source`]. Display and traversal
+    /// callers want [`Self::get_by_target_in_force`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -606,6 +681,73 @@ impl EdgeRepository {
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE target_id = $1 AND target_type = $2
+              AND ($3::bool OR visibility = 'public'
+                   OR (owner_group_id = ANY($4::uuid[])
+                       AND (co_owner_group_id IS NULL
+                            OR co_owner_group_id = ANY($4::uuid[]))))
+            ORDER BY created_at DESC
+            "#,
+            target_id,
+            target_type,
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]),
+        )
+        .fetch_all(executor)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            })
+            .collect())
+    }
+
+    /// [`Self::get_by_target`] restricted to edges IN FORCE — the display and
+    /// traversal read.
+    ///
+    /// Edge removal is a retraction (`valid_to` set, row kept), so the
+    /// unfiltered [`Self::get_by_target`] also returns every edge that has been
+    /// deleted. That is right for its structural callers (workflow lineage,
+    /// PROV export) and wrong for anything that renders or walks the graph —
+    /// MCP `get_neighborhood` / `traverse`, the HTTP claim-neighbourhood BFS,
+    /// recall's graph expansion and the G8 contradiction pre-screen. See
+    /// `docs/architecture/edge-retraction-tiers.md`.
+    ///
+    /// A separate function rather than a flag on [`Self::get_by_target`], so neither
+    /// default can be flipped by accident at a call site, and so
+    /// `tests/edge_in_force_lint.rs` can pin exactly which callers still use
+    /// the unfiltered read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_target_in_force<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        target_id: Uuid,
+        target_type: &str,
+    ) -> Result<Vec<EdgeRow>, DbError> {
+        // MACRO SITE. The visibility term is `get_by_target`'s static transcription
+        // of `Viewer::edge_predicate_fragment` (PR-13), copied unchanged: the
+        // co-ownership INTERSECTION with the same two binds. The added conjunct
+        // is the static spelling of `EDGE_IN_FORCE_UNALIASED` (`sqlx::query!`
+        // needs a literal); `edge_in_force_lint.rs` derives the expected text
+        // from the constant, so the two cannot drift apart.
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            FROM edges
+            WHERE target_id = $1 AND target_type = $2
+              AND (valid_to IS NULL OR valid_to > now())
               AND ($3::bool OR visibility = 'public'
                    OR (owner_group_id = ANY($4::uuid[])
                        AND (co_owner_group_id IS NULL

@@ -1285,7 +1285,7 @@ impl EpiGraphMcpFull {
     // ── Graph (2 tools) ──
 
     #[tool(
-        description = "Get the immediate graph neighborhood of any node — all connected edges with optional relationship and direction filters."
+        description = "Get the immediate graph neighborhood of any node — all connected edges with optional relationship and direction filters. Edges removed with delete_edge (retracted) are hidden unless include_retracted=true, which returns them flagged `retracted: true` with their `valid_to`."
     )]
     async fn get_neighborhood(
         &self,
@@ -1298,7 +1298,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Multi-hop graph walk from a starting node. BFS traversal with optional relationship filter and truth threshold."
+        description = "Multi-hop graph walk from a starting node. BFS traversal with optional relationship filter and truth threshold. Retracted edges (removed with delete_edge) are neither returned nor followed unless include_retracted=true, which flags them `retracted: true`."
     )]
     async fn traverse(
         &self,

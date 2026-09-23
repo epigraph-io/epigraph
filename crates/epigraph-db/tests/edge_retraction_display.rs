@@ -517,3 +517,99 @@ async fn subgraph_edges_omit_retracted_and_keep_future_dated_edges(pool: PgPool)
         "the in-force and future-dated edges are returned; the retracted one ({gone}) is not"
     );
 }
+
+// ── EdgeRepository::get_by_{source,target}_in_force ────────────────────────
+
+/// The in-force endpoint reads drop a retracted edge AND keep the PR-13 edge
+/// viewer predicate they were copied from. Losing the second while adding the
+/// first would be a tenancy leak, so both halves are asserted on one fixture:
+/// a private edge between two PUBLIC claims (migration 070 arm (b) keeps that
+/// declaration) is visible to its owner and not to a stranger.
+#[sqlx::test(migrations = "../../migrations")]
+async fn in_force_endpoint_reads_drop_retracted_edges_and_keep_the_viewer_predicate(pool: PgPool) {
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "in-force-owner").await;
+    let (stranger_agent, _g) = fixture::seed_agent_with_group(&pool, "in-force-stranger").await;
+    let owner = Viewer::resolve(&pool, owner_agent).await.expect("owner");
+    let stranger = Viewer::resolve(&pool, stranger_agent)
+        .await
+        .expect("stranger");
+    let ids = claims(&pool, owner_agent, &["hub", "live", "gone", "private"]).await;
+    let (hub, live, gone, private) = (ids[0], ids[1], ids[2], ids[3]);
+    let e_live = edge(&pool, hub, live, "supports").await;
+    let e_gone = retracted(&pool, hub, gone, "supports").await;
+    let e_private = edge(&pool, hub, private, "supports").await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(e_private)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("privatise edge");
+
+    let ids_of = |rows: Vec<epigraph_db::repos::edge::EdgeRow>| {
+        let mut v: Vec<Uuid> = rows.into_iter().map(|r| r.id).collect();
+        v.sort();
+        v
+    };
+    let sorted = |mut v: Vec<Uuid>| {
+        v.sort();
+        v
+    };
+
+    // The unfiltered structural read still returns the retracted row — the
+    // precondition that makes the in-force assertions below meaningful.
+    assert_eq!(
+        ids_of(
+            EdgeRepository::get_by_source(&pool, &owner, hub, "claim")
+                .await
+                .expect("unfiltered")
+        ),
+        sorted(vec![e_live, e_gone, e_private]),
+    );
+
+    assert_eq!(
+        ids_of(
+            EdgeRepository::get_by_source_in_force(&pool, &owner, hub, "claim")
+                .await
+                .expect("owner, outgoing")
+        ),
+        sorted(vec![e_live, e_private]),
+        "the owner sees its private edge and not the retracted one"
+    );
+    assert_eq!(
+        ids_of(
+            EdgeRepository::get_by_source_in_force(&pool, &stranger, hub, "claim")
+                .await
+                .expect("stranger, outgoing")
+        ),
+        vec![e_live],
+        "a stranger sees neither the retracted edge nor the private one"
+    );
+    assert_eq!(
+        ids_of(
+            EdgeRepository::get_by_target_in_force(&pool, &owner, gone, "claim")
+                .await
+                .expect("owner, incoming at gone")
+        ),
+        Vec::<Uuid>::new(),
+        "the retracted edge is gone from the target side too"
+    );
+    assert_eq!(
+        ids_of(
+            EdgeRepository::get_by_target_in_force(&pool, &owner, private, "claim")
+                .await
+                .expect("owner, incoming at private")
+        ),
+        vec![e_private]
+    );
+    assert_eq!(
+        ids_of(
+            EdgeRepository::get_by_target_in_force(&pool, &stranger, private, "claim")
+                .await
+                .expect("stranger, incoming at private")
+        ),
+        Vec::<Uuid>::new()
+    );
+}

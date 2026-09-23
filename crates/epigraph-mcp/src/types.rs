@@ -840,6 +840,11 @@ pub struct GetNeighborhoodParams {
 
     #[schemars(description = "Maximum number of edges to return (default 50)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Also return RETRACTED edges (removed with delete_edge / patch_edge valid_to), each flagged `retracted: true` with its `valid_to`. Default false: a retracted edge is hidden."
+    )]
+    pub include_retracted: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -860,6 +865,11 @@ pub struct TraverseParams {
 
     #[schemars(description = "Maximum number of nodes to return (default 50, max 100)")]
     pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Also walk RETRACTED edges (removed with delete_edge / patch_edge valid_to), each flagged `retracted: true` with its `valid_to`. Default false: a retracted edge is neither returned nor followed."
+    )]
+    pub include_retracted: Option<bool>,
 }
 
 // ── DS/Belief ──
@@ -1580,6 +1590,12 @@ pub struct DeprecateWorkflowResponse {
     pub reason: String,
 }
 
+/// One edge of a `get_neighborhood` response.
+///
+/// `valid_to` and `retracted` are ADDITIVE and omitted when empty, so the
+/// default response is byte-identical for an in-force edge with no end date.
+/// A retracted edge only appears at all under `include_retracted: true`, and
+/// then always carries `retracted: true` and its `valid_to`.
 #[derive(Debug, Serialize)]
 pub struct NeighborhoodEdge {
     pub edge_id: String,
@@ -1588,6 +1604,13 @@ pub struct NeighborhoodEdge {
     pub target_id: String,
     pub target_type: String,
     pub relationship: String,
+    /// RFC 3339 end of the edge's validity, when it has one (a future value
+    /// means "in force until then").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// `true` when `valid_to` is in the past, i.e. the edge was removed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retracted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1606,11 +1629,17 @@ pub struct TraverseNode {
     pub depth: i32,
 }
 
+/// One edge of a `traverse` response. `valid_to` / `retracted` are additive,
+/// with the same meaning as on [`NeighborhoodEdge`].
 #[derive(Debug, Serialize)]
 pub struct TraverseEdge {
     pub source_id: String,
     pub target_id: String,
     pub relationship: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retracted: bool,
 }
 
 #[derive(Debug, Serialize)]
