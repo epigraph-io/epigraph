@@ -68,6 +68,17 @@ local server; route tests are top-level files in `crates/epigraph-api/tests/`.
 Local DB: `postgres://postgres@127.0.0.1:55432/epigraph_db_repo_test`
 (pgserver, TCP only). Never the live `epigraph` DB.
 
+> **The four route specs in §2.1–§2.4 below predate tenancy.** Read every
+> `redacted` flag, `[REDACTED]` value and "redaction-aware" count in them as
+> superseded by §2.5/§2.6: each route carries a `ViewerExtractor`, filters in
+> the repo layer, and **omits** what the viewer may not see rather than
+> flagging it. Concretely: no `redacted: bool` on `EgoNode` or `ChainNode`; a
+> centre the viewer may not read is a **404**, not a lone centre; and an edge
+> whose endpoint is not in the returned `nodes` is dropped by both `/ego` and
+> `/provenance-chain` — they disagreed on that, and keeping such an edge now
+> discloses an invisible claim's id. The Explorer consumes exactly these
+> shapes (`services/explorer/src/upstream/types.rs`).
+
 ### 2.1 `GET /api/v1/claims/:id/provenance-chain`
 
 Query: `max_depth` (`u32`, default 4, clamped to `1..=8`), `relationships`
@@ -153,22 +164,31 @@ surfaces call.
   "frames": 0, "workflows": 0, "computed_at": "rfc3339" }
 ```
 
-### 2.5 Access-control fixes
+### 2.5 / 2.6 Access control — SUPERSEDED BY TENANCY
 
-- `check_content_access` **fails closed**: a lookup error yields `Redacted`, not
-  `Full`.
-- A set-based `batch_content_access(pool, ids, requester) -> HashMap<Uuid,
-  ContentAccess>` with the exact semantics of `check_content_access`, proven by
-  an equivalence test over public / private-owner / private-other /
-  community-member / community-other / no-ownership-row fixtures. Fails closed.
+**These two sections described `check_content_access` /
+`batch_content_access` and a redaction sweep. Both are gone. Do not
+implement them, and do not read what follows in this document as live
+guidance where it assumes them.**
 
-### 2.6 Redaction sweep
+`crates/epigraph-db/src/access_control.rs` is deleted. Access is
+`crates/epigraph-db/src/visibility.rs::Viewer`, which has exactly two shapes
+(`Scoped { principal, group_ids, writable }` and `Bypass`) and no anonymous
+shape. Handlers obtain one through the `ViewerExtractor`; repos filter **in
+SQL**, splicing a predicate into a statement that carries the marker comment
+`/* {VISIBILITY:alias} */` (or `/* {EDGE_VISIBILITY:alias} */` for `edges`).
+Source lints enforce it: `crates/epigraph-db/tests/visibility_lint.rs`,
+`crates/epigraph-api/tests/viewer_route_table_lint.rs`,
+`crates/epigraph-db/tests/no_anonymous_viewer.rs`.
 
-Apply the batch check to every read the Explorer renders claim text from that
-does not redact today: `POST /search/semantic`, `GET /claims/by-labels`,
-`GET /claims/:id/history`, `GET /agents/:id/claims`, `GET /frames/:id/claims`,
-and the three graph `expand` routes (labels are claim content). Redacted ⇒
-`"[REDACTED]"`, the existing convention.
+Commit `68b8a8b1` deleted redaction outright: **a row the viewer may not see
+is ABSENT** — omitted from a list, or a 404 byte-identical to the one a
+nonexistent id gets — never returned blanked as `"[REDACTED]"`.
+`crates/epigraph-api/tests/no_redaction_sentinel.rs` fails the build if the
+sentinel reappears. The one deliberate exception is
+`/claims/:id/{supporting,contradicting}-evidence`, which keeps its empty-list
+shape: it never had a claim-existence check, so a 404 there would *newly*
+disclose which ids exist.
 
 ### 2.7 Small fixes
 
@@ -220,12 +240,11 @@ services/explorer/
 | `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | absolute origin + base path, e.g. `https://explorer.example.com/explorer`; used for OG, redirects, `redirect_uri` |
 | `EPIGRAPH_OAUTH_BASE_URL` | = API URL | browser-facing OAuth AS origin (`/oauth/authorize`) |
 | `EPIGRAPH_EXPLORER_CLIENT_ID` | required for login | pre-registered client (README SQL) |
-| `EPIGRAPH_EXPLORER_PUBLIC_UNFURL` | `false` | when true, anonymous `/claim/:id` renders OG text from an anonymous upstream read; else a generic card |
 | `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` | `https://www.notion.so https://*.notion.so https://*.notion.site` | CSP `frame-ancestors` |
 | `EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY` | `6` | global semaphore, well under the API's pool of 10 |
 | `EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` | `8000` | per call |
 | `EPIGRAPH_EXPLORER_INSECURE_COOKIES` | `false` | drop `Secure` for plain-http local dev |
-| `EPIGRAPH_EXPLORER_DEV_BEARER` | unset | **dev only**: refused at startup unless the public base URL host is `localhost`/`127.0.0.1` |
+| `EPIGRAPH_EXPLORER_DEV_BEARER` | unset | **dev only**: refused at startup unless the public base URL host is `localhost`/`127.0.0.1`. Must carry an `agent_id`, and has no refresh — see the README |
 
 No real hostnames or IPs in source, docs or examples — RFC 2606 names only
 (`explorer.example.com`); the `no_deployment_host_literals` test scans
@@ -257,8 +276,16 @@ No real hostnames or IPs in source, docs or examples — RFC 2606 names only
   (JSON body), drop the session.
 - Every HTML page except `/health`, `/auth/*`, `/static/*` requires a session.
   Anonymous `/claim/:id` returns **200** with a sign-in prompt and OG tags (a
-  redirect would unfurl as a login page); OG text only when
-  `PUBLIC_UNFURL=true` and the anonymous upstream read is not redacted.
+  redirect would unfurl as a login page), and makes **no upstream call**. The
+  card is always generic: under tenancy the API's public allowlist is exactly
+  `/health`, `/api/v1/openapi.json` and the OAuth paths (pinned by
+  `crates/epigraph-api/tests/public_router_allowlist.rs`), so there is no
+  anonymous read to build a card from. `EPIGRAPH_EXPLORER_PUBLIC_UNFURL` was
+  deleted with the branch it served. **Stated limitation:** link previews
+  never contain claim text until a public-share mechanism exists in the
+  kernel — a signed per-claim share token, or an explicit
+  `visibility = 'public'` read on the allowlist. The Explorer must not work
+  around it with a service token.
 
 ### 3.4 Routes
 
@@ -283,8 +310,11 @@ No real hostnames or IPs in source, docs or examples — RFC 2606 names only
 | `GET /health` | liveness |
 | `GET /auth/login`, `/auth/callback`, `POST /auth/logout`, `POST /auth/redeem` | auth |
 
-- **Rules for rendering.** If `GET /claims/:id` returns content `"[REDACTED]"`,
-  skip every other content-bearing sub-call and keep the text out of OG.
+- **Rules for rendering.** `GET /claims/:id` 404s for a claim the viewer
+  cannot see; the page is the ordinary not-found page and no sub-call is
+  made. An edge naming an id that is absent from the response's own node set
+  is dropped rather than rendered, and an unfiltered cluster count
+  (`total_size`) is never published next to a viewer-filtered list.
 - **Degraded sections.** A failed or timed-out sub-call renders that section as
   unavailable; the page still renders.
 - **Outlink grouping.** Mirror `GRAPH_VIEW_RELATIONSHIPS` (`routes/graph.rs:29-66`)
@@ -346,18 +376,14 @@ No real hostnames or IPs in source, docs or examples — RFC 2606 names only
 - The Caddy snippet uses `handle_path /explorer*` and `reverse_proxy
   127.0.0.1:8096`. The BFF's configured base path handles the stripped prefix.
 - `README.md` covers the operator SQL for the OAuth client row, the Google
-  allowlist note, env vars, local dev, the in-memory session caveat, and the
-  post-tenancy OG caveat.
+  allowlist note, env vars, local dev, the in-memory session caveat, the
+  dev-bearer-needs-a-principal caveat, and the OG caveat.
 
 ## 4. Deferred (backlog, not this PR)
 
-- MCP `get_provenance_chain` does not redact. The new route does, so this is a
-  live MCP-side leak.
 - Configurable `register.rs` redirect-origin allowlist.
 - API pool size and `statement_timeout` configuration. A `CatchPanicLayer`.
 - `POST /search/hybrid` wrapping `search_hybrid_scoped_since`. This closes part
   of the `recall` drift (spec §8.3) and gives an indexed keyword mode.
 - The latest-run lookup lacks an `algo='louvain'` filter.
-- Post-tenancy OG unfurls. Under D3, anonymous callers get nothing, so this needs
-  a design.
 - The parity backlog item (spec §9).
