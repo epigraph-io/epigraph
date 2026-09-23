@@ -5,33 +5,221 @@
 use epigraph_core::Claim;
 use epigraph_db::{ClaimRepository, EdgeRepository};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgConnection};
 
 use crate::errors::{internal_error, McpError};
+use crate::server::EpiGraphMcpFull;
+
+/// Begin the ONE transaction an MCP submission runs in, stamped from the
+/// **author's** viewer.
+///
+/// # Why the author's viewer and not the caller's
+///
+/// `submit_claim` and `memorize` author as `server.agent_id()` — the MCP
+/// process's own agent — not as the HTTP principal on the bearer token. The rows
+/// they write therefore inherit `owner_group_id` from the AUTHOR's personal
+/// group, and migration 077's `WITH CHECK` on every claim-derived table asks
+/// `owner_group_id = ANY(epigraph_writable_groups())`. Stamping the caller's
+/// writable set would answer a question nothing asked and refuse the write.
+/// `epigraph-db/tests/rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`
+/// is the pin: its arm 3 stamps the author's group and succeeds, its arm 4
+/// stamps a *different* real group and is still refused.
+///
+/// `Viewer::resolve` reads `group_memberships` through
+/// `epigraph_live_memberships(uuid)`, a SECURITY DEFINER function granted to
+/// `epigraph_app` (migration 077), so resolving on the *unstamped* pool returns
+/// the author's real memberships rather than the empty set
+/// `group_memberships_tenancy` would otherwise yield. That is what makes this
+/// bootstrap non-circular.
+///
+/// # Why `None` is a refusal and never a fallback
+///
+/// Falling back to `server.pool` when no `ScopedPool` is attached is precisely
+/// how the defect this exists to fix presents: the claim INSERT is admitted (by
+/// an orphan `claims_privacy` policy, where one exists), the trace INSERT is
+/// refused with `42501`, and the caller receives an error carrying no claim id
+/// for a row that is now a permanent orphan. A loud refusal with nothing written
+/// is the only safe shape. Same decision, same reasoning and the same
+/// `tenancy.scoped_write` log target as
+/// `epigraph-api/src/routes/groups.rs::rotate_key`.
+///
+/// # Errors
+/// * `McpError::internal_error` if this process was not built from a
+///   [`epigraph_db::ScopedPool`].
+/// * `McpError::internal_error` if the author's viewer cannot be resolved, or if
+///   `BEGIN` / the GUC stamp fails.
+pub async fn begin_author_stamped_tx<'p>(
+    server: &'p EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            "write refused: this MCP process was not built from a ScopedPool, so no \
+             connection can be stamped with the author's tenancy context. Refusing rather \
+             than writing on the unstamped pool, which commits the claim and then loses its \
+             trace, evidence and AUTHORED edge to a 42501. Construct the server with \
+             EpiGraphMcpFull::with_scoped_pool."
+        );
+        internal_error(format!(
+            "{tool_name}: this MCP server was not built from a ScopedPool, so the write \
+             path cannot stamp a connection with the author's tenancy context. Nothing was \
+             written. Construct the server with EpiGraphMcpFull::with_scoped_pool."
+        ))
+    })?;
+
+    let author_viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, author_agent_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                author = %author_agent_id,
+                error = %e,
+                "could not resolve the author's viewer"
+            );
+            internal_error(format!(
+                "{tool_name}: could not resolve the author's viewer: {e}"
+            ))
+        })?;
+
+    scoped.begin_as(&author_viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            author = %author_agent_id,
+            error = %e,
+            "could not begin an author-stamped transaction"
+        );
+        internal_error(format!(
+            "{tool_name}: could not begin an author-stamped transaction: {e}"
+        ))
+    })
+}
+
+/// Emit a verb-edge whose failure must NOT abort the caller's transaction.
+///
+/// # Why a SAVEPOINT rather than `let _ = EdgeRepository::create(…)`
+///
+/// The architecture doc's atomicity policy makes verb-edges best-effort: a
+/// failed `AUTHORED` / `DERIVED_FROM` / `HAS_TRACE` emit is logged and the
+/// submission still succeeds. That was expressible as a swallowed error only
+/// while every statement ran on its own pool checkout. Inside a PostgreSQL
+/// transaction a failed statement aborts the whole transaction, so swallowing
+/// the error does not preserve the policy — it *defers* the failure to `COMMIT`,
+/// which then fails with `current transaction is aborted, commands ignored until
+/// end of transaction block` and the real cause nowhere in the error the caller
+/// receives. That is strictly worse than either alternative: the claim is lost
+/// (as if the edge were fatal) AND the diagnostic is gone.
+///
+/// Propagating instead was also refused, and the reason is deployment-shaped
+/// rather than stylistic. `edges` is one of the three tables that a deployment
+/// may carry an orphan PERMISSIVE `*_privacy` policy for; where that policy is
+/// absent, `edges_tenancy`'s `WITH CHECK` governs alone. Making the edge fatal
+/// would therefore convert a WARN into a total `submit_claim` / `memorize`
+/// outage on any deployment whose edge policy refuses the row, which is exactly
+/// the fail-closed-regression-as-data-loss shape this programme is trying to
+/// avoid creating.
+///
+/// A savepoint keeps both properties: the edge either lands or is rolled back
+/// alone, and the outer transaction is still usable either way.
+///
+/// # Errors
+///
+/// Returns an error only if the SAVEPOINT itself could not be taken or released
+/// — i.e. the outer transaction was already unusable, which the caller must not
+/// paper over. An edge INSERT that is *refused* is logged and reported as
+/// `Ok(())`.
+#[allow(clippy::too_many_arguments)]
+pub async fn emit_verb_edge_best_effort(
+    conn: &mut PgConnection,
+    source_id: uuid::Uuid,
+    source_type: &str,
+    target_id: uuid::Uuid,
+    target_type: &str,
+    relationship: &str,
+    properties: Option<serde_json::Value>,
+    tool_name: &'static str,
+) -> Result<(), McpError> {
+    let mut sp = conn.begin().await.map_err(internal_error)?;
+    match EdgeRepository::create(
+        &mut *sp,
+        source_id,
+        source_type,
+        target_id,
+        target_type,
+        relationship,
+        properties,
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(_) => sp.commit().await.map_err(internal_error),
+        Err(e) => {
+            tracing::warn!(
+                source_id = %source_id,
+                target_id = %target_id,
+                relationship = relationship,
+                tool = tool_name,
+                error = %e,
+                "verb-edge emit failed; rolled back to savepoint and continuing — the \
+                 claim and its provenance are unaffected"
+            );
+            sp.rollback().await.map_err(internal_error)
+        }
+    }
+}
 
 /// Idempotently create a claim by `(content_hash, agent_id)` and emit an
 /// AUTHORED verb-edge marking the submission lifecycle event.
 ///
-/// Mirrors the API handler's pattern at routes/claims.rs:444-576: dedup
-/// inside a connection scope via `ClaimRepository::create_or_get`, then
-/// fire-and-forget the AUTHORED edge on the pool after the connection is
-/// released. AUTHORED failure is logged via `tracing::warn!` but never
-/// propagated — orphan claims are tolerated per the architecture doc's
-/// atomicity policy. Each submission emits a distinct AUTHORED edge
-/// regardless of `was_created`, because each submission is an authorship
-/// verb-event.
+/// Mirrors the API handler's pattern at routes/claims.rs: dedup via
+/// `ClaimRepository::create_or_get`, then the AUTHORED verb-edge. Each
+/// submission emits a distinct AUTHORED edge regardless of `was_created`,
+/// because each submission is an authorship verb-event.
+///
+/// # This takes a connection, not a pool, and that is the fix
+///
+/// It used to take `&PgPool`, acquire its own checkout for the claim, drop it,
+/// and then emit AUTHORED on a second checkout. Three consequences, all
+/// observed in production:
+///
+/// 1. **The claim committed on its own.** A caller whose trace INSERT was then
+///    refused (`42501` on `reasoning_traces`, the unstamped-connection defect
+///    `epigraph-db/tests/rls_enforcement.rs` pins) got an error with no claim
+///    id, while the claim row survived with no trace, no evidence and no
+///    AUTHORED edge. The log line this function used to carry said so in as
+///    many words: *"claim row persisted as orphan"*.
+/// 2. **The connection could not be the stamped one.** Only
+///    `ScopedPool::begin_as` stamps the tenancy GUCs the 077 policies read, and
+///    it yields a transaction. A pool parameter cannot accept one.
+/// 3. **Each checkout was a separate tenancy context**, so which statements were
+///    admitted depended on which pooled connection each one happened to get.
+///
+/// The caller now owns the transaction — see
+/// `tools::claims::submit_claim` and `tools::memory::memorize` — and passes
+/// `&mut *tx`.
+///
+/// `viewer` is the CALLER's read authority, deliberately distinct from the
+/// author's authority that stamped the connection: the spliced predicate on the
+/// dedup read asks "may this caller see this row", while the session GUCs ask
+/// "may the author write into this group". Both must hold; neither substitutes
+/// for the other.
 ///
 /// # Errors
-/// Returns the underlying `McpError::internal_error` if `pool.acquire()`
-/// or `ClaimRepository::create_or_get` fail. AUTHORED edge failure is
-/// not returned (logged + swallowed).
+/// Returns `McpError::internal_error` if `default_decl_for_author` or
+/// `ClaimRepository::create_or_get` fail. AUTHORED edge failure is not returned
+/// (logged + rolled back to a savepoint, see
+/// [`emit_verb_edge_best_effort`]).
 pub async fn create_claim_idempotent(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim: &Claim,
     tool_name: &'static str,
 ) -> Result<(Claim, bool), McpError> {
-    let mut conn = pool.acquire().await.map_err(internal_error)?;
     // Tenancy declaration (PR-16). Every MCP writer that reaches this helper
     // (`submit_claim`, `memorize`, `batch_submit_claims`) posts a claim
     // authored by the calling principal and carries no visibility parameter, so
@@ -39,34 +227,24 @@ pub async fn create_claim_idempotent(
     // Giving those tools a `visibility` argument is the write-side gate's work,
     // not this PR's; when it arrives, this is the single place it lands for all
     // three.
-    let decl = ClaimRepository::default_decl_for_author(&mut conn, claim.agent_id.into())
+    let decl = ClaimRepository::default_decl_for_author(&mut *conn, claim.agent_id.into())
         .await
         .map_err(internal_error)?;
-    let (claim, was_created) = ClaimRepository::create_or_get(&mut conn, viewer, claim, decl)
+    let (claim, was_created) = ClaimRepository::create_or_get(&mut *conn, viewer, claim, decl)
         .await
         .map_err(internal_error)?;
-    drop(conn);
 
-    if let Err(e) = EdgeRepository::create(
-        pool,
+    emit_verb_edge_best_effort(
+        &mut *conn,
         claim.agent_id.as_uuid(),
         "agent",
         claim.id.as_uuid(),
         "claim",
         "AUTHORED",
         Some(json!({"tool": tool_name, "was_created": was_created})),
-        None,
-        None,
+        tool_name,
     )
-    .await
-    {
-        tracing::warn!(
-            claim_id = %claim.id.as_uuid(),
-            tool = tool_name,
-            error = %e,
-            "AUTHORED verb-edge emit failed; claim row persisted as orphan"
-        );
-    }
+    .await?;
 
     // Note: the durable `claim.created` event for this submission is emitted
     // inside `ClaimRepository::create_strict` (which `create_or_get` calls on
