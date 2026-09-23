@@ -13,11 +13,13 @@
 //! 3. the caller must own it or hold `claims:admin` (403), even when it can
 //!    write the owning group;
 //! 4. the status `UPDATE` carries `{WRITABLE:c}`, so the caller must be able
-//!    to write the group that owns the row (403 when it cannot).
+//!    to write the group that owns the row (403 when it cannot);
+//! 5. the factor re-frame moves only factors whose every variable the caller
+//!    may write.
 //!
 //! Every refusal asserts the ROWS as well as the status: the claim's
 //! `hypothesis_status`, its `research_validity` frame membership, the
-//! `research_validity` mass function. A 4xx that still
+//! `research_validity` mass function and the factor frames. A 4xx that still
 //! wrote would pass a status-only test.
 //!
 //! # Fixture shape
@@ -485,5 +487,49 @@ async fn promoting_a_hypothesis_the_caller_cannot_read_is_404_and_writes_nothing
     assert_untouched(
         &promotion_state(&pool, h).await,
         "the unreadable hypothesis",
+    );
+}
+
+/// The factor re-frame moves only factors whose every variable the caller may
+/// write.
+///
+/// `factors` has no tenancy columns and no RLS, so nothing at the database
+/// level stops the re-frame. Two factors name the hypothesis: one shared with
+/// the owner's own claim, one shared with a PUBLIC claim in another
+/// principal's group, which the owner can read but not write. Before the fix,
+/// both moved. Now the second stays in `hypothesis_assessment`, and the
+/// promotion itself still succeeds, so a third party cannot block it by linking
+/// a factor to the hypothesis.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_factor_reframe_leaves_factors_naming_a_claim_the_caller_cannot_write() {
+    let (url, pool) = test_pool().await;
+    let owner = common::seed_system_agent(&pool).await;
+    let other = common::seed_system_agent(&pool).await;
+    let h = seed_ready_hypothesis(&pool, owner, "public").await;
+    let (hyp_frame, rv_frame) = ensure_frames(&pool).await;
+
+    let own = seed_claim(&pool, owner, "public", "the owner's own evidence").await;
+    let foreign = seed_claim(&pool, other, "public", "another principal's claim").await;
+    let own_factor = seed_factor(&pool, &[h, own], hyp_frame).await;
+    let foreign_factor = seed_factor(&pool, &[h, foreign], hyp_frame).await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::test_bearer_token_for_principal(owner, &["claims:write"]);
+    let (status, body) = promote(addr, &token, h).await;
+    assert_eq!(
+        status, 200,
+        "a factor shared with another owner's claim must not block the promotion; body={body}"
+    );
+
+    assert_promoted(&promotion_state(&pool, h).await, "the owner's hypothesis");
+    assert_eq!(
+        factor_frame(&pool, own_factor).await,
+        rv_frame,
+        "the factor over the owner's own claims must move"
+    );
+    assert_eq!(
+        factor_frame(&pool, foreign_factor).await,
+        hyp_frame,
+        "a factor naming a claim the caller cannot write must stay in hypothesis_assessment"
     );
 }

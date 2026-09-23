@@ -184,6 +184,80 @@ impl FactorRepository {
             .collect())
     }
 
+    /// Move the factors in frame `from_frame` that name `claim_id` into frame
+    /// `to_frame`, but only those whose EVERY variable is a claim the viewer
+    /// may WRITE. Returns how many moved.
+    ///
+    /// The factor re-frame of `POST /api/v1/hypothesis/:id/promote`
+    /// (`routes/hypothesis.rs::promote_hypothesis`, `F-SBC-A2`). The route ran
+    /// `UPDATE factors SET frame_id = $3 WHERE frame_id = $1 AND $2 =
+    /// ANY(variable_ids)` inline. That moved every factor mentioning the
+    /// hypothesis, including factors whose other variables are claims the
+    /// caller cannot write, or cannot even read. A factor's frame decides which
+    /// propagation run it takes part in, so moving it changes the inputs of
+    /// every claim it names, not only the hypothesis.
+    ///
+    /// # Why narrow, and not refuse
+    ///
+    /// A factor that names a claim outside the caller's write authority STAYS
+    /// in `from_frame`. The whole promotion is not refused, for two reasons:
+    ///
+    /// * Refusing would let anyone who can create a factor linking the
+    ///   hypothesis to one of their own claims block its owner's promotion
+    ///   permanently.
+    /// * Refusing on a variable the caller cannot READ would tell the caller
+    ///   that such a claim exists.
+    ///
+    /// Narrowing touches nothing outside the caller's write authority and
+    /// discloses nothing. The cost is that a factor shared with another
+    /// owner's claim is not carried into `to_frame`. That is deliberate, and
+    /// it is the same line the `claims` write draws.
+    ///
+    /// # No database backstop, stated
+    ///
+    /// `factors` has no tenancy columns and row-level security is off (measured
+    /// at migration head 100: `relrowsecurity` false). Migration 077 will never
+    /// guard this statement, so the `{WRITABLE:c}` predicate on the `claims`
+    /// subquery is the only gate it has. A variable id that names no claim at
+    /// all fails the predicate too, so a dangling factor is not moved.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn move_writable_factors_to_frame<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        from_frame: Uuid,
+        to_frame: Uuid,
+    ) -> Result<u64, crate::DbError> {
+        let sql = viewer.splice_write(
+            "UPDATE factors AS f \
+                SET frame_id = $3 \
+              WHERE f.frame_id = $1 \
+                AND $2 = ANY(f.variable_ids) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM unnest(f.variable_ids) AS v(id) \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM claims c \
+                          WHERE c.id = v.id \
+                            /* {WRITABLE:c} */ \
+                     ) \
+                )",
+            4,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(from_frame)
+            .bind(claim_id)
+            .bind(to_frame);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$4` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let result = q.execute(executor).await.map_err(crate::DbError::from)?;
+        Ok(result.rows_affected())
+    }
+
     /// Upsert a BP message (factor↔variable, one direction).
     pub async fn upsert_bp_message(
         pool: &PgPool,

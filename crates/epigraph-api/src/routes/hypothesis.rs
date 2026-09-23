@@ -444,7 +444,8 @@ pub async fn hypothesis_status(
 /// the raw pool, constrained by id alone. So any authenticated principal that
 /// could READ a promotion-ready hypothesis could promote it. That includes a
 /// token without `claims:write` and a principal that neither owns the claim nor
-/// can write the group that owns it.
+/// can write the group that owns it. The factor re-frame also moved factors
+/// naming claims the caller could not see.
 ///
 /// The gate now runs in this order, and each layer refuses before anything is
 /// written:
@@ -475,8 +476,12 @@ pub async fn hypothesis_status(
 /// * the latest `hypothesis_assessment` mass function is copied into
 ///   `research_validity`, read through the viewer;
 /// * the claim joins the `research_validity` frame;
-/// * the factors naming the claim move from `hypothesis_assessment` to
-///   `research_validity`.
+/// * factors naming the claim move frames, but only those whose EVERY variable
+///   is a claim the caller may write
+///   (`FactorRepository::move_writable_factors_to_frame`). `factors` has no
+///   tenancy and no RLS, so that predicate is its only gate. A factor shared
+///   with a claim outside the caller's write authority stays where it is. See
+///   that function for why this narrows rather than refuses.
 ///
 /// Every read and write after the readiness re-check runs on ONE
 /// `ScopedPool::begin_as(&viewer)` transaction. A refusal part-way through
@@ -653,23 +658,17 @@ pub async fn promote_hypothesis(
     .await
     .map_err(|e| ApiError::InternalError { message: format!("Failed to add to frame: {e}") })?;
 
-    // Update factors: move from hypothesis_assessment to research_validity
-    sqlx::query(
-        r#"
-        UPDATE factors
-        SET frame_id = $3
-        WHERE frame_id = $1
-          AND $2 = ANY(variable_ids)
-        "#,
+    // Move factors from hypothesis_assessment to research_validity: only those
+    // whose every variable the caller may write. See the handler doc.
+    epigraph_db::FactorRepository::move_writable_factors_to_frame(
+        &mut *tx,
+        &viewer,
+        id,
+        hyp_frame.0,
+        rv_frame.0,
     )
-    .bind(hyp_frame.0)
-    .bind(id)
-    .bind(rv_frame.0)
-    .execute(&mut *tx)
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to update factors: {e}"),
-    })?;
+    .map_err(db_error)?;
 
     tx.commit().await.map_err(|e| {
         tracing::error!(
