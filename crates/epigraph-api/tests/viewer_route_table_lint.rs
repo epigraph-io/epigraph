@@ -274,7 +274,13 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `claims`, so the invariant is enforced in the statement, and by RLS as
     // well once the request path runs as `epigraph_app` (it already runs on a
     // stamped `ScopedRead`).
-    ("workflows.rs", 4),
+    // `workflows.rs` was 4. The `F-inline-claim-content-reads` discharge moved
+    // three: `get_workflow`'s flat-workflow read and `report_outcome`'s
+    // existence gate now share `WorkflowRepository::flat_workflow_claim`
+    // (`{VISIBILITY:c}`), and `report_outcome`'s second `SELECT content`
+    // re-read is gone. The one left is `report_hierarchical_outcome`'s step
+    // lookup.
+    ("workflows.rs", 1),
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`

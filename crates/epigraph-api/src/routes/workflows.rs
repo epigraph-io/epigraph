@@ -12,7 +12,7 @@
 //! - `DELETE /api/v1/workflows/:id`            - Deprecate workflow
 //! - `POST   /api/v1/workflows/:id/behavioral-executions` - Record behavioral execution
 //!
-//! # Tenancy: 14 of this file's 40 raw-pool sites are converted
+//! # Tenancy: 18 of this file's 40 raw-pool sites are converted or removed
 //!
 //! Conversion shard 7 — the last read shard. `search_workflows` (6 sites),
 //! `find_workflow_hierarchical` (3) and `list_workflows` (1) each assemble their
@@ -89,21 +89,25 @@
 //! the raw pool. See the handler doc and `F-write-authz-reads-unfiltered`
 //! below.
 //!
-//! The other 26 sites are NOT converted. 24 sit in WRITE handlers
-//! (`store_workflow`, `report_outcome`, `deprecate_workflow`'s event,
+//! Four more are `get_workflow`'s two and `report_outcome`'s two, moved by the
+//! `F-inline-claim-content-reads` discharge. `get_workflow` held no `Viewer`
+//! at all; it now takes a `ViewerExtractor` and runs both its reads on one
+//! [`AppState::read_as`] connection, the flat-workflow read through
+//! `WorkflowRepository::flat_workflow_claim` (`{VISIBILITY:c}`).
+//! `report_outcome` is a WRITE handler, so only its READS moved: the existence
+//! gate reads through the same repo function on a `read_as` connection that is
+//! released before any write, and its second, unfiltered `SELECT content`
+//! re-read is gone (the gate already returned the content). A flat workflow
+//! the caller cannot read is 404 on both routes.
+//!
+//! The other 22 sites are NOT converted, and all 22 sit in WRITE handlers
+//! (`store_workflow`, `report_outcome`'s writes, `deprecate_workflow`'s event,
 //! `report_hierarchical_outcome`, `ingest_workflow`,
 //! `record_behavioral_execution`, `evolve_step`, `add_step`, `delete_step`):
 //! [`AppState::read_as`] is documented read-only, and a write routed through a
 //! `ScopedRead` is rolled back on drop under `SessionGucMode::Transaction` while
 //! still type-checking. Their owner is `ScopedPool::begin_as` plus
-//! `Viewer::splice_write`. The remaining 2 are `get_workflow`, a routed GET that
-//! holds no `Viewer` at all — adding a `ViewerExtractor` to a routed handler is
-//! a route-table change with its own acceptance, not a read-shard conversion.
-//! Its owner is `F-inline-claim-content-reads`, whose UNCOMPENSATED half carries
-//! this file's 4 and whose `assigned` field calls it LIVE rather than latent;
-//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
-//! `("workflows.rs", 4)` accordingly. Nothing further about it is recorded
-//! here — see `docs/tenancy/progress.json`.
+//! `Viewer::splice_write`.
 //!
 //! `deprecate_workflow`'s half of `F-write-authz-reads-unfiltered` is
 //! DISCHARGED. The handler checks `claims:write`, answers 404 for a workflow
@@ -117,12 +121,13 @@
 //! here. It is the open finding `F-DEFERRED-0922-A1` in
 //! `docs/tenancy/progress.json`.
 //!
-//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
-//! `("workflows.rs", 4)` and `ROUTE_LAYER_WRITES` still carries
-//! `("workflows.rs", 4)`; all eight sit in unconverted handlers and no inline
-//! statement was relocated. (`deprecate_workflow`'s inline `SELECT id` existence
-//! probe has since moved into the repo layer. It projected no content column
-//! and wrote nothing, so it was in neither count and neither moves.)
+//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` carries
+//! `("workflows.rs", 1)`, down from 4: the three statements above moved into
+//! the repo layer. The one left is `report_hierarchical_outcome`'s step lookup.
+//! `ROUTE_LAYER_WRITES` still carries `("workflows.rs", 4)`; no write moved.
+//! (`deprecate_workflow`'s inline `SELECT id` existence probe had already moved
+//! into the repo layer. It projected no content column and wrote nothing, so it
+//! was in neither count.)
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -691,8 +696,9 @@ pub async fn list_workflows(
 /// GET /api/v1/workflows/:id - Fetch a single workflow by ID.
 ///
 /// Probes the `workflows` table (hierarchical) first; falls through to the
-/// legacy flat-workflow claims path. Returns 404 only when the id is absent
-/// from both tables.
+/// legacy flat-workflow claims path. Returns 404 when the id is absent from
+/// both tables, AND when it names a flat workflow claim the caller cannot read:
+/// the two are deliberately indistinguishable.
 ///
 /// Response fields common to both paths:
 /// - `workflow_id`: the UUID
@@ -701,18 +707,45 @@ pub async fn list_workflows(
 /// - `truth_value`: workflow truth / claim truth_value
 /// - `properties`: metadata JSONB (hierarchical) or claim properties (flat)
 /// - `canonical_name`: canonical_name (hierarchical) or `null` (flat)
+///
+/// # Tenancy
+///
+/// The flat path reads through the caller's [`Viewer`](epigraph_db::Viewer)
+/// (`WorkflowRepository::flat_workflow_claim`, `{VISIBILITY:c}`). Until the
+/// `F-inline-claim-content-reads` discharge this handler took no `Viewer` and
+/// served any flat workflow claim's content and properties to any bearer.
+///
+/// The hierarchical probe is NOT filtered, because nothing can filter it:
+/// `workflows` carries no tenancy columns (no `visibility`, no
+/// `owner_group_id`, `relrowsecurity` false). That table-level gap belongs to
+/// the PR that gives `workflows` tenancy columns, as recorded on
+/// `D-PR16-per-id-claim-oracles-write-half`, not to this handler. The probe
+/// runs on the same stamped connection so the handler holds one connection.
 #[cfg(feature = "db")]
 pub async fn get_workflow(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_workflow",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // ── 1. Try hierarchical workflows table ─────────────────────────────────
     let hier: Option<WorkflowHierarchicalRow> = sqlx::query_as::<_, WorkflowHierarchicalRow>(
         "SELECT id, canonical_name, goal, truth_value, metadata \
          FROM workflows WHERE id = $1",
     )
     .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
+    .fetch_optional(&mut *read)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to fetch hierarchical workflow: {e}"),
@@ -730,20 +763,16 @@ pub async fn get_workflow(
     }
 
     // ── 2. Fall through to legacy flat-workflow claims ───────────────────────
-    let row = sqlx::query_as::<_, WorkflowContentRow>(
-        "SELECT id, content, truth_value, properties \
-         FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow claim: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".to_string(),
-        id: workflow_id.to_string(),
-    })?;
+    let row =
+        epigraph_db::WorkflowRepository::flat_workflow_claim(&mut *read, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch workflow claim: {e}"),
+            })?
+            .ok_or(ApiError::NotFound {
+                entity: "workflow".to_string(),
+                id: workflow_id.to_string(),
+            })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": row.id,
@@ -757,26 +786,52 @@ pub async fn get_workflow(
 }
 
 /// POST /api/v1/workflows/:id/outcome - Report execution outcome.
+///
+/// The existence gate reads through the caller's
+/// [`Viewer`](epigraph_db::Viewer): a flat workflow the caller cannot read is
+/// 404, and nothing is written. Until the `F-inline-claim-content-reads`
+/// discharge this handler took no `Viewer`, so any bearer could rewrite the
+/// truth value and usage counters of another group's private workflow, and
+/// the 404/200 difference said whether it existed. The MCP twin
+/// (`report_workflow_outcome`) already gated on a viewer-filtered read.
+///
+/// The WRITES below are unchanged and still constrain by id alone on the raw
+/// pool. They are counted in `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES`
+/// and `epigraph-db/tests/no_unscoped_pool.rs`, and their owner is the
+/// write-gate programme (`ScopedPool::begin_as` plus `Viewer::splice_write`).
+/// What this gate adds is that a caller can no longer reach them for a row it
+/// cannot see.
 #[cfg(feature = "db")]
 pub async fn report_outcome(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Verify workflow exists
-    let workflow = sqlx::query_as::<_, WorkflowRow>(
-        "SELECT id, truth_value, properties FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // Verify the workflow exists AND is readable by the caller. The stamped
+    // connection is released at the end of this block, before any write.
+    let workflow = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "report_outcome",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        epigraph_db::WorkflowRepository::flat_workflow_claim(&mut *read, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to fetch workflow: {e}"),
+            })?
+            .ok_or(ApiError::NotFound {
+                entity: "workflow".into(),
+                id: workflow_id.to_string(),
+            })?
+    };
 
     let before_truth = workflow.truth_value.unwrap_or(0.5);
 
@@ -856,18 +911,13 @@ pub async fn report_outcome(
         .await;
 
     // ── Behavioral execution row (best-effort) ──────────────────────────
-    // Parse workflow goal for fallback
-    let parsed_goal: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
-        .bind(workflow_id)
-        .fetch_optional(&state.db_pool)
-        .await
+    // Parse workflow goal for fallback. From the content the gate above already
+    // read: the two UPDATEs in between touch `truth_value` and `properties`,
+    // never `content`, so re-reading it was a second, unfiltered round trip for
+    // the same value.
+    let parsed_goal: String = serde_json::from_str::<serde_json::Value>(&workflow.content)
         .ok()
-        .flatten()
-        .and_then(|content: String| {
-            serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(String::from))
-        })
+        .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(String::from))
         .unwrap_or_default();
 
     let behavioral_goal = request.goal_text.unwrap_or(parsed_goal);
@@ -1814,25 +1864,6 @@ async fn auto_wire_inserted_edges(
 }
 
 // ── Internal types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    truth_value: Option<f64>,
-    properties: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowContentRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    content: String,
-    truth_value: Option<f64>,
-    properties: Option<serde_json::Value>,
-}
 
 #[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]

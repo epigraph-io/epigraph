@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (288 today; the assertions below measure the tree and
+//! deletes in week two. (284 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 288 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 284 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,17 +120,19 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 288 is not 0 — and no shard in the series may be
+//!      discharged the gate — 284 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 128 of the 416 sites the series began with are gone — 113
+//!      decision: 132 of the 416 sites the series began with are gone — 113
 //!      converted by the shards, 3 REMOVED outright when `routes/claims.rs`'s
 //!      `group_id` membership gates stopped reading `group_memberships` through
 //!      the raw pool, and 4 moved onto `ScopedPool::begin_as` when
 //!      `routes/workflows.rs::deprecate_workflow` was gated
-//!      (F-write-authz-reads-unfiltered), and 8 moved onto
-//!      `AppState::read_as` by the F-inline-claim-content-reads discharge
-//!      (`routes/embeddings.rs` 2, `routes/conflicts.rs` 3,
-//!      `routes/policies.rs` 2, `routes/political.rs` 1) — and 288 are not.
+//!      (F-write-authz-reads-unfiltered), and 12 went with the
+//!      F-inline-claim-content-reads discharge — 11 moved onto
+//!      `AppState::read_as` (`routes/embeddings.rs` 2, `routes/conflicts.rs`
+//!      3, `routes/policies.rs` 2, `routes/political.rs` 1,
+//!      `routes/workflows.rs` 3) and 1 removed outright (`report_outcome`'s
+//!      redundant content re-read) — and 284 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -561,7 +563,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 288;
+const HIGH_WATER: usize = 284;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -614,11 +616,13 @@ const HIGH_WATER: usize = 288;
 /// `HIGH_WATER` 294 -> 291, this constant unchanged. `routes/policies.rs`
 /// 9 -> 7 (`list_network_policies`, `get_challenge`): `HIGH_WATER` 291 -> 289.
 /// `routes/political.rs` 5 -> 4 (`inflation_leaderboard`): 289 -> 288.
+/// `routes/workflows.rs` 26 -> 22 (`get_workflow`, `report_outcome`):
+/// 288 -> 284.
 const HIGH_WATER_FILES: usize = 43;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 288 sites across 43 files as of this commit. Lower an entry when a shard
+/// 284 sites across 43 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -857,7 +861,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // walk and the two writes) now run on one `ScopedPool::begin_as(&viewer)`
     // transaction. Its fifth, the post-commit `workflow.deprecated` event, is
     // still here.
-    ("routes/workflows.rs", 26),
+    //
+    // 26 -> 22 with the `F-inline-claim-content-reads` discharge: `get_workflow`
+    // took a `ViewerExtractor` and runs both its reads on `AppState::read_as`
+    // (2); `report_outcome`'s existence gate moved onto `read_as` (1) and its
+    // unfiltered `SELECT content` re-read was removed outright (1). Every site
+    // left sits in a WRITE handler.
+    ("routes/workflows.rs", 22),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

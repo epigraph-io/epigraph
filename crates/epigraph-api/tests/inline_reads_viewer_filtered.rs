@@ -737,3 +737,117 @@ async fn semantic_search_selected_drops_ids_the_viewer_cannot_read(pool: PgPool)
         mine.similarity
     );
 }
+
+// ── routes/workflows.rs ──
+
+/// Label `claim` a flat workflow whose JSON content carries `goal`.
+async fn make_flat_workflow(pool: &PgPool, claim: Uuid, goal: &str) {
+    set_labels(pool, claim, &["workflow"]).await;
+    sqlx::query("UPDATE claims SET content = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(serde_json::json!({ "goal": goal }).to_string())
+        .execute(pool)
+        .await
+        .expect("set workflow content");
+}
+
+/// `GET /workflows/:id`, flat path: the viewer's own private workflow is
+/// served, another group's is a 404 like a missing id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_workflow_serves_own_private_flat_workflow_and_404s_a_strangers(pool: PgPool) {
+    let p = plant(&pool, "wf-get").await;
+    make_flat_workflow(&pool, p.mine, "mine goal").await;
+    make_flat_workflow(&pool, p.theirs, "theirs goal").await;
+    let state = split_state(&pool).await;
+
+    let served = epigraph_api::routes::workflows::get_workflow(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state.clone()),
+        axum::extract::Path(p.mine),
+    )
+    .await
+    .expect("the viewer's own private workflow must be served")
+    .0;
+    assert_eq!(served["content"]["goal"], "mine goal");
+
+    for (id, what) in [
+        (p.theirs, "a workflow private to another group"),
+        (Uuid::new_v4(), "CALIBRATION: an absent id"),
+    ] {
+        let got = epigraph_api::routes::workflows::get_workflow(
+            ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+            State(state.clone()),
+            axum::extract::Path(id),
+        )
+        .await;
+        assert!(
+            matches!(got, Err(epigraph_api::errors::ApiError::NotFound { .. })),
+            "{what} must be a 404"
+        );
+    }
+}
+
+/// `POST /workflows/:id/outcome`: the existence gate reads through the viewer.
+///
+/// A stranger's private workflow is a 404 and is NOT written — its truth value
+/// and counters are asserted unchanged on the superuser pool. The viewer's own
+/// private workflow passes the gate (the handler reads its truth value back as
+/// `before_truth`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_outcome_gates_on_a_workflow_the_viewer_can_read(pool: PgPool) {
+    let p = plant(&pool, "wf-outcome").await;
+    make_flat_workflow(&pool, p.mine, "mine goal").await;
+    make_flat_workflow(&pool, p.theirs, "theirs goal").await;
+    let state = split_state(&pool).await;
+    let request = || epigraph_api::routes::workflows::ReportOutcomeRequest {
+        success: true,
+        outcome_details: "probe".to_string(),
+        quality: Some(1.0),
+        step_executions: None,
+        goal_text: None,
+    };
+
+    let refused = epigraph_api::routes::workflows::report_outcome(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state.clone()),
+        axum::extract::Path(p.theirs),
+        Json(request()),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(epigraph_api::errors::ApiError::NotFound { .. })
+        ),
+        "an outcome against a workflow private to another group must be a 404"
+    );
+    let (truth, props): (f64, serde_json::Value) =
+        sqlx::query_as("SELECT truth_value, properties FROM claims WHERE id = $1")
+            .bind(p.theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("read the stranger's workflow back");
+    assert!(
+        (truth - 0.8).abs() < 1e-9 && props.get("use_count").is_none(),
+        "the refused report must not have written: truth {truth}, properties {props}"
+    );
+
+    let served = epigraph_api::routes::workflows::report_outcome(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state),
+        axum::extract::Path(p.mine),
+        Json(request()),
+    )
+    .await
+    .expect(
+        "the viewer's own private workflow must pass the gate; it 404s when the \
+         gate runs on the unstamped raw pool",
+    )
+    .0;
+    assert_eq!(served["workflow_id"], p.mine.to_string());
+    assert_eq!(
+        served["before_truth"].as_f64(),
+        Some(0.8),
+        "before_truth comes from the gate's own read of the private row"
+    );
+}

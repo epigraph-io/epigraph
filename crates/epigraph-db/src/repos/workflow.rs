@@ -47,6 +47,15 @@ pub struct WorkflowListRow {
     pub properties: serde_json::Value,
 }
 
+/// A flat workflow claim, from [`WorkflowRepository::flat_workflow_claim`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FlatWorkflowClaimRow {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: Option<f64>,
+    pub properties: Option<serde_json::Value>,
+}
+
 /// One hit from [`WorkflowRepository::search_by_goal_embedding`] — the ANN
 /// leg `recall()` RRF-merges with its claims dense+lexical leg.
 ///
@@ -407,6 +416,43 @@ impl WorkflowRepository {
             2,
         );
         let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(executor).await
+    }
+
+    /// The FLAT workflow claim `workflow_id` (content, truth value,
+    /// properties), when the viewer can read it. `None` when there is no such
+    /// claim, when it is not labelled `'workflow'`, or when it is outside the
+    /// viewer's visibility; the three are deliberately indistinguishable.
+    ///
+    /// Backs `GET /api/v1/workflows/:id`'s flat-workflow fallback and
+    /// `POST /api/v1/workflows/:id/outcome`'s existence gate. Both ran this
+    /// statement inline on the raw pool with no `Viewer`
+    /// (`F-inline-claim-content-reads`): any bearer could read a private
+    /// workflow's content and properties by id, and report an outcome against
+    /// it, which rewrote its truth value and usage counters. Both routes now
+    /// answer 404 on `None`.
+    ///
+    /// A READ marker, like [`Self::flat_workflow_author`]: this decides
+    /// whether the caller may see the row. Whether it may write it is a
+    /// separate predicate on the write itself.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn flat_workflow_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Option<FlatWorkflowClaimRow>, sqlx::Error> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.content, c.truth_value, c.properties FROM claims c \
+             WHERE c.id = $1 AND 'workflow' = ANY(c.labels) \
+               /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FlatWorkflowClaimRow>(&sql).bind(workflow_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
