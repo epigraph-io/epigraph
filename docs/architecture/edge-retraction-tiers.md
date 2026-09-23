@@ -122,16 +122,22 @@ structural with its reason.
 The list was derived mechanically on the valid-to-display-tier branch: every
 function under `crates/*/src` whose body reads `FROM`/`JOIN edges` and has no
 `valid_to` filter, minus the ones tabled above and the write paths (dedup
-probes inside an `INSERT`, the retraction writers' own snapshots). Re-run that
-scan before relying on the list being complete.
+probes inside an `INSERT`, the retraction writers' own snapshots). Re-running
+it while correcting the `delete_edge` wording found the rows marked (†), which
+the first pass missed, so treat the list as a floor: re-run that scan before
+relying on it being complete.
+
+Where a read is reachable from an MCP tool or an HTTP route, the entry names
+it: those are the places a caller who has just deleted an edge will still see
+it.
 
 **Likely belief-bearing (highest priority).** These look like siblings of reads
 the belief tier already filters.
 
 | Read | Where | Why it looks belief-bearing |
 |---|---|---|
-| Sheaf claim-neighbour belief pairs | `SheafRepository::get_claim_neighbor_betp_pairs` (`repos/sheaf.rs`) | sibling of the filtered `get_epistemic_edge_pairs`; feeds sheaf consistency |
-| Conflict scan / silence check `CONTRADICTS` counts | `scan_conflicts`, `silence_check` (`epigraph-api/src/routes/conflicts.rs`) | the same frame silence alarm `belief.rs` computes in force |
+| Sheaf claim-neighbour belief pairs (MCP `check_sheaf_consistency`, `GET /api/v1/sheaf/consistency`) | `SheafRepository::get_claim_neighbor_betp_pairs` (`repos/sheaf.rs`) | sibling of the filtered `get_epistemic_edge_pairs`; feeds sheaf consistency |
+| Conflict scan / silence check `CONTRADICTS` counts (`GET /api/v1/conflicts/scan`, `GET /api/v1/conflicts/silence-check`) | `scan_conflicts`, `silence_check` (`epigraph-api/src/routes/conflicts.rs`) | the same frame silence alarm `belief.rs` computes in force |
 | Reasoning-engine edge load | `load_edges_from_db` (`epigraph-api/src/routes/reasoning.rs`) | feeds the reasoning endpoints the same way the G8 pre-screen's reads feed Ascent |
 
 **Likely display.**
@@ -144,17 +150,21 @@ the belief tier already filters.
 | Semantic-link reads | `SemanticLinkRepository::{get_by_id, get_by_source, get_by_target, get_between, get_by_type, list, count}` (`repos/semantic_link.rs`) | `SemanticLinkRepository::retract` is one of the retraction writers above, so a removed link is still listed by its own repository |
 | Evidence views | `get_evidence`, `build_evidence_chains` (`epigraph-api/src/routes/edges.rs`); `EvidenceRepository::{provided_for_claim_as_of, by_relationship_for_claim}` | |
 | `GET /api/v1/edges` (`list_edges`) and the other `EdgeRepository` reads `get_by_relationship`, `get_between` | `repos/edge.rs` | these SELECT `valid_to`, so a caller can see the retraction, but they do not hide it |
+| (†) Alternative-set candidates (MCP `suggest_alternative_sets`) | `AlternativeSetRepository::scan_candidates` (`repos/alternative_set.rs`) | a retracted `supports` or `contradicts` edge still produces a suggested pair, and a retracted `alternative_of` link still counts as "already linked" in the anti-join, suppressing one |
 
 **Undecided (attribution / provenance / analytics).**
 
 | Read | Where |
 |---|---|
+| (†) Provenance chain (MCP `get_provenance_chain`) | `ProvenanceChainRepository::chain` (`repos/provenance_chain.rs`) — a recursive walk, so the follow-vs-return rule applies if it is filtered; on the PROV-export argument, flagging may be the better fix than hiding |
 | Propagation genealogy and agent profiles | `PoliticalRepository::{get_claim_genealogy, get_agent_profile_claims, get_agent_evidence_distribution, get_agent_position_timeline, get_originated_claims_with_amplification, get_claim_techniques}` (`repos/political.rs`) |
 | Claim lineage walks | `LineageRepository` (`repos/lineage.rs`) — probably structural, on the same argument as workflow lineage, but not recorded as such |
 | Attribution | `EdgeRepository::{get_claims_attributed_to, count_claims_attributed_to, count_for_entity}` |
 | Grounding and evidence counts | `ClaimRepository::{grounded_neighborhood, count_all_evidence_for_claim, has_grounded_evidence}` |
 | Method, analysis, experiment, hypothesis | `MethodRepository` evidence reads, `AnalysisRepository`, `ExperimentRepository::count_completed_with_analysis`, `hypothesis_status` (`epigraph-api/src/routes/hypothesis.rs`) |
 | Match-candidate and behavioural reads | `MatchCandidateRepo::corroborates_edges_for_claim`, `behavioral_affinity_lineage`, `corpus_stats::tenant_counts` |
+| (†) Paper attribution outside `source_key.rs` | `PaperRepository::{has_processed_by_edge, count_asserted_claims, list_authors, list_asserted_claims}` (`repos/paper.rs`), the DOI `asserts` probe in `ClaimRepository::search_by_embedding_since`, the `asserts` join in `auto_wire_ds_for_edge` (`epigraph-engine/src/edge_factor.rs`) — probably structural on the `source_key` argument, but not recorded as such |
+| (†) Workflow reads outside the files the structural row names | `WorkflowRepository` (`repos/workflow.rs`), the `executes` reads in `report_hierarchical_outcome` (`epigraph-api/src/routes/workflows.rs`) and `do_report_hierarchical_outcome_via_pool` (`epigraph-mcp/src/tools/workflow_hierarchical.rs`) — probably structural on the workflow-lineage argument, but not recorded as such |
 | Operator CLIs | `crates/epigraph-cli/src/bin/*`, `bridge/components.rs`, `rerank/core.rs` |
 
 ## Enforcement
