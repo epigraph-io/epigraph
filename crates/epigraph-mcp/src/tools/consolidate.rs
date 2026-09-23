@@ -30,7 +30,27 @@ pub async fn consolidate_claims(
     viewer: &epigraph_db::visibility::Viewer,
     params: ConsolidateClaimsParams,
 ) -> Result<CallToolResult, McpError> {
-    let acting_agent_id = server.agent_id().await?;
+    // The acting agent is the REQUEST principal, not `server.agent_id()`.
+    // `request_viewer` resolved `viewer` from the caller's `agents.id` on HTTP
+    // and from the server's own agent on stdio, where the two are the same
+    // value, so stdio behaviour is unchanged. The repo uses this one id to
+    // author the merged row, key idempotency, and check write authority.
+    // Passing the server's signer agent instead checked the SERVER's group
+    // memberships on HTTP, so any `claims:write` caller could merge and retire
+    // private claims in the server agent's groups, and a caller who could
+    // write its own group was refused whenever the server agent could not
+    // (deferred-commitment screen key consolidate-writable-role).
+    //
+    // `principal()` is `None` only for an unrestricted maintenance viewer,
+    // which `request_viewer` never returns. Refuse rather than fall back to
+    // any other identity.
+    let acting_agent_id = viewer.principal().ok_or_else(|| {
+        invalid_params(
+            "consolidate_claims needs a request principal; an unrestricted viewer has \
+             no agent to author the merge or to hold write authority"
+                .to_string(),
+        )
+    })?;
 
     let source_ids = params
         .source_claim_ids
@@ -74,11 +94,12 @@ pub async fn consolidate_claims(
     )
     .await
     .map_err(|e| match e {
-        // The cross-group refusal (PR-16, plan §4.6) is a CLIENT error: the
-        // caller asked for a merge whose sources span two owner groups, and
-        // the answer is "pick sources within one group", not "the server
-        // failed". `internal_error` would render it as INTERNAL_ERROR and an
-        // agent would retry it forever. The HTTP twin is 409
+        // The cross-group refusal (PR-16, plan §4.6) and the write-authority
+        // refusal are CLIENT errors: the caller asked for a merge whose sources
+        // span two owner groups, or that writes into a group it cannot write,
+        // and the answer is "pick other sources", not "the server failed".
+        // `internal_error` would render it as INTERNAL_ERROR and an agent
+        // would retry it forever. The HTTP twin is 409
         // (`DbError::Conflict` -> `ApiError::Conflict`); INVALID_PARAMS is the
         // nearest JSON-RPC code that carries the message to the caller.
         epigraph_db::DbError::Conflict { ref reason } => invalid_params(reason.clone()),

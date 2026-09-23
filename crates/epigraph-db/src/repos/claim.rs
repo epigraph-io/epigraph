@@ -7341,6 +7341,18 @@ impl ClaimRepository {
     /// `AUTHORED` is excluded from deduplication (migration 017 explicitly
     /// allows it to accumulate) and `supersedes` from migration entirely.
     ///
+    /// # `acting_agent_id` must be the REQUEST principal
+    ///
+    /// One agent id does four jobs here: it authors the merged row, keys the
+    /// idempotent-return lookup, owns the all-public fallback group, and is the
+    /// principal whose write authority is checked. Because it is one value,
+    /// authorship and authorization cannot name two different agents.
+    ///
+    /// The caller must therefore pass the authenticated principal of the
+    /// request (`Viewer::principal()`), never a process identity. The MCP tool
+    /// used to pass the server's own signer agent. On the HTTP transport that
+    /// authorized the SERVER's group memberships instead of the caller's.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` on a bad source set (wrong count,
     /// duplicates, non-current, already-superseded), `DbError::NotFound`
@@ -7516,8 +7528,9 @@ impl ClaimRepository {
         // A revocation or a demotion to `reader` that commits after the
         // caller resolved its viewer is still refused.
         //
-        // It keys on `acting_agent_id`. An all-public merge
-        // (`merged_owner == None`) skips it and costs nothing extra.
+        // It keys on `acting_agent_id`, which must be the request principal
+        // (see the doc comment). An all-public merge (`merged_owner == None`)
+        // skips it and costs nothing extra.
         //
         // NOT a database backstop. This runs on a raw `PgPool`, so no
         // `epigraph.writable_group_ids` GUC is stamped, and migration 077's
