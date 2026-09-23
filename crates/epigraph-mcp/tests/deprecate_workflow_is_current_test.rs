@@ -196,3 +196,84 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
         "unrelated non-workflow claim flipped is_current"
     );
 }
+
+/// A failed cascade read must surface its real cause, not report a success that
+/// was silently rolled back.
+///
+/// `deprecate_workflow` now opens ONE transaction for the whole deprecation. The
+/// cascade's `EdgeRepository::get_by_target` was `.unwrap_or_default()`, which was
+/// harmless while the tool ran on `&server.pool` — the target's deprecation had
+/// already autocommitted and a failed read merely skipped the children. Inside a
+/// transaction the same swallow is a poison pill.
+///
+/// The outcome is worse than the `25P02` one would expect, and it is MEASURED.
+/// On the swallowing revision this arm returns:
+///
+/// ```text
+/// {"deprecated_ids": ["dc975b42-…"], "reason": "cascade read failure"}   is_error: false
+/// ```
+///
+/// — success, with nothing written. PostgreSQL accepts `COMMIT` on an aborted
+/// transaction and answers with the `ROLLBACK` command tag rather than an error,
+/// so `tx.commit()` returns `Ok` and the whole deprecation is discarded while the
+/// tool reports it as done. #494 wrapped `create_or_get`'s duplicate-key re-find
+/// and `EventRepository::publish_or_log_conn` in SAVEPOINTs for exactly this class.
+///
+/// # Why this arm is not vacuous under the BYPASSRLS harness
+///
+/// It does not assert that a write succeeds — an arm shaped that way passes
+/// identically on the unconverted tree. It induces a read failure that no role can
+/// bypass (the relation is GONE) and asserts that the caller is TOLD. Reverting
+/// the `?` to `.unwrap_or_default()` fails this arm on any role, at the
+/// `expect_err` — MEASURED, not predicted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn deprecate_workflow_cascade_read_failure_reports_its_real_cause(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let root = seed_workflow_claim(&pool, "cascade-read-failure", &["s1"]).await;
+
+    // Make the cascade's `get_by_target` fail in a way no privilege level can
+    // bypass. Each `#[sqlx::test]` owns its own database, so this is local.
+    sqlx::query("DROP TABLE edges CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let err = epigraph_mcp::tools::workflows::deprecate_workflow(
+        &server,
+        &viewer,
+        epigraph_mcp::types::DeprecateWorkflowParams {
+            workflow_id: root.to_string(),
+            reason: "cascade read failure".into(),
+            cascade: Some(true),
+        },
+    )
+    .await
+    .expect_err("a cascade that cannot enumerate its children has not completed");
+
+    let msg = err.message.to_lowercase();
+    assert!(
+        msg.contains("edges"),
+        "the cascade read's real cause must reach the caller; got {:?}. A message \
+         mentioning only an aborted transaction (25P02) means the read was swallowed \
+         again and the loop kept issuing statements into a dead transaction.",
+        err.message
+    );
+    assert!(
+        !msg.contains("25p02") && !msg.contains("current transaction is aborted"),
+        "the caller must not receive the SECONDARY failure; got {:?}",
+        err.message
+    );
+
+    // And nothing landed: the whole deprecation is one transaction, so a cascade
+    // that cannot complete must not leave the root flipped.
+    let is_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(root)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        is_current,
+        "the root must not stay deprecated when the cascade aborted"
+    );
+}

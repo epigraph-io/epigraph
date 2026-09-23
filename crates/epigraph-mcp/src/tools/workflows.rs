@@ -1222,9 +1222,38 @@ pub async fn deprecate_workflow(
         visited.insert(workflow_id);
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
+            // PROPAGATED, not swallowed. This read was `.unwrap_or_default()`
+            // before the branch, and on `&server.pool` that was harmless: the
+            // target's deprecation had already autocommitted and a failed read
+            // merely skipped the children. INSIDE the transaction the same swallow
+            // is a poison pill, and the failure it produces is WORSE than the
+            // `25P02` one might expect.
+            //
+            // MEASURED, by dropping `edges` inside a `#[sqlx::test]` database and
+            // calling this tool with `cascade: true` on the swallowing revision:
+            //
+            //     {"deprecated_ids": ["dc975b42-…"], "reason": "cascade read failure"}
+            //     is_error: false
+            //
+            // — success, with nothing written. The mechanism is PostgreSQL's, not
+            // sqlx's: after an error inside a transaction block, `COMMIT` is
+            // accepted and returns the `ROLLBACK` command tag rather than an error
+            // (verified directly: `BEGIN; INSERT…; SELECT FROM <missing>; COMMIT;`
+            // leaves zero rows and raises nothing on the COMMIT). So the swallow
+            // aborts the transaction, the loop exits with an empty edge list,
+            // `tx.commit()` returns `Ok`, and the tool reports a deprecation that
+            // was discarded in full. A caller cannot tell, and neither can a log.
+            //
+            // That is the failure mode #494's SAVEPOINT discipline exists to
+            // prevent (`EventRepository::publish_or_log_conn` opens one;
+            // `create_or_get`'s duplicate-key re-find opens one). A SAVEPOINT would
+            // work here too, but propagation is the better answer for THIS read: a
+            // savepoint preserves the "skip the children" behaviour, and that
+            // behaviour was only ever an accident of running outside a transaction.
+            // A cascade that cannot enumerate its children has not completed.
             let edges = EdgeRepository::get_by_target(&mut *tx, viewer, current, "claim")
                 .await
-                .unwrap_or_default();
+                .map_err(internal_error)?;
 
             for edge in edges {
                 if !DESCENDANT_REL.contains(&edge.relationship.as_str()) {
@@ -1259,7 +1288,7 @@ pub async fn deprecate_workflow(
                     continue;
                 }
 
-                ClaimRepository::deprecate_claim(
+                let child_rows = ClaimRepository::deprecate_claim(
                     &mut *tx,
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
@@ -1269,7 +1298,19 @@ pub async fn deprecate_workflow(
                 epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
                     .map_err(internal_error)?;
-                deprecated_ids.push(child_id.to_string());
+                // REPORT ONLY WHAT ACTUALLY FLIPPED. `deprecate_claim` returns
+                // `rows_affected`, and a cascade child can legitimately yield 0:
+                // `claims_tenancy`'s USING side filters the UPDATE's target, so a
+                // row this session may not write is silently not written rather
+                // than refused. Pushing the id regardless made the response assert
+                // a deprecation that did not happen — and unlike a `42501`, a
+                // USING-filtered miss raises nothing for the caller to notice.
+                // The traversal still descends: `is_workflow` above proved this is
+                // a workflow claim, and a child that was skipped here may still
+                // have descendants that are not.
+                if child_rows > 0 {
+                    deprecated_ids.push(child_id.to_string());
+                }
                 queue.push(child_id);
             }
         }
