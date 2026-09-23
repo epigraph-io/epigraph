@@ -427,28 +427,39 @@ pub async fn assess_claim(
     }
 
     // ── 9. Generate embedding ────────────────────────────────────────────
+    //
+    // Written through the viewer-gated repo helper, not an inline UPDATE
+    // (deferred-commitment key embed-on-write-helper). The claim id came from
+    // the PATH, so this is not a write-on-create: the handler must not put a
+    // vector on a claim the caller may only read, on a superseded claim, or on
+    // a SEALED one. For a sealed claim `get_by_id` returns the sealed content,
+    // so the vector would have been derived from ciphertext and would trip
+    // CLAUDE.md's sealed_with_embedding audit. `embedded` reports whether a
+    // row was actually written: `Ok(false)` is "not embedded", never success.
     let embedded = if let Some(ref embedding_service) = state.embedding_service {
         match embedding_service.generate_query(&claim_content).await {
             Ok(embedding) => {
-                let pgvector_str = format!(
-                    "[{}]",
-                    embedding
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                let store_result =
-                    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                        .bind(&pgvector_str)
-                        .bind(claim_id)
-                        .execute(pool)
-                        .await;
-                if let Err(e) = store_result {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding");
-                    false
-                } else {
-                    true
+                let stored: Result<bool, epigraph_db::DbError> = async {
+                    let mut conn = pool.acquire().await?;
+                    epigraph_db::ClaimRepository::store_embedding_vec_if_unsealed(
+                        &mut conn, &viewer, claim_id, &embedding,
+                    )
+                    .await
+                }
+                .await;
+                match stored {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        tracing::debug!(
+                            claim_id = %claim_id,
+                            "Embedding not stored: claim is sealed, superseded or not writable by the caller"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding");
+                        false
+                    }
                 }
             }
             Err(e) => {

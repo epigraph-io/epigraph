@@ -465,7 +465,12 @@ const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 ///
 /// Everything else is debt. Do not add to it.
 const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
-    ("assess.rs", 1),
+    // `assess.rs` was 1 -- `assess_claim`'s inline `UPDATE claims SET
+    // embedding` on the path's claim id, which skipped both the seal predicate
+    // and the write predicate. It now writes through
+    // `ClaimRepository::store_embedding_vec_if_unsealed` with the handler's
+    // viewer (deferred-commitment key embed-on-write-helper). Removed, not
+    // zeroed.
     ("belief.rs", 1),
     ("claims.rs", 4),
     ("computation.rs", 2),
