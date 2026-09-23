@@ -104,6 +104,10 @@ pub struct PropagationStepRow {
 // Repository
 // ============================================================================
 
+/// One row of [`PoliticalRepository::inflation_leaderboard`]:
+/// `(agent_id, display_name, mean_inflation, claim_count)`.
+pub type InflationLeaderboardRow = (Uuid, Option<String>, f64, i64);
+
 pub struct PoliticalRepository;
 
 impl PoliticalRepository {
@@ -478,6 +482,49 @@ impl PoliticalRepository {
         let rows: Vec<(Uuid, String, f64, serde_json::Value)> = vq.fetch_all(executor).await?;
 
         Ok(rows)
+    }
+
+    /// Agents ranked by the mean `inflation_factor` of their claims, over the
+    /// claims the viewer can read. Top 20; agents with fewer than two readable
+    /// scored claims are left out.
+    ///
+    /// Backs `GET /api/v1/inflation-index/leaderboard`, which ran this
+    /// aggregate inline on the raw pool with no `Viewer`
+    /// (`F-inline-claim-content-reads`). Unfiltered, each agent's mean and
+    /// count were functions of claims the caller may not read, and the
+    /// `HAVING` threshold made an agent's presence on the board one too.
+    ///
+    /// `agents` is not marked: it carries no tenancy columns, and the join only
+    /// names the author of a claim that already passed the `claims` predicate.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn inflation_leaderboard<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<Vec<InflationLeaderboardRow>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.agent_id, a.display_name,
+                   AVG((c.properties->>'inflation_factor')::FLOAT) AS mean_inflation,
+                   COUNT(*) AS claim_count
+            FROM claims c
+            JOIN agents a ON a.id = c.agent_id
+            WHERE c.properties ? 'inflation_factor'
+              /* {VISIBILITY:c} */
+            GROUP BY c.agent_id, a.display_name
+            HAVING COUNT(*) >= 2
+            ORDER BY mean_inflation DESC
+            LIMIT 20
+            "#,
+            1,
+        );
+        let mut vq = sqlx::query_as::<_, InflationLeaderboardRow>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        Ok(vq.fetch_all(executor).await?)
     }
 
     // ── Techniques on a claim ────────────────────────────────────────────

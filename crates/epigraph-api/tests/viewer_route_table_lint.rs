@@ -260,7 +260,10 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `properties` (host/port/protocol/status) with no viewer. They are now
     // `PolicyRepository::list_active_network` and `::get_challenge`, each
     // marking `claims`; an unreadable challenge is a 404.
-    ("political.rs", 1),
+    // `political.rs` was 1 until `F-inline-claim-content-reads` was
+    // discharged and is now 0: `inflation_leaderboard` averaged
+    // `c.properties->>'inflation_factor'` over every tenant's claims. It is now
+    // `PoliticalRepository::inflation_leaderboard`, marking `claims`.
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
     // forward-only scan could not see. Its in-code comment argues it is not a
     // live leak — the ids come from the viewer-filtered

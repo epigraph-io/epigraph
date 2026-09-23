@@ -616,3 +616,68 @@ async fn get_challenge_serves_own_private_challenge_and_404s_a_strangers(pool: P
         "CALIBRATION: an absent id is a 404 too, so the two cases are indistinguishable"
     );
 }
+
+// ── routes/political.rs ──
+
+/// `GET /inflation-index/leaderboard`: each agent's mean and count are
+/// computed over the claims the caller can read.
+///
+/// All three scored claims are AUTHORED by the same agent, so they land in one
+/// leaderboard row and its numbers say exactly which were counted: the
+/// readable pair averages 3.0 over 2, all three 6.0 over 3. On the unstamped
+/// raw pool only the public claim is readable, the `HAVING COUNT(*) >= 2`
+/// threshold drops the agent, and the row is missing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inflation_leaderboard_aggregates_only_claims_the_viewer_can_read(pool: PgPool) {
+    let p = plant(&pool, "inflation").await;
+    let authored_by_viewer_owned_by_stranger = seed_group_claim(
+        &pool,
+        p.viewer_agent,
+        p.stranger_group,
+        "inflation authored-by-viewer, owned-by-stranger",
+    )
+    .await;
+    for (claim, factor) in [
+        (p.public, 2.0),
+        (p.mine, 4.0),
+        (authored_by_viewer_owned_by_stranger, 12.0),
+    ] {
+        set_properties(
+            &pool,
+            claim,
+            serde_json::json!({ "inflation_factor": factor }),
+        )
+        .await;
+    }
+
+    let viewer = viewer_for(&pool, p.viewer_agent).await;
+    let state = split_state(&pool).await;
+    let rows = epigraph_api::routes::political::inflation_leaderboard(
+        ViewerExtractor(viewer),
+        State(state),
+        axum::extract::Query(epigraph_api::routes::political::InflationIndexParams { topic: None }),
+    )
+    .await
+    .expect("inflation_leaderboard")
+    .0;
+
+    let row = rows
+        .iter()
+        .find(|r| r["agent_id"].as_str() == Some(p.viewer_agent.to_string().as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "the author must be on the board with its two readable claims; it is \
+                 missing when the read runs on the unstamped raw pool. Got {rows:?}"
+            )
+        });
+    assert_eq!(
+        row["claim_count"].as_i64(),
+        Some(2),
+        "the claim owned by another group must not be counted: {row}"
+    );
+    let mean = row["mean_inflation_index"].as_f64().expect("mean");
+    assert!(
+        (mean - 3.0).abs() < 1e-9,
+        "the mean must be over the two readable claims (3.0), not all three (6.0): {row}"
+    );
+}
