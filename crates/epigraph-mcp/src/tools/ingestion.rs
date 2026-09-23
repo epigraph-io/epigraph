@@ -210,6 +210,18 @@ pub async fn ingest_document(
         Arc::clone(&server.embedder),
         server.read_only,
     );
+    // The detached task inherits the parent's `ScopedPool` when there is one.
+    // `new_shared` sets `scoped: None`, and a background server that cannot
+    // stamp a connection is the shape that produced the one confirmed orphan on
+    // this path: the ingest's DB writes run where no caller can see the error,
+    // so a refused write reaches nobody. Propagating does not by itself convert
+    // `do_ingest_document`'s statements — they still run on `server.pool` and
+    // remain the registered `epigraph-mcp` limit — but it is what makes that
+    // conversion a change to this file alone rather than to the wiring too.
+    let bg = match server.scoped.as_ref() {
+        Some(scoped) => bg.with_scoped_pool(scoped.clone()),
+        None => bg,
+    };
     let doi_log = doi.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
@@ -249,6 +261,18 @@ pub async fn ingest_document_inline(
         Arc::clone(&server.embedder),
         server.read_only,
     );
+    // The detached task inherits the parent's `ScopedPool` when there is one.
+    // `new_shared` sets `scoped: None`, and a background server that cannot
+    // stamp a connection is the shape that produced the one confirmed orphan on
+    // this path: the ingest's DB writes run where no caller can see the error,
+    // so a refused write reaches nobody. Propagating does not by itself convert
+    // `do_ingest_document`'s statements — they still run on `server.pool` and
+    // remain the registered `epigraph-mcp` limit — but it is what makes that
+    // conversion a change to this file alone rather than to the wiring too.
+    let bg = match server.scoped.as_ref() {
+        Some(scoped) => bg.with_scoped_pool(scoped.clone()),
+        None => bg,
+    };
     let doi_log = doi.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {

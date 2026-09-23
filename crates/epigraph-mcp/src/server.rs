@@ -31,9 +31,15 @@ pub struct EpiGraphMcpFull {
     /// `PgPool` a caller already has. The four legacy constructors set `None`;
     /// [`Self::with_scoped_pool`] is the one that populates it.
     ///
-    /// A `None` here means `crate::maintenance::maintenance_viewer` fails
-    /// closed — the three maintenance tools refuse rather than silently reading
-    /// a scoped subset or a full corpus they were not licensed for.
+    /// `None` here means the WRITE path fails closed:
+    /// `crate::claim_helper::begin_author_stamped_tx` refuses rather than
+    /// running `submit_claim` / `memorize` on an unstamped connection, where the
+    /// claim commits and its trace is then refused with `42501`.
+    ///
+    /// `Some` here does NOT license the three maintenance tools. They are gated
+    /// separately, on whether their own query plumbing has been converted — see
+    /// `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection`
+    /// for why that gate deliberately does not key on this field.
     pub(crate) scoped: Option<epigraph_db::ScopedPool>,
     pub(crate) signer: Arc<AgentSigner>,
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
@@ -544,10 +550,19 @@ impl EpiGraphMcpFull {
 
     /// Attach a [`epigraph_db::ScopedPool`] to an already-built server.
     ///
-    /// The only way `self.scoped` becomes `Some`, and therefore the only way
-    /// `crate::maintenance::maintenance_viewer` can succeed. Consumed and
-    /// returned so it composes with the four existing constructors rather than
-    /// forcing a fifth:
+    /// The only way `self.scoped` becomes `Some`, and therefore the only way the
+    /// write path can stamp a connection with the author's tenancy context
+    /// (`crate::claim_helper::begin_author_stamped_tx`). Consumed and returned so
+    /// it composes with the four existing constructors rather than forcing a
+    /// fifth:
+    ///
+    /// **This does NOT enable the three maintenance tools, and a reader
+    /// reasonably expects that it would.** `maintenance_viewer` checks a separate
+    /// gate first, because those tools still run their statements on
+    /// `self.pool`: a bypass viewer spent there returns zero rows with no error.
+    /// `main` calls this for the write path only, and
+    /// `maintenance.rs::tests::attaching_a_scoped_pool_does_not_enable_the_maintenance_tools`
+    /// is the pin.
     ///
     /// ```ignore
     /// let server = EpiGraphMcpFull::new(pool, signer, embedder, ro)
