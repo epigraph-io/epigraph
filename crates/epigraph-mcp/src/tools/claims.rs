@@ -1138,6 +1138,11 @@ pub(crate) async fn require_owner_or_admin(
         if principal == target_agent_id {
             return Ok(());
         }
+        // Between the principal check and the denial, deliberately: every
+        // ALLOW above is unchanged. One visible difference on the DENY path: a
+        // failed operator lookup (e.g. a database without migration 102) now
+        // returns an internal error instead of the ownership denial text — the
+        // gate does not decide on an answer it did not get.
         if let Some(caller) = auth.agent_id {
             if operator_arm_allows(server, caller, target_agent_id).await? {
                 return Ok(());
@@ -1160,10 +1165,6 @@ pub(crate) async fn require_owner_or_admin(
         return Ok(());
     }
 
-    if operator_arm_allows(server, caller_agent, target_agent_id).await? {
-        return Ok(());
-    }
-
     if !server.signer_identity_declared {
         // Undecidable, not denied — see the doc comment. Warned rather than
         // silent: this is the one arm that mutates another agent's claim with
@@ -1177,6 +1178,17 @@ pub(crate) async fn require_owner_or_admin(
              owner-equality fallback is undecidable. Pass --agent-key to restore strict \
              ownership enforcement."
         );
+        return Ok(());
+    }
+
+    // The operator arm runs AFTER the undeclared-signer arm, so that arm is
+    // byte-for-byte the pre-102 behaviour — including when the operator lookup
+    // fails (e.g. a database without migration 102), where it still warns and
+    // allows instead of returning an internal error. The order changes no
+    // decision: an undeclared (random, per-process) signer can be neither
+    // operated (`operator::check_operator_transport` refuses it) nor anyone's
+    // operator.
+    if operator_arm_allows(server, caller_agent, target_agent_id).await? {
         return Ok(());
     }
 

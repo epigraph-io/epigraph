@@ -485,3 +485,45 @@ async fn a_revoked_link_grants_nothing(pool: PgPool) {
         .expect("revoking an agent must not take its claims away from the operator");
     assert!(!is_current(&pool, mine).await);
 }
+
+/// Review finding F12: on stdio the pre-102 undeclared-signer arm (warn and
+/// allow) must behave exactly as before 102, including when the operator lookup
+/// FAILS. The operator arm therefore runs after it.
+///
+/// The lookup is made to fail by dropping the author read (the state of a
+/// database without migration 102's read).
+///
+/// * CALIBRATION: a DECLARED stdio signer's cross-agent supersede now surfaces
+///   the lookup failure as an error (the gate does not decide ownership on an
+///   answer it did not get), so the failure is real.
+/// * The same supersede from an UNDECLARED signer is still allowed (its
+///   pre-102 warn-and-allow), rather than turned into an internal error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undeclared_stdio_signer_keeps_its_pre_102_arm_when_the_operator_lookup_fails(
+    pool: PgPool,
+) {
+    let author = agent(&pool, "author").await;
+    let (declared, _) = server_with_seed(&pool, 0x5F).await;
+    let (undeclared, _) = server_with_seed(&pool, 0x60).await;
+    let undeclared = undeclared.with_generated_signer_identity();
+    sqlx::query("DROP FUNCTION public.epigraph_operator_of_author(uuid)")
+        .execute(&pool)
+        .await
+        .expect("drop the author read, as on a database without it");
+
+    let c = own_claim(&pool, author).await;
+    let err = supersede(&declared, &pool, c, None)
+        .await
+        .expect_err("CALIBRATION: a declared signer's operator lookup must fail here");
+    assert!(
+        err.contains("epigraph_operator_of_author"),
+        "CALIBRATION: the refusal must be the failed lookup: {err}"
+    );
+    assert!(is_current(&pool, c).await);
+
+    supersede(&undeclared, &pool, c, None).await.expect(
+        "an undeclared stdio signer's cross-agent supersede must keep its pre-102 \
+         warn-and-allow even when the operator lookup would fail",
+    );
+    assert!(!is_current(&pool, c).await);
+}
