@@ -1184,6 +1184,58 @@ pub async fn deprecate_workflow(
     // DEPRECATED hierarchy — some variants flipped, some still current, and
     // `find_workflow_hierarchical` returning the ones that were missed.
     //
+    // THE STAMP IS LOAD-BEARING, AND THAT IS MEASURED RATHER THAN ARGUED.
+    //
+    // A review finding held that this conversion is INERT for its own target
+    // population, because every workflow claim is authored by the
+    // `workflow-ingest-system` agent while this tool stamps from
+    // `server.agent_id()`. The authorship half is correct —
+    // `epigraph_ingest_executor::execute_workflow_ingest_plan` resolves
+    // `get_or_create_system_agent` and passes that id to
+    // `create_with_id_if_absent` — but the population half does not survive
+    // measurement. Taken as `epigraph_app` (`rolbypassrls = false`) with the real
+    // binary over a unix socket, via `scripts/e2e/probe-workflow.sh`, on a
+    // cleanly-migrated schema, differing only in the binary:
+    //
+    //   flat workflow claim owned by the server agent's OWN group
+    //     stamped   -> succeeds, `is_current = false`
+    //     unstamped -> `new row violates row-level security policy for table
+    //                   "claims"`, `is_current = true`
+    //   the same claim owned by a FOREIGN group
+    //     stamped   -> refused;  unstamped -> refused
+    //
+    // Revert the stamp and the write fails; restore it and the write lands. On
+    // CONFIG B both binaries succeed, so production sees no change.
+    //
+    // WHY THE FOREIGN CASE IS NOT THE ANSWER HERE. The reviewer reached it with
+    // raw SQL. Through the tool it is not reachable: `store_workflow` returns a
+    // `workflows` ROW id, and `find_workflow` and `find_workflow_hierarchical`
+    // both return that same id (MEASURED: the id they returned was present in
+    // `workflows` and absent from `claims`). No discovery tool in this surface
+    // hands `deprecate_workflow` a system-agent-owned CLAIM id.
+    //
+    // THE RESIDUAL THAT IS REAL, stated so the green above is not over-read: for a
+    // HIERARCHICAL workflow this tool deprecates nothing in `claims` at all. It is
+    // handed the `workflows` row id, `deprecate_claim` matches zero rows, and the
+    // thesis and step claims stay `is_current = true` while the response reports
+    // that id as deprecated. MEASURED: `deprecated_ids: ["3d99ce3a-…"]` with
+    // `SELECT … FROM claims WHERE id = '3d99ce3a-…'` returning no row and all four
+    // seeded workflow claims still current. Fixing that means deprecating claims
+    // the system agent owns, which is the author-stamping question (#493) rather
+    // than a rename — it is recorded here, not silently widened.
+    //
+    // TWO AUTHORITIES IN ONE LOOP, deliberately. The transaction's session GUCs
+    // carry the SERVER AGENT's groups (the write authority), while the traversal
+    // below splices the CALLER's `viewer` (the read authority). That divergence is
+    // intentional and neither half may take the other's: stamping the caller would
+    // refuse the write this tool exists to perform, and reading with the server
+    // agent's viewer would let a caller cascade into workflow claims it cannot
+    // see. The widened USING side does mean the cascade can ENUMERATE rows the
+    // caller's viewer would not reach on the unstamped pool; the `viewer.splice`
+    // label oracle below is what keeps that from turning into a write, and it is
+    // filtered rather than exempted for exactly this reason. On stdio the caller
+    // and the server agent coincide, so this only differs on authenticated HTTP.
+    //
     // The traversal reads run on the same stamped connection as the writes, which
     // is the correct direction: an unstamped read returns FEWER rows, so a
     // cascade planned on one connection and executed on another could silently
