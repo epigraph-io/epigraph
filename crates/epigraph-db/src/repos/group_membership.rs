@@ -245,7 +245,8 @@ impl GroupMembershipRepository {
         // `GroupKeyEpochRepository::rotate_conn`'s roster lock — same table,
         // same qual, same order — so the two functions request the same rows in
         // the same sequence. Keep them identical: this is the whole of the
-        // ordering argument in the doc comment. See that comment for the READ
+        // ordering argument in the doc comment. `CommunityRepository::remove_member`
+        // takes the same statement too, and is the third copy to keep in step. See that comment for the READ
         // COMMITTED re-evaluation that makes the loser refuse, and for why zero
         // locked rows is benign.
         //

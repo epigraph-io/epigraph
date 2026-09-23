@@ -161,38 +161,42 @@ pub enum MembershipOutcome {
 /// Repository for Community operations
 pub struct CommunityRepository;
 
-/// Is `acting_agent` allowed to change this community's membership?
+/// The closed-membership rule as one statement: is `$2` (the acting agent)
+/// allowed to change the membership of community `$1`?
 ///
-/// See the module docs for the rule and why it is this rule. Returns `true`
-/// when the projected group has no live members at all (bootstrap), otherwise
-/// requires the acting agent to hold a live membership in it.
+/// See the module docs for the rule and why it is this rule. True when the
+/// projected group has no live members at all (bootstrap), otherwise only if
+/// the acting agent holds a live membership in it. A `None` agent binds SQL
+/// NULL, `agent_id = NULL` is never true, and the second disjunct is false —
+/// the same refusal the two-query form gave a caller with no principal.
+///
+/// A `const` rather than a connection-taking helper, deliberately. It is run in
+/// two places: [`may_manage_membership`] runs it on the pool for `add_member`,
+/// and `remove_member` runs it on its own transaction AFTER taking the roster
+/// lock, so the answer and the writes it authorises see the same roster. A
+/// helper generic over `PgExecutor` would have been a viewer-less
+/// connection-taking repo function. `visibility_lint.rs` forbids those, and the
+/// rule has no viewer to spend, because it must read the whole roster.
+/// Sharing the text means the rule is still written once.
+const MAY_MANAGE_MEMBERSHIP_SQL: &str = "
+    SELECT NOT EXISTS (SELECT 1 FROM group_memberships m
+                        WHERE m.group_id = $1 AND m.revoked_at IS NULL)
+        OR EXISTS (SELECT 1 FROM group_memberships m
+                    WHERE m.group_id = $1 AND m.agent_id = $2
+                      AND m.revoked_at IS NULL)";
+
+/// Is `acting_agent` allowed to change this community's membership?
+/// [`MAY_MANAGE_MEMBERSHIP_SQL`] on the pool; see there.
 async fn may_manage_membership(
     pool: &PgPool,
     acting_agent: Option<Uuid>,
     community_id: Uuid,
 ) -> Result<bool, DbError> {
-    let has_members: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM group_memberships m
-                         WHERE m.group_id = $1 AND m.revoked_at IS NULL)",
-    )
-    .bind(community_id)
-    .fetch_one(pool)
-    .await?;
-    if !has_members {
-        return Ok(true);
-    }
-    let Some(agent) = acting_agent else {
-        return Ok(false);
-    };
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM group_memberships m
-                         WHERE m.group_id = $1 AND m.agent_id = $2
-                           AND m.revoked_at IS NULL)",
-    )
-    .bind(community_id)
-    .bind(agent)
-    .fetch_one(pool)
-    .await?)
+    Ok(sqlx::query_scalar(MAY_MANAGE_MEMBERSHIP_SQL)
+        .bind(community_id)
+        .bind(acting_agent)
+        .fetch_one(pool)
+        .await?)
 }
 
 impl CommunityRepository {
@@ -456,12 +460,33 @@ impl CommunityRepository {
     /// row, so revoking unconditionally would cut access the remaining
     /// perspective still justifies.
     ///
+    /// # Only a `reader` row is retracted
+    ///
+    /// This path grants exactly one thing — a `role = 'reader'` row, via
+    /// [`Self::add_member`] — so it retracts exactly that. An `admin` or
+    /// `writer` row for the same `(group, agent)` was granted elsewhere:
+    /// [`Self::create`]'s creator row, or `POST /api/v1/groups/:id/members`.
+    /// `add_member`'s `ON CONFLICT` reuses such a row rather than demoting it,
+    /// so without this filter removing a perspective revoked standing the
+    /// community path never gave — including the creator's only admin row,
+    /// which left the group with no administrator. Admin and writer standing is
+    /// removed only through
+    /// `GroupMembershipRepository::revoke_member_unless_last_admin`, which
+    /// carries the last-admin guard. The `community_members` row is still
+    /// deleted either way: the perspective leaves the community, and a
+    /// separately granted role stays live, deliberately.
+    ///
     /// # Authorization
     ///
     /// Closed membership (module docs), with one addition: an agent may always
     /// remove **its own** perspective. Without that carve-out an agent whose
     /// only membership is the one being removed could still be evicted by a
     /// peer but could not leave voluntarily, which is the wrong asymmetry.
+    ///
+    /// Decided INSIDE the transaction, after the roster lock below, on the same
+    /// connection as the writes. Decided on the pool before `begin`, as it used
+    /// to be, a member whose own revocation was in flight could pass the check
+    /// on the pre-revocation roster and then evict someone.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails.
@@ -472,6 +497,34 @@ impl CommunityRepository {
         community_id: Uuid,
         perspective_id: Uuid,
     ) -> Result<MembershipOutcome, DbError> {
+        let mut tx = pool.begin().await?;
+
+        // THE ROSTER LOCK, taken before anything is read. Same statement as
+        // `GroupMembershipRepository::revoke_member_unless_last_admin` and
+        // `GroupKeyEpochRepository::rotate_conn` — same table, same predicate,
+        // same `ORDER BY` — so all three request one group's live rows in one
+        // order and queue rather than deadlock; that function's doc comment
+        // carries the ordering argument, and it holds here because the revoke
+        // `UPDATE` below writes a row this statement already locked. What it
+        // buys HERE is the authorization check: a concurrent revocation of the
+        // acting agent holds that agent's row, this statement waits for it, and
+        // the check below then reads the committed outcome. Zero locked rows is
+        // benign — nothing live means nothing to revoke. The rows are not used;
+        // the lock is the point.
+        let _locked_roster: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT agent_id
+            FROM group_memberships
+            WHERE group_id = $1
+              AND revoked_at IS NULL
+            ORDER BY agent_id
+            FOR UPDATE
+            "#,
+        )
+        .bind(community_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
         let owns_the_perspective = match acting_agent {
             Some(agent) => {
                 sqlx::query_scalar::<_, bool>(
@@ -480,17 +533,20 @@ impl CommunityRepository {
                 )
                 .bind(perspective_id)
                 .bind(agent)
-                .fetch_one(pool)
+                .fetch_one(&mut *tx)
                 .await?
             }
             None => false,
         };
-        if !owns_the_perspective && !may_manage_membership(pool, acting_agent, community_id).await?
-        {
+        let may_manage: bool = sqlx::query_scalar(MAY_MANAGE_MEMBERSHIP_SQL)
+            .bind(community_id)
+            .bind(acting_agent)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !owns_the_perspective && !may_manage {
+            // Dropping `tx` rolls it back and releases the roster lock.
             return Ok(MembershipOutcome::DeniedNotAMember);
         }
-
-        let mut tx = pool.begin().await?;
 
         let result = sqlx::query(
             r#"
@@ -513,6 +569,7 @@ impl CommunityRepository {
                AND gm.group_id = $1
                AND gm.agent_id = p.owner_agent_id
                AND gm.revoked_at IS NULL
+               AND gm.role = 'reader'
                AND NOT EXISTS (
                    SELECT 1 FROM community_members cm
                      JOIN perspectives p2 ON p2.id = cm.perspective_id

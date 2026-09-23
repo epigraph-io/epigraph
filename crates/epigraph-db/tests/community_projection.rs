@@ -574,3 +574,227 @@ async fn an_agent_may_always_remove_its_own_perspective(pool: PgPool) {
     assert_eq!(outcome, MembershipOutcome::Applied);
     assert_eq!(live_membership(&pool, row.id, leaver).await, 0);
 }
+
+// =============================================================================
+// F-PR20-B — the removal path retracts only what it granted, and decides under
+// the roster lock.
+// =============================================================================
+
+async fn live_role(pool: &PgPool, group: Uuid, agent: Uuid) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT role FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_optional(pool)
+    .await
+    .expect("read live role")
+}
+
+async fn live_admins(pool: &PgPool, group: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships \
+          WHERE group_id = $1 AND role = 'admin' AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("count live admins")
+}
+
+async fn in_community(pool: &PgPool, community: Uuid, perspective: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM community_members \
+                         WHERE community_id = $1 AND perspective_id = $2)",
+    )
+    .bind(community)
+    .bind(perspective)
+    .fetch_one(pool)
+    .await
+    .expect("read community_members")
+}
+
+/// Removing the creator's perspective must not revoke the creator's admin row.
+///
+/// `create` gives the creator a `role = 'admin'` row, and `add_member`'s
+/// `ON CONFLICT` reuses that row when the creator later adds a perspective. The
+/// removal path grants only `reader` rows, so it may retract only `reader`
+/// rows; the admin row is removable only through the group route's last-admin
+/// guard. The perspective itself still leaves the community.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_cannot_revoke_the_creators_admin_membership_via_remove_member(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "reader").await;
+    let row = CommunityRepository::create(&pool, "guarded", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let creators = seed_perspective(&pool, Some(creator), "creators").await;
+    let readers = seed_perspective(&pool, Some(reader), "readers").await;
+    for p in [creators, readers] {
+        assert_eq!(
+            CommunityRepository::add_member(&pool, Some(creator), row.id, p)
+                .await
+                .expect("add member"),
+            MembershipOutcome::Applied
+        );
+    }
+    assert_eq!(
+        live_role(&pool, row.id, creator).await.as_deref(),
+        Some("admin"),
+        "CALIBRATION: adding the creator's perspective reuses its admin row"
+    );
+
+    let outcome = CommunityRepository::remove_member(&pool, Some(reader), row.id, creators)
+        .await
+        .expect("remove member");
+
+    assert_eq!(outcome, MembershipOutcome::Applied);
+    assert!(
+        !in_community(&pool, row.id, creators).await,
+        "the perspective still leaves the community"
+    );
+    assert_eq!(
+        live_role(&pool, row.id, creator).await.as_deref(),
+        Some("admin"),
+        "the creator's admin row was not granted by this path and must not be revoked by it"
+    );
+    assert_eq!(
+        live_admins(&pool, row.id).await,
+        1,
+        "the group must keep its administrator"
+    );
+}
+
+/// The creator removing its own perspective keeps its admin grant, and a
+/// removal that revoked nothing records no re-key obligation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn creator_removing_own_perspective_keeps_admin_grant(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let row = CommunityRepository::create(&pool, "self-edit", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let mine = seed_perspective(&pool, Some(creator), "mine").await;
+    CommunityRepository::add_member(&pool, Some(creator), row.id, mine)
+        .await
+        .expect("add member");
+
+    let outcome = CommunityRepository::remove_member(&pool, Some(creator), row.id, mine)
+        .await
+        .expect("remove member");
+
+    assert_eq!(outcome, MembershipOutcome::Applied);
+    assert!(!in_community(&pool, row.id, mine).await);
+    assert_eq!(
+        live_role(&pool, row.id, creator).await.as_deref(),
+        Some("admin"),
+        "the admin grant came from `create`, not from the perspective"
+    );
+    let mark: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT reseal_required_at FROM groups WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read mark");
+    assert!(
+        mark.is_none(),
+        "no membership was revoked, so no re-key is owed"
+    );
+}
+
+/// Wait until a backend in this test database is blocked on a lock, or until
+/// `task` returns. `true` means the wait was observed. Measured rather than
+/// timed, for the reason `epigraph-api/tests/group_lifecycle.rs` gives on its
+/// copy: every session in a `#[sqlx::test]` database is this test's own.
+async fn a_backend_is_blocked_on_a_lock<T>(
+    pool: &PgPool,
+    task: &tokio::task::JoinHandle<T>,
+) -> bool {
+    for _ in 0..200 {
+        if task.is_finished() {
+            return false;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// The authorization is decided under the roster lock, so a member whose own
+/// revocation commits first cannot then evict anyone.
+///
+/// A separate transaction revokes the acting member and holds the row. The
+/// removal must wait for that row and then read the committed roster, where
+/// the actor is no longer a member. When the check ran on the pool before the
+/// transaction began, it read the pre-revocation roster, returned `Applied`
+/// while the revocation was still open, and evicted the other member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_member_revoked_concurrently_cannot_complete_an_eviction(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (actor, _) = fixture::seed_agent_with_group(&pool, "actor").await;
+    let (target, _) = fixture::seed_agent_with_group(&pool, "target").await;
+    let row = CommunityRepository::create(&pool, "contended", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let actors = seed_perspective(&pool, Some(actor), "actors").await;
+    let targets = seed_perspective(&pool, Some(target), "targets").await;
+    for p in [actors, targets] {
+        CommunityRepository::add_member(&pool, Some(creator), row.id, p)
+            .await
+            .expect("add member");
+    }
+
+    let url = fixture::database_url_for(&pool).await;
+    let mut own = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+        .await
+        .expect("open a connection outside the test pool");
+    let mut revocation = sqlx::Connection::begin(&mut own)
+        .await
+        .expect("revocation tx");
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(row.id)
+    .bind(actor)
+    .execute(&mut *revocation)
+    .await
+    .expect("revoke the actor, uncommitted");
+
+    let removal = tokio::spawn({
+        let pool = pool.clone();
+        async move { CommunityRepository::remove_member(&pool, Some(actor), row.id, targets).await }
+    });
+
+    if !a_backend_is_blocked_on_a_lock(&pool, &removal).await {
+        let early = removal.await.expect("removal task panicked");
+        panic!(
+            "the removal decided without waiting for the actor's membership row, \
+             which is the row its authorization reads; it returned {early:?}"
+        );
+    }
+
+    revocation.commit().await.expect("commit the revocation");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), removal)
+        .await
+        .expect("the removal never unblocked")
+        .expect("removal task panicked")
+        .expect("remove member");
+    assert_eq!(
+        outcome,
+        MembershipOutcome::DeniedNotAMember,
+        "the actor's revocation committed before the removal read the roster"
+    );
+    assert!(in_community(&pool, row.id, targets).await);
+    assert_eq!(live_membership(&pool, row.id, target).await, 1);
+}
