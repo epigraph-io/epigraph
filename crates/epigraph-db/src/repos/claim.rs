@@ -8207,7 +8207,6 @@ impl ClaimRepository {
     /// duplicates, non-current, already-superseded) and `DbError::NotFound`
     /// when a source id does not exist.
     #[instrument(skip(pool, merged_content), fields(n_sources = source_ids.len()))]
-    #[allow(clippy::too_many_lines)]
     pub async fn consolidate(
         pool: &PgPool,
         source_ids: &[Uuid],
@@ -8217,6 +8216,52 @@ impl ClaimRepository {
         reason: &str,
         acting_agent_id: Uuid,
     ) -> Result<ConsolidateResult, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::consolidate_conn(
+            &mut conn,
+            source_ids,
+            merged_content,
+            merged_truth,
+            mode,
+            reason,
+            acting_agent_id,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate`] on a connection the caller owns — the form a
+    /// tenancy-stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one
+    /// implementation. `begin()` below issues a real `BEGIN` on a bare pooled
+    /// connection — exactly what `pool.begin()` did — and a `SAVEPOINT` inside a
+    /// caller's transaction, so the merge is one unit in both shapes.
+    ///
+    /// # Why a stamped caller needs this
+    ///
+    /// On an unstamped pool checkout, migration 077's `claims_tenancy` `WITH
+    /// CHECK` has an empty writable set, so the merged-claim INSERT is refused
+    /// for every caller on a cleanly-migrated schema — `consolidate_claims` was
+    /// unavailable there. And the all-public branch's `personal_group_of` read
+    /// is BLIND on that connection (`groups_tenancy` has no true arm), so it
+    /// took the mint path on every merge: `epigraph_ensure_personal_group`'s
+    /// reviving `ON CONFLICT` inside an unrelated write — hard constraint #3's
+    /// hazard. Stamped from the acting agent, the read sees the group and mints
+    /// nothing.
+    ///
+    /// # Errors
+    /// As [`Self::consolidate`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn consolidate_conn(
+        conn: &mut sqlx::PgConnection,
+        source_ids: &[Uuid],
+        merged_content: &str,
+        merged_truth: f64,
+        mode: ConsolidateMode,
+        reason: &str,
+        acting_agent_id: Uuid,
+    ) -> Result<ConsolidateResult, DbError> {
+        use sqlx::Acquire;
         let protocol = |m: String| DbError::QueryFailed {
             source: sqlx::Error::Protocol(m),
         };
@@ -8236,7 +8281,7 @@ impl ClaimRepository {
             return Err(protocol("consolidate: merged_content is empty".into()));
         }
 
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         // Lock every source up front so a concurrent merge/supersede cannot
         // interleave between validation and retirement.

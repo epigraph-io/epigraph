@@ -303,7 +303,17 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
 /// `NOT_ACTUALLY_A_POOL_WRITE` gained two entries rather than the heuristic being
 /// narrowed: the false-positive set of this lint is WRITTEN DOWN, and that is the
 /// property that makes broadening it safe rather than noisy.
+///
+/// # `consolidate` is here because this scanner could not see that write at all
+///
+/// `ClaimRepository::consolidate(&server.pool, …)` inserts a claim, rewrites
+/// edges and retires N sources, and its name matched none of the tokens above —
+/// so `consolidate_claims` was refused on every cleanly-migrated schema without
+/// ever appearing in this register. Unit E converted it onto
+/// `begin_author_stamped_tx`; the token is what makes reverting that conversion
+/// a failure here rather than a silent return to the blind spot.
 const WRITE_TOKENS: &[&str] = &[
+    "consolidate",
     "acquire",
     "create",
     "insert",

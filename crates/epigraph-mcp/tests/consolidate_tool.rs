@@ -13,13 +13,18 @@ use epigraph_mcp::types::ConsolidateClaimsParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn build_server(pool: PgPool, read_only: bool) -> epigraph_mcp::EpiGraphMcpFull {
+/// A server built FROM A `ScopedPool`, because `consolidate_claims` now runs its
+/// merge in a transaction stamped from the acting agent and refuses (nothing
+/// written) on a server that cannot stamp one. Without the pool this fixture
+/// measures the refusal, not the merge.
+async fn build_server(pool: PgPool, read_only: bool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, read_only)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, read_only).with_scoped_pool(scoped)
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
@@ -71,7 +76,7 @@ async fn tool_merges_and_caps_confidence_at_best_source(pool: PgPool) {
     let s1 = seed_claim(&pool, agent, "tool src one", 0.6).await;
     let s2 = seed_claim(&pool, agent, "tool src two", 0.9).await;
 
-    let server = build_server(pool.clone(), false);
+    let server = build_server(pool.clone(), false).await;
     let out = consolidate_claims(&server, &viewer, params(&[s1, s2], "tool merged", None))
         .await
         .expect("consolidate ok");
@@ -123,7 +128,7 @@ async fn unknown_mode_is_rejected(pool: PgPool) {
     let s1 = seed_claim(&pool, agent, "mode a", 0.6).await;
     let s2 = seed_claim(&pool, agent, "mode b", 0.6).await;
 
-    let server = build_server(pool, false);
+    let server = build_server(pool, false).await;
     let mut p = params(&[s1, s2], "x", None);
     p.mode = "obliterate".to_string();
     let err = consolidate_claims(&server, &viewer, p)
