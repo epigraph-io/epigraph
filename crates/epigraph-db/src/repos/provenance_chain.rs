@@ -283,6 +283,24 @@ impl ProvenanceChainRepository {
             })
             .collect();
 
+        // Retain the edges against the HYDRATED node set, not against the walk.
+        //
+        // `kept_ids` above comes from the walk, which is filtered on `edges`;
+        // `nodes` comes from hydration, which is filtered on `claims`. Migration
+        // 070's trigger usually derives an edge's tenancy from its endpoints, so
+        // the two agree — but an edge stamped independently of its endpoints
+        // survives the first filter while the claim it names does not survive
+        // the second, and the edge then carries that claim's uuid out of here.
+        // `topo_sort` already skips such an edge for ORDERING (see its
+        // `by_id.contains_key` guard); the returned field kept it, so the id
+        // reached every caller, including MCP `get_provenance_chain`.
+        //
+        // A uuid plus a relationship name is a disclosure even with no content
+        // attached: it says a claim exists, that it is an ancestor of this one,
+        // and by what relation.
+        let node_ids: HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
+        edges.retain(|e| node_ids.contains(&e.source) && node_ids.contains(&e.target));
+
         let nodes = topo_sort(nodes, &edges);
 
         Ok(ProvenanceChain {
