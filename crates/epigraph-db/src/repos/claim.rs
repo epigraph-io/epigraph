@@ -4499,6 +4499,63 @@ impl ClaimRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// [`store_embedding`](Self::store_embedding), taking the vector itself.
+    ///
+    /// Formats with [`crate::format_pgvector`] and writes through the same
+    /// seal-guarded statement, so a caller never builds the pgvector literal
+    /// and never issues its own `UPDATE claims SET embedding`. For a caller
+    /// that holds no `Viewer` because the row is one it has just inserted
+    /// (write-on-create). A caller acting on a claim id someone ELSE supplied
+    /// must use [`store_embedding_vec_if_unsealed`](Self::store_embedding_vec_if_unsealed)
+    /// instead, which also refuses a row the viewer may not write.
+    ///
+    /// # Returns
+    ///
+    /// The same `bool` as [`store_embedding`](Self::store_embedding): `false`
+    /// for both "no such claim" and "the claim is sealed". A write-on-create
+    /// caller should treat `false` as "not embedded", never as success.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, embedding))]
+    pub async fn store_embedding_vec(
+        pool: &PgPool,
+        id: Uuid,
+        embedding: &[f32],
+    ) -> Result<bool, DbError> {
+        Self::store_embedding(pool, id, &crate::pgvector::format_pgvector(embedding)).await
+    }
+
+    /// [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed),
+    /// taking the vector itself.
+    ///
+    /// The write for a caller acting on a claim id it did not just create: a
+    /// route whose path names the claim, or a handler that embeds a claim it
+    /// loaded by id. The row lock, the seal check, the `is_current` check and
+    /// the `/* {WRITABLE:c} */` predicate are all the callee's; this function
+    /// only formats the literal. `false` covers "absent", "sealed",
+    /// "superseded" and "not writable by this viewer", indistinguishably, so
+    /// a route that maps `false` to one 404 is not an existence or seal
+    /// oracle.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, embedding))]
+    pub async fn store_embedding_vec_if_unsealed(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        embedding: &[f32],
+    ) -> Result<bool, DbError> {
+        Self::store_embedding_if_unsealed(
+            conn,
+            viewer,
+            id,
+            &crate::pgvector::format_pgvector(embedding),
+        )
+        .await
+    }
+
     /// Maximum number of claim IDs accepted by [`pairwise_cosine_distance`](Self::pairwise_cosine_distance).
     /// At N=1000 the O(N²) cross-join produces ~500 k pair comparisons in Postgres; beyond
     /// this threshold query time becomes unreasonable and the result set itself is huge.

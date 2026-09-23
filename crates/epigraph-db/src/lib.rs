@@ -51,6 +51,7 @@
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
 pub mod errors;
+pub mod pgvector;
 pub mod pool;
 pub mod repos;
 pub mod visibility;
@@ -64,6 +65,7 @@ pub mod visibility;
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
 pub use errors::DbError;
+pub use pgvector::format_pgvector;
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
     create_pool_with_options, maintenance_database_url, maintenance_verdict,

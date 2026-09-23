@@ -217,9 +217,18 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("claim_theme.rs::bulk_assign", "clustering, corpus-wide"),
     ("claim_theme.rs::delete_all", "clustering, corpus-wide"),
     ("claim_theme.rs::unassign_claim", "clustering, corpus-wide"),
+    // MEASURED CORRECTION, same shape as the `claim.rs::store_embedding` note
+    // above. This reason read "embedding backfill, corpus-wide", and no backfill
+    // ever called it: when deferred-commitment `embed-on-write-helper` measured
+    // it, it had NO production caller at all, while
+    // `PUT /api/v1/evidence/:id/embedding` and `submit_packet` each issued their
+    // own route-layer copy of its UPDATE with no seal predicate. It is now the
+    // write-on-create path for evidence its caller has just inserted, which IS
+    // request-reachable; the by-id route writes through the WRITABLE-spliced
+    // `evidence.rs::store_embedding_vec_if_unsealed` instead.
     (
         "evidence.rs::store_embedding",
-        "embedding backfill, corpus-wide",
+        "write-on-create for just-inserted evidence; statement refuses sealed rows",
     ),
     ("match_candidate.rs::retire", "dedup sweep, corpus-wide"),
     // ── privatization: selection must be unfiltered to be correct ───────────

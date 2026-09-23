@@ -1470,6 +1470,187 @@ async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(po
     );
 }
 
+/// The one evidence row [`seed_sealable_claim`] attaches to `claim`.
+async fn evidence_of(pool: &PgPool, claim: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("the fixture seeds exactly one evidence row per claim")
+}
+
+async fn evidence_vector_is_null(pool: &PgPool, evidence: Uuid) -> bool {
+    sqlx::query_scalar("SELECT embedding IS NULL FROM evidence WHERE id = $1")
+        .bind(evidence)
+        .fetch_one(pool)
+        .await
+        .expect("read an evidence row's vector column")
+}
+
+/// Both evidence embedding writes refuse a sealed claim's evidence, and both
+/// still write an unsealed claim's.
+///
+/// # Why this exists
+///
+/// CLAUDE.md's second audit query counts evidence vectors under a sealed claim
+/// and calls any non-zero result a page-the-on-call condition. Before
+/// deferred-commitment `embed-on-write-helper`, `EvidenceRepository::store_embedding`
+/// had no seal predicate at all, and `PUT /api/v1/evidence/:id/embedding`
+/// issued its own unguarded `UPDATE evidence SET embedding` from the route, so
+/// nothing on either path could keep that count at zero.
+///
+/// The by-id write runs under a BYPASS viewer so the seal is the only variable:
+/// the fixture's group is one the author administers, and a scoped viewer
+/// would make a refusal ambiguous between "sealed" and "not writable". The
+/// write predicate has its own witness in `write_gate_evidence_update.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_evidence_embedding_writes_refuse_a_sealed_claims_evidence(pool: PgPool) {
+    use epigraph_db::repos::EvidenceRepository;
+
+    let world = seed_world(&pool).await;
+    let plain = seed_sealable_claim(&pool, &world, "ordinary evidence, embeddable").await;
+    let sealed = seed_sealable_claim(&pool, &world, "confidential evidence, not embeddable").await;
+    let plain_ev = evidence_of(&pool, plain).await;
+    let sealed_ev = evidence_of(&pool, sealed).await;
+
+    let payload = seal_payload(&pool, sealed).await;
+    commit_seal(&pool, &world, &[payload]).await;
+
+    // Starting point: the seal left the sealed evidence row with no vector, and
+    // it left the evidence row itself in place, so a zero-row UPDATE below is a
+    // refusal rather than an absent row.
+    assert!(
+        evidence_vector_is_null(&pool, sealed_ev).await,
+        "the fixture's sealed evidence must start with no vector"
+    );
+
+    let vector = vec![0.125_f32; 1536];
+
+    // ── the write-on-create helper ──────────────────────────────────────────
+    let wrote = EvidenceRepository::store_embedding_vec(&pool, plain_ev.into(), &vector)
+        .await
+        .expect("store a vector on an unsealed claim's evidence");
+    assert!(
+        wrote,
+        "an unsealed claim's evidence must still be embeddable; a statement that \
+         refuses everything passes every negative assertion in this test"
+    );
+    assert!(!evidence_vector_is_null(&pool, plain_ev).await);
+
+    let refused = EvidenceRepository::store_embedding_vec(&pool, sealed_ev.into(), &vector)
+        .await
+        .expect("the refusal is a zero-row UPDATE, not an error");
+    assert!(
+        !refused,
+        "the shared evidence embedding write must report no row for a sealed \
+         claim's evidence"
+    );
+    assert!(
+        evidence_vector_is_null(&pool, sealed_ev).await,
+        "a sealed claim's evidence carrying a vector is CLAUDE.md's \
+         sealed_with_embedding violation on the evidence table"
+    );
+
+    // ── the by-id, viewer-gated write ───────────────────────────────────────
+    sqlx::query("UPDATE evidence SET embedding = NULL WHERE id = $1")
+        .bind(plain_ev)
+        .execute(&pool)
+        .await
+        .expect("reset the positive arm");
+
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let wrote = EvidenceRepository::store_embedding_vec_if_unsealed(
+        &mut conn,
+        &bypass,
+        plain_ev.into(),
+        &vector,
+    )
+    .await
+    .expect("store a vector on an unsealed claim's evidence by id");
+    assert!(wrote, "the by-id write must still embed unsealed evidence");
+    assert!(!evidence_vector_is_null(&pool, plain_ev).await);
+
+    let refused = EvidenceRepository::store_embedding_vec_if_unsealed(
+        &mut conn,
+        &bypass,
+        sealed_ev.into(),
+        &vector,
+    )
+    .await
+    .expect("the refusal is a zero-row UPDATE, not an error");
+    assert!(
+        !refused,
+        "the by-id evidence embedding write must report no row for a sealed \
+         claim's evidence, even under a viewer that may write every row"
+    );
+    assert!(evidence_vector_is_null(&pool, sealed_ev).await);
+}
+
+/// An evidence row whose OWN content is ciphertext is refused even when its
+/// claim is not sealed.
+///
+/// The second arm of the evidence seal predicate. The seal ceremony writes an
+/// `evidence_encryption` row only alongside the claim's, so the test above
+/// cannot tell the two arms apart; this one seeds `evidence_encryption` under a
+/// plaintext claim so that only the row-level arm can refuse. The positive
+/// control is a sibling evidence row on the same claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_evidence_row_with_its_own_ciphertext_is_not_embedded(pool: PgPool) {
+    use epigraph_db::repos::EvidenceRepository;
+
+    let world = seed_world(&pool).await;
+    let claim =
+        seed_sealable_claim(&pool, &world, "plaintext claim, one sealed evidence row").await;
+    let open_ev = evidence_of(&pool, claim).await;
+    let sealed_ev = viewer_fixture::seed_evidence(&pool, claim, "observation").await;
+
+    sqlx::query(
+        "INSERT INTO evidence_encryption \
+             (evidence_id, group_id, epoch, privacy_tier, encrypted_content) \
+         VALUES ($1, $2, $3, 'fully_private', $4)",
+    )
+    .bind(sealed_ev)
+    .bind(world.group)
+    .bind(EPOCH)
+    .bind(vec![0xabu8; 64])
+    .execute(&pool)
+    .await
+    .expect("seal one evidence row under a plaintext claim");
+
+    let vector = vec![0.25_f32; 1536];
+
+    assert!(
+        EvidenceRepository::store_embedding_vec(&pool, open_ev.into(), &vector)
+            .await
+            .expect("store on the open sibling"),
+        "the sibling with no ciphertext row must still be embeddable"
+    );
+    assert!(
+        !EvidenceRepository::store_embedding_vec(&pool, sealed_ev.into(), &vector)
+            .await
+            .expect("the refusal is a zero-row UPDATE, not an error"),
+        "an evidence row carrying its own ciphertext must not get a vector"
+    );
+
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    assert!(
+        !EvidenceRepository::store_embedding_vec_if_unsealed(
+            &mut conn,
+            &bypass,
+            sealed_ev.into(),
+            &vector,
+        )
+        .await
+        .expect("the refusal is a zero-row UPDATE, not an error"),
+        "the by-id write must refuse the same row"
+    );
+    assert!(evidence_vector_is_null(&pool, sealed_ev).await);
+    assert!(!evidence_vector_is_null(&pool, open_ev).await);
+}
+
 #[test]
 fn the_fixture_seeds_exactly_the_tables_the_seal_deletes() {
     assert_eq!(

@@ -463,3 +463,65 @@ async fn a_bypass_viewer_updates_without_binding_a_group(pool: PgPool) {
         Some("MAINTENANCE")
     );
 }
+
+// ---------------------------------------------------------------------------
+// the evidence EMBEDDING write, same gate
+// ---------------------------------------------------------------------------
+
+async fn embedding_is_null(pool: &PgPool, id: EvidenceId) -> bool {
+    sqlx::query_scalar("SELECT embedding IS NULL FROM evidence WHERE id = $1")
+        .bind(Uuid::from(id))
+        .fetch_one(pool)
+        .await
+        .expect("read back embedding")
+}
+
+/// `store_embedding_vec_if_unsealed` binds the WRITABLE set, not the read set.
+///
+/// `PUT /api/v1/evidence/:id/embedding` used to write `evidence.embedding`
+/// from the route with an id and nothing else, so any bearer could overwrite
+/// the vector on any evidence row (deferred-commitment key
+/// `embed-on-write-helper`). It now writes through this function. The pair
+/// below is the same discriminating pair as the `raw_content` tests above, on
+/// the same asymmetric fixture: one principal, `reader` in R and `writer` in
+/// W, so a `group_bind()` substitution for `writable_bind()` flips the
+/// negative arm and nothing else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_evidence_embedding_write_needs_write_authority_not_read(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let viewer = Viewer::resolve(&pool, f.principal).await.expect("resolve");
+    let vector = vec![0.5_f32; 1536];
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let refused =
+        EvidenceRepository::store_embedding_vec_if_unsealed(&mut conn, &viewer, f.ev_r, &vector)
+            .await
+            .expect("the statement must execute, not error");
+    assert!(
+        !refused,
+        "a principal holding only `reader` in the owning group wrote an \
+         evidence vector. The embedding write is binding the READ group set."
+    );
+    assert!(
+        embedding_is_null(&pool, f.ev_r).await,
+        "the read-only group's evidence must still carry no vector"
+    );
+
+    let wrote =
+        EvidenceRepository::store_embedding_vec_if_unsealed(&mut conn, &viewer, f.ev_w, &vector)
+            .await
+            .expect("store");
+    assert!(
+        wrote,
+        "a principal holding `writer` in the owning group could not embed its \
+         own evidence — the predicate is over-suppressing"
+    );
+    assert!(
+        !embedding_is_null(&pool, f.ev_w).await,
+        "the returned `true` must correspond to a real vector on THIS row"
+    );
+    assert!(
+        embedding_is_null(&pool, f.ev_r).await,
+        "the permitted write must not have touched the other group's row"
+    );
+}

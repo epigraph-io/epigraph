@@ -573,10 +573,35 @@ impl EvidenceRepository {
         }
     }
 
-    /// Store an embedding vector for an evidence item
+    /// Store an embedding vector on an evidence row that is not sealed.
     ///
-    /// Accepts a pgvector-formatted string (e.g., "[0.1,0.2,...]") and stores
-    /// it in the evidence embedding column.
+    /// Accepts a pgvector-formatted string (e.g., "[0.1,0.2,...]"); prefer
+    /// [`store_embedding_vec`](Self::store_embedding_vec), which formats it.
+    ///
+    /// # The seal predicate, and why it has two arms
+    ///
+    /// The evidence twin of `ClaimRepository::store_embedding`, which refuses a
+    /// sealed claim in the statement itself. Until the deferred-commitment
+    /// `embed-on-write-helper` change this statement had NO seal predicate, so
+    /// the evidence half of CLAUDE.md's `sealed_with_embedding` audit — "a
+    /// sealed claim's evidence keeps a plaintext-derived vector", which must be
+    /// 0 — was enforced by nothing on this path.
+    ///
+    /// * `claim_encryption` on the PARENT claim is the audit's own key: the
+    ///   audit counts any evidence vector under a sealed claim as a violation,
+    ///   so the write refuses exactly that set.
+    /// * `evidence_encryption` on the row ITSELF refuses an evidence row whose
+    ///   own content is ciphertext. The caller supplies the vector, so a caller
+    ///   holding the plaintext could otherwise attach a derivative of it to a
+    ///   row whose point is that none survives.
+    ///
+    /// Refusing on either is the conservative union: at worst an embeddable
+    /// row is left for backfill, never a sealed one embedded.
+    ///
+    /// # Returns
+    ///
+    /// `true` when a row was updated; `false` for "no such evidence" and "the
+    /// evidence or its claim is sealed", deliberately not distinguished.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -588,12 +613,119 @@ impl EvidenceRepository {
     ) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
 
-        let result = sqlx::query("UPDATE evidence SET embedding = $1::vector WHERE id = $2")
-            .bind(embedding_pgvector)
-            .bind(uuid)
-            .execute(pool)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE evidence SET embedding = $1::vector \
+              WHERE id = $2 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = evidence.claim_id \
+                ) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = evidence.id \
+                )",
+        )
+        .bind(embedding_pgvector)
+        .bind(uuid)
+        .execute(pool)
+        .await?;
 
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// [`store_embedding`](Self::store_embedding), taking the vector itself.
+    ///
+    /// For a caller that holds no `Viewer` because the evidence row is one it
+    /// has just inserted (write-on-create). A caller acting on an evidence id
+    /// someone else supplied must use
+    /// [`store_embedding_vec_if_unsealed`](Self::store_embedding_vec_if_unsealed).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool, embedding))]
+    pub async fn store_embedding_vec(
+        pool: &PgPool,
+        id: EvidenceId,
+        embedding: &[f32],
+    ) -> Result<bool, DbError> {
+        Self::store_embedding(pool, id, &crate::pgvector::format_pgvector(embedding)).await
+    }
+
+    /// Store an embedding vector on an evidence row **only while neither it nor
+    /// its claim is sealed**, and only on a row the viewer may write.
+    ///
+    /// The evidence counterpart of
+    /// `ClaimRepository::store_embedding_if_unsealed`, for a route whose path
+    /// names the evidence row (`PUT /api/v1/evidence/:id/embedding`). Same
+    /// three refusals as [`store_embedding`](Self::store_embedding)'s seal
+    /// arms plus the `/* {WRITABLE:e} */` write predicate.
+    ///
+    /// # Why the PARENT CLAIM's row is locked first
+    ///
+    /// Same argument as the claim-side function, one table over. Under
+    /// `READ COMMITTED` a blocked `UPDATE` re-checks its own row but reads
+    /// every OTHER table — `claim_encryption` here — from its original
+    /// snapshot, so a seal committing while this write waited would go unseen.
+    /// A separate `SELECT … FOR UPDATE` on the parent claim first makes the
+    /// `UPDATE` take its snapshot after the lock is granted. The seal
+    /// transaction's FIRST statement inserts `claim_encryption`, whose foreign
+    /// key takes a `KEY SHARE` lock on that same claim row, so a seal cannot
+    /// start while this lock is held, and one already in flight holds its
+    /// `KEY SHARE` until it commits — this lock then waits for it. Both
+    /// transactions take the claim row before the evidence row, so the pair
+    /// cannot deadlock on lock order.
+    ///
+    /// # Returns
+    ///
+    /// `false` for "absent", "sealed", "claim sealed" and "not writable by this
+    /// viewer", indistinguishably — a route mapping it to one 404 is neither an
+    /// existence oracle nor a seal oracle.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, embedding))]
+    pub async fn store_embedding_vec_if_unsealed(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+        embedding: &[f32],
+    ) -> Result<bool, DbError> {
+        let uuid: Uuid = id.into();
+        let embedding_pgvector = crate::pgvector::format_pgvector(embedding);
+
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+
+        // The lock, as its own statement. `evidence.claim_id` is NOT NULL, so
+        // the subquery names exactly one claim when the evidence exists and
+        // none when it does not.
+        sqlx::query(
+            "SELECT 1 FROM claims c \
+              WHERE c.id = (SELECT e.claim_id FROM evidence e WHERE e.id = $1) \
+              FOR UPDATE OF c",
+        )
+        .bind(uuid)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let sql = viewer.splice_write(
+            "UPDATE evidence AS e SET embedding = $2::vector \
+              WHERE e.id = $1 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = e.claim_id \
+                ) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id \
+                ) \
+                /* {WRITABLE:e} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(uuid).bind(&embedding_pgvector);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$3` to fill and binding unconditionally would
+        // over-supply the maintenance path by one parameter.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let result = q.execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
