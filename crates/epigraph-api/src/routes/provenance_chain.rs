@@ -1,5 +1,5 @@
 //! `GET /api/v1/claims/:id/provenance-chain` — the HTTP surface of
-//! [`epigraph_db::ProvenanceChainRepository::chain`], the claim→claim
+//! [`epigraph_db::ProvenanceChainRepository::chain_conn`], the claim→claim
 //! derivation walk that MCP `get_provenance_chain` exposes.
 //!
 //! It is NOT a view of `GET /api/v1/claims/:id/provenance`
@@ -7,14 +7,22 @@
 //! → evidence, this one walks claim → ancestor claim. Both are rendered, as
 //! separate sections.
 //!
-//! Two things differ from the MCP tool deliberately:
+//! One thing differs from the MCP tool deliberately: **404 on a missing root.**
+//! The repo's recursive CTE always seeds `root`, so a claim that does not exist
+//! comes back as an empty success. Over HTTP that is indistinguishable from
+//! "this claim derives from nothing", so the handler turns "root not among the
+//! hydrated nodes" into `NotFound` — and, because hydration is viewer-filtered,
+//! a claim the viewer may not read takes exactly the same branch and produces
+//! exactly the same body.
 //!
-//! - **404 on a missing root.** The repo's recursive CTE always seeds `root`,
-//!   so a nonexistent claim comes back as an empty success. Over HTTP that is
-//!   indistinguishable from "this claim derives from nothing", so the handler
-//!   turns "root not among the hydrated nodes" into `NotFound`.
-//! - **Per-node redaction.** MCP does not redact this walk (a known leak,
-//!   filed as a backlog item); every HTTP read of claim content does.
+//! This handler applies no access pass of its own. Both halves of the walk are
+//! filtered in the repo: an edge the viewer cannot see does not extend the
+//! frontier, and a claim the viewer cannot read is absent from `nodes` — and,
+//! since the repo retains edges against the hydrated node set, absent from
+//! `edges` too. An ancestor that is not there is not there; there is no
+//! placeholder node and no blanked field.
+//!
+//! All SQL lives in `epigraph_db::ProvenanceChainRepository`.
 //!
 //! The module is `#[cfg(feature = "db")]` as a whole and is registered only in
 //! the db router, so no `cfg(not(db))` stub is needed.
@@ -26,8 +34,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::access_control::{batch_content_access, ContentAccess};
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 use crate::state::AppState;
 
 /// Default traversal depth when `max_depth` is absent, matching MCP
@@ -54,14 +62,15 @@ pub struct ProvenanceChainQuery {
 #[derive(Debug, Serialize)]
 pub struct ChainNode {
     pub id: Uuid,
-    /// `"[REDACTED]"` when the requester may not read this claim.
+    /// The claim's text. Always the real text: a claim the viewer may not read
+    /// is absent from `nodes` entirely rather than present with this field
+    /// blanked.
     pub content: String,
     pub truth_value: f64,
     pub labels: Vec<String>,
     pub is_current: bool,
     /// Fewest hops from the root at which this claim was reached.
     pub depth: i32,
-    pub redacted: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,35 +113,44 @@ fn parse_relationships(raw: Option<&str>) -> Option<Vec<String>> {
 
 /// `GET /api/v1/claims/:id/provenance-chain`
 pub async fn claim_provenance_chain(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<ProvenanceChainQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<ProvenanceChainResponse>, ApiError> {
-    let pool = &state.db_pool;
-
-    // SECURITY: the requester comes from the validated bearer only; this route
-    // takes no `agent_id` query parameter precisely because it would be spoofable.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-
     let max_depth = params
         .max_depth
         .unwrap_or(DEFAULT_MAX_DEPTH)
         .clamp(MIN_MAX_DEPTH, MAX_MAX_DEPTH) as u8;
     let relationships = parse_relationships(params.relationships.as_deref());
 
-    let chain = epigraph_db::ProvenanceChainRepository::chain(
-        pool,
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_provenance_chain",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let chain = epigraph_db::ProvenanceChainRepository::chain_conn(
+        &mut read,
+        &viewer,
         claim_id,
         max_depth,
         relationships.as_deref(),
     )
     .await?;
 
+    crate::routes::finish_scoped_read(read, "claim_provenance_chain").await?;
+
     // The root is always reached at depth 0 and is never dropped by the node
-    // cap, so its absence from `nodes` means hydration found no such claim.
+    // cap, so its absence from `nodes` means hydration found no such claim —
+    // because there is none, or because this viewer may not read it. The two
+    // are the same answer on purpose.
     if !chain.nodes.iter().any(|n| n.id == claim_id) {
         return Err(ApiError::NotFound {
             entity: "Claim".to_string(),
@@ -140,38 +158,24 @@ pub async fn claim_provenance_chain(
         });
     }
 
-    let node_ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
-    let access = batch_content_access(pool, &node_ids, requester).await;
-
     let nodes = chain
         .nodes
         .into_iter()
-        .map(|n| {
-            // An id missing from the map would be a bug in the batch check;
-            // treat it the way the check itself fails — closed.
-            let redacted = access
-                .get(&n.id)
-                .copied()
-                .unwrap_or(ContentAccess::Redacted)
-                == ContentAccess::Redacted;
-            let mut content = n.content;
-            if redacted {
-                crate::access_control::redact_claim_content(&mut content);
-            }
-            ChainNode {
-                id: n.id,
-                content,
-                truth_value: n.truth_value,
-                labels: n.labels,
-                is_current: n.is_current,
-                depth: n.depth,
-                redacted,
-            }
+        .map(|n| ChainNode {
+            id: n.id,
+            content: n.content,
+            truth_value: n.truth_value,
+            labels: n.labels,
+            is_current: n.is_current,
+            depth: n.depth,
         })
         .collect();
 
-    // Edges are kept even when they touch a redacted node: the shape of the
-    // derivation is not the secret, the text is.
+    // Every edge here names two nodes that are in `nodes`: the repo retains the
+    // edge set against the hydrated nodes, not against the walk. An edge whose
+    // far endpoint is invisible would otherwise hand the caller that claim's
+    // uuid and the relationship it stands in — a disclosure with no content
+    // attached, which is still a disclosure.
     let edges = chain
         .edges
         .into_iter()
