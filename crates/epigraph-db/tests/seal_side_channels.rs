@@ -1197,6 +1197,82 @@ async fn a_redelivered_seal_commit_changes_nothing(pool: PgPool) {
     assert_eq!(hash_after_first, hash_after_second);
 }
 
+/// The seal mutation refuses, whole, a claim private to ANOTHER group
+/// (D-PR16-ownership-transfer-is-unguarded).
+///
+/// Nothing in the schema ties `claim_encryption.group_id` to
+/// `claims.owner_group_id`: migration 081's guard admits any `group` row. So
+/// without this check the mutation would encrypt group A's row under the
+/// sealing group's key epoch while A still owned it. That row is unreadable to
+/// everyone: A holds no key, the sealer cannot see it through RLS, and 093's arm
+/// (c) forbids moving it. The route refuses this first with a sentence. This
+/// test pins the backstop inside the mutation's own transaction, which binds
+/// every caller.
+///
+/// The commit names the target's own claim as well. That is what shows the
+/// refusal is WHOLE: a mutation that dropped the foreign item and sealed the
+/// rest would report a partial seal as `already_done`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seal_mutation_refuses_a_claim_private_to_another_group(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let own = seed_sealable_claim(&pool, &world, "the sealing group's own finding").await;
+    let (bystander, group_a) = viewer_fixture::seed_agent_with_group(&pool, "bystander").await;
+    let foreign_text = "a finding private to an unrelated group";
+    let foreign = viewer_fixture::seed_group_claim(&pool, bystander, group_a, foreign_text).await;
+    let payloads = vec![
+        seal_payload(&pool, own).await,
+        seal_payload(&pool, foreign).await,
+    ];
+
+    {
+        let (scoped, _viewer) = viewer_fixture::bypass(&pool).await;
+        let (mut conn, _lease) = scoped
+            .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::PrivatizationApply)
+            .await
+            .expect("maintenance connection");
+        let mut tx = sqlx::Connection::begin(&mut *conn)
+            .await
+            .expect("begin seal tx");
+        let err = PrivatizationRepository::seal_claims_conn(&mut tx, world.group, EPOCH, &payloads)
+            .await
+            .expect_err("sealing another group's private claim must be refused");
+        assert!(
+            matches!(&err, epigraph_db::DbError::Conflict { reason }
+                if reason.contains("1 of 2") && reason.contains("private to a group other than")),
+            "expected a whole-call Conflict naming the count, got {err:?}"
+        );
+        tx.rollback().await.expect("roll back");
+    }
+
+    for (claim, text) in [
+        (own, "the sealing group's own finding"),
+        (foreign, foreign_text),
+    ] {
+        let (content, owner, ciphertext_rows): (String, Uuid, i64) = sqlx::query_as(
+            "SELECT c.content, c.owner_group_id, \
+                    (SELECT count(*) FROM claim_encryption ce WHERE ce.claim_id = c.id) \
+               FROM claims c WHERE c.id = $1",
+        )
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("read the claim");
+        assert_eq!(
+            content, text,
+            "a refused seal leaves every plaintext as it was"
+        );
+        assert_eq!(ciphertext_rows, 0);
+        if claim == foreign {
+            assert_eq!(owner, group_a, "and leaves group A's claim in group A");
+        }
+    }
+
+    // CALIBRATION: the refusal is about the foreign row, not the call. The same
+    // mutation over the sealing group's own claim alone seals it.
+    let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payloads[0])).await;
+    assert_eq!(sealed, vec![own]);
+}
+
 /// The reseal completion test: a rotation leaves every ciphertext row bound to
 /// the retired epoch, and only a real re-seal clears the flag.
 #[sqlx::test(migrations = "../../migrations")]

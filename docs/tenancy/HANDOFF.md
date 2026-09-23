@@ -133,7 +133,12 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   `093_claims_block_ownership_transfer.sql` (the trigger now fires on
   `owner_group_id` too and refuses a group-private claim's change of owner
   without `epigraph.allow_declassify`, and a sealed one's always) together with
-  `restrict_claims_conn` moving only `public` rows. The 2026-09-14 ACCEPTED was
+  `restrict_claims_conn` moving only `public` rows, and by the seal ceremony
+  (`seal_manifest_page_conn`, `seal_commit`'s `plan_sealable_conn` check,
+  `seal_claims_conn`'s in-transaction refusal) ranging only over frozen rows
+  the plan's target group owns. The land review found that last half missing:
+  without it a `mode='seal'` plan served another group's private claim on its
+  manifest and sealed it under the target's key. The 2026-09-14 ACCEPTED was
   invalid: `restrict_claims_conn` was already re-owning other groups' private
   claims. **PR-16 discharged none of the five obligations that named it** —
   they are re-owned onto the write-gate PR.

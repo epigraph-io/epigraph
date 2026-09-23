@@ -207,6 +207,11 @@ guard, and 070 arm (d) then propagates the new owner to all 17 derived tables.
 owner_group_id`; a group-private claim cannot change owner without
 `epigraph.allow_declassify`, a sealed one never) and by `restrict_claims_conn` moving only
 `public` rows, which was a live re-owning path the 2026-09-14 ACCEPTED had dismissed.
+**And by the seal ceremony**, which the first revision missed: a `mode='seal'` plan's
+manifest served, and its commit sealed under the target's key, a frozen claim still
+private to another group. `seal_manifest_page_conn`, `seal_commit`'s `plan_sealable_conn`
+check and `seal_claims_conn`'s in-transaction refusal now range only over frozen rows the
+target group owns (`privatization_seal.rs::a_seal_never_serves_or_seals_a_claim_private_to_another_group`).
 
 **3.3 `D-PR16-claim-authorship-is-not-a-credential`** — nothing checks that a caller may
 author as the `agent_id` in the request body, and `routes/hypothesis.rs` derives

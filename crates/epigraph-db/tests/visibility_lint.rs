@@ -799,6 +799,19 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "plan_sealable_conn",
+        "READ of `privatization_plan_items`, `privatization_plans` and `claims`, projecting the \
+         INTERSECTION of a caller-supplied id list with the frozen rows that are private to the \
+         plan's OWN target group. Like `plan_contains_conn` it returns only ids the caller already \
+         named and projects no content. The `claims` predicate is not a viewer filter but the \
+         definition of what a seal plan may seal: a frozen row private to another group is not \
+         this plan's TCB (D-PR16-ownership-transfer-is-unguarded). A viewer-narrowed answer would \
+         be wrong in both directions: it would refuse a target-group row the actor cannot read, and \
+         nothing in it would refuse a foreign-group row the actor happens to share. The caller has \
+         already been authorised for this plan under §6.6.",
+    ),
+    (
+        "privatization.rs",
         "record_seal_audit_conn",
         "WRITE, append-only, of `privatization_audit`, and the first writer of that table's \
          `before_sealed` / `after_sealed` columns. It appends one row per entity inside the same \
@@ -825,7 +838,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          of those tables is in migration 077's protected set, so the `WITH CHECK` on the \
          maintenance connection is the control, not a read predicate. It is bounded to the ids its \
          own first statement inserted, which is what makes the set that gains a ciphertext row and \
-         the set that loses its plaintext the same set.",
+         the set that loses its plaintext the same set. Its one READ comes first. It locks the named \
+         `claims` rows `FOR SHARE` and projects one boolean per id: is the row private to a group \
+         other than the one sealing? It refuses the whole call if any is. That read is an \
+         ownership check against the caller's explicit `group_id`, not a disclosure, so there is no \
+         viewer for it to spend.",
     ),
     (
         "privatization.rs",

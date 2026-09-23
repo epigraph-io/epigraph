@@ -2083,6 +2083,17 @@ pub async fn get_audit(
 /// every row is already `visibility='group'`), and a dual entry in
 /// `security_events` and `privatization_audit` for every page served.
 ///
+/// # It serves only the frozen rows the plan's TARGET GROUP owns
+///
+/// That is not a viewer filter. It is what "this plan's TCB" means. A plan's
+/// frozen set can reach a claim private to an unrelated group A, and the apply
+/// leaves that row in A as a `skipped` item. Serving it here would disclose
+/// A's plaintext to the target group's plan authority, and the commit that
+/// followed would encrypt a row A still owns under the target's key epoch.
+/// `PrivatizationRepository::seal_manifest_page_conn` carries the predicate,
+/// and `seal_commit` refuses a claim outside it
+/// (D-PR16-ownership-transfer-is-unguarded).
+///
 /// # `manifest_digest` binds the SHAPE, not the bytes
 ///
 /// It is BLAKE3 over the page's `(claim_id, version ids…, evidence ids…)` in
@@ -2229,10 +2240,11 @@ pub async fn seal_manifest(
 ///
 /// # Errors
 ///
-/// `400` a malformed ciphertext, a wrong hash, a padding violation, or a
-/// missing TCB member; `401` no auth context; `403` §6.6; `404` no such plan;
-/// `409` a plan that is not sealable or a stale manifest digest; `410` an
-/// expired plan; `500` a database fault.
+/// `400` a malformed ciphertext, a wrong hash, a padding violation, a missing
+/// TCB member, or a claim that is not private to the plan's target group;
+/// `401` no auth context; `403` §6.6; `404` no such plan; `409` a plan that is
+/// not sealable or a stale manifest digest; `410` an expired plan; `500` a
+/// database fault.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
 pub async fn seal_commit(
@@ -2285,6 +2297,29 @@ pub async fn seal_commit(
             message: format!(
                 "{} of {} claims in this commit are not items of plan {plan_id}",
                 claim_ids.len() - frozen.len(),
+                claim_ids.len()
+            ),
+        });
+    }
+
+    // 1b. And every one is private to THIS plan's target group. Being an item
+    //     is not enough: the frozen set is selected with no tenancy filter, so
+    //     it can hold a claim private to an unrelated group, which the apply
+    //     left in that group as a `skipped` item. Sealing it would encrypt a
+    //     row that group still owns under the target's key epoch, a row nobody
+    //     can read afterwards (D-PR16-ownership-transfer-is-unguarded). The
+    //     manifest never serves such a row, so a commit naming one did not come
+    //     from the manifest. `seal_claims_conn` refuses the same thing again
+    //     inside the mutation's transaction; this is the refusal that says why.
+    let sealable =
+        PrivatizationRepository::plan_sealable_conn(&mut *maint, plan_id, &claim_ids).await?;
+    if sealable.len() != claim_ids.len() {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "{} of {} claims in this commit are items of plan {plan_id} but are not private to \
+                 its target group, so they are not this plan's to seal; the seal manifest does not \
+                 serve them",
+                claim_ids.len() - sealable.len(),
                 claim_ids.len()
             ),
         });

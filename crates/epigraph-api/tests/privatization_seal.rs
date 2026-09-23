@@ -672,6 +672,268 @@ async fn a_seal_manifest_is_refused_before_the_plan_is_applied(pool: PgPool) {
     assert_eq!(visibility, "public");
 }
 
+/// BLAKE3 over the TCB SHAPE of `claims`, as the route's private
+/// `manifest_digest` computes it over `seal_tcb_shape_conn`'s rows.
+///
+/// A forged commit needs a CORRECT digest. Otherwise the refusal it earns is
+/// the stale-digest `409`, and the test would pass with the ownership check
+/// removed. The caller calibrates it against a digest the route actually
+/// served, so a change of format fails that calibration rather than quietly
+/// turning the forged commit into a digest mismatch.
+async fn shape_digest(pool: &PgPool, claims: &[Uuid]) -> String {
+    let mut ids = claims.to_vec();
+    ids.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    for claim in ids {
+        let mut versions: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM claim_versions WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_all(pool)
+                .await
+                .expect("read version ids");
+        let mut evidence: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_all(pool)
+                .await
+                .expect("read evidence ids");
+        versions.sort_unstable();
+        evidence.sort_unstable();
+        hasher.update(claim.as_bytes());
+        hasher.update(b"v");
+        for v in versions {
+            hasher.update(v.as_bytes());
+        }
+        hasher.update(b"e");
+        for e in evidence {
+            hasher.update(e.as_bytes());
+        }
+    }
+    format!("b3:{}", hex::encode(hasher.finalize().as_bytes()))
+}
+
+/// `(content, owner_group_id, claim_encryption rows)` for one claim.
+async fn seal_state(pool: &PgPool, claim: Uuid) -> (String, Uuid, i64) {
+    sqlx::query_as(
+        "SELECT c.content, c.owner_group_id, \
+                (SELECT count(*) FROM claim_encryption ce WHERE ce.claim_id = c.id) \
+           FROM claims c WHERE c.id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("read the claim's seal state")
+}
+
+/// **A seal never serves, and never seals, a claim private to ANOTHER group**
+/// (D-PR16-ownership-transfer-is-unguarded).
+///
+/// # The chain this closes
+///
+/// A seal plan's frozen set is selected with no tenancy filter. So a public
+/// seed that group A's private claim was derived from pulls A's claim in.
+/// `restrict_claims_conn` now leaves that row in A as a `skipped` item. The
+/// seal ceremony that follows used to consume the whole frozen set with no
+/// owner check:
+/// - the manifest served A's plaintext (content, versions, evidence) to the
+///   target group's plan authority;
+/// - the commit checked only that the ids were frozen items;
+/// - the mutation wrote `claim_encryption.group_id = <target>` over a row A
+///   still owned.
+///
+/// That leaves a row nobody can read. A holds no key for it, the target cannot
+/// see it through RLS, and 093's arm (c) forbids moving it back.
+///
+/// # What each assertion pins
+///
+/// - The manifest serves exactly the rows the target owns. That includes the
+///   `resident`, which was private to the target before the plan froze and is
+///   therefore `skipped` too. The filter is on ownership, not on item state.
+/// - A commit FORGED to name A's claim, with a digest that is otherwise
+///   correct, is refused whole with the ownership sentence, and nothing is
+///   sealed.
+/// - The honest commit seals the target's two rows and leaves A's claim in A,
+///   in plaintext.
+///
+/// `seal_side_channels.rs::the_seal_mutation_refuses_a_claim_private_to_another_group`
+/// pins the backstop inside the mutation, which is what answers if the route's
+/// check is ever bypassed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_never_serves_or_seals_a_claim_private_to_another_group(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+
+    let seed = seed_subject(&pool, &world, "a public result the target is sealing").await;
+    let resident = viewer_fixture::seed_group_claim(
+        &pool,
+        world.actor,
+        world.target_group,
+        "already private to the target group",
+    )
+    .await;
+    fx::derived_from(&pool, resident, seed).await;
+
+    // Group A's claim is AUTHORED by the actor, an agent in both groups. That
+    // keeps the preview's authors_losing_count at 0, so the route-created plan
+    // needs no second approver. A bystander author would add that requirement,
+    // which is orthogonal to this test. The seal must respect OWNERSHIP, and
+    // an author who can read the row does not make it the target group's.
+    let (_, group_a) = viewer_fixture::seed_agent_with_group(&pool, "group-a-admin").await;
+    let foreign_text = "group A's unsealed private finding";
+    let foreign = viewer_fixture::seed_group_claim(&pool, world.actor, group_a, foreign_text).await;
+    sqlx::query(
+        "INSERT INTO claim_versions (claim_id, version_number, content, truth_value, \
+                                     created_by, visibility, owner_group_id) \
+         VALUES ($1, 1, $2, 0.8, $3, 'group', $4)",
+    )
+    .bind(foreign)
+    .bind(foreign_text)
+    .bind(world.actor)
+    .bind(group_a)
+    .execute(&pool)
+    .await
+    .expect("seed a version of A's claim");
+    let foreign_evidence = viewer_fixture::seed_evidence(&pool, foreign, "document").await;
+    sqlx::query("UPDATE evidence SET raw_content = $2 WHERE id = $1")
+        .bind(foreign_evidence)
+        .bind(foreign_text)
+        .execute(&pool)
+        .await
+        .expect("give A's evidence plaintext");
+    fx::derived_from(&pool, foreign, seed).await;
+
+    let plan = applied_seal_plan(&pool, &world, &[seed]).await;
+
+    // CALIBRATION: all three are frozen, and the apply moved only the seed.
+    // Without this, a closure that never reached A's claim would pass every
+    // assertion below.
+    let states: std::collections::HashMap<Uuid, String> = fx::items(&pool, plan)
+        .await
+        .into_iter()
+        .map(|(id, _, s)| (id, s))
+        .collect();
+    assert_eq!(states.get(&seed).map(String::as_str), Some("applied"));
+    assert_eq!(
+        states.get(&resident).map(String::as_str),
+        Some("skipped"),
+        "CALIBRATION: the resident must be a frozen, skipped item, or the manifest's \
+         ownership filter is never distinguished from an item-state filter"
+    );
+    assert_eq!(
+        states.get(&foreign).map(String::as_str),
+        Some("skipped"),
+        "CALIBRATION: A's claim must be a frozen, skipped item, or this test never offers the \
+         seal a foreign row"
+    );
+    assert_eq!(
+        fx::tenancy(&pool, foreign).await,
+        ("group".to_string(), group_a)
+    );
+
+    // --- the manifest ---
+    let manifest = fetch_seal_manifest(&pool, &world, plan)
+        .await
+        .expect("seal manifest");
+    let served: Vec<Uuid> = manifest.items.iter().map(|i| i.claim_id).collect();
+    let mut expected = vec![seed, resident];
+    expected.sort_unstable();
+    assert_eq!(
+        served, expected,
+        "the manifest serves exactly the frozen rows the target group owns: the applied seed and \
+         the skipped resident, and never group A's claim"
+    );
+    let wire = serde_json::to_string(&manifest).expect("serialise the manifest");
+    assert!(
+        !wire.contains(foreign_text),
+        "no part of the manifest may carry group A's plaintext"
+    );
+
+    // --- a commit forged to name A's claim ---
+    assert_eq!(
+        shape_digest(&pool, &served).await,
+        manifest.manifest_digest,
+        "CALIBRATION: the test's digest must reproduce the route's, or the forged commit below \
+         is refused as stale and proves nothing about ownership"
+    );
+    let version_id: Uuid = sqlx::query_scalar("SELECT id FROM claim_versions WHERE claim_id = $1")
+        .bind(foreign)
+        .fetch_one(&pool)
+        .await
+        .expect("read A's version id");
+    let forged_entry = routes::SealManifest {
+        plan_id: plan,
+        epoch: manifest.epoch,
+        pad_to: manifest.pad_to,
+        manifest_digest: String::new(),
+        next_cursor: None,
+        items: vec![routes::SealManifestEntry {
+            claim_id: foreign,
+            content: "overwritten".to_string(),
+            labels: Vec::new(),
+            properties: serde_json::json!({}),
+            versions: vec![routes::ManifestVersion {
+                id: version_id,
+                content: "overwritten".to_string(),
+            }],
+            evidence: vec![routes::ManifestEvidence {
+                id: foreign_evidence,
+                raw_content: Some("overwritten".to_string()),
+                properties: serde_json::json!({}),
+            }],
+        }],
+    };
+    let mut forged = seal_body(&manifest).await;
+    forged.items.extend(seal_body(&forged_entry).await.items);
+    forged.manifest_digest = shape_digest(&pool, &[seed, resident, foreign]).await;
+
+    let err = post_seal_commit(&pool, &world, plan, forged)
+        .await
+        .expect_err("a commit naming another group's private claim must be refused");
+    assert!(
+        matches!(&err, ApiError::BadRequest { message }
+            if message.contains("1 of 3") && message.contains("not private to its target group")),
+        "expected the ownership refusal, not a stale digest or a database error; got {err:?}"
+    );
+    for claim in [seed, resident, foreign] {
+        assert_eq!(
+            seal_state(&pool, claim).await.2,
+            0,
+            "a refused commit seals nothing, including the rows it was entitled to"
+        );
+    }
+    let (content, owner, _) = seal_state(&pool, foreign).await;
+    assert_eq!(content, foreign_text);
+    assert_eq!(owner, group_a);
+
+    // --- the honest commit ---
+    let resp = post_seal_commit(&pool, &world, plan, seal_body(&manifest).await)
+        .await
+        .expect("the commit the manifest describes");
+    assert_eq!(resp.committed, 2);
+    for claim in [seed, resident] {
+        let (content, owner, ciphertext_rows) = seal_state(&pool, claim).await;
+        assert_eq!(content, format!("[sealed:x{}]", claim.simple()));
+        assert_eq!(owner, world.target_group);
+        assert_eq!(ciphertext_rows, 1);
+    }
+    assert_eq!(
+        seal_state(&pool, foreign).await,
+        (foreign_text.to_string(), group_a, 0),
+        "group A's claim stays in A, in plaintext, with no ciphertext row"
+    );
+    let (version_text, evidence_text): (String, Option<String>) = sqlx::query_as(
+        "SELECT (SELECT content FROM claim_versions WHERE claim_id = $1), \
+                (SELECT raw_content FROM evidence WHERE id = $2)",
+    )
+    .bind(foreign)
+    .bind(foreign_evidence)
+    .fetch_one(&pool)
+    .await
+    .expect("read A's version and evidence");
+    assert_eq!(version_text, foreign_text);
+    assert_eq!(evidence_text.as_deref(), Some(foreign_text));
+}
+
 /// Seal a whole plan through the routes, and assert it sealed everything.
 async fn seal_through_routes(pool: &PgPool, world: &fx::World, plan: Uuid, expect: usize) {
     let manifest = fetch_seal_manifest(pool, world, plan)

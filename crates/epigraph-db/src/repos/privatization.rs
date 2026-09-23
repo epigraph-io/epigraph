@@ -2558,6 +2558,12 @@ impl PrivatizationRepository {
     /// already refuses on the drift path (D-PR16-ownership-transfer-is-unguarded).
     /// The row now joins the `skipped` set below.
     ///
+    /// Skipping it here is not enough on its own for a `mode='seal'` plan. The
+    /// seal ceremony that follows must not take the row either, so
+    /// [`Self::seal_manifest_page_conn`], [`Self::plan_sealable_conn`] and
+    /// [`Self::seal_claims_conn`] range only over frozen rows the target group
+    /// owns.
+    ///
     /// Migration 093's arm (c) is the database half of the same rule. It
     /// refuses the move on any connection that has not armed
     /// `epigraph.allow_declassify`, and this statement never arms it. So
@@ -2957,6 +2963,26 @@ impl PrivatizationRepository {
     /// completeness check refuses loudly, rather than one that is too large,
     /// which nothing would catch.
     ///
+    /// # The TCB is the frozen rows the plan's TARGET GROUP owns, not every
+    /// # frozen row
+    ///
+    /// The predicate `c.visibility = 'group' AND c.owner_group_id =
+    /// p.target_group_id` is not a viewer filter. It defines what this plan
+    /// may seal. The frozen set is selected under a bypass viewer with no
+    /// tenancy filter, so it can contain a claim private to an unrelated group
+    /// A. [`Self::restrict_claims_conn`] leaves such a row in A and its item
+    /// `skipped` (D-PR16-ownership-transfer-is-unguarded). Serving it here
+    /// would hand A's plaintext (content, labels, properties, versions,
+    /// evidence) to the target group's plan authority. A commit over it would
+    /// then encrypt a row A still owns under the TARGET's key epoch, which
+    /// leaves a row nobody can read: A's members hold no key for it, and the
+    /// target's members cannot see it through RLS. Migration 093's arm (c)
+    /// would also forbid ever moving it back.
+    ///
+    /// It is NOT keyed on `i.state = 'applied'`. A row that was already private
+    /// to the target group when the plan froze is `skipped` by the apply, and
+    /// it is still this plan's to seal.
+    ///
     /// # Paging is keyset, on `claims.id`
     ///
     /// `after` is exclusive. An OFFSET page over a set that a concurrent seal is
@@ -2979,8 +3005,12 @@ impl PrivatizationRepository {
               FROM public.claims c
               JOIN public.privatization_plan_items i
                 ON i.entity_id = c.id AND i.kind = 'claim'
+              JOIN public.privatization_plans p
+                ON p.id = i.plan_id
              WHERE i.plan_id = $1
                AND ($2::uuid IS NULL OR c.id > $2)
+               AND c.visibility = 'group'
+               AND c.owner_group_id = p.target_group_id
                /* {VISIBILITY:c} */
              ORDER BY c.id
              LIMIT $3
@@ -3156,10 +3186,31 @@ impl PrivatizationRepository {
     /// because it is what makes the ordering an invariant of the database
     /// rather than of this function.
     ///
+    /// # It refuses, whole, a claim private to ANOTHER group
+    ///
+    /// Before anything is written it locks every named claim `FOR SHARE` and
+    /// refuses the call if any of them is `group`-visible under an owner other
+    /// than `group_id`. Nothing in the schema ties `claim_encryption.group_id`
+    /// to `claims.owner_group_id`: 081's guard passes any `group` row. So without
+    /// this check a caller could encrypt group A's row under group B's key epoch
+    /// while A still owns it. A's members would then hold no key for it, B's
+    /// members could not see it through RLS, and migration 093's arm (c) would
+    /// forbid moving it back (D-PR16-ownership-transfer-is-unguarded).
+    ///
+    /// The route's `plan_sealable_conn` check is the control, and it answers
+    /// with a sentence. This check is the backstop, for three reasons. It runs
+    /// inside the mutation's own transaction. Its row locks hold the owner
+    /// still until that transaction commits. And it binds every caller of this
+    /// function, not only the route. It refuses the WHOLE call rather than
+    /// dropping the offending item, because an item dropped in silence is a
+    /// partial seal reported as `already_done`. A `public` row is left to 081's
+    /// `42501`, which is already loud.
+    ///
     /// # Errors
     ///
     /// [`DbError`] for a query fault. A `42501` from statement 1 is 081's guard
-    /// refusing an unrestricted claim.
+    /// refusing an unrestricted claim. [`DbError::Conflict`] when any item is
+    /// private to a group other than `group_id`, and then nothing is written.
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,
@@ -3170,6 +3221,40 @@ impl PrivatizationRepository {
             return Ok(Vec::new());
         }
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+
+        // 0. Refuse another group's private row, and hold every owner still
+        //    until this transaction ends. Every row is locked, not only the
+        //    foreign ones, because a row not locked here could be re-owned
+        //    between this check and statement 2. `ORDER BY` gives concurrent
+        //    lockers one acquisition order.
+        let owners = sqlx::query_as::<_, (Uuid, bool)>(
+            r"
+            SELECT c.id,
+                   (c.visibility = 'group'
+                    AND c.owner_group_id IS DISTINCT FROM $2) AS foreign_private
+              FROM public.claims c
+             WHERE c.id = ANY($1)
+             ORDER BY c.id
+               FOR SHARE OF c
+            ",
+        )
+        .bind(&claim_ids)
+        .bind(group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        let foreign = owners.iter().filter(|(_, f)| *f).count();
+        if foreign > 0 {
+            return Err(DbError::Conflict {
+                reason: format!(
+                    "{foreign} of {} claims in this seal are private to a group other than the \
+                     one sealing them; a seal encrypts only rows the sealing group owns, and \
+                     nothing was written",
+                    claim_ids.len()
+                ),
+            });
+        }
+
         let content_cts: Vec<Vec<u8>> = items.iter().map(|i| i.content_ct.clone()).collect();
         let labels_cts: Vec<Vec<u8>> = items.iter().map(|i| i.labels_ct.clone()).collect();
         let props_cts: Vec<Vec<u8>> = items.iter().map(|i| i.properties_ct.clone()).collect();
@@ -3758,6 +3843,52 @@ impl PrivatizationRepository {
             SELECT i.entity_id
               FROM public.privatization_plan_items i
              WHERE i.plan_id = $1 AND i.kind = 'claim' AND i.entity_id = ANY($2)
+             ORDER BY i.entity_id
+            ",
+        )
+        .bind(plan_id)
+        .bind(claim_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Which of `claim_ids` this plan may SEAL: frozen items that are private
+    /// to the plan's own target group.
+    ///
+    /// [`Self::plan_contains_conn`] proves a claim is one the plan selected.
+    /// That is not enough for a seal, because the frozen set is selected with
+    /// no tenancy filter and can hold a claim private to an unrelated group.
+    /// The apply leaves such a row where it is, as a `skipped` item
+    /// (D-PR16-ownership-transfer-is-unguarded). This is the same predicate
+    /// [`Self::seal_manifest_page_conn`] serves by, so a commit may name only
+    /// rows the manifest could have served. Like `plan_contains_conn` it
+    /// returns an intersection of ids the caller already named, never a
+    /// widening of them.
+    ///
+    /// It is not keyed on item state. A row already private to the target
+    /// when the plan froze is `skipped` and is still the plan's to seal.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn plan_sealable_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            r"
+            SELECT i.entity_id
+              FROM public.privatization_plan_items i
+              JOIN public.privatization_plans p ON p.id = i.plan_id
+              JOIN public.claims c ON c.id = i.entity_id
+             WHERE i.plan_id = $1 AND i.kind = 'claim' AND i.entity_id = ANY($2)
+               AND c.visibility = 'group'
+               AND c.owner_group_id = p.target_group_id
              ORDER BY i.entity_id
             ",
         )
