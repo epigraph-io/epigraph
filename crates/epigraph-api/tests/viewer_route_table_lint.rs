@@ -661,28 +661,60 @@ fn sqlx_call_offsets(src: &str) -> Vec<usize> {
     while let Some(rel) = src[from..].find("sqlx::query") {
         let at = from + rel;
         from = at + "sqlx::query".len();
-
-        // Skip the `_as` / `_scalar` suffix, then any turbofish, then require `(`.
-        let mut tail = &src[from..];
-        for suffix in ["_as", "_scalar"] {
-            if let Some(rest) = tail.strip_prefix(suffix) {
-                tail = rest;
-                break;
-            }
-        }
-        let tail = tail.trim_start();
-        let opens_call = if let Some(rest) = tail.strip_prefix("::<") {
-            // Turbofish: find its close, then require `(`.
-            rest.find('>')
-                .is_some_and(|gt| rest[gt + 1..].trim_start().starts_with('('))
-        } else {
-            tail.starts_with('(')
-        };
-        if opens_call {
+        if call_open_paren(src, at).is_some() {
             out.push(at);
         }
     }
     out
+}
+
+/// The byte offset of the `(` that opens the `sqlx::query*` call at `at`, or
+/// `None` when the text there is not an invocation.
+///
+/// # The turbofish is matched by DEPTH, not by its first `>`
+///
+/// This used to take the first `>` after `::<` as the turbofish's close. For
+/// `query_as::<_, (i64, Option<f64>, Option<f64>)>(` that `>` closes
+/// `Option<f64`, is followed by `,` rather than `(`, and the whole call was
+/// scored "not an invocation" — so `routes/embeddings.rs::neighborhood_density`'s
+/// corpus-wide aggregate, an unfiltered read over every tenant's embeddings,
+/// was never counted by this ratchet. Any nested generic in the row type
+/// (`Option<T>`, `Vec<T>`, `DateTime<Utc>`) had the same blind spot, including
+/// `query_scalar::<_, Option<T>>(`. The close is now the `>` that returns the
+/// angle-bracket depth to zero.
+fn call_open_paren(src: &str, at: usize) -> Option<usize> {
+    let b = src.as_bytes();
+    let skip_ws = |mut j: usize| {
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        j
+    };
+    let mut i = at + "sqlx::query".len();
+    for suffix in ["_as", "_scalar"] {
+        if src[i..].starts_with(suffix) {
+            i += suffix.len();
+            break;
+        }
+    }
+    i = skip_ws(i);
+    if src[i..].starts_with("::<") {
+        let mut j = i + "::<".len();
+        let mut depth = 1usize;
+        while j < b.len() && depth > 0 {
+            match b[j] {
+                b'<' => depth += 1,
+                b'>' => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+        }
+        if depth > 0 {
+            return None;
+        }
+        i = skip_ws(j);
+    }
+    src[i..].starts_with('(').then_some(i)
 }
 
 /// The balanced-paren argument region of the `sqlx::query*` call at `at`.
@@ -691,11 +723,34 @@ fn sqlx_call_offsets(src: &str) -> Vec<usize> {
 /// over-counted (it swept up whatever statement followed) and under-counted
 /// (see [`resolved_region`]). String literals — normal and raw — are skipped so
 /// that parentheses inside the SQL text cannot unbalance the depth count.
+///
+/// The region starts at the CALL's `(`, found by [`call_open_paren`], not at
+/// the first `(` after `at`. For a turbofish whose row type is a tuple, the
+/// first `(` is the tuple's, and the "argument region" used to be the type
+/// `(i64, Option<f64>)` rather than the SQL.
 fn arg_region(src: &str, at: usize) -> &str {
+    match call_open_paren(src, at) {
+        Some(open) => paren_region(src, open),
+        None => &src[at..],
+    }
+}
+
+/// The balanced-paren region opened by the FIRST `(` at or after `at`.
+///
+/// What [`arg_region`] computed before it learned to find a call's own `(`.
+/// [`classify_auth_ctx_shape`] still wants exactly this — the `(` of `Some(` —
+/// and it is not a `sqlx::query*` site, so it keeps the old rule under a name
+/// that says what it does.
+fn first_paren_region(src: &str, at: usize) -> &str {
+    match src[at..].find('(') {
+        Some(i) => paren_region(src, at + i),
+        None => &src[at..],
+    }
+}
+
+/// The balanced-paren region starting at the `(` at byte `open`.
+fn paren_region(src: &str, open: usize) -> &str {
     let b = src.as_bytes();
-    let Some(open) = src[at..].find('(').map(|i| at + i) else {
-        return &src[at..];
-    };
     let n = src.len();
     let mut j = open + 1;
     let mut depth = 1usize;
@@ -1158,9 +1213,9 @@ fn classify_auth_ctx_shape(src: &str, at: usize) -> AuthCtxShape {
         return AuthCtxShape::Unknown;
     }
     // `at + AUTH_CTX_BARE.len() - 1` is the `(` that opens `Extension(`, but
-    // `arg_region` wants the OUTER one: `at + 4` is the `(` of `Some(`, and it
-    // is the first `(` at or after `at`, so the region it returns starts there.
-    let end = at + 4 + arg_region(src, at).len();
+    // the region wanted is the OUTER one: `at + 4` is the `(` of `Some(`, and it
+    // is the first `(` at or after `at`, so the region returned starts there.
+    let end = at + 4 + first_paren_region(src, at).len();
     if before.ends_with("let") {
         return if window_after(src, end, 200)
             .split('{')
@@ -1322,6 +1377,63 @@ fn a_format_built_statement_is_counted() {
     let offsets = sqlx_call_offsets(raw);
     assert_eq!(offsets.len(), 1);
     assert!(reads_claim_content(&resolved_region(raw, offsets[0])));
+}
+
+/// **The self-test for the nested-generic blind spot**, which let
+/// `routes/embeddings.rs::neighborhood_density`'s aggregate go uncounted.
+///
+/// Two halves, because the defect had two halves: the call was not recognised
+/// at all (the turbofish scan stopped at `Option<f64`'s `>`), and even a
+/// recognised call's argument region would have started at the TUPLE's `(`
+/// and scanned the row type instead of the SQL. Synthetic fixtures, so the
+/// test cannot be satisfied by editing the routes directory.
+#[test]
+fn a_nested_generic_turbofish_is_counted() {
+    let aggregate = r#"
+        let row = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(
+            "SELECT COUNT(*), AVG(1 - (embedding <=> $1::vector)) FROM claims"
+        ).bind(v).fetch_one(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(aggregate);
+    assert_eq!(
+        offsets.len(),
+        1,
+        "a turbofish whose row type nests a generic must still be recognised as \
+         a call; the first `>` closes `Option<f64`, not the turbofish"
+    );
+    let region = resolved_region(aggregate, offsets[0]);
+    assert!(
+        region.contains("FROM claims"),
+        "the argument region must start at the CALL's `(`, not the tuple's: got \
+         {region:?}"
+    );
+    assert!(reads_claim_content(&region), "and it must be charged");
+
+    let scalar = r#"
+        let v = sqlx::query_scalar::<_, Option<String>>("SELECT content FROM claims WHERE id = $1")
+            .bind(id).fetch_one(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(scalar);
+    assert_eq!(
+        offsets.len(),
+        1,
+        "`query_scalar::<_, Option<T>>(` is a call"
+    );
+    assert!(reads_claim_content(&resolved_region(scalar, offsets[0])));
+
+    // A nested generic whose SQL reads no content must still NOT be charged:
+    // recognising more calls must not turn into charging more statements.
+    let themes = r#"
+        let frac = sqlx::query_scalar::<_, Option<f64>>(
+            "SELECT COUNT(*)::float8 FROM claim_themes"
+        ).fetch_one(pool).await?;
+    "#;
+    let offsets = sqlx_call_offsets(themes);
+    assert_eq!(offsets.len(), 1);
+    assert!(!reads_claim_content(&resolved_region(themes, offsets[0])));
+
+    // An unclosed turbofish is not a call.
+    assert!(sqlx_call_offsets("sqlx::query_as::<_, (i64,").is_empty());
 }
 
 #[test]
