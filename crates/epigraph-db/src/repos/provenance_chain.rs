@@ -104,6 +104,31 @@ impl ProvenanceChainRepository {
         max_depth: u8,
         relationships: Option<&[String]>,
     ) -> Result<ProvenanceChain, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::chain_conn(&mut conn, viewer, claim_id, max_depth, relationships).await
+    }
+
+    /// [`Self::chain`] on a caller-supplied connection.
+    ///
+    /// The `&PgPool` form above cannot serve an HTTP handler: a converted
+    /// handler holds an [`crate::ScopedRead`] whose session carries the
+    /// viewer's tenancy GUCs, and reaching past it to the raw pool is the exact
+    /// failure `AppState::read_as` documents — an unstamped connection makes
+    /// the RLS policy and the in-query predicate disagree, which hides rows
+    /// from their own owners with no error. Both statements run here, so both
+    /// see the same corpus.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the traversal or hydration query
+    /// fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn chain_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        max_depth: u8,
+        relationships: Option<&[String]>,
+    ) -> Result<ProvenanceChain, DbError> {
         let depth = i32::from(max_depth.clamp(1, 8));
 
         let (incoming, outgoing) = match relationships {
@@ -190,7 +215,7 @@ impl ProvenanceChainRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         // Fewest-hops depth per node, the stored edge set, and any cycles.
@@ -242,7 +267,7 @@ impl ProvenanceChainRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         let depth_of: HashMap<Uuid, i32> = kept.iter().copied().collect();
