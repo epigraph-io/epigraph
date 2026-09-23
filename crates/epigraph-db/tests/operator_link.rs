@@ -294,7 +294,7 @@ async fn a_second_operator_and_a_self_link_are_refused(pool: PgPool) {
         .await
         .expect_err("a second live operator must be refused");
     assert!(
-        err.to_string().contains("already has a live link"),
+        err.to_string().contains("already has a link"),
         "the refusal must say why: {err}"
     );
     let err = AgentRepository::link_operator(&mut conn, agent, agent)
@@ -336,6 +336,170 @@ async fn an_auth_lineage_edge_alone_is_not_an_operator_link(pool: PgPool) {
         .await
         .expect("links")
         .is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The link record is definer-only (review finding: the link was forgeable).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An `epigraph_app` session CANNOT forge a link, even though it can still
+/// write both halves of what used to count as one.
+///
+/// Replays the review's attacks as `epigraph_app`, stamped exactly as
+/// `Viewer::resolve` stamps an ordinary principal:
+///
+/// * (1b) principal `O` writes a `writer` row for agent `X` into `O`'s own
+///   personal group AND an `X --OPERATED_BY--> O` edge;
+/// * (4) the HTTP-signer variant: `record_auth_lineage` has already written
+///   `S --OPERATED_BY--> P` (as it does for every OAuth caller), and `P`'s
+///   session adds only the membership.
+///
+/// Both writes still SUCCEED (asserted, so the premise cannot rot into a
+/// vacuous pass), and neither agent reads as operated: the authority is the
+/// `operator_links` row, which only a definer frame can write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_session_cannot_forge_a_link_from_an_edge_and_a_membership(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (o, o_group) = fixture::seed_agent_with_group(&pool, "forger-o").await;
+    let x = seed_bare_agent(&pool).await;
+    let (p, p_group) = fixture::seed_agent_with_group(&pool, "forger-p").await;
+    let signer = seed_bare_agent(&pool).await;
+    epigraph_db::EdgeRepository::create_if_not_exists(
+        &pool,
+        signer,
+        "agent",
+        p,
+        "agent",
+        "OPERATED_BY",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("lineage edge, exactly as record_auth_lineage writes it");
+
+    let o_viewer = Viewer::resolve(&pool, o).await.expect("resolve O");
+    let p_viewer = Viewer::resolve(&pool, p).await.expect("resolve P");
+
+    let (attack_1b, attack_4) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &o_viewer).await;
+        let mem = sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'writer')",
+        )
+        .bind(o_group)
+        .bind(x)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        let edge = sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+        )
+        .bind(x)
+        .bind(o)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+
+        set_gucs_from(&mut conn, &p_viewer).await;
+        let signer_mem = sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, 'writer')",
+        )
+        .bind(p_group)
+        .bind(signer)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        (conn, ((mem, edge), signer_mem))
+    })
+    .await;
+
+    let (mem, edge) = attack_1b;
+    assert_eq!(
+        (mem.expect("1b membership"), edge.expect("1b edge")),
+        (1, 1),
+        "PREMISE: an app session can still write both halves of the old link shape; if it \
+         cannot, this test no longer replays the attack"
+    );
+    assert_eq!(
+        attack_4.expect("attack 4 membership"),
+        1,
+        "PREMISE (attack 4)"
+    );
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    assert!(
+        AgentRepository::operator_links(&mut conn, x)
+            .await
+            .expect("links of X")
+            .is_empty(),
+        "attack 1b: an edge plus a membership written by O's own session made O the operator \
+         of X. The link must require an operator_links row only a definer can write"
+    );
+    assert!(
+        AgentRepository::operator_links(&mut conn, signer)
+            .await
+            .expect("links of the signer")
+            .is_empty(),
+        "attack 4: one membership row made the shared HTTP signer 'operated by' its caller"
+    );
+}
+
+/// `operator_links` itself refuses an app-session INSERT through its POLICY,
+/// not only through the REVOKE. The test grants the app role every table
+/// privilege first (`fixture::grant_app_privileges`), so the refusal observed
+/// is the row-security one; the REVOKE is asserted separately, before that
+/// grant, because 077's `ALTER DEFAULT PRIVILEGES` would otherwise hand the
+/// app role INSERT on a new table.
+#[sqlx::test(migrations = "../../migrations")]
+async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let app_may_insert: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('epigraph_app', 'public.operator_links', 'INSERT')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("privilege probe");
+    assert!(
+        !app_may_insert,
+        "102 must REVOKE ALL on operator_links FROM epigraph_app: 077's default privileges \
+         grant it INSERT on every new table"
+    );
+
+    let (o, o_group) = fixture::seed_agent_with_group(&pool, "forger").await;
+    let x = seed_bare_agent(&pool).await;
+    let o_viewer = Viewer::resolve(&pool, o).await.expect("resolve O");
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    let refused = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &o_viewer).await;
+        let r = sqlx::query(
+            "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(x)
+        .bind(o)
+        .bind(o_group)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    let err = refused.expect_err(
+        "an app session inserted an operator_links row: with the grant in place, the INSERT \
+         policy is the only thing between the request DSN and a forged link",
+    );
+    assert!(
+        err.to_string().contains("row-level security"),
+        "the refusal must come from the row-security policy, not from a missing grant: {err}"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM operator_links")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

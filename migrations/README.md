@@ -234,17 +234,25 @@ Current reservation:
   `100` was: it has never been applied to a deployed database — production is at
   59.
 
-- **102**: public `operator_link` — operator-scoped ownership. Two `SECURITY
-  DEFINER` functions and nothing else: `epigraph_link_operator(agent, operator)`
-  records `agent --OPERATED_BY--> operator` plus a `writer` membership for the
-  agent in the operator's personal group (EXECUTE: `epigraph_maintenance` only —
-  revoked from `PUBLIC` and from `epigraph_app`), and
-  `epigraph_operator_of(agent)` is the read the authoring and ownership paths
-  use (EXECUTE: `epigraph_app`), so neither depends on a stamped session. The
-  link is recorded once: the membership is inserted only when the roster holds
-  no row of any state for the pair, with `ON CONFLICT DO NOTHING`, so a revoked
-  link is never revived (the #493 shape `epigraph_ensure_personal_group` has is
-  deliberately not reused). Pinned by
+- **102**: public `operator_link` — operator-scoped ownership. One
+  definer-only table and two `SECURITY DEFINER` functions.
+  `operator_links(agent_id PK, operator_id, operator_group_id)` is the link
+  RECORD: ENABLE + FORCE row security, an INSERT policy admitting only
+  `epigraph_definer_bypass()`, no UPDATE/DELETE policy, and INSERT/UPDATE/DELETE
+  revoked from `epigraph_app`, so an app session cannot forge a link from an
+  edge plus a membership (the review's finding). `epigraph_link_operator(agent,
+  operator)` writes that row plus a `writer` membership for the agent in the
+  operator's personal group and the `agent --OPERATED_BY--> operator` graph
+  edge (EXECUTE: `epigraph_maintenance` only — revoked from `PUBLIC` and from
+  `epigraph_app`), and `epigraph_operator_of(agent)` is the read the authoring
+  and ownership paths use (EXECUTE: `epigraph_app`), so neither depends on a
+  stamped session. The link is recorded once: the membership is inserted only
+  when the roster holds no row of any state for the pair, with `ON CONFLICT DO
+  NOTHING`, so a revoked link is never revived (the #493 shape
+  `epigraph_ensure_personal_group` has is deliberately not reused). The table
+  is registered with the FORCE ratchets (`FORCE_PROTECTED_SET`,
+  `rls_enforcement.rs::PROTECTED`, `locked_decisions.rs::OPERATOR_TABLES`,
+  `docs/runbooks/079-undo.sql`). Pinned by
   `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted` and
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`; behaviour in
   `epigraph-db/tests/operator_link.rs`. **Deploy order:** a binary carrying
@@ -252,10 +260,10 @@ Current reservation:
   against a database without 102, so apply 102 first. Allocated here, not in
   `093–099`, because this is not one of the obligation batches that block is
   reserved for. Like `100` and `101` it sits inside internal's `060–112`; see
-  "Version range coordination" above. **No undo runbook ships**: undo is two
-  `DROP FUNCTION IF EXISTS` statements named in the file, together with a binary
-  that no longer calls them. **Applied to a throwaway database only, NOT to any
-  deployed database.**
+  "Version range coordination" above. **No undo runbook ships**: undo is the
+  `DROP FUNCTION` / `DROP TABLE` statements named in the file, together with a
+  binary that no longer calls them. **Applied to a throwaway database only, NOT
+  to any deployed database.**
 
 - **103+**: public next
 

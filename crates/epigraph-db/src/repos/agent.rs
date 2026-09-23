@@ -1333,12 +1333,15 @@ impl AgentRepository {
     /// Every LIVE operator link of `agent_id`, through migration 102's
     /// `epigraph_operator_of` definer read.
     ///
-    /// A live link is an in-force `agent --OPERATED_BY--> operator` edge AND a
-    /// live `writer`/`admin` membership for the agent in the operator's
-    /// personal group. The membership half is what stops an HTTP server's
-    /// auth-lineage edges (`EpiGraphMcpFull::record_auth_lineage`, which write
-    /// no membership) from reading as links, and it is what makes a revoked
-    /// membership end the link everywhere at once.
+    /// A live link is an `operator_links` row AND a live `writer`/`admin`
+    /// membership for the agent in the group that row names. The row is
+    /// writable only inside `epigraph_link_operator`'s definer frame (or on a
+    /// maintenance login), which is what makes a link unforgeable from an
+    /// `epigraph_app` session; the `OPERATED_BY` edge is the graph record and
+    /// grants nothing, so an HTTP server's auth-lineage edges
+    /// (`EpiGraphMcpFull::record_auth_lineage`) never read as links. The
+    /// membership half is what makes a revoked membership end the link
+    /// everywhere at once.
     ///
     /// Returned as a list, not collapsed, because the two consumers need
     /// OPPOSITE answers for the ambiguous case: [`Self::operator_of`] (the

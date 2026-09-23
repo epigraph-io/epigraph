@@ -3,8 +3,9 @@
 -- human operator writes into that operator's personal group, and the operator
 -- (and the operator's other agents) own what it writes.
 --
--- Two SECURITY DEFINER functions, no table, no policy change, no rows written
--- by the migration itself.
+-- One definer-only table (`operator_links`), two SECURITY DEFINER functions,
+-- no change to any existing policy, and no rows written by the migration
+-- itself.
 --
 -- ===================================================================
 -- 1. WHY THIS EXISTS
@@ -18,8 +19,10 @@
 -- (`EpiGraphMcpFull::record_auth_lineage`), stdio writes none, and nothing on
 -- the ownership path reads them.
 --
--- The link below is the missing record: `agent --OPERATED_BY--> operator` PLUS
--- a live `writer` membership for the agent in the operator's personal group.
+-- The link below is the missing record: a row in `operator_links` PLUS a live
+-- `writer` membership for the agent in the operator's personal group. The
+-- `agent --OPERATED_BY--> operator` edge is still written, as the GRAPH record
+-- of the link, but it grants nothing (section 4).
 -- `ClaimRepository::default_decl_for_author` owns an operated agent's new
 -- claims by that group, and `epigraph_mcp::tools::claims::require_owner_or_admin`
 -- treats agents sharing an operator (and the operator itself) as owners of each
@@ -36,6 +39,9 @@
 -- privilege of the connection that calls this function is what AUTHORIZES it.
 -- On an `epigraph_app` connection the call raises 42501 -- it is never a
 -- silent no-op -- and `epigraph-mcp` treats that as fatal at startup.
+--
+-- The EXECUTE revoke is only half of that basis. The other half is that the
+-- link RECORD cannot be written by anything else: see section 4.
 --
 -- ===================================================================
 -- 3. RECORDED ONCE: NEVER REVIVE, NEVER ADMIN
@@ -62,8 +68,13 @@
 --     holds a live membership; stamping the agent as creator would make its
 --     `writer` row admin-equivalent. When this function creates the group it
 --     seeds the operator's own `admin` row, also DO NOTHING.
+--   * the `operator_links` row is keyed on the agent and inserted
+--     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
+--     ever: a row naming a DIFFERENT operator is refused rather than replaced,
+--     whatever the state of that other link's membership. Re-pointing an agent
+--     is a deliberate out-of-band act, not something a restart can do.
 --   * the `OPERATED_BY` edge is inserted only when no edge of that relationship
---     exists between the pair IN ANY STATE, so a retracted link is not
+--     exists between the pair IN ANY STATE, so a retracted edge is not
 --     re-asserted either.
 --
 -- RESIDUAL: a membership row that is HARD-deleted (rather than soft-revoked)
@@ -72,7 +83,57 @@
 -- revoked_at = now()`, as 092 section 3 also records.
 --
 -- ===================================================================
--- 4. THE READ SIDE: `epigraph_operator_of`, AND WHY IT IS A DEFINER
+-- 4. THE LINK RECORD IS A DEFINER-ONLY TABLE, NOT AN EDGE
+--
+-- An earlier form of this file had no table: a link was "an in-force
+-- `OPERATED_BY` edge AND a live writer membership". MEASURED by review on a
+-- throwaway migrated to this file, as `SET SESSION AUTHORIZATION epigraph_app`
+-- stamped exactly as `Viewer::resolve` stamps an ordinary principal P, BOTH
+-- halves were writable without `epigraph_maintenance`:
+--
+--   * `groups_tenancy` / `group_memberships_tenancy` let P insert a `writer`
+--     row for ANY agent X into P's own personal group, and `edges` accepts an
+--     `X --OPERATED_BY--> P` edge from P's session. P thereby became X's
+--     "operator" -- owner of all X's claims, and owner-group of X's future
+--     writes -- without X's consent and without the maintenance grant.
+--   * worse, `record_auth_lineage` ALREADY writes `signer --OPERATED_BY--> P`
+--     for every OAuth caller P of an HTTP server, so ONE membership row from P
+--     made the shared HTTP signer "operated by P" at runtime.
+--
+-- REST `create_edge` also accepts `OPERATED_BY` with arbitrary `properties`, so
+-- marking the edge (`properties->>'source'`) would not have been a fix either.
+-- The authority therefore lives in `operator_links`, which only a definer frame
+-- (or a maintenance login) can write:
+--
+--   * ENABLE + FORCE row security, with an INSERT policy whose only disjunct is
+--     `epigraph_definer_bypass()`, i.e. `current_user` a member of
+--     `epigraph_maintenance`. Inside `epigraph_link_operator` that is the
+--     function OWNER; on an `epigraph_app` session it is false. A maintenance
+--     login satisfies it too, which is the same trust the link function
+--     already extends to that role.
+--   * a SELECT policy of `epigraph_bypass() OR epigraph_definer_bypass()`, so the
+--     definer reads below and a maintenance session can see rows and an app
+--     session sees none.
+--   * NO UPDATE and NO DELETE policy: under FORCE that is a default-deny for
+--     every role that is not a superuser. A link is ended by revoking the
+--     membership (section 5), never by editing this row.
+--     `rls_enforcement.rs::DELIBERATELY_UNCOVERED` records both pairs.
+--   * `REVOKE ALL ... FROM PUBLIC, epigraph_app`, then `GRANT SELECT` back to
+--     `epigraph_app`. 077's `ALTER DEFAULT PRIVILEGES` would otherwise hand
+--     `epigraph_app` INSERT/UPDATE/DELETE on this table the moment it is
+--     created. SELECT is kept because
+--     `rls_enforcement.rs::the_app_role_can_reach_every_public_table_without_the_test_fixture`
+--     requires it of every relation, and it discloses nothing: the SELECT
+--     policy admits no row to an app session. The policies are the control;
+--     the revoke is the second lock.
+--
+-- The table carries no `visibility` / `owner_group_id` columns on purpose: it is
+-- control state, not a tenancy-partitioned entity, and
+-- `locked_decisions.rs` recovers 062's `tier_a` from exactly those two column
+-- names.
+--
+-- ===================================================================
+-- 5. THE READ SIDE: `epigraph_operator_of`, AND WHY IT IS A DEFINER
 --
 -- On an UNSTAMPED `epigraph_app` session `groups_tenancy` and
 -- `group_memberships_tenancy` hide every row, so a read-first-then-mint helper
@@ -80,28 +141,32 @@
 -- `begin_author_stamped_tx` records the measurement). The authoring path must
 -- ask "does this agent have an operator, and what is the operator's group?"
 -- WITHOUT depending on the caller's stamp, so the question is a `STABLE
--- SECURITY DEFINER` read granted to `epigraph_app`. It returns nothing it did
--- not already expose: `OPERATED_BY` edges are public (agent endpoints stamp
--- `('public', world)` in 070/072) and a personal group's id is derived from the
--- public `did:epigraph:personal:<agent>` key.
+-- SECURITY DEFINER` read granted to `epigraph_app`.
 --
--- A LIVE LINK is BOTH halves: an `OPERATED_BY` edge in force AND a live
--- `writer`/`admin` membership in the target's personal group. The membership
--- conjunct is what keeps an HTTP server's auth-lineage edges (one per OAuth
--- principal that ever called it, and no membership) from reading as links. A
--- revoked membership therefore ends the link for authoring AND for ownership in
--- the same statement, with no second switch to forget.
+-- A LIVE LINK is BOTH halves: the `operator_links` row AND a live
+-- `writer`/`admin` membership for the agent in the group that row names. The
+-- row is what makes the link unforgeable; the membership conjunct is what lets
+-- the operator END it with an ordinary revoke. A revoked membership therefore
+-- ends the link for authoring AND for ownership in the same statement, with no
+-- second switch to forget.
 --
--- More than one live link is returned as more than one row; the Rust callers
--- treat that as ambiguous (no operator for authoring and ownership, a refusal
--- for the HTTP startup gate). `epigraph_link_operator` refuses to create a
--- second live link, so ambiguity is reachable only through out-of-band writes.
+-- DISCLOSURE, ACCEPTED: the function answers for ANY agent id, so an app
+-- session can learn whether an agent is operated, by whom, and -- through the
+-- membership conjunct -- whether that one membership is live, which
+-- `group_memberships_tenancy` would otherwise hide from a non-member. The
+-- operator relationship is already public through the `OPERATED_BY` edge
+-- (agent endpoints stamp `('public', world)` in 070/072) and a personal group's
+-- id follows from the public `did:epigraph:personal:<agent>` key, so the new
+-- information is one liveness bit per link. That is accepted rather than bound
+-- to the session principal (083's shape): the authoring path must ask about
+-- the AUTHOR, and the ownership gate about the claim's author, neither of which
+-- is the session principal.
 --
 -- ===================================================================
--- 5. OWNERSHIP IS THE MECHANISM, AS IN 086/089/092
+-- 6. OWNERSHIP IS THE MECHANISM, AS IN 086/089/092
 --
--- Both bodies read or write FORCEd-RLS tables (`edges`, `groups`,
--- `group_memberships`), so they work only inside a definer frame that
+-- Both bodies read or write FORCEd-RLS tables (`operator_links`, `edges`,
+-- `groups`, `group_memberships`), so they work only inside a definer frame that
 -- `epigraph_definer_bypass()` admits, i.e. while the OWNER is a member of
 -- `epigraph_maintenance`. The `OWNER TO` below sits in a `pg_roles` guard and
 -- can silently no-op, so it is pinned in CI by
@@ -112,43 +177,64 @@
 -- an unbypassed `epigraph_link_operator` is refused by the tenancy policies.
 --
 -- ===================================================================
--- 6. DEPLOY ORDER AND UNDO
+-- 7. DEPLOY ORDER AND UNDO
 --
 -- `ClaimRepository::default_decl_for_author` calls `epigraph_operator_of`, so a
 -- binary carrying this change FAILS CLOSED on every claim write against a
 -- database that has not applied 102 (`42883 function does not exist`). Apply
 -- 102 before, or with, the binary.
 --
--- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`
--- and `DROP FUNCTION IF EXISTS public.epigraph_operator_of(uuid)` -- but only
--- together with a binary that no longer calls them. Links already recorded are
--- ordinary `edges` / `group_memberships` rows; revoking the membership
--- (`UPDATE group_memberships SET revoked_at = now() ...`) ends a link without
--- any DDL. **Applied to a throwaway database only, NOT to any deployed
+-- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`,
+-- `DROP FUNCTION IF EXISTS public.epigraph_operator_of(uuid)` and
+-- `DROP TABLE IF EXISTS public.operator_links` -- but only together with a
+-- binary that no longer calls them, and after removing `operator_links` from
+-- `epigraph_api::state::FORCE_PROTECTED_SET` (its boot assertion counts FORCEd
+-- relations). Revoking the agent's membership
+-- (`UPDATE group_memberships SET revoked_at = now() ...`) ends one link
+-- without any DDL. **Applied to a throwaway database only, NOT to any deployed
 -- database.**
 -- ===================================================================
 
--- The read. See section 4.
+-- The link record. See section 4.
+CREATE TABLE IF NOT EXISTS public.operator_links (
+    agent_id          uuid PRIMARY KEY REFERENCES public.agents(id) ON DELETE RESTRICT,
+    operator_id       uuid NOT NULL REFERENCES public.agents(id) ON DELETE RESTRICT,
+    operator_group_id uuid NOT NULL REFERENCES public.groups(id) ON DELETE RESTRICT,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT operator_links_not_self CHECK (agent_id <> operator_id)
+);
+CREATE INDEX IF NOT EXISTS idx_operator_links_operator
+    ON public.operator_links (operator_id);
+
+ALTER TABLE public.operator_links ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.operator_links FORCE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS operator_links_definer_read ON public.operator_links;
+CREATE POLICY operator_links_definer_read ON public.operator_links
+    FOR SELECT TO PUBLIC
+    USING ((SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass()));
+
+DROP POLICY IF EXISTS operator_links_definer_insert ON public.operator_links;
+CREATE POLICY operator_links_definer_insert ON public.operator_links
+    FOR INSERT TO PUBLIC
+    WITH CHECK ((SELECT public.epigraph_definer_bypass()));
+
+REVOKE ALL ON public.operator_links FROM PUBLIC;
+
+-- The read. See section 5.
 CREATE OR REPLACE FUNCTION public.epigraph_operator_of(p_agent uuid)
 RETURNS TABLE (operator_id uuid, operator_group_id uuid)
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
-    SELECT DISTINCT e.target_id, g.id
-      FROM public.edges e
-      JOIN public.groups g
-        ON g.did_key = 'did:epigraph:personal:' || e.target_id::text
-       AND g.kind = 'personal'
+    SELECT l.operator_id, l.operator_group_id
+      FROM public.operator_links l
       JOIN public.group_memberships m
-        ON m.group_id = g.id
-       AND m.agent_id = p_agent
+        ON m.group_id = l.operator_group_id
+       AND m.agent_id = l.agent_id
        AND m.revoked_at IS NULL
        AND m.role IN ('writer', 'admin')
-     WHERE e.source_id = p_agent
-       AND e.source_type = 'agent'
-       AND e.target_type = 'agent'
-       AND e.relationship = 'OPERATED_BY'
-       AND e.target_id <> p_agent
-       AND (e.valid_to IS NULL OR e.valid_to > now())
+     WHERE l.agent_id = p_agent
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) FROM PUBLIC;
 
@@ -192,21 +278,21 @@ BEGIN
     END IF;
     -- Single hop. An operator that is itself operated would make "who owns
     -- this" depend on a chain nobody declared as a whole.
-    IF EXISTS (SELECT 1 FROM public.epigraph_operator_of(p_operator)) THEN
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
         RAISE EXCEPTION 'epigraph_link_operator: % is itself operated by another agent and '
                         'cannot be an operator', p_operator
             USING ERRCODE = '55000';
     END IF;
-    -- One live operator per agent. A second declaration is a configuration
-    -- error to surface, not a link to add or a link to silently replace.
-    SELECT o.operator_id INTO v_other
-      FROM public.epigraph_operator_of(p_agent) o
-     WHERE o.operator_id <> p_operator
-     LIMIT 1;
+    -- One operator per agent, ever. A second declaration is a configuration
+    -- error to surface, not a link to add or a link to silently replace --
+    -- whatever the state of the first link's membership.
+    SELECT l.operator_id INTO v_other
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent AND l.operator_id <> p_operator;
     IF v_other IS NOT NULL THEN
-        RAISE EXCEPTION 'epigraph_link_operator: agent % already has a live link to operator %; '
-                        'revoke that membership before linking it to %',
-                        p_agent, v_other, p_operator
+        RAISE EXCEPTION 'epigraph_link_operator: agent % already has a link to operator %; '
+                        'an agent is linked to one operator, and re-pointing it is an '
+                        'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
 
@@ -233,7 +319,12 @@ BEGIN
          WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text;
     END IF;
 
-    -- (b) The agent's writer membership: recorded once. Both guards are
+    -- (b) The link record: recorded once. See section 4.
+    INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id)
+    VALUES (p_agent, p_operator, v_group)
+    ON CONFLICT (agent_id) DO NOTHING;
+
+    -- (c) The agent's writer membership: recorded once. Both guards are
     -- load-bearing -- see section 3.
     INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
                                           epoch, role)
@@ -243,7 +334,8 @@ BEGIN
     ON CONFLICT DO NOTHING;
     GET DIAGNOSTICS v_mem_rows = ROW_COUNT;
 
-    -- (c) The edge, if no OPERATED_BY edge exists between the pair in any state.
+    -- (d) The graph record, if no OPERATED_BY edge exists between the pair in
+    -- any state. It grants nothing; see section 4.
     INSERT INTO public.edges (source_id, source_type, target_id, target_type,
                               relationship, properties)
     SELECT p_agent, 'agent', p_operator, 'agent', 'OPERATED_BY',
@@ -276,11 +368,14 @@ DO $$ BEGIN
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) '
                 'TO epigraph_maintenance';
+        EXECUTE 'GRANT SELECT, INSERT ON public.operator_links TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_link_operator(uuid, uuid) '
                 'FROM epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) '
                 'TO epigraph_app';
+        EXECUTE 'REVOKE ALL ON public.operator_links FROM epigraph_app';
+        EXECUTE 'GRANT SELECT ON public.operator_links TO epigraph_app';
     END IF;
 END $$;
