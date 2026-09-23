@@ -417,14 +417,25 @@ async fn a_brand_new_authors_first_submission_carries_a_writable_stamp(pool: PgP
 /// The negative half: an author whose personal-group membership has been REVOKED
 /// is refused up front, and nothing is written.
 ///
-/// Why revocation rather than a missing group: `personal_group_of` is read-first
-/// and mints only when the group is ABSENT, deliberately, so that a write path
-/// can never revive a membership somebody revoked
-/// (`claim.rs::personal_group_of`'s doc states that as a security property). So a
-/// revoked membership is the one state the pre-ensure cannot repair — and it is
-/// exactly the state in which the stamp would be `{}` and the submission would
-/// fail from inside the transaction, on whichever statement came first, with a
-/// `42501` naming a table rather than the cause.
+/// Why revocation rather than a missing group: a missing group is ensured by
+/// `server.rs::agent_id`'s PR-09 block on the first `agent_id()` call of the
+/// process, so "no group at all" is not a state a submission reaches. A REVOKED
+/// membership is, and it is exactly the state in which the stamp would be `{}`
+/// and the submission would fail from inside the transaction, on whichever
+/// statement came first, with a `42501` naming a table rather than the cause.
+///
+/// # Why this arm is faithful to production and not an artefact of the harness
+///
+/// `agent_id()` caches after its first call, so the SECOND submission below does
+/// NOT re-run `ensure_personal_group` — which matters, because that function's
+/// membership statement is `ON CONFLICT … DO UPDATE SET revoked_at = NULL, role =
+/// 'admin'` and would otherwise revive what the test just revoked. The write path
+/// itself calls nothing that re-mints: a `personal_group_of_pool` pre-ensure was
+/// added to `begin_author_stamped_tx` and then removed precisely because on an
+/// unstamped `epigraph_app` session its lookup is blind and it would take that
+/// revive path on every submission, making this arm pass here and mean nothing in
+/// production. Both halves of that are measured in
+/// `epigraph-db/tests/author_stamped_write_loop.rs::the_personal_group_lookup_is_blind_on_an_unstamped_app_session`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_author_with_no_live_writable_membership_is_refused_before_anything_is_written(
     pool: PgPool,
@@ -459,7 +470,7 @@ async fn an_author_with_no_live_writable_membership_is_refused_before_anything_i
              here means the process is relying on the session bypassing RLS.",
         );
     assert!(
-        err.message.contains("no writable group"),
+        err.message.contains("no live writable group membership"),
         "the refusal must name the cause — the author has no writable group — rather than \
          surfacing a 42501 from whichever statement ran first; got: {}",
         err.message

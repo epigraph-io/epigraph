@@ -13,6 +13,10 @@
 //!   declares `SECURITY DEFINER`, owns as `epigraph_maintenance` and grants to
 //!   `epigraph_app`. THIS FILE, arm 1, with the calibration that the direct read
 //!   on the same connection returns nothing.
+//!   Arm 1b is the sibling measurement that keeps a write path from "helpfully"
+//!   ensuring the author's group on that same connection: the `groups` lookup is
+//!   blind there too, so an ensure would take its membership-REVIVING mint path
+//!   on every submission.
 //! * **stamp → `epigraph_writable_groups()`.** THIS FILE, arm 2, under
 //!   `begin_as` — the primitive the MCP path uses, with `is_local = true`.
 //!   `qual_guc_coherence.rs::writable_gucs_match_the_viewers_writable_set` and
@@ -103,6 +107,108 @@ async fn viewer_resolve_reaches_the_authors_memberships_on_an_unstamped_app_sess
          the failure mode the whole conversion would silently inherit: every submission stamped \
          `{{}}`, every tier-A WITH CHECK refusing it. Got: {:?}",
         viewer.writable_groups()
+    );
+}
+
+/// ARM 1b. THE READ THAT LOOKS SAFE AND IS BLIND: `personal_group_of`'s
+/// `SELECT id FROM groups WHERE did_key = …` sees NOTHING on the same unstamped
+/// app session, so on that session it always takes its MINT path — and the mint
+/// revives a revoked membership.
+///
+/// # Why this arm exists at all
+///
+/// `epigraph-mcp`'s `begin_author_stamped_tx` briefly called
+/// `ClaimRepository::personal_group_of_pool` on `server.pool` as belt-and-braces
+/// before resolving the author's viewer. That call was removed, and this arm is
+/// the measurement that says why rather than leaving it to a comment nobody can
+/// check.
+///
+/// `personal_group_of`'s doc states its read-first order as a SECURITY property:
+/// `epigraph_ensure_personal_group`'s membership statement is
+/// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL,
+/// role = 'admin'`, so the mint path REVIVES a revoked membership, and the
+/// lookup is what keeps a write path from reaching it. That property holds only
+/// if the lookup can see the row. On an unstamped `epigraph_app` session it
+/// cannot: `groups_tenancy`'s USING is `bypass OR definer_bypass OR id =
+/// ANY(session_groups) OR created_by_agent_id = principal_id` (migration 077
+/// §6), and every arm is false there.
+///
+/// So a write path that called it on `server.pool` would re-mint on EVERY
+/// submission, silently restoring memberships somebody revoked — and it would
+/// have passed every `#[sqlx::test]` arm, because the superuser harness reads
+/// `groups` fine and therefore never reaches the mint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_personal_group_lookup_is_blind_on_an_unstamped_app_session(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "loopblind").await;
+    let did_key = format!("did:epigraph:personal:{author}");
+
+    // CALIBRATION: the superuser harness sees the row, so the 0 below is the
+    // POLICY and not a missing fixture.
+    let seen_as_superuser: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE did_key = $1")
+            .bind(&did_key)
+            .fetch_one(&pool)
+            .await
+            .expect("read groups as the harness role");
+    assert_eq!(
+        seen_as_superuser, 1,
+        "the fixture must have seeded the personal group under the deterministic did_key"
+    );
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let seen_as_app: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM groups WHERE did_key = $1")
+        .bind(&did_key)
+        .fetch_one(&app)
+        .await
+        .expect("the read must not ERROR — it must return nothing");
+    assert_eq!(
+        seen_as_app, 0,
+        "if the unstamped app session CAN see the group, `personal_group_of` is a real \
+         read-first lookup on the MCP write path and the belt-and-braces pre-ensure that was \
+         removed from `begin_author_stamped_tx` can be restored. Until then it is a blind read \
+         that always mints."
+    );
+
+    // The second half: what the mint does to a revoked membership. Measured on
+    // the harness role, because the hazard is the STATEMENT's `ON CONFLICT`, not
+    // who calls it.
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(author)
+        .execute(&pool)
+        .await
+        .expect("revoke the author's membership");
+    let live_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM group_memberships \
+          WHERE agent_id = $1 AND group_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(author)
+    .bind(author_group)
+    .fetch_one(&pool)
+    .await
+    .expect("count live memberships");
+    assert_eq!(live_before, 0, "CALIBRATION: the revoke took effect");
+
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(author)
+        .fetch_one(&pool)
+        .await
+        .expect("re-mint the personal group the way the blind read's fallback would");
+    let live_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM group_memberships \
+          WHERE agent_id = $1 AND group_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(author)
+    .bind(author_group)
+    .fetch_one(&pool)
+    .await
+    .expect("count live memberships");
+    assert_eq!(
+        live_after, 1,
+        "the mint path is expected to REVIVE the revoked membership — that is why it must not \
+         be reachable from a write path. If this ever returns 0 the `ON CONFLICT … DO UPDATE SET \
+         revoked_at = NULL` was narrowed, and the argument in \
+         `epigraph-mcp/src/claim_helper.rs::begin_author_stamped_tx` needs revisiting rather \
+         than quietly becoming stale."
     );
 }
 
