@@ -513,6 +513,109 @@ impl AgentRateLimiter {
     }
 }
 
+/// Build the API rate limiter from operator settings, or `None` when it is
+/// off.
+///
+/// Pure: `bin/server.rs` reads `EPIGRAPH_RATE_LIMIT_RPM`,
+/// `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` and `EPIGRAPH_TRUSTED_PROXIES` and passes
+/// the raw values in, so every branch is testable without touching process
+/// state. `docs/deploy.md` ("API rate limiting") is the operator contract.
+///
+/// # Off unless asked for
+///
+/// `rpm` unset, empty or `0` disables rate limiting. It is opt-in because a
+/// per-principal quota that suits interactive traffic throttles batch
+/// callers (ingestion scripts, bulk `submit/packet`, MCP-over-HTTP), and a
+/// deployment should choose its number rather than inherit one.
+///
+/// # Global limit off unless asked for
+///
+/// `global_rpm` unset, empty or `0` leaves the global bucket disabled: it is
+/// shared by every caller, so a value below real aggregate load turns one busy
+/// client into everyone's 429.
+///
+/// # Trusted proxies
+///
+/// Unset or empty: loopback ([`default_trusted_proxies`]), which is where the
+/// same-host reverse proxy connects from. `none`: trust no one. Otherwise a
+/// comma-separated list of addresses and CIDRs. Parsed, and so validated, even
+/// when the limiter is off, so a typo fails the boot that introduced it.
+///
+/// # Errors
+///
+/// A value that does not parse, or a global limit set without a per-client
+/// one (a limit the operator believes is enforced but would not be). The
+/// caller refuses to start rather than run with a limit other than the one
+/// configured.
+pub fn rate_limiter_from_settings(
+    rpm: Option<&str>,
+    global_rpm: Option<&str>,
+    trusted_proxies: Option<&str>,
+) -> Result<Option<AgentRateLimiter>, String> {
+    fn positive(name: &str, value: Option<&str>) -> Result<Option<u32>, String> {
+        match value.map(str::trim).filter(|v| !v.is_empty()) {
+            None => Ok(None),
+            Some(v) => match v.parse::<u32>() {
+                Ok(0) => Ok(None),
+                Ok(n) => Ok(Some(n)),
+                Err(e) => Err(format!(
+                    "{name}={v:?} is not a whole number of requests per minute: {e}"
+                )),
+            },
+        }
+    }
+
+    // Empty is unset, as for the two limits: `Environment=EPIGRAPH_TRUSTED_PROXIES=`
+    // in a unit file must not quietly mean "trust no one", which behind a
+    // same-host proxy puts every client in the proxy's bucket.
+    let trusted = match trusted_proxies.map(str::trim).filter(|v| !v.is_empty()) {
+        None => default_trusted_proxies(),
+        Some(v) if v.eq_ignore_ascii_case("none") => Vec::new(),
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                entry
+                    .parse::<IpNet>()
+                    .or_else(|_| entry.parse::<IpAddr>().map(IpNet::from))
+                    .map(|net| net.trunc())
+                    .map_err(|_| {
+                        format!(
+                            "EPIGRAPH_TRUSTED_PROXIES entry {entry:?} is neither an IP address \
+                             nor a CIDR (use `none` to trust no proxy)"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    let per_client = positive("EPIGRAPH_RATE_LIMIT_RPM", rpm)?;
+    let global = positive("EPIGRAPH_RATE_LIMIT_GLOBAL_RPM", global_rpm)?;
+
+    let Some(default_rpm) = per_client else {
+        if global.is_some() {
+            return Err(
+                "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM is set but EPIGRAPH_RATE_LIMIT_RPM \
+                        is not, so no rate limiting would run at all; set both, or unset \
+                        the global limit"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    };
+
+    let config = RateLimitConfig {
+        default_rpm,
+        global_rpm: global.unwrap_or(0),
+        replenish_interval_secs: 1,
+        enable_global_limit: global.is_some(),
+    };
+    Ok(Some(
+        AgentRateLimiter::new(config).with_trusted_proxies(trusted),
+    ))
+}
+
 impl std::fmt::Debug for AgentRateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentRateLimiter")
@@ -644,6 +747,113 @@ mod tests {
             limiter.check(&throttled).is_err(),
             "a sweep must not reset a throttled caller's quota"
         );
+    }
+
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn settings_leave_rate_limiting_off_unless_a_per_client_rpm_is_given() {
+        for rpm in [None, Some(""), Some("  "), Some("0")] {
+            assert!(
+                rate_limiter_from_settings(rpm, None, None)
+                    .expect("valid")
+                    .is_none(),
+                "rpm {rpm:?} must mean disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_pass_the_configured_numbers_through() {
+        let limiter = rate_limiter_from_settings(Some("120"), None, None)
+            .expect("valid")
+            .expect("enabled");
+        assert_eq!(limiter.config().default_rpm, 120);
+        assert!(
+            !limiter.config().enable_global_limit,
+            "no global limit unless one is configured"
+        );
+        assert_eq!(limiter.trusted_proxies(), default_trusted_proxies());
+
+        let limiter = rate_limiter_from_settings(Some(" 600 "), Some("50000"), None)
+            .expect("valid")
+            .expect("enabled");
+        assert_eq!(limiter.config().default_rpm, 600);
+        assert!(limiter.config().enable_global_limit);
+        assert_eq!(limiter.config().global_rpm, 50_000);
+
+        let limiter = rate_limiter_from_settings(Some("60"), Some("0"), None)
+            .expect("valid")
+            .expect("enabled");
+        assert!(
+            !limiter.config().enable_global_limit,
+            "0 disables the global limit"
+        );
+    }
+
+    #[test]
+    fn settings_parse_trusted_proxies() {
+        let limiter = rate_limiter_from_settings(
+            Some("60"),
+            None,
+            Some("10.0.0.0/8, 192.168.1.5,2001:db8::/32,"),
+        )
+        .expect("valid")
+        .expect("enabled");
+        assert_eq!(
+            limiter.trusted_proxies(),
+            [
+                net("10.0.0.0/8"),
+                net("192.168.1.5/32"),
+                net("2001:db8::/32")
+            ]
+        );
+        assert!(limiter.is_trusted_proxy("10.1.2.3".parse().unwrap()));
+        assert!(
+            !limiter.is_trusted_proxy("127.0.0.1".parse().unwrap()),
+            "an explicit list replaces the loopback default"
+        );
+
+        let limiter = rate_limiter_from_settings(Some("60"), None, Some("None"))
+            .expect("valid")
+            .expect("enabled");
+        assert!(limiter.trusted_proxies().is_empty());
+    }
+
+    #[test]
+    fn settings_refuse_values_that_would_not_do_what_they_say() {
+        assert!(rate_limiter_from_settings(Some("sixty"), None, None).is_err());
+        assert!(rate_limiter_from_settings(Some("-1"), None, None).is_err());
+        assert!(rate_limiter_from_settings(Some("60"), Some("lots"), None).is_err());
+        assert!(
+            rate_limiter_from_settings(None, Some("5000"), None).is_err(),
+            "a global limit with no per-client limit would enforce nothing"
+        );
+        assert!(
+            rate_limiter_from_settings(None, None, Some("10.0.0.0/33")).is_err(),
+            "a malformed proxy list fails even while the limiter is off"
+        );
+        assert_eq!(
+            rate_limiter_from_settings(Some("60"), None, Some(" "))
+                .expect("valid")
+                .expect("enabled")
+                .trusted_proxies(),
+            default_trusted_proxies(),
+            "an empty proxy list is unset, not `none`"
+        );
+    }
+
+    #[test]
+    fn the_default_trusted_set_is_loopback_only() {
+        let limiter = AgentRateLimiter::with_defaults();
+        assert!(limiter.is_trusted_proxy("127.0.0.1".parse().unwrap()));
+        assert!(limiter.is_trusted_proxy("127.3.4.5".parse().unwrap()));
+        assert!(limiter.is_trusted_proxy("::1".parse().unwrap()));
+        assert!(limiter.is_trusted_proxy("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!limiter.is_trusted_proxy("10.0.0.1".parse().unwrap()));
+        assert!(!limiter.is_trusted_proxy("::2".parse().unwrap()));
     }
 
     /// A request the SERVICE refused for load is not billed to the caller.

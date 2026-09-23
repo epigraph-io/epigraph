@@ -1102,3 +1102,76 @@ library recall has no principal at all, so there is no personal group to name
 and migration 062's `recall_events_group_needs_real_group` CHECK forbids
 substituting a sentinel. Rows from that path remain `('public', world)` and are
 identifiable by `agent_id IS NULL`.
+
+---
+
+## API rate limiting (opt-in) — `EPIGRAPH_RATE_LIMIT_RPM`
+
+**Nothing changes on deploy.** Rate limiting stays **off** unless
+`EPIGRAPH_RATE_LIMIT_RPM` is set. Until this change no production code installed
+a limiter at all, so `rate_limit_middleware` passed every request through; it is
+now available, but a deployment has to choose its number.
+
+```ini
+# epigraph-api.service
+Environment=EPIGRAPH_RATE_LIMIT_RPM=600
+# Optional: a ceiling across ALL callers. Leave unset unless you know the
+# aggregate load; it is one shared bucket.
+#Environment=EPIGRAPH_RATE_LIMIT_GLOBAL_RPM=20000
+# Optional: who may set X-Forwarded-For. Default: loopback only.
+#Environment=EPIGRAPH_TRUSTED_PROXIES=127.0.0.1,::1
+```
+
+| Variable | Unset / empty / `0` | Otherwise |
+|---|---|---|
+| `EPIGRAPH_RATE_LIMIT_RPM` | limiter off | requests per minute per principal (or per client address, for anonymous traffic) |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | no global ceiling | requests per minute across everyone; **refuses to boot** if set without `EPIGRAPH_RATE_LIMIT_RPM` |
+| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8`, `::1` | comma-separated addresses/CIDRs, or `none` |
+
+A value that does not parse makes the process `exit(1)` at boot, and the boot
+log says which limits are in force (`API rate limiting enabled` / `disabled`).
+
+**Sizing.** The quota is per principal, and every request counts, reads
+included. Batch callers — ingestion scripts, bulk `POST /api/v1/submit/packet`,
+MCP-over-HTTP clients — burst far above interactive traffic. Size the number for
+your heaviest legitimate principal, not for a browser. Over the limit a caller
+gets `429` with `Retry-After`; successful responses carry `X-RateLimit-Limit`
+and `X-RateLimit-Remaining`. `/health`, `/readiness`, `/liveness` and `OPTIONS`
+are never limited.
+
+**Who counts as one caller.**
+
+* A request whose bearer token authentication would accept is keyed on its
+  **principal** (`agent_id`, else the OAuth client), wherever it connects from.
+  Two agents behind one NAT get separate quotas; one agent hopping addresses
+  keeps one quota.
+* Anything else — no token, or a token that is invalid, expired or revoked — is
+  keyed on the **client address**. IPv6 clients are keyed by their `/64`.
+* The client address is the TCP peer. Only when the peer is a trusted proxy is
+  `X-Forwarded-For` believed, read from the **right**: the right-most entry that
+  is not itself a trusted proxy is the client. Entries to its left were written
+  by the client and are ignored. That rule is correct whether the proxy
+  replaces the header (Caddy's default since 2.5, which drops a client-supplied
+  `X-Forwarded-For` unless `trusted_proxies` is configured in Caddy) or appends
+  to it (nginx `$proxy_add_x_forwarded_for`). With no usable `X-Forwarded-For`,
+  a trusted proxy's `X-Real-IP` is used, then the peer.
+
+**The Caddy assumption.** The supported topology is Caddy on the same VM
+proxying to the API over loopback, which is why loopback is the default trusted
+set. If your proxy reaches the API from anywhere else — a Docker bridge
+(`172.17.0.1`), a separate load-balancer host — **add its address to
+`EPIGRAPH_TRUSTED_PROXIES`**, or every client will share the proxy's single
+bucket. Conversely, do not list a network whose hosts are not all proxies you
+run: any host in the trusted set can claim to be any client.
+
+The peer address reaches the middleware only because both listeners (plain and
+`EPIGRAPH_TLS_CERT`) serve with `into_make_service_with_connect_info`;
+`crates/epigraph-api/tests/rate_limit_wiring.rs` pins that. A request with
+neither a peer address nor a principal is let through unlimited, and warns once
+per process, rather than being pooled into one shared bucket.
+
+**Audit trail.** Every `429` is recorded in the in-process security audit log.
+For an authenticated caller it is also persisted to `security_events` under its
+agent id. An anonymous caller's key is a hash of its address, not an
+`agents.id`, so that insert fails the `agents` foreign key and logs
+`Failed to persist security event` — the anonymous `429` itself is unaffected.

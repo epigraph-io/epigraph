@@ -403,6 +403,9 @@ pub struct AppState {
     ///
     /// Optional: When None, rate limiting is disabled.
     /// Uses per-agent and global rate limits based on token bucket algorithm.
+    /// Every constructor leaves it `None`; `bin/server.rs` installs one only
+    /// when `EPIGRAPH_RATE_LIMIT_RPM` is set (see
+    /// `security::rate_limit::rate_limiter_from_settings`).
     pub rate_limiter: Option<AgentRateLimiter>,
     /// Security audit log for tracking security-relevant events
     ///

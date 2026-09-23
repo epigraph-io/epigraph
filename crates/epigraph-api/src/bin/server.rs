@@ -597,6 +597,48 @@ async fn main() {
         state.with_providers(providers)
     };
 
+    // API rate limiting: OPT-IN, and installed on BOTH feature variants'
+    // state because it is applied here, after they converge.
+    //
+    // Until this block existed nothing in production called
+    // `with_rate_limiter`: every `AppState` constructor sets `rate_limiter:
+    // None`, so `rate_limit_middleware` let every request through. It stays off
+    // unless EPIGRAPH_RATE_LIMIT_RPM is set, because the right per-principal
+    // number depends on the deployment's batch callers; see `docs/deploy.md`
+    // ("API rate limiting") and `rate_limiter_from_settings` for the contract.
+    // A malformed value refuses to boot rather than enforcing a different limit
+    // than the one written down. `tests/rate_limit_wiring.rs` pins this call.
+    let state = match epigraph_api::security::rate_limit::rate_limiter_from_settings(
+        std::env::var("EPIGRAPH_RATE_LIMIT_RPM").ok().as_deref(),
+        std::env::var("EPIGRAPH_RATE_LIMIT_GLOBAL_RPM")
+            .ok()
+            .as_deref(),
+        std::env::var("EPIGRAPH_TRUSTED_PROXIES").ok().as_deref(),
+    ) {
+        Ok(Some(limiter)) => {
+            tracing::info!(
+                per_principal_or_client_rpm = limiter.config().default_rpm,
+                global_rpm = if limiter.config().enable_global_limit {
+                    limiter.config().global_rpm.to_string()
+                } else {
+                    "off".to_string()
+                },
+                trusted_proxies = ?limiter.trusted_proxies(),
+                "API rate limiting enabled: keyed on the bearer principal, else the \
+                 client address (forwarding headers believed only from trusted proxies)"
+            );
+            state.with_rate_limiter(limiter)
+        }
+        Ok(None) => {
+            tracing::info!("API rate limiting disabled (EPIGRAPH_RATE_LIMIT_RPM unset or 0)");
+            state
+        }
+        Err(reason) => {
+            tracing::error!(%reason, "invalid rate-limit configuration; refusing to start");
+            std::process::exit(1);
+        }
+    };
+
     // Start background job runner with ClusterGraph + ThemeClusterRebuild
     // handlers (db feature only).  The runner uses PostgresJobQueue for
     // durable persistence.  Each cron loop fires 60 s after startup then

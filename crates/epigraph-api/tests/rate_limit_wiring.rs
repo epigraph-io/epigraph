@@ -16,6 +16,13 @@
 //! peer address, and every anonymous request on it goes unlimited. The
 //! internal metrics listener is deliberately NOT required to carry connect
 //! info: it serves `metrics_app`, which has no rate-limit layer.
+//!
+//! And the operator settings reach the state: the three env vars are read and
+//! handed to `rate_limiter_from_settings`, whose result is installed with
+//! `with_rate_limiter`. Until that call existed, no production code installed a
+//! limiter and the middleware let every request through. What the settings
+//! MEAN is tested where they are parsed (`security::rate_limit` unit tests);
+//! this only proves `main` passes them through rather than dropping them.
 
 mod lint_text;
 
@@ -59,5 +66,40 @@ fn both_application_listeners_serve_with_connect_info() {
         "bin/server.rs serves the application router as `axum::serve(listener, app)`, \
          which carries no peer address; use \
          `app.into_make_service_with_connect_info::<std::net::SocketAddr>()`"
+    );
+}
+
+#[test]
+fn the_rate_limit_settings_are_read_and_installed() {
+    let src = squash(&server_source());
+
+    let call = "epigraph_api::security::rate_limit::rate_limiter_from_settings(\
+                std::env::var(\"EPIGRAPH_RATE_LIMIT_RPM\").ok().as_deref(),\
+                std::env::var(\"EPIGRAPH_RATE_LIMIT_GLOBAL_RPM\").ok().as_deref(),\
+                std::env::var(\"EPIGRAPH_TRUSTED_PROXIES\").ok().as_deref(),)";
+    assert_eq!(
+        src.matches(call).count(),
+        1,
+        "bin/server.rs must pass EPIGRAPH_RATE_LIMIT_RPM, EPIGRAPH_RATE_LIMIT_GLOBAL_RPM and \
+         EPIGRAPH_TRUSTED_PROXIES, in that order, to rate_limiter_from_settings exactly once"
+    );
+
+    let installs = src.matches("state.with_rate_limiter(limiter)").count();
+    assert_eq!(
+        installs, 1,
+        "the limiter rate_limiter_from_settings returns must be installed with \
+         `state.with_rate_limiter(limiter)`; found {installs} install sites"
+    );
+
+    let call_at = src.find(call).expect("asserted above");
+    let install_at = src
+        .find("state.with_rate_limiter(limiter)")
+        .expect("asserted above");
+    let router_at = src
+        .find("create_router(")
+        .expect("bin/server.rs builds the router with create_router");
+    assert!(
+        call_at < install_at && install_at < router_at,
+        "the limiter must be installed on the state BEFORE create_router consumes it"
     );
 }
