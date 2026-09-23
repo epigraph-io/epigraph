@@ -1510,6 +1510,24 @@ pub async fn patch_claim(
         &params.remove_labels,
     )
     .await?;
+    // STILL UNSTAMPED, and named here rather than left silent. This transaction
+    // is ATOMIC but carries no tenancy context, so `patch_claim_atomic_conn`'s
+    // `UPDATE claims` is refused by `claims_tenancy`'s `WITH CHECK` on a session
+    // whose writable set is `{}` — the same refusal the `update_labels` tool
+    // above was converted out of.
+    //
+    // It is not converted with it because the fix is a REPOSITORY SIGNATURE
+    // CHANGE, not a call-site one: `patch_claim_atomic_conn` takes a
+    // `&mut sqlx::Transaction`, which `ScopedTx` is not (it derefs to
+    // `PgConnection`), so the parameter has to become a connection — with an
+    // `epigraph-api` caller to move and a `visibility_lint` register entry to
+    // write, since a `&mut PgConnection` parameter is exactly what that lint's
+    // connection scanner reads.
+    //
+    // Recorded because this site escaped the residual-write inventory
+    // altogether: it takes no `&server.pool` ARGUMENT — it calls
+    // `server.pool.begin()` — so an argument-shaped scan cannot see it. Its
+    // sibling `update_labels`, two functions up, was in that inventory.
     let mut tx = server.pool.begin().await.map_err(internal_error)?;
     let diff = ClaimRepository::patch_claim_atomic_conn(
         &mut tx,
