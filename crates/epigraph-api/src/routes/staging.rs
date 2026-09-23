@@ -1,13 +1,20 @@
 //! Staging ingestion endpoints for the screening UI.
 //!
-//! These endpoints create staging subgraphs from various sources (JSON claims,
-//! git repositories) that can be reviewed and selectively merged into the main
-//! graph. PDF ingestion is handled separately via the extract_pdf.py script.
+//! `ingest/json` builds a staging subgraph from submitted JSON claims and
+//! `analyze-rejection` previews the cascade of rejecting a staging edge. Both
+//! are pure previews: neither reads nor writes the database.
+//!
+//! `ingest/git` and `merge` are NOT implemented and answer `501 Not
+//! Implemented` for every well-formed request. They used to answer 200 with a
+//! fabricated result (an empty subgraph; merge counts for a merge that never
+//! wrote anything), which a client could not tell apart from success. PDF
+//! ingestion is handled separately via the extract_pdf.py script.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use uuid::Uuid;
 
 // ── Request / Response types ─────────────────────────────────────────────────
@@ -181,14 +188,24 @@ pub struct IngestGitRequest {
 
 /// POST /api/v1/staging/ingest/git
 ///
-/// Accepts a git repository path and parameters, runs the git ingester in
-/// dry-run mode, and returns a staging subgraph. The actual `ingest_git` binary
-/// would need to be invoked server-side; for now this validates the request and
-/// returns the structure for the UI to preview.
+/// **Not implemented.** Validates the body, so a malformed one is still a 400,
+/// then answers `501 Not Implemented`.
+///
+/// This used to return a hard-coded empty `StagingSubgraph` with 200, which a
+/// caller cannot tell apart from "this repository has no commits". The success
+/// type is `Infallible` so that a stub cannot report success again without
+/// changing this signature.
+///
+/// A real implementation must NOT shell out to the `ingest_git` binary with the
+/// client-supplied `repo_path`: that gives every authenticated caller an
+/// arbitrary server-filesystem read and a process spawn. It should take an
+/// uploaded bundle or an allow-listed repository id, or git ingestion should
+/// stay CLI-only (`crates/epigraph-cli/src/bin/ingest_git.rs` already ingests
+/// through the API).
 pub async fn ingest_git(
     State(_state): State<AppState>,
     Json(request): Json<IngestGitRequest>,
-) -> Result<Json<StagingSubgraph>, ApiError> {
+) -> Result<Infallible, ApiError> {
     if request.repo_path.trim().is_empty() {
         return Err(ApiError::ValidationError {
             field: "repo_path".to_string(),
@@ -196,13 +213,9 @@ pub async fn ingest_git(
         });
     }
 
-    // For now, return an empty staging subgraph.
-    // Full implementation will invoke ingest_git --dry-run and parse output.
-    Ok(Json(StagingSubgraph {
-        claims: Vec::new(),
-        edges: Vec::new(),
-        proposed_connections: Vec::new(),
-    }))
+    Err(ApiError::NotImplemented {
+        feature: "staging git ingest (POST /api/v1/staging/ingest/git)".to_string(),
+    })
 }
 
 // ── Merge ────────────────────────────────────────────────────────────────────
@@ -216,13 +229,29 @@ pub struct MergeRequest {
 
 /// POST /api/v1/staging/merge
 ///
-/// Merges accepted claims and edges from a staging subgraph into the main
-/// graph via the existing submit/packet endpoint. Only edges in
-/// `accepted_edge_ids` are included.
+/// **Not implemented.** Validates the body, so a malformed one is still a 400,
+/// then answers `501 Not Implemented`. Nothing is written.
+///
+/// This used to answer 200 with `{merged_claims, merged_edges,
+/// merged_connections}` while writing nothing, so a screening client could
+/// believe its reviewed claims had landed and discard the staging subgraph.
+/// `merged_connections` also counted every proposed connection whose staging
+/// claim was in the request, accepted or not. The success type is `Infallible`
+/// so that a stub cannot report success again without changing this signature.
+///
+/// A real merge belongs in its own change, and it must:
+/// - write through the repo layer (all SQL in `crates/epigraph-db/src/repos/`),
+///   not by calling the submit/packet HTTP handler;
+/// - write under the caller's scoped tenancy and ownership, and require a write
+///   scope;
+/// - create only the edges named in `accepted_edge_ids`, and only the proposed
+///   connections the caller explicitly accepted;
+/// - embed every inserted claim post-commit and join the write-path list in
+///   `CLAUDE.md`.
 pub async fn merge_staging(
     State(_state): State<AppState>,
     Json(request): Json<MergeRequest>,
-) -> Result<Json<MergeResponse>, ApiError> {
+) -> Result<Infallible, ApiError> {
     if request.staging.claims.is_empty() {
         return Err(ApiError::ValidationError {
             field: "staging.claims".to_string(),
@@ -230,46 +259,9 @@ pub async fn merge_staging(
         });
     }
 
-    // Filter edges to only include accepted ones
-    let accepted_edges: Vec<&StagingEdge> = request
-        .staging
-        .edges
-        .iter()
-        .filter(|e| request.accepted_edge_ids.contains(&e.id))
-        .collect();
-
-    let accepted_connections: Vec<&ProposedConnection> = request
-        .staging
-        .proposed_connections
-        .iter()
-        .filter(|c| {
-            // Accept connections where the staging claim is being merged
-            request
-                .staging
-                .claims
-                .iter()
-                .any(|cl| cl.id == c.staging_claim_id)
-        })
-        .collect();
-
-    // In a full implementation, this would:
-    // 1. Create EpistemicPackets for each claim
-    // 2. Submit them via the existing submit/packet handler
-    // 3. Create edges between accepted claims
-    // For now, return the count of what would be merged
-    Ok(Json(MergeResponse {
-        merged_claims: request.staging.claims.len(),
-        merged_edges: accepted_edges.len(),
-        merged_connections: accepted_connections.len(),
-    }))
-}
-
-/// Response from a merge operation.
-#[derive(Debug, Serialize)]
-pub struct MergeResponse {
-    pub merged_claims: usize,
-    pub merged_edges: usize,
-    pub merged_connections: usize,
+    Err(ApiError::NotImplemented {
+        feature: "staging merge (POST /api/v1/staging/merge)".to_string(),
+    })
 }
 
 // ── Rejection Cascade Analysis ───────────────────────────────────────────────
