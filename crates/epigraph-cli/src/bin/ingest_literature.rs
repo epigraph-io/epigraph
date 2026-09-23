@@ -302,6 +302,13 @@ fn default_version() -> String {
 // =============================================================================
 // API SUBMISSION TYPES (mirrors submit.rs)
 // =============================================================================
+//
+// These mirror structs are SIGNED. The server verifies the packet signature over
+// its own re-serialization of these fields, so each mirror must serialize to the
+// same JSON value the server's struct does. `skip_serializing_if` is therefore
+// set where the server sets it and nowhere else. See
+// `epigraph_cli::packet_signing` for the fields where that matters, and
+// `tests::server_verifies` for the test that pins it.
 
 #[derive(Debug, Serialize)]
 struct EpistemicPacket {
@@ -314,11 +321,17 @@ struct EpistemicPacket {
 #[derive(Debug, Serialize)]
 struct ClaimSubmission {
     content: String,
+    /// Omitted when `None`, as the server's `OptionalTruth` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     initial_truth: Option<f64>,
     agent_id: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `null` when `None`: the server always emits it.
     idempotency_key: Option<String>,
+    /// Never set by this ingester. Carried only because the server's struct
+    /// always emits `properties` (`null`) and `labels` (`[]`), and the
+    /// signature covers them.
+    properties: Option<serde_json::Value>,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -530,12 +543,20 @@ fn build_packets(
                 initial_truth: None, // Let the engine calculate from evidence
                 agent_id,
                 idempotency_key: None,
+                properties: None,
+                labels: Vec::new(),
             };
 
-            // The submit/packet endpoint requires a placeholder signature (128 hex zeros)
-            // until Ed25519 verification is wired up server-side. Real signatures are
-            // rejected by the current server implementation (see submit.rs validation).
-            let packet_signature = "0".repeat(128);
+            // Signed as `agent_id`'s key over the server's canonical signable
+            // bytes, so the packet verifies under EPIGRAPH_REQUIRE_SIGNATURES=true.
+            // Nothing mutates the packet after this; it is POSTed as built.
+            let packet_signature = epigraph_cli::packet_signing::packet_signature(
+                signer,
+                &claim_submission,
+                &evidence_items,
+                &trace,
+            )
+            .expect("packet mirror structs serialize to plain JSON");
 
             EpistemicPacket {
                 claim: claim_submission,
@@ -1131,6 +1152,63 @@ async fn create_prov_edge(
 mod tests {
     use super::*;
 
+    /// Would `submit_packet` accept this packet's signature from `signer`'s agent
+    /// under EPIGRAPH_REQUIRE_SIGNATURES=true? This encodes the packet as
+    /// reqwest's `.json()` does and decodes it into the server's own
+    /// `EpistemicPacket` as axum's `Json` does. It then verifies with the server's
+    /// `signable_bytes()`. A mirror field that serializes differently from the
+    /// server's struct fails here.
+    fn server_verifies(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
+        let wire = serde_json::to_vec(packet).expect("packet encodes");
+        let server: epigraph_api::routes::submit::EpistemicPacket =
+            serde_json::from_slice(&wire).expect("server decodes the wire packet");
+        let mut sig = [0u8; 64];
+        if hex::decode_to_slice(&server.signature, &mut sig).is_err() {
+            return false;
+        }
+        epigraph_crypto::SignatureVerifier::verify(
+            &signer.public_key(),
+            &server.signable_bytes().expect("server canonicalizes"),
+            &sig,
+        )
+        .expect("well-formed public key")
+    }
+
+    /// Every packet, both the text-only ones and those carrying Figure evidence,
+    /// is signed by the ingesting agent over the bytes the server recomputes. This
+    /// pins the mirror's null/[]/absent serialization of `idempotency_key`,
+    /// `properties`, `labels` and `initial_truth`.
+    #[test]
+    fn packets_verify_against_server_signable_bytes() {
+        let signer = AgentSigner::generate();
+        for json in [
+            sample_extraction_json(),
+            sample_extraction_with_figures_json(),
+        ] {
+            let extraction: LiteratureExtraction = serde_json::from_str(json).unwrap();
+            for packet in build_packets(&extraction, &signer, Uuid::new_v4()) {
+                let wire = serde_json::to_value(&packet).unwrap();
+                assert!(wire["claim"].get("initial_truth").is_none());
+                // `.get`, not indexing: a missing key would also index as Null.
+                assert_eq!(
+                    wire["claim"].get("idempotency_key"),
+                    Some(&serde_json::Value::Null)
+                );
+                assert_eq!(
+                    wire["claim"].get("properties"),
+                    Some(&serde_json::Value::Null)
+                );
+                assert_eq!(wire["claim"]["labels"], serde_json::json!([]));
+                assert!(
+                    server_verifies(&packet, &signer),
+                    "packet for {:?} must verify",
+                    packet.claim.content
+                );
+                assert!(!server_verifies(&packet, &AgentSigner::generate()));
+            }
+        }
+    }
+
     fn sample_extraction_json() -> &'static str {
         r#"{
             "source": {
@@ -1192,6 +1270,7 @@ mod tests {
         assert_eq!(p0.claim.agent_id, agent_id);
         assert_eq!(p0.reasoning_trace.methodology, "extraction");
         assert!(!p0.signature.is_empty());
+        assert!(server_verifies(p0, &signer));
 
         // Verify evidence hash matches raw content
         let expected_hash = hex::encode(ContentHasher::hash(
