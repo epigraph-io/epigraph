@@ -202,20 +202,18 @@ pub async fn ingest_document(
 
     preflight_write_authority(server, "ingest_document").await?;
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
-    let bg = EpiGraphMcpFull::new_shared(
-        server.pool.clone(),
-        Arc::clone(&server.signer),
-        Arc::clone(&server.embedder),
-        server.read_only,
-    );
-    // The detached task inherits the parent's `ScopedPool` when there is one.
-    // `new_shared` sets `scoped: None`, and `do_ingest_document` now runs its
-    // walk in a transaction stamped from that pool — without it the task
-    // refuses, which the preflight above has already ruled out.
-    let bg = match server.scoped.as_ref() {
-        Some(scoped) => bg.with_scoped_pool(scoped.clone()),
-        None => bg,
-    };
+    // A CLONE of the parent, not a fresh `new_shared`: it must carry the
+    // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
+    // exact state the preflight above was run against.
+    //
+    // The cache is the load-bearing part. A fresh server has an EMPTY
+    // `agent_db_id`, so the task's `agent_id()` re-ran PR-09's
+    // `ensure_personal_group` on the unstamped pool — the reviving `ON
+    // CONFLICT` — once per ingest rather than once per process. MEASURED by
+    // review (SQL trace of the detached task): agents lookup ->
+    // `epigraph_ensure_personal_group` -> the revoked personal membership is
+    // live again -> `INSERT INTO claims`.
+    let bg = server.clone();
     let doi_log = doi.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
@@ -237,11 +235,18 @@ pub async fn ingest_document(
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
-/// but the COMMON refusal — this server's agent has no live writable group, or
+/// but the COMMON refusal — this server's agent has no live writable
+/// membership of its PERSONAL group (which owns every row the walk writes), or
 /// the process was built without a `ScopedPool` — is knowable before the task
 /// starts. This opens exactly the transaction the task will open, from the same
-/// author, and drops it: so that refusal is returned to the caller as an error
-/// with nothing written, instead of a `queued` over a task that cannot write.
+/// author, runs the same owner-group check ([`IngestTx::owner_decl`]), and
+/// drops it: so that refusal is returned to the caller as an error with nothing
+/// written, instead of a `queued` over a task that cannot write.
+///
+/// Checking only "some writable group" was the earlier shape, and it was the
+/// wrong question: a server agent revoked in its personal group but live in a
+/// team group passed it, and the detached walk then revived the revoked
+/// membership (see `owner_decl`).
 ///
 /// What it cannot pre-empt, and is disclosed rather than hidden: a failure
 /// specific to the document's content (a constraint on one of its rows, a
@@ -252,7 +257,12 @@ async fn preflight_write_authority(
     tool_name: &'static str,
 ) -> Result<(), McpError> {
     let agent_id = server.agent_id().await?;
-    let tx = begin_ingest_tx(server, agent_id, tool_name).await?;
+    let mut tx = begin_ingest_tx(server, agent_id, tool_name).await?;
+    // The OWNER group, not merely "some writable group": the same read-only
+    // check the walk itself makes (`IngestTx::owner_decl`), so an author whose
+    // personal membership is revoked or read-only is refused HERE, to the
+    // caller, instead of being told `queued` over a task that writes nothing.
+    tx.owner_decl(agent_id, tool_name).await?;
     // Nothing was written on it; dropping it rolls back.
     drop(tx);
     Ok(())
@@ -283,18 +293,10 @@ pub async fn ingest_document_inline(
 
     preflight_write_authority(server, "ingest_document_inline").await?;
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
-    let bg = EpiGraphMcpFull::new_shared(
-        server.pool.clone(),
-        Arc::clone(&server.signer),
-        Arc::clone(&server.embedder),
-        server.read_only,
-    );
-    // The detached task inherits the parent's `ScopedPool`; see
-    // `ingest_document` above.
-    let bg = match server.scoped.as_ref() {
-        Some(scoped) => bg.with_scoped_pool(scoped.clone()),
-        None => bg,
-    };
+    // A clone of the parent, sharing its `agent_db_id` cache; see
+    // `ingest_document` above for why a fresh `new_shared` revived revoked
+    // memberships.
+    let bg = server.clone();
     let doi_log = doi.clone();
     tokio::spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
@@ -537,6 +539,87 @@ impl IngestTx<'_> {
             Self::Privileged(tx) => tx.commit().await.map_err(|e| e.to_string()),
         }
     }
+
+    /// The tenancy declaration every row of this ingest is owned under: the
+    /// ingesting agent's PERSONAL group — proved live and writable on THIS
+    /// transaction, never minted.
+    ///
+    /// # Why not `ClaimRepository::default_decl_for_author`
+    ///
+    /// That helper is read-first-then-MINT: when the personal group is not
+    /// visible it calls `ensure_personal_group`, whose `ON CONFLICT … DO UPDATE
+    /// SET revoked_at = NULL, role = 'admin'` revives a revoked admin
+    /// membership (hard constraint #3). On a transaction stamped from the
+    /// author, "not visible" means exactly "no LIVE membership of it" — the
+    /// case where minting is a privilege change, not provisioning.
+    ///
+    /// `begin_author_stamped_tx` only proves the author has SOME writable
+    /// group, and "some writable group is not the same question"
+    /// (`epigraph_ingest_executor::system_agent_write_authority` says so for
+    /// its own agent). MEASURED by review, on the real binary as `epigraph_app`:
+    /// server agent revoked in its personal group but a live `writer` in a team
+    /// group, `ingest_document_inline` twice — `personal:admin(revoked)` became
+    /// `personal:admin(live)` and +3 / +4 claims committed under it.
+    ///
+    /// So on the Stamped arm this is a pure read plus a refusal:
+    /// * [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
+    ///   — `None` means no live membership; refuse.
+    /// * `group = ANY(epigraph_writable_groups())` on the same transaction —
+    ///   the exact question migration 077's `WITH CHECK` will ask of every row;
+    ///   a live `reader` membership fails it; refuse.
+    ///
+    /// The Privileged arm (the operator CLI on `MaintenancePool`, BYPASSRLS) is
+    /// unchanged: there is no stamp to reason about, its reads are not blind,
+    /// and it is an operator acting on purpose.
+    async fn owner_decl(
+        &mut self,
+        agent_id: Uuid,
+        tool_name: &'static str,
+    ) -> Result<epigraph_core::TenancyDecl, McpError> {
+        let tx = match self {
+            Self::Privileged(tx) => {
+                return ClaimRepository::default_decl_for_author(tx, agent_id)
+                    .await
+                    .map_err(internal_error);
+            }
+            Self::Stamped(tx) => tx,
+        };
+        let refuse = |why: String| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                author = %agent_id,
+                "{why}"
+            );
+            internal_error(format!("{tool_name}: {why}"))
+        };
+        let Some(group) =
+            epigraph_db::GroupMembershipRepository::visible_personal_group_conn(tx, agent_id)
+                .await
+                .map_err(internal_error)?
+        else {
+            return Err(refuse(format!(
+                "the ingesting agent ({agent_id}) holds no LIVE membership of its personal group, \
+                 which owns every row this ingest would write. Refusing rather than provisioning \
+                 it: the provisioning call revives a revoked membership as admin, and reversing \
+                 a revocation is an operator decision. Nothing was written"
+            )));
+        };
+        let writable: bool =
+            sqlx::query_scalar("SELECT $1 = ANY(public.epigraph_writable_groups()::uuid[])")
+                .bind(group)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|e| internal_error(format!("{tool_name}: writable-group check: {e}")))?;
+        if !writable {
+            return Err(refuse(format!(
+                "the ingesting agent ({agent_id}) holds a live but READ-ONLY membership of its \
+                 personal group ({group}), which owns every row this ingest would write, so \
+                 every INSERT would be refused. Nothing was written"
+            )));
+        }
+        Ok(epigraph_core::TenancyDecl::public(group))
+    }
 }
 
 async fn begin_ingest_tx<'p>(
@@ -777,16 +860,14 @@ pub async fn do_ingest_document(
     // `persist_planned_claim`'s `decl` parameter for why. `TenancyDecl` is
     // `Copy`, so passing it per iteration costs nothing.
     //
-    // On the STAMPED transaction, not `default_decl_for_author_pool`: that
-    // variant's `personal_group_of` read is blind on an unstamped checkout
-    // (`groups_tenancy` has no true arm there), so it took its mint path —
-    // `epigraph_ensure_personal_group`'s reviving `ON CONFLICT` — on every
-    // document. Stamped from the author, the read sees the group and mints
-    // nothing; an author with no live writable group was already refused by
-    // `begin_author_stamped_tx`.
-    let decl = ClaimRepository::default_decl_for_author(&mut tx, agent_id)
-        .await
-        .map_err(internal_error)?;
+    // On the STAMPED transaction, and through a helper that never mints:
+    // `IngestTx::owner_decl`. The earlier comment here said "an author with no
+    // live writable group was already refused by `begin_author_stamped_tx`" —
+    // true, and the wrong discriminator: an author live in a TEAM group but
+    // revoked in its personal one passed that check, and
+    // `default_decl_for_author`'s mint path then revived the revoked admin
+    // membership inside this transaction. See `owner_decl`.
+    let decl = tx.owner_decl(agent_id, "ingest_document").await?;
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
@@ -1612,10 +1693,8 @@ pub async fn do_ingest_document_spine(
     let mut converged_unlabelled = 0_usize;
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
-    // Hoisted, as above.
-    let decl = ClaimRepository::default_decl_for_author(&mut tx, agent_id)
-        .await
-        .map_err(internal_error)?;
+    // Hoisted, as above, and through the same never-minting helper.
+    let decl = tx.owner_decl(agent_id, "ingest_document_spine").await?;
     for planned in &plan.claims {
         if planned.level == 3 {
             continue;
