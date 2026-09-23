@@ -134,4 +134,91 @@ impl SheafRepository {
 
         Ok(rows)
     }
+
+    /// The ids of every claim within `max_depth` epistemic hops of `center`,
+    /// walking only claims and edges the viewer may read. `center` itself is
+    /// included.
+    ///
+    /// The neighborhood read of `POST /api/v1/graph/compose`
+    /// (`routes/computation.rs::compose_subgraphs`, `F-SHARD4-A1`), which ran
+    /// this recursive CTE inline on the raw pool, in a route-layer helper that
+    /// took a `&PgPool`, with no viewer predicate at all.
+    ///
+    /// # Three predicates, and why each is needed
+    ///
+    /// * **The seed** (`{VISIBILITY:seed}`). The old CTE seeded `$1` as a bare
+    ///   literal, so an id the viewer cannot read, or one that names no claim,
+    ///   was still counted as a node. Now an unreadable center yields an EMPTY
+    ///   result. A readable center is always in its own neighborhood, so the
+    ///   caller can read "empty" as "not found" without a second statement.
+    /// * **The edge** (`{EDGE_VISIBILITY:e}`). A group-private edge between two
+    ///   public claims stays private under migration 070's no-widening rule.
+    ///   Walking it would put a claim in the neighborhood only because of an
+    ///   edge the caller cannot see.
+    /// * **The far endpoint** (`{VISIBILITY:far}`). A public edge can still
+    ///   reach a private claim. Filtering the edge alone would count that claim
+    ///   and then walk THROUGH it, so a public claim two hops away would be
+    ///   reached only by way of a node the caller cannot see. The far endpoint
+    ///   is joined to `claims` so the walk stops at it. The join also drops an
+    ///   endpoint that names no claim at all. That is forced: under migration
+    ///   077's policies a missing claim and an unreadable one are the same
+    ///   empty join.
+    ///
+    /// All three markers resolve to `$3`: `$1` is the center and `$2` is the
+    /// depth bound.
+    ///
+    /// # What is deliberately unchanged
+    ///
+    /// The relationship set and the walk itself (edges in either direction,
+    /// `claim`-to-`claim` only) are what the route used before. So is the
+    /// treatment of retracted edges: an edge with `valid_to` set still widens
+    /// the neighborhood, where [`Self::get_epistemic_edge_pairs`] drops it.
+    /// That is a belief question, not a tenancy one, and is left out of this
+    /// change on purpose.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn epistemic_neighborhood_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        center: Uuid,
+        max_depth: i32,
+    ) -> Result<Vec<Uuid>, crate::DbError> {
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE neighborhood AS (
+                SELECT seed.id AS node_id, 0 AS depth
+                  FROM claims seed
+                 WHERE seed.id = $1
+                   /* {VISIBILITY:seed} */
+                UNION
+                SELECT far.id, n.depth + 1
+                  FROM neighborhood n
+                  JOIN edges e ON (
+                      (e.source_id = n.node_id AND e.source_type = 'claim' AND e.target_type = 'claim')
+                      OR (e.target_id = n.node_id AND e.source_type = 'claim' AND e.target_type = 'claim')
+                  )
+                  JOIN claims far
+                    ON far.id = CASE WHEN e.source_id = n.node_id THEN e.target_id ELSE e.source_id END
+                 WHERE n.depth < $2
+                   AND e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes')
+                   /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:far} */
+            )
+            SELECT DISTINCT node_id FROM neighborhood
+            "#,
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql)
+            .bind(center)
+            .bind(max_depth);
+        // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders no
+        // predicate, so the statement has no `$3` to fill.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await.map_err(crate::DbError::from)?;
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
 }
