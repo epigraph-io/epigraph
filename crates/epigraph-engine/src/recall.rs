@@ -10,15 +10,14 @@
 //! # Fallback behaviour
 //!
 //! If `embedder.generate_query` fails (e.g. no API key), the function falls
-//! back to text search via `ClaimRepository::list`. This matches the existing
-//! MCP behaviour.
+//! back to an `ILIKE` text search over current claims
+//! (`ClaimRepository::search_content_current`).
 //!
 //! # Filters
 //!
-//! The semantic leg returns `is_current` claims only and applies `min_truth`
-//! in SQL ahead of the ANN `LIMIT`, so the truth floor narrows the candidate
-//! pool rather than trimming an already-truncated page.
-//! `tests/recall_test.rs` pins it.
+//! Both legs return `is_current` claims only, and both apply `min_truth` in SQL
+//! ahead of `LIMIT`, so the truth floor narrows the candidate pool rather than
+//! trimming an already-truncated page. `tests/recall_test.rs` pins both.
 
 use epigraph_core::ClaimId;
 use epigraph_db::{ClaimRepository, PgPool};
@@ -69,7 +68,7 @@ fn format_pgvector(vec: &[f32]) -> String {
 
 /// Semantic recall: embed the query, find similar claims, filter by truth.
 ///
-/// Falls back to `ClaimRepository::list` text search when `embedder` returns
+/// Falls back to a text search over current claims when `embedder` returns
 /// an error (e.g. embeddings disabled, no API key).
 ///
 /// # Parameters
@@ -77,7 +76,8 @@ fn format_pgvector(vec: &[f32]) -> String {
 /// - `embedder`  — embedding service; only `generate_query` is called
 /// - `query`     — natural-language query string
 /// - `limit`     — maximum number of results to return (clamped 1–50 by callers)
-/// - `min_truth` — minimum truth value threshold; results below are dropped
+/// - `min_truth` — minimum truth value threshold, applied before `limit`:
+///   claims below it neither appear nor take a slot from one that clears it
 ///
 /// # Errors
 /// Returns `RecallError::Db` if the fallback text search fails.
@@ -252,7 +252,13 @@ async fn annotate_disputes(
     }
 }
 
-/// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
+/// Text-search fallback: an `ILIKE` substring match over current claims.
+///
+/// `is_current` and `min_truth` are both applied in SQL ahead of `LIMIT` by
+/// `ClaimRepository::search_content_current`. This used to read through
+/// `ClaimRepository::list`, which filters neither, and drop low-truth rows in
+/// Rust afterwards — so an embedder outage resurfaced superseded claims, and a
+/// page whose `limit` newest matches were low-truth came back short.
 async fn text_search_fallback(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -260,10 +266,10 @@ async fn text_search_fallback(
     limit: i64,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let claims = ClaimRepository::list(pool, viewer, limit, 0, Some(query)).await?;
+    let claims =
+        ClaimRepository::search_content_current(pool, viewer, query, min_truth, limit).await?;
     Ok(claims
         .into_iter()
-        .filter(|c| c.truth_value.value() >= min_truth)
         .map(|c| RecallResult {
             claim_id: c.id.as_uuid().to_string(),
             content: c.content,

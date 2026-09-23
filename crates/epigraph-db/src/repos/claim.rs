@@ -2921,6 +2921,95 @@ impl ClaimRepository {
         Ok(claims)
     }
 
+    /// Current claims whose content contains `search` (`ILIKE '%search%'`) and
+    /// whose `truth_value >= min_truth`, most-recent first.
+    ///
+    /// The text fallback of the library `epigraph_engine::recall`, used when the
+    /// query cannot be embedded. It used [`Self::list`] and filtered the page in
+    /// Rust, which had two defects `crates/epigraph-engine/tests/recall_test.rs`
+    /// pins:
+    ///
+    /// * `list` has no `is_current` predicate, so an embedder outage
+    ///   resurfaced superseded and duplicate-marked claims that the semantic
+    ///   leg never returns.
+    /// * The truth floor ran after `LIMIT`, so it could only inspect the
+    ///   `limit` newest matches — the defect [`Self::list_by_truth_range`]
+    ///   exists to avoid (backlog bug `5a55a48e`). Both predicates sit here
+    ///   ahead of `LIMIT`.
+    ///
+    /// `search` is interpolated into the pattern exactly as [`Self::list`]
+    /// does it (no escaping of `%`/`_`), so the fallback matches what it
+    /// matched before; only the two filters are new.
+    ///
+    /// # Returns
+    /// Claims post-fixed with the row's `supersedes`, as [`Self::list`] does,
+    /// rather than `claim_from_row`'s fabricated `None`. `is_current` is true by
+    /// construction.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn search_content_current<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        search: &str,
+        min_truth: f64,
+        limit: i64,
+    ) -> Result<Vec<Claim>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            trace_id: Option<Uuid>,
+            created_at: chrono::DateTime<chrono::Utc>,
+            updated_at: chrono::DateTime<chrono::Utc>,
+            supersedes: Option<Uuid>,
+        }
+
+        let sql = viewer.splice(
+            r#"
+            SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
+                   supersedes
+            FROM claims
+            WHERE content ILIKE $1
+              AND is_current
+              AND truth_value >= $2
+              /* {VISIBILITY:claims} */
+            ORDER BY created_at DESC
+            LIMIT $3
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(format!("%{search}%"))
+            .bind(min_truth)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let truth_value = TruthValue::new(row.truth_value)?;
+            let mut claim = claim_from_row(
+                row.id,
+                row.content,
+                row.agent_id,
+                row.trace_id,
+                truth_value,
+                row.created_at,
+                row.updated_at,
+            );
+            claim.is_current = true;
+            claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
+            claims.push(claim);
+        }
+        Ok(claims)
+    }
+
     /// List claims whose `truth_value` falls within `[min_truth, max_truth]`,
     /// most-recent first. The range filter is applied in SQL **before**
     /// `LIMIT`, so matching claims are reachable regardless of how recently

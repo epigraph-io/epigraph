@@ -7,21 +7,27 @@
 //! `recall_claims_embedding_test.rs`) already do — but the suite itself was
 //! never written, so nothing pinned WHERE recall applies its filters.
 //!
-//! That turned out to matter. The semantic leg fetched exactly `limit` ANN
-//! candidates and only then dropped rows below `min_truth` in Rust, so a page
-//! whose nearest `limit` candidates were low-truth came back short, or empty,
-//! while qualifying claims sat just past the cut. That is the "seed recall
-//! returned no claims" starvation episcience synthesis has hit before.
+//! That turned out to matter. Both legs fetched exactly `limit` candidates and
+//! only then dropped rows below `min_truth` in Rust, so a page whose nearest
+//! `limit` candidates were low-truth came back short, or empty, while
+//! qualifying claims sat just past the cut. That is the "seed recall returned
+//! no claims" starvation episcience synthesis has hit before. The text
+//! fallback additionally read through `ClaimRepository::list`, which has no
+//! `is_current` predicate, so an embedder outage resurfaced superseded claims.
 //!
 //! # What each test pins
 //!
 //! * `min_truth` excludes, on both legs.
-//! * `min_truth` narrows the semantic candidate pool BEFORE `LIMIT` —
-//!   `semantic_leg_min_truth_does_not_starve_limit`. It carries a calibration
-//!   assertion (the same query at `min_truth = 0.0`) proving the low-truth
-//!   decoys really are the top-`limit` candidates, so the test cannot pass
-//!   vacuously on a fixture where the qualifying claims happened to rank
-//!   first anyway.
+//! * `min_truth` narrows the candidate pool BEFORE `LIMIT`, on both legs —
+//!   the `*_does_not_starve_limit` pair. Each carries a calibration assertion
+//!   (the same query at `min_truth = 0.0`) proving the low-truth decoys really
+//!   are the top-`limit` candidates, so the test cannot pass vacuously on a
+//!   fixture where the qualifying claims happened to rank first anyway.
+//! * `is_current` on the text fallback. There is no semantic-leg twin, and
+//!   not by omission: `chk_deprecated_no_embedding` (`is_current OR embedding
+//!   IS NULL`) makes a non-current row with a vector unwritable, so the ANN
+//!   leg's `is_current` predicate is enforced by the schema before recall is
+//!   reached; a test for it would pass with the predicate deleted.
 //! * The `min_truth` bind composes with the viewer's group bind — a group
 //!   member sees their own private claim through the semantic leg, a stranger
 //!   does not. A mis-numbered bind makes the ANN statement ERROR, and recall
@@ -30,7 +36,7 @@
 //!   produces.
 //! * Dispute annotation on both legs.
 //!
-//! # A limit of the starvation test
+//! # A limit of the starvation tests
 //!
 //! On these tiny throwaway databases the ANN statement sees every row, so
 //! "filter before LIMIT" is exact. On a large corpus served by
@@ -38,7 +44,7 @@
 //! `ef_search` candidate set, and a highly selective `min_truth` can still
 //! under-fill without `hnsw.iterative_scan` — the same limitation the
 //! visibility predicate carries (`docs/tenancy/FINAL-PLAN.md` §10.1 R1).
-//! This test pins placement, not that.
+//! These tests pin placement, not that.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -108,7 +114,10 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
 struct Seed<'a> {
     content: &'a str,
     truth: f64,
+    is_current: bool,
     embedding: Option<&'a str>,
+    /// Backdates `created_at`, which is what the text fallback orders by.
+    minutes_ago: i32,
     group: Option<Uuid>,
 }
 
@@ -117,12 +126,22 @@ impl<'a> Seed<'a> {
         Self {
             content,
             truth,
+            is_current: true,
             embedding: None,
+            minutes_ago: 0,
             group: None,
         }
     }
     fn embedded(mut self, v: &'a str) -> Self {
         self.embedding = Some(v);
+        self
+    }
+    fn retired(mut self) -> Self {
+        self.is_current = false;
+        self
+    }
+    fn minutes_ago(mut self, m: i32) -> Self {
+        self.minutes_ago = m;
         self
     }
     fn private_to(mut self, group: Uuid) -> Self {
@@ -139,16 +158,19 @@ async fn seed(pool: &PgPool, agent: Uuid, s: Seed<'_>) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, embedding, \
-                             is_current, visibility, owner_group_id) \
-         VALUES ($1, $2, sha256($1::text::bytea), $3, $4, $5::vector, true, $6, $7)",
+                             is_current, visibility, owner_group_id, created_at) \
+         VALUES ($1, $2, sha256($1::text::bytea), $3, $4, $5::vector, $6, $7, $8, \
+                 now() - make_interval(mins => $9))",
     )
     .bind(id)
     .bind(s.content)
     .bind(agent)
     .bind(s.truth)
     .bind(s.embedding)
+    .bind(s.is_current)
     .bind(visibility)
     .bind(owner)
+    .bind(s.minutes_ago)
     .execute(pool)
     .await
     .expect("seed claim");
@@ -366,6 +388,81 @@ async fn text_fallback_drops_claims_below_min_truth(pool: PgPool) {
     assert!(
         results.iter().all(|r| r.similarity == 0.0),
         "every result came through the text fallback"
+    );
+}
+
+/// The fallback's `min_truth` must also narrow before `LIMIT`. It orders by
+/// recency, so the decoys are the three NEWEST matches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn text_fallback_min_truth_does_not_starve_limit(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let mut decoys = HashSet::new();
+    for i in 0..3 {
+        let content = format!("glimmerdusk decoy {i}");
+        decoys.insert(seed(&pool, agent, Seed::new(&content, 0.1)).await);
+    }
+    let a = seed(
+        &pool,
+        agent,
+        Seed::new("glimmerdusk a", 0.9).minutes_ago(60),
+    )
+    .await;
+    let b = seed(
+        &pool,
+        agent,
+        Seed::new("glimmerdusk b", 0.9).minutes_ago(61),
+    )
+    .await;
+
+    let unfiltered = recall(&pool, &viewer, &failing_embedder(), "glimmerdusk", 2, 0.0)
+        .await
+        .expect("recall");
+    assert!(
+        ids(&unfiltered).is_subset(&decoys) && unfiltered.len() == 2,
+        "calibration: the 2 newest matches must be decoys"
+    );
+
+    let results = recall(&pool, &viewer, &failing_embedder(), "glimmerdusk", 2, 0.5)
+        .await
+        .expect("recall");
+    assert_eq!(
+        ids(&results),
+        HashSet::from([a, b]),
+        "min_truth must be applied before LIMIT on the fallback too"
+    );
+}
+
+/// An embedder outage must not resurface superseded claims: the fallback is
+/// held to the same "current claims only" contract as the semantic leg.
+#[sqlx::test(migrations = "../../migrations")]
+async fn text_fallback_excludes_non_current_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let live = seed(
+        &pool,
+        agent,
+        Seed::new("snarkleberry live", 0.9).minutes_ago(5),
+    )
+    .await;
+    // Newest, highest-truth, and matching: the fallback's first pick if it
+    // does not filter on `is_current`.
+    let retired = seed(
+        &pool,
+        agent,
+        Seed::new("snarkleberry retired", 0.95).retired(),
+    )
+    .await;
+
+    let results = recall(&pool, &viewer, &failing_embedder(), "snarkleberry", 10, 0.0)
+        .await
+        .expect("recall");
+
+    let got = ids(&results);
+    assert!(got.contains(&live), "the current claim is returned");
+    assert!(
+        !got.contains(&retired),
+        "a non-current claim must not come back through the text fallback"
     );
 }
 
