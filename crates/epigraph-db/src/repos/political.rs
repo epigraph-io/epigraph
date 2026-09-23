@@ -494,7 +494,9 @@ impl PoliticalRepository {
     /// count were functions of claims the caller may not read, and the
     /// `HAVING` threshold made an agent's presence on the board one too.
     ///
-    /// `agents` is not marked: it carries no tenancy columns, and the join only
+    /// `agents` is not marked. It is tier B (migration 069): it has no
+    /// `visibility` / `owner_group_id` to mark, and `display_name` is always
+    /// readable so that authorship can render on a public claim. The join only
     /// names the author of a claim that already passed the `claims` predicate.
     ///
     /// # Errors
