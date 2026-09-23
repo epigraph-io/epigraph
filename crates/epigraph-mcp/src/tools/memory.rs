@@ -267,22 +267,24 @@ pub async fn memorize(
         }
     };
 
-    // Reuse the novelty gate's already-generated vector when available, matching
-    // submit_claim's pattern — avoids a second OpenAI call.
+    // On an AUTHOR-STAMPED connection, reusing the novelty gate's vector when
+    // there is one. Identical construction and identical reasoning to
+    // `tools::claims::submit_claim`; `claim_helper::embed_claim_author_stamped`
+    // carries the long form — in short, the `UPDATE claims SET embedding` is
+    // refused on the unstamped pool and the refusal is silent because the embed
+    // is best-effort.
     let embedded = match embed_text {
         None => false,
         Some(text) => {
-            if let Some(pgvec) = pending_embedding.take() {
-                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                    Ok(stored) => stored,
-                    Err(e) => {
-                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                        false
-                    }
-                }
-            } else {
-                server.embedder.embed_and_store(claim_uuid, &text).await
-            }
+            crate::claim_helper::embed_claim_author_stamped(
+                server,
+                agent_id,
+                claim_uuid,
+                &text,
+                pending_embedding.take(),
+                "memorize",
+            )
+            .await
         }
     };
 

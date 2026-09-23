@@ -500,25 +500,30 @@ pub async fn submit_claim(
         }
     };
 
-    // Reuse the novelty gate's already-generated vector when we have one
-    // (avoids a second OpenAI call for the same content). Only the gate's own
-    // embedder-failure path (`pending_embedding = None`) and the repair arm —
-    // where the exact-resubmit shortcut means the gate never ran — fall back to
-    // `embed_and_store`'s independent generate-and-store.
+    // The store runs on an AUTHOR-STAMPED connection, not on `server.pool`: the
+    // `UPDATE claims SET embedding` is governed by `claims_tenancy`'s WITH CHECK
+    // and is refused on an unstamped session, silently, because the embed is
+    // best-effort. See `claim_helper::embed_claim_author_stamped` for the
+    // measurement and for why the provider call stays outside the transaction.
+    //
+    // Both arms go through it: the novelty gate's already-generated vector when
+    // there is one (no second OpenAI call), and a fresh `generate` otherwise —
+    // the gate's own embedder-failure path and the repair arm, where the
+    // exact-resubmit shortcut means the gate never ran. The previous fallback,
+    // `McpEmbedder::embed_and_store`, stores through the embedder's OWN
+    // unstamped pool and is therefore refused in exactly the same way.
     let embedded = match embed_text {
         None => false,
         Some(text) => {
-            if let Some(pgvec) = pending_embedding.take() {
-                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                    Ok(stored) => stored,
-                    Err(e) => {
-                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                        false
-                    }
-                }
-            } else {
-                server.embedder.embed_and_store(claim_uuid, &text).await
-            }
+            crate::claim_helper::embed_claim_author_stamped(
+                server,
+                agent_id,
+                claim_uuid,
+                &text,
+                pending_embedding.take(),
+                "submit_claim",
+            )
+            .await
         }
     };
 
