@@ -1151,7 +1151,11 @@ no such check at all, so any caller could record an event as any existing
 agent.
 
 **One writer of the event log is NOT covered, and operators reading
-`actor_id` should know it.** `claim.created` events are written by the claim
+`actor_id` should know it.** This is from an enumeration of every writer, not
+from the ones review happened to name: two earlier drafts of this paragraph
+missed the challenge and evidence routes. `EventRepository::insert`'s doc in
+`crates/epigraph-db/src/repos/event.rs` lists every writer and the actor it
+passes. `claim.created` events are written by the claim
 repository whenever a claim is inserted, and they take their actor from the
 claim's `agent_id`. On `POST /api/v1/claims` that is a request field. On
 `POST /api/v1/submit/packet` it is too, unless `EPIGRAPH_REQUIRE_SIGNATURES` is

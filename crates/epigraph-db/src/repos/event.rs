@@ -30,21 +30,45 @@ impl EventRepository {
     /// [`Self::publish_or_log`] and [`Self::publish_or_log_conn`] trust their
     /// caller in the same way.
     ///
-    /// **Where that holds** (deferred-commitment `events-actor-id-binding`,
-    /// `D-PR25-event-actor-id-unbound`). `epigraph-api`
-    /// `routes/events.rs::create_event` and `epigraph-mcp`
-    /// `tools/events.rs::publish_event` each apply a `bind_actor` rule.
-    /// `epigraph-api` `routes/challenge.rs::submit_challenge` passes its
-    /// `RequirePrincipal`. The MCP emitters that pass `server.agent_id()` take
-    /// no caller-supplied actor. They are `challenge_claim` here, and
-    /// `emit_tool_invoked`, `link_epistemic` and `edge_mutation` through
-    /// `publish_or_log`. On the HTTP listener that agent is the listener's
-    /// shared identity rather than the per-request caller.
+    /// **Every writer of the event log, and the actor it passes**
+    /// (deferred-commitment `events-actor-id-binding`,
+    /// `D-PR25-event-actor-id-unbound`, inventory of 2026-09-23). "The event
+    /// log" is what `GET /api/v1/events` serves: this table merged with
+    /// `epigraph-api`'s in-process ring buffer (`routes/events.rs`,
+    /// `EventStore::push`), which has no foreign key and so does not even
+    /// require a real agent. The inventory is every non-test call to this
+    /// function, to [`Self::publish_or_log`] / [`Self::publish_or_log_conn`],
+    /// and to `global_event_store()`'s `push`. A new writer belongs in it.
     ///
-    /// **Where it does NOT hold.** `ClaimRepository`'s `claim.created` emits
-    /// (`create`, `create_with_tx`, `create_strict`, `create_with_id_if_absent`)
-    /// pass the new row's `claims.agent_id`. On `POST /api/v1/claims` that is
-    /// the request body's `agent_id`. On `POST /api/v1/submit/packet` it is the
+    /// * **The authenticated principal.** `epigraph-api`
+    ///   `routes/events.rs::create_event` and `epigraph-mcp`
+    ///   `tools/events.rs::publish_event` apply a `bind_actor` rule.
+    ///   `routes/challenge.rs::submit_challenge` passes its `RequirePrincipal`.
+    ///   `routes/belief.rs::submit_evidence`'s nine ring-buffer pushes pass
+    ///   `viewer.principal()` (they passed the body's `agent_id` until the
+    ///   second review of this item). `routes/edges.rs`'s ring-buffer pushes
+    ///   (`edge.added`, `claim.superseded`, `edge.deleted`, `edge.updated`,
+    ///   `edge.retired`) pass the token's `agent_id`, or `None` for a token
+    ///   without one.
+    /// * **The server's own agent.** The MCP emitters that pass
+    ///   `server.agent_id()`: `challenge_claim` here, and `emit_tool_invoked`,
+    ///   `link_epistemic` and `edge_mutation` through `publish_or_log`. None
+    ///   takes a caller-supplied actor. On the HTTP listener that agent is the
+    ///   listener's shared identity rather than the per-request caller.
+    /// * **The row being created.** `AgentRepository`'s `agent.registered`
+    ///   passes the new `agents` row's own id. The insert fails on an id that
+    ///   already exists, so it cannot name another agent.
+    /// * **Unattributed (`None`).** `conflict.resolved` (`routes/conflicts.rs`),
+    ///   `gap.surfaced` (`routes/gaps.rs`), and `workflow.created` and
+    ///   `workflow.deprecated` (`routes/workflows.rs`) here. `frame.created`
+    ///   (`routes/belief.rs`) and `community.formed` (`routes/community.rs`) in
+    ///   the ring buffer.
+    ///
+    /// **Where it does NOT hold: the one caller-supplied actor left.**
+    /// `ClaimRepository`'s `claim.created` emits (`create`, `create_with_tx`,
+    /// `create_strict`, `create_with_id_if_absent`) pass the new row's
+    /// `claims.agent_id`. On `POST /api/v1/claims` that is the request body's
+    /// `agent_id`. On `POST /api/v1/submit/packet` it is the
     /// packet's, checked against a signature only when
     /// `EPIGRAPH_REQUIRE_SIGNATURES` is set. So a caller can still file a
     /// `claim.created` event under another existing agent's name. That is the

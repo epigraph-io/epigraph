@@ -83,6 +83,16 @@ impl EventStore {
     }
 
     /// Append a new event, assigning it a monotonic version and timestamp.
+    ///
+    /// `actor_id` is stored as given. It is TRUSTED input with no check at
+    /// all: unlike the `events` table, the ring buffer has no foreign key, so
+    /// it does not even have to name a real agent. The db build's
+    /// `GET /api/v1/events` serves these events alongside the persisted ones,
+    /// and nothing downstream can tell them apart. So a caller-facing handler
+    /// must pass an actor derived from the authenticated principal, or `None`,
+    /// and never a request field. `epigraph_db::EventRepository::insert`'s doc
+    /// lists every caller of this method and what it passes
+    /// (`D-PR25-event-actor-id-unbound`).
     pub async fn push(
         &self,
         event_type: String,
@@ -240,7 +250,8 @@ const MAX_PAYLOAD_SIZE: usize = 65_536;
 /// deferring webhook fan-out to PR-10). That does not transfer: the ring buffer
 /// is not a no-db artefact. `routes/edges.rs` pushes `edge.added` (payload:
 /// `source_id`, `target_id`) and `claim.superseded`, `routes/belief.rs` pushes
-/// `frame.created`, and `routes/community.rs` pushes too — all from
+/// `frame.created` and `submit_evidence`'s nine belief events (payload:
+/// `claim_id`), and `routes/community.rs` pushes too — all from
 /// `#[cfg(feature = "db")]` handlers. Leaving step 2 open would have made the
 /// merge the trivial bypass for the filter added one function up.
 ///
@@ -477,9 +488,13 @@ async fn retain_visible_events(
 /// an unattributed one.
 ///
 /// That is a statement about this route and MCP `publish_event`, not about the
-/// event log. `ClaimRepository`'s `claim.created` emits still take their actor
-/// from `claims.agent_id`, which `POST /api/v1/claims` reads from the request
-/// body. That half stays with the open
+/// event log. Two other caller-facing writers bind the actor by other means:
+/// `routes/challenge.rs::submit_challenge` passes its `RequirePrincipal`, and
+/// `routes/belief.rs::submit_evidence` passes `viewer.principal()` to its nine
+/// ring-buffer pushes. One writer still takes a caller-supplied actor:
+/// `ClaimRepository`'s `claim.created` emits take theirs from
+/// `claims.agent_id`, which `POST /api/v1/claims` reads from the request body.
+/// That half stays with the open
 /// `D-PR16-claim-authorship-is-not-a-credential`. See
 /// `EventRepository::insert`'s doc for every writer and what it passes.
 ///
