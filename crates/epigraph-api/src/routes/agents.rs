@@ -27,9 +27,12 @@
 //!   `docs/tenancy/progress.json` and is owned by that entry, not by this shard,
 //!   which neither widens nor narrows it.
 //!
-//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES`,
-//! `AUTH_OPTIONAL_PROVENANCE_SITES` and `AUTH_OPTIONAL_WRITE_SITES` rows for
-//! this file all sit in the write handlers above and are unchanged.
+//! `viewer_route_table_lint.rs`'s `AUTH_OPTIONAL_PROVENANCE_SITES` and
+//! `AUTH_OPTIONAL_WRITE_SITES` rows for this file sit in the write handlers
+//! above and are unchanged. Its two `FAIL_OPEN_SCOPE_SITES` rows are gone: the
+//! fail-open-scope-sites conversion made `create_agent` and `update_agent`
+//! refuse 401 when no `AuthContext` reached them, instead of skipping the
+//! `agents:write` check (and `update_agent`'s self-or-admin check with it).
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -175,19 +178,25 @@ const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PRO
 ///
 /// POST /agents
 ///
-/// Creates a new agent with the given public key and optional display name.
-/// When called by an authenticated user (OAuth2 bearer token), also auto-provisions
-/// an `oauth_clients` row so the new agent can authenticate via client_credentials.
+/// Creates a new agent with the given public key and optional display name, and
+/// auto-provisions an `oauth_clients` row for a newly created agent so it can
+/// authenticate via client_credentials. Requires `agents:write`; refuses 401
+/// when no `AuthContext` reached the handler.
 #[cfg(feature = "db")]
 pub async fn create_agent(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateAgentRequest>,
 ) -> Result<Json<AgentResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = &auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-    }
+    // Refuse rather than skip when no AuthContext reached the handler. The
+    // `if let` this replaced authorized nothing in that case and was safe only
+    // because the route sits behind `bearer_auth_middleware`.
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
 
     let public_key = parse_public_key(&request.public_key)?;
 
@@ -210,10 +219,15 @@ pub async fn create_agent(
         AgentRepository::create_or_get(&state.db_pool, &agent).await?;
     let new_agent_id = Uuid::from(created_agent.id);
 
-    // Auto-provision an OAuth client only for a *newly created* agent (and only
-    // when the caller is authenticated). On a find-hit the client already
-    // exists from the original registration; re-creating it would hit the
-    // `oauth_clients` unique constraint on `client_id` and warn-spam the log.
+    // Auto-provision an OAuth client only for a *newly created* agent. On a
+    // find-hit the client already exists from the original registration;
+    // re-creating it would hit the `oauth_clients` unique constraint on
+    // `client_id` and warn-spam the log.
+    //
+    // The inner `if let` can no longer be false: the handler refuses a request
+    // with no `AuthContext` before it gets here. It is left in place because it
+    // is the one row of `viewer_route_table_lint.rs::AUTH_OPTIONAL_WRITE_SITES`,
+    // and collapsing it is that register's change, not this one's.
     if was_created {
         if let Some(axum::Extension(auth)) = &auth_ctx {
             let client_id_str = hex::encode(public_key);
@@ -690,15 +704,17 @@ pub async fn update_agent(
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateAgentRequest>,
 ) -> Result<Json<AgentResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-        // Caller must be the target agent OR have claims:admin
-        if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
-            return Err(ApiError::Forbidden {
-                reason: "can only mutate your own agent record".into(),
-            });
-        }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+    // Caller must be the target agent OR have claims:admin
+    if !auth.has_scope("claims:admin") && auth.agent_id != Some(id) {
+        return Err(ApiError::Forbidden {
+            reason: "can only mutate your own agent record".into(),
+        });
     }
 
     let agent_id = AgentId::from_uuid(id);

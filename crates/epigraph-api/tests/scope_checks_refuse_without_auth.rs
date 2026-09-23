@@ -267,3 +267,30 @@ async fn papers_rs_refuses_without_auth() {
     )];
     assert_refused(router, &cases).await;
 }
+
+#[tokio::test]
+async fn agents_rs_refuses_without_auth() {
+    use routes::agents;
+    let router = Router::new()
+        .route("/api/v1/agents", post(agents::create_agent))
+        .route(
+            "/api/v1/agents/:id",
+            axum::routing::put(agents::update_agent),
+        )
+        .with_state(unreachable_state());
+    let cases = [
+        case(
+            "agents.rs::create_agent",
+            Method::POST,
+            "/api/v1/agents".into(),
+            Some(json!({"public_key": "11".repeat(32)})),
+        ),
+        case(
+            "agents.rs::update_agent",
+            Method::PUT,
+            format!("/api/v1/agents/{}", Uuid::new_v4()),
+            Some(json!({"display_name": "x"})),
+        ),
+    ];
+    assert_refused(router, &cases).await;
+}

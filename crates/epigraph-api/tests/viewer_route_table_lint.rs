@@ -308,13 +308,13 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // list/rotate/revoke now refuse 401 without an `AuthContext`, and
     // `revoke_agent_key`'s self-or-`claims:admin` check, which sat inside the
     // same `if let`, runs unconditionally with it.
-    // 1 → 2 when the needle set widened from one spelling to four. NOT a new
-    // site and NOT a regression: `create_agent`'s `agents:write` check is
-    // written `if let Some(axum::Extension(ref auth)) = &auth_ctx` — the same
-    // idiom with a trailing `&` on the scrutinee — and the single-spelling
-    // needle could not see it. The block was always here; the register could
-    // not count it.
-    ("agents.rs", 2),
+    // `("agents.rs", 2)` REMOVED by the fail-open-scope-sites conversion. It had
+    // gone 1 → 2 when the needle set widened from one spelling to four (NOT a
+    // new site: `create_agent`'s check was written with a trailing `&` on the
+    // scrutinee, which the single-spelling needle could not see). Both
+    // `create_agent` and `update_agent` now refuse 401 without an
+    // `AuthContext`; `update_agent`'s self-or-`claims:admin` check, which sat
+    // inside the same `if let`, runs unconditionally with the scope check.
     // `("audit.rs", 1)` REMOVED by PR-18a, on the PR-10 precedent recorded
     // below: `query_security_events` now takes the prescribed
     // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
@@ -401,9 +401,18 @@ const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
 ///
 /// # The `create_agent` entry, and its compensating control
 ///
+/// **Superseded in part by the fail-open-scope-sites conversion.** The
+/// `agents:write` check is now unconditional IN THE HANDLER: `create_agent`
+/// refuses 401 with `let Some(..) = auth_ctx else { .. }` before it reaches this
+/// block, so the block's `if let` can no longer be false and the entry is
+/// dead-conditional rather than auth-optional. It stays registered because
+/// collapsing it is a change to this register, not to the scope one. The
+/// router-level paragraph below is kept as the history of why the entry was
+/// safe before the handler refused on its own.
+///
 /// `create_agent` declares no `ViewerExtractor`, so the route-level statement
-/// that its `agents:write` check is unconditional does not come from the
-/// handler's signature. It comes from the router: `POST /agents` and
+/// that its `agents:write` check is unconditional did not come from the
+/// handler's signature. It came from the router: `POST /agents` and
 /// `POST /api/v1/agents` are registered on the `protected` router in
 /// `routes/mod.rs::create_router`, which is layered with `bearer_auth_middleware`
 /// — a total function that either injects an `AuthContext` or returns
