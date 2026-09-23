@@ -76,7 +76,7 @@ pub use pool::{
 pub use repos::{
     ActivityRepository, AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository,
     AlternativePairRow, AlternativeSetRepository, AnalysisRecord, AnalysisRepository,
-    BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
+    AuthorOperator, BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
     ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
     ClaimListFilter, ClaimNeighbor, ClaimNeighborBetpRow, ClaimRepository, ClaimSortField,

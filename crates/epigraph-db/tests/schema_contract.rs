@@ -1163,26 +1163,33 @@ async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
     );
 }
 
-/// Migration 102's two operator-link definer bodies: `SECURITY DEFINER`, owned
-/// by `epigraph_maintenance`, an EXPLICIT ACL with no `PUBLIC` grant, and the
+/// Migration 102's operator-link definer bodies: `SECURITY DEFINER`, owned by
+/// `epigraph_maintenance`, an EXPLICIT ACL with no `PUBLIC` grant, and the
 /// asymmetric role grant that IS the trust basis — `epigraph_app` may ASK who an
-/// agent's operator is and may NOT record a link.
+/// agent's operator is (the actor and author reads) and may NOT record a link
+/// (either link function).
 ///
 /// Per-function, on the 086/089/092 template, because there is still no generic
 /// sweep: a later `DROP FUNCTION` + `CREATE` silently restores the implicit
-/// `PUBLIC` grant, and the guarded `OWNER TO` can silently no-op. For
-/// `epigraph_link_operator` the first would let any request-DSN connection enrol
-/// any agent as a writer in any operator's personal group; for
-/// `epigraph_operator_of` a non-member owner reads no link at all (fails closed,
-/// but silently turns operator ownership off). The behavioural half — the call
-/// actually raising 42501 for `epigraph_app` — is
-/// `operator_link.rs::epigraph_app_cannot_execute_link_operator`.
+/// `PUBLIC` grant, and the guarded `OWNER TO` can silently no-op. For the link
+/// functions the first would let any request-DSN connection enrol any agent in
+/// any operator's personal group; for the reads a non-member owner reads no
+/// link at all (fails closed, but silently turns operator ownership off). The
+/// behavioural half — the calls actually raising 42501 for `epigraph_app` — is
+/// `operator_link.rs::epigraph_app_cannot_execute_link_operator` and
+/// `epigraph_app_cannot_execute_link_retired_agent`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_102_operator_definers_are_owned_and_granted(pool: PgPool) {
     for (name, signature, volatility, app_may_execute) in [
         (
-            "epigraph_operator_of",
-            "public.epigraph_operator_of(uuid)",
+            "epigraph_operator_actor",
+            "public.epigraph_operator_actor(uuid)",
+            "s",
+            true,
+        ),
+        (
+            "epigraph_operator_of_author",
+            "public.epigraph_operator_of_author(uuid)",
             "s",
             true,
         ),

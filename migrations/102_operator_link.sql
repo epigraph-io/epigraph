@@ -3,9 +3,9 @@
 -- human operator writes into that operator's personal group, and the operator
 -- (and the operator's other agents) own what it writes.
 --
--- One definer-only table (`operator_links`), three SECURITY DEFINER
--- functions, no change to any existing policy, and no rows written by the
--- migration itself.
+-- One definer-only table (`operator_links`), four SECURITY DEFINER
+-- functions (two writes, two reads), no change to any existing policy, and no
+-- rows written by the migration itself.
 --
 -- ===================================================================
 -- 1. WHY THIS EXISTS
@@ -25,8 +25,8 @@
 -- of the link, but it grants nothing (section 4).
 -- `ClaimRepository::default_decl_for_author` owns an operated agent's new
 -- claims by that group, and `epigraph_mcp::tools::claims::require_owner_or_admin`
--- treats agents sharing an operator (and the operator itself) as owners of each
--- other's claims.
+-- treats the operator, and the agents acting for it, as owners of the claims
+-- its linked agents authored.
 --
 -- ===================================================================
 -- 2. THE TRUST BASIS: DECLARED BY THE HOST, AUTHORIZED BY THE DSN
@@ -69,7 +69,7 @@
 --     `writer` row admin-equivalent. When this function creates the group it
 --     seeds the operator's own `admin` row, also DO NOTHING.
 --   * an EXISTING group is accepted only if it is `kind = 'personal'` AND
---     `created_by_agent_id = p_operator`, and `epigraph_operator_of` applies
+--     `created_by_agent_id = p_operator`, and `epigraph_operator_actor` applies
 --     the same test. The did_key alone is not proof: `groups_tenancy`'s WITH
 --     CHECK lets ANY principal insert a group it creates, including one
 --     carrying `did:epigraph:personal:<someone else>` (measured by review as
@@ -143,7 +143,27 @@
 -- names.
 --
 -- ===================================================================
--- 5. THE READ SIDE: `epigraph_operator_of`, AND WHY IT IS A DEFINER
+-- 5. THE READ SIDE: TWO QUESTIONS, TWO DEFINER READS
+--
+-- There are two different questions, and conflating them is a bug in one
+-- direction or the other:
+--
+--   * `epigraph_operator_of_author(agent)` -- "whose are this author's
+--     claims?" Resolved from the `operator_links` row ALONE, retired links
+--     included. It is used ONLY for the TARGET side of
+--     `require_owner_or_admin` (whose claim is being acted on) and by
+--     refusal-only checks (an HTTP listener must not serve as a linked signer).
+--   * `epigraph_operator_actor(agent)` -- "may this agent act for an
+--     operator?" Requires a NOT-retired row, a live `writer`/`admin`
+--     membership in the group the row names, and that group being the
+--     operator's own personal group. It is used for the CALLER side of the
+--     ownership rule and by `ClaimRepository::default_decl_for_author`.
+--
+-- Why authoring must use the ACTOR read: a retired identity has no membership,
+-- so if it ever ran again and `default_decl_for_author` chose its OPERATOR's
+-- group (as the author read would), its new claims would be owned by a group
+-- it cannot write and RLS would refuse every one of them.
+-- `operator_link.rs::a_retired_agent_gains_no_write_authority` pins that.
 --
 -- On an UNSTAMPED `epigraph_app` session `groups_tenancy` and
 -- `group_memberships_tenancy` hide every row, so a read-first-then-mint helper
@@ -153,38 +173,41 @@
 -- WITHOUT depending on the caller's stamp, so the question is a `STABLE
 -- SECURITY DEFINER` read granted to `epigraph_app`.
 --
--- A LIVE LINK is BOTH halves: the `operator_links` row AND a live
+-- An ACTING link is BOTH halves: the `operator_links` row AND a live
 -- `writer`/`admin` membership for the agent in the group that row names. The
 -- row is what makes the link unforgeable; the membership conjunct is what lets
--- the operator END it with an ordinary revoke. A revoked membership therefore
--- ends the link for authoring AND for ownership in the same statement, with no
--- second switch to forget.
+-- the operator END the agent's authority with an ordinary revoke. A revoked
+-- membership therefore stops the agent authoring into the operator's group and
+-- acting for the operator in the same statement -- while the operator KEEPS
+-- ownership of what the agent already wrote, through the author read.
 --
--- DISCLOSURE, ACCEPTED: the function answers for ANY agent id, so an app
--- session can learn whether an agent is operated, by whom, and -- through the
--- membership conjunct -- whether that one membership is live, which
+-- DISCLOSURE, ACCEPTED: both functions answer for ANY agent id, so an app
+-- session can learn whether an agent is operated, by whom, whether the link is
+-- retired, and -- through the actor read's membership conjunct -- whether
+-- that one membership is live, which
 -- `group_memberships_tenancy` would otherwise hide from a non-member. The
 -- operator relationship is already public through the `OPERATED_BY` edge
 -- (agent endpoints stamp `('public', world)` in 070/072) and a personal group's
 -- id follows from the public `did:epigraph:personal:<agent>` key, so the new
--- information is one liveness bit per link. That is accepted rather than bound
--- to the session principal (083's shape): the authoring path must ask about
--- the AUTHOR, and the ownership gate about the claim's author, neither of which
--- is the session principal.
+-- information is the retired bit and one liveness bit per link. That is
+-- accepted rather than bound to the session principal (083's shape): the
+-- authoring path must ask about the AUTHOR, and the ownership gate about the
+-- claim's author, neither of which is the session principal.
 --
 -- ===================================================================
 -- 6. OWNERSHIP IS THE MECHANISM, AS IN 086/089/092
 --
--- Both bodies read or write FORCEd-RLS tables (`operator_links`, `edges`,
+-- Every body reads or writes FORCEd-RLS tables (`operator_links`, `edges`,
 -- `groups`, `group_memberships`), so they work only inside a definer frame that
 -- `epigraph_definer_bypass()` admits, i.e. while the OWNER is a member of
 -- `epigraph_maintenance`. The `OWNER TO` below sits in a `pg_roles` guard and
 -- can silently no-op, so it is pinned in CI by
 -- `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted`
 -- and at deploy by `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. The
--- failure directions are both CLOSED: an unbypassed `epigraph_operator_of`
--- reads no link (agents author into their own group, as before this file), and
--- an unbypassed `epigraph_link_operator` is refused by the tenancy policies.
+-- failure directions are both CLOSED: an unbypassed read reads no link
+-- (agents author into their own group and own nothing through an operator, as
+-- before this file), and an unbypassed link function is refused by the tenancy
+-- policies.
 --
 -- ===================================================================
 -- 7. RETIRED LINKS: `epigraph_link_retired_agent`
@@ -201,7 +224,7 @@
 -- agent, so the identity must gain ZERO write authority from being linked. A
 -- retired row therefore:
 --
---   * is never an ACTOR link: `epigraph_operator_of` requires `NOT retired`
+--   * is never an ACTOR link: `epigraph_operator_actor` requires `NOT retired`
 --     (and a live writer/admin membership, which this function never creates),
 --     so a retired identity never authors into the operator's group and never
 --     acts for the operator;
@@ -224,14 +247,15 @@
 -- ===================================================================
 -- 8. DEPLOY ORDER AND UNDO
 --
--- `ClaimRepository::default_decl_for_author` calls `epigraph_operator_of`, so a
+-- `ClaimRepository::default_decl_for_author` calls `epigraph_operator_actor`, so a
 -- binary carrying this change FAILS CLOSED on every claim write against a
 -- database that has not applied 102 (`42883 function does not exist`). Apply
 -- 102 before, or with, the binary.
 --
 -- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_link_retired_agent(uuid, uuid)`,
--- `DROP FUNCTION IF EXISTS public.epigraph_operator_of(uuid)` and
+-- `DROP FUNCTION IF EXISTS public.epigraph_operator_actor(uuid)`,
+-- `DROP FUNCTION IF EXISTS public.epigraph_operator_of_author(uuid)` and
 -- `DROP TABLE IF EXISTS public.operator_links` -- but only together with a
 -- binary that no longer calls them, and after removing `operator_links` from
 -- `epigraph_api::state::FORCE_PROTECTED_SET` (its boot assertion counts FORCEd
@@ -271,8 +295,21 @@ CREATE POLICY operator_links_definer_insert ON public.operator_links
 
 REVOKE ALL ON public.operator_links FROM PUBLIC;
 
--- The read. See section 5.
-CREATE OR REPLACE FUNCTION public.epigraph_operator_of(p_agent uuid)
+-- The AUTHOR read: "whose are this author's claims?" See section 5. The row
+-- alone, retired included; `operator_links` is keyed on the agent, so this is
+-- at most one row.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_of_author(p_agent uuid)
+RETURNS TABLE (operator_id uuid, operator_group_id uuid, retired boolean)
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT l.operator_id, l.operator_group_id, l.retired
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) FROM PUBLIC;
+
+-- The ACTOR read: "may this agent act for an operator?" See section 5.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_actor(p_agent uuid)
 RETURNS TABLE (operator_id uuid, operator_group_id uuid)
 LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
@@ -290,7 +327,7 @@ SET search_path = public, pg_temp AS $$
      WHERE l.agent_id = p_agent
        AND NOT l.retired
 $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) FROM PUBLIC;
 
 -- The write. See sections 2 and 3. Returns one row describing what it did, so
 -- the caller can log the outcome rather than infer it.
@@ -427,11 +464,11 @@ BEGIN
                           AND e.relationship = 'OPERATED_BY');
     GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
 
-    -- `link_live` is computed by the SAME read the authoring and ownership
-    -- paths use, not re-derived here. `membership_live` alone over-reports: a
+    -- `link_live` is computed by the SAME actor read the authoring and
+    -- ownership paths use, not re-derived here. `membership_live` alone over-reports: a
     -- live membership whose role is no longer writer/admin (review probe: role
     -- set to 'reader', then re-link) returned membership_live=t while
-    -- `epigraph_operator_of` returned nothing, and the startup log said the
+    -- the actor read returned nothing, and the startup log said the
     -- agent authored into the operator's group when it did not.
     RETURN QUERY
     SELECT v_group,
@@ -441,7 +478,7 @@ BEGIN
                     WHERE m.group_id = v_group AND m.agent_id = p_agent
                       AND m.revoked_at IS NULL),
            v_edge_rows > 0,
-           EXISTS (SELECT 1 FROM public.epigraph_operator_of(p_agent) o
+           EXISTS (SELECT 1 FROM public.epigraph_operator_actor(p_agent) o
                     WHERE o.operator_id = p_operator),
            EXISTS (SELECT 1 FROM public.operator_links l
                     WHERE l.agent_id = p_agent AND l.retired);
@@ -569,7 +606,9 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) FROM P
 -- exist in a deployed cluster and not in every throwaway.
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
-        EXECUTE 'ALTER FUNCTION public.epigraph_operator_of(uuid) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_actor(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_of_author(uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_link_operator(uuid, uuid) '
                 'OWNER TO epigraph_maintenance';
@@ -579,7 +618,9 @@ DO $$ BEGIN
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
                 'TO epigraph_maintenance';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT SELECT, INSERT ON public.operator_links TO epigraph_maintenance';
     END IF;
@@ -588,7 +629,9 @@ DO $$ BEGIN
                 'FROM epigraph_app';
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
                 'FROM epigraph_app';
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) '
                 'TO epigraph_app';
         EXECUTE 'REVOKE ALL ON public.operator_links FROM epigraph_app';
         EXECUTE 'GRANT SELECT ON public.operator_links TO epigraph_app';

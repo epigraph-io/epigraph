@@ -82,8 +82,6 @@ pub fn check_operator_transport(
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
-/// ANY live link refuses, including an ambiguous one — the opposite fail
-/// direction from the authoring path, which treats ambiguity as "no operator".
 /// A lookup failure also refuses: this gate cannot let a listener start on an
 /// answer it did not get.
 ///
@@ -108,7 +106,7 @@ pub async fn refuse_operated_http_signer(
         .acquire()
         .await
         .map_err(|e| format!("could not acquire a connection for the operator-link check: {e}"))?;
-    let links = AgentRepository::operator_links(&mut conn, agent_id)
+    let link = AgentRepository::operator_actor(&mut conn, agent_id)
         .await
         .map_err(|e| {
             format!(
@@ -116,17 +114,16 @@ pub async fn refuse_operated_http_signer(
                  link (is migration 102 applied?): {e}"
             )
         })?;
-    if links.is_empty() {
+    let Some(link) = link else {
         return Ok(());
-    }
-    let operators: Vec<String> = links.iter().map(|l| l.operator_id.to_string()).collect();
+    };
     Err(format!(
         "this HTTP listener's signer agent {agent_id} has a live operator link to {}. An HTTP \
          listener authors every caller's claims as that one agent, so every caller would write \
          into the operator's personal group with the operator's ownership. Run the listener \
          under a different --agent-key, or revoke the agent's membership in the operator's \
          personal group.",
-        operators.join(", ")
+        link.operator_id
     ))
 }
 
@@ -203,7 +200,7 @@ pub async fn self_link(
 /// states it.
 ///
 /// Keyed on [`OperatorLinkOutcome::link_live`] — the answer of the same
-/// `epigraph_operator_of` read the authoring and ownership paths use — and NOT
+/// `epigraph_operator_actor` read the authoring and ownership paths use — and NOT
 /// on `membership_live`. A live membership is necessary, not sufficient: with
 /// its role changed to `reader` the membership is live and the link is not,
 /// and logging "authors into the operator's group" then would be false.

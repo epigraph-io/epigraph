@@ -1094,20 +1094,31 @@ pub async fn update_with_evidence(
 ///
 /// ## The operator arm (migration 102)
 ///
-/// Added BESIDE every branch above, never in place of one. Agents that an
-/// operator has linked (`epigraph_link_operator`: an `OPERATED_BY` edge plus a
-/// live `writer` membership in the operator's personal group) author into that
-/// operator's group, and the operator's authority over those claims is the
-/// point of linking them. So, with `caller` = the server's own agent on stdio
-/// and `auth.agent_id` over HTTP, and `op(x)` = x's ONE live operator:
+/// Added BESIDE every branch above, never in place of one. It asks two
+/// DIFFERENT questions, one per side, and uses a different definer read for
+/// each (`migrations/102_operator_link.sql` section 5):
 ///
-/// - `op(target) == caller` — the operator acting on its agents' claims
-///   (over HTTP this is the operator's own login principal);
-/// - `op(caller) == op(target)`, both present — sibling agents of one operator,
-///   e.g. a job whose model was bumped and so runs under a new identity;
-/// - `op(caller) == target` — an agent acting on a claim its operator authored
-///   directly. This arm is from the operator's request ("agents should inherit
-///   my owner permissions"), not from the brief's enumerated rule.
+/// - `author_op(target)` = `AgentRepository::operator_of_author` — "whose are
+///   this author's claims?", from the `operator_links` record alone, RETIRED
+///   links included, no membership consulted. Used ONLY for the target.
+/// - `actor_op(caller)` = `AgentRepository::operator_actor` — "may this agent
+///   act for an operator?": a not-retired record, a live `writer`/`admin`
+///   membership, the operator's own personal group. Used ONLY for the caller.
+///
+/// With `caller` = the server's own agent on stdio and `auth.agent_id` over
+/// HTTP, the arm allows exactly:
+///
+/// - `caller == author_op(target)` — the operator acting on its linked agents'
+///   claims, retired ones included (over HTTP this is the operator's own
+///   `auth.agent_id`);
+/// - `actor_op(caller) == author_op(target)`, both present — an agent acting
+///   for the operator on another of its agents' claims, e.g. a job whose model
+///   was bumped and so runs under a new identity, over its retired
+///   predecessor's claims.
+///
+/// A retired identity is never an actor, so it owns nothing through this arm
+/// (its key may be exposed). An operator's OWN directly authored claims are
+/// not reachable from its agents here: `author_op(operator)` is `None`.
 ///
 /// It is keyed on AUTHORS, never on the claim's owner group. "The owner group is
 /// writable by the caller" would be the wrong generalisation: most pre-tenancy
@@ -1186,38 +1197,43 @@ pub(crate) async fn require_owner_or_admin(
 
 /// The operator arm of [`require_owner_or_admin`]; see its doc for the rule.
 ///
-/// Read through `AgentRepository::operator_of` (migration 102's definer read),
-/// which treats an ambiguous agent — more than one live link — as unoperated,
-/// so ambiguity can only REMOVE this arm, never widen it. A lookup failure is
-/// an error, not a `false`: the gate must not quietly decide ownership without
-/// the answer it asked for.
+/// The TARGET side reads `AgentRepository::operator_of_author` and the CALLER
+/// side `AgentRepository::operator_actor` (migration 102's two definer reads).
+/// Swapping either is a defect: an author read on the caller side would let a
+/// retired identity — whose key may be exposed — act for its operator, and an
+/// actor read on the target side would take the operator's ownership of a
+/// retired or revoked agent's claims away. A lookup failure is an error, not a
+/// `false`: the gate must not quietly decide ownership without the answer it
+/// asked for.
 async fn operator_arm_allows(
     server: &EpiGraphMcpFull,
     caller: uuid::Uuid,
     target: uuid::Uuid,
 ) -> Result<bool, McpError> {
-    let target_op = epigraph_db::AgentRepository::operator_of_pool(&server.pool, target)
-        .await
-        .map_err(internal_error)?
-        .map(|l| l.operator_id);
-    let caller_op = epigraph_db::AgentRepository::operator_of_pool(&server.pool, caller)
-        .await
-        .map_err(internal_error)?
-        .map(|l| l.operator_id);
-
-    let reason = if target_op == Some(caller) {
+    let Some(target_op) =
+        epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, target)
+            .await
+            .map_err(internal_error)?
+            .map(|a| a.operator_id)
+    else {
+        // An author with no link record has no operator for anyone to share.
+        return Ok(false);
+    };
+    let reason = if caller == target_op {
         "caller is the operator of the claim's author"
-    } else if caller_op.is_some() && caller_op == target_op {
-        "caller and the claim's author share an operator"
-    } else if caller_op == Some(target) {
-        "the claim's author is the caller's operator"
+    } else if epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+        .await
+        .map_err(internal_error)?
+        .is_some_and(|l| l.operator_id == target_op)
+    {
+        "caller acts for the operator of the claim's author"
     } else {
         return Ok(false);
     };
     tracing::info!(
         caller = %caller,
         target_agent = %target,
-        operator = ?target_op.or(caller_op),
+        operator = %target_op,
         reason,
         "claim ownership granted through an operator link"
     );

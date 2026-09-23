@@ -648,8 +648,8 @@ impl ClaimRepository {
     ///
     /// # An OPERATED author writes into its operator's group (migration 102)
     ///
-    /// When `agent_id` has exactly one live operator link
-    /// ([`AgentRepository::operator_of`](crate::repos::AgentRepository::operator_of)),
+    /// When `agent_id` has an ACTING operator link
+    /// ([`AgentRepository::operator_actor`](crate::repos::AgentRepository::operator_actor)),
     /// the declaration is `('public', <the OPERATOR's personal group>)`. The
     /// agent holds `writer` there, so the author-stamped transaction it writes
     /// in (`epigraph_mcp::claim_helper::begin_author_stamped_tx`) can write the
@@ -661,8 +661,14 @@ impl ClaimRepository {
     /// The operator lookup runs FIRST and goes through a `SECURITY DEFINER`
     /// read, so it answers correctly on an unstamped `epigraph_app` session,
     /// where `groups_tenancy` hides every row and a read-first lookup here
-    /// would be blind. An unlinked, revoked or ambiguous author falls through
-    /// to [`Self::personal_group_of`] exactly as before.
+    /// would be blind. An unlinked, revoked or RETIRED author falls through to
+    /// [`Self::personal_group_of`] exactly as before.
+    ///
+    /// It is the ACTOR read, never the author read
+    /// ([`AgentRepository::operator_of_author`](crate::repos::AgentRepository::operator_of_author)):
+    /// a retired identity has no membership in its operator's group, so if it
+    /// ever ran again and this chose that group, RLS would refuse every claim
+    /// it wrote (`operator_link.rs::a_retired_agent_gains_no_write_authority`).
     ///
     /// # Errors
     /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
@@ -673,7 +679,7 @@ impl ClaimRepository {
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
     ) -> Result<TenancyDecl, DbError> {
-        if let Some(link) = crate::repos::AgentRepository::operator_of(conn, agent_id).await? {
+        if let Some(link) = crate::repos::AgentRepository::operator_actor(conn, agent_id).await? {
             return Ok(TenancyDecl::public(link.operator_group_id));
         }
         Ok(TenancyDecl::public(

@@ -936,20 +936,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
-        "operator_links",
-        "READ through migration 102's `epigraph_operator_of` SECURITY DEFINER function, not of a \
-         table. It must answer on an UNSTAMPED epigraph_app session (brief constraint 4: a \
+        "operator_actor",
+        "READ through migration 102's `epigraph_operator_actor` SECURITY DEFINER function, not of \
+         a table. It must answer on an UNSTAMPED epigraph_app session (brief constraint 4: a \
          viewer-gated read there is blind and turns read-then-mint into re-mint), so a Viewer \
          would be the wrong control. It returns only (operator agent id, operator personal group \
-         id) for the NAMED agent — the OPERATED_BY edge it reads is public (agent endpoints stamp \
-         ('public', world) in 070/072) and a personal group's id derives from the public \
-         `did:epigraph:personal:<agent>` key.",
+         id) for the NAMED agent — the operator relationship is public through the OPERATED_BY \
+         edge (agent endpoints stamp ('public', world) in 070/072) and a personal group's id \
+         derives from the public `did:epigraph:personal:<agent>` key; 102 section 5 records the \
+         one liveness bit it adds.",
     ),
     (
         "agent.rs",
-        "operator_of",
-        "READ. The single-link projection of `operator_links` (ambiguity collapses to None); same \
-         definer function, same reason as that entry.",
+        "operator_of_author",
+        "READ through migration 102's `epigraph_operator_of_author` SECURITY DEFINER function; \
+         same reason as `operator_actor`. It returns only (operator agent id, operator personal \
+         group id, retired) for the NAMED agent.",
     ),
     (
         "agent.rs",

@@ -236,7 +236,7 @@ Current reservation:
 
 - **102**: public `operator_link` — operator-scoped ownership. One
   definer-only table and two `SECURITY DEFINER` functions.
-  `operator_links(agent_id PK, operator_id, operator_group_id)` is the link
+  `operator_links(agent_id PK, operator_id, operator_group_id, retired)` is the link
   RECORD: ENABLE + FORCE row security, an INSERT policy admitting only
   `epigraph_definer_bypass()`, no UPDATE/DELETE policy, and INSERT/UPDATE/DELETE
   revoked from `epigraph_app`, so an app session cannot forge a link from an
@@ -244,9 +244,14 @@ Current reservation:
   operator)` writes that row plus a `writer` membership for the agent in the
   operator's personal group and the `agent --OPERATED_BY--> operator` graph
   edge (EXECUTE: `epigraph_maintenance` only — revoked from `PUBLIC` and from
-  `epigraph_app`), and `epigraph_operator_of(agent)` is the read the authoring
-  and ownership paths use (EXECUTE: `epigraph_app`), so neither depends on a
-  stamped session. `epigraph_link_retired_agent(agent, operator)` (EXECUTE:
+  `epigraph_app`). Two reads (EXECUTE: `epigraph_app`), so neither path
+  depends on a stamped session, answer two different questions:
+  `epigraph_operator_of_author(agent)` ("whose are this author's claims?" —
+  the record alone, retired included) for the TARGET side of
+  `require_owner_or_admin`, and `epigraph_operator_actor(agent)` ("may this
+  agent act for an operator?" — not retired, live writer/admin membership,
+  the operator's own personal group) for the CALLER side and for
+  `default_decl_for_author`. `epigraph_link_retired_agent(agent, operator)` (EXECUTE:
   `epigraph_maintenance` only) writes a RETIRED row plus the edge and NO
   membership, so a retired identity whose key may be exposed gains zero write
   authority while the operator owns its claims; `epigraph_link_operator` never

@@ -249,7 +249,7 @@ async fn link_revoke_relink_stays_revoked(pool: PgPool) {
     );
     let mut conn = pool.acquire().await.expect("acquire");
     assert_eq!(
-        AgentRepository::operator_of(&mut conn, agent_a)
+        AgentRepository::operator_actor(&mut conn, agent_a)
             .await
             .expect("operator_of"),
         None,
@@ -286,7 +286,7 @@ async fn link_revoke_relink_stays_revoked(pool: PgPool) {
 /// The review's probe: link `Y`, change its membership role to `reader`,
 /// re-link. The membership is still live, so the old `membership_live` said
 /// "linked" and the startup log said the agent authored into the operator's
-/// group — while `epigraph_operator_of` returned nothing and it did not.
+/// group — while the actor read returned nothing and it did not.
 #[sqlx::test(migrations = "../../migrations")]
 async fn link_live_reports_the_link_the_authoring_path_reads(pool: PgPool) {
     let operator = seed_bare_agent(&pool).await;
@@ -315,7 +315,7 @@ async fn link_live_reports_the_link_the_authoring_path_reads(pool: PgPool) {
     );
     let mut conn = pool.acquire().await.expect("acquire");
     assert_eq!(
-        AgentRepository::operator_of(&mut conn, y)
+        AgentRepository::operator_actor(&mut conn, y)
             .await
             .expect("operator_of"),
         None,
@@ -345,7 +345,7 @@ async fn a_second_operator_and_a_self_link_are_refused(pool: PgPool) {
         .expect_err("self-link must be refused");
     assert!(err.to_string().contains("its own operator"), "{err}");
     assert_eq!(
-        AgentRepository::operator_of(&mut conn, agent)
+        AgentRepository::operator_actor(&mut conn, agent)
             .await
             .expect("operator_of")
             .map(|l| l.operator_id),
@@ -364,10 +364,10 @@ async fn a_second_operator_and_a_self_link_are_refused(pool: PgPool) {
         "{err}"
     );
     assert!(
-        AgentRepository::operator_links(&mut conn, op_j)
+        AgentRepository::operator_actor(&mut conn, op_j)
             .await
             .expect("links of op_j")
-            .is_empty(),
+            .is_none(),
         "the refused link must leave op_j unoperated"
     );
     let p_group: Option<Uuid> = sqlx::query_scalar(
@@ -414,10 +414,10 @@ async fn an_auth_lineage_edge_alone_is_not_an_operator_link(pool: PgPool) {
     .expect("lineage edge, as record_auth_lineage writes it");
 
     let mut conn = pool.acquire().await.expect("acquire");
-    assert!(AgentRepository::operator_links(&mut conn, signer)
+    assert!(AgentRepository::operator_actor(&mut conn, signer)
         .await
         .expect("links")
-        .is_empty());
+        .is_none());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -513,18 +513,18 @@ async fn an_app_session_cannot_forge_a_link_from_an_edge_and_a_membership(pool: 
 
     let mut conn = pool.acquire().await.expect("acquire");
     assert!(
-        AgentRepository::operator_links(&mut conn, x)
+        AgentRepository::operator_actor(&mut conn, x)
             .await
             .expect("links of X")
-            .is_empty(),
+            .is_none(),
         "attack 1b: an edge plus a membership written by O's own session made O the operator \
          of X. The link must require an operator_links row only a definer can write"
     );
     assert!(
-        AgentRepository::operator_links(&mut conn, signer)
+        AgentRepository::operator_actor(&mut conn, signer)
             .await
             .expect("links of the signer")
-            .is_empty(),
+            .is_none(),
         "attack 4: one membership row made the shared HTTP signer 'operated by' its caller"
     );
 }
@@ -660,11 +660,11 @@ async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
     .await
     .expect("membership in the squatted group");
     assert!(
-        AgentRepository::operator_links(&mut conn, e)
+        AgentRepository::operator_actor(&mut conn, e)
             .await
             .expect("links")
-            .is_empty(),
-        "epigraph_operator_of accepted a group the operator did not create"
+            .is_none(),
+        "epigraph_operator_actor accepted a group the operator did not create"
     );
 }
 
@@ -977,7 +977,7 @@ async fn a_retired_link_records_the_row_and_edge_and_no_membership(pool: PgPool)
 ///
 /// * its writable set does NOT include the operator's group, and a write owned
 ///   by that group is refused (42501);
-/// * it is not an ACTOR: `epigraph_operator_of` returns nothing;
+/// * it is not an ACTOR: `epigraph_operator_actor` returns nothing;
 /// * and the authoring default for it is its OWN personal group, which it can
 ///   write — so a retired identity that runs again still works, in its own lane.
 #[sqlx::test(migrations = "../../migrations")]
@@ -998,7 +998,7 @@ async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
     let (actor, decl, into_operator, into_own) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             set_gucs_from(&mut conn, &viewer).await;
-            let actor = AgentRepository::operator_links(&mut conn, retired)
+            let actor = AgentRepository::operator_actor(&mut conn, retired)
                 .await
                 .expect("operator_of on an app session");
             let decl = ClaimRepository::default_decl_for_author(&mut conn, retired)
@@ -1012,7 +1012,7 @@ async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
         .await;
 
     assert!(
-        actor.is_empty(),
+        actor.is_none(),
         "a retired link must never read as an acting link: {actor:?}"
     );
     assert_eq!(
@@ -1111,7 +1111,7 @@ async fn link_retired_agent_refuses_and_never_touches_a_membership(pool: PgPool)
 /// it. The operator's own session can enrol any agent in the operator's group
 /// (group_memberships_tenancy's creator/admin arm, replayed in
 /// `an_app_session_cannot_forge_a_link_from_an_edge_and_a_membership`), so the
-/// `NOT retired` conjunct in `epigraph_operator_of` — not the absence of a
+/// `NOT retired` conjunct in `epigraph_operator_actor` — not the absence of a
 /// membership — is what keeps a retired identity from acting for its operator.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retired_link_with_a_membership_is_still_not_an_actor(pool: PgPool) {
@@ -1130,10 +1130,68 @@ async fn a_retired_link_with_a_membership_is_still_not_an_actor(pool: PgPool) {
 
     let mut conn = pool.acquire().await.expect("acquire");
     assert!(
-        AgentRepository::operator_links(&mut conn, retired)
+        AgentRepository::operator_actor(&mut conn, retired)
             .await
             .expect("operator_of")
-            .is_empty(),
+            .is_none(),
         "a retired link must never read as an acting link, membership or not"
     );
+}
+
+/// A1: the two reads answer two different questions.
+///
+/// * `operator_of_author` — "whose are this author's claims?" — names the
+///   operator for an ACTING agent, a RETIRED agent and a REVOKED agent alike:
+///   the record alone decides it, so an operator keeps ownership of what an
+///   agent wrote after retiring or revoking it.
+/// * `operator_actor` — "may this agent act for an operator?" — names it for
+///   the acting agent ONLY.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let acting = seed_bare_agent(&pool).await;
+    let retired = seed_bare_agent(&pool).await;
+    let revoked = seed_bare_agent(&pool).await;
+    let unlinked = seed_bare_agent(&pool).await;
+    link(&pool, acting, operator).await;
+    link_retired(&pool, retired, operator).await;
+    link(&pool, revoked, operator).await;
+    GroupMembershipRepository::revoke_member_unless_last_admin(&pool, op_group, revoked)
+        .await
+        .expect("revoke");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    for (agent, want_retired) in [(acting, false), (retired, true), (revoked, false)] {
+        let author = AgentRepository::operator_of_author(&mut conn, agent)
+            .await
+            .expect("author read")
+            .unwrap_or_else(|| panic!("the author read must name the operator for {agent}"));
+        assert_eq!(
+            (author.operator_id, author.operator_group_id, author.retired),
+            (operator, op_group, want_retired)
+        );
+    }
+    assert_eq!(
+        AgentRepository::operator_of_author(&mut conn, unlinked)
+            .await
+            .expect("author read"),
+        None
+    );
+
+    assert_eq!(
+        AgentRepository::operator_actor(&mut conn, acting)
+            .await
+            .expect("actor read")
+            .map(|l| l.operator_id),
+        Some(operator)
+    );
+    for agent in [retired, revoked, unlinked] {
+        assert_eq!(
+            AgentRepository::operator_actor(&mut conn, agent)
+                .await
+                .expect("actor read"),
+            None,
+            "only an acting link may act"
+        );
+    }
 }

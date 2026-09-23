@@ -1007,12 +1007,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_inherit_fragment_tenancy_stmt", 89),
     ("epigraph_group_roster_admits_principal", 92),
     // 102, operator-scoped ownership. Deferred for the same structural reason
-    // as 092. Both fail CLOSED under a non-member owner: `epigraph_operator_of`
-    // reads no link (operated agents silently author into their own group
-    // again) and `epigraph_link_operator` is refused by the tenancy policies —
-    // so the stake is a feature silently OFF, which is exactly what a green
-    // pre-flight must not hide.
-    ("epigraph_operator_of", 102),
+    // as 092. All fail CLOSED under a non-member owner: the two reads
+    // (`epigraph_operator_actor`, `epigraph_operator_of_author`) read no link
+    // (operated agents silently author into their own group again, and
+    // operators silently own nothing) and the two link functions are refused
+    // by the tenancy policies — so the stake is a feature silently OFF, which
+    // is exactly what a green pre-flight must not hide.
+    ("epigraph_operator_actor", 102),
+    ("epigraph_operator_of_author", 102),
     ("epigraph_link_operator", 102),
     ("epigraph_link_retired_agent", 102),
 ];

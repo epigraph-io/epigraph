@@ -61,6 +61,14 @@ async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
     assert!(out.membership_live && out.link_live);
 }
 
+async fn link_retired(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = AgentRepository::link_retired_agent(&mut conn, agent, operator)
+        .await
+        .expect("retired link on the privileged harness connection");
+    assert!(out.link_retired && !out.membership_live, "{out:?}");
+}
+
 async fn personal_group(pool: &PgPool, agent: Uuid) -> Uuid {
     sqlx::query_scalar("SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text")
         .bind(agent)
@@ -233,28 +241,79 @@ async fn an_operator_on_stdio_may_retire_its_agents_claims(pool: PgPool) {
     assert!(!is_current(&pool, c).await);
 }
 
-/// From the operator's request ("agents should inherit my owner
-/// permissions"): an operated agent may act on a claim its operator authored
-/// directly — and only its OWN operator's.
+/// The ownership rule is exactly two arms (stage-2 brief A1): the operator
+/// over its linked agents' claims, and an acting agent over its operator's
+/// OTHER linked agents' claims. An operated agent does NOT own a claim its
+/// operator authored directly: the operator itself has no link record, so
+/// `author_op(operator)` is `None`. (An earlier revision had a third arm,
+/// `op(caller) == target`; it was removed to keep the rule to the brief's two.
+/// A human's other claims, of course, stay refused too.)
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_operated_agent_may_retire_its_operators_own_claims_and_no_one_elses(pool: PgPool) {
+async fn an_operated_agent_does_not_own_its_operators_directly_authored_claims(pool: PgPool) {
     let operator = agent(&pool, "operator").await;
     let other_human = agent(&pool, "other-human").await;
     let (server, me) = server_with_seed(&pool, 0x54).await;
     link(&pool, me, operator).await;
 
-    let mine = own_claim(&pool, operator).await;
-    supersede(&server, &pool, mine, None)
-        .await
-        .expect("an operated agent must inherit its operator's ownership");
-    assert!(!is_current(&pool, mine).await);
+    for author in [operator, other_human] {
+        let c = own_claim(&pool, author).await;
+        let err = supersede(&server, &pool, c, None)
+            .await
+            .expect_err("an operated agent must not own a claim authored by a human directly");
+        assert!(err.contains("declared signer identity"), "{err}");
+        assert!(is_current(&pool, c).await);
+    }
+}
 
-    let theirs = own_claim(&pool, other_human).await;
-    let err = supersede(&server, &pool, theirs, None)
+/// A2 + A1: a RETIRED agent's claims — world-owned legacy ones and ones owned
+/// by its own personal group — belong to its operator. The operator (HTTP,
+/// `auth.agent_id` = operator) and an agent ACTING for the operator (stdio)
+/// may both retire them. This is the TARGET side reading the author record,
+/// retired included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operator_and_an_actor_sibling_own_a_retired_agents_claims(pool: PgPool) {
+    let operator = agent(&pool, "operator").await;
+    let (actor_server, actor) = server_with_seed(&pool, 0x5B).await;
+    link(&pool, actor, operator).await;
+    let retired = agent(&pool, "retired").await;
+    link_retired(&pool, retired, operator).await;
+    let world = fixture::world_group(&pool).await;
+
+    let legacy = claim(&pool, retired, world).await;
+    supersede(&actor_server, &pool, legacy, None)
         .await
-        .expect_err("a different human's claim must stay refused");
-    assert!(err.contains("declared signer identity"), "{err}");
-    assert!(is_current(&pool, theirs).await);
+        .expect("an agent acting for the operator must own the retired agent's world-owned claim");
+    assert!(!is_current(&pool, legacy).await);
+
+    let own = own_claim(&pool, retired).await;
+    let (other_server, _) = server_with_seed(&pool, 0x5C).await;
+    supersede(&other_server, &pool, own, Some(&http_auth(Some(operator))))
+        .await
+        .expect("the operator must own its retired agent's claims");
+    assert!(!is_current(&pool, own).await);
+}
+
+/// A2: a RETIRED identity can never act for its operator — not over a sibling
+/// actor's claims, not over another retired sibling's. Its key may be exposed;
+/// the CALLER side reads the actor record, which a retired link never is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_agent_cannot_act_for_its_operator(pool: PgPool) {
+    let operator = agent(&pool, "operator").await;
+    let (retired_server, retired) = server_with_seed(&pool, 0x5D).await;
+    link_retired(&pool, retired, operator).await;
+    let actor = agent(&pool, "actor").await;
+    link(&pool, actor, operator).await;
+    let other_retired = agent(&pool, "other-retired").await;
+    link_retired(&pool, other_retired, operator).await;
+
+    for author in [actor, other_retired] {
+        let c = own_claim(&pool, author).await;
+        let err = supersede(&retired_server, &pool, c, None)
+            .await
+            .expect_err("a retired identity must not act for its operator");
+        assert!(err.contains("declared signer identity"), "{err}");
+        assert!(is_current(&pool, c).await);
+    }
 }
 
 /// The authoring half, end to end through `submit_claim`: an operated agent's
@@ -416,4 +475,13 @@ async fn a_revoked_link_grants_nothing(pool: PgPool) {
         .await
         .expect_err("a revoked link must not keep granting ownership");
     assert!(err.contains("declared signer identity"), "{err}");
+
+    // ...while the OPERATOR keeps ownership of what the revoked agent wrote:
+    // the target side reads the author record, not the membership.
+    let mine = claim(&pool, me, fixture::world_group(&pool).await).await;
+    let (other_server, _) = server_with_seed(&pool, 0x5E).await;
+    supersede(&other_server, &pool, mine, Some(&http_auth(Some(operator))))
+        .await
+        .expect("revoking an agent must not take its claims away from the operator");
+    assert!(!is_current(&pool, mine).await);
 }
