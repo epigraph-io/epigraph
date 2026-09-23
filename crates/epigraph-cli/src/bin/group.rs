@@ -387,6 +387,10 @@ fn run(cli: Cli) -> Result<String, String> {
                 "add_member_request": {
                     "agent_id": member_agent_id,
                     "wrapped_key_share": hex::encode(wrapped.to_bytes()),
+                    // The route REQUIRES the epoch the share was wrapped for,
+                    // and refuses (409) when it is not the group's current
+                    // epoch, rather than stamping a share on the wrong epoch.
+                    "epoch": binding.epoch,
                     "role": role.as_db_str(),
                 },
                 "epoch": binding.epoch,
@@ -475,6 +479,9 @@ fn run(cli: Cli) -> Result<String, String> {
                 "add_member_request": {
                     "agent_id": to_member_agent_id,
                     "wrapped_key_share": hex::encode(rewrapped.to_bytes()),
+                    // The destination binding's epoch, for the same reason
+                    // `wrap` emits it.
+                    "epoch": to.epoch,
                     "role": role.as_db_str(),
                 },
                 "epoch": to.epoch,
@@ -732,7 +739,7 @@ mod tests {
                 admin_secret: hex::encode(admin.to_bytes()),
                 member_public: hex::encode(member.verifying_key().to_bytes()),
                 group_id,
-                epoch: 0,
+                epoch: 3,
                 member_agent_id,
                 role: "writer".to_string(),
             },
@@ -742,6 +749,9 @@ mod tests {
         let body = &parsed["add_member_request"];
 
         assert_eq!(body["role"].as_str().unwrap(), "writer");
+        // The member route requires the epoch the share was wrapped for; a
+        // body without it is refused before anything is written.
+        assert_eq!(body["epoch"].as_i64(), Some(3));
         assert_eq!(
             body["agent_id"].as_str().unwrap(),
             member_agent_id.to_string()
@@ -756,7 +766,7 @@ mod tests {
             &parse_payload(share).unwrap(),
             &member,
             &admin.verifying_key(),
-            ShareBinding::new(group_id, 0, member_agent_id),
+            ShareBinding::new(group_id, 3, member_agent_id),
         )
         .unwrap();
         assert_eq!(recovered, keys.base_key);
@@ -806,6 +816,7 @@ mod tests {
         let body = &parsed["add_member_request"];
 
         assert_eq!(body["role"].as_str().unwrap(), "admin");
+        assert_eq!(body["epoch"].as_i64(), Some(0));
         assert!(parsed["can_write"].as_bool().unwrap());
         assert_eq!(
             body["agent_id"].as_str().unwrap(),

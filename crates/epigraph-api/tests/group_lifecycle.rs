@@ -182,6 +182,7 @@ async fn create_group_then_add_member_then_get_member_role_round_trips(pool: PgP
         Some(json!({
             "agent_id": newcomer,
             "wrapped_key_share": wrapped_share("share-1"),
+            "epoch": 0,
             "role": "writer",
         })),
     )
@@ -321,6 +322,7 @@ async fn role_omitted_defaults_to_reader_and_does_not_500(pool: PgPool) {
         Some(json!({
             "agent_id": newcomer,
             "wrapped_key_share": wrapped_share("share-role"),
+            "epoch": 0,
             // role deliberately omitted
         })),
     )
@@ -352,6 +354,7 @@ async fn role_member_is_rejected_with_400(pool: PgPool) {
         Some(json!({
             "agent_id": newcomer,
             "wrapped_key_share": wrapped_share("share-member"),
+            "epoch": 0,
             "role": "member",
         })),
     )
@@ -501,6 +504,7 @@ async fn an_admin_can_be_removed_once_a_second_admin_exists(pool: PgPool) {
         Some(json!({
             "agent_id": second,
             "wrapped_key_share": wrapped_share("share-duo"),
+            "epoch": 0,
             "role": "admin",
         })),
     )
@@ -628,6 +632,7 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
         Some(json!({
             "agent_id": other,
             "wrapped_key_share": wrapped_share("share-scope"),
+            "epoch": 0,
         })),
     )
     .await;
@@ -642,6 +647,7 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
         Some(json!({
             "agent_id": other,
             "wrapped_key_share": wrapped_share("share-scope2"),
+            "epoch": 0,
         })),
     )
     .await;
@@ -681,7 +687,7 @@ async fn add_member_rejects_a_wrapped_share_that_is_not_60_bytes(pool: PgPool) {
             Method::POST,
             &uri,
             Some(&admin),
-            Some(json!({ "agent_id": newcomer, "wrapped_key_share": share })),
+            Some(json!({ "agent_id": newcomer, "epoch": 0, "wrapped_key_share": share })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "wrapped_key_share {label}");
@@ -693,7 +699,7 @@ async fn add_member_rejects_a_wrapped_share_that_is_not_60_bytes(pool: PgPool) {
         Method::POST,
         &uri,
         Some(&admin),
-        Some(json!({ "agent_id": newcomer, "wrapped_key_share": "zzzz" })),
+        Some(json!({ "agent_id": newcomer, "epoch": 0, "wrapped_key_share": "zzzz" })),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -721,6 +727,7 @@ async fn adding_an_existing_member_twice_is_409_not_500(pool: PgPool) {
     let payload = json!({
         "agent_id": newcomer,
         "wrapped_key_share": wrapped_share("share-dup"),
+        "epoch": 0,
         "role": "reader",
     });
 
@@ -761,6 +768,7 @@ async fn adding_an_unknown_agent_is_404_not_500(pool: PgPool) {
         Some(json!({
             "agent_id": Uuid::new_v4(),
             "wrapped_key_share": wrapped_share("share-fk"),
+            "epoch": 0,
             "role": "reader",
         })),
     )
@@ -830,6 +838,7 @@ async fn two_concurrent_admin_removals_cannot_strand_a_group(pool: PgPool) {
         Some(json!({
             "agent_id": b,
             "wrapped_key_share": wrapped_share("share-race"),
+            "epoch": 0,
             "role": "admin",
         })),
     )
@@ -965,6 +974,7 @@ async fn the_guard_waits_for_the_admin_rows_its_decision_reads(pool: PgPool) {
         Some(json!({
             "agent_id": b,
             "wrapped_key_share": wrapped_share("share-wait"),
+            "epoch": 0,
             "role": "admin",
         })),
     )
@@ -1062,6 +1072,7 @@ async fn the_lock_set_covers_every_live_member_not_only_the_admins(pool: PgPool)
             Some(json!({
                 "agent_id": agent,
                 "wrapped_key_share": wrapped_share(seed),
+                "epoch": 0,
                 "role": role,
             })),
         )
@@ -1158,6 +1169,7 @@ async fn two_concurrent_removals_of_different_members_both_succeed(pool: PgPool)
             Some(json!({
                 "agent_id": agent,
                 "wrapped_key_share": wrapped_share(seed),
+                "epoch": 0,
                 "role": role,
             })),
         )
@@ -1219,6 +1231,7 @@ async fn count_live_admins_excluding_ignores_the_excluded_and_the_revoked(pool: 
             Some(json!({
                 "agent_id": agent,
                 "wrapped_key_share": wrapped_share(seed),
+                "epoch": 0,
                 "role": role,
             })),
         )

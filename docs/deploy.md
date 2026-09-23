@@ -1244,3 +1244,40 @@ restart, as before.
 
 Rows written before this change are not rewritten. An event whose `actor_id` was
 forged, or left `NULL`, keeps it.
+
+## `POST /api/v1/groups/:id/members` names the epoch its share was wrapped for, and membership writes serialize with rotation
+
+Deferred-commitment batch `fix/deferred-2026-09-22-lane-b`, screen key
+`add-member-rotate-race` (register `D-PR20-A` in `docs/tenancy/progress.json`).
+This is a code-only change. It ships no migration and takes effect when the
+binaries roll.
+
+Before this change a member added while `POST /api/v1/groups/:id/rotate` was
+running could be written at the epoch the rotation was retiring. That member
+held no share for the new epoch and could not read anything sealed after the
+rotation, and the rotation still reported every member re-wrapped.
+
+### 1a. BREAKING — the member body must carry `epoch`, and a stale one is a `409`
+
+* **A body without `epoch`** was a `201`, stamped with whatever epoch the server
+  read. It is now a `422` from the JSON extractor, and nothing is written.
+  **The affected caller** is any client that builds this body itself.
+  `epigraph-group wrap` and `epigraph-group rewrap` now print `epoch` inside
+  `add_member_request`, so a body copied from their output keeps working.
+  **Remedy:** send the `--epoch` the share was wrapped for.
+* **An `epoch` that is not the group's current key epoch** is a `409`, and
+  nothing is written. The message names both epochs. This is what a rotation
+  that commits between wrapping the share and posting it now produces.
+  **Remedy:** read `current_epoch` from `GET /api/v1/groups/:id`, run
+  `epigraph-group wrap --epoch <current_epoch>` again and resubmit.
+
+### 1b. Membership writes and rotation now queue per group
+
+`POST` and `DELETE /api/v1/groups/:id/members`, `POST /api/v1/groups/:id/rotate`,
+and `POST` and `DELETE /api/v1/communities/:id/members` each take one per-group,
+transaction-scoped advisory lock before anything else. For a single group they
+now run one at a time. Different groups wait on each other only when their ids
+share a 32-bit hash, which is what the lock is keyed on. Each holds the lock
+for one short transaction, so the visible effect is that a member add arriving
+during a rotation waits for it to commit. A wait shows in `pg_stat_activity`
+with `wait_event_type = 'Lock'` and `wait_event = 'advisory'`.

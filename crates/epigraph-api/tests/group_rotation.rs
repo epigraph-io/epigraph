@@ -159,6 +159,7 @@ async fn group_with_two_members(pool: &PgPool, seed: &str) -> (Uuid, Uuid, Uuid,
         Some(json!({
             "agent_id": member,
             "wrapped_key_share": wrapped_share(&format!("{seed}-member-share")),
+            "epoch": 0,
             "role": "writer",
         })),
     )
@@ -543,6 +544,120 @@ async fn a_groups_admin_token_cannot_rotate_a_group_it_does_not_administer(pool:
 }
 
 // =============================================================================
+// 2b. A MEMBER ADDED ACROSS A ROTATION
+// =============================================================================
+
+/// A share wrapped for the epoch a rotation retired is refused, and nothing is
+/// written.
+///
+/// The admin wraps a newcomer's share for the epoch the group reports, and a
+/// rotation commits before the POST lands. The route used to stamp whatever
+/// epoch it read. After the per-group lock, that is the NEW epoch, so it would
+/// have stored a share for the old key under the new epoch's number, and the
+/// member could not open it. Before the lock, the route could stamp the
+/// retired epoch instead. The request now names the epoch its share was wrapped
+/// for, and a mismatch with the epoch read under the lock is a 409 that writes
+/// nothing. The same body re-wrapped for the new epoch is accepted there.
+///
+/// The concurrent form, with the rotation still open while the add waits on
+/// the lock, is `epigraph-db/tests/group_membership_lock.rs`. This is the
+/// route's half: the status, the message, and that the body's `epoch` is
+/// required.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_member_share_wrapped_for_a_retired_epoch_is_refused_and_writes_nothing(pool: PgPool) {
+    let (group_id, creator, member, admin) = group_with_two_members(&pool, "stale-share").await;
+    make_recoverable(&pool, group_id).await;
+    let (status, body) = send(
+        app(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group_id}/rotate"),
+        Some(&admin),
+        Some(rotation_for(&[creator, member], "stale-share")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rotate: {body}");
+    assert_eq!(body["new_epoch"], 1);
+
+    let newcomer = seed_agent(&pool, "stale-share-newcomer").await;
+    let (status, body) = send(
+        app(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group_id}/members"),
+        Some(&admin),
+        Some(json!({
+            "agent_id": newcomer,
+            "wrapped_key_share": wrapped_share("stale-share-newcomer-epoch-0"),
+            "epoch": 0,
+            "role": "reader",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a share wrapped for the retired epoch must be refused: {body}"
+    );
+    let message = body.to_string();
+    assert!(
+        message.contains("epoch 0") && message.contains("current key epoch is 1"),
+        "the refusal must say which epoch to re-wrap for: {body}"
+    );
+    let live = live_shares(&pool, group_id).await;
+    assert_eq!(
+        live.len(),
+        2,
+        "the refused add wrote a membership: {live:?}"
+    );
+
+    // A body with no `epoch` at all is refused by the extractor. It is not
+    // stamped with whatever epoch the server reads.
+    let (status, body) = send(
+        app(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group_id}/members"),
+        Some(&admin),
+        Some(json!({
+            "agent_id": newcomer,
+            "wrapped_key_share": wrapped_share("stale-share-newcomer-no-epoch"),
+            "role": "reader",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a body that does not name its share's epoch must be refused: {body}"
+    );
+    assert_eq!(live_shares(&pool, group_id).await.len(), 2);
+
+    let (status, body) = send(
+        app(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group_id}/members"),
+        Some(&admin),
+        Some(json!({
+            "agent_id": newcomer,
+            "wrapped_key_share": wrapped_share("stale-share-newcomer-epoch-1"),
+            "epoch": 1,
+            "role": "reader",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "re-wrapped for epoch 1: {body}"
+    );
+    assert_eq!(body["epoch"], 1);
+    let live = live_shares(&pool, group_id).await;
+    assert_eq!(live.len(), 3, "{live:?}");
+    assert!(
+        live.iter().all(|(_, epoch, _)| *epoch == 1),
+        "every live member is on the current epoch: {live:?}"
+    );
+}
+
+// =============================================================================
 // 3. WHAT A MEMBER REMOVAL MARKS
 // =============================================================================
 
@@ -622,6 +737,7 @@ async fn removing_a_member_marks_the_reseal_obligation_without_disabling_the_gro
         Some(json!({
             "agent_id": newcomer,
             "wrapped_key_share": wrapped_share("removal-mark-newcomer-share"),
+            "epoch": 0,
             "role": "reader",
         })),
     )
@@ -721,6 +837,7 @@ async fn a_second_removal_does_not_restart_the_obligations_clock(pool: PgPool) {
         Some(json!({
             "agent_id": second,
             "wrapped_key_share": wrapped_share("clock-second-share"),
+            "epoch": 0,
             "role": "reader",
         })),
     )

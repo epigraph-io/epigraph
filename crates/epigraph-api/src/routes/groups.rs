@@ -80,6 +80,22 @@ pub struct AddMemberRequest {
     pub agent_id: Uuid,
     /// Member's wrapped key share (hex-encoded encrypted payload)
     pub wrapped_key_share: String,
+    /// The key epoch `wrapped_key_share` was wrapped for: the `--epoch` given
+    /// to `epigraph-group wrap`, which echoes it into the body it prints.
+    ///
+    /// REQUIRED, and a mismatch with the group's current epoch is a 409 that
+    /// writes nothing. The share's AAD binds its epoch, and the server holds
+    /// no key to read it back out, so the request has to say it. Without it,
+    /// a rotation that commits between the admin wrapping the share and this
+    /// request landing leaves the route two bad choices. It can stamp the new
+    /// epoch on a share for the old key, and the member cannot open it. Or it
+    /// can stamp the old epoch, and the member sits on a retired epoch. An
+    /// optional field would leave every client that omits it open to exactly
+    /// that, so the field is not optional.
+    ///
+    /// BREAKING: a body without `epoch` is refused by the JSON extractor
+    /// (`docs/deploy.md`).
+    pub epoch: i32,
     /// Role: "admin", "writer", or "reader".
     ///
     /// BREAKING (PR-01): "member" is no longer accepted. It was never storable
@@ -305,7 +321,11 @@ pub async fn create_group(
 /// Add a member to a group.
 ///
 /// The caller must have already wrapped the group base key for the new member
-/// using ECDH key exchange (`wrap_key_for_member`).
+/// using ECDH key exchange (`wrap_key_for_member`), and names the epoch it
+/// wrapped for in `epoch`. The member is written at the group's current epoch
+/// under the group membership lock that rotation also takes. If that epoch is
+/// not the one the share was wrapped for, the request is refused with 409 and
+/// nothing is written.
 ///
 /// # Authorization
 /// `groups:admin` scope AND a live `role='admin'` membership in this group.
@@ -361,10 +381,12 @@ pub async fn add_member(
     // wrapped for, and the server holds no key with which to verify any of the
     // three. A well-formed share bound to the wrong tuple is stored and fails
     // closed on the member's machine. That is the cost of the server never
-    // holding a group key, not an oversight. Neither side verifies the tuple:
-    // the operator supplies it to the ceremony tool, which contacts no server
-    // and so cannot know the group's live state, and this route stamps the
-    // membership row with the epoch it reads from the database.
+    // holding a group key, not an oversight. The server cannot verify the
+    // tuple, but it does check the one part it can compare: the request's
+    // `epoch` must equal the current epoch read under the group membership
+    // lock, or nothing is written (409). The group id comes from the path and
+    // the member from `agent_id`, and a share wrapped for another group or
+    // member still fails closed on the member's machine.
     const WRAPPED_KEY_SHARE_BYTES: usize = 12 + 32 + 16;
 
     let wrapped_key_bytes =
@@ -399,6 +421,7 @@ pub async fn add_member(
         group_id,
         req.agent_id,
         &wrapped_key_bytes,
+        req.epoch,
         &req.role,
     )
     .await
@@ -434,6 +457,22 @@ pub async fn add_member(
                 reason: "Group has no current key epoch; rotate or re-provision it \
                      before adding members"
                     .to_string(),
+            });
+        }
+        // The share opens a different epoch's key than the one the member
+        // would be written at. Usually a rotation committed after the admin
+        // wrapped it. Writing it at either epoch is wrong; see
+        // `AddMemberRequest::epoch`.
+        epigraph_db::AddMemberOutcome::EpochMismatch {
+            share_epoch,
+            current_epoch,
+        } => {
+            return Err(ApiError::Conflict {
+                reason: format!(
+                    "wrapped_key_share was wrapped for epoch {share_epoch}, but the group's \
+                     current key epoch is {current_epoch}; wrap epoch {current_epoch}'s key for \
+                     this member (epigraph-group wrap --epoch {current_epoch}) and resubmit"
+                ),
             });
         }
     };

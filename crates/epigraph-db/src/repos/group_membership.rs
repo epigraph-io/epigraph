@@ -44,6 +44,16 @@ pub enum AddMemberOutcome {
     /// joinable: pinning the member to a made-up epoch would give them a share
     /// that decrypts nothing. Nothing was written.
     NoCurrentEpoch,
+    /// The share was wrapped for `share_epoch`, but the group's current epoch,
+    /// read under the lock, is `current_epoch`. Nothing was written. Storing
+    /// the share at `current_epoch` would record a share that cannot open that
+    /// epoch's key. Storing it at `share_epoch` would put a member on an epoch
+    /// that is not current. The admin must wrap the current epoch's key and
+    /// resubmit.
+    EpochMismatch {
+        share_epoch: i32,
+        current_epoch: i32,
+    },
 }
 
 /// Repository for GroupMembership operations
@@ -106,7 +116,8 @@ impl GroupMembershipRepository {
         Ok(())
     }
 
-    /// Add an agent to a group at the group's CURRENT key epoch.
+    /// Add an agent to a group at the group's CURRENT key epoch, and only if
+    /// that is the epoch its share was wrapped for.
     ///
     /// One transaction takes [`Self::lock_group_membership_conn`], reads the
     /// current epoch and `INSERT`s at it. The route used to read the epoch on
@@ -114,8 +125,17 @@ impl GroupMembershipRepository {
     /// passed in. A rotation that committed between the two stamped the
     /// newcomer at the retired epoch. No transaction overlap was needed for
     /// that, and `rotate_conn`'s roster lock could not have caught it. The
-    /// epoch is no longer a parameter, so no caller can reintroduce the gap by
-    /// reading it early.
+    /// epoch to write is not a parameter, so no caller can reintroduce the gap
+    /// by reading it early.
+    ///
+    /// `share_epoch` is the epoch `wrapped_key_share` was wrapped for. The
+    /// share's AAD binds it, and the server holds no key to read it back, so
+    /// the caller must state it. The lock alone does not make the outcome
+    /// right. If a rotation commits after the admin wrapped the share and
+    /// before this runs, the lock makes this read the NEW epoch, and writing
+    /// there would store a share for the old key under the new epoch's number.
+    /// So the two are compared under the lock, and a mismatch writes nothing
+    /// and returns [`AddMemberOutcome::EpochMismatch`].
     ///
     /// "Current" means `active` or `rotating`, with the same predicate and
     /// ordering as `GroupKeyEpochRepository::get_current_epoch`. See that
@@ -131,6 +151,7 @@ impl GroupMembershipRepository {
         group_id: Uuid,
         agent_id: Uuid,
         wrapped_key_share: &[u8],
+        share_epoch: i32,
         role: &str,
     ) -> Result<AddMemberOutcome, DbError> {
         let mut tx = pool.begin().await?;
@@ -154,6 +175,13 @@ impl GroupMembershipRepository {
             // Dropping `tx` rolls it back and releases the lock.
             return Ok(AddMemberOutcome::NoCurrentEpoch);
         };
+
+        if epoch != share_epoch {
+            return Ok(AddMemberOutcome::EpochMismatch {
+                share_epoch,
+                current_epoch: epoch,
+            });
+        }
 
         let row: (Uuid,) = sqlx::query_as(
             r#"

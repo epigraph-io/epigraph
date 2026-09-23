@@ -7,8 +7,10 @@
 //! and inserted in a second statement. A member added mid-rotation was
 //! therefore stamped at the epoch being retired and was not re-wrapped, and
 //! the rotation still reported every live member re-wrapped.
-//! `GroupMembershipRepository::lock_group_membership_conn` is the fix, and
-//! these tests measure the lock rather than infer it from timing.
+//! `GroupMembershipRepository::lock_group_membership_conn` is the fix, with
+//! `add_member` refusing a share wrapped for any epoch other than the one it
+//! reads under that lock. These tests measure the lock rather than infer it
+//! from timing.
 
 mod viewer_fixture;
 
@@ -170,6 +172,7 @@ async fn every_roster_writer_waits_for_the_group_membership_lock(pool: PgPool) {
                     group_id,
                     reader,
                     &share("r"),
+                    0,
                     "reader",
                 )
                 .await
@@ -254,23 +257,29 @@ async fn every_roster_writer_waits_for_the_group_membership_lock(pool: PgPool) {
     assert_eq!(outcome, MembershipOutcome::Applied);
 }
 
-/// THE RACE ITSELF. A member added while a rotation is open lands on the NEW
-/// epoch, never the one being retired.
+/// THE RACE ITSELF. A member added while a rotation is open never lands on
+/// the epoch being retired.
 ///
-/// The rotation runs on a connection of our own and is left open, holding
-/// the lock with epoch 1 created but not committed. The add must wait. When
-/// the rotation commits, the add reads epoch 1 and writes there, and every live
-/// member ends on epoch 1. Before the lock, the add read epoch 0 (the rotation
-/// was uncommitted), inserted immediately, and was left on the retired epoch
-/// with no epoch-1 share once the rotation committed.
+/// The admin wrapped the newcomer's share for epoch 0, the epoch the group
+/// reported before the rotation. The rotation runs on a connection of our own
+/// and is left open, holding the lock with epoch 1 created but not committed.
+/// The add must wait. When the rotation commits, the add reads epoch 1, sees
+/// that the share was wrapped for epoch 0, and writes nothing. Resubmitted with
+/// a share for epoch 1, it lands there, and every live member ends on epoch 1.
+///
+/// Before the lock, the add read epoch 0 (the rotation was uncommitted),
+/// inserted immediately, and was left on the retired epoch with no epoch-1
+/// share once the rotation committed. With the lock and no epoch check, it
+/// would have waited and then written the epoch-0 share at epoch 1, where the
+/// member cannot open it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_member_added_during_a_rotation_lands_on_the_new_epoch(pool: PgPool) {
+async fn a_member_added_during_a_rotation_never_lands_on_the_retired_epoch(pool: PgPool) {
     let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
     let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
     let (newcomer, _) = fixture::seed_agent_with_group(&pool, "newcomer").await;
     let group_id = rotatable_team_group(&pool, creator, "race").await;
     let added =
-        GroupMembershipRepository::add_member(&pool, group_id, member, &share("m"), "writer")
+        GroupMembershipRepository::add_member(&pool, group_id, member, &share("m"), 0, "writer")
             .await
             .expect("add member");
     assert!(
@@ -298,8 +307,15 @@ async fn a_member_added_during_a_rotation_lands_on_the_new_epoch(pool: PgPool) {
     let add = tokio::spawn({
         let pool = pool.clone();
         async move {
-            GroupMembershipRepository::add_member(&pool, group_id, newcomer, &share("n"), "reader")
-                .await
+            GroupMembershipRepository::add_member(
+                &pool,
+                group_id,
+                newcomer,
+                &share("n-epoch-0"),
+                0,
+                "reader",
+            )
+            .await
         }
     });
     if !a_backend_is_blocked_on_a_lock(&pool, &add).await {
@@ -317,9 +333,30 @@ async fn a_member_added_during_a_rotation_lands_on_the_new_epoch(pool: PgPool) {
         .expect("add_member never unblocked after the rotation committed")
         .expect("add task panicked")
         .expect("add member");
+    assert_eq!(
+        outcome,
+        AddMemberOutcome::EpochMismatch {
+            share_epoch: 0,
+            current_epoch: 1,
+        },
+        "a share wrapped for epoch 0 must not be written once epoch 1 is current"
+    );
+    let roster = live_roster(&pool, group_id).await;
+    assert_eq!(roster.len(), 2, "the refused add wrote a row: {roster:?}");
+
+    let retried = GroupMembershipRepository::add_member(
+        &pool,
+        group_id,
+        newcomer,
+        &share("n-epoch-1"),
+        1,
+        "reader",
+    )
+    .await
+    .expect("add member at the new epoch");
     assert!(
-        matches!(outcome, AddMemberOutcome::Added { epoch: 1, .. }),
-        "the add must read the epoch the rotation committed: {outcome:?}"
+        matches!(retried, AddMemberOutcome::Added { epoch: 1, .. }),
+        "{retried:?}"
     );
 
     let roster = live_roster(&pool, group_id).await;
