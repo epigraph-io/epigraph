@@ -48,9 +48,13 @@ fn now() -> u64 {
 
 fn config() -> ApiConfig {
     ApiConfig {
-        require_signatures: false,
+        // `require_packet_signatures`, not `require_signatures`: the field was
+        // renamed on main, and `ApiConfig` is deliberately not
+        // `#[non_exhaustive]` so every literal names every field.
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        allow_all_identities: false,
     }
 }
 
@@ -76,7 +80,13 @@ async fn app_with_google(pool: &PgPool, fx: &ProviderFixture) -> axum::Router {
         redirect_uri_env: None,
         auto_provision: true,
         default_scopes: vec!["claims:read".into()],
-        allowed_emails: vec![],
+        // An EXPLICIT allowlist, not `allow_all_identities: true`. Since PR-02
+        // an empty allowlist DENIES — `provision_external_user_client` refuses
+        // with "provider has no identity allowlist and allow_all_identities is
+        // false" — and this fixture predates that. Naming the one identity it
+        // signs keeps the deny-by-default posture under test while letting the
+        // flow reach the consent page, which is what this file is about.
+        allowed_emails: vec![USER_EMAIL.into()],
         allowed_domains: vec![],
     };
     let id_token = fx.sign(&json!({

@@ -476,7 +476,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/authorize.rs",
-        6,
+        7,
         "Pre-authentication by definition. The authorize/callback/consent endpoints sit on the \
          anonymous OAuth router — the surface public_router_allowlist.rs pins — and run before any \
          principal exists. Establishing one is what they are for. REVIEWED, NOT RUBBER-STAMPED: \
@@ -485,7 +485,17 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          resolved. It is still pre-authentication in the sense that matters here — no EpiGraph \
          principal has been minted, so there is no agent id a Viewer could resolve from — but a \
          shard should re-read this entry rather than assume it, and it is the first exemption to \
-         revisit if the consent step ever mints early.",
+         revisit if the consent step ever mints early. \
+         \
+         6 -> 7: the Explorer branch's consent-page fix adds one \
+         OAuthClientRepository::get_by_client_id in callback_endpoint, so the page can name the \
+         REQUESTING client instead of a hard-coded product name. The file-level reason covers it \
+         and was re-read rather than assumed: it is the same repo method this file already calls \
+         at /oauth/authorize, on the same anonymous router, strictly BEFORE the provider exchange \
+         and before any principal is provisioned. `oauth_clients` additionally carries no tenancy \
+         columns at all and is in none of migration 077's protected arrays — 077 says in its own \
+         comment that a policy there would make the token mint's UPDATE match zero rows — so there \
+         is no predicate a Viewer could have been spent on even if one existed.",
     ),
     (
         "oauth/device.rs",
