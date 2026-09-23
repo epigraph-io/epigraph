@@ -3770,11 +3770,12 @@ impl ClaimRepository {
     ///
     /// # Implementation Notes
     /// The UPDATE that marks the old claim `is_current = false` also sets
-    /// `embedding = NULL` in the **same statement**.  This is required by the
-    /// CHECK constraint `chk_deprecated_no_embedding` (migration 052), which
-    /// fires per-statement rather than per-transaction: splitting the two
-    /// assignments across two UPDATE statements would violate the constraint
-    /// between statements.  Any future caller — REST handlers, CLI tools, tests
+    /// `embedding = NULL` and `embedding_3072 = NULL` in the **same
+    /// statement**.  This is required by the CHECK constraints
+    /// `chk_deprecated_no_embedding` (migration 052) and
+    /// `chk_deprecated_no_embedding_3072` (migration 101), which fire
+    /// per-statement rather than per-transaction: splitting the assignments
+    /// across two UPDATE statements would violate them between statements.  Any future caller — REST handlers, CLI tools, tests
     /// — must preserve this single-statement invariant.  See also
     /// [`ClaimRepository::mark_duplicate`] which is subject to the same
     /// constraint.
@@ -3826,12 +3827,15 @@ impl ClaimRepository {
             });
         }
 
-        // Mark old claim as non-current and null its embedding in one statement.
-        // Combining both in a single UPDATE is required by the CHECK constraint
-        // `chk_deprecated_no_embedding` (migration 052) which fires per-statement,
-        // not per-transaction: a two-step update would violate it between statements.
+        // Mark old claim as non-current and null BOTH vector columns in one
+        // statement. Combining them in a single UPDATE is required by the CHECK
+        // constraints `chk_deprecated_no_embedding` (migration 052, `embedding`)
+        // and `chk_deprecated_no_embedding_3072` (migration 101,
+        // `embedding_3072`), which fire per-statement, not per-transaction: a
+        // two-step update would violate them between statements.
         sqlx::query(
-            "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
+            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+                               updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(old_uuid)
@@ -4892,11 +4896,13 @@ impl ClaimRepository {
         .await?;
 
         if edge_type == "supersedes" {
-            // Also null the embedding so the retired step drops out of semantic
-            // search. Mirrors the invariant enforced by supersede() and
-            // mark_duplicate(): is_current=false → embedding=NULL.
+            // Also null both vector columns so the retired step drops out of
+            // semantic search. Mirrors the invariant enforced by supersede() and
+            // mark_duplicate(): is_current=false → embedding=NULL and
+            // embedding_3072=NULL, in one statement (migrations 052 and 101).
             sqlx::query(
-                "UPDATE claims SET is_current = false, embedding = NULL, updated_at = NOW() \
+                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+                                   updated_at = NOW() \
                  WHERE id = $1",
             )
             .bind(parent_uuid)
@@ -4924,10 +4930,12 @@ impl ClaimRepository {
     ///
     /// # Implementation Notes
     /// The UPDATE that sets `is_current = false` on the duplicate also sets
-    /// `embedding = NULL` in the **same statement**, satisfying the CHECK
-    /// constraint `chk_deprecated_no_embedding` (migration 052).  This
-    /// constraint fires per-statement, so any split across two UPDATE statements
-    /// would violate it between them.  Any future caller must preserve this
+    /// `embedding = NULL` and `embedding_3072 = NULL` in the **same
+    /// statement**, satisfying the CHECK constraints
+    /// `chk_deprecated_no_embedding` (migration 052) and
+    /// `chk_deprecated_no_embedding_3072` (migration 101).  They fire
+    /// per-statement, so any split across two UPDATE statements would violate
+    /// them between statements.  Any future caller must preserve this
     /// single-statement invariant.  See also [`ClaimRepository::supersede`]
     /// which has the same requirement.
     #[instrument(skip(pool))]
@@ -5025,13 +5033,15 @@ impl ClaimRepository {
                 )),
             });
         }
-        // Null the embedding in the same statement as is_current=false so the
-        // CHECK constraint chk_deprecated_no_embedding (migration 052) is not
-        // violated mid-transaction. Dropping it from semantic search is the same
+        // Null both vector columns in the same statement as is_current=false so
+        // the CHECK constraints chk_deprecated_no_embedding (migration 052) and
+        // chk_deprecated_no_embedding_3072 (migration 101) are not violated
+        // mid-transaction. Dropping it from semantic search is the same
         // invariant as supersede() and deprecate_claim().
         sqlx::query(
             "UPDATE claims \
-             SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW() \
+             SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL, \
+                 updated_at = NOW() \
              WHERE id = $2",
         )
         .bind(canon_uuid)
@@ -6413,7 +6423,9 @@ mod tests {
 
 impl ClaimRepository {
     /// Deprecate a single claim: drop its truth to the 0.05 sentinel, flip
-    /// `is_current = false`, and NULL its embedding in one statement.
+    /// `is_current = false`, and NULL both vector columns (`embedding`,
+    /// `embedding_3072`) in one statement — migrations 052 and 101 CHECK each
+    /// per statement.
     ///
     /// This is the canonical deprecation primitive for workflow claims. It is
     /// the THIRD `is_current = false` cleanup path (alongside `supersede` and
@@ -6437,7 +6449,8 @@ impl ClaimRepository {
         let uuid: Uuid = id.into();
         let result = sqlx::query(
             "UPDATE claims \
-             SET truth_value = 0.05, is_current = false, embedding = NULL, updated_at = NOW() \
+             SET truth_value = 0.05, is_current = false, embedding = NULL, \
+                 embedding_3072 = NULL, updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(uuid)
@@ -7340,12 +7353,14 @@ impl ClaimRepository {
         }
 
         // Retire sources. One statement: chk_deprecated_no_embedding (migration
-        // 052) is a per-statement CHECK, so is_current=false and embedding=NULL
-        // must land together.
+        // 052) and chk_deprecated_no_embedding_3072 (migration 101) are
+        // per-statement CHECKs, so is_current=false and both vector NULLs must
+        // land together.
         sqlx::query!(
             r#"
             UPDATE claims
-            SET supersedes = $1, is_current = false, embedding = NULL, updated_at = NOW()
+            SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL,
+                updated_at = NOW()
             WHERE id = ANY($2)
             "#,
             merged_id,

@@ -1515,13 +1515,17 @@ async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(po
         "a current, unsealed claim must still be embeddable by the restore write"
     );
 
-    // What `ClaimRepository::supersede` does to the loser, reduced to the one
-    // column this write consults.
-    sqlx::query("UPDATE claims SET is_current = false, embedding = NULL WHERE id = $1")
-        .bind(stale)
-        .execute(&pool)
-        .await
-        .expect("supersede the claim out from under the in-flight job");
+    // What `ClaimRepository::supersede` does to the loser, reduced to the
+    // column this write consults plus the two vector columns migrations 052
+    // and 101 require the same statement to null (this fixture seeds both).
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(stale)
+    .execute(&pool)
+    .await
+    .expect("supersede the claim out from under the in-flight job");
 
     let refused = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
         &mut conn, &bypass, stale, &vector,

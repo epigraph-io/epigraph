@@ -14,6 +14,12 @@
 //! for the vector column an unseal does not restore, so it is run deliberately
 //! over corpora that contain sealed rows; the exclusion is what makes that
 //! safe. See [`ReembedTarget::sealed_predicate`].
+//!
+//! RETIRED CLAIMS ARE NEVER SELECTED OR WRITTEN. A claim with
+//! `is_current = false` must carry no vector in either column (CHECKs
+//! `chk_deprecated_no_embedding`, migration 052, and
+//! `chk_deprecated_no_embedding_3072`, migration 101). See
+//! [`ReembedTarget::current_predicate`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -88,6 +94,37 @@ impl ReembedTarget {
             }
         }
     }
+
+    /// The predicate admitting only rows that may carry a vector at all.
+    ///
+    /// # Why it sits in the WRITE as well as the selection
+    ///
+    /// A retired claim (`is_current = false`: superseded, marked duplicate,
+    /// deprecated, consolidated) must hold no vector in either column. Before
+    /// this predicate existed the selection had no `is_current` clause, so a
+    /// run wrote a 3072-d vector onto every retired claim and nothing ever
+    /// nulled it again; recall and theme k-means at `centroid_dim = 3072` read
+    /// `embedding_3072 IS NOT NULL` as "live" and surfaced those rows. Migration
+    /// 101 now forbids that state with a CHECK, which turns the old behaviour
+    /// from a silent leak into a run that aborts on the first retired row.
+    ///
+    /// Filtering the selection is not enough on its own: a claim can be
+    /// retired between [`fetch_batch`] and [`update_embedding_3072`] (the
+    /// provider call in between is the slow part of every batch). The UPDATE
+    /// therefore re-checks the predicate, so a raced row is a zero-row no-op
+    /// rather than a CHECK violation that kills the run. That re-check is
+    /// sound under READ COMMITTED because `is_current` is a column of the row
+    /// being updated: a blocked UPDATE re-evaluates its qualification against
+    /// the newly committed version of that row.
+    ///
+    /// `evidence` has no `is_current` column and is not covered by either
+    /// CHECK, so every unsealed evidence row stays eligible.
+    fn current_predicate(self) -> &'static str {
+        match self {
+            Self::Claims => "claims.is_current",
+            Self::Evidence => "TRUE",
+        }
+    }
 }
 
 /// Summary of a completed reembed run.
@@ -142,8 +179,11 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
 
         for ((row_id, _), embedding) in rows.iter().zip(embeddings.iter()) {
             let pgvec = format_pgvector(embedding);
-            update_embedding_3072(pool, config.target, *row_id, &pgvec).await?;
-            rows_written += 1;
+            // A row retired since `fetch_batch` is skipped by the write's own
+            // predicate; count only what actually landed.
+            if update_embedding_3072(pool, config.target, *row_id, &pgvec).await? {
+                rows_written += 1;
+            }
         }
 
         // Advance checkpoint to last id of this batch.
@@ -165,7 +205,8 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
     })
 }
 
-/// Fetch a batch of rows whose `embedding_3072` is NULL, ordered by id.
+/// Fetch a batch of current, unsealed rows whose `embedding_3072` is NULL,
+/// ordered by id.
 async fn fetch_batch(
     pool: &PgPool,
     target: ReembedTarget,
@@ -175,6 +216,7 @@ async fn fetch_batch(
     let table = target.table();
     let content_col = target.content_column();
     let sealed = target.sealed_predicate();
+    let current = target.current_predicate();
 
     let sql = format!(
         "SELECT id, {content_col} AS content \
@@ -183,6 +225,7 @@ async fn fetch_batch(
            AND ($1::uuid IS NULL OR id > $1) \
            AND {content_col} IS NOT NULL \
            AND length({content_col}) > 0 \
+           AND {current} \
            AND NOT {sealed} \
          ORDER BY id \
          LIMIT $2"
@@ -197,17 +240,24 @@ async fn fetch_batch(
     Ok(rows)
 }
 
-/// UPDATE one row's `embedding_3072` column.
+/// UPDATE one row's `embedding_3072` column, unless the row has been retired
+/// since it was selected. Returns whether a row was written.
 async fn update_embedding_3072(
     pool: &PgPool,
     target: ReembedTarget,
     id: Uuid,
     pgvec: &str,
-) -> Result<(), ReembedError> {
+) -> Result<bool, ReembedError> {
     let table = target.table();
-    let sql = format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2");
-    sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
-    Ok(())
+    let current = target.current_predicate();
+    let sql = format!("UPDATE {table} SET embedding_3072 = $1::vector WHERE id = $2 AND {current}");
+    let written = sqlx::query(&sql)
+        .bind(pgvec)
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(written > 0)
 }
 
 /// Format a `&[f32]` as pgvector literal `[a,b,c,...]`.
