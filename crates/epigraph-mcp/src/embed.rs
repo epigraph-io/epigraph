@@ -34,6 +34,27 @@ pub const HYBRID_RRF_K: i64 = 60;
 /// falling back — hard constraint #5 of the write-path brief: a refusal must stay
 /// loud, because a fallback to the unstamped pool is how a `42501` becomes a
 /// silent orphan.
+///
+/// # MEASURED, end to end, with the real binary as `epigraph_app`
+///
+/// `store_workflow` (4 executor-authored claims) + `add_step` (1), on the
+/// prod-faithful schema configuration:
+///
+/// | binary | outcome |
+/// |---|---|
+/// | this code | `all_claims=5 all_embedded=5`, no warning in the log |
+/// | one hunk reverted — `main` builds the embedder WITHOUT `with_scoped_pool` | `all_claims=5 all_embedded=0`, five `tenancy.scoped_write` ERRORs |
+/// | restored | `all_claims=5 all_embedded=5` again |
+///
+/// The mutation is the proof that the declaration is what stores the vectors, and
+/// it is run on the PROD-FAITHFUL configuration deliberately. On the clean
+/// configuration these tools never reach the embed at all — the executor's own
+/// unstamped `claims` INSERT is refused first (the D5 residual registered in
+/// `tests/residual_unstamped_writes.rs`), so a clean-schema arm would report
+/// `all_claims=0` and discriminate nothing. This is therefore the one
+/// configuration in which the seven executor-path callers' embed is observable,
+/// and the arm that makes it non-vacuous is the reverted hunk rather than the
+/// policies.
 pub enum StorePath {
     /// No store capability was declared. Every store attempt is refused with a
     /// named cause. This is what `McpEmbedder::new` yields, so a new construction
