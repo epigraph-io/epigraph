@@ -119,6 +119,20 @@ Filter rule: pair `(a, b)` is **same-source** iff
 These three components define **provenance-of-the-claim** (where it came
 from in the ingestion graph). Same-source pairs are dropped entirely.
 
+> **As built (2026-09-22), and where it departs from the sketch above.**
+> `crates/epigraph-engine/src/matching/source_key.rs` is authoritative.
+> - `paper_id` is `paper_doi`, resolved through the `paper -asserts-> claim`
+>   edge (4dfb7da3).
+> - There is **no ingestion-run component**. `claims.ingestion_run_id` was
+>   never added, and the `properties->>'ingestion_run_id'` read that stood in
+>   for it matched nothing, so it was removed. A real non-paper provenance
+>   signal is backlog c618e4fc.
+> - `derivation_root` is replaced by `derivation_lineage`: the claim plus
+>   every claim it was derived from, compared by **overlap**, not equality.
+>   The walk follows claim-to-claim edges only, matches `derived_from` /
+>   `derives_from` case-insensitively, and reads `source` as the derived
+>   claim. See `epigraph_db::repos::derivation` for the direction argument.
+
 **Open choice: should `agent_id` equality also count as same-source?**
 Including it makes the matcher stricter (e.g., two papers by the same
 author asserting the same finding would be filtered out — even though
@@ -409,7 +423,8 @@ The pipeline lives there; drivers are thin:
 3. New column: `claims.last_match_scan_at TIMESTAMPTZ NULL`.
 4. New column: `claims.ingestion_run_id UUID NULL` (if not already present —
    verify before writing migration; if absent, derive from `authored` /
-   `derived_from` chain instead and skip the column).
+   `derived_from` chain instead and skip the column). **Not built**; see the
+   "As built" note under component 1.
 5. No edges-table change: `CORROBORATES`, `same_as`, `same_source`, and
    `contradicts` are all already accepted relationships (per `edges.rs:85-88`).
 6. No new HNSW index: reuse migration 030 from Phase 7.
