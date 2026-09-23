@@ -255,7 +255,11 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // moved from `RequirePrincipal` to `ViewerExtractor` in the same change:
     // taking the principal-only extractor is what would have kept this read out
     // of every register permanently.
-    ("policies.rs", 2),
+    // `policies.rs` was 2 until `F-inline-claim-content-reads` was discharged
+    // and is now 0: `list_network_policies` and `get_challenge` projected
+    // `properties` (host/port/protocol/status) with no viewer. They are now
+    // `PolicyRepository::list_active_network` and `::get_challenge`, each
+    // marking `claims`; an unreadable challenge is a 404.
     ("political.rs", 1),
     // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
     // forward-only scan could not see. Its in-code comment argues it is not a

@@ -133,6 +133,9 @@ pub use repos::mass_function::{
 pub use repos::perspective::PerspectiveRow;
 pub use repos::scoped_belief::ScopedBeliefRow;
 
+// Re-export policy-claim reads (network-access policies and challenges)
+pub use repos::policy::{NetworkPolicyRow, PolicyRepository};
+
 // Re-export Political network monitoring types
 pub use repos::political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,

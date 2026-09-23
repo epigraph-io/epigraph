@@ -46,6 +46,7 @@ pub mod oauth_client;
 pub mod paper;
 pub mod pattern_template;
 pub mod perspective;
+pub mod policy;
 pub mod political;
 pub mod privatization;
 pub mod provenance;
@@ -119,6 +120,7 @@ pub use method::{
 };
 pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
 pub use perspective::PerspectiveRepository;
+pub use policy::{NetworkPolicyRow, PolicyRepository};
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,
     PropagandaTechniqueRow, PropagationStepRow, TimelineClaimRow,

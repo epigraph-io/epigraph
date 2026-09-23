@@ -501,3 +501,118 @@ async fn frame_conflict_densities_count_only_what_the_viewer_can_read(pool: PgPo
          withheld by the claim and the BBA predicate respectively"
     );
 }
+
+// ── routes/policies.rs ──
+
+/// Give a seeded claim a label set (the fixture's seeders write none).
+async fn set_labels(pool: &PgPool, claim: Uuid, labels: &[&str]) {
+    let owned: Vec<String> = labels.iter().map(|s| (*s).to_string()).collect();
+    sqlx::query("UPDATE claims SET labels = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(&owned)
+        .execute(pool)
+        .await
+        .expect("set labels");
+}
+
+/// `GET /policies/network` returns each policy's `properties` (host, port,
+/// protocol), so a policy private to another group must not be listed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_network_policies_lists_only_policies_the_viewer_can_read(pool: PgPool) {
+    let p = plant(&pool, "policy").await;
+    for (claim, host) in [
+        (p.public, "public.example"),
+        (p.mine, "mine.example"),
+        (p.theirs, "theirs.example"),
+    ] {
+        set_labels(&pool, claim, &["policy", "policy:active", "policy:network"]).await;
+        set_properties(
+            &pool,
+            claim,
+            serde_json::json!({ "host": host, "port": 443 }),
+        )
+        .await;
+    }
+
+    let viewer = viewer_for(&pool, p.viewer_agent).await;
+    let state = split_state(&pool).await;
+    let body = epigraph_api::routes::policies::list_network_policies(
+        ViewerExtractor(viewer),
+        State(state),
+        axum::extract::Query(epigraph_api::routes::policies::ListPoliciesQuery { min_truth: 0.5 }),
+    )
+    .await
+    .expect("list_network_policies")
+    .0;
+
+    let hosts: Vec<&str> = body["policies"]
+        .as_array()
+        .expect("policies array")
+        .iter()
+        .filter_map(|p| p["host"].as_str())
+        .collect();
+    assert!(
+        hosts.contains(&"public.example") && hosts.contains(&"mine.example"),
+        "the public policy and the viewer's own private policy must both be listed; \
+         the second is absent on the unstamped raw pool. Got {hosts:?}"
+    );
+    assert!(
+        !hosts.contains(&"theirs.example"),
+        "a policy private to another group must not be listed. Got {hosts:?}"
+    );
+    assert_eq!(hosts.len(), 2, "exactly two policies: got {hosts:?}");
+}
+
+/// `GET /policy-challenges/:id`: the viewer's own private challenge is served,
+/// another group's is a 404 — the same answer as a challenge that does not
+/// exist.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_challenge_serves_own_private_challenge_and_404s_a_strangers(pool: PgPool) {
+    let p = plant(&pool, "challenge").await;
+    for (claim, host) in [(p.mine, "mine.example"), (p.theirs, "theirs.example")] {
+        set_labels(&pool, claim, &["policy", "policy:challenge"]).await;
+        set_properties(
+            &pool,
+            claim,
+            serde_json::json!({ "host": host, "port": 22, "status": "pending" }),
+        )
+        .await;
+    }
+    let state = split_state(&pool).await;
+
+    let mine = epigraph_api::routes::policies::get_challenge(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state.clone()),
+        axum::extract::Path(p.mine),
+    )
+    .await;
+    let mine = mine
+        .expect("the viewer's own private challenge must be served")
+        .0;
+    assert_eq!(mine["host"], "mine.example");
+
+    let theirs = epigraph_api::routes::policies::get_challenge(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state.clone()),
+        axum::extract::Path(p.theirs),
+    )
+    .await;
+    assert!(
+        matches!(theirs, Err(epigraph_api::errors::ApiError::NotFound { .. })),
+        "a challenge private to another group must be a 404, not its properties"
+    );
+
+    let missing = epigraph_api::routes::policies::get_challenge(
+        ViewerExtractor(viewer_for(&pool, p.viewer_agent).await),
+        State(state),
+        axum::extract::Path(Uuid::new_v4()),
+    )
+    .await;
+    assert!(
+        matches!(
+            missing,
+            Err(epigraph_api::errors::ApiError::NotFound { .. })
+        ),
+        "CALIBRATION: an absent id is a 404 too, so the two cases are indistinguishable"
+    );
+}

@@ -17,7 +17,29 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 #[cfg(feature = "db")]
-use crate::{errors::ApiError, AppState};
+use crate::{errors::ApiError, middleware::bearer::ViewerExtractor, AppState};
+
+/// A connection stamped with `viewer`'s tenancy context, with the conversion
+/// template's error shape: the refusal reason is logged, and the response
+/// carries a fixed message.
+#[cfg(feature = "db")]
+async fn scoped_read<'a>(
+    state: &'a AppState,
+    viewer: &epigraph_db::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedRead<'a>, ApiError> {
+    state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler,
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ListPoliciesQuery {
@@ -47,37 +69,35 @@ pub struct ResolveChallengeRequest {
 }
 
 /// GET /api/v1/policies/network — list active network-access policies.
+///
+/// Read through the caller's [`Viewer`](epigraph_db::Viewer): a policy claim
+/// private to a group is listed only for that group's members. Until
+/// `F-inline-claim-content-reads` was discharged this ran inline on the raw
+/// pool with no viewer and returned every tenant's policy `properties`.
 #[cfg(feature = "db")]
 pub async fn list_network_policies(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListPoliciesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let min_truth = params.min_truth.clamp(0.0, 1.0);
-    let rows: Vec<(Uuid, f64, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, truth_value, properties \
-         FROM claims \
-         WHERE 'policy:active' = ANY(labels) \
-           AND 'policy:network' = ANY(labels) \
-           AND truth_value >= $1 \
-         ORDER BY truth_value DESC",
-    )
-    .bind(min_truth)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to list policies: {e}"),
-    })?;
+    let mut read = scoped_read(&state, &viewer, "list_network_policies").await?;
+    let rows = epigraph_db::PolicyRepository::list_active_network(&mut *read, &viewer, min_truth)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to list policies: {e}"),
+        })?;
 
     let policies: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(id, truth_value, properties)| {
+        .map(|p| {
             serde_json::json!({
-                "claim_id": id,
-                "host": properties.get("host"),
-                "port": properties.get("port"),
-                "protocol": properties.get("protocol"),
-                "truth_value": truth_value,
-                "decay_exempt": properties.get("decay_exempt").and_then(|v| v.as_bool()).unwrap_or(false),
+                "claim_id": p.id,
+                "host": p.properties.get("host"),
+                "port": p.properties.get("port"),
+                "protocol": p.properties.get("protocol"),
+                "truth_value": p.truth_value,
+                "decay_exempt": p.properties.get("decay_exempt").and_then(|v| v.as_bool()).unwrap_or(false),
             })
         })
         .collect();
@@ -196,26 +216,27 @@ pub async fn create_challenge(
 }
 
 /// GET /api/v1/policy-challenges/:id — fetch a challenge by ID.
+///
+/// A challenge the caller cannot read is 404, the same answer as one that does
+/// not exist, so this is not an existence oracle. Read through the caller's
+/// [`Viewer`](epigraph_db::Viewer) since the `F-inline-claim-content-reads`
+/// discharge; before it, any bearer could read any challenge's properties.
 #[cfg(feature = "db")]
 pub async fn get_challenge(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, properties FROM claims \
-         WHERE id = $1 AND 'policy:challenge' = ANY(labels)",
-    )
-    .bind(id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch challenge: {e}"),
-    })?;
-
-    let (id, properties) = row.ok_or(ApiError::NotFound {
-        entity: "policy-challenge".to_string(),
-        id: id.to_string(),
-    })?;
+    let mut read = scoped_read(&state, &viewer, "get_challenge").await?;
+    let properties = epigraph_db::PolicyRepository::get_challenge(&mut *read, &viewer, id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch challenge: {e}"),
+        })?
+        .ok_or(ApiError::NotFound {
+            entity: "policy-challenge".to_string(),
+            id: id.to_string(),
+        })?;
 
     Ok(Json(serde_json::json!({
         "id": id,
