@@ -186,10 +186,19 @@ mod tests {
     /// `#[cfg(test)]` module inside `src/`. Kept to the minimum this one test
     /// needs (no query-string handling) rather than re-forking the whole helper.
     async fn scoped_pool_over(pool: &PgPool) -> ScopedPool {
-        let db: String = sqlx::query_scalar("SELECT current_database()")
-            .fetch_one(pool)
-            .await
-            .expect("current_database()");
+        // `connect_options().get_database()` rather than the canonical helper's
+        // `SELECT current_database()`. Same answer, no round trip — and,
+        // load-bearing: `tests/no_inline_sql_in_tools.rs::the_scan_root_choice_is_still_free`
+        // fails the build on ANY `sqlx::query*` under `crates/epigraph-mcp/src/`
+        // outside `src/tools/`, TEST sites included. MEASURED: the query form put
+        // this module in that lint's offender list ("src/maintenance.rs: 0
+        // production, 1 test"). Removing the query is the right answer; widening
+        // the lint's scan root to accommodate one fixture would be the wrong one.
+        let db = pool
+            .connect_options()
+            .get_database()
+            .expect("the #[sqlx::test] pool names its ephemeral database")
+            .to_string();
         let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
         let (authority, query) = match base.split_once('?') {
             Some((a, q)) => (a, Some(q)),

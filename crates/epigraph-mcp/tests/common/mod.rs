@@ -198,6 +198,50 @@ pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
 }
 
+/// The canonical viewer fixture, included HERE in addition to each test binary's
+/// own `mod fixture;`.
+///
+/// Why not reach `crate::fixture::scoped_pool` instead: `mod fixture;` is
+/// declared per test BINARY, and not every binary that declares `mod common;`
+/// declares it — a path through the crate root would compile in some binaries and
+/// not others. This is a second COMPILATION of the one canonical body, not a
+/// second copy of it: `epigraph-db/tests/viewer_fixture_single_source.rs` asserts
+/// that exactly one file named `viewer_fixture.rs` carries a body, and this adds
+/// no file it would see.
+#[path = "../../../epigraph-db/tests/viewer_fixture.rs"]
+mod canonical_fixture;
+
+/// [`build_test_server`] plus the [`epigraph_db::ScopedPool`] that the canonical
+/// write path now REQUIRES.
+///
+/// # Why a second constructor rather than changing the first
+///
+/// `submit_claim`, `memorize`, `batch_submit_claims` and `resolve_backlog_item`
+/// run their claim + trace + evidence + `update_trace_id` in ONE transaction
+/// stamped from the author's viewer, and `ScopedPool::begin_as` is the only thing
+/// that can open one. A server with no `ScopedPool` REFUSES those tools outright,
+/// deliberately — falling back to the unstamped pool is how a `42501` on
+/// `reasoning_traces` becomes a committed claim with no provenance. So a write
+/// test needs this; a read test does not, and making the ~230 `build_test_server`
+/// call sites async to give every one of them a pool they will not use would be
+/// churn with a cost (each `ScopedPool::connect` opens its own connections).
+///
+/// Async where `build_test_server` is sync, because building a `ScopedPool`
+/// means connecting: it owns pool construction so that `after_release` — the
+/// tenancy-GUC scrub — can be installed at build time, which sqlx permits only
+/// there.
+pub async fn build_scoped_test_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = canonical_fixture::scoped_pool(&pool).await;
+    build_test_server(pool).with_scoped_pool(scoped)
+}
+
+/// [`build_test_server_generated_signer`] plus a `ScopedPool`. See
+/// [`build_scoped_test_server`] for why the scoped variant exists at all.
+pub async fn build_scoped_test_server_generated_signer(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = canonical_fixture::scoped_pool(&pool).await;
+    build_test_server_generated_signer(pool).with_scoped_pool(scoped)
+}
+
 /// A server in `main::select_signer`'s rung-4 configuration: neither
 /// `--agent-key` nor `--agent-model` was supplied, so the signer is a fresh
 /// random keypair belonging to this process alone. Both halves matter — the

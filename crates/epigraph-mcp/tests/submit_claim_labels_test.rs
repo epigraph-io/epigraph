@@ -8,7 +8,7 @@ use common::*;
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_claim_attaches_labels_when_provided(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone()).await;
     let result = epigraph_mcp::tools::claims::submit_claim(
         &server,
         &viewer,
