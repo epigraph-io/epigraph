@@ -96,6 +96,10 @@ use std::path::{Path, PathBuf};
 ///   every other tenant's rows, leaving them unembedded or their beliefs stale
 ///   forever, and report success. A theme centroid computed per-viewer would
 ///   give each tenant a different value for the same row.
+///   `find_claims_needing_embeddings` and `list_claim_ids` refuse a `Scoped`
+///   viewer with `DbError::BypassViewerRequired` in every build profile (it
+///   used to be a `debug_assert!`, compiled out of a release build). The three
+///   `claim_theme` functions take `_viewer` and do not check it.
 /// * **Corpus cardinality** — `triple.rs::index_counts`, three scalars used for
 ///   index health.
 /// * **Write paths PR-16 owns** — `evidence.rs::delete`,

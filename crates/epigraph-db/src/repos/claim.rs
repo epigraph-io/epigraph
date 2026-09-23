@@ -4414,8 +4414,21 @@ impl ClaimRepository {
     /// apart. Callers that legitimately hold a maintenance pool still pass
     /// `&PgPool` unchanged.
     ///
+    /// # The viewer must be `Bypass`, and that is checked in release builds
+    ///
+    /// The statement is `VISIBILITY-EXEMPT`, so the viewer never reaches the
+    /// SQL. A `Scoped` viewer is refused before any statement runs. This used
+    /// to be a `debug_assert!`, which a release build compiles out (the
+    /// workspace sets no `[profile.release]`). A `Scoped` viewer in release got
+    /// every tenant's unembedded claim ids AND content on an unfiltered session.
+    /// On a stamped one it got only its own tenant's, and the backfill left
+    /// every other tenant unembedded while reporting success. As the section
+    /// above says, the check covers the viewer only. The connection is still
+    /// the caller's to get right.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns [`DbError::BypassViewerRequired`] for a `Scoped` viewer, and
+    /// `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
     pub async fn find_claims_needing_embeddings<'e, E>(
         executor: E,
@@ -4425,11 +4438,11 @@ impl ClaimRepository {
     where
         E: sqlx::Executor<'e, Database = sqlx::Postgres>,
     {
-        debug_assert!(
-            viewer.is_bypass(),
-            "find_claims_needing_embeddings is a maintenance enumerator; a Scoped \
-             viewer here would silently leave other tenants unembedded forever"
-        );
+        if !viewer.is_bypass() {
+            return Err(DbError::BypassViewerRequired {
+                operation: "ClaimRepository::find_claims_needing_embeddings",
+            });
+        }
         // Exclude host-provenance telemetry (epiclaw-host ProvenanceRecorder
         // signs every observable event as an immutable claim — container
         // lifecycle, task execution, agent output, messages). These are
@@ -4447,7 +4460,7 @@ impl ClaimRepository {
             -- row; a per-tenant view of the gap would leave every other
             -- tenant's claims unembedded forever and silently break semantic
             -- recall for them. Runs under SystemReason::EmbeddingBackfill on a
-            -- maintenance connection (debug_assert above, and the generic
+            -- maintenance connection (the Bypass refusal above, and the generic
             -- executor so the caller can pass that very connection).
             --
             -- Encrypted claims are excluded instead. Keyed on `claim_encryption`,
@@ -5833,6 +5846,68 @@ mod tests {
         assert!(
             !missing.iter().any(|(id, _)| *id == tele_event_prop),
             "event-property telemetry claim must be excluded"
+        );
+    }
+
+    /// `find_claims_needing_embeddings` refuses a `Scoped` viewer with a
+    /// returned error, in every build profile.
+    ///
+    /// The test asserts on the `Err` and not on a panic. So it fails against
+    /// the old `debug_assert!` guard both ways: in a debug build the assert
+    /// panics, and in a release build it is compiled out and the call returns
+    /// `Ok` with the seeded claim's id and content.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_claims_needing_embeddings_refuses_a_scoped_viewer(pool: sqlx::PgPool) {
+        let agent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels)
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'test-embed-scoped', 'system', ARRAY['test'])
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let claim_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding)
+             VALUES ($1, sha256($1::bytea), 0.5, $2, NULL)
+             RETURNING id",
+        )
+        .bind(format!("test-embed-scoped-{}", Uuid::new_v4()))
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Calibration. On this pool and data a Bypass viewer enumerates the
+        // claim, so the refusal below is not an empty-table artefact.
+        let bypass = ClaimRepository::find_claims_needing_embeddings(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::EmbeddingBackfill,
+            ),
+            1000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            bypass.iter().any(|(id, _)| *id == claim_id),
+            "calibration: Bypass sees the seeded claim"
+        );
+
+        // The test pool is not filtered by row-level security. Without the
+        // check, a Scoped viewer in no group would get the seeded claim's id
+        // and content back like the Bypass viewer did.
+        let scoped = crate::visibility::Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        let err = ClaimRepository::find_claims_needing_embeddings(&pool, &scoped, 1000)
+            .await
+            .expect_err("a Scoped viewer must be refused, not answered");
+        assert!(
+            matches!(
+                err,
+                DbError::BypassViewerRequired {
+                    operation: "ClaimRepository::find_claims_needing_embeddings"
+                }
+            ),
+            "expected BypassViewerRequired naming find_claims_needing_embeddings, got {err:?}"
         );
     }
 
