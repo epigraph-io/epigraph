@@ -1454,9 +1454,27 @@ pub async fn update_labels(
     // `reject_unexpanded_labels` is the caller's input, not a server fault. The
     // repo layer refuses it inside the same statement that would have written
     // it, so nothing is persisted — only the reported code was wrong here.
-    let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
+    //
+    // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
+    // WITH CHECK refuses it on an unstamped session. The stamp is the MCP
+    // server's own agent, which is what makes the SANCTIONED case work: the
+    // stdio ownership gate above degrades to "the claim's author is this server's
+    // agent", so the row is owned by the group this session can write. A
+    // `claims:admin` HTTP caller relabelling ANOTHER agent's claim is still
+    // refused on a cleanly-migrated schema, because the row is owned by that
+    // agent's group and no viewer this process can resolve carries write
+    // authority there — the same residual `challenge_claim` carries, and a
+    // tenancy-model question rather than a stamping one.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "update_labels",
+    )
+    .await?;
+    let labels = ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
         .await
         .map_err(db_caller_error)?;
+    tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
 }
 

@@ -30,7 +30,11 @@ async fn deprecate_workflow_diamond_dag_no_duplicates(pool: PgPool) {
     insert_claim_edge(&pool, c, a, "variant_of").await;
     insert_claim_edge(&pool, c, b, "variant_of").await;
 
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let result = epigraph_mcp::tools::workflows::deprecate_workflow(
         &server,
         &viewer,

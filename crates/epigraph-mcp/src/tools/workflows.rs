@@ -984,9 +984,24 @@ pub async fn report_workflow_outcome(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    EvidenceRepository::create(&server.pool, &evidence)
-        .await
-        .map_err(internal_error)?;
+    // The evidence row, on an author-stamped connection: `evidence` is tier-A
+    // with 077's strict WITH CHECK, so this INSERT is refused on the unstamped
+    // pool. It commits on its own for the reason
+    // `tools::claims::update_with_evidence` documents at length — migration 046
+    // gives `mass_functions.evidence_id` a FK to `evidence(id)` and the DS wiring
+    // below runs on a sibling connection, which cannot see an uncommitted row.
+    {
+        let mut tx = crate::claim_helper::begin_author_stamped_tx(
+            server,
+            agent_id,
+            "report_workflow_outcome",
+        )
+        .await?;
+        EvidenceRepository::create(&mut *tx, &evidence)
+            .await
+            .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+    }
 
     let before = claim.truth_value.value();
 
@@ -1008,15 +1023,26 @@ pub async fn report_workflow_outcome(
     .await
     .map_err(internal_error)?;
 
-    // Derive truth_value from CDST pignistic probability
+    // Derive truth_value from CDST pignistic probability. `UPDATE claims`, so
+    // stamped for the same reason as the evidence INSERT above; after the DS
+    // wiring necessarily, because the value comes from it.
     let after = TruthValue::clamped(ds.pignistic_prob);
-    ClaimRepository::update_truth_value(
-        &server.pool,
-        epigraph_core::ClaimId::from_uuid(workflow_id),
-        after,
-    )
-    .await
-    .map_err(internal_error)?;
+    {
+        let mut tx = crate::claim_helper::begin_author_stamped_tx(
+            server,
+            agent_id,
+            "report_workflow_outcome",
+        )
+        .await?;
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+            after,
+        )
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+    }
 
     // Update use counts in workflow JSON
     let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
@@ -1118,18 +1144,39 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
+    // ── THE WHOLE DEPRECATION, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // `deprecate_claim` is an `UPDATE claims`, so `claims_tenancy`'s WITH CHECK
+    // governs it and an unstamped session is refused with `42501`. The cascade
+    // makes that worse than a single refusal: it walks a tree deprecating one
+    // claim at a time, so a refusal partway through used to leave a HALF-
+    // DEPRECATED hierarchy — some variants flipped, some still current, and
+    // `find_workflow_hierarchical` returning the ones that were missed.
+    //
+    // The traversal reads run on the same stamped connection as the writes, which
+    // is the correct direction: an unstamped read returns FEWER rows, so a
+    // cascade planned on one connection and executed on another could silently
+    // skip a child it was entitled to deprecate.
+    let agent_id = server.agent_id().await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "deprecate_workflow")
+            .await?;
+
     // Deprecate the target workflow (A4: also set is_current = false).
     // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
     // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
     // so the deprecated workflow drops out of semantic recall and does not
     // inflate the `stale_present` audit count.
-    ClaimRepository::deprecate_claim(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
+    ClaimRepository::deprecate_claim(&mut *tx, epigraph_core::ClaimId::from_uuid(workflow_id))
         .await
         .map_err(internal_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
-    epigraph_db::WorkflowRepository::set_truth_value(&server.pool, workflow_id, 0.05)
+    // `workflows` is NOT RLS-protected (measured: no policy, not in 062's
+    // tier-A), so this half was never refused — it is in the transaction so the
+    // two halves of one deprecation cannot land apart.
+    epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, workflow_id, 0.05)
         .await
         .map_err(internal_error)?;
     deprecated_ids.push(workflow_id.to_string());
@@ -1144,7 +1191,7 @@ pub async fn deprecate_workflow(
         visited.insert(workflow_id);
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
-            let edges = EdgeRepository::get_by_target(&server.pool, viewer, current, "claim")
+            let edges = EdgeRepository::get_by_target(&mut *tx, viewer, current, "claim")
                 .await
                 .unwrap_or_default();
 
@@ -1168,7 +1215,7 @@ pub async fn deprecate_workflow(
                     if let Some(g) = viewer.group_bind() {
                         q = q.bind(g);
                     }
-                    q.fetch_optional(&server.pool)
+                    q.fetch_optional(&mut *tx)
                         .await
                         .map_err(internal_error)?
                         .unwrap_or(false)
@@ -1182,13 +1229,13 @@ pub async fn deprecate_workflow(
                 }
 
                 ClaimRepository::deprecate_claim(
-                    &server.pool,
+                    &mut *tx,
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
                 .await
                 .map_err(internal_error)?;
                 // Mirror onto the hierarchical row, if any.
-                epigraph_db::WorkflowRepository::set_truth_value(&server.pool, child_id, 0.05)
+                epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
                     .map_err(internal_error)?;
                 deprecated_ids.push(child_id.to_string());
@@ -1196,6 +1243,8 @@ pub async fn deprecate_workflow(
             }
         }
     }
+
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,

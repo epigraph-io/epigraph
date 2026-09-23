@@ -1132,15 +1132,25 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn set_truth_value(
-        pool: &PgPool,
+    /// # The executor is generic for COHESION, not because `workflows` is protected
+    ///
+    /// MEASURED on a database migrated 001->101: `workflows` has
+    /// `relrowsecurity = false`, no policy, and no entry in migration 062's
+    /// tier-A array — so unlike the `claims` UPDATE this call cascades from, it
+    /// is NOT refused on an unstamped session. It is generic so that the two
+    /// halves of one deprecation can share a transaction: a `claims` row flipped
+    /// to `is_current = false` while its hierarchical `workflows` row keeps its
+    /// truth value is exactly the split `deprecate_workflow`'s cascade exists to
+    /// prevent, and `find_workflow_hierarchical` reads the half that was missed.
+    pub async fn set_truth_value<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         workflow_id: Uuid,
         truth_value: f64,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query("UPDATE workflows SET truth_value = $1 WHERE id = $2")
             .bind(truth_value)
             .bind(workflow_id)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(result.rows_affected())
     }

@@ -7543,7 +7543,19 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError` if the database query fails.
-    pub async fn deprecate_claim(pool: &PgPool, id: ClaimId) -> Result<u64, DbError> {
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// This is an `UPDATE claims`, so migration 077's `claims_tenancy`
+    /// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` governs
+    /// it, and an unstamped application session's writable set is `{}` — the
+    /// UPDATE is refused with `42501`. Only a `ScopedPool::begin_as` connection
+    /// can satisfy it, and that is a transaction rather than a pool. `&PgPool`
+    /// and `&mut PgConnection` both satisfy [`sqlx::PgExecutor`], so existing
+    /// pool-taking callers compile unchanged.
+    pub async fn deprecate_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: ClaimId,
+    ) -> Result<u64, DbError> {
         let uuid: Uuid = id.into();
         let result = sqlx::query(
             "UPDATE claims \
@@ -7551,7 +7563,7 @@ impl ClaimRepository {
              WHERE id = $1",
         )
         .bind(uuid)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(result.rows_affected())
     }

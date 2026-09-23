@@ -33,7 +33,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
-use common::{build_test_server, seed_claim_with_labels};
+use common::{build_scoped_test_server, seed_claim_with_labels};
 
 fn write_auth(principal: Uuid) -> AuthContext {
     AuthContext {
@@ -73,7 +73,11 @@ async fn labels_of(pool: &PgPool, claim_id: Uuid) -> Vec<String> {
 async fn update_labels_adding_resolved_to_a_foreign_claim_is_refused(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "someone else's backlog item", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let err = epigraph_mcp::tools::claims::update_labels(
         &server,
@@ -112,7 +116,11 @@ async fn update_labels_removing_resolved_from_a_foreign_claim_is_refused(pool: P
     )
     .await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
@@ -141,7 +149,11 @@ async fn update_labels_removing_resolved_from_a_foreign_claim_is_refused(pool: P
 async fn patch_claim_adding_resolved_to_a_foreign_claim_is_refused(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "patch_claim bypass subject", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     epigraph_mcp::tools::claims::patch_claim(
         &server,
@@ -181,7 +193,11 @@ async fn patch_claim_adding_resolved_to_a_foreign_claim_is_refused(pool: PgPool)
 async fn update_labels_admin_scope_may_retire_a_foreign_claim(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "admin-retired item", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
@@ -208,7 +224,11 @@ async fn update_labels_leaves_non_retirement_labels_ungated_for_a_foreign_princi
     let claim =
         seed_claim_with_labels(&pool, "cross-agent taxonomy maintenance", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     epigraph_mcp::tools::claims::update_labels(
         &server,
@@ -237,7 +257,11 @@ async fn update_labels_leaves_non_retirement_labels_ungated_for_a_foreign_princi
 async fn update_labels_still_permits_resolved_on_the_unauthenticated_stdio_path(pool: PgPool) {
     let claim = seed_claim_with_labels(&pool, "epiclaw-retired item", &["backlog"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     epigraph_mcp::tools::claims::update_labels(
         &server,

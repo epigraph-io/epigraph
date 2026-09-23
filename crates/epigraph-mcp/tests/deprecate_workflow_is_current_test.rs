@@ -23,7 +23,11 @@ async fn plant_stub_embedding(pool: &PgPool, id: uuid::Uuid) {
 async fn mcp_deprecate_workflow_sets_is_current_false(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let id = seed_workflow_claim(&pool, "to-deprecate", &["s1"]).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     epigraph_mcp::tools::workflows::deprecate_workflow(
         &server,
@@ -58,7 +62,11 @@ async fn deprecate_workflow_nulls_embedding(pool: PgPool) {
     let id = seed_workflow_claim(&pool, "to-deprecate-embed", &["s1"]).await;
     plant_stub_embedding(&pool, id).await;
 
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     epigraph_mcp::tools::workflows::deprecate_workflow(
         &server,
         &viewer,
@@ -97,7 +105,11 @@ async fn deprecate_workflow_cascade_nulls_embeddings(pool: PgPool) {
         plant_stub_embedding(&pool, id).await;
     }
 
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     epigraph_mcp::tools::workflows::deprecate_workflow(
         &server,
         &viewer,
@@ -138,7 +150,11 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
     let unrelated = seed_claim(&pool, "non-workflow", 0.5).await;
     insert_claim_edge(&pool, unrelated, root, "supersedes").await;
 
-    let server = build_test_server(pool.clone());
+    // Scoped: these tools now write on author-stamped transactions, and a
+    // server with no `ScopedPool` refuses them by name rather than writing on
+    // the unstamped pool, where the tier-A `WITH CHECK` refuses the `claims`
+    // UPDATE with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     epigraph_mcp::tools::workflows::deprecate_workflow(
         &server,
         &viewer,
