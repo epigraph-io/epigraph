@@ -1647,7 +1647,22 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
     state: &'s AppState,
     route: &'static str,
 ) -> Result<epigraph_db::ScopedTx<'s>, ApiError> {
-    let authority = epigraph_ingest_executor::system_agent_write_authority(&state.db_pool)
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            route = route,
+            "write refused: this process was not built from a ScopedPool, so no connection can \
+             be stamped with the ingest system agent's tenancy context."
+        );
+        ApiError::InternalError {
+            message: format!(
+                "{route}: this server was not built from a ScopedPool, so the workflow ingest \
+                 path cannot stamp a connection. Nothing was written."
+            ),
+        }
+    })?;
+
+    let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -1664,21 +1679,6 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
                 ),
             }
         })?;
-
-    let scoped = state.scoped.as_ref().ok_or_else(|| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            route = route,
-            "write refused: this process was not built from a ScopedPool, so no connection can \
-             be stamped with the ingest system agent's tenancy context."
-        );
-        ApiError::InternalError {
-            message: format!(
-                "{route}: this server was not built from a ScopedPool, so the workflow ingest \
-                 path cannot stamp a connection. Nothing was written."
-            ),
-        }
-    })?;
 
     scoped
         .begin_as(&authority.viewer)

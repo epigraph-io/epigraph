@@ -238,22 +238,6 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
     server: &'p EpiGraphMcpFull,
     tool_name: &'static str,
 ) -> Result<(uuid::Uuid, epigraph_db::ScopedTx<'p>), McpError> {
-    let authority = epigraph_ingest_executor::system_agent_write_authority(&server.pool)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "tenancy.scoped_write",
-                tool = tool_name,
-                error = %e,
-                "write refused: could not establish the workflow-ingest-system agent's write \
-                 authority. Nothing was written."
-            );
-            internal_error(format!(
-                "{tool_name}: could not establish the workflow-ingest-system agent's write \
-                 authority: {e}. Nothing was written."
-            ))
-        })?;
-
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         tracing::error!(
             target: "tenancy.scoped_write",
@@ -270,6 +254,22 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
              EpiGraphMcpFull::with_scoped_pool."
         ))
     })?;
+
+    let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                error = %e,
+                "write refused: could not establish the workflow-ingest-system agent's write \
+                 authority. Nothing was written."
+            );
+            internal_error(format!(
+                "{tool_name}: could not establish the workflow-ingest-system agent's write \
+                 authority: {e}. Nothing was written."
+            ))
+        })?;
 
     let tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
         tracing::error!(

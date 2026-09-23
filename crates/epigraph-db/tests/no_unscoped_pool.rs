@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 298;
+const HIGH_WATER: usize = 297;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -586,7 +586,8 @@ const HIGH_WATER: usize = 298;
 /// `the_scanner_is_not_vacuous`'s own failure on the converted tree. The
 /// DS-substrate conversion in the same branch took it 27 -> 25 and `HIGH_WATER`
 /// 300 -> 298, by the same method and for the same reason: the file keeps 25
-/// sites, so no key is deleted.
+/// sites, so no key is deleted. Unit E's authority fix took it 25 -> 24 and
+/// `HIGH_WATER` 298 -> 297, the file keeping 24 sites.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
@@ -827,7 +828,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // system-agent-stamped transaction, so its two `&state.db_pool` sites went
     // with it. Both counts were read off this test's own failure output rather than
     // derived by subtraction, which is the method every shard since 5 has used.
-    ("routes/workflows.rs", 25),
+    //
+    // 25 -> 24: the bootstrap read named above no longer takes `state.db_pool`.
+    // `system_agent_write_authority` now takes the `ScopedPool`, because deciding
+    // whether it may provision needs a PRINCIPAL-stamped read of the agent's own
+    // revoked memberships (the first revision minted on an empty live set and
+    // revived a revoked admin). Read off this test's failure output.
+    ("routes/workflows.rs", 24),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is
