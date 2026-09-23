@@ -118,80 +118,24 @@ impl SecurityEventRepository {
         Ok(row)
     }
 
-    /// Query security events matching optional filter criteria.
-    ///
-    /// Results are ordered by `created_at DESC` (most recent first).
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the SELECT fails.
-    #[instrument(skip(pool))]
-    pub async fn query(
-        pool: &PgPool,
-        filter: SecurityEventFilter,
-    ) -> Result<Vec<SecurityEventRow>, DbError> {
-        let limit = filter.limit.unwrap_or(1000).min(10_000);
-
-        // All filter parameters are passed to the parameterized query.
-        // NULL parameters are treated as "match any" via IS NULL checks in WHERE.
-        // failures_only: when true, only rows with success=false are returned;
-        //   success IS NULL rows are excluded (they are not failures by default).
-        let rows = sqlx::query!(
-            r#"
-            SELECT
-                id,
-                event_type,
-                agent_id,
-                success,
-                details,
-                ip_address::text AS ip_address,
-                user_agent,
-                correlation_id,
-                created_at
-            FROM security_events
-            WHERE
-                ($1::uuid IS NULL        OR agent_id   = $1)
-            AND ($2::text IS NULL        OR event_type = $2)
-            AND ($3::timestamptz IS NULL OR created_at >= $3)
-            AND ($4::timestamptz IS NULL OR created_at <= $4)
-            AND (NOT $5                  OR success = false)
-            ORDER BY created_at DESC
-            LIMIT $6
-            "#,
-            filter.agent_id as Option<Uuid>,
-            filter.event_type as Option<String>,
-            filter.from as Option<DateTime<Utc>>,
-            filter.until as Option<DateTime<Utc>>,
-            filter.failures_only,
-            limit,
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| SecurityEventRow {
-                id: r.id,
-                event_type: r.event_type,
-                agent_id: r.agent_id,
-                success: r.success,
-                details: r.details,
-                ip_address: r.ip_address,
-                user_agent: r.user_agent,
-                correlation_id: r.correlation_id,
-                created_at: r.created_at,
-            })
-            .collect())
-    }
-
     /// Query security events a PRINCIPAL may read, on a caller-supplied
     /// connection.
     ///
-    /// Same filter, ordering and limit as [`Self::query`], plus one conjunct:
-    /// the row is the principal's own (`agent_id = $7`), or the principal is a
+    /// Filters on the optional [`SecurityEventFilter`] fields, orders by
+    /// `created_at DESC` and caps the limit at 10 000 (default 1000). NULL
+    /// filter parameters match any value, and `failures_only` excludes
+    /// `success IS NULL` rows. On top of the filter there is one conjunct: the
+    /// row is the principal's own (`agent_id = $7`), or the principal is a
     /// live instance administrator. That is migration 083's
     /// `security_events_read` policy restated in the statement, so the policy
     /// and the statement are two independent filters that give the same answer.
+    ///
+    /// # There is no unscoped sibling
+    ///
+    /// This replaced `query(&PgPool, filter)`, which had the same filter and no
+    /// conjunct. Its two callers, `routes/audit.rs` and `routes/timeline.rs`,
+    /// both moved here, and it was deleted rather than left as the easier
+    /// function to reach for.
     ///
     /// # Why the statement repeats the policy
     ///

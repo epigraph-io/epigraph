@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (302 today; the assertions below measure the tree and
+//! deletes in week two. (301 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 302 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 301 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -119,12 +119,13 @@
 //!      more across `routes/workflows.rs` (10), `routes/entities.rs` (5),
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
-//!      `routes/challenge.rs`. `routes/audit.rs`'s one site followed outside
-//!      the shard series, as the fix for `F-PR18a-B1`. None
-//!      discharged the gate — 302 is not 0 — and no shard in the series may be
+//!      `routes/challenge.rs`. `routes/audit.rs`'s one site and one of
+//!      `routes/timeline.rs`'s two followed outside the shard series, as the fix
+//!      for `F-PR18a-B1` and its sibling. None
+//!      discharged the gate — 301 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 114 of the 416 sites the series began with are converted, and
-//!      302 are not.
+//!      decision: 115 of the 416 sites the series began with are converted, and
+//!      301 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -554,7 +555,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 302;
+const HIGH_WATER: usize = 301;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -584,12 +585,14 @@ const HIGH_WATER: usize = 302;
 /// `F-PR18a-B1`'s fix moved it, 44 -> 43, and `HIGH_WATER` 303 -> 302:
 /// `routes/audit.rs` had one site and its key was DELETED. Both integers were
 /// read off `the_scanner_is_not_vacuous`'s failure on the converted tree
-/// (`left: 302`), not derived by subtraction.
+/// (`left: 302`), not derived by subtraction. Its sibling, `routes/timeline.rs`'s
+/// security-event read, took `HIGH_WATER` 302 -> 301 (`left: 301`) and did not
+/// move this: the file keeps its activity read.
 const HIGH_WATER_FILES: usize = 43;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 302 sites across 43 files as of this commit. Lower an entry when a shard
+/// 301 sites across 43 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -791,7 +794,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `&PgPool`-parameter blind-spot list in this file's module doc.
     ("routes/submit.rs", 4),
     ("routes/tasks.rs", 15),
-    ("routes/timeline.rs", 2),
+    // 2 before `F-PR18a-B1`'s sibling fix, which moved `get_agent_timeline`'s
+    // security-event read onto `AppState::read_as` and
+    // `SecurityEventRepository::query_for_principal_conn`. The one left is its
+    // `ActivityRepository::list_by_agent` read. `activities` has no tenancy
+    // columns and no policy, so a stamped connection would not change it.
+    ("routes/timeline.rs", 1),
     // 9 before conversion shard 7, which moved `claim_history` onto
     // `AppState::read_as`. Of the eight that remain, six are `supersede_claim`
     // and two `mark_duplicate` — both write. One of the six is additionally

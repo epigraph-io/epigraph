@@ -1,5 +1,7 @@
-//! `GET /api/v1/audit/security` reads a caller's own security events, and an
-//! instance administrator's view of everyone's, on a viewer-stamped connection.
+//! `GET /api/v1/audit/security`, and the security-event half of
+//! `GET /api/v1/agents/:id/timeline`, read a caller's own security events, and
+//! an instance administrator's view of everyone's, on a viewer-stamped
+//! connection.
 //!
 //! Deferred-commitment screen key `f-pr18a-b1-audit-scoped-read`
 //! (`docs/tenancy/progress.json`, finding `F-PR18a-B1`). Before the fix,
@@ -8,6 +10,11 @@
 //! `audit:read`, which every role carries, and it passed a caller-supplied
 //! `?agent_id=` straight through. The only per-principal narrowing was
 //! migration 083's `security_events_read` policy.
+//!
+//! `routes/timeline.rs::get_agent_timeline` read the same table through the same
+//! function, with the path's `:id` as its only filter and no scope check at all.
+//! It was found while re-deriving the finding and is covered by the
+//! `the_timeline_*` arms below.
 //!
 //! # The instrument
 //!
@@ -29,11 +36,12 @@ mod viewer_fixture;
 
 use std::collections::BTreeSet;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::Extension;
 use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::audit::{query_security_events, SecurityEventQuery};
+use epigraph_api::routes::timeline::get_agent_timeline;
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::repos::instance_admin::InstanceAdminRepository;
@@ -311,6 +319,107 @@ async fn the_route_refuses_rather_than_falls_back_without_a_scoped_pool(pool: Pg
     let err = call(&state, &pool, s.a, AUDIT_READ, None)
         .await
         .expect_err("no ScopedPool, no read");
+    assert!(
+        matches!(&err, ApiError::InternalError { message } if message.contains("scoped connection")),
+        "expected the opaque read_as refusal, got {err:?}"
+    );
+}
+
+/// The timeline's security-event entries, by id, as `caller` sees `agent`'s
+/// timeline, plus its activity entries.
+async fn timeline(
+    state: &AppState,
+    pool: &PgPool,
+    caller: Uuid,
+    agent: Uuid,
+) -> Result<(BTreeSet<Uuid>, BTreeSet<Uuid>), ApiError> {
+    let viewer = epigraph_db::Viewer::resolve(pool, caller)
+        .await
+        .expect("resolve");
+    let axum::Json(entries) =
+        get_agent_timeline(ViewerExtractor(viewer), State(state.clone()), Path(agent)).await?;
+    let ids = |kind: &str| -> BTreeSet<Uuid> {
+        entries
+            .iter()
+            .filter(|e| e.entry_type == kind)
+            .map(|e| {
+                e.details["id"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("every timeline entry carries its row id")
+            })
+            .collect()
+    };
+    Ok((ids("security_event"), ids("activity")))
+}
+
+async fn seed_activity(pool: &PgPool, agent: Uuid) -> Uuid {
+    epigraph_db::ActivityRepository::create(
+        pool,
+        "timeline_probe",
+        chrono::Utc::now(),
+        Some(agent),
+        Some("f-pr18a-b1 timeline probe"),
+        serde_json::json!({}),
+    )
+    .await
+    .expect("seed activity")
+}
+
+/// The sibling route. A caller sees security events on its own timeline, none
+/// on another agent's, and an instance admin sees them on anyone's. The
+/// activity half is served in every case, so a foreign timeline is narrowed
+/// and not refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_timeline_serves_only_the_security_events_the_caller_may_read(pool: PgPool) {
+    let s = seed(&pool).await;
+    let b_activity = seed_activity(&pool, s.b).await;
+    let state = split_state(&pool).await;
+
+    let (events, _) = timeline(&state, &pool, s.a, s.a)
+        .await
+        .expect("A's own timeline");
+    assert_eq!(
+        events, s.a_rows,
+        "A's own timeline must carry exactly A's security events. Fewer means the read \
+         moved back to the unstamped raw pool"
+    );
+
+    let (events, activities) = timeline(&state, &pool, s.a, s.b)
+        .await
+        .expect("A may still open B's timeline");
+    assert!(
+        events.is_empty(),
+        "A must see none of B's security events on B's timeline; got {events:?}"
+    );
+    assert_eq!(
+        activities,
+        BTreeSet::from([b_activity]),
+        "CALIBRATION: B's timeline still serves its activity half to A, so the empty \
+         security-event half is narrowing and not a failed or refused read"
+    );
+
+    let (events, activities) = timeline(&state, &pool, s.admin, s.b)
+        .await
+        .expect("the admin's view of B's timeline");
+    assert_eq!(
+        events,
+        BTreeSet::from([s.b_row]),
+        "an instance admin sees B's security events on B's timeline"
+    );
+    assert_eq!(activities, BTreeSet::from([b_activity]));
+}
+
+/// Like the audit route, the timeline refuses without a `ScopedPool` rather
+/// than reading security events off the raw pool.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_timeline_refuses_rather_than_falls_back_without_a_scoped_pool(pool: PgPool) {
+    let s = seed(&pool).await;
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+
+    let err = timeline(&state, &pool, s.a, s.a)
+        .await
+        .expect_err("no ScopedPool, no timeline");
     assert!(
         matches!(&err, ApiError::InternalError { message } if message.contains("scoped connection")),
         "expected the opaque read_as refusal, got {err:?}"
