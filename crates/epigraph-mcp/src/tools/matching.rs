@@ -28,7 +28,7 @@ use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::{ClaimRepository, EdgeRepository, MatchCandidateRepo};
+use epigraph_db::{ClaimRepository, DecisionOutcome, MatchCandidateRepo};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -159,22 +159,30 @@ pub async fn decide_match_candidate(
     // `retire_match_candidate` just retracted. The undo is
     // `retire_match_candidate`, which deliberately carries NO such gate —
     // retirement is only ever applied to an already-`promoted` row.
+    //
+    // `row` is an UNLOCKED read, so `reject_if_decided` is only the fast path.
+    // The gate that holds under concurrency is inside
+    // `MatchCandidateRepo::promote` / `reject`, which re-read the status under
+    // the row lock in the transaction that writes it; `already_decided` maps
+    // their refusal to the same error.
+    let already_decided = |status: &str| {
+        invalid_params(format!(
+            "candidate {candidate_id} already decided (status={status}); use \
+             retire_match_candidate to undo a promotion"
+        ))
+    };
     let reject_if_decided = || -> Result<(), McpError> {
         if row.status == "pending" {
             return Ok(());
         }
-        Err(invalid_params(format!(
-            "candidate {candidate_id} already decided (status={}); use \
-             retire_match_candidate to undo a promotion",
-            row.status
-        )))
+        Err(already_decided(&row.status))
     };
 
-    match decision.as_str() {
+    let updated = match decision.as_str() {
         "promote" => {
             reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
-            // before `set_status`. "promote" is the operator saying "act on
+            // before the write. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes from
             // the row's own `verifier_verdict`. Writing CORROBORATES
             // unconditionally recorded the exact inverse of the verifier's
@@ -200,54 +208,73 @@ pub async fn decide_match_candidate(
             // false) since the candidate was generated, promoting would create
             // a structural inconsistency — an edge incident on a retired claim
             // (backlog bug 5c7fc645). Refuse rather than write it.
-            if !ClaimRepository::are_all_current(&server.pool, viewer, &[row.claim_a, row.claim_b])
-                .await
-                .map_err(internal_error)?
-            {
-                return Err(invalid_params(format!(
+            //
+            // Viewer-scoped, so it is also the check that the caller may SEE
+            // both claims. `promote` re-checks current-ness under lock but with
+            // no viewer, so it only adds to this check, never replaces it.
+            let not_current = || {
+                invalid_params(format!(
                     "cannot promote candidate {candidate_id}: a '{relationship}' edge requires \
                      both claims to be current (is_current=true). One of {} / {} is superseded, a \
                      duplicate, or missing.",
                     row.claim_a, row.claim_b
-                )));
+                ))
+            };
+            if !ClaimRepository::are_all_current(&server.pool, viewer, &[row.claim_a, row.claim_b])
+                .await
+                .map_err(internal_error)?
+            {
+                return Err(not_current());
             }
 
-            repo.set_status(candidate_id, "promoted", Some(acting_agent))
+            // Status flip and edge write in ONE transaction under the
+            // candidate's row lock, with the edge properties (and the
+            // `"source": "cross_source_matcher"` marker migration 090's
+            // `edges_symmetric_relationship_uniq` keys on) built from the
+            // locked row. Two autocommit statements here used to let a
+            // `retire_match_candidate` land between them and leave a `stale`
+            // row with a live matcher edge.
+            match repo
+                .promote(
+                    candidate_id,
+                    Some(acting_agent),
+                    row.verifier_verdict.as_deref(),
+                    relationship,
+                )
                 .await
-                .map_err(internal_error)?;
-
-            // Write the edge if it doesn't already exist (either direction).
-            // The unique-triple index was dropped in migrations 017/018, and
-            // migration 090's `edges_symmetric_relationship_uniq` replaces it:
-            // the explicit existence check — now centralized in
-            // `EdgeRepository::create_symmetric_if_absent` — is the FAST PATH,
-            // and that index is what makes the answer true for a duplicate the
-            // check cannot see. The index is keyed on the
-            // `"source": "cross_source_matcher"` marker the props below stamp.
-            // The are_all_current guard above stays here at the call site.
-            let props = serde_json::json!({
-                "candidate_id":     candidate_id,
-                "score":            row.score,
-                "features":         row.features,
-                "verifier_verdict": row.verifier_verdict,
-                "decided_by":       acting_agent,
-                "source":           "cross_source_matcher",
-            });
-            EdgeRepository::create_symmetric_if_absent(
-                &server.pool,
-                row.claim_a,
-                row.claim_b,
-                relationship,
-                props,
-            )
-            .await
-            .map_err(internal_error)?;
+                .map_err(internal_error)?
+            {
+                DecisionOutcome::Decided(updated) => updated,
+                DecisionOutcome::AlreadyDecided { status } => {
+                    return Err(already_decided(&status));
+                }
+                DecisionOutcome::VerdictChanged { current } => {
+                    return Err(invalid_params(format!(
+                        "candidate {candidate_id}'s verifier_verdict changed while this \
+                         decision was in flight (now {}); re-read the candidate and decide again",
+                        current.as_deref().unwrap_or("NULL")
+                    )));
+                }
+                DecisionOutcome::ClaimsNotCurrent => return Err(not_current()),
+            }
         }
         "reject" => {
             reject_if_decided()?;
-            repo.set_status(candidate_id, "rejected", Some(acting_agent))
+            match repo
+                .reject(candidate_id, Some(acting_agent))
                 .await
-                .map_err(internal_error)?;
+                .map_err(internal_error)?
+            {
+                DecisionOutcome::Decided(updated) => updated,
+                DecisionOutcome::AlreadyDecided { status } => {
+                    return Err(already_decided(&status));
+                }
+                other => {
+                    return Err(internal_error(format!(
+                        "reject returned a promote-only outcome: {other:?}"
+                    )));
+                }
+            }
         }
         other => {
             // `retire` is NOT handled here — it is its own tool because it
@@ -259,9 +286,8 @@ pub async fn decide_match_candidate(
                  promotion, call the separate `retire_match_candidate` tool."
             )));
         }
-    }
+    };
 
-    let updated = repo.get(candidate_id).await.map_err(internal_error)?;
     success_json(&row_to_out(updated))
 }
 

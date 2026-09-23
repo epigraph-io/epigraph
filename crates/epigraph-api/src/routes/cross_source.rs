@@ -360,27 +360,38 @@ pub async fn decide_candidate(
     let repo = epigraph_db::MatchCandidateRepo::new(state.db_pool.clone());
     let row = map_sqlx(repo.get(id).await)?;
 
-    // Undecided-only guard. This lives *inside* the `promote` / `reject` arms
-    // rather than above the match, because those two are the verdicts that
-    // must not be replayed: a second `promote` overwrites `decided_by` and
-    // re-creates an edge a retirement just removed, and a re-`reject` rewrites
-    // the provenance of a ruling already made.
+    // Undecided-only FAST PATH. `row` is an unlocked read, so this closure is
+    // not the gate: two decides can both pass it, and a retire can land after
+    // it. The gate is inside `MatchCandidateRepo::promote` / `reject`, which
+    // re-read the status under the row lock in the same transaction that
+    // writes it (`already_decided` below maps their refusal to the same 409).
+    // This check stays because it answers the common replay with that 409
+    // before the promote arm's verdict/current-ness checks can answer 400 for
+    // a row that was never going to be decided anyway.
     //
-    // `retire` is the deliberate exception — it is the *undo* of a decision,
-    // so a decided row is precisely its input. Hoisting the guard above the
-    // match (its original position) is what made a promoted candidate
-    // unretractable over HTTP at all, leaving the `retire_match_candidates`
-    // operator binary on the host as the only route.
+    // It lives *inside* the `promote` / `reject` arms rather than above the
+    // match, because those two are the verdicts that must not be replayed: a
+    // second `promote` overwrites `decided_by` and re-creates an edge a
+    // retirement just removed, and a re-`reject` rewrites the provenance of a
+    // ruling already made. `retire` is the deliberate exception — it is the
+    // *undo* of a decision, so a decided row is precisely its input. Hoisting
+    // the guard above the match (its original position) is what made a
+    // promoted candidate unretractable over HTTP at all, leaving the
+    // `retire_match_candidates` operator binary on the host as the only route.
+    let already_decided = |status: &str| ApiError::Conflict {
+        reason: format!("candidate {id} already decided (status={status})"),
+    };
     let reject_if_decided = || -> Result<(), ApiError> {
         if row.status == "pending" {
             return Ok(());
         }
-        Err(ApiError::Conflict {
-            reason: format!("candidate {id} already decided (status={})", row.status),
-        })
+        Err(already_decided(&row.status))
+    };
+    let db_error = |e: &dyn std::fmt::Display| ApiError::DatabaseError {
+        message: e.to_string(),
     };
 
-    match req.verdict.as_str() {
+    let updated = match req.verdict.as_str() {
         "retire" => {
             let outcome =
                 repo.retire(id, decided_by)
@@ -424,7 +435,7 @@ pub async fn decide_candidate(
         "promote" => {
             reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
-            // before `set_status`. "promote" is the operator saying "act on
+            // before the write. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes
             // from the row's own `verifier_verdict`. Writing CORROBORATES
             // unconditionally recorded the exact inverse of the verifier's
@@ -447,66 +458,80 @@ pub async fn decide_candidate(
                 });
             };
 
+            let not_current = || ApiError::BadRequest {
+                message: format!(
+                    "cannot promote candidate {id}: both claims must be current \
+                     (is_current=true)"
+                ),
+            };
+            // Viewer-scoped: this is the check that the caller may SEE both
+            // claims. `promote` re-checks current-ness under lock, but with no
+            // viewer, so it can only add to this check, never replace it.
             let all_current = epigraph_db::ClaimRepository::are_all_current(
                 &state.db_pool,
                 &viewer,
                 &[row.claim_a, row.claim_b],
             )
             .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
+            .map_err(|e| db_error(&e))?;
             if !all_current {
-                return Err(ApiError::BadRequest {
-                    message: format!(
-                        "cannot promote candidate {id}: both claims must be current \
-                         (is_current=true)"
-                    ),
-                });
+                return Err(not_current());
             }
 
-            repo.set_status(id, "promoted", decided_by)
+            // Status flip and edge write in ONE transaction under the row
+            // lock, with the edge properties built from the locked row. This
+            // is what lets `retire` serialise against a promote in flight.
+            match repo
+                .promote(
+                    id,
+                    decided_by,
+                    row.verifier_verdict.as_deref(),
+                    relationship,
+                )
                 .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: e.to_string(),
-                })?;
-
-            let props = serde_json::json!({
-                "candidate_id": id,
-                "score": row.score,
-                "features": row.features,
-                "verifier_verdict": row.verifier_verdict,
-                "decided_by": decided_by,
-                "source": "cross_source_matcher",
-            });
-            epigraph_db::EdgeRepository::create_symmetric_if_absent(
-                &state.db_pool,
-                row.claim_a,
-                row.claim_b,
-                relationship,
-                props,
-            )
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: e.to_string(),
-            })?;
+                .map_err(|e| db_error(&e))?
+            {
+                epigraph_db::DecisionOutcome::Decided(updated) => updated,
+                epigraph_db::DecisionOutcome::AlreadyDecided { status } => {
+                    return Err(already_decided(&status));
+                }
+                epigraph_db::DecisionOutcome::VerdictChanged { current } => {
+                    return Err(ApiError::Conflict {
+                        reason: format!(
+                            "candidate {id}'s verifier_verdict changed while this decision was \
+                             in flight (now {}); re-read the candidate and decide again",
+                            current.as_deref().unwrap_or("NULL")
+                        ),
+                    });
+                }
+                epigraph_db::DecisionOutcome::ClaimsNotCurrent => return Err(not_current()),
+            }
         }
         "reject" => {
             reject_if_decided()?;
-            repo.set_status(id, "rejected", decided_by)
+            match repo
+                .reject(id, decided_by)
                 .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: e.to_string(),
-                })?;
+                .map_err(|e| db_error(&e))?
+            {
+                epigraph_db::DecisionOutcome::Decided(updated) => updated,
+                epigraph_db::DecisionOutcome::AlreadyDecided { status } => {
+                    return Err(already_decided(&status));
+                }
+                other => {
+                    return Err(ApiError::InternalError {
+                        message: format!("reject returned a promote-only outcome: {other:?}"),
+                    });
+                }
+            }
         }
         other => {
             return Err(ApiError::BadRequest {
                 message: format!("verdict must be 'promote', 'reject' or 'retire', got {other}"),
             });
         }
-    }
+    };
 
-    let updated = map_sqlx(repo.get(id).await)?;
     Ok(Json(serde_json::json!({
         "id": updated.id.to_string(),
         "status": updated.status,

@@ -85,6 +85,31 @@ pub struct RetiredEdge {
     pub created_at: DateTime<Utc>,
 }
 
+/// Result of [`MatchCandidateRepo::promote`] / [`MatchCandidateRepo::reject`].
+///
+/// Every refusal is an `Ok` variant rather than an error: each is an expected
+/// outcome of a race the caller lost, and each surface maps it to its own
+/// client-error shape (HTTP 409 / 400, MCP `invalid_params`). A `DbError` from
+/// these methods is a genuine database failure, and it always means the
+/// transaction rolled back — the row is still `pending` and no edge exists.
+#[derive(Debug, Clone)]
+pub enum DecisionOutcome {
+    /// The row was `pending` under the lock and is now decided. Carries the row
+    /// as committed, so the caller reports what THIS call did rather than a
+    /// re-read that a later writer may already have moved.
+    Decided(MatchCandidateRow),
+    /// The row was not `pending` once locked. Nothing was written.
+    AlreadyDecided { status: String },
+    /// `promote` only: the row's `verifier_verdict` under the lock differs from
+    /// the one the caller resolved the edge relationship from. Nothing was
+    /// written — the relationship the caller passed may no longer be the one the
+    /// verdict calls for.
+    VerdictChanged { current: Option<String> },
+    /// `promote` only: an endpoint was superseded, marked duplicate or removed
+    /// between the caller's check and the lock. Nothing was written.
+    ClaimsNotCurrent,
+}
+
 #[derive(Clone)]
 pub struct MatchCandidateRepo {
     pool: PgPool,
@@ -106,10 +131,11 @@ impl MatchCandidateRepo {
     /// *decision*.
     ///
     /// The discriminator is `decided_at`, not `status != 'pending'`, because
-    /// [`crate::repos::match_candidate::MatchCandidateRepo::set_status`] is the
-    /// only writer of `decided_at`, while the matcher itself writes
-    /// `status = 'rejected'` with `decided_at` NULL. Keying on status would
-    /// freeze matcher-set rejections forever and defeat re-scoring.
+    /// the operator-decision writers ([`Self::promote`], [`Self::reject`],
+    /// [`Self::retire`] and [`Self::set_status`]) are the only writers of
+    /// `decided_at`, while the matcher itself writes `status = 'rejected'` with
+    /// `decided_at` NULL. Keying on status would freeze matcher-set rejections
+    /// forever and defeat re-scoring.
     ///
     /// `verifier_verdict` / `verifier_rationale` are written **here**, in the
     /// same statement and under the same guard, rather than by a follow-up
@@ -202,6 +228,10 @@ impl MatchCandidateRepo {
             .await
     }
 
+    /// Unconditionally overwrite a row's decision. NOT the decide path: it
+    /// neither gates on `pending` nor writes an edge, so a promote built from it
+    /// is exactly the two-statement shape [`Self::promote`] replaced. Kept for
+    /// fixtures that need a decided row without the edge.
     pub async fn set_status(&self, id: Uuid, status: &str, by: Option<Uuid>) -> sqlx::Result<()> {
         sqlx::query(
             "UPDATE match_candidates
@@ -214,6 +244,165 @@ impl MatchCandidateRepo {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Promote a `pending` candidate: flip it to `promoted` AND write its
+    /// matcher edge, in ONE transaction, under the candidate's row lock.
+    ///
+    /// # Why one transaction
+    ///
+    /// The decide paths used to run `set_status` and
+    /// `EdgeRepository::create_symmetric_if_absent` as two autocommit
+    /// statements. A [`Self::retire`] that took the row lock between them saw
+    /// `promoted` with no edge yet, retracted nothing, flipped the row to
+    /// `stale` — and then the promote's INSERT landed, leaving a `stale` row
+    /// with a live matcher edge whose derived factor kept biasing belief
+    /// propagation. With both writes inside this transaction, `retire`'s
+    /// `SELECT … FOR UPDATE` blocks until the edge is committed and therefore
+    /// sees (and retracts) it. The same lock serialises two concurrent decides:
+    /// the second blocks, then reads the first one's status and is refused.
+    ///
+    /// # Everything the edge says comes from the LOCKED row
+    ///
+    /// * `status` must be `pending`, else [`DecisionOutcome::AlreadyDecided`].
+    ///   The unlocked read a caller does first is a fast path, not the gate.
+    /// * `relationship` is resolved by the caller from `verifier_verdict`
+    ///   (the mapping lives in `epigraph-engine`, which this crate cannot
+    ///   depend on). `expected_verdict` is the verdict it resolved from; if the
+    ///   locked row carries a different one — [`Self::upsert`] rewrites the
+    ///   verdict of an undecided row — the call is refused with
+    ///   [`DecisionOutcome::VerdictChanged`] rather than writing a polarity the
+    ///   row no longer supports.
+    /// * The edge `properties` (`score`, `features`, `verifier_verdict`) are
+    ///   built here from the locked row, and the `"source":
+    ///   "cross_source_matcher"` marker that migration 090's
+    ///   `edges_symmetric_relationship_uniq` and [`Self::retire`] both key on
+    ///   is stamped here, so no decide caller can omit it.
+    ///
+    /// # Current-ness, re-checked under lock
+    ///
+    /// Both endpoints are re-read `FOR SHARE`, which conflicts with the
+    /// `UPDATE claims SET is_current = false` of a supersede or
+    /// `mark_duplicate`, so an endpoint cannot be retired between this check
+    /// and the edge commit ([`DecisionOutcome::ClaimsNotCurrent`]). This is
+    /// ADDITIVE to the caller's viewer-scoped `ClaimRepository::are_all_current`
+    /// check, never a replacement: this read carries no `Viewer` and so says
+    /// nothing about whether the caller may see the claims. Lock order is
+    /// candidate row, then claim rows; no writer takes them in the other order
+    /// (nothing outside this repository writes `match_candidates`).
+    ///
+    /// A dedup hit on the edge (the `create_symmetric_if_absent` statement
+    /// inserting zero rows, e.g. a reversed-duplicate candidate already linked
+    /// the pair) is success. Any `Err` — the tenancy trigger's RAISE,
+    /// `edges_validate_refs`, a CHECK — rolls the status flip back with it.
+    pub async fn promote(
+        &self,
+        id: Uuid,
+        by: Option<Uuid>,
+        expected_verdict: Option<&str>,
+        relationship: &str,
+    ) -> Result<DecisionOutcome, crate::errors::DbError> {
+        let mut tx = self.pool.begin().await?;
+
+        let locked: MatchCandidateRow =
+            sqlx::query_as("SELECT * FROM match_candidates WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if locked.status != "pending" {
+            return Ok(DecisionOutcome::AlreadyDecided {
+                status: locked.status,
+            });
+        }
+        if locked.verifier_verdict.as_deref() != expected_verdict {
+            return Ok(DecisionOutcome::VerdictChanged {
+                current: locked.verifier_verdict,
+            });
+        }
+
+        let endpoints = [locked.claim_a, locked.claim_b];
+        let live: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM claims
+             WHERE id = ANY($1) AND COALESCE(is_current, true) = true
+             FOR SHARE",
+        )
+        .bind(&endpoints[..])
+        .fetch_all(&mut *tx)
+        .await?;
+        let distinct: std::collections::HashSet<&Uuid> = endpoints.iter().collect();
+        if live.len() != distinct.len() {
+            return Ok(DecisionOutcome::ClaimsNotCurrent);
+        }
+
+        // `AND status = 'pending'` is redundant under the lock taken above; it
+        // is kept so the gate is also in the statement that writes.
+        let decided: MatchCandidateRow = sqlx::query_as(
+            "UPDATE match_candidates
+             SET status = 'promoted', decided_at = now(), decided_by = $2
+             WHERE id = $1 AND status = 'pending'
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(by)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let props = serde_json::json!({
+            "candidate_id":     id,
+            "score":            decided.score,
+            "features":         decided.features,
+            "verifier_verdict": decided.verifier_verdict,
+            "decided_by":       by,
+            "source":           "cross_source_matcher",
+        });
+        // The same statement `EdgeRepository::create_symmetric_if_absent`
+        // runs, executed on this transaction. Zero rows is a dedup hit, not an
+        // error; see this method's doc.
+        crate::repos::edge::EdgeRepository::symmetric_insert_if_absent(
+            decided.claim_a,
+            decided.claim_b,
+            relationship,
+            props,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(DecisionOutcome::Decided(decided))
+    }
+
+    /// Reject a `pending` candidate under the same row lock as
+    /// [`Self::promote`], so a reject cannot overwrite a promotion (or a
+    /// retirement) that committed after the caller's unlocked read — that is
+    /// the state that leaves a matcher edge in force under a `rejected` row.
+    /// Returns [`DecisionOutcome::Decided`] or
+    /// [`DecisionOutcome::AlreadyDecided`]; the other variants are
+    /// promote-only.
+    pub async fn reject(&self, id: Uuid, by: Option<Uuid>) -> sqlx::Result<DecisionOutcome> {
+        let mut tx = self.pool.begin().await?;
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if status != "pending" {
+            return Ok(DecisionOutcome::AlreadyDecided { status });
+        }
+
+        let decided: MatchCandidateRow = sqlx::query_as(
+            "UPDATE match_candidates
+             SET status = 'rejected', decided_at = now(), decided_by = $2
+             WHERE id = $1 AND status = 'pending'
+             RETURNING *",
+        )
+        .bind(id)
+        .bind(by)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(DecisionOutcome::Decided(decided))
     }
 
     /// Retract a candidate's promotion: delete every matcher-created edge
@@ -272,19 +461,18 @@ impl MatchCandidateRepo {
         let mut tx = self.pool.begin().await?;
 
         // Row-lock the candidate. This serialises retirement against a
-        // *subsequent* decide — that path's first write is `set_status`, which
-        // blocks here — and against a concurrent retire of the same row.
+        // decide on the same row — in EITHER order — and against a concurrent
+        // retire of the same row.
         //
-        // It does NOT close the window against a promote already in flight:
-        // `decide_candidate`'s promote arm runs `set_status` and
-        // `create_symmetric_if_absent` as two separate statements in two
-        // implicit transactions, so one that has already committed
-        // `set_status` and is mid-INSERT is not held by this lock. Its edge is
-        // invisible to the SELECT below and survives the retirement, leaving
-        // the row `stale` with a live matcher edge. Retiring again cleans it
-        // up. Making that impossible means folding the promote arm's two
-        // statements into one transaction, which is a change to the promote
-        // path, not to this one.
+        // The in-flight-promote window this comment used to record as a known
+        // limit is DISCHARGED (deferred-commitment key
+        // match-candidate-promote-tx): `Self::promote` now writes the status
+        // flip and the matcher edge in one transaction under this same row
+        // lock, so a promote that has flipped the status still holds the lock
+        // until its edge is committed. This SELECT therefore blocks until then
+        // and the edge SELECT below sees the edge it has to retract.
+        // Pinned by `match_candidate_repo.rs::
+        // retire_waits_for_an_in_flight_promote_and_retracts_its_edge`.
         let (claim_a, claim_b, previous_status): (Uuid, Uuid, String) = sqlx::query_as(
             "SELECT claim_a, claim_b, status FROM match_candidates
              WHERE id = $1

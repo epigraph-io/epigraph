@@ -228,9 +228,12 @@ impl EdgeRepository {
     /// connects the two in EITHER direction.
     ///
     /// This is the single home for the cross-source matcher's edge-write SQL:
-    /// the `Policy::write_edge` body in `epigraph-engine` and the
-    /// `decide_match_candidate` PROMOTE arm in `epigraph-mcp` both route
-    /// through it so the dedup form lives in one place. The existence check is
+    /// the `Policy::write_edge` body in `epigraph-engine` routes through it, and
+    /// [`crate::repos::match_candidate::MatchCandidateRepo::promote`] (the one
+    /// write path behind both the HTTP and the MCP PROMOTE arms) runs the same
+    /// statement inside its own transaction via
+    /// [`Self::symmetric_insert_if_absent`], so the dedup form lives in one
+    /// place. The existence check is
     /// **bidirectional** — `(a,b)` and `(b,a)` with the same `relationship`
     /// count as the same edge — because CORROBORATES is semantically symmetric
     /// even though the row preserves the caller's `a,b` ordering (we do NOT
@@ -274,7 +277,7 @@ impl EdgeRepository {
     /// exclusion violations only — 074's tenancy RAISE and `edges_validate_refs`
     /// still propagate, which is what keeps this write fail-closed.
     ///
-    /// The matcher's `are_all_current` guard stays at the MCP call site; this
+    /// The matcher's `are_all_current` guard stays at the call site; this
     /// method is purely the write.
     ///
     /// # Errors
@@ -287,7 +290,31 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<bool, DbError> {
-        let result = sqlx::query(
+        let result = Self::symmetric_insert_if_absent(a, b, relationship, properties)
+            .execute(pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The statement [`Self::create_symmetric_if_absent`] runs, built and bound
+    /// but NOT executed, so a repo method that owns a transaction can run the
+    /// identical write inside it. `MatchCandidateRepo::promote` is that caller:
+    /// its status flip and this edge must commit together under the candidate's
+    /// row lock, or a retirement can land between them.
+    ///
+    /// A statement builder rather than an executor-generic sibling on purpose.
+    /// A `PgExecutor` parameter would make this a viewer-less connection-taking
+    /// repo function, a set `visibility_lint.rs` holds exact; this takes no
+    /// connection at all, and `pub(crate)` keeps the only transaction that
+    /// executes it inside this crate's repo layer.
+    pub(crate) fn symmetric_insert_if_absent(
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
+        sqlx::query(
             "INSERT INTO edges (source_id, source_type, target_id, target_type,
                                 relationship, properties)
              SELECT $1, 'claim', $2, 'claim', $3, $4
@@ -303,10 +330,6 @@ impl EdgeRepository {
         .bind(b)
         .bind(relationship)
         .bind(Json(properties))
-        .execute(pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0)
     }
 
     /// Symmetric idempotent create that also returns the edge id.

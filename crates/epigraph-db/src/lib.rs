@@ -125,6 +125,7 @@ pub use repos::graph_view::{
     SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use repos::mass_function::{CachedBelief, MassFunctionRow};
+pub use repos::match_candidate::DecisionOutcome;
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy
 // `ownership` table on this line. The export came in from main, which still
 // carries the module, and is dropped rather than resurrected.

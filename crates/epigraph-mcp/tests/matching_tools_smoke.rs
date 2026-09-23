@@ -837,3 +837,105 @@ async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: 
         "must no longer advertise 'retire' as a valid verdict: {msg}"
     );
 }
+
+/// Block until at least `n` backends connected to THIS test's database are
+/// waiting on a heavyweight lock. `#[sqlx::test]` gives every test its own
+/// database, so the `datname` filter isolates it from parallel tests.
+async fn wait_for_lock_waiters(pool: &PgPool, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {n} lock waiter(s); saw {waiting}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The already-decided gate above reads the row WITHOUT a lock, so on its own
+/// it is a fast path: a retirement committed after that read was overwritten.
+/// The pre-fix `promote` arm's `set_status` waited on the retirement's row
+/// lock, then wrote `promoted` over `stale` and re-created the retracted edge;
+/// `reject` wrote `rejected` over it. Both returned success.
+///
+/// Now the decision goes through `MatchCandidateRepo::promote` / `reject`,
+/// which re-read the status under the row lock inside the transaction that
+/// writes it, so both must be refused and the retirement must stand. The
+/// retirement is simulated by a transaction that holds the lock until the tool
+/// call is observed parked on it (deferred-commitment key
+/// match-candidate-promote-tx).
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_match_candidate_refuses_under_the_row_lock_when_a_retire_commits_mid_flight(
+    pool: PgPool,
+) {
+    let server = build_server(pool.clone(), false).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = insert_agent(&pool).await;
+
+    for verdict in ["promote", "reject"] {
+        let a = insert_claim(&pool, agent).await;
+        let b = insert_claim(&pool, agent).await;
+        let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+
+        let mut retire_tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM match_candidates WHERE id = $1 FOR UPDATE")
+            .bind(cand)
+            .execute(&mut *retire_tx)
+            .await
+            .unwrap();
+
+        let (result, ()) = tokio::join!(
+            tools::matching::decide_match_candidate(
+                &server,
+                &viewer,
+                DecideMatchCandidateParams {
+                    candidate_id: cand.to_string(),
+                    verdict: verdict.into(),
+                },
+            ),
+            async {
+                wait_for_lock_waiters(&pool, 1).await;
+                sqlx::query(
+                    "UPDATE match_candidates SET status = 'stale', decided_at = now()
+                     WHERE id = $1",
+                )
+                .bind(cand)
+                .execute(&mut *retire_tx)
+                .await
+                .unwrap();
+                retire_tx.commit().await.unwrap();
+            }
+        );
+
+        let err = result.expect_err("a decide that lost the race to a retire must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("already decided") && msg.contains("status=stale"),
+            "{verdict}: the refusal must report the status seen under the lock: {msg}"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
+                .bind(cand)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "stale",
+            "{verdict} must not overwrite the retirement"
+        );
+        assert!(
+            edge_relationships(&pool, a, b).await.is_empty(),
+            "{verdict} must not leave a live matcher edge under a stale row"
+        );
+    }
+}

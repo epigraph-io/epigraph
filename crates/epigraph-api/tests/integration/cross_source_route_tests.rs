@@ -675,6 +675,91 @@ async fn promote_and_reject_still_refuse_an_already_decided_candidate(pool: PgPo
     assert_eq!(status_of(&pool, candidate).await, "stale");
 }
 
+/// Block until at least `n` backends connected to THIS test's database are
+/// waiting on a heavyweight lock. `#[sqlx::test]` gives every test its own
+/// database, so the `datname` filter isolates it from parallel tests.
+async fn wait_for_lock_waiters(pool: &PgPool, n: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {n} lock waiter(s); saw {waiting}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// `reject_if_decided` reads the row WITHOUT a lock, so it is only a fast
+/// path: a retirement that commits after that read used to be overwritten.
+/// The pre-fix promote arm's `set_status` waited on the retirement's row lock,
+/// then wrote `promoted` over `stale` and re-created the retracted edge; the
+/// reject arm wrote `rejected` over it. Both answered 200.
+///
+/// Now `MatchCandidateRepo::promote` / `reject` re-read the status under the
+/// row lock inside the transaction that writes it, so both must 409 and leave
+/// the retirement standing. The retirement is simulated by a transaction that
+/// holds the lock until the request is observed parked on it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn decide_refuses_under_the_row_lock_when_a_retire_commits_mid_flight(pool: PgPool) {
+    let agent = insert_agent(&pool).await;
+    let token = decide_bearer_token(Uuid::new_v4(), Some(agent), "agent");
+
+    for verdict in ["promote", "reject"] {
+        let a = insert_claim(&pool, agent).await;
+        let b = insert_claim(&pool, agent).await;
+        let candidate = insert_pending_candidate(&pool, a, b).await;
+
+        let mut retire_tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM match_candidates WHERE id = $1 FOR UPDATE")
+            .bind(candidate)
+            .execute(&mut *retire_tx)
+            .await
+            .unwrap();
+
+        let (resp, ()) = tokio::join!(
+            post_decide(pool.clone(), candidate, &token, verdict),
+            async {
+                wait_for_lock_waiters(&pool, 1).await;
+                sqlx::query(
+                    "UPDATE match_candidates SET status = 'stale', decided_at = now()
+                     WHERE id = $1",
+                )
+                .bind(candidate)
+                .execute(&mut *retire_tx)
+                .await
+                .unwrap();
+                retire_tx.commit().await.unwrap();
+            }
+        );
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "{verdict} must be refused once the lock shows the row was retired"
+        );
+        assert_eq!(
+            status_of(&pool, candidate).await,
+            "stale",
+            "{verdict} must not overwrite the retirement"
+        );
+        assert_eq!(
+            matcher_edge_footprint(&pool, a, b).await.0,
+            0,
+            "{verdict} must not leave a live matcher edge under a stale row"
+        );
+    }
+}
+
 // NOTE: this route is registered in routes/mod.rs (Task 3 of the
 // 2026-07-11 xsm-telegram-approval plan) — this test only passes once
 // that registration lands.

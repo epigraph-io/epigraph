@@ -1749,10 +1749,13 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// across policy boundaries by construction, so post-090
 /// `create_symmetric_if_absent` answers `false` ("already linked") about an edge
 /// the writing session cannot see. That boolean reaches no caller-visible
-/// response: all three production callers discard it —
-/// `routes/cross_source.rs`'s PROMOTE arm returns `{id, status}`,
-/// `tools/matching.rs` returns `row_to_out(updated)`, and
-/// `matching/policy.rs::write_edge` returns `Ok(())`. A future caller that wants
+/// response: both production writers of that statement discard it —
+/// `MatchCandidateRepo::promote` (the one write path behind
+/// `routes/cross_source.rs`'s PROMOTE arm, which returns `{id, status}`, and
+/// `tools/matching.rs`, which returns `row_to_out` of the decided row) runs it
+/// through `EdgeRepository::symmetric_insert_if_absent` inside its transaction
+/// and returns only the candidate row, and `matching/policy.rs::write_edge`
+/// returns `Ok(())`. A future caller that wants
 /// to surface it (as the sibling `_returning` variant already surfaces
 /// `created`) has to confront that first. Recorded against
 /// `D-PR17-read-guards-widen-under-rls`.
@@ -1867,8 +1870,8 @@ fn matcher_props() -> serde_json::Value {
 ///
 /// Migration 090 is keyed on `(pair + properties->>'source' =
 /// 'cross_source_matcher')`, the same identity `MatchCandidateRepo::retire`
-/// already uses to find the edges it may retract. All three production callers
-/// of `create_symmetric_if_absent` stamp it, so a fixture that omitted it would
+/// already uses to find the edges it may retract. Both production writers
+/// of the `create_symmetric_if_absent` statement stamp it, so a fixture that omitted it would
 /// exercise a shape production never writes and would pass for the wrong
 /// reason. The narrowing is what keeps an operator-authored edge over the same
 /// pair legal — `cross_source_route_tests.rs::retire_leaves_non_matcher_edges_between_the_same_pair_alone`
@@ -1880,11 +1883,14 @@ fn matcher_props() -> serde_json::Value {
 /// The index only bites for a row carrying `properties->>'source' =
 /// 'cross_source_matcher'`, and that marker comes from the CALLER's payload —
 /// `create_symmetric_if_absent` hardcodes both endpoint types but passes
-/// `properties` through verbatim. All three production callers stamp it today;
-/// a fourth that did not would take its rows out of the predicate silently.
-/// Recorded here rather than pinned, because pinning it means either stamping
-/// the marker inside the repo function or enumerating call sites in a lint, and
-/// both are behaviour changes outside this batch's scope.
+/// `properties` through verbatim. Both production writers stamp it today;
+/// a third that did not would take its rows out of the predicate silently.
+/// The decide path is now pinned: `MatchCandidateRepo::promote` builds the
+/// payload itself, so neither decide transport can omit the marker, and
+/// `match_candidate_repo.rs::promote_flips_status_and_writes_the_edge_from_the_locked_row`
+/// asserts it. `matching/policy.rs::write_edge` and any future caller are still
+/// unpinned — stamping inside `create_symmetric_if_absent` or a call-site lint
+/// remains the behaviour change it was.
 #[sqlx::test(migrations = "../../migrations")]
 async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer(pool: PgPool) {
     use epigraph_db::EdgeRepository;
