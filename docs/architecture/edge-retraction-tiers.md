@@ -73,6 +73,12 @@ compound and atomic halves disagree is worse than either.
 | `recall_with_context` graph expansion | `ClaimRepository::graph_expand_seeds_since` (in-force endpoint read) | none |
 | `recall_with_context` structural context (sections, atoms, siblings, CORROBORATES / epistemic neighbours, `continues_argument`, atom bridges, paper attribution) | all 15 `edges` aliases in `fetch_batched_context` (`crates/epigraph-mcp/src/tools/recall.rs`) | none |
 | Semantic-search graph neighbours; RAG `edge_count` (a ranking input) | `ClaimRepository::semantic_graph_neighbors`, `rag_hybrid_context` | none |
+| Precomputed communities and per-theme neighborhoods (`graph_clusters`, `cluster_edges`, `graph_neighborhoods`, `neighborhood_edges`) | every `edges` read in `crates/epigraph-jobs/src/cluster_graph/{runner,neighborhood}.rs`, including the leaf (`decomposes_to`) classification | none |
+
+The `cluster_graph` rows change what the job computes, not only what is shown:
+after this rule landed, a retracted edge no longer contributes to Louvain, so
+the first run afterwards can move community boundaries and cluster ids compared
+with the previous run. That is the intended outcome, not a regression.
 
 The in-force endpoint reads are separate functions, not a flag on
 `get_by_source` / `get_by_target`, because those stay the structural read (see
@@ -111,4 +117,8 @@ retraction was not about (a6adf739, 7e870b69).
   of `fetch_batched_context` resting on a retracted edge.
 * `crates/epigraph-api/tests/edge_retraction_display_http.rs` — the claim
   neighbourhood, `graph/edges` and `graph/full` after the `DELETE` handler.
+* `crates/epigraph-jobs/tests/cluster_graph_retraction_test.rs` — communities
+  and neighborhoods before/after a retraction.
+* `routes::belief::tests::predict_contradiction_ignores_a_retracted_refutes_edge`
+  — the G8 pre-screen.
 * `crates/epigraph-db/tests/edge_retraction_enforcement.rs` — the belief tier.

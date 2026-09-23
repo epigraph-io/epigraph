@@ -5,6 +5,8 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use epigraph_db::repos::edge::{EDGE_IN_FORCE, EDGE_IN_FORCE_UNALIASED};
+
 use super::louvain::{louvain, LouvainInput};
 
 /// Edge relationship strings considered "epistemic" for clustering. Governance
@@ -56,11 +58,16 @@ pub async fn run_clustering(pool: &PgPool, cfg: &RunConfig) -> Result<RunSummary
     .await?;
 
     let allow_array: Vec<&str> = EPISTEMIC_RELATIONSHIPS.to_vec();
-    let edges: Vec<EdgeRow> = sqlx::query_as::<_, EdgeRow>(
+    // In force only. The communities back the explorer's overview, a display
+    // read: an edge removed with `DELETE /api/v1/edges/:id` (a retraction —
+    // the row keeps `valid_to`) must not keep pulling its endpoints into one
+    // community. See docs/architecture/edge-retraction-tiers.md.
+    let edges: Vec<EdgeRow> = sqlx::query_as::<_, EdgeRow>(&format!(
         "SELECT source_id AS source, target_id AS target
          FROM edges
-         WHERE relationship = ANY($1)",
-    )
+         WHERE relationship = ANY($1)
+           AND {EDGE_IN_FORCE_UNALIASED}"
+    ))
     .bind(&allow_array)
     .fetch_all(pool)
     .await?;
@@ -222,8 +229,9 @@ async fn write_clusters(
         flush_membership(&mut tx, &batch, run_id).await?;
     }
 
-    // Inter-cluster edge counts: re-scan edges within transaction.
-    sqlx::query(
+    // Inter-cluster edge counts: re-scan edges within transaction, in force
+    // only (same reason as the edge load in `run_clustering`).
+    sqlx::query(&format!(
         r#"
         INSERT INTO cluster_edges (run_id, cluster_a, cluster_b, weight)
         SELECT $1::uuid AS run_id,
@@ -234,10 +242,11 @@ async fn write_clusters(
         JOIN claim_cluster_membership ma ON ma.claim_id = e.source_id AND ma.run_id = $1
         JOIN claim_cluster_membership mb ON mb.claim_id = e.target_id AND mb.run_id = $1
         WHERE e.relationship = ANY($2)
+          AND {EDGE_IN_FORCE}
           AND ma.cluster_id <> mb.cluster_id
         GROUP BY 1, 2, 3
-        "#,
-    )
+        "#
+    ))
     .bind(run_id)
     .bind(EPISTEMIC_RELATIONSHIPS)
     .execute(&mut *tx)

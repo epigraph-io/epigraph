@@ -50,6 +50,9 @@ const DISPLAY_TIER_FILES: &[&str] = &[
     // The explorer's cluster / neighbourhood / compound views and
     // `load_subgraph` (graph_full, graph_query). Module doc, "Retracted edges".
     "crates/epigraph-db/src/repos/graph_view.rs",
+    // The precomputed communities / neighborhoods those views render.
+    "crates/epigraph-jobs/src/cluster_graph/runner.rs",
+    "crates/epigraph-jobs/src/cluster_graph/neighborhood.rs",
 ];
 
 /// Workspace-relative `(file, fn)` display-tier functions in files that also

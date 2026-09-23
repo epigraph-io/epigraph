@@ -35,6 +35,7 @@
 
 use std::collections::HashMap;
 
+use epigraph_db::repos::edge::EDGE_IN_FORCE;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -143,9 +144,12 @@ async fn run_one_theme(
     cfg: &Config,
 ) -> Result<(), sqlx::Error> {
     // Fetch atomic/standalone claims: those in this theme that have no
-    // outgoing `decomposes_to` edge (i.e. they are leaves in the claim tree).
+    // outgoing IN-FORCE `decomposes_to` edge (i.e. they are leaves in the claim
+    // tree as it stands — a retracted decomposition no longer makes a claim a
+    // compound, matching `GraphViewRepository`'s classification of the same
+    // neighborhoods; see docs/architecture/edge-retraction-tiers.md).
     // Uses DISTINCT ON (c.id) to collapse multiple frame memberships to one row.
-    let atoms: Vec<AtomRow> = sqlx::query_as::<_, AtomRow>(
+    let atoms: Vec<AtomRow> = sqlx::query_as::<_, AtomRow>(&format!(
         r#"
         SELECT DISTINCT ON (c.id) c.id, c.pignistic_prob, cf.frame_id
         FROM claims c
@@ -155,10 +159,11 @@ async fn run_one_theme(
               SELECT 1 FROM edges e
               WHERE e.source_id = c.id
                 AND e.relationship = 'decomposes_to'
+                AND {EDGE_IN_FORCE}
           )
         ORDER BY c.id, cf.frame_id
-        "#,
-    )
+        "#
+    ))
     .bind(theme_id)
     .fetch_all(pool)
     .await?;
@@ -172,7 +177,8 @@ async fn run_one_theme(
     // Pull positive-weight edges between in-theme atoms.
     // Uses a LATERAL join on edge_to_factor_type() to evaluate the function
     // once per row (cheaper than a correlated subquery).
-    let edges: Vec<WeightedEdgeRow> = sqlx::query_as::<_, WeightedEdgeRow>(
+    // In force only: a retracted edge must not tie two atoms together.
+    let edges: Vec<WeightedEdgeRow> = sqlx::query_as::<_, WeightedEdgeRow>(&format!(
         r#"
         SELECT e.source_id AS source,
                e.target_id AS target,
@@ -182,8 +188,9 @@ async fn run_one_theme(
         WHERE e.source_id = ANY($1)
           AND e.target_id = ANY($1)
           AND ft.forward_strength > 0
-        "#,
-    )
+          AND {EDGE_IN_FORCE}
+        "#
+    ))
     .bind(&atom_ids)
     .fetch_all(pool)
     .await?;
@@ -331,7 +338,7 @@ async fn write_neighborhood_edges(
     run_id: Uuid,
     theme_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         r#"
         INSERT INTO neighborhood_edges (run_id, neighborhood_a, neighborhood_b, weight)
         SELECT $1::uuid                                          AS run_id,
@@ -349,10 +356,11 @@ async fn write_neighborhood_edges(
           ON nb.id = mb.neighborhood_id AND nb.theme_id = $2
         LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
         WHERE ma.neighborhood_id <> mb.neighborhood_id
+          AND {EDGE_IN_FORCE}
         GROUP BY 1, 2, 3
         HAVING SUM(COALESCE(ft.forward_strength, 0)) > 0
-        "#,
-    )
+        "#
+    ))
     .bind(run_id)
     .bind(theme_id)
     .execute(pool)
