@@ -233,6 +233,22 @@ pub async fn submit_ds_evidence(
     // belief is stale until D2 or the CLI above runs. That window is a known
     // release-gate residual, registered in
     // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs`.
+    //
+    // AND IT SUCCEEDS ONLY FOR CLAIMS THIS SERVER'S GROUP OWNS. Stated here because
+    // the sentence above ("this tool now commits `claim_frames` + `mass_functions`")
+    // is true only of that case, and the reported e2e arm was run on the agent's own
+    // claim. `claim_frames` and `mass_functions` are CLAIM-DERIVED: migration 074's
+    // `epigraph_derived_require_tenancy` fills `(visibility, owner_group_id)` from
+    // the parent claim and 070 arm (c) re-stamps it, so the `WITH CHECK` asks about
+    // the CLAIM's group, not the evidence author's. The stamp here carries
+    // `server.agent_id()`'s writable set, so a BBA against ANOTHER group's claim is
+    // still refused on a cleanly-migrated schema. `tools/challenges.rs` states the
+    // same residual for `challenge_claim` in its doc header, and
+    // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
+    // a_challenge_against_a_foreign_groups_claim_is_still_refused` pins it on the
+    // non-bypassing role. `tools/claims.rs::update_with_evidence` has the same shape
+    // for the same reason. Whether an admin scope should carry write authority into
+    // a group it is not a member of is a tenancy-model decision, not a bug here.
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
             .await?;

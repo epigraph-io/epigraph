@@ -974,6 +974,18 @@ pub async fn update_with_evidence(
     // accumulate. Today neither reaches execution on either configuration: the DS
     // wiring above refuses first (MEASURED on both). This block is therefore
     // correct-and-unreachable until D2, rather than active.
+    //
+    // AND WHEN IT DOES BECOME REACHABLE IT WILL SERVE ONLY CLAIMS THIS SERVER'S
+    // GROUP OWNS. The stamp carries `server.agent_id()`'s writable set, and
+    // `claims_tenancy`'s `WITH CHECK` asks about the ROW's `owner_group_id` — the
+    // TARGET claim's group, not the evidence author's. So `update_with_evidence`
+    // against another agent's claim stays refused on a cleanly-migrated schema,
+    // exactly as `update_labels` does. That residual is pinned on the non-bypassing
+    // role by `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
+    // relabelling_a_foreign_groups_claim_is_refused_on_a_stamped_app_session` and
+    // its `…_lands_when_the_session_carries_the_claims_own_group` pair; the same
+    // statement holds for `challenge_claim` and `submit_ds_evidence`, and each
+    // states it at its own site. It is a tenancy-model decision, not a defect here.
     let after_truth = TruthValue::clamped(ds.pignistic_prob);
     {
         let mut tx =
