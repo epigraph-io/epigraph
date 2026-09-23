@@ -681,11 +681,17 @@ mod tests {
     use tower::ServiceExt as _;
 
     /// Build a minimal router with just the event endpoints for testing.
+    ///
+    /// `list_events` and `graph_snapshot` take a `ViewerExtractor`; see
+    /// [`crate::routes::nodb_test_auth`] for why the layer is needed.
     fn test_router() -> Router {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/events", get(list_events).post(create_event))
             .route("/api/v1/graph/snapshot/:version", get(graph_snapshot))
+            .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                "claims:read",
+            ])))
             .with_state(state)
     }
 

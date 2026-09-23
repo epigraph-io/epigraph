@@ -22,14 +22,14 @@
 //!   tokio tasks, each creating its own router via `create_router` to avoid
 //!   consuming the router with `oneshot`.
 
-// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
-// the `not(feature = "db")` configuration has 28 pre-existing compile errors
-// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
-// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
-// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
-// intended behaviour, not coverage of it. The behaviour is actually asserted
-// by `tests/public_router_allowlist.rs`, which probes every route on the
-// `protected` chain of the buildable variant.
+// `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds the
+// tests below (`db` is a default feature); CI's no-db step,
+// `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+// them. Until F-PR10-no-db-test-cfg-never-compiles was discharged they compiled
+// in no configuration at all (`routes/admin.rs`'s `ApiConfig` literal omitted
+// `allow_all_identities`, among others). For the `db` build, PR-03's
+// `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+// which probes every route on the `protected` chain.
 #[cfg(all(test, not(feature = "db")))]
 mod malformed_input_tests {
     use crate::routes::batch::batch_create_claims;
@@ -48,10 +48,17 @@ mod malformed_input_tests {
     use uuid::Uuid;
 
     /// Create a direct router for the submit endpoint (no auth middleware).
+    ///
+    /// "No auth middleware" is not "no `AuthContext`": the handler takes an
+    /// authentication extractor, so the context is layered in directly. See
+    /// [`crate::routes::nodb_test_auth`].
     fn submit_router() -> Router {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                "claims:write",
+            ])))
             .with_state(state)
     }
 
@@ -71,19 +78,28 @@ mod malformed_input_tests {
             .with_state(state)
     }
 
-    /// Create a direct router for the RAG endpoint.
+    /// Create a direct router for the RAG endpoint, with an `AuthContext`
+    /// layered in for its `ViewerExtractor`.
     fn rag_router() -> Router {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/query/rag", get(rag_context))
+            .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                "claims:read",
+            ])))
             .with_state(state)
     }
 
-    /// Create a direct router for the webhook registration endpoint (no auth middleware).
+    /// Create a direct router for the webhook registration endpoint (no auth
+    /// middleware), with an `AuthContext` layered in for its
+    /// `RequireScopeWebhooksWrite` extractor.
     fn webhook_router() -> Router {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/webhooks", post(register_webhook))
+            .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                "webhooks:write",
+            ])))
             .with_state(state)
     }
 
@@ -968,10 +984,8 @@ mod auth_failure_tests {
 
 #[cfg(all(test, not(feature = "db")))]
 mod concurrency_tests {
-    use crate::routes::admin::SystemStats;
     use crate::routes::batch::batch_create_claims;
     use crate::routes::challenge::submit_challenge;
-    use crate::routes::rag::RagContextResponse;
     use crate::routes::submit::submit_packet;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
@@ -1027,6 +1041,9 @@ mod concurrency_tests {
                 tokio::spawn(async move {
                     let router = Router::new()
                         .route("/api/v1/submit/packet", post(submit_packet))
+                        .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                            "claims:write",
+                        ])))
                         .with_state(state);
 
                     let body = valid_packet_json();

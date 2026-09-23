@@ -1525,6 +1525,31 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The `AuthContext` the bearer middleware would install, for the `not(db)`
+/// handler tests that mount a handler on a bare `Router`.
+///
+/// Every handler those tests reach takes an authentication extractor
+/// (`ViewerExtractor`, `RequirePrincipal`, a `RequireScope*`, or an
+/// `Option<Extension<AuthContext>>` it refuses on `None`). A bare router
+/// carries no `AuthContext`, so without this layer each request answers 401
+/// before it reaches the validation the test was written to assert, and the
+/// assertion measures the extractor instead. One uuid names the client, the
+/// agent and the owner. The refusal itself is asserted over the real middleware
+/// stack, which this layer is not part of: `negative_tests::auth_failure_tests`
+/// and the `*_via_full_router_is_401` tests go through `create_router`.
+#[cfg(all(test, not(feature = "db")))]
+pub(crate) fn nodb_test_auth(scopes: &[&str]) -> crate::middleware::bearer::AuthContext {
+    let id = uuid::Uuid::new_v4();
+    crate::middleware::bearer::AuthContext {
+        client_id: id,
+        agent_id: Some(id),
+        owner_id: Some(id),
+        client_type: crate::middleware::bearer::ClientType::Service,
+        scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+        jti: uuid::Uuid::new_v4(),
+    }
+}
+
 // Tests are disabled when db feature is enabled since they need a real database
 #[cfg(all(test, not(feature = "db")))]
 mod tests {

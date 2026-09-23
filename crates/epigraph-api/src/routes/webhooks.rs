@@ -2570,12 +2570,13 @@ mod tests {
 
     // ---- Handler integration tests (need AppState without DB) ----
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds
+    // this module (`db` is a default feature); CI's no-db step,
+    // `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+    // it. Until F-PR10-no-db-test-cfg-never-compiles was discharged it compiled
+    // in no configuration at all. For the `db` build, PR-03's
+    // `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+    // which probes every route on the `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::super::*;
@@ -2593,22 +2594,27 @@ mod tests {
                 require_packet_signatures: false,
                 ..ApiConfig::default()
             });
-
-            Router::new()
-                .route("/api/v1/webhooks", post(register_webhook))
-                .route("/api/v1/webhooks", get(list_webhooks))
-                .route("/api/v1/webhooks/:id", get(get_webhook))
-                .route("/api/v1/webhooks/:id", delete(delete_webhook))
-                .with_state(state)
+            test_router_with_state(state)
         }
 
-        /// Create a test router with shared state for multi-request tests
+        /// Create a test router with shared state for multi-request tests.
+        ///
+        /// ONE principal per router, carried by every request through it. The
+        /// handlers filter on ownership (`list_webhooks` returns only the
+        /// caller's rows, `get_webhook`/`delete_webhook` answer 403 on another
+        /// principal's), so a register-then-read test passes only because both
+        /// requests carry the same `agent_id`. `webhooks:write` is what
+        /// `register_webhook` and `delete_webhook` require; the reads require a
+        /// principal and no scope. See [`crate::routes::nodb_test_auth`].
         fn test_router_with_state(state: AppState) -> Router {
             Router::new()
                 .route("/api/v1/webhooks", post(register_webhook))
                 .route("/api/v1/webhooks", get(list_webhooks))
                 .route("/api/v1/webhooks/:id", get(get_webhook))
                 .route("/api/v1/webhooks/:id", delete(delete_webhook))
+                .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                    "webhooks:write",
+                ])))
                 .with_state(state)
         }
 

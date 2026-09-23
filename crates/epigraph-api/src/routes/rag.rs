@@ -907,12 +907,13 @@ mod tests {
     // These tests exercise the validation logic in the handler without needing
     // a real database, by using the non-db feature gate path.
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds
+    // this module (`db` is a default feature); CI's no-db step,
+    // `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+    // it. Until F-PR10-no-db-test-cfg-never-compiles was discharged it compiled
+    // in no configuration at all. For the `db` build, PR-03's
+    // `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+    // which probes every route on the `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::*;
@@ -923,10 +924,15 @@ mod tests {
         use axum::Router;
         use tower::ServiceExt;
 
+        /// `rag_context` takes a `ViewerExtractor`; see
+        /// [`crate::routes::nodb_test_auth`].
         fn test_router() -> Router {
             let state = AppState::new(ApiConfig::default());
             Router::new()
                 .route("/api/v1/query/rag", get(rag_context))
+                .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                    "claims:read",
+                ])))
                 .with_state(state)
         }
 
@@ -1295,12 +1301,13 @@ mod tests {
 
     // ---- Evidence Search Handler Tests (non-DB) ----
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds
+    // this module (`db` is a default feature); CI's no-db step,
+    // `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+    // it. Until F-PR10-no-db-test-cfg-never-compiles was discharged it compiled
+    // in no configuration at all. For the `db` build, PR-03's
+    // `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+    // which probes every route on the `protected` chain.
     #[cfg(not(feature = "db"))]
     mod evidence_search_handler_tests {
         use super::*;
@@ -1385,12 +1392,13 @@ mod tests {
 
     // ---- Evidence Embedding Handler Test (non-DB) ----
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds
+    // this module (`db` is a default feature); CI's no-db step,
+    // `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+    // it. Until F-PR10-no-db-test-cfg-never-compiles was discharged it compiled
+    // in no configuration at all. For the `db` build, PR-03's
+    // `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+    // which probes every route on the `protected` chain.
     #[cfg(not(feature = "db"))]
     mod evidence_embedding_handler_tests {
         use super::*;

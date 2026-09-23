@@ -266,14 +266,14 @@ fn validate_batch_item(item: &BatchClaimItem) -> Result<Claim, String> {
 // TESTS
 // =============================================================================
 
-// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
-// the `not(feature = "db")` configuration has 28 pre-existing compile errors
-// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
-// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
-// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
-// intended behaviour, not coverage of it. The behaviour is actually asserted
-// by `tests/public_router_allowlist.rs`, which probes every route on the
-// `protected` chain of the buildable variant.
+// `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds the
+// tests below (`db` is a default feature); CI's no-db step,
+// `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+// them. Until F-PR10-no-db-test-cfg-never-compiles was discharged they compiled
+// in no configuration at all (`routes/admin.rs`'s `ApiConfig` literal omitted
+// `allow_all_identities`, among others). For the `db` build, PR-03's
+// `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+// which probes every route on the `protected` chain.
 #[cfg(all(test, not(feature = "db")))]
 mod tests {
     use super::*;

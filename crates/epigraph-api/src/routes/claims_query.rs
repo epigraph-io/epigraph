@@ -1619,4 +1619,54 @@ mod tests {
             );
         }
     }
+
+    // ---- The not(db) arm's authentication precondition ----
+    //
+    // 920496de gave this arm the `ViewerExtractor` the `db` arm takes, so both
+    // builds refuse the same requests. Every test above layers an `AuthContext`
+    // in, and every `create_router` test is refused by the bearer middleware
+    // before the handler runs, so neither kind would notice the extractor being
+    // dropped from this arm's signature again. These two call the bare handler
+    // with no middleware, one for each of the extractor's two 401 branches.
+
+    #[tokio::test]
+    async fn test_bare_handler_without_an_auth_context_is_401() {
+        let router = Router::new()
+            .route("/api/v1/claims", get(list_claims_query))
+            .with_state(AppState::new(ApiConfig::default()));
+        let request = Request::builder()
+            .uri("/api/v1/claims")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "the not(db) claims listing answered a request that carried no \
+             AuthContext; the db arm refuses it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bare_handler_with_a_principal_less_token_is_401() {
+        let mut auth = crate::routes::nodb_test_auth(&["claims:read"]);
+        auth.agent_id = None;
+        let router = Router::new()
+            .route("/api/v1/claims", get(list_claims_query))
+            .layer(axum::Extension(auth))
+            .with_state(AppState::new(ApiConfig::default()));
+        let request = Request::builder()
+            .uri("/api/v1/claims")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "the not(db) claims listing answered a token that names no agent; \
+             the db arm refuses it"
+        );
+    }
 }

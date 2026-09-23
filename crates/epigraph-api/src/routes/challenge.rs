@@ -414,12 +414,13 @@ mod tests {
 
     // ---- Handler integration tests (need AppState without DB) ----
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds
+    // this module (`db` is a default feature); CI's no-db step,
+    // `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+    // it. Until F-PR10-no-db-test-cfg-never-compiles was discharged it compiled
+    // in no configuration at all. For the `db` build, PR-03's
+    // `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+    // which probes every route on the `protected` chain.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::super::*;
@@ -438,9 +439,14 @@ mod tests {
                 ..ApiConfig::default()
             });
 
+            // `list_challenges` takes a `ViewerExtractor`; see
+            // [`crate::routes::nodb_test_auth`].
             Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                    "claims:read",
+                ])))
                 .with_state(state)
         }
 
@@ -614,6 +620,9 @@ mod tests {
             // Build router with the same state
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                    "claims:read",
+                ])))
                 .with_state(state);
 
             let request = Request::builder()
@@ -831,6 +840,9 @@ mod tests {
             // Build router with same state for the GET endpoint
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                    "claims:read",
+                ])))
                 .with_state(state);
 
             let request = Request::builder()
@@ -896,6 +908,9 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(crate::routes::nodb_test_auth(&[
+                    "claims:read",
+                ])))
                 .with_state(state);
 
             // List for claim A → expect 2
@@ -1081,12 +1096,13 @@ mod tests {
         }
     } // end mod handler_tests
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // `not(db)` ONLY. The default `cargo test -p epigraph-api` never builds
+    // this module (`db` is a default feature); CI's no-db step,
+    // `cargo test -p epigraph-api --no-default-features --lib`, builds and runs
+    // it. Until F-PR10-no-db-test-cfg-never-compiles was discharged it compiled
+    // in no configuration at all. For the `db` build, PR-03's
+    // `OK -> UNAUTHORIZED` flips are asserted by `tests/public_router_allowlist.rs`,
+    // which probes every route on the `protected` chain.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;

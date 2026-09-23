@@ -2024,6 +2024,11 @@ mod tests {
 mod event_tests {
     use super::*;
     use crate::state::ApiConfig;
+
+    /// See [`crate::routes::nodb_test_auth`].
+    fn test_auth() -> crate::middleware::bearer::AuthContext {
+        crate::routes::nodb_test_auth(&["claims:write"])
+    }
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::routing::post;
@@ -2070,6 +2075,7 @@ mod event_tests {
 
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state.clone());
 
         let body = valid_packet_json();
@@ -2104,6 +2110,7 @@ mod event_tests {
 
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state.clone());
 
         // Invalid payload: empty claim content
