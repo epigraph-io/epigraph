@@ -6,6 +6,7 @@ pub mod decompose;
 pub mod enrichment;
 #[cfg(feature = "genai")]
 pub mod matching_client;
+pub mod packet_signing;
 #[cfg(feature = "db")]
 pub mod recompute_betp;
 #[cfg(feature = "db")]

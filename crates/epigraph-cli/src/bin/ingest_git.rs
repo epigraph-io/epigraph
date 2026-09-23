@@ -964,6 +964,13 @@ fn split_body_and_files(combined: &str) -> (String, String) {
 // =============================================================================
 // API SUBMISSION TYPES (mirrors submit.rs)
 // =============================================================================
+//
+// These mirror structs are SIGNED. The server verifies the packet signature over
+// its own re-serialization of these fields, so each mirror must serialize to the
+// same JSON value the server's struct does. `skip_serializing_if` is therefore
+// set where the server sets it and nowhere else. See
+// `epigraph_cli::packet_signing` for the fields where that matters, and
+// `tests::server_verifies` for the test that pins it.
 
 #[derive(Debug, Serialize)]
 struct EpistemicPacket {
@@ -973,17 +980,38 @@ struct EpistemicPacket {
     signature: String,
 }
 
+impl EpistemicPacket {
+    /// Sign the packet as `signer`, over the bytes the server recomputes.
+    ///
+    /// Call this AFTER the last mutation. The signature covers every field,
+    /// including the labels `submit_find_or_create` sets.
+    fn sign(&mut self, signer: &AgentSigner) {
+        self.signature = epigraph_cli::packet_signing::packet_signature(
+            signer,
+            &self.claim,
+            &self.evidence,
+            &self.reasoning_trace,
+        )
+        .expect("packet mirror structs serialize to plain JSON");
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ClaimSubmission {
     content: String,
+    /// Omitted when `None`, as the server's `OptionalTruth` is. The server
+    /// rejects an explicit `null`, and its signable bytes carry no key.
+    #[serde(skip_serializing_if = "Option::is_none")]
     initial_truth: Option<f64>,
     agent_id: Uuid,
     idempotency_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized, `null` when `None`, because the server's struct is
+    /// and the signature covers it.
     pub properties: Option<serde_json::Value>,
     /// Labels set on the claim AT CREATION by the server (creator-owned), so a
     /// multi-principal writer needs no ownership-gated label PATCH / claims:admin.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized, `[]` when empty, because the server's struct is and
+    /// the signature covers it.
     pub labels: Vec<String>,
 }
 
@@ -1415,20 +1443,18 @@ fn build_packet(
         labels: Vec::new(), // set by submit_find_or_create at creation
     };
 
-    // Use placeholder signature — the API server does not yet verify real Ed25519
-    // signatures on submit_packet (it only accepts all-zeros placeholders).
-    // The real signature is computed but stored as evidence signatures instead.
-    let _packet_bytes =
-        serde_json::to_vec(&(&claim_submission, &evidence_items, &trace)).unwrap_or_default();
-    let _real_signature = hex::encode(signer.sign(&_packet_bytes));
-    let packet_signature = "0".repeat(128); // placeholder accepted by server
-
-    EpistemicPacket {
+    // Signed as `agent_id`'s key over the server's canonical signable bytes, so
+    // the packet verifies under EPIGRAPH_REQUIRE_SIGNATURES=true. The legacy
+    // per-commit path POSTs this packet unchanged. `submit_find_or_create`
+    // re-signs after it sets labels.
+    let mut packet = EpistemicPacket {
         claim: claim_submission,
         evidence: evidence_items,
         reasoning_trace: trace,
-        signature: packet_signature,
-    }
+        signature: String::new(),
+    };
+    packet.sign(signer);
+    packet
 }
 
 /// Build packets for all commits, using a shared signer and agent ID
@@ -1461,7 +1487,7 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
         raw_content: Some(evidence_text.clone()),
         signature: Some(hex::encode(signer.sign(evidence_text.as_bytes()))),
     };
-    EpistemicPacket {
+    let mut packet = EpistemicPacket {
         claim: ClaimSubmission {
             content,
             initial_truth: Some(0.95),
@@ -1480,8 +1506,10 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
             explanation: format!("Root node for repository {repo_slug}"),
             signature: None,
         },
-        signature: "0".repeat(128),
-    }
+        signature: String::new(),
+    };
+    packet.sign(signer);
+    packet
 }
 
 /// Metadata describing a single merged pull request, supplied by the CI caller.
@@ -1546,7 +1574,9 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
             explanation: format!("PR #{} merged at {}", meta.number, meta.merged_at),
             signature: None,
         },
-        signature: "0".repeat(128),
+        // Unsigned: the PR claim is authored by the orchestrator agent, whose
+        // private key this ingester does not hold.
+        signature: epigraph_cli::packet_signing::unsigned_packet_signature(),
     }
 }
 
@@ -1560,14 +1590,20 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
 /// creates claims under system/author/orchestrator agents it does not "own", so
 /// a post-hoc relabel would be rejected. Labels are applied only on the create
 /// path server-side; a duplicate submit leaves the existing claim's labels intact.
+///
+/// `signer` must hold the key of `packet.claim.agent_id`. The packet is re-signed
+/// here, after the labels are set, because the signature covers them. `None`
+/// sends the packet unsigned, which only a server with signature enforcement off
+/// accepts.
 #[allow(dead_code)]
 async fn submit_find_or_create(
     client: &reqwest::Client,
     endpoint: &str,
     mut packet: EpistemicPacket,
     labels: &[&str],
+    signer: Option<&AgentSigner>,
 ) -> Result<Uuid, String> {
-    packet.claim.labels = labels.iter().map(|s| s.to_string()).collect();
+    label_and_sign(&mut packet, labels, signer);
     let url = format!("{endpoint}/api/v1/submit/packet");
     let resp = client
         .post(&url)
@@ -1590,6 +1626,17 @@ async fn submit_find_or_create(
     Ok(parsed.claim_id)
 }
 
+/// Bake `labels` into the packet's claim, then sign it as `signer`. Signing comes
+/// second because the signature covers the labels. With `signer = None` the packet
+/// carries the explicit unsigned marker instead of a signature over stale bytes.
+fn label_and_sign(packet: &mut EpistemicPacket, labels: &[&str], signer: Option<&AgentSigner>) {
+    packet.claim.labels = labels.iter().map(|s| s.to_string()).collect();
+    match signer {
+        Some(signer) => packet.sign(signer),
+        None => packet.signature = epigraph_cli::packet_signing::unsigned_packet_signature(),
+    }
+}
+
 /// Find-or-create the repository's root node and return its claim id, labelled
 /// `source:git-history` / `node:repo` / `repo:<slug>`.
 #[allow(dead_code)]
@@ -1607,6 +1654,7 @@ async fn ensure_repo_node(
         endpoint,
         packet,
         &["source:git-history", "node:repo", &label],
+        Some(signer),
     )
     .await
 }
@@ -2180,6 +2228,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         &args.endpoint,
         pr_packet,
         &["source:git-history", "node:pr", &pr_label],
+        None,
     )
     .await?;
     // repo --decomposes_to--> PR, stamped at merge time.
@@ -2211,6 +2260,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
             &args.endpoint,
             packet,
             &["source:git-history", "node:commit", &commit_label],
+            Some(&signer),
         )
         .await?;
         // PR --decomposes_to--> commit, stamped at commit time.
@@ -2883,6 +2933,138 @@ mod tests {
     use super::*;
 
     // -------------------------------------------------------------------------
+    // Packet-signature tests: does the SERVER verify what we sign?
+    // -------------------------------------------------------------------------
+
+    /// Would `submit_packet` accept this packet's signature from `signer`'s agent
+    /// under EPIGRAPH_REQUIRE_SIGNATURES=true?
+    ///
+    /// This follows the real path. The packet is encoded as reqwest's `.json()`
+    /// encodes it, decoded into the server's own `EpistemicPacket` as axum's
+    /// `Json` decodes it, and checked with the server's `signable_bytes()` and
+    /// `SignatureVerifier`. A mirror field that serializes differently from the
+    /// server's struct fails here.
+    fn server_verifies(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
+        let wire = serde_json::to_vec(packet).expect("packet encodes");
+        let server: epigraph_api::routes::submit::EpistemicPacket =
+            serde_json::from_slice(&wire).expect("server decodes the wire packet");
+        let mut sig = [0u8; 64];
+        if hex::decode_to_slice(&server.signature, &mut sig).is_err() {
+            return false;
+        }
+        epigraph_crypto::SignatureVerifier::verify(
+            &signer.public_key(),
+            &server.signable_bytes().expect("server canonicalizes"),
+            &sig,
+        )
+        .expect("well-formed public key")
+    }
+
+    fn fully_annotated_commit() -> ParsedCommit {
+        ParsedCommit {
+            hash: "5a1b2c3d4e5f60718293a4b5c6d7e8f901234567".to_string(),
+            author_name: "Alice".to_string(),
+            author_email: "alice@example.com".to_string(),
+            date: "2026-02-10T12:00:00+00:00".to_string(),
+            commit_type: CommitType::Security,
+            scope: "crypto".to_string(),
+            claim_text: "use constant-time comparison".to_string(),
+            evidence: vec!["Audit flagged == on signature bytes".to_string()],
+            reasoning: vec!["Short-circuit comparison leaks timing".to_string()],
+            verification: vec!["cargo test passes".to_string()],
+            parent_hashes: vec!["parent123".to_string()],
+            files_changed: vec!["src/verify.rs".to_string(), "src/lib.rs".to_string()],
+        }
+    }
+
+    #[test]
+    fn commit_packet_signature_verifies_against_server_signable_bytes() {
+        // The legacy per-commit path POSTs build_packet's output unchanged.
+        let signer = author_signer("Alice", "alice@example.com");
+        let packet = build_packet(&fully_annotated_commit(), &signer, Uuid::new_v4(), None);
+        assert!(
+            server_verifies(&packet, &signer),
+            "the packet signature must verify over the server's canonical bytes"
+        );
+        assert!(
+            !server_verifies(&packet, &AgentSigner::generate()),
+            "and only for the key of the agent it claims to be"
+        );
+    }
+
+    #[test]
+    fn labels_are_covered_so_the_packet_is_signed_after_they_are_set() {
+        let signer = author_signer("Alice", "alice@example.com");
+        let mut packet = build_packet(&fully_annotated_commit(), &signer, Uuid::new_v4(), None);
+
+        // Mutating the claim after signing breaks verification: labels are signed.
+        packet.claim.labels = vec!["node:commit".into()];
+        assert!(
+            !server_verifies(&packet, &signer),
+            "a signature made before the labels were set must not verify"
+        );
+
+        // The submit path sets labels THEN signs.
+        label_and_sign(
+            &mut packet,
+            &["source:git-history", "node:commit", "repo:o/r"],
+            Some(&signer),
+        );
+        assert_eq!(
+            packet.claim.labels,
+            vec!["source:git-history", "node:commit", "repo:o/r"]
+        );
+        assert!(server_verifies(&packet, &signer));
+
+        // No signer: the explicit unsigned marker, never a stale signature.
+        label_and_sign(&mut packet, &["node:commit"], None);
+        assert_eq!(
+            packet.signature,
+            epigraph_cli::packet_signing::unsigned_packet_signature()
+        );
+        assert!(!server_verifies(&packet, &signer));
+    }
+
+    #[test]
+    fn repo_packet_signature_verifies_after_labelling() {
+        let signer = repo_root_signer();
+        let mut packet = build_repo_packet("epigraph-io/epigraph", Uuid::new_v4(), &signer);
+        assert!(server_verifies(&packet, &signer), "as built");
+        label_and_sign(
+            &mut packet,
+            &[
+                "source:git-history",
+                "node:repo",
+                "repo:epigraph-io/epigraph",
+            ],
+            Some(&signer),
+        );
+        assert!(server_verifies(&packet, &signer), "as submitted");
+    }
+
+    /// Pins the `ClaimSubmission` fields whose default serialization differs from
+    /// the server's struct. `properties: None` must go out as `null`, empty
+    /// `labels` as `[]`, `idempotency_key: None` as `null`, and
+    /// `initial_truth: None` must be omitted. The server rejects an explicit
+    /// `null` for `initial_truth`, so this also checks the packet still decodes.
+    #[test]
+    fn absent_properties_labels_and_initial_truth_still_verify() {
+        let signer = AgentSigner::generate();
+        let mut packet = build_packet(&fully_annotated_commit(), &signer, Uuid::new_v4(), None);
+        packet.claim.properties = None;
+        packet.claim.initial_truth = None;
+        packet.claim.idempotency_key = None;
+        packet.claim.labels = Vec::new();
+        packet.sign(&signer);
+
+        let wire = serde_json::to_value(&packet).unwrap();
+        assert_eq!(wire["claim"]["properties"], serde_json::Value::Null);
+        assert_eq!(wire["claim"]["labels"], serde_json::json!([]));
+        assert!(wire["claim"].get("initial_truth").is_none());
+        assert!(server_verifies(&packet, &signer));
+    }
+
+    // -------------------------------------------------------------------------
     // Deterministic per-author agent identity tests
     // -------------------------------------------------------------------------
 
@@ -3315,9 +3497,10 @@ fix(db): prevent SQL injection in claim search
         // Confidence: full metadata = 0.85
         assert!((packet.reasoning_trace.confidence - 0.85).abs() < f64::EPSILON);
 
-        // Signature should be present
+        // Signature should be present, and be a real one the server verifies
         assert!(!packet.signature.is_empty());
         assert_eq!(hex::decode(&packet.signature).unwrap().len(), 64);
+        assert!(server_verifies(&packet, &signer));
     }
 
     #[test]
@@ -4262,6 +4445,13 @@ crates/epigraph-core/src/domain/mod.rs",
                 sig_bytes.len(),
                 64,
                 "Packet signature for {} should be 64 bytes",
+                commit.hash
+            );
+            // ...and it must VERIFY: a 64-byte placeholder (e.g. all zeros)
+            // passes the shape checks above and is rejected by the server.
+            assert!(
+                server_verifies(&packet, &signer),
+                "Packet signature for {} must verify over the server's signable bytes",
                 commit.hash
             );
 
