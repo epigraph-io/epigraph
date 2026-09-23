@@ -89,6 +89,31 @@
 //! read, and the only rows that can appear as a result are claims rows that
 //! the `{VISIBILITY:c}` predicate on the final projection already admits.
 //!
+//! # Retracted edges — every `edges` alias is also IN FORCE
+//!
+//! Edge removal is a retraction (`EdgeRepository::retract_by_id` and its
+//! siblings set `valid_to`; the row survives for audit), so an `edges` read
+//! that does not filter on `valid_to` renders a deleted edge as live. Every
+//! alias in this module therefore carries the static spelling of
+//! [`EDGE_IN_FORCE`](crate::repos::edge::EDGE_IN_FORCE) —
+//! `AND (<alias>.valid_to IS NULL OR <alias>.valid_to > now())` — immediately
+//! before its `{EDGE_VISIBILITY:..}` marker, in the same clause and for the
+//! same placement reasons (`ON` for a `LEFT JOIN`, `WHERE` otherwise, inside
+//! every `NOT EXISTS`). The rule mirrors the tenancy one: these endpoints
+//! render the graph restricted to the edges the viewer may read AND that are
+//! in force now.
+//!
+//! That includes the `decomposes_to` classification probes. A retracted
+//! decomposition (a `mark_duplicate` collapse, or a mistaken split removed
+//! with `DELETE /api/v1/edges/:id`) stops making its source a compound here,
+//! so the compound and atomic views of one neighborhood keep agreeing. The
+//! global exclusion probes outside this module
+//! (`ClaimRepository::list_undecomposed`, `latest_in_lineage`) are structural
+//! reads and are not changed. `tests/edge_in_force_lint.rs` is the ratchet: it
+//! fails if an `edges` read in this file lacks the predicate for its alias, or
+//! if the spelling drifts from `EDGE_IN_FORCE`. The tiering is written down in
+//! `docs/architecture/edge-retraction-tiers.md`.
+//!
 //! [`subgraph_edges`]: GraphViewRepository::subgraph_edges
 //! [`expand_cluster_nodes`]: GraphViewRepository::expand_cluster_nodes
 //! [`neighborhood_compound_nodes`]: GraphViewRepository::neighborhood_compound_nodes
@@ -282,7 +307,7 @@ impl GraphViewRepository {
                 FROM claim_cluster_membership m
                 LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
                                   AND e.relationship = ANY($3)
-                                  /* {EDGE_VISIBILITY:e} */
+                                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
                 WHERE m.cluster_id = $1 AND m.run_id = $2 /* {VISIBILITY:m} */
                 GROUP BY m.claim_id
             )
@@ -348,7 +373,7 @@ impl GraphViewRepository {
                     ($2::text[] IS NULL OR e.relationship = ANY($2::text[])) AS is_allowed \
              FROM edges e \
              WHERE e.source_id = ANY($1) AND e.target_id = ANY($1) \
-               /* {EDGE_VISIBILITY:e} */",
+               AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */",
             3,
         );
         let mut q = sqlx::query_as::<_, ClusterSubgraphEdgeRow>(&sql)
@@ -398,7 +423,8 @@ impl GraphViewRepository {
                 SELECT e.source_id AS compound_id, e.target_id AS atom_id
                 FROM edges e
                 JOIN atoms a ON a.claim_id = e.target_id
-                WHERE e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */
+                WHERE e.relationship = 'decomposes_to'
+                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             ),
             compound_nodes AS (
                 SELECT cta.compound_id AS id, COUNT(*)::int AS atom_count
@@ -409,9 +435,11 @@ impl GraphViewRepository {
                 SELECT a.claim_id AS id
                 FROM atoms a
                 WHERE NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = a.claim_id
-                                    AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
+                                    AND e.relationship = 'decomposes_to'
+                                    AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */)
                   AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = a.claim_id
-                                    AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
+                                    AND e.relationship = 'decomposes_to'
+                                    AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */)
             )
             SELECT c.id, COALESCE(c.content, c.id::text) AS label, 'compound'::text AS kind,
                    cn.atom_count, c.pignistic_prob,
@@ -453,7 +481,7 @@ impl GraphViewRepository {
                    COALESCE(c.content, c.id::text) AS label,
                    (SELECT e.source_id FROM edges e
                     WHERE e.target_id = c.id AND e.relationship = 'decomposes_to'
-                      /* {EDGE_VISIBILITY:e} */
+                      AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
                     LIMIT 1) AS compound_id,
                    c.pignistic_prob,
                    (SELECT cf.frame_id FROM claim_frames cf WHERE cf.claim_id = c.id LIMIT 1) AS frame_id
@@ -501,7 +529,7 @@ impl GraphViewRepository {
             JOIN claims c ON c.id = e.source_id
             JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id AND m.neighborhood_id = $1
             WHERE e.relationship = 'decomposes_to' /* {VISIBILITY:c} */ /* {VISIBILITY:m} */
-              /* {EDGE_VISIBILITY:e} */
+              AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             GROUP BY 1, 2
             "#,
             2,
@@ -583,12 +611,13 @@ impl GraphViewRepository {
                 SELECT e.target_id AS atom_id
                 FROM edges e, seed
                 WHERE e.source_id = seed.center AND e.relationship = 'decomposes_to'
-                  /* {EDGE_VISIBILITY:e} */
+                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
                 UNION
                 SELECT seed.center FROM seed
                 WHERE NOT EXISTS (
                     SELECT 1 FROM edges ce WHERE ce.source_id = (SELECT center FROM seed)
-                    AND ce.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:ce} */
+                    AND ce.relationship = 'decomposes_to'
+                    AND (ce.valid_to IS NULL OR ce.valid_to > now()) /* {EDGE_VISIBILITY:ce} */
                 )
             ),
             epistemic_edges AS (
@@ -600,7 +629,8 @@ impl GraphViewRepository {
                 JOIN edge_to_factor_type(e.relationship) ft ON ft.forward_strength > 0
                 JOIN center_atoms ca
                     ON ca.atom_id = e.source_id OR ca.atom_id = e.target_id
-                WHERE e.source_id != e.target_id /* {EDGE_VISIBILITY:e} */
+                WHERE e.source_id != e.target_id
+                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             ),
             projected AS (
                 SELECT
@@ -611,7 +641,7 @@ impl GraphViewRepository {
                 LEFT JOIN edges d
                     ON d.target_id = ee.other_atom_id
                     AND d.relationship = 'decomposes_to'
-                    /* {EDGE_VISIBILITY:d} */
+                    AND (d.valid_to IS NULL OR d.valid_to > now()) /* {EDGE_VISIBILITY:d} */
             )
             SELECT
                 c.id,
@@ -667,7 +697,8 @@ impl GraphViewRepository {
             atom_to_compound AS (
                 SELECT e.target_id AS atom_id, e.source_id AS compound_id
                 FROM edges e JOIN atoms a ON a.claim_id = e.target_id
-                WHERE e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */
+                WHERE e.relationship = 'decomposes_to'
+                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             )
             SELECT a2c_s.compound_id AS source,
                    a2c_t.compound_id AS target,
@@ -683,7 +714,7 @@ impl GraphViewRepository {
             WHERE a2c_s.compound_id <> a2c_t.compound_id
               AND e.relationship <> 'decomposes_to'
               AND ft.forward_strength > 0
-              /* {EDGE_VISIBILITY:e} */
+              AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             GROUP BY 1, 2, 3
             "#,
             2,
@@ -722,16 +753,19 @@ impl GraphViewRepository {
                 FROM edges e
                 JOIN claim_neighborhood_membership m ON m.claim_id = e.target_id
                 WHERE m.neighborhood_id = $1 AND e.relationship = 'decomposes_to'
-                  /* {VISIBILITY:m} */ /* {EDGE_VISIBILITY:e} */
+                  /* {VISIBILITY:m} */
+                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             ),
             neighborhood_standalones AS (
                 SELECT m.claim_id AS id
                 FROM claim_neighborhood_membership m
                 WHERE m.neighborhood_id = $1
                   AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = m.claim_id
-                                    AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
+                                    AND e.relationship = 'decomposes_to'
+                                    AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */)
                   AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = m.claim_id
-                                    AND e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */)
+                                    AND e.relationship = 'decomposes_to'
+                                    AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */)
                   /* {VISIBILITY:m} */
             ),
             compound_universe AS (
@@ -743,7 +777,7 @@ impl GraphViewRepository {
             JOIN compound_universe b ON b.id = e.target_id
             -- No relationship filter: if both endpoints are displayed, the edge
             -- is displayed. Users hide unwanted types via GraphControls toggles.
-            WHERE true /* {EDGE_VISIBILITY:e} */
+            WHERE true AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             "#,
             2,
         );
@@ -786,7 +820,8 @@ impl GraphViewRepository {
                 SELECT e.source_id AS parent_id, e.target_id AS atom_id
                 FROM edges e
                 JOIN nbhd_atoms a ON a.claim_id = e.target_id
-                WHERE e.relationship = 'decomposes_to' /* {EDGE_VISIBILITY:e} */
+                WHERE e.relationship = 'decomposes_to'
+                  AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             ),
             nbhd_compounds AS (
                 SELECT DISTINCT parent_id AS id FROM parent_of_atom
@@ -813,10 +848,10 @@ impl GraphViewRepository {
                 FROM nbhd_compounds c1
                 JOIN nbhd_compounds c2 ON c1.id < c2.id
                 JOIN edges pa1 ON pa1.target_id = c1.id AND pa1.relationship = 'decomposes_to'
-                              /* {EDGE_VISIBILITY:pa1} */
+                              AND (pa1.valid_to IS NULL OR pa1.valid_to > now()) /* {EDGE_VISIBILITY:pa1} */
                 JOIN edges pa2 ON pa2.target_id = c2.id AND pa2.relationship = 'decomposes_to'
                               AND pa1.source_id = pa2.source_id
-                              /* {EDGE_VISIBILITY:pa2} */
+                              AND (pa2.valid_to IS NULL OR pa2.valid_to > now()) /* {EDGE_VISIBILITY:pa2} */
                 GROUP BY 1, 2, 3
             )
             SELECT * FROM shared_atom_pairs
@@ -859,7 +894,7 @@ impl GraphViewRepository {
             LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
             WHERE e.relationship <> 'decomposes_to'
               AND ft.forward_strength > 0
-              /* {EDGE_VISIBILITY:e} */
+              AND (e.valid_to IS NULL OR e.valid_to > now()) /* {EDGE_VISIBILITY:e} */
             "#,
             2,
         );
@@ -895,10 +930,10 @@ impl GraphViewRepository {
             "SELECT \
                EXISTS (SELECT 1 FROM edges ce \
                        WHERE ce.source_id = $1 AND ce.relationship = 'decomposes_to' \
-                         /* {EDGE_VISIBILITY:ce} */) AS has_children, \
+                         AND (ce.valid_to IS NULL OR ce.valid_to > now()) /* {EDGE_VISIBILITY:ce} */) AS has_children, \
                EXISTS (SELECT 1 FROM edges pe \
                        WHERE pe.target_id = $1 AND pe.relationship = 'decomposes_to' \
-                         /* {EDGE_VISIBILITY:pe} */) AS has_parent",
+                         AND (pe.valid_to IS NULL OR pe.valid_to > now()) /* {EDGE_VISIBILITY:pe} */) AS has_parent",
             2,
         );
         let mut q = sqlx::query_as::<_, (bool, bool)>(&sql).bind(claim_id);
@@ -1009,7 +1044,7 @@ impl GraphViewRepository {
                     relationship, properties \
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1) \
-               /* {EDGE_VISIBILITY:edges} */",
+               AND (valid_to IS NULL OR valid_to > now()) /* {EDGE_VISIBILITY:edges} */",
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphEdgeRow>(&sql).bind(node_ids);
