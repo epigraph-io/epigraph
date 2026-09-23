@@ -140,12 +140,33 @@ fn evidence_from_row(
 }
 
 impl EvidenceRepository {
-    /// Create new evidence in the database
+    /// Create new evidence in the database.
+    ///
+    /// # Why the executor is generic
+    ///
+    /// Same reason as
+    /// [`ReasoningTraceRepository::create`](crate::ReasoningTraceRepository::create),
+    /// and see that doc for the full argument: an `evidence` INSERT belongs in
+    /// the SAME transaction as the claim it derives from, and a `&PgPool`
+    /// parameter made that impossible to express. `&PgPool` and
+    /// `&mut PgConnection` both satisfy [`sqlx::PgExecutor`], so existing
+    /// pool-taking callers are unaffected.
+    ///
+    /// `evidence` differs from `reasoning_traces` in one respect worth naming so
+    /// nobody concludes this change was unnecessary: a deployment may carry an
+    /// orphan PERMISSIVE `evidence_privacy` policy (present in no migration of
+    /// the 077 series) whose unconditional `USING` is reused as its `WITH CHECK`,
+    /// which is the only reason an UNSTAMPED evidence INSERT succeeds there. That
+    /// is an accident of a deployment, not a property of the schema, and it is
+    /// what made the 42501 look like a `reasoning_traces`-only defect.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, evidence))]
-    pub async fn create(pool: &PgPool, evidence: &Evidence) -> Result<Evidence, DbError> {
+    #[instrument(skip(executor, evidence))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        evidence: &Evidence,
+    ) -> Result<Evidence, DbError> {
         let id: Uuid = evidence.id.into();
         let agent_id: Uuid = evidence.agent_id.into();
         let claim_id: Uuid = evidence.claim_id.into();
@@ -182,7 +203,7 @@ impl EvidenceRepository {
             evidence_type_json,
             created_at
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         // Parse content_hash

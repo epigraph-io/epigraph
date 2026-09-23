@@ -81,16 +81,34 @@ impl ReasoningTraceRepository {
     /// Note: This stores the trace metadata but does NOT store the inputs
     /// in trace_parents. Use `add_parent` to link traces together.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `reasoning_traces` is one of the tables migration 077 gives a STRICT
+    /// `WITH CHECK` (`owner_group_id = ANY(epigraph_writable_groups())`) and 079
+    /// FORCEs. An unstamped application connection has an empty writable set, so
+    /// the INSERT is refused with `42501` — pinned by
+    /// `epigraph-db/tests/rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`.
+    /// The only connection that CAN write it is one stamped by
+    /// `ScopedPool::begin_as`, and that hands back a transaction, not a pool. A
+    /// `&PgPool` parameter therefore made this function unreachable from the one
+    /// connection shape that works, which is why the executor is generic rather
+    /// than a pool: `&PgPool` and `&mut PgConnection` both satisfy
+    /// [`sqlx::PgExecutor`], so every existing pool-taking caller compiles
+    /// unchanged while a transaction can now join.
+    ///
+    /// Mirrors the read side of this repository, which has been
+    /// `<'e, E: PgExecutor<'e>>` since PR-09.
+    ///
     /// # Arguments
-    /// * `pool` - The database connection pool
+    /// * `executor` - A pool, connection, or transaction handle
     /// * `trace` - The reasoning trace to create
     /// * `claim_id` - The ID of the claim this trace is associated with
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, trace))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, trace))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         trace: &ReasoningTrace,
         claim_id: ClaimId,
     ) -> Result<ReasoningTrace, DbError> {
@@ -123,7 +141,7 @@ impl ReasoningTraceRepository {
             properties_json,
             created_at
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         let methodology = Self::db_string_to_methodology(&row.reasoning_type)?;
