@@ -247,3 +247,110 @@ async fn unrelated_relationships_are_not_traversed(pool: PgPool) {
         "only the root; a contradicts edge is dispute, not derivation"
     );
 }
+
+/// **The dangling-edge rule.** An edge whose far endpoint did not survive the
+/// CLAIM filter must not appear in `edges`, even though it survived the EDGE
+/// filter and extended the walk.
+///
+/// # Why this is a distinct behaviour and not a restatement of "invisible nodes are dropped"
+///
+/// `chain_conn` filters in two places over two different tables. The recursive
+/// term filters `edges`, and `kept_ids` is derived from that walk; the
+/// hydration query filters `claims`, and `nodes` is derived from that. The
+/// edge set used to be retained against `kept_ids` — the walk — so the two sets
+/// could disagree, and when they did the edge was returned carrying the uuid of
+/// a claim the viewer may not read, plus the relationship it stands in. That is
+/// a disclosure with no content attached: it says the claim exists, that it is
+/// an ancestor of this one, and by what relation. `topo_sort` already skipped
+/// such an edge for ORDERING (its `by_id.contains_key` guard), so the returned
+/// `edges` field was the only path by which the id escaped.
+///
+/// # The fixture forces the edge PUBLIC, and that is the whole test
+///
+/// Migration 070's trigger derives an edge's tenancy from its ENDPOINTS, so an
+/// edge left to the trigger tracks the private claim it points at, the walk
+/// drops it first, and the two filters never disagree. An arm built that way is
+/// satisfied by the edge predicate alone and stays green with the `retain`
+/// deleted. `seed_edge_owned_by(.., "public", world)` is what makes the walk
+/// keep the edge and the claim filter the only thing that can withhold the
+/// node — which is precisely the divergence this rule exists for.
+///
+/// This is a repo-level arm on purpose: the defect is reachable through MCP
+/// `get_provenance_chain` independently of any HTTP route, so the regression
+/// belongs beside the repo rather than only beside the handler.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_naming_an_invisible_claim_is_dropped_from_the_returned_edges(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "pc-dangling-owner").await;
+    let (stranger, _stranger_group) =
+        fixture::seed_agent_with_group(&pool, "pc-dangling-stranger").await;
+
+    let root = fixture::seed_public_claim(&pool, owner, "pc dangling: the public conclusion").await;
+    let secret = fixture::seed_group_claim(
+        &pool,
+        owner,
+        owner_group,
+        "pc dangling: the private premise",
+    )
+    .await;
+
+    let world = fixture::world_group(&pool).await;
+    fixture::seed_edge_owned_by(&pool, secret, root, "public", world).await;
+
+    // ── the stranger ──
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve the stranger");
+    let chain = ProvenanceChainRepository::chain(&pool, &viewer, root, 4, None)
+        .await
+        .expect("chain");
+
+    let ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
+    assert_eq!(
+        ids,
+        vec![root],
+        "the private premise must be absent from `nodes`; got {ids:?}"
+    );
+    assert!(
+        chain.edges.is_empty(),
+        "an edge naming a claim the viewer cannot read must be DROPPED, not returned \
+         with that claim's uuid — the edge itself survived the EDGE predicate here \
+         (it is public), so only retaining against the hydrated node set can remove \
+         it; got {:?}",
+        chain.edges
+    );
+    for e in &chain.edges {
+        assert!(
+            ids.contains(&e.source) && ids.contains(&e.target),
+            "every returned edge's endpoints must appear in `nodes`; {e:?} does not"
+        );
+    }
+
+    // ── CALIBRATION: the owner, who can see both ──
+    //
+    // Without this the assertions above are satisfied by a walk that returns
+    // nothing to anybody, and the arm would report a false pass for a repo that
+    // had simply stopped working.
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve the owner");
+    let chain = ProvenanceChainRepository::chain(&pool, &owner_viewer, root, 4, None)
+        .await
+        .expect("chain");
+
+    let mut ids: Vec<Uuid> = chain.nodes.iter().map(|n| n.id).collect();
+    ids.sort();
+    let mut expected = vec![root, secret];
+    expected.sort();
+    assert_eq!(
+        ids, expected,
+        "CALIBRATION: the owner of the private premise must see both nodes"
+    );
+    assert_eq!(
+        chain.edges.len(),
+        1,
+        "CALIBRATION: and the derivation edge between them; got {:?}",
+        chain.edges
+    );
+    assert_eq!(chain.edges[0].source, secret);
+    assert_eq!(chain.edges[0].target, root);
+}
