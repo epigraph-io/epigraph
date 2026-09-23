@@ -583,7 +583,7 @@ pub async fn do_ingest_document(
 
         let (persisted_id, resolved_to_existing) = persist_planned_claim(
             pool,
-            &claim,
+            viewer,
             planned,
             agent_id,
             TruthValue::clamped(raw_truth),
@@ -592,6 +592,8 @@ pub async fn do_ingest_document(
         .await?;
         // Idempotent add: also runs on the dedup branch below, so an atom
         // shared across papers (convergence) picks up every paper's label.
+        // `persist_planned_claim` resolves an atom only onto a row `viewer`
+        // can read, so this never labels another tenant's private claim.
         ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])
             .await
             .map_err(internal_error)?;
@@ -1001,25 +1003,17 @@ fn find_arxiv_id(s: &str) -> Option<String> {
 /// Two classes, per `epigraph_ingest::common::ids`:
 ///
 /// * **document-scoped (COMPOUND, levels 0–2)** — thesis / section / paragraph.
-///   `id = uuid_v5(COMPOUND_NAMESPACE, hash(text) ++ "{title}\u{1f}{path}")`, so
-///   two papers with a section titled "Introduction" get two different ids *by
-///   design*. Written with [`ClaimRepository::create_with_id_if_absent`], which
-///   binds the caller's id and hash and resolves on `ON CONFLICT (id)`. This is
-///   the same primitive `workflow_ingest` and `epigraph-ingest-executor`
-///   already use; the document path was the sole holdout.
+///   See [`persist_document_node`].
+/// * **content-addressed (ATOM, level 3)** — see [`persist_atom`].
 ///
-///   The legacy [`ClaimRepository::create`] instead re-resolves
-///   `SELECT id FROM claims WHERE content_hash = $1`, discarding the planner's
-///   id — that is what fused 70 papers onto one `Abstract` node and, through
-///   `id_map`, remapped every planned structural edge onto it.
-///
-/// * **content-addressed (ATOM, level 3)** — `id = uuid_v5(ATOM_NAMESPACE,
-///   hash(text))`. Convergence across papers IS the feature (it is how
-///   cross-source corroboration finds agreement), so these stay on the
-///   content-hash path unchanged.
+/// Neither class goes through a content-hash-only dedup any more. The legacy
+/// `ClaimRepository::create` did: it re-resolved
+/// `SELECT id FROM claims WHERE content_hash = $1`, discarding the planner's id
+/// — which fused 70 papers onto one `Abstract` node — and returning whichever
+/// row matched, in whatever tenant. It has been deleted.
 async fn persist_planned_claim(
     pool: &sqlx::PgPool,
-    claim: &Claim,
+    viewer: &epigraph_db::visibility::Viewer,
     planned: &PlannedClaim,
     agent_id: Uuid,
     truth: TruthValue,
@@ -1034,39 +1028,166 @@ async fn persist_planned_claim(
     decl: epigraph_core::TenancyDecl,
 ) -> Result<(Uuid, bool), McpError> {
     if planned.id_is_document_scoped() {
-        let was_new = ClaimRepository::create_with_id_if_absent(
-            pool,
-            planned.id,
-            &planned.content,
-            &planned.content_hash,
+        persist_document_node(pool, planned, agent_id, truth, decl).await
+    } else {
+        persist_atom(pool, viewer, planned, agent_id, truth, decl).await
+    }
+}
+
+/// A **document-scoped (COMPOUND, levels 0–2)** node — thesis / section /
+/// paragraph.
+///
+/// `id = uuid_v5(COMPOUND_NAMESPACE, hash(text) ++ "{title}\u{1f}{path}")`, so
+/// two papers with a section titled "Introduction" get two different ids *by
+/// design*. Written with [`ClaimRepository::create_with_id_if_absent`], which
+/// binds the caller's id and hash and resolves on `ON CONFLICT (id)`. This is
+/// the same primitive `workflow_ingest` and `epigraph-ingest-executor` already
+/// use.
+///
+/// NOT closed here, and stated so nobody reads it as closed: the seed is the
+/// document's title and path, so two TENANTS ingesting the same document derive
+/// the same id, and `ON CONFLICT (id)` reuses the first tenant's node without a
+/// visibility check — the gap [`persist_atom`] closes for atoms. It is shared
+/// with every `create_with_id_if_absent` caller (the workflow writers
+/// included) and belongs to a change that gives all of them one answer.
+async fn persist_document_node(
+    pool: &sqlx::PgPool,
+    planned: &PlannedClaim,
+    agent_id: Uuid,
+    truth: TruthValue,
+    decl: epigraph_core::TenancyDecl,
+) -> Result<(Uuid, bool), McpError> {
+    let was_new = ClaimRepository::create_with_id_if_absent(
+        pool,
+        planned.id,
+        &planned.content,
+        &planned.content_hash,
+        agent_id,
+        truth,
+        &[],
+        decl,
+    )
+    .await
+    .map_err(internal_error)?;
+    // Idempotency is by id rather than by content hash: re-ingesting the SAME
+    // document re-derives the same seed → the same id → conflict →
+    // `was_new == false`. Narrow window: a run that dies between this insert
+    // and the trace write below leaves the node without trace/evidence, and
+    // the retry takes the reuse branch. The old `already_had_trace` probe
+    // covered that; closing it again would cost a SELECT per claim.
+    Ok((planned.id, !was_new))
+}
+
+/// A **content-addressed (ATOM, level 3)** claim: `id = uuid_v5(ATOM_NAMESPACE,
+/// hash(text))`, a GLOBAL id. Convergence across papers IS the feature (it is
+/// how cross-source corroboration finds agreement), so a second paper
+/// asserting the same sentence resolves to the same row — but only a row the
+/// ingesting `viewer` can read.
+///
+/// Three steps, in order:
+///
+/// 1. **The author's own row**, on the noun-claim key `(content_hash,
+///    agent_id)`, read through `viewer`. This is the dedup a re-ingest, or a
+///    sentence the same agent already submitted through `submit_claim`, must
+///    hit — and it answers identically whether or not the deployment carries
+///    `uq_claims_content_hash_agent` (migrations/README.md records it missing
+///    on the long-lived database).
+/// 2. **Insert under the planner's id** with
+///    [`ClaimRepository::create_with_id_if_absent`]. A `DuplicateKey` here is
+///    the post-013 race with step 1 (the same agent wrote this text under
+///    another id in between), resolved by re-running step 1.
+/// 3. **On an id conflict, re-read the row through `viewer`.** `ON CONFLICT
+///    (id) DO NOTHING` answers "not inserted" for a row in ANY tenant, without
+///    an error, so without this read the caller would go on to label the row,
+///    `asserts`-link it and report its id — a cross-tenant write plus an
+///    existence oracle. A visible row converges; an invisible one FAILS THE
+///    INGEST CLOSED.
+///
+/// What changed from the legacy content-hash-only `create`, stated because it
+/// moves corroboration: an atom no longer merges into ANOTHER agent's claim
+/// that merely has the same text under a different id (a `submit_claim` row,
+/// say). It gets its own row at the atom id; only atom-id convergence and the
+/// author's own `(content_hash, agent_id)` row are reused.
+///
+/// The fail-closed refusal is deliberately not a fallback id. Tenant-scoping
+/// the atom seed is not local to this file: `workflow_ingest` /
+/// `epigraph-ingest-executor` write atoms under the same global
+/// `ATOM_NAMESPACE`, `epigraph_ingest`'s invariant guard and
+/// `spine_node_identity_test.rs` pin that id, and every existing atom id would
+/// move. That is a spec decision, not a patch.
+async fn persist_atom(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    planned: &PlannedClaim,
+    agent_id: Uuid,
+    truth: TruthValue,
+    decl: epigraph_core::TenancyDecl,
+) -> Result<(Uuid, bool), McpError> {
+    // Step 1. `trace_id.is_some()` is genuine convergence (the earlier ingest
+    // already wrote the provenance we must not overwrite); a different id is
+    // the author's own non-atom row with the same text, which likewise keeps
+    // its provenance.
+    let own_row = || async {
+        let mut conn = pool.acquire().await.map_err(internal_error)?;
+        ClaimRepository::find_by_content_hash_and_agent(
+            &mut conn,
+            viewer,
+            planned.content_hash.as_slice(),
             agent_id,
-            truth,
-            &[],
-            decl,
         )
         .await
-        .map_err(internal_error)?;
-        // Idempotency is now by id rather than by content hash: re-ingesting
-        // the SAME document re-derives the same seed → the same id → conflict →
-        // `was_new == false`. Narrow window: a run that dies between this insert
-        // and the trace write below leaves the node without trace/evidence, and
-        // the retry takes the reuse branch. The old `already_had_trace` probe
-        // covered that; closing it again would cost a SELECT per claim.
-        return Ok((planned.id, !was_new));
+        .map_err(internal_error)
+    };
+    if let Some(own) = own_row().await? {
+        let id: Uuid = own.id.into();
+        return Ok((id, id != planned.id || own.trace_id.is_some()));
     }
 
-    // Atom: `create` dedupes on content_hash and returns the existing row.
-    // `persisted_id != planned.id` catches a hash collision against some other
-    // claim; `trace_id.is_some()` catches genuine atom convergence, where the
-    // earlier ingestion already wrote the provenance we must not overwrite.
-    let persisted = ClaimRepository::create(pool, claim, decl)
+    // Step 2.
+    match ClaimRepository::create_with_id_if_absent(
+        pool,
+        planned.id,
+        &planned.content,
+        &planned.content_hash,
+        agent_id,
+        truth,
+        &[],
+        decl,
+    )
+    .await
+    {
+        Ok(true) => return Ok((planned.id, false)),
+        Ok(false) => {}
+        Err(epigraph_db::DbError::DuplicateKey { .. }) => {
+            let own = own_row().await?.ok_or_else(|| {
+                internal_error(
+                    "atom insert hit (content_hash, agent_id) but the author's row is not \
+                     readable on re-find",
+                )
+            })?;
+            let id: Uuid = own.id.into();
+            return Ok((id, id != planned.id || own.trace_id.is_some()));
+        }
+        Err(e) => return Err(internal_error(e)),
+    }
+
+    // Step 3. The atom id is taken. Converge only onto a row this viewer reads.
+    match ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(planned.id))
         .await
-        .map_err(internal_error)?;
-    let persisted_id: Uuid = persisted.id.into();
-    Ok((
-        persisted_id,
-        persisted_id != planned.id || persisted.trace_id.is_some(),
-    ))
+        .map_err(internal_error)?
+    {
+        Some(existing) => Ok((planned.id, existing.trace_id.is_some())),
+        None => Err(McpError::invalid_request(
+            format!(
+                "ingest refused: atom {} (level 3) is content-addressed, and a claim with that \
+                 id exists that this principal cannot read. Converging onto it would write \
+                 into another tenant's claim, so nothing was written for this atom and the \
+                 ingest stopped here; re-running it will stop at the same atom.",
+                planned.id
+            ),
+            None,
+        )),
+    }
 }
 
 fn methodology_from_planned(planned: &PlannedClaim) -> Methodology {
@@ -1279,9 +1400,12 @@ pub async fn do_ingest_document_spine(
         claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+        // Levels 0-2 only (level 3 is skipped above), so the document-scoped
+        // writer directly; this path holds no viewer. See
+        // `persist_document_node` for the id-collision gap it shares with
+        // every `create_with_id_if_absent` caller.
+        let (persisted_id, resolved_to_existing) = persist_document_node(
             pool,
-            &claim,
             planned,
             agent_id,
             TruthValue::clamped(raw_truth),
