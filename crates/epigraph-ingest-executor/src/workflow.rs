@@ -408,8 +408,27 @@ pub async fn execute_workflow_ingest_plan(
     }
 
     // ── 6. workflow —executes→ claim edges ──────────────────────────────
+    //
+    // `plan_index` IS LOAD-BEARING AND IT IS NEW. Every reader that renders a
+    // hierarchical workflow's steps in "plan order" — `resolve_steps_to_heads`
+    // and `steps_for_workflows` in `epigraph-db/src/repos/workflow.rs` — ordered
+    // by `e.created_at ASC, c.id ASC`, and that worked only because each edge was
+    // inserted on its OWN pool checkout and so got its own `NOW()`.
+    //
+    // Inside one transaction `NOW()` is TRANSACTION-start time in PostgreSQL, so
+    // every edge in a plan shares it exactly, the tiebreak falls through to
+    // `c.id ASC` — a content-derived UUID — and the steps come back in an
+    // arbitrary order. MEASURED, not anticipated:
+    // `find_workflow_union_hierarchical_test::find_workflow_returns_a_workflow_that_store_workflow_created`
+    // failed with `["record the outcome", "recall recent theme claims", "cluster
+    // without wipe_first"]` against a plan that ordered them the other way round.
+    //
+    // So the ordinal is recorded explicitly instead of being inferred from a
+    // timestamp. That is strictly more robust than what it replaces: a
+    // `created_at` tiebreak was already fragile for two edges written inside the
+    // same clock tick, which is why `c.id ASC` was there at all.
     let mut executes_edges = 0_usize;
-    for planned in &plan.claims {
+    for (plan_index, planned) in plan.claims.iter().enumerate() {
         let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
             &mut *conn,
             workflow_id,
@@ -417,7 +436,10 @@ pub async fn execute_workflow_ingest_plan(
             planned.id,
             "claim",
             "executes",
-            Some(serde_json::json!({"level": planned.level})),
+            Some(serde_json::json!({
+                "level": planned.level,
+                "plan_index": plan_index,
+            })),
             None,
             None,
         )

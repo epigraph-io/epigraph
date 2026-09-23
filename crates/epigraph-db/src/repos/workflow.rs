@@ -524,15 +524,26 @@ impl WorkflowRepository {
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
-        // step_lineage_id, ordered by edge created_at + claim id (matches
-        // do_report_hierarchical_outcome_via_pool).
+        // step_lineage_id, in PLAN ORDER.
+        //
+        // The order key is the `plan_index` ordinal that
+        // `epigraph_ingest_executor::execute_workflow_ingest_plan` records on the
+        // `executes` edge, NOT `e.created_at`. Those edges are now written inside
+        // ONE transaction, and `NOW()` is transaction-start time in PostgreSQL, so
+        // they all share a `created_at` and the old `created_at, c.id` key returned
+        // an arbitrary order. See that loop's comment for the measurement.
+        // `created_at` remains the fallback so edges written before the ordinal
+        // existed are ordered exactly as they were.
         let sql = viewer.splice(
             "SELECT c.id, c.step_lineage_id \
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
-             ORDER BY e.created_at ASC, c.id ASC",
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut sq = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(&sql).bind(workflow_id);
@@ -1086,7 +1097,11 @@ impl WorkflowRepository {
              WHERE e.source_id = ANY($1) \
                AND e.relationship = 'executes' \
                AND (c.properties->>'level')::int = 2 /* {VISIBILITY:c} */ \
-             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+             ORDER BY e.source_id, \
+                      CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut q = sqlx::query_as(&sql).bind(workflow_ids);
