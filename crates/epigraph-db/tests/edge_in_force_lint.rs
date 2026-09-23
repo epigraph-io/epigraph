@@ -91,6 +91,12 @@ const DISPLAY_TIER_FNS: &[(&str, &str)] = &[
         "crates/epigraph-mcp/src/tools/recall.rs",
         "fetch_batched_context",
     ),
+    // POST /api/v1/graph/query: the WITH RECURSIVE path walk that decides the
+    // node set (the edge projection is load_subgraph's, in graph_view.rs).
+    (
+        "crates/epigraph-api/src/routes/graph_query.rs",
+        "execute_graph_query",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {

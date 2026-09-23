@@ -66,7 +66,8 @@ compound and atomic halves disagree is worse than either.
 
 | Read | Where | Opt-in |
 |---|---|---|
-| Cluster / neighbourhood / compound views, `load_subgraph` edges (`graph_full`, graph-query routes) | every `edges` alias in `GraphViewRepository` (`crates/epigraph-db/src/repos/graph_view.rs`) | none |
+| Cluster / neighbourhood / compound views, and the `load_subgraph` EDGE projection (`graph_full`, `POST /api/v1/graph/query`) | every `edges` alias in `GraphViewRepository` (`crates/epigraph-db/src/repos/graph_view.rs`) | none |
+| `POST /api/v1/graph/query` path walk — decides the NODE set that `load_subgraph` then projects | the `WITH RECURSIVE` walk in `execute_graph_query` (`crates/epigraph-api/src/routes/graph_query.rs`) | none |
 | MCP `get_neighborhood`, `traverse` | `EdgeRepository::get_by_{source,target}_in_force` via `crates/epigraph-mcp/src/tools/graph.rs` | `include_retracted: true` — rows flagged `retracted: true` with `valid_to`; `traverse` then also follows them |
 | `GET /api/v1/claims/:id/neighborhood` (multi-hop BFS) | `neighborhood_hop` in `crates/epigraph-api/src/routes/edges.rs` | `?include_retracted=true` — every edge already carries `valid_to` |
 | `GET /api/v1/graph/edges`, `GET /api/v1/graph/full` | `EdgeRepository::list_all_in_force` (renamed from `list_all`) | none |
@@ -86,7 +87,11 @@ The in-force endpoint reads are separate functions, not a flag on
 `get_by_source` / `get_by_target`, because those stay the structural read (see
 below) and neither default should be flippable by accident. `traverse` chooses
 at the READ, so a hidden edge never widens the frontier or changes how
-`node_limit` truncates.
+`node_limit` truncates. The same rule holds for every walk in this tier (the
+claim-neighbourhood BFS, `graph_expand_seeds_since`, the graph-query path
+walk): filtering only the edges a walk RETURNS is not enough, because the
+node set is decided by the edges it FOLLOWS — hiding the edge while keeping
+the node it reached renders a node with nothing explaining it.
 
 ### 3. Structural — never filtered
 
@@ -122,7 +127,8 @@ retraction was not about (a6adf739, 7e870b69).
   dispute annotation and `exclude_contested` after `delete_edge` on the only
   `contradicts` edge (contested asserted first).
 * `crates/epigraph-api/tests/edge_retraction_display_http.rs` — the claim
-  neighbourhood, `graph/edges` and `graph/full` after the `DELETE` handler.
+  neighbourhood, `graph/edges`, `graph/full` and the `graph/query` path walk
+  after the `DELETE` handler.
 * `crates/epigraph-jobs/tests/cluster_graph_retraction_test.rs` — communities
   and neighborhoods before/after a retraction.
 * `routes::belief::tests::predict_contradiction_ignores_a_retracted_refutes_edge`

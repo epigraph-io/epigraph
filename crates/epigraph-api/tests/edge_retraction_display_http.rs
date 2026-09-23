@@ -6,6 +6,9 @@
 //! `valid_to`, `GET /api/v1/claims/:id/neighborhood`, `GET /api/v1/graph/edges`
 //! and `GET /api/v1/graph/full` all went on serving the "deleted" edge — and
 //! the neighbourhood BFS walked through it to nodes reachable only that way.
+//! `POST /api/v1/graph/query` had the node half of the same bug: its path walk
+//! kept returning nodes reachable only through a deleted edge after the edge
+//! itself had been hidden from the projection.
 //!
 //! Handlers are driven directly (the `shard6_routes_scoped_read.rs` pattern),
 //! and the edge is removed through the `delete_edge` HANDLER itself, so the
@@ -16,10 +19,12 @@
 mod viewer_fixture;
 
 use axum::extract::{Path, Query, State};
+use axum::Json;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::edges::{
     claim_neighborhood, delete_edge, graph_edges, graph_full, GraphAccessParams, NeighborhoodParams,
 };
+use epigraph_api::routes::graph_query::{execute_graph_query, GraphQueryRequest};
 use epigraph_api::state::{ApiConfig, AppState};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -185,5 +190,78 @@ async fn graph_edges_and_graph_full_omit_a_deleted_edge(pool: PgPool) {
         sorted(full.nodes.iter().map(|n| n.id).collect()),
         sorted(vec![a, c]),
         "B was in the graph only through the deleted edge"
+    );
+}
+
+/// `POST /api/v1/graph/query` with a variable-length pattern. The WITH
+/// RECURSIVE walk decides the node set and `load_subgraph` projects the edges
+/// among it; the projection was already in force, the walk was not, so after
+/// the delete `behind` and `past` came back as nodes with no edge explaining
+/// them. `*0..2` keeps the root in the result, so the in-force half of the
+/// fixture (root -> near) is asserted alongside the absence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_query_walk_does_not_reach_nodes_through_a_deleted_edge(pool: PgPool) {
+    let (agent, _g) = seed_agent_with_group(&pool, "http-gql-retraction").await;
+    let root = seed_public_claim(&pool, agent, "gql root").await;
+    let near = seed_public_claim(&pool, agent, "gql near, still linked").await;
+    let behind = seed_public_claim(&pool, agent, "gql behind the deleted edge").await;
+    let past = seed_public_claim(&pool, agent, "gql reachable only through `behind`").await;
+    // Anchor the walk on exactly one start node (the parser maps `r.probe` to
+    // `properties->>'probe'`), so no other claim can seed a path.
+    let probe = Uuid::new_v4().to_string();
+    sqlx::query(
+        "UPDATE claims SET properties = jsonb_build_object('probe', $2::text) WHERE id = $1",
+    )
+    .bind(root)
+    .bind(&probe)
+    .execute(&pool)
+    .await
+    .expect("tag the root");
+    let live = edge(&pool, root, near, "supports").await;
+    let gone = edge(&pool, root, behind, "supports").await;
+    let second_hop = edge(&pool, behind, past, "supports").await;
+    let state = state(&pool).await;
+
+    let run = |state: AppState, pool: PgPool, probe: String| async move {
+        execute_graph_query(
+            ViewerExtractor(public_viewer(&pool).await),
+            State(state),
+            Json(GraphQueryRequest {
+                query: format!(
+                    "MATCH (r:claim)-[:supports*0..2]->(x) WHERE r.probe = '{probe}' RETURN *"
+                ),
+                agent_id: None,
+            }),
+        )
+        .await
+        .expect("graph query serves")
+        .0
+    };
+
+    let before = run(state.clone(), pool.clone(), probe.clone()).await;
+    assert_eq!(
+        sorted(before.nodes.iter().map(|n| n.id).collect()),
+        sorted(vec![root, near, behind, past]),
+        "precondition: the 2-hop walk reaches `past` through `behind`"
+    );
+    assert_eq!(
+        sorted(before.edges.iter().map(|e| e.id).collect()),
+        sorted(vec![live, gone, second_hop]),
+        "precondition: all three edges are projected"
+    );
+
+    http_delete(&state, gone).await;
+
+    let after = run(state.clone(), pool.clone(), probe.clone()).await;
+    assert_eq!(
+        sorted(after.nodes.iter().map(|n| n.id).collect()),
+        sorted(vec![root, near]),
+        "`behind` and `past` were reachable only through the deleted edge; the walk \
+         must not return them"
+    );
+    assert_eq!(
+        after.edges.iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![live],
+        "only the in-force edge is projected"
     );
 }

@@ -176,6 +176,16 @@ pub async fn execute_graph_query(
         let max_hops = edge.max_hops.min(4); // Safety cap
         let min_hops = edge.min_hops;
 
+        // Display tier (docs/architecture/edge-retraction-tiers.md): the walk
+        // follows only IN-FORCE edges. `load_subgraph` below already hides a
+        // retracted edge from the projected edge list, but that is not enough
+        // on its own — the node set is decided HERE, so a pattern such as
+        // `(a)-[:supports*1..2]->(b)` would still return `b` when the only
+        // route to it is an edge removed with `DELETE /api/v1/edges/:id`
+        // (a retraction: the row keeps `valid_to`). A hidden edge must never
+        // widen the frontier; `traverse` and the claim-neighbourhood BFS
+        // apply the same rule at the read.
+        use epigraph_db::repos::edge::EDGE_IN_FORCE;
         let sql = format!(
             r#"
             WITH RECURSIVE paths(id, depth) AS (
@@ -190,6 +200,7 @@ pub async fn execute_graph_query(
                 FROM edges e
                 JOIN paths p ON {direction_filter}
                 WHERE p.depth < {max_hops}
+                  AND {EDGE_IN_FORCE}
                 {rel_filter}
             )
             SELECT DISTINCT id FROM paths WHERE depth >= {min_hops};
