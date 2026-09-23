@@ -531,6 +531,13 @@ impl WorkflowRepository {
 
     /// Find all descendants of a workflow via `variant_of` or `supersedes` edges
     /// (for cascade deprecation).
+    ///
+    /// Each id appears once. `UNION`, not `UNION ALL`, so a cycle among the
+    /// lineage's edges terminates: `UNION` discards a row that is already in
+    /// the result. With `UNION ALL` a cycle kept the working table non-empty
+    /// forever, inside `DELETE /api/v1/workflows/:id`'s transaction. Pinned by
+    /// `tests/find_descendants_cycle.rs`. If the lineage cycles back to
+    /// `workflow_id`, it is in the result too.
     pub async fn find_descendants<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -542,7 +549,7 @@ impl WorkflowRepository {
                  SELECT source_id AS id FROM edges \
                  WHERE target_id = $1 AND relationship IN ('variant_of', 'supersedes') \
                    /* {EDGE_VISIBILITY:edges} */ \
-                 UNION ALL \
+                 UNION \
                  SELECT e.source_id FROM edges e \
                  JOIN descendants d ON e.target_id = d.id \
                  WHERE e.relationship IN ('variant_of', 'supersedes') \
