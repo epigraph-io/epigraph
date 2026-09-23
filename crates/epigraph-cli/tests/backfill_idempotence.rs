@@ -972,10 +972,10 @@ async fn verify_covers_the_086_read_definer_once_its_migration_is_applied(pool: 
     assert_eq!(
         code, 1,
         "verify must refuse a deploy whose 086 read definer is app-owned. Since migration 094 \
-         such a body RAISES 42501 on every call, so the event surfaces and webhook delivery \
-         fail; before 094 it returned fewer rows with NO error to the app role and \
-         hidden_claim_ids reported nothing hidden. This gate turns either into a pre-flight \
-         finding; stderr:\n{stderr}"
+         such a body RAISES 42501 on every app-role call, so the event surfaces and webhook \
+         delivery fail there; before 094 it returned fewer rows with NO error to the app role \
+         and hidden_claim_ids reported nothing hidden. This gate turns either into a \
+         pre-flight finding; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("epigraph_claim_tenancy_by_ids") && stderr.contains("epigraph_maintenance"),
@@ -1229,8 +1229,9 @@ async fn verify_covers_the_089_stamping_definer_once_its_migration_is_applied(po
 /// narrowing to migration 077's unbounded arm with no error. **Corrected by
 /// migration 094.** MEASURED before 094, the unadmitted frame's read recursed
 /// through `group_memberships_tenancy` and failed with `stack depth limit
-/// exceeded`. Since 094 the body returns FALSE without reading, which refuses
-/// group creation for everyone. This gate is what reports that state before
+/// exceeded`. Since 094 the body returns FALSE without reading on an app-role
+/// session, which refuses group creation there. This gate is what reports that
+/// state before
 /// it surfaces as refused group creations, which is why the entry needs a test
 /// rather than a list edit.
 ///
@@ -1283,7 +1284,7 @@ async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool
         code, 1,
         "verify must refuse a deploy whose 092 roster predicate is owned by a role that is not \
          a member of epigraph_maintenance. Since migration 094 such a body answers FALSE \
-         without reading, so group creation is refused for everyone; before 094 its \
+         without reading on the app role, so group creation is refused there; before 094 its \
          NOT EXISTS read recursed until the stack limit. This gate turns either into a \
          pre-flight finding; stderr:\n{stderr}"
     );

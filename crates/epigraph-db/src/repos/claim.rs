@@ -3125,13 +3125,15 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors. That includes
-    /// `42501` from the definer itself since migration 094, when its owner is
-    /// not admitted by `epigraph_definer_bypass()`. Before 094 that state
-    /// returned `Ok` with every private id missing on an app-role session, which
-    /// both callers read as "nothing is hidden". (A superuser or
-    /// maintenance-member session still got the correct answer, through
-    /// `claims_tenancy`'s `session_user` arm.) Both callers map this error to a
-    /// refusal. Pinned by
+    /// `42501` from the definer itself since migration 094, when neither its
+    /// owner (`epigraph_definer_bypass()`) nor the session user
+    /// (`epigraph_bypass()`) is a member of `epigraph_maintenance`, i.e. on an
+    /// app-role session under a wrong owner. Before 094 that state returned
+    /// `Ok` with every private id missing, which both callers read as "nothing
+    /// is hidden". A superuser or maintenance-member session is admitted by
+    /// `claims_tenancy`'s `session_user` arm, so it got the correct answer
+    /// before 094 and still does. Both callers map this error to a refusal.
+    /// Pinned by
     /// `rls_enforcement.rs::a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`.
     pub async fn hidden_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,

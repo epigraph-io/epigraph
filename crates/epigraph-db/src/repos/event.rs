@@ -144,17 +144,18 @@ impl EventRepository {
     ///
     /// ## A definer frame that has lost its authority is an error, not an answer
     ///
-    /// Since migration 094 the function RAISES `42501` when
-    /// `epigraph_definer_bypass()` does not admit its frame, i.e. when its owner
-    /// is not a member of `epigraph_maintenance`. Before 094 such a frame,
-    /// called from an app-role session, read `claims` under the policy, both
-    /// arms lost the private row together, and every event was returned. That
-    /// was the fail-open residual PR-25 recorded. (A superuser or
-    /// maintenance-member session was admitted by `claims_tenancy`'s
-    /// `session_user` arm and got the correct answer.)
-    /// So this function now returns `Err` for the whole page, and all three
-    /// callers fail the request. That is an outage while the owner is wrong,
-    /// which is the price 094's header records. Pinned by
+    /// Since migration 094 the function RAISES `42501` when neither
+    /// `epigraph_definer_bypass()` (its owner) nor `epigraph_bypass()` (the
+    /// session user) admits its read, i.e. on an app-role session when its
+    /// owner is not a member of `epigraph_maintenance`. Before 094 that frame
+    /// read `claims` under the policy, both arms lost the private row together,
+    /// and every event was returned. That was the fail-open residual PR-25
+    /// recorded. So this function now returns `Err` for the whole page on such a
+    /// session, and all three callers fail the request. That is an outage while
+    /// the owner is wrong, which is the price 094's header records. A superuser
+    /// or maintenance-member session is admitted by `claims_tenancy`'s
+    /// `session_user` arm, so it got the correct answer before 094 and still
+    /// does. Pinned by
     /// `epigraph-db/tests/rls_enforcement.rs::a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`.
     ///
     /// ## Ordering: 086 must be applied before a binary carrying this serves traffic

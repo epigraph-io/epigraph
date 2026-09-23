@@ -1089,8 +1089,8 @@ Deferred-commitment batch `fix/deferred-2026-09-22-lane-b`. One migration,
 
 **What changes.** `epigraph_claim_tenancy_by_ids` (086) and
 `epigraph_group_roster_admits_principal` (092) are `SECURITY DEFINER` bodies
-whose reads are complete only while their OWNER is a member of
-`epigraph_maintenance`. 086 and 092 set that owner inside an
+whose reads, on an `epigraph_app` session, are complete only while their OWNER
+is a member of `epigraph_maintenance`. 086 and 092 set that owner inside an
 `IF EXISTS (pg_roles)` guard that silently no-ops on a cluster where the role
 was missing at the time (060 only `RAISE NOTICE`s), and a re-own or a restore
 reaches the same state. Before 094, such an owner made 086 report "nothing
@@ -1099,12 +1099,14 @@ through the event surfaces, and made 092 fail erratically with `stack depth
 limit exceeded` on the same sessions. A superuser or maintenance-member session
 was not affected: `claims_tenancy`'s `epigraph_bypass()` arm reads
 `session_user` and admitted the frame's read, so 086 answered correctly there.
-From 094 on:
+094 makes each body test those same two arms, `epigraph_definer_bypass()` (the
+owner) and `epigraph_bypass()` (the session user), before it reads. It refuses
+only when neither admits the read. From 094 on:
 
 | Body | Wrong owner, before 094 | Wrong owner, from 094 |
 |---|---|---|
-| `epigraph_claim_tenancy_by_ids` | app role: returns fewer rows, no error, so private claim events are DELIVERED. Superuser or maintenance member: correct | RAISES `42501`: `GET /api/v1/events`, `GET /api/v1/graph/snapshot/:version` and MCP `list_events` fail, webhook deliveries are suppressed |
-| `epigraph_group_roster_admits_principal` | app role: `54001 stack depth limit exceeded` on some group reads. Superuser or maintenance member: unaffected | returns FALSE: group creation is refused (`42501` from `groups_tenancy`), and a creator is denied a group it can reach only through the creator arm |
+| `epigraph_claim_tenancy_by_ids` | app role: returns fewer rows, no error, so private claim events are DELIVERED. Superuser or maintenance member: correct | app role: RAISES `42501`, so `GET /api/v1/events`, `GET /api/v1/graph/snapshot/:version` and MCP `list_events` fail and webhook deliveries are suppressed. Superuser or maintenance member: correct, as before. No `epigraph_maintenance` role on the cluster: RAISES on every session |
+| `epigraph_group_roster_admits_principal` | app role: `54001 stack depth limit exceeded` on some group reads. Superuser or maintenance member: unaffected | app role: returns FALSE, so group creation is refused (`42501` from `groups_tenancy`) and a creator is denied a group it can reach only through the creator arm. Superuser or maintenance member: unaffected |
 
 On a correctly migrated database, where both owners are `epigraph_maintenance`,
 nothing changes. The trade-off is recorded in `docs/tenancy/progress.json` under
@@ -1125,4 +1127,9 @@ migration that installs that function has not been applied.
 Symptoms that mean this check was skipped and an owner is wrong: `42501` errors
 naming `epigraph_claim_tenancy_by_ids` in the API or MCP logs (the error's HINT
 carries the fix), or group creation failing with `new row violates row-level
-security policy for table "groups"`.
+security policy for table "groups"`. They appear only on `epigraph_app`
+sessions, which serve requests from plan §9.2 step 11d on, or on a cluster
+with no `epigraph_maintenance` role. While the DSN is the owning superuser, as
+it is on every deployment today, a wrong owner has NO runtime symptom. That is
+why the `verify` run above is required and not optional: it is the only thing
+that finds the wrong owner before step 11d turns it into an outage.

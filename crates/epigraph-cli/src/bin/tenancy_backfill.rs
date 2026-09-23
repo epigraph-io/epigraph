@@ -860,9 +860,14 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// the same instrument rather than a second one.
 ///
 /// **Since migration 094 that failure is no longer silent.** The body tests
-/// `epigraph_definer_bypass()` before it reads and RAISES `42501` when its frame
-/// is not admitted, so a wrong owner is an OUTAGE of the five surfaces above,
-/// not a leak through them. This entry is still worth running. It turns that
+/// `claims_tenancy`'s two privileged arms, `epigraph_definer_bypass()` (the
+/// owner) and `epigraph_bypass()` (the session user), before it reads, and
+/// RAISES `42501` when neither admits it. So on an app-role session a wrong
+/// owner is an OUTAGE of the five surfaces above, not a leak through them. A
+/// superuser or maintenance-member session keeps its complete, correct answer.
+/// This check is keyed on the first arm alone, the owner, because after plan
+/// §9.2 step 11d the app role serves every request and only that arm admits
+/// it. This entry is still worth running. It turns that
 /// outage into a pre-flight finding. It is no longer the only thing between a
 /// degraded owner and a leak, which matters, because no documented step ran
 /// it after 086 existed (the NOTE in [`applicable_definer_functions`] asks for
@@ -992,10 +997,11 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// re-entered this predicate through `group_memberships_tenancy`'s creator
 /// disjunct and failed with `54001 stack depth limit exceeded`. So it was
 /// fail-erratic, and only an unplanned recursion kept the `NOT EXISTS` from
-/// admitting. Since 094 the body tests `epigraph_definer_bypass()` first and
-/// returns FALSE without reading. A wrong owner now refuses the creator arm,
-/// group creation included. This entry reports that state before it shows up as
-/// refused group creations.
+/// admitting. Since 094 the body tests `epigraph_definer_bypass()` (the owner)
+/// and `epigraph_bypass()` (the session user) first, and returns FALSE without
+/// reading when neither admits it. A wrong owner now refuses the creator arm on
+/// app-role sessions, group creation included. This entry reports that state
+/// before it shows up as refused group creations.
 ///
 /// The predicate this gate applies —
 /// `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')` — is exactly the
@@ -1091,9 +1097,10 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
 ///   Historical since PR-22: migration 084 drops both the table and 071's shim,
 ///   so this arm has no subject left and its entry is gone from
 ///   [`DEFINER_FUNCTIONS`]. The other three arms are unaffected.
-/// * **086 — a DEGRADED READ CONTROL (PR-24), an OUTAGE since migration 094.**
-///   094's body RAISES `42501` when its frame is not admitted, so the rest of
-///   this bullet describes the pre-094 behaviour.
+/// * **086 — a DEGRADED READ CONTROL (PR-24), an OUTAGE on the app role since
+///   migration 094.** 094's body RAISES `42501` when neither the owner nor the
+///   session user is a member of `epigraph_maintenance`, so the rest of this
+///   bullet describes the pre-094 behaviour.
 ///   `epigraph_claim_tenancy_by_ids`
 ///   reaches `claims` only through `claims_tenancy`'s definer-bypass disjunct.
 ///   An app-owned body is policy-filtered like any other reader, so on an
@@ -1188,10 +1195,13 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                      when the role is absent (060 only NOTICEs on insufficient_privilege), so \
                      this is a SILENT no-op: 070's bodies become RLS-filtered at PR-17 -- arm \
                      (b) then stamps a private endpoint PUBLIC. Since migration 094, 086's read \
-                     helper RAISES 42501 on every call (GET /api/v1/events, graph snapshots, \
-                     MCP list_events and webhook delivery all fail), and 092's roster predicate \
-                     answers false (group creation is refused). With the role provisioned, fix \
-                     with: ALTER FUNCTION public.{f} OWNER TO {MAINTENANCE_ROLE}."
+                     helper RAISES 42501 on every call whose session user is not a member of \
+                     {MAINTENANCE_ROLE} (every app-role call, and every call at all while the \
+                     role is missing), so GET /api/v1/events, graph snapshots, MCP list_events \
+                     and webhook delivery fail there. 092's roster predicate answers false on \
+                     the same sessions, so group creation is refused. With the role \
+                     provisioned, fix with: ALTER FUNCTION public.{f} OWNER TO \
+                     {MAINTENANCE_ROLE}."
                 );
             }
         }

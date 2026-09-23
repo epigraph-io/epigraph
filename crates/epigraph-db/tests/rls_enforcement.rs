@@ -2628,8 +2628,9 @@ async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
 }
 
 // ===========================================================================
-// Migration 094 — a definer frame `epigraph_definer_bypass()` does not admit
-// refuses to answer, instead of answering from a policy-filtered read
+// Migration 094 — a definer frame whose read neither `epigraph_definer_bypass()`
+// (the owner) nor `epigraph_bypass()` (the session user) admits refuses to
+// answer, instead of answering from a policy-filtered read
 // ===========================================================================
 
 /// Re-own a definer body, as the superuser harness pool.
@@ -2699,9 +2700,11 @@ fn db_refusal(e: &sqlx::Error) -> Option<(String, String)> {
 
 /// **Migration 094, the 086 half.** When `epigraph_claim_tenancy_by_ids`' owner
 /// is not admitted by `epigraph_definer_bypass()`, both repo functions that read
-/// through it return an ERROR, for every caller. Before 094 they returned
-/// `Ok`. On the app role that answer was wrong in the delivering direction. On
-/// the superuser harness it was correct (see "Both connections" below).
+/// through it return an ERROR on an `epigraph_app` session, and the CORRECT
+/// answer on a superuser or maintenance-member session. Before 094 they
+/// returned `Ok` on all three. On the app role that answer was wrong in the
+/// delivering direction. On the other two it was correct (see "Three sessions"
+/// below).
 ///
 /// # The failure this closes, measured rather than argued
 ///
@@ -2725,25 +2728,34 @@ fn db_refusal(e: &sqlx::Error) -> Option<(String, String)> {
 /// that is both conservative and visible, and both callers already map `Err` to
 /// a refusal: `routes/webhooks.rs::agent_may_receive` suppresses the delivery,
 /// and `routes/events.rs`, `graph_snapshot` and MCP `list_events` fail the
-/// request. That is an OUTAGE of those surfaces while the owner is wrong, and
-/// 094's header records it as the price, not as free.
+/// request. That is an OUTAGE of those surfaces on the app role while the owner
+/// is wrong, and 094's header records it as the price, not as free.
 ///
-/// # Both connections, and what each could show before 094
+/// # Three sessions, and why only one is refused
 ///
 /// A `SECURITY DEFINER` frame runs as its owner whatever the calling role is,
-/// but that fixes `current_user` only. `claims_tenancy` also admits through
-/// `(SELECT epigraph_bypass())`, which reads `session_user`. The harness is a
-/// superuser, and a superuser is a member of every role. So before 094 the
-/// superuser arm got a COMPLETE read and the CORRECT answer, and only the
-/// app-role arm could fail, and did. The guard in this revision of 094 does not
-/// consult `session_user`, so it refuses the superuser harness as well. That
-/// arm pins the guard's strictness. It is not evidence of a pre-094 leak.
+/// but that fixes `current_user` only. `claims_tenancy` admits the frame's read
+/// through `(SELECT epigraph_bypass())`, which reads `session_user`, as well as
+/// through `(SELECT epigraph_definer_bypass())`, which reads `current_user`.
+/// The harness is a superuser, and a superuser is a member of every role. So
+/// before 094 the superuser arm got a COMPLETE read and the CORRECT answer, and
+/// so did a session authorised as `epigraph_maintenance`. Only the app-role arm
+/// could fail before 094, and it did.
+///
+/// 094's guard is those same two arms, so it refuses exactly the app-role arm.
+/// The other two arms assert the correct answer, not a refusal. That is the
+/// deployed posture today, because every DSN is still the owning superuser. A
+/// guard keyed on the owner alone, which an earlier revision of 094 had, raised
+/// `42501` on both and turned a correct answer into an outage of the event
+/// surfaces. The two arms fail on that guard, which is why they are here. The
+/// maintenance arm is a NON-superuser member, so it also fails a guard that
+/// admits superusers by attribute rather than by membership.
 ///
 /// # The last arm is the calibration that the refusal is about the OWNER
 ///
-/// Re-owning to `epigraph_maintenance` restores the answer on the same pool and
-/// the same viewer. Without it, an error for an unrelated reason (a missing
-/// grant, a broken body) would satisfy every assertion before it.
+/// Re-owning to `epigraph_maintenance` restores the app role's answer on the
+/// same pool and the same viewer. Without it, an error for an unrelated reason
+/// (a missing grant, a broken body) would satisfy the refusal assertions.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify(pool: PgPool) {
     use epigraph_db::repos::{ClaimRepository, EventRepository};
@@ -2807,55 +2819,129 @@ async fn a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify(
          member = {admitted}"
     );
 
+    // The maintenance session needs EXECUTE to reach the guard at all. The
+    // re-own above rewrote the ACL and moved maintenance's grant to the new
+    // owner. Without this grant the arm would fail on a missing grant, which
+    // says nothing about the guard.
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION public.epigraph_claim_tenancy_by_ids(uuid[]) \
+         TO epigraph_maintenance",
+    )
+    .execute(&pool)
+    .await
+    .expect("let the maintenance session call the body");
     let app_pool = app_role_pool(&pool).await;
-    for (label, p) in [("app-role", &app_pool), ("superuser harness", &pool)] {
-        match ClaimRepository::hidden_claim_ids(p, &stranger, &ids).await {
-            Err(DbError::QueryFailed { source }) => {
-                let (code, message) = db_refusal(&source).unwrap_or_else(|| {
-                    panic!("{label}: hidden_claim_ids failed, but not in the database: {source}")
-                });
-                assert_eq!(
-                    code, "42501",
-                    "{label}: the refusal must be 094's insufficient_privilege, not an \
-                     unrelated failure. Message: {message}"
-                );
-                assert!(
-                    message.contains("epigraph_claim_tenancy_by_ids")
-                        && message.contains("epigraph_maintenance"),
-                    "{label}: the refusal must name the function and the role its owner lacks, \
-                     or an operator reading the log cannot act on it. Message: {message}"
-                );
-            }
-            other => panic!(
-                "{label}: hidden_claim_ids must REFUSE when its definer frame is not admitted. \
-                 Before migration 094, on the app role, it returned Ok with the private id \
-                 missing, because the frame read claims under claims_tenancy and both arms of \
-                 the set difference lost the row together, and both callers read that as \
-                 \"nothing is hidden\" and deliver. Got: {other:?}"
-            ),
-        }
+    let maintenance_pool = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
 
-        match EventRepository::list(p, &stranger, None, Some(member_agent), 100).await {
-            Err(e) => {
-                let (code, message) = db_refusal(&e).unwrap_or_else(|| {
-                    panic!("{label}: EventRepository::list failed, but not in the database: {e}")
-                });
-                assert_eq!(code, "42501", "{label}: message {message}");
-                assert!(
-                    message.contains("epigraph_claim_tenancy_by_ids"),
-                    "{label}: message {message}"
-                );
-            }
-            Ok(rows) => panic!(
-                "{label}: EventRepository::list must REFUSE when its definer frame is not \
-                 admitted. It is the sole tenancy filter for the persisted half of \
-                 GET /api/v1/events, for graph_snapshot and for MCP list_events. Before \
-                 migration 094, on the app role, it returned the event naming the private \
-                 claim to a stranger (returned it: {}). Rows: {:?}",
-                rows.iter().any(|r| r.id == ev_private),
-                rows.iter().map(|r| r.id).collect::<Vec<_>>()
-            ),
+    // PREMISE: which sessions `claims_tenancy`'s `epigraph_bypass()` arm admits.
+    // That arm reads `session_user`, and it is the one arm that separates the
+    // three sessions below. The maintenance session must be a member without
+    // being a superuser, or it would only repeat the harness arm.
+    for (label, p, expect_bypass, expect_super) in [
+        ("app-role", &app_pool, false, false),
+        ("superuser harness", &pool, true, true),
+        ("maintenance member", &maintenance_pool, true, false),
+    ] {
+        let (bypass, is_super): (bool, bool) = sqlx::query_as(
+            "SELECT public.epigraph_bypass(), \
+                    (SELECT r.rolsuper FROM pg_roles r WHERE r.rolname = session_user)",
+        )
+        .fetch_one(p)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: session probe: {e}"));
+        assert_eq!(
+            (bypass, is_super),
+            (expect_bypass, expect_super),
+            "PREMISE, {label}: (epigraph_bypass(), session user is superuser)"
+        );
+    }
+
+    // ---- THE APP ROLE IS REFUSED. No arm of `claims_tenancy` admits the
+    // frame's read here, so this is the session the residual was about.
+    let label = "app-role";
+    match ClaimRepository::hidden_claim_ids(&app_pool, &stranger, &ids).await {
+        Err(DbError::QueryFailed { source }) => {
+            let (code, message) = db_refusal(&source).unwrap_or_else(|| {
+                panic!("{label}: hidden_claim_ids failed, but not in the database: {source}")
+            });
+            assert_eq!(
+                code, "42501",
+                "{label}: the refusal must be 094's insufficient_privilege, not an \
+                 unrelated failure. Message: {message}"
+            );
+            assert!(
+                message.contains("epigraph_claim_tenancy_by_ids")
+                    && message.contains("epigraph_maintenance"),
+                "{label}: the refusal must name the function and the role its owner lacks, \
+                 or an operator reading the log cannot act on it. Message: {message}"
+            );
         }
+        other => panic!(
+            "{label}: hidden_claim_ids must REFUSE when its definer frame is not admitted. \
+             Before migration 094, on the app role, it returned Ok with the private id \
+             missing, because the frame read claims under claims_tenancy and both arms of \
+             the set difference lost the row together, and both callers read that as \
+             \"nothing is hidden\" and deliver. Got: {other:?}"
+        ),
+    }
+    match EventRepository::list(&app_pool, &stranger, None, Some(member_agent), 100).await {
+        Err(e) => {
+            let (code, message) = db_refusal(&e).unwrap_or_else(|| {
+                panic!("{label}: EventRepository::list failed, but not in the database: {e}")
+            });
+            assert_eq!(code, "42501", "{label}: message {message}");
+            assert!(
+                message.contains("epigraph_claim_tenancy_by_ids"),
+                "{label}: message {message}"
+            );
+        }
+        Ok(rows) => panic!(
+            "{label}: EventRepository::list must REFUSE when its definer frame is not \
+             admitted. It is the sole tenancy filter for the persisted half of \
+             GET /api/v1/events, for graph_snapshot and for MCP list_events. Before \
+             migration 094, on the app role, it returned the event naming the private \
+             claim to a stranger (returned it: {}). Rows: {:?}",
+            rows.iter().any(|r| r.id == ev_private),
+            rows.iter().map(|r| r.id).collect::<Vec<_>>()
+        ),
+    }
+
+    // ---- A SESSION THE POLICY ADMITS STILL GETS THE CORRECT ANSWER. Its read
+    // is complete whatever the owner, before 094 and after it, so the guard
+    // must let it through. A refusal here would be an outage with nothing
+    // behind it. It is the outage the owner-only guard caused on the superuser
+    // DSN every deployment still uses.
+    for (label, p) in [
+        ("superuser harness", &pool),
+        ("maintenance member", &maintenance_pool),
+    ] {
+        let hidden = ClaimRepository::hidden_claim_ids(p, &stranger, &ids)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{label}: hidden_claim_ids must ANSWER, not refuse. claims_tenancy's \
+                     epigraph_bypass() arm admits this session's read whatever the owner, so \
+                     the read is complete and a refusal is stricter than the read it guards. \
+                     Got: {e:?}"
+                )
+            });
+        assert_eq!(
+            hidden,
+            std::collections::HashSet::from([private_id]),
+            "{label}: with a non-member owner, this session must still classify exactly as the \
+             calibration did: the private id hidden from the stranger, the public one not"
+        );
+        let rows = EventRepository::list(p, &stranger, None, Some(member_agent), 100)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{label}: EventRepository::list must ANSWER, not refuse. Got: {e:?}")
+            });
+        assert!(
+            !rows.iter().any(|r| r.id == ev_private),
+            "{label}: with a non-member owner, the event naming the private claim must still be \
+             suppressed for the stranger. Rows: {:?}",
+            rows.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
     }
 
     // ---- CALIBRATION, the other way: restore the owner and the same pool and
@@ -2944,7 +3030,8 @@ async fn try_bootstrap_group(pool: &PgPool, principal: Uuid) -> Result<Uuid, sql
 
 /// **Migration 094, the 092 half.** When `epigraph_group_roster_admits_principal`'s
 /// owner is not admitted by `epigraph_definer_bypass()`, the predicate answers
-/// FALSE without reading `group_memberships`.
+/// FALSE without reading `group_memberships` on an `epigraph_app` session, and
+/// answers from its complete read on a superuser or maintenance-member session.
 ///
 /// # What the degraded predicate actually did before 094 — a correction
 ///
@@ -2965,16 +3052,29 @@ async fn try_bootstrap_group(pool: &PgPool, principal: Uuid) -> Result<Uuid, sql
 ///
 /// # What 094 does instead, and the price, which is asserted rather than hidden
 ///
-/// The body now checks `epigraph_definer_bypass()` first and returns FALSE
-/// without reading when it is not admitted. That is the direction every sibling
-/// body already fails in (092 section 5), and it does not depend on the
-/// recursion. The price is group creation. The bootstrap arm is this predicate,
-/// so under a non-member owner `INSERT INTO groups … RETURNING` is refused.
+/// The body now checks the two privileged arms of `group_memberships_tenancy`
+/// first: `epigraph_definer_bypass()` (the owner) and `epigraph_bypass()` (the
+/// session user). When neither admits the read, it returns FALSE without
+/// reading. That is the direction every sibling body already fails in (092
+/// section 5), and it does not depend on the recursion. The price is group
+/// creation on the app role. The bootstrap arm is this predicate, so under a
+/// non-member owner an app-role `INSERT INTO groups … RETURNING` is refused.
 /// Before 094 it succeeded, because an empty roster read as empty either way.
 /// Commit db2ac67b declined exactly this trade-off. 094 takes it, and it is
 /// recorded as an explicit decision in `docs/tenancy/progress.json`. The
 /// refusal is asserted below so that a later edit that quietly re-admits the
 /// bootstrap under a degraded owner fails here.
+///
+/// # A session the policy admits still gets the true answer
+///
+/// A superuser or maintenance-member session is admitted by
+/// `group_memberships_tenancy`'s `epigraph_bypass()` arm, so the frame's read is
+/// complete whatever the owner. The predicate is called directly on both, and
+/// must answer TRUE for the live member and FALSE for the removed creator. An
+/// owner-only guard, which an earlier revision of 094 had, answered FALSE for
+/// both. Every policy that calls the predicate carries the same
+/// `epigraph_bypass()` arm ahead of it, so that did not change a policy outcome.
+/// It was still a wrong answer from a read that was complete.
 ///
 /// # The last arm is the calibration that the refusal is about the OWNER
 #[sqlx::test(migrations = "../../migrations")]
@@ -3057,6 +3157,37 @@ async fn a_roster_predicate_whose_owner_is_not_admitted_answers_false(pool: PgPo
          this now succeeds, the predicate is answering from an unadmitted frame again. \
          Got: {boot:?}"
     );
+
+    // ---- A SESSION THE POLICY ADMITS STILL GETS THE TRUE ANSWER. Called
+    // directly, with the owner still wrong. `epigraph_maintenance` already holds
+    // EXECUTE from the grant above.
+    let maintenance_pool = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    for (label, p) in [
+        ("superuser harness", &pool),
+        ("maintenance member", &maintenance_pool),
+    ] {
+        let mut conn = p.acquire().await.expect("acquire");
+        for (who, principal, expected) in [
+            ("the live member", f.other, true),
+            ("the removed creator", f.creator, false),
+        ] {
+            set_gucs(&mut conn, "", "", &principal.to_string()).await;
+            let got: bool =
+                sqlx::query_scalar("SELECT public.epigraph_group_roster_admits_principal($1)")
+                    .bind(f.group)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}, {who}: the predicate must answer: {e}"));
+            assert_eq!(
+                got, expected,
+                "{label}, {who}: with a non-member owner this session's read of group_memberships \
+                 is still complete, because group_memberships_tenancy's epigraph_bypass() arm \
+                 admits it. So the predicate must return the roster's true answer, not the \
+                 guard's FALSE"
+            );
+        }
+        set_gucs(&mut conn, "", "", "").await;
+    }
 
     // ---- CALIBRATION, the other way. Restore the owner, and the bootstrap
     // succeeds for the same principal on the same connection shape. The removed

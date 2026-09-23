@@ -1,7 +1,8 @@
 -- 094_definer_bodies_fail_closed.sql
 -- Make the two tenancy definer bodies whose correctness rests on their OWNER
--- refuse to answer when `epigraph_definer_bypass()` does not admit their frame,
--- instead of answering from a policy-filtered read.
+-- refuse to answer when neither privileged arm of the policy they read through
+-- (`epigraph_definer_bypass()`, `epigraph_bypass()`) admits their read, instead
+-- of answering from a policy-filtered read.
 --
 -- Deferred-commitment screen key `definer-authority-degrade-fail-open`. Claimed
 -- from the reserved tenancy block 092-099 in `migrations/README.md`, in the SAME
@@ -15,9 +16,10 @@
 -- ===================================================================
 -- 1. THE RESIDUAL, AND WHY THE CONTROL CITED FOR IT NEVER RAN
 --
--- Both bodies read a FORCEd table. What admits the read is the table policy's
--- `OR (SELECT public.epigraph_definer_bypass())` disjunct, and that function
--- (067) is `pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER')`, where
+-- Both bodies read a FORCEd table. For an unprivileged session, what admits the
+-- read is the table policy's `OR (SELECT public.epigraph_definer_bypass())`
+-- disjunct, and that function (067) is
+-- `pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER')`, where
 -- `current_user` inside a SECURITY DEFINER frame is the FUNCTION OWNER. 086 and
 -- 092 each set that owner with an `ALTER FUNCTION ... OWNER TO` inside an
 -- `IF EXISTS (pg_roles)` guard, which silently no-ops on the cluster 060 could
@@ -84,24 +86,55 @@
 -- ===================================================================
 -- 3. THE GUARD, AND EXACTLY WHAT IT TESTS
 --
--- Each body now opens with `IF NOT public.epigraph_definer_bypass()`. Inside the
--- frame that asks the one question the body's correctness depends on: "is my
--- owner a member of epigraph_maintenance?" This is the same predicate
--- `tenancy_backfill.rs::verify_definer_ownership` applies, so the runtime guard
--- and the deploy gate cannot disagree. Consequences, stated rather than left to
--- be discovered:
+-- Each body now opens with
+-- `IF NOT (public.epigraph_definer_bypass() OR public.epigraph_bypass())`.
+-- Those are the two privileged arms of the policy the body reads through.
+-- `claims_tenancy` (086's read) and `group_memberships_tenancy` (092's read)
+-- each open with `(SELECT epigraph_bypass()) OR (SELECT
+-- epigraph_definer_bypass())` (077). Inside the frame, `epigraph_definer_bypass()`
+-- tests `current_user`, which the frame fixes to the OWNER.
+-- `epigraph_bypass()` tests `session_user`, which the frame does not change.
+-- So the guard refuses exactly when the body would otherwise answer from a
+-- policy-filtered read. Apart from the missing-role case below, it is no
+-- stricter than that read. Consequences, stated rather than left to be
+-- discovered:
 --
---   * A SUPERUSER owner passes when the role exists (a superuser is a member of
---     every role) and is correct, since it bypasses row security anyway.
---   * A MISSING `epigraph_maintenance` role fails the guard even for a
---     superuser owner, because 067 returns FALSE rather than calling
---     `pg_has_role` on an absent role. `verify` already reports that state as
---     a FAIL, and 086's own COMMENT states the invariant ("Owner must satisfy
---     epigraph_definer_bypass()"), so the guard enforces what was documented
---     and not the incidental ways a frame might happen to read unfiltered.
+--   * An `epigraph_app` session under a non-member owner fails both arms and
+--     is refused. That is the residual this file closes.
+--   * A SUPERUSER or maintenance-member SESSION passes through
+--     `epigraph_bypass()`, whatever the owner. Its read was complete before
+--     this file (section 2), so the body answers, and answers correctly. This
+--     is the posture of every current deployment, whose DSN is still the owning
+--     superuser (plan 9.2 step 11d has not run). A guard on
+--     `epigraph_definer_bypass()` alone would have turned those correct
+--     answers into an outage. Measured on a template clone of the lane
+--     database, with 086's body re-owned to `epigraph_app`: the owner-only
+--     guard raised `42501` on a superuser session whose pre-094 answer was
+--     five of five ids classified. This guard returns the five.
+--   * A SUPERUSER owner passes through `epigraph_definer_bypass()` when the
+--     role exists (a superuser is a member of every role). That is correct,
+--     since it bypasses row security anyway.
+--   * A MISSING `epigraph_maintenance` role makes BOTH functions false, for
+--     every session and every owner, because 067 returns FALSE rather than
+--     calling `pg_has_role` on an absent role. So the guard refuses there even
+--     where the read would be complete (a superuser owner). That is deliberate.
+--     `verify` reports that state as a FAIL, and 086's own COMMENT states the
+--     invariant ("Owner must satisfy epigraph_definer_bypass()"). The guard
+--     enforces the documented authority, not the incidental ways a frame might
+--     happen to read unfiltered. Its price is in section 4.
 --   * An owner lacking EXECUTE on `epigraph_definer_bypass()` gets `42501`
---     from the call itself. That fails closed too, with a less specific
---     message.
+--     from the call, on every session. That fails closed too, with a less
+--     specific message. It is also what the pre-094 body did, because the
+--     policy calls the same function as the same owner. Measured: both raised
+--     "permission denied for function epigraph_definer_bypass" on superuser,
+--     maintenance and app sessions alike. `epigraph_bypass()` has PUBLIC
+--     EXECUTE (067 never revokes it).
+--
+-- `tenancy_backfill.rs::verify_definer_ownership` checks the first arm only:
+-- whether the OWNER is a member. That is the right deploy gate. The second arm
+-- admits only sessions whose read is complete anyway. After step 11d the
+-- sessions that serve requests are `epigraph_app`, which the second arm never
+-- admits, so the owner is the only arm that keeps their answers.
 --
 -- ===================================================================
 -- 4. EACH BODY FAILS TOWARD ITS OWN "DENY", AND THE PRICE OF EACH
@@ -112,12 +145,23 @@
 -- 200 and no error. Every caller already maps an error to a refusal:
 -- `routes/webhooks.rs::agent_may_receive` suppresses the delivery, and
 -- `routes/events.rs` (both halves), `graph_snapshot` and MCP `list_events` fail
--- the request. THE PRICE: while the owner is wrong, those surfaces are DOWN,
--- not leaking. `EventRepository::list` calls the function inline once per
--- payload uuid, so one call raising fails the whole page. Every event page
--- carrying a uuid fails, not just the affected event. This is the same outage
--- 086 already accepted for a missing `GRANT EXECUTE`. The message names the
--- function, the current owner and the fix.
+-- the request. THE PRICE: while the owner is wrong, those surfaces are DOWN
+-- rather than leaking, for every session the guard refuses. That means every
+-- `epigraph_app` session, which after step 11d is every request. On a cluster
+-- with no `epigraph_maintenance` role it means every session at all.
+-- `EventRepository::list` calls the function inline once per payload uuid, so
+-- one call raising fails the whole page. Every event page carrying a uuid
+-- fails, not just the affected event. This is the same outage 086 already
+-- accepted for a missing `GRANT EXECUTE`. The message names the function, the
+-- owner, the session user and the fix. Two qualifications:
+--   * WHO PAYS TODAY. A superuser or maintenance-member session is not
+--     affected by a wrong owner, before or after this file (section 3). That
+--     includes every current deployment. The price applies from step 11d on.
+--   * AN ADDED COST. On a cluster WITHOUT the role, a superuser-owned body
+--     read completely before this file and answered correctly on every
+--     session. It now refuses every session, so this file turns that cluster
+--     from correct to down. 060 creates the role wherever its runner can, and
+--     `verify` fails on its absence.
 --
 -- `epigraph_group_roster_admits_principal` RETURNS FALSE without reading. It
 -- is a boolean policy predicate, and false is its deny. That is the direction
@@ -126,11 +170,18 @@
 -- sites are policy clauses, where a raise would fail every statement that
 -- touches `groups` while the principal is NULL (`NULL AND f(x)` still
 -- evaluates `f(x)`). That is far wider than the one arm this predicate bounds.
--- THE PRICE is group creation. The bootstrap is this predicate, so while the
--- owner is wrong `GroupRepository::create_with_admin`'s
--- `INSERT INTO groups ... RETURNING` is refused by `groups_tenancy` (42501),
--- where before this file it succeeded. A creator reading a group outside
--- `epigraph_session_groups()` through the creator arm alone is also denied.
+-- Its guard is the same two-arm guard, for the same reason, because the three
+-- policies that call it each carry the same `epigraph_bypass()` arm ahead of
+-- it. A bypass session is admitted by that arm, so the guard changes no policy
+-- outcome there. It keeps a direct call from such a session answering
+-- correctly instead of FALSE for a live member.
+-- THE PRICE is group creation on `epigraph_app` sessions. The bootstrap is
+-- this predicate, so while the owner is wrong
+-- `GroupRepository::create_with_admin`'s `INSERT INTO groups ... RETURNING` is
+-- refused by `groups_tenancy` (42501) on the app role, where before this file
+-- it succeeded. A creator reading a group outside `epigraph_session_groups()`
+-- through the creator arm alone is also denied. A superuser session skips row
+-- security, so group creation on today's superuser DSNs is unaffected.
 -- Commit db2ac67b declined this trade-off, to avoid "a group-creation outage on
 -- the very cluster the guard exists for". Section 2's measurement changes the
 -- basis for that. The alternative was not a working cluster but an erratic
@@ -146,7 +197,8 @@
 -- * No policy. No `CREATE`/`ALTER`/`DROP POLICY`, no `ROW LEVEL SECURITY`, no
 --   `ALTER TABLE`. What the three 092 policies and `claims_tenancy` ADMIT is
 --   unchanged whenever the owner is admitted, which is every correctly migrated
---   database. Asserted from this file's source by
+--   database, and whenever the session user is a superuser or a maintenance
+--   member, whatever the owner. Asserted from this file's source by
 --   `locked_decisions.rs::d4_migration_094_installs_no_policy`.
 -- * No signature or return type. `CREATE OR REPLACE` cannot change either, and
 --   `hidden_claim_ids`, `EventRepository::list` and the policies call both
@@ -181,14 +233,17 @@ RETURNS TABLE (id uuid, visibility text, owner_group_id uuid)
 LANGUAGE plpgsql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 BEGIN
-    IF NOT public.epigraph_definer_bypass() THEN
+    -- The two privileged arms of claims_tenancy, and nothing stricter: the
+    -- owner (current_user in this frame) or the session user. See section 3.
+    IF NOT (public.epigraph_definer_bypass() OR public.epigraph_bypass()) THEN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
             MESSAGE = format(
-                'epigraph_claim_tenancy_by_ids: refusing to classify claim ids: this '
-                'SECURITY DEFINER frame runs as %I, which is not a member of '
-                'epigraph_maintenance, so its read of claims would be filtered by '
-                'claims_tenancy and would report nothing hidden', current_user),
+                'epigraph_claim_tenancy_by_ids: refusing to classify claim ids: '
+                'neither the owner of this SECURITY DEFINER frame (%I) nor the '
+                'session user (%I) is a member of epigraph_maintenance, so its '
+                'read of claims would be filtered by claims_tenancy and would '
+                'report nothing hidden', current_user, session_user),
             HINT = 'Re-own it: ALTER FUNCTION public.epigraph_claim_tenancy_by_ids(uuid[]) '
                    'OWNER TO epigraph_maintenance; then run epigraph-tenancy-backfill '
                    'verify. See migrations 086 and 094.';
@@ -204,8 +259,9 @@ COMMENT ON FUNCTION public.epigraph_claim_tenancy_by_ids(uuid[]) IS
     'Tenancy label (id, visibility, owner_group_id) for caller-named claim ids. '
     'Never content. Backs ClaimRepository::hidden_claim_ids and '
     'EventRepository::list. Owner must satisfy epigraph_definer_bypass(); since '
-    'migration 094 the body RAISES 42501 when it does not, rather than answering '
-    'from a policy-filtered read. See migrations 086 and 094.';
+    'migration 094 the body RAISES 42501 when neither it nor epigraph_bypass() '
+    '(the session user) admits the call, rather than answering from a '
+    'policy-filtered read. See migrations 086 and 094.';
 
 -- 092's roster predicate. Body unchanged below the guard: 092's two
 -- disjuncts, verbatim.
@@ -215,8 +271,9 @@ SET search_path = public, pg_temp AS $$
 BEGIN
     -- An unadmitted frame reads group_memberships under its own policy, and
     -- the first disjunct below is a NOT EXISTS: an incomplete read would
-    -- ADMIT. Answer FALSE instead, without reading. See 094 section 4.
-    IF NOT public.epigraph_definer_bypass() THEN
+    -- ADMIT. Answer FALSE instead, without reading. The guard is that
+    -- policy's two privileged arms, as in the body above. See sections 3-4.
+    IF NOT (public.epigraph_definer_bypass() OR public.epigraph_bypass()) THEN
         RETURN false;
     END IF;
     RETURN NOT EXISTS (

@@ -1070,9 +1070,10 @@ async fn migration_089_stamping_definer_is_revoked_from_public(pool: PgPool) {
 /// unadmitted frame's read re-entered the predicate through
 /// `group_memberships_tenancy`'s creator disjunct and failed with `54001 stack
 /// depth limit exceeded`, so the residual was fail-erratic, not a silent admit.
-/// Since 094 the body tests `epigraph_definer_bypass()` first and returns FALSE
-/// without reading, so a wrong owner now REFUSES the creator arm, including
-/// group creation (`migration_094_definer_bodies_check_their_owner_before_they_read`
+/// Since 094 the body tests `epigraph_definer_bypass()` (the owner) and
+/// `epigraph_bypass()` (the session user) first, and returns FALSE without
+/// reading when neither admits it. So on an app-role session a wrong owner now
+/// REFUSES the creator arm, including group creation (`migration_094_definer_bodies_check_their_owner_before_they_read`
 /// below, and `rls_enforcement.rs::a_roster_predicate_whose_owner_is_not_admitted_answers_false`).
 /// The owner is still the mechanism. Without it the arm is refused rather than
 /// narrowed. `locked_decisions.rs::d4_the_group_creation_bootstrap_arm_is_bounded_by_the_roster`
@@ -1121,8 +1122,9 @@ async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
         "it must be owned by epigraph_maintenance, whose membership is what \
          epigraph_definer_bypass() tests against current_user inside the definer frame. Owned \
          by a role that is not a member, the frame is not admitted, and since migration 094 \
-         the predicate answers FALSE without reading, which refuses the group-creation \
-         bootstrap for everyone. The owner is the MECHANISM here, not hardening."
+         the predicate answers FALSE without reading on every app-role session, which \
+         refuses the group-creation bootstrap there. The owner is the MECHANISM here, not \
+         hardening."
     );
 
     let public_can_execute: bool = sqlx::query_scalar(
@@ -1263,9 +1265,10 @@ async fn migration_093_widening_guard_fires_on_visibility_and_owner(pool: PgPool
 /// SESSION user is. Before 094 a frame neither admitted, which is an app-role
 /// session under a wrong owner, answered from a policy-filtered read: 086's
 /// classifier reported nothing hidden, and 092's predicate relied on a recursion
-/// to keep its `NOT EXISTS` from admitting. 094 makes each body test the bypass first. 086's
-/// RAISES `42501`, because a set-returning classifier has no deny value. 092's
-/// RETURNS FALSE, because false is a policy predicate's deny.
+/// to keep its `NOT EXISTS` from admitting. 094 makes each body test those same
+/// two arms first. 086's RAISES `42501`, because a set-returning classifier has
+/// no deny value. 092's RETURNS FALSE, because false is a policy predicate's
+/// deny.
 ///
 /// This pins the INSTALLED shape. The behaviour is pinned in
 /// `rls_enforcement.rs` by
@@ -1277,9 +1280,14 @@ async fn migration_093_widening_guard_fires_on_visibility_and_owner(pool: PgPool
 /// restoring the fail-open read, and nothing would say so until a cluster
 /// degraded.
 ///
-/// The guard is located by the call, not by `IF`, and it must come BEFORE the
+/// The guard is located by its whole expression, and it must come BEFORE the
 /// body's first read of the table. A guard placed after the read would still
 /// contain the words while the read it was meant to prevent had already run.
+/// The whole expression is pinned because both arms carry weight. Without
+/// `epigraph_bypass()` the guard refuses superuser and maintenance-member
+/// sessions whose read is complete. That is today's deployed posture, and it
+/// is an outage with nothing behind it. Without `epigraph_definer_bypass()` it
+/// refuses every `epigraph_app` session even under a correct owner.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_094_definer_bodies_check_their_owner_before_they_read(pool: PgPool) {
     for (name, table, deny) in [
@@ -1327,11 +1335,15 @@ async fn migration_094_definer_bodies_check_their_owner_before_they_read(pool: P
         );
 
         let guard = src
-            .find("public.epigraph_definer_bypass()")
+            .find("IF NOT (public.epigraph_definer_bypass() OR public.epigraph_bypass()) THEN")
             .unwrap_or_else(|| {
                 panic!(
-                    "{name} no longer calls public.epigraph_definer_bypass(). Without it the body \
-                 answers from whatever the frame's owner can see. Body:\n{src}"
+                    "{name} no longer opens with 094's guard, \
+                     `IF NOT (public.epigraph_definer_bypass() OR public.epigraph_bypass())`. \
+                     Those are the two privileged arms of the policy the body reads through. \
+                     Drop the first and the body answers from whatever the frame's owner can \
+                     see. Drop the second and it refuses sessions whose read is complete. \
+                     Body:\n{src}"
                 )
             });
         let read = src.find(table).unwrap_or_else(|| {
@@ -1339,8 +1351,7 @@ async fn migration_094_definer_bodies_check_their_owner_before_they_read(pool: P
         });
         assert!(
             guard < read,
-            "{name} must test epigraph_definer_bypass() BEFORE its first read of {table}. \
-             Body:\n{src}"
+            "{name} must run its guard BEFORE its first read of {table}. Body:\n{src}"
         );
         let refusal = src.find(deny).unwrap_or_else(|| {
             panic!("{name} must deny with `{deny}` when the frame is not admitted. Body:\n{src}")

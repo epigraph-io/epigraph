@@ -387,9 +387,10 @@
 //!     database that lost its bookkeeping row cannot silently skip it.
 //!     **DISCHARGED by migration 094 (2026-09-22). This bullet is kept as the
 //!     PR-24 record and no longer describes the tree.** The body now RAISES
-//!     `42501` when `epigraph_definer_bypass()` does not admit its frame, so
-//!     degraded authority fails CLOSED at the function rather than resting on
-//!     `verify`. The acceptance statement is
+//!     `42501` when neither `epigraph_definer_bypass()` (the owner) nor
+//!     `epigraph_bypass()` (the session user) admits its read, so degraded
+//!     authority fails CLOSED at the function rather than resting on `verify`.
+//!     The acceptance statement is
 //!     `rls_enforcement.rs::a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`,
 //!     which re-owns the body and fails without 094. See
 //!     `## Status at migration 094` below. One correction to the bullet itself:
@@ -475,8 +476,9 @@
 //!   no new entry there — the function is already registered, and the *same*
 //!   function is what backs both probes — but the stake it carries is larger.
 //!   **DISCHARGED by migration 094 (2026-09-22)**, as the PR-24 bullet above
-//!   records. A degraded frame now makes `EventRepository::list` return `Err`,
-//!   i.e. an OUTAGE of those three surfaces rather than a leak through them, and
+//!   records. A degraded frame now makes `EventRepository::list` return `Err`
+//!   on an app-role session, i.e. an OUTAGE of those three surfaces rather than
+//!   a leak through them, and
 //!   `verify` is no longer the only thing standing behind them. See
 //!   `## Status at migration 094`.
 //!   **AMENDED by `tenancy/fix-coverage-hygiene` (2026-09-17); the three
@@ -678,16 +680,25 @@
 //! is asserted from the migration source by [`d4_migration_094_installs_no_policy`]
 //! on 086's template. What each policy ADMITS is unchanged whenever the
 //! function's owner is admitted by `epigraph_definer_bypass()`, which is every
-//! correctly migrated database.
+//! correctly migrated database, and whenever the session user is a superuser
+//! or a maintenance member, whatever the owner.
 //!
 //! 094 replaces `epigraph_claim_tenancy_by_ids` (086) and
 //! `epigraph_group_roster_admits_principal` (092) with plpgsql bodies that test
-//! `epigraph_definer_bypass()` BEFORE they read. Deferred-commitment screen key
+//! `epigraph_definer_bypass() OR epigraph_bypass()` BEFORE they read. Those
+//! are the two privileged arms of the policy each body reads through
+//! (`claims_tenancy`, `group_memberships_tenancy`). The first tests the owner
+//! (`current_user` in the frame), the second the session user. So the guard
+//! refuses exactly when the read would be policy-filtered, and is no stricter
+//! than the read. Deferred-commitment screen key
 //! `definer-authority-degrade-fail-open`.
 //!
 //! * **D1 — the PR-24/PR-25 residual is DISCHARGED, in the direction the
-//!   bullets above said it could not be.** An unadmitted frame no longer
-//!   answers from a policy-filtered read. 086's classifier RAISES `42501`
+//!   bullets above said it could not be.** A frame that neither arm admits (an
+//!   `epigraph_app` session under a non-member owner) no longer answers from a
+//!   policy-filtered read. A superuser or maintenance-member session keeps its
+//!   answer, which was complete and correct before 094 too. 086's classifier
+//!   RAISES `42501`
 //!   (a set-returning function has no deny value, and "nothing hidden" is the
 //!   leak), so `hidden_claim_ids` and `EventRepository::list` return `Err` and
 //!   every caller turns that into a refusal. The PR-10 trio pinned above is
@@ -706,8 +717,11 @@
 //!   was a recursion nobody designed as a control.
 //! * **The price is recorded, not hidden.** While an owner is wrong, 094 makes
 //!   the event surfaces fail and makes group creation fail (`groups_tenancy`
-//!   refuses `INSERT … RETURNING`, 42501). Commit db2ac67b declined the second
-//!   half. 094 takes it as an explicit decision:
+//!   refuses `INSERT … RETURNING`, 42501), on `epigraph_app` sessions, which
+//!   serve requests from plan §9.2 step 11d on. On a cluster with no
+//!   `epigraph_maintenance` role, the event surfaces fail on every session.
+//!   Today's superuser DSNs are unaffected. Commit db2ac67b declined the
+//!   group-creation half. 094 takes it as an explicit decision:
 //!   `docs/tenancy/progress.json::decisions_taken.definer_bodies_fail_closed_2026_09_22`.
 //!   `rls_enforcement.rs::a_roster_predicate_whose_owner_is_not_admitted_answers_false`
 //!   asserts the refusal, so a later edit cannot quietly re-admit it.
@@ -2442,11 +2456,12 @@ fn d4_migration_094_installs_no_policy() {
                 "CREATE OR REPLACE FUNCTION PUBLIC.EPIGRAPH_GROUP_ROSTER_ADMITS_PRINCIPAL"
             )
             && sql
-                .matches("IF NOT PUBLIC.EPIGRAPH_DEFINER_BYPASS()")
+                .matches("IF NOT (PUBLIC.EPIGRAPH_DEFINER_BYPASS() OR PUBLIC.EPIGRAPH_BYPASS())")
                 .count()
                 == 2,
-        "094 must still replace both bodies and guard both on epigraph_definer_bypass(), or \
-         the negative assertions above are vacuous"
+        "094 must still replace both bodies and guard both on the two privileged arms of the \
+         policy each reads through, epigraph_definer_bypass() OR epigraph_bypass(), or the \
+         negative assertions above are vacuous"
     );
     assert!(
         sql.matches("STABLE SECURITY DEFINER").count() == 2
