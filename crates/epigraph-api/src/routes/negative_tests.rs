@@ -56,10 +56,23 @@ mod malformed_input_tests {
     }
 
     /// Create a direct router for the challenge endpoint (no auth middleware).
+    ///
+    /// It does carry the `AuthContext` the middleware would have left:
+    /// `submit_challenge` takes `RequirePrincipal`, which 401s without one, and
+    /// these cases are about body validation, not authentication.
     fn challenge_router() -> Router {
         let state = AppState::new(ApiConfig::default());
+        let auth = crate::middleware::bearer::AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(Uuid::new_v4()),
+            owner_id: None,
+            client_type: crate::middleware::bearer::ClientType::Agent,
+            scopes: vec!["claims:write".into()],
+            jti: Uuid::new_v4(),
+        };
         Router::new()
             .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+            .layer(axum::Extension(auth))
             .with_state(state)
     }
 

@@ -309,7 +309,7 @@ async fn system_stats() {}
     responses(
         (status = 201, description = "Challenge submitted successfully", body = ChallengeResponse),
         (status = 400, description = "Invalid challenge request", body = ErrorResponse),
-        (status = 401, description = "Invalid or missing signature", body = ErrorResponse),
+        (status = 401, description = "Invalid or missing credential, or a token that carries no agent_id", body = ErrorResponse),
         (status = 404, description = "Claim not found", body = ErrorResponse),
     ),
     security(

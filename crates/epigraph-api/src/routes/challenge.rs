@@ -19,6 +19,11 @@
 //! Its owner is `D-PR16-claim-authorship-is-not-a-credential`, an open operator
 //! decision.
 //!
+//! `submit_challenge` does hold a PRINCIPAL (`RequirePrincipal`), and uses it
+//! for exactly one thing: the `actor_id` of the `claim.challenged` event it
+//! writes. See the handler's `# Attribution` section. `challenges.challenger_id`
+//! still comes from the request body and is still D-PR16's.
+//!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
 use axum::{
@@ -150,10 +155,43 @@ fn format_challenge_type(ct: ChallengeType) -> String {
 /// # Errors
 ///
 /// - 400 Bad Request: Invalid challenge type, empty explanation, or duplicate challenge
-/// - 401 Unauthorized: Missing or invalid signature (handled by middleware)
+/// - 401 Unauthorized: Missing or invalid credential (handled by middleware), or
+///   a token that carries no `agent_id` (`RequirePrincipal`)
 /// - 201 Created: Challenge submitted successfully
+///
+/// # Attribution (review follow-up to `events-actor-id-binding`)
+///
+/// The `claim.challenged` event's `actor_id` is the **authenticated
+/// principal**. Before this change the handler took no principal extractor and
+/// wrote `Some(request.challenger_id)`, an unchecked body field, so any caller
+/// past `bearer_auth_middleware` could put an `events` row under any existing
+/// agent's name (`events_actor_id_fkey` bounds it to real `agents` rows and no
+/// further). That row cannot be told apart from a genuine one in
+/// `GET /api/v1/events`, in MCP `list_events`' `actor_id` filter or in snapshot
+/// replay. It was the same forgery `D-PR25-event-actor-id-unbound` closed on
+/// `POST /api/v1/events` and MCP `publish_event`, through a third door.
+///
+/// **What this does NOT decide.** `challenges.challenger_id` is still
+/// `request.challenger_id`, and a caller naming another agent as the challenger
+/// is still accepted. That is delegated authorship, the same question as
+/// `claims.agent_id`, and it is the open operator decision
+/// `D-PR16-claim-authorship-is-not-a-credential`. So on a delegated challenge
+/// the event (who made the request) and the challenge row (who was named) can
+/// disagree. That is the same split `routes/claims.rs::create_claim` makes
+/// between `agent_id` and `owner_group_id`, and it is the direction that keeps
+/// the event log honest without pre-empting the decision.
+///
+/// `RequirePrincipal`, not `Option<Extension<AuthContext>>`: an optional
+/// principal would let an agent-less token write an unattributed event, the
+/// fall-through `middleware/bearer.rs` documents that extractor as removing.
+/// **This is a behaviour change for a token with no `agent_id`** (a
+/// `ClientType::Service` credential, or an OAuth client registered before
+/// PR-02). Such a token was accepted here and is now 401, before anything is
+/// written. The signature is not `#[cfg]`-split: `RequirePrincipal` exists in
+/// both builds, and the `not(feature = "db")` build writes no `events` row.
 pub async fn submit_challenge(
     State(state): State<AppState>,
+    crate::middleware::bearer::RequirePrincipal { principal, .. }: crate::middleware::bearer::RequirePrincipal,
     Path(claim_id): Path<Uuid>,
     Json(request): Json<SubmitChallengeRequest>,
 ) -> Result<(StatusCode, Json<ChallengeResponse>), ApiError> {
@@ -218,11 +256,12 @@ pub async fn submit_challenge(
             message: format!("Failed to persist challenge: {e}"),
         })?;
 
-        // Also emit a DB event
+        // Also emit a DB event, attributed to the caller rather than to the
+        // body's `challenger_id`. See the `# Attribution` section above.
         let _ = epigraph_db::EventRepository::insert(
             &state.db_pool,
             "claim.challenged",
-            Some(request.challenger_id),
+            Some(principal),
             &serde_json::json!({
                 "challenge_id": challenge_id,
                 "claim_id": claim_id,
@@ -243,6 +282,12 @@ pub async fn submit_challenge(
             resolved_by: None,
         }
     };
+
+    // This build has no `events` table. Its challenge goes to the in-memory
+    // `ChallengeService`, and the bus event below names the challenger, which
+    // mirrors the challenge row rather than attributing the request.
+    #[cfg(not(feature = "db"))]
+    let _ = principal;
 
     #[cfg(not(feature = "db"))]
     let response = {
@@ -431,7 +476,26 @@ mod tests {
         use http_body_util::BodyExt;
         use tower::ServiceExt;
 
-        /// Create a test router with challenge endpoints (no auth middleware for unit tests)
+        /// The `AuthContext` `bearer_auth_middleware` leaves on a request in
+        /// production. `submit_challenge` takes `RequirePrincipal`, which 401s
+        /// without one, so every router below that serves it carries this
+        /// layer on that route. The principal is a fresh agent per call: these
+        /// cases assert the challenge, not the event actor, and the
+        /// `not(feature = "db")` build writes no `events` row. The attribution
+        /// is asserted by `tests/challenge_event_actor_binding.rs`.
+        fn test_auth() -> crate::middleware::bearer::AuthContext {
+            crate::middleware::bearer::AuthContext {
+                client_id: Uuid::new_v4(),
+                agent_id: Some(Uuid::new_v4()),
+                owner_id: None,
+                client_type: crate::middleware::bearer::ClientType::Agent,
+                scopes: vec!["claims:read".into(), "claims:write".into()],
+                jti: Uuid::new_v4(),
+            }
+        }
+
+        /// Create a test router with challenge endpoints (no auth middleware
+        /// for unit tests; the submit route carries a [`test_auth`] principal)
         fn test_router() -> Router {
             let state = AppState::new(ApiConfig {
                 require_packet_signatures: false,
@@ -440,6 +504,7 @@ mod tests {
 
             Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                .layer(axum::Extension(test_auth()))
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
                 .with_state(state)
         }
@@ -645,6 +710,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                .layer(axum::Extension(test_auth()))
                 .with_state(state);
 
             let body = serde_json::json!({
@@ -701,6 +767,7 @@ mod tests {
 
                 let router = Router::new()
                     .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                    .layer(axum::Extension(test_auth()))
                     .with_state(state);
 
                 let claim_id = Uuid::new_v4();
@@ -972,6 +1039,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                .layer(axum::Extension(test_auth()))
                 .with_state(state);
 
             // Agent A challenges
@@ -1011,6 +1079,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                .layer(axum::Extension(test_auth()))
                 .with_state(state);
 
             let claim_id = Uuid::new_v4();
@@ -1106,6 +1175,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                .layer(axum::Extension(test_auth()))
                 .with_state(state.clone());
 
             let claim_id = Uuid::new_v4();
@@ -1145,6 +1215,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
+                .layer(axum::Extension(test_auth()))
                 .with_state(state.clone());
 
             let claim_id = Uuid::new_v4();

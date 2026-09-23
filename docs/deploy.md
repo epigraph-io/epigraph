@@ -1134,15 +1134,17 @@ it is on every deployment today, a wrong owner has NO runtime symptom. That is
 why the `verify` run above is required and not optional: it is the only thing
 that finds the wrong owner before step 11d turns it into an outage.
 
-## Event attribution: `POST /api/v1/events` and MCP `publish_event` bind `actor_id` to the caller
+## Event attribution: `POST /api/v1/events`, MCP `publish_event` and `POST /api/v1/claims/:id/challenge` bind the event's actor to the caller
 
 Deferred-commitment batch `fix/deferred-2026-09-22-lane-b`, screen key
 `events-actor-id-binding`. This is a code-only change. It ships no migration and
-takes effect when the binaries roll. The two write surfaces of the event log now
-apply one rule: **an event's `actor_id` is the authenticated principal.** An
-omitted (or `null`) `actor_id` is filled from the principal. An `actor_id` equal
-to it is accepted. Any other value is refused before anything is written.
-Before this change both surfaces persisted whatever `actor_id` they were sent.
+takes effect when the binaries roll. The two write surfaces of the event log,
+and the challenge route that writes to it directly, now apply one rule: **the
+event's `actor_id` is the authenticated principal.** On the two event surfaces
+an omitted (or `null`) `actor_id` is filled from the principal, an `actor_id`
+equal to it is accepted, and any other value is refused before anything is
+written. Before this change all three persisted whatever actor they were sent
+(the challenge route used the body's `challenger_id`).
 `events_actor_id_fkey` only required that it name a real agent, so any caller
 could record an event as any existing agent.
 
@@ -1170,6 +1172,28 @@ The handler took no auth extractor. It now takes `RequirePrincipal`.
   signer agent. A stdio caller that names any other agent is refused as well.
   **The affected caller** is a stdio client that passed a different agent's id
   as `actor_id`. **Remedy:** omit it.
+
+### 1c. BREAKING — `POST /api/v1/claims/:id/challenge` files its event under the caller, and refuses a token with no principal
+
+This route was found in review of the change above. It took no principal
+extractor and wrote its `claim.challenged` event with `actor_id` = the body's
+`challenger_id`. It now takes `RequirePrincipal`.
+
+* **The `claim.challenged` event's `actor_id`** was the body's `challenger_id`.
+  It is now the caller's own agent. **Nothing is refused for naming another
+  challenger.** The challenge row's `challenger_id` still comes from the body,
+  because whether a caller may challenge on another agent's behalf is the open
+  operator decision `D-PR16-claim-authorship-is-not-a-credential`. So on such a
+  request the event and the challenge row name different agents. **The affected
+  reader** is anything that joined `claim.challenged` events to challenges by
+  actor. **Remedy:** join on the payload's `challenge_id`.
+* **A token whose `agent_id` is `None`** was a `201`. It is now a `401` with
+  `token carries no agent_id`, and neither the challenge nor the event is
+  written. The affected credentials, the remedy and the log line are the same
+  as in §1a, with `route="/api/v1/claims/<id>/challenge"`.
+
+MCP `challenge_claim` is unchanged. It never took a caller-supplied actor: it
+files both the challenge and the event under the MCP server's own agent.
 
 Rows written before this change are not rewritten. An event whose `actor_id` was
 forged, or left `NULL`, keeps it.
