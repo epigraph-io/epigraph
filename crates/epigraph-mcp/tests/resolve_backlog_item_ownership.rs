@@ -45,12 +45,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
-use common::build_test_server;
+use common::build_scoped_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Bootstrap the server's signer agent so `resolve_backlog_item`'s
     // internal `agent_id().await` resolves to a real registered UUID.
@@ -96,7 +96,7 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Submit a backlog claim THROUGH the server (so its agent_id is the
     // server's own signer). Then retire it: must succeed.
@@ -164,7 +164,7 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_random_agent(&pool).await;
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
@@ -204,7 +204,7 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let agent = seed_random_agent(&pool).await;
     let claim = seed_claim_with_agent(&pool, agent, &["backlog"]).await;
@@ -245,7 +245,7 @@ async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPo
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_random_agent(&pool).await;
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;

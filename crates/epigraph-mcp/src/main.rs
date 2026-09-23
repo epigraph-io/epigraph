@@ -34,7 +34,6 @@ use clap::Parser;
 use rmcp::ServiceExt;
 
 use epigraph_crypto::AgentSigner;
-use epigraph_db::create_pool;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::EpiGraphMcpFull;
 
@@ -251,7 +250,7 @@ fn select_signer(
 ///
 /// Extracted (and pure over its inputs) so every arm is unit-testable without a
 /// process or a database, mirroring `select_signer`. This is not merely stylistic:
-/// `create_pool` connects EAGERLY, so a subprocess test of an *accepting* arm
+/// `ScopedPool::connect` connects EAGERLY, so a subprocess test of an *accepting* arm
 /// would sail past the gate and then hang/fail on the DB, proving nothing about
 /// the gate. `tests/jwt_secret_gate_test.rs` still covers the rejecting arms
 /// end-to-end, which is what proves `main` actually calls this.
@@ -327,23 +326,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Connect to database.
+    // ── Connect to database, through ScopedPool ─────────────────────────
     //
-    // MAINTENANCE-DSN-EXEMPT: this process serves callers, so its pool is
-    // deliberately the application pool. Its three genuine maintenance tools
-    // (dedup sweep, embedding backfill, belief recompute) reach a bypass
-    // through `crate::maintenance::maintenance_viewer`, which today fails
-    // CLOSED because `EpiGraphMcpFull::with_scoped_pool` has no caller.
+    // This process serves callers, so the DSN is deliberately the APPLICATION
+    // DSN (`--database-url`), not the maintenance one. What changed is the
+    // CONSTRUCTOR: `create_pool` is gone in favour of `ScopedPool::connect`, and
+    // that is load-bearing in two ways rather than stylistic.
     //
-    // PR-15 left that closed rather than half-opening it: those three tools run
-    // their queries on `self.pool`, so attaching a `ScopedPool` here would let
-    // them mint a privileged viewer and spend it on an unprivileged connection
-    // — the privileged-viewer/ordinary-pool hybrid PR-15 deleted from eleven
-    // CLI binaries — trading a hard error for a silent no-op under FORCE.
-    // Closing it properly is a change to the three tools' query plumbing and
-    // belongs with PR-17. See `crates/epigraph-mcp/src/maintenance.rs`.
+    // 1. **The write path cannot work without it.** Migration 077 gives every
+    //    claim-derived table a `WITH CHECK` keyed on `epigraph_writable_groups()`,
+    //    which is a session GUC. `apply_session_gucs` is private to
+    //    `epigraph-db` with exactly two callers, `ScopedPool::acquire_as` and
+    //    `ScopedPool::begin_as` — so a process holding only a `PgPool` has NO
+    //    way to stamp a connection, and once the DSN moved to `epigraph_app`
+    //    every `reasoning_traces` INSERT on this surface began failing with
+    //    `42501` while the claim INSERT ahead of it was still admitted. See
+    //    `claim_helper::begin_author_stamped_tx`.
+    // 2. **`after_release` can only be installed at pool BUILD time.** That is
+    //    the hook that scrubs a released connection's tenancy GUCs, and sqlx
+    //    exposes no setter for it on an existing `PgPool`. A pool built any other
+    //    way cannot have the scrub retrofitted, so a recycled connection could
+    //    carry one principal's group set into the next session's statements.
+    //
+    // `server.pool` is `scoped.inner().clone()` — the SAME pool, not a second
+    // one. Building both would double the connection count and make the
+    // hybrid hazard below genuinely worse rather than merely unaddressed.
+    //
+    // THE THREE MAINTENANCE TOOLS ARE NOT ENABLED BY THIS, AND THAT IS
+    // DELIBERATE. `sweep_semantic_duplicates`, `recompute_beliefs` and
+    // `backfill_embeddings` still run their statements on `server.pool`, so
+    // minting a bypass viewer for them would spend it on an unprivileged
+    // connection: zero rows, no error. They are gated on
+    // `maintenance::maintenance_tools_run_on_the_maintenance_connection()`,
+    // which does NOT key on `scoped.is_some()` for exactly that reason, and
+    // `maintenance.rs`'s test module pins that this attachment does not un-gate
+    // them. Converting their query plumbing is PR-17's.
     tracing::info!("Connecting to database...");
-    let pool = create_pool(&cli.database_url).await?;
+    let guc_mode = epigraph_db::SessionGucMode::from_env(
+        std::env::var("EPIGRAPH_SESSION_GUC_MODE")
+            .unwrap_or_default()
+            .as_str(),
+    );
+    // `connect_with_options`, not `connect`, and the ONLY reason is to preserve
+    // the pool sizing this process already had. MEASURED, both sides:
+    // `create_pool` used `max_connections(10).acquire_timeout(5s)`;
+    // `ScopedPoolOptions::default()` is `max_connections: 10,
+    // acquire_timeout: 30s`. The connection CAP is identical, so capacity does
+    // not change — but the plain `connect` would have moved the acquire timeout
+    // 5s -> 30s, so a saturated MCP would start queueing requests for half a
+    // minute instead of failing fast. That is a latency regression no test in
+    // this workspace can observe, and it is not what this change is for.
+    // `ScopedPool::connect_with_options` exists for exactly this (PR-15 added it
+    // so the job pool could keep its own sizing). `statement_timeout: None`
+    // matches `create_pool`, which set none.
+    let scoped = epigraph_db::ScopedPool::connect_with_options(
+        &cli.database_url,
+        guc_mode,
+        epigraph_db::ScopedPoolOptions {
+            max_connections: 10,
+            acquire_timeout: std::time::Duration::from_secs(5),
+            statement_timeout: None,
+        },
+    )
+    .await?;
+    // The §0.5 boot probe, same as `epigraph-api/src/bin/server.rs`. Behind a
+    // transaction-mode pooler a session-scoped `set_config` silently vanishes
+    // between statements, so every policy collapses and the write path's
+    // `begin_as` stamp would be the only thing still working — a fail-CLOSED
+    // data-loss shape, not an error. Caught at boot rather than in traffic.
+    if guc_mode == epigraph_db::SessionGucMode::Transaction {
+        tracing::warn!(
+            "EPIGRAPH_SESSION_GUC_MODE=transaction — skipping the session-GUC probe. Unset \
+             this variable on a session-mode endpoint."
+        );
+    } else {
+        scoped.probe_session_gucs().await.map_err(|e| {
+            format!(
+                "FATAL: session GUCs do not survive between statements on one pooled \
+                 connection, so this deployment is behind a transaction-mode pooler. Set \
+                 EPIGRAPH_SESSION_GUC_MODE=transaction, or point --database-url at a \
+                 session-mode endpoint. ({e})"
+            )
+        })?;
+        tracing::info!("Session-GUC probe passed");
+    }
+    let pool = scoped.inner().clone();
     tracing::info!("Database connected");
 
     // Create or restore agent signer. Precedence lives in `select_signer`
@@ -509,7 +576,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     read_only,
                     federation.clone(),
                     llm_identity.clone(),
-                );
+                )
+                // Attached here too even though this probe only resolves an
+                // agent id. It is an `Arc<dyn ServerPrincipalSource>` handed to
+                // the middleware and reachable for the life of the listener, so
+                // a version of it that could not stamp a connection would be a
+                // second, quietly write-incapable server object.
+                .with_scoped_pool(scoped.clone());
                 let probe = if identity_declared {
                     probe
                 } else {
@@ -547,7 +620,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     read_only,
                     federation.clone(),
                     llm_identity.clone(),
-                );
+                )
+                // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101),
+                // and this closure builds a fresh server PER SESSION — so an
+                // attachment on the stdio path alone would leave every real
+                // caller on a server whose `scoped` is `None`, i.e. would turn
+                // the 42501 into a total `submit_claim` / `memorize` refusal.
+                // `ScopedPool` is `Clone` over one inner `PgPool`, so cloning
+                // per session shares the pool rather than opening another.
+                .with_scoped_pool(scoped.clone());
                 Ok(if identity_declared {
                     srv
                 } else {
@@ -637,7 +718,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cli.read_only,
             federation,
             llm_identity,
-        );
+        )
+        // The stdio transport writes too — epiclaw's scheduled agents reach
+        // `submit_claim` / `memorize` over stdio — so it needs the same stamped
+        // pool as the HTTP factory above, not a read-only subset of it.
+        .with_scoped_pool(scoped);
         // Rung-4 signer: the owner-equality fallback in
         // `require_owner_or_admin` has no stable identity to compare against.
         // See `EpiGraphMcpFull::with_generated_signer_identity`.

@@ -476,16 +476,20 @@ async fn create_or_get_returns_existing_when_present(pool: PgPool) {
 // ────────────────────────────────────────────────────────────────────────────
 // create_or_get — post-107 idempotency (single-thread)
 //
-// Single-threaded tests cannot deterministically exercise the catch path in
-// create_or_get (the unique-violation recovery from a concurrent INSERT) —
-// the find-by-(content_hash, agent_id) lookup runs first and returns the
-// existing row before the INSERT is attempted. This test instead verifies
-// that post-107 idempotency holds: a second create_or_get for the same
+// A plain single-threaded arm cannot reach the catch path in create_or_get (the
+// unique-violation recovery from a concurrent INSERT) — the
+// find-by-(content_hash, agent_id) lookup runs first and returns the existing
+// row before the INSERT is attempted. This arm instead verifies that post-107
+// idempotency holds: a second create_or_get for the same
 // (content_hash, agent_id) returns the canonical row with was_created=false
 // regardless of which internal branch (find-then-return or
-// INSERT-catch-refind) actually fires. The catch path is verified by
-// inspection of the create_or_get implementation; a true concurrent test
-// would be inherently racy and is intentionally omitted (spec lines 99–101).
+// INSERT-catch-refind) actually fires.
+//
+// The catch path itself is NO LONGER left to inspection. It is driven
+// deterministically — a losing race, synthesised with a trigger rather than with
+// concurrency — by `the_dedup_race_is_absorbed_inside_a_caller_transaction`
+// below, which is the arm that distinguishes "absorbed" from "the caller's whole
+// transaction is aborted".
 // ────────────────────────────────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -524,4 +528,234 @@ async fn create_or_get_is_idempotent_post_107(pool: PgPool) {
     let first_id: Uuid = first.id.into();
     let second_id: Uuid = second.id.into();
     assert_eq!(first_id, second_id);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// create_or_get — the dedup race, INSIDE a caller's transaction
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The advisory-lock key the race barrier uses. Arbitrary; scoped to the private
+/// `#[sqlx::test]` database.
+const RACE_BARRIER_KEY: i64 = 424_242;
+
+/// Hold the caller's `INSERT INTO claims` still, INSIDE the statement, until the
+/// test says go.
+///
+/// # Why a barrier and not a trigger that simply raises `23505`
+///
+/// The catch path's whole point is that a row committed by ANOTHER writer is
+/// findable on the re-read, and nothing the failing statement itself does can
+/// play that part: a trigger that inserted the winner would have that insert
+/// rolled back with the savepoint (MEASURED — the re-find then reported
+/// `DuplicateKey from create_strict but no row found on re-find`), and a trigger
+/// that only raised `23505` leaves nothing to find either. The winner has to be
+/// committed by a different session while the caller's INSERT is in flight, which
+/// is precisely the interleaving the production race is.
+///
+/// So the barrier is deterministic rather than timed: a `BEFORE INSERT` trigger
+/// scoped by `WHEN (NEW.id = <the caller's id>)` takes a session advisory lock
+/// the test already holds. The caller's statement parks there; the test commits
+/// the winner on its own connection — whose insert carries a different id and so
+/// does NOT fire the trigger — and then releases the lock. No `pg_sleep`, no
+/// polling window that can be too short on a loaded machine: the wait is the
+/// lock.
+///
+/// The trigger releases the lock immediately after taking it, so the pooled
+/// connection is not returned holding one. Never cleaned up: `#[sqlx::test]`
+/// throws the database away.
+async fn install_race_barrier(pool: &PgPool, caller_claim: Uuid) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION zz_race_barrier_for_test() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_lock($1);
+             PERFORM pg_advisory_unlock($1);
+             RETURN NEW;
+         END $$"
+            .replace("$1", &RACE_BARRIER_KEY.to_string())
+            .as_str(),
+    )
+    .execute(pool)
+    .await
+    .expect("create the barrier trigger function");
+    // The id is a test-local UUID, never caller data, and a trigger `WHEN` clause
+    // takes no binds.
+    sqlx::query(&format!(
+        "CREATE TRIGGER zz_race_barrier_for_test BEFORE INSERT ON claims
+         FOR EACH ROW WHEN (NEW.id = '{caller_claim}'::uuid)
+         EXECUTE FUNCTION zz_race_barrier_for_test()"
+    ))
+    .execute(pool)
+    .await
+    .expect("install the barrier trigger");
+}
+
+/// Wait until some backend is BLOCKED on the race barrier — i.e. the caller's
+/// INSERT has reached the trigger and parked.
+///
+/// Reads `pg_locks` rather than sleeping, so the handshake is observed and not
+/// assumed. The bound exists only so a broken fixture fails instead of hanging
+/// the suite.
+async fn wait_until_blocked_on_the_barrier(pool: &PgPool) {
+    for _ in 0..600 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks \
+              WHERE locktype = 'advisory' AND objid = $1::bigint AND NOT granted",
+        )
+        .bind(RACE_BARRIER_KEY)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no backend ever blocked on the race barrier, so the caller's INSERT never reached the \
+         trigger and this arm would have proved nothing"
+    );
+}
+
+/// A lost `(content_hash, agent_id)` race must still DEDUP when the caller holds
+/// a transaction — and the caller's transaction must still be usable afterwards.
+///
+/// # The defect this pins
+///
+/// `create_or_get`'s race recovery catches `DbError::DuplicateKey` from
+/// `create_strict` and re-runs `find_by_content_hash_and_agent` **on the same
+/// connection**. That is expressible on an autocommit pool checkout and NOT
+/// inside a transaction: PostgreSQL aborts the whole transaction on the first
+/// failed statement, so the re-find cannot execute and the caller gets
+/// `25P02 current transaction is aborted, commands ignored until end of
+/// transaction block` instead of `(existing, false)`. The method's entire dedup
+/// contract therefore evaporated the moment a writer wrapped it in a transaction
+/// — which `epigraph-mcp`'s submission path now does for every `submit_claim` and
+/// `memorize`. The repair is a SAVEPOINT around the insert attempt.
+///
+/// # Why the last assertions are the ones that matter
+///
+/// `was_created == false` alone could be satisfied by a savepoint that swallowed
+/// the failure and left the transaction aborted — the error would then surface at
+/// the caller's NEXT statement, which is exactly the failure mode being repaired.
+/// So the arm runs one more statement and commits, on the same transaction, and
+/// reads the row back afterwards.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dedup_race_is_absorbed_inside_a_caller_transaction(pool: PgPool) {
+    let agent_id = Uuid::new_v4();
+    insert_test_agent(&pool, agent_id).await;
+    let content = format!("cog race {}", Uuid::new_v4());
+    let claim = make_claim(&content, agent_id);
+    let caller_claim_id: Uuid = claim.id.into();
+
+    add_unique_constraint(&pool).await;
+    install_race_barrier(&pool, caller_claim_id).await;
+
+    // THE OTHER WRITER's connection, holding the barrier so the caller parks
+    // inside its INSERT.
+    let mut other = pool
+        .acquire()
+        .await
+        .expect("acquire the winner's connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(RACE_BARRIER_KEY)
+        .execute(&mut *other)
+        .await
+        .expect("take the barrier");
+
+    let caller_pool = pool.clone();
+    let caller_claim = claim.clone();
+    let caller = tokio::spawn(async move {
+        let viewer = fixture::public_viewer(&caller_pool).await;
+        let mut tx = caller_pool
+            .begin()
+            .await
+            .expect("begin the caller's transaction");
+        let outcome = ClaimRepository::create_or_get(
+            &mut tx,
+            &viewer,
+            &caller_claim,
+            epigraph_core::TenancyDecl::Inherited,
+        )
+        .await;
+        let (returned, was_created) = outcome.expect(
+            "a lost race must be absorbed and reported as a dedup hit. A `25P02 current \
+             transaction is aborted` here is the defect: the catch path's re-find cannot run \
+             because the failed INSERT aborted the caller's transaction.",
+        );
+        let returned_id: Uuid = returned.id.into();
+
+        // THE HALF THAT DISTINGUISHES FIXED FROM UNFIXED: the transaction is
+        // still usable, so the submission can go on to write its trace and
+        // commit.
+        sqlx::query("UPDATE claims SET labels = ARRAY['race-survivor'] WHERE id = $1")
+            .bind(returned_id)
+            .execute(&mut *tx)
+            .await
+            .expect(
+                "the caller's transaction must still be usable after the absorbed race — the \
+                 refused INSERT was rolled back to a savepoint, not left aborting everything \
+                 after it",
+            );
+        tx.commit().await.expect("commit the caller's transaction");
+        (returned_id, was_created)
+    });
+
+    wait_until_blocked_on_the_barrier(&pool).await;
+
+    // The winner commits, THEN the barrier lifts. Its id differs, so the
+    // `WHEN` clause keeps it out of the trigger.
+    let winner = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current) \
+         VALUES ($1, $2, $3, 0.5, $4, true)",
+    )
+    .bind(winner)
+    .bind(&content)
+    .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+    .bind(agent_id)
+    .execute(&mut *other)
+    .await
+    .expect("the other writer commits the winning row");
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(RACE_BARRIER_KEY)
+        .execute(&mut *other)
+        .await
+        .expect("release the barrier");
+    drop(other);
+
+    let (returned_id, was_created) = caller.await.expect("the caller task must not panic");
+
+    assert!(
+        !was_created,
+        "the winning row already existed by the time the INSERT ran, so this call did not \
+         create one"
+    );
+    assert_eq!(
+        returned_id, winner,
+        "the row returned must be the RACE WINNER's, not the id this call tried to insert — \
+         that is what 'absorbed' means. The caller's own id here would mean the insert somehow \
+         succeeded and the constraint did not fire."
+    );
+
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(returned_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the committed row back");
+    assert_eq!(
+        labels,
+        vec!["race-survivor".to_string()],
+        "the whole transaction must have committed, not just the statements before the race"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows for this content");
+    assert_eq!(
+        rows, 1,
+        "exactly one row for the content: the race winner. A second row means the dedup was \
+         bypassed rather than absorbed."
+    );
 }

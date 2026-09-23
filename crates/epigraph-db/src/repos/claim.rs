@@ -16,6 +16,33 @@ pub struct ClaimRepository;
 /// Postgres error) rather than a cap. Enforced at compile time.
 const _: () = assert!(ClaimRepository::MAX_AGENT_CLAIMS > 0);
 
+/// **The embedded population**, as one SQL predicate over `claims`: the rows
+/// CLAUDE.md's embedding invariant says should carry a vector.
+///
+/// Spliced by all three statements that decide whether a given claim is owed an
+/// embedding — [`ClaimRepository::find_claims_needing_embeddings`] (the
+/// maintenance enumerator), [`ClaimRepository::claim_text_for_embedding`] (the
+/// by-id read the unseal restoration uses) and
+/// [`ClaimRepository::claim_text_if_embedding_missing`] (the by-id read the MCP
+/// write path's repair arm uses). One string rather than three copies because
+/// the three answers must agree: a copy that omitted the telemetry clauses would
+/// make a write path embed the very population the enumerator excludes
+/// (host-provenance claims are `is_current = true` with `embedding IS NULL` BY
+/// DESIGN and dominate the gap), and one that omitted the `claim_encryption`
+/// clause would put a plaintext-derived vector on a sealed row, which CLAUDE.md
+/// calls a confidentiality violation rather than an embedding gap.
+///
+/// Deliberately does NOT include `embedding IS NULL`: "is this claim in the
+/// embedded population" and "is its vector missing right now" are different
+/// questions, and `claim_text_for_embedding`'s caller already holds a row it
+/// intends to (re)embed.
+const EMBEDDABLE_POPULATION: &str = "COALESCE(is_current, true) = true \
+     AND NOT ('telemetry' = ANY(labels)) \
+     AND (properties->>'event') IS NULL \
+     AND NOT EXISTS ( \
+         SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
+     )";
+
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
@@ -5008,14 +5035,46 @@ impl ClaimRepository {
     ///
     /// Takes `&mut PgConnection` for transactional composition.
     ///
+    /// # Why the insert attempt runs inside a SAVEPOINT
+    ///
+    /// The race-handling above is only expressible if the connection is still
+    /// usable after the failed INSERT, and inside a transaction it is not:
+    /// PostgreSQL aborts the whole transaction on the first failed statement, so
+    /// the `find_by_content_hash_and_agent` re-read in the catch path could not
+    /// run at all. MEASURED, by removing this savepoint and running
+    /// `claim_repo_helpers.rs::the_dedup_race_is_absorbed_inside_a_caller_transaction`:
+    /// the call fails with `25P02 current transaction is aborted, commands
+    /// ignored until end of transaction block`. So a genuine
+    /// `(content_hash, agent_id)` race — the only thing this method's dedup
+    /// contract exists for — stopped de-duplicating and started failing the
+    /// caller's whole unit of work the moment a writer wrapped it in a
+    /// transaction. `epigraph-mcp`'s submission path is that writer.
+    ///
+    /// The savepoint restores the contract without changing it: the refused
+    /// INSERT is rolled back alone, the re-find runs on a usable connection, and
+    /// the caller gets `(existing, false)`. Same construction as
+    /// `EventRepository::publish_or_log_conn` and
+    /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`, for the
+    /// same reason.
+    ///
+    /// On a connection that is NOT already in a transaction, `conn.begin()` is a
+    /// real `BEGIN`/`COMMIT` pair around the one INSERT — same durability, one
+    /// extra round trip, and the same visible behaviour the pre-savepoint code
+    /// had.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` for non-unique-violation database errors.
+    /// Returns `DbError::QueryFailed` for non-unique-violation database errors,
+    /// and for a failure to take or release the savepoint (the caller's
+    /// transaction is then already unusable and must not be handed back as if
+    /// the write had succeeded).
     pub async fn create_or_get(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
+        use sqlx::Acquire;
+
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
@@ -5030,7 +5089,28 @@ impl ClaimRepository {
             return Ok((existing, false));
         }
 
-        match Self::create_strict(&mut *conn, claim, decl).await {
+        let attempt = {
+            let mut sp = conn
+                .begin()
+                .await
+                .map_err(|source| DbError::QueryFailed { source })?;
+            match Self::create_strict(&mut sp, claim, decl).await {
+                Ok(c) => {
+                    sp.commit()
+                        .await
+                        .map_err(|source| DbError::QueryFailed { source })?;
+                    Ok(c)
+                }
+                Err(e) => {
+                    sp.rollback()
+                        .await
+                        .map_err(|source| DbError::QueryFailed { source })?;
+                    Err(e)
+                }
+            }
+        };
+
+        match attempt {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
                 // Post-107 race: another writer won. Re-find and return.
@@ -5385,7 +5465,7 @@ impl ClaimRepository {
         // excluded. Also restrict to current claims: per the embedding
         // invariant, `is_current = false` rows should have `embedding = NULL`
         // by design, so they never "need" an embedding. (backlog a4aaa487)
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
             r#"
             -- VISIBILITY-EXEMPT: embedding backfill must see every unembedded
             -- row; a per-tenant view of the gap would leave every other
@@ -5394,23 +5474,21 @@ impl ClaimRepository {
             -- maintenance connection (debug_assert above, and the generic
             -- executor so the caller can pass that very connection).
             --
-            -- Encrypted claims are excluded instead. Keyed on `claim_encryption`,
-            -- NEVER on `visibility`: a group-private claim is still plaintext in
+            -- The population predicate is `EMBEDDABLE_POPULATION`, shared with
+            -- the two by-id reads so the enumerator and the write paths cannot
+            -- disagree about which rows are owed a vector. Encrypted claims are
+            -- excluded there, keyed on `claim_encryption` and NEVER on
+            -- `visibility`: a group-private claim is still plaintext in
             -- `claims.content` and must be embedded, whereas a sealed claim has
             -- no plaintext to embed and calling the embedder on its ciphertext
             -- would both fail and leak length.
             SELECT id, content FROM claims
             WHERE embedding IS NULL
-              AND COALESCE(is_current, true) = true
-              AND NOT ('telemetry' = ANY(labels))
-              AND (properties->>'event') IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id
-              )
+              AND {EMBEDDABLE_POPULATION}
             ORDER BY created_at
             LIMIT $1
-            "#,
-        )
+            "#
+        ))
         .bind(limit)
         .fetch_all(executor)
         .await?;
@@ -5463,15 +5541,63 @@ impl ClaimRepository {
         claim_id: Uuid,
     ) -> Result<Option<String>, DbError> {
         let sql = viewer.splice(
-            "SELECT content FROM claims \
-              WHERE id = $1 \
-                AND COALESCE(is_current, true) = true \
-                AND NOT ('telemetry' = ANY(labels)) \
-                AND (properties->>'event') IS NULL \
-                AND NOT EXISTS ( \
-                    SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id \
-                ) \
-                /* {VISIBILITY:claims} */",
+            &format!(
+                "SELECT content FROM claims WHERE id = $1 AND {EMBEDDABLE_POPULATION} \
+                 /* {{VISIBILITY:claims}} */"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<(String,)> = q.fetch_optional(executor).await?;
+        Ok(row.map(|(content,)| content))
+    }
+
+    /// [`claim_text_for_embedding`](Self::claim_text_for_embedding) narrowed to
+    /// claims that are **missing** their vector: the text to embed, or `None` if
+    /// this claim either already carries one or does not belong to the embedded
+    /// population at all.
+    ///
+    /// # Why a write path needs this and `was_created` is not enough
+    ///
+    /// The MCP submission path used to gate its post-commit embed on
+    /// `was_created` alone, on the reasoning that a dedup hit means "the
+    /// canonical row already has its embedding". That is false for exactly the
+    /// row the orphan-repair arms were added for. A production orphan is a claim
+    /// whose submission committed the claim and was then refused on
+    /// `reasoning_traces` with `42501` — and the refusal arrived BEFORE the
+    /// post-commit embed, so the row carries `is_current = true` AND
+    /// `embedding IS NULL`, which is CLAUDE.md's `live_missing` invariant
+    /// violation. Repairing its provenance and leaving that `NULL` in place
+    /// leaves it permanently invisible to `recall()`, while the tool reports
+    /// HTTP success.
+    ///
+    /// # The population rules are shared, not restated
+    ///
+    /// [`EMBEDDABLE_POPULATION`] is the single predicate this and
+    /// `claim_text_for_embedding` splice, so the repair path cannot drift into
+    /// embedding a row the enumerators exclude. That matters most for TELEMETRY:
+    /// host-provenance claims are `is_current = true` with `embedding IS NULL`
+    /// BY DESIGN (CLAUDE.md's telemetry exception — they dominate the gap), so a
+    /// naive `embedding IS NULL` test would make every telemetry resubmit pay an
+    /// embedding call and pollute semantic recall. Sealed claims are excluded for
+    /// the reason `claim_text_for_embedding`'s doc gives.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn claim_text_if_embedding_missing<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<Option<String>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT content FROM claims WHERE id = $1 AND embedding IS NULL \
+                 AND {EMBEDDABLE_POPULATION} /* {{VISIBILITY:claims}} */"
+            ),
             2,
         );
         let mut q = sqlx::query_as::<_, (String,)>(&sql).bind(claim_id);

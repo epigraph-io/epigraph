@@ -1170,6 +1170,24 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── THE THREE WRITES. Every other entry in this register is a READ with
+    // nothing to filter; these are the first writes, and the argument is a
+    // different one, so it is stated in full rather than borrowed.
+    (
+        "trace.rs",
+        "create",
+        "INSERT INTO `reasoning_traces`. A WRITE, which is what makes this entry different in          kind from every read above: the control on a write is not an in-query viewer predicate          but migration 077's `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,          evaluated by PostgreSQL against the CONNECTION's session GUCs. A `&Viewer` parameter          here would be spent on nothing -- `Viewer::splice` has no marker to fill on an INSERT          with no FROM -- while `Viewer::splice_write` is PR-16's, not this change's. WHY THE          EXECUTOR MOVED: the only connection that can satisfy that `WITH CHECK` is one stamped          by `ScopedPool::begin_as`, which hands back a transaction; a `&PgPool` parameter made          this function unreachable from the one connection shape that works, which is why every          MCP `reasoning_traces` INSERT failed with `42501` once the deployed DSN moved to          `epigraph_app`. `rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`          is the pin on both halves (arm 1 refuses unstamped, arm 3 admits author-stamped).          SCOPE: the executor widened, the SQL is byte-identical and was not re-derived.",
+    ),
+    (
+        "evidence.rs",
+        "create",
+        "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "edge.rs",
+        "create",
+        "INSERT INTO `edges`. Same write-side argument as the two above. It moved because a          verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted ABOUT a row the same          submission just wrote: once that row's INSERT lives in a transaction, an edge emitted          on a different connection points at a row no other session can see yet. NOTE FOR A          CALLER PASSING A TRANSACTION, which the function's own doc also carries: a failed          statement aborts the whole PostgreSQL transaction, so `let _ = create(...)` does NOT          preserve best-effort semantics there -- it defers the failure to COMMIT as          `current transaction is aborted` with the cause gone.          `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort` wraps it in a SAVEPOINT          for exactly that reason. SCOPE: executor only; the SQL is unchanged.",
+    ),
     (
         "method.rs",
         "get",

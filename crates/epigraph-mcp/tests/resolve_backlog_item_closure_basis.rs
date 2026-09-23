@@ -30,12 +30,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
-use common::build_test_server;
+use common::build_scoped_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn closure_basis_is_recorded_as_justifies_edges(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let server_agent = bootstrap_server_agent(&server, &pool).await;
 
     let original = seed_backlog_claim(&pool, server_agent).await;
@@ -136,7 +136,7 @@ async fn closure_basis_is_recorded_as_justifies_edges(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_basis_the_caller_cannot_see_is_refused_not_skipped(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let server_agent = bootstrap_server_agent(&server, &pool).await;
 
     let original = seed_backlog_claim(&pool, server_agent).await;
@@ -203,7 +203,7 @@ async fn a_basis_the_caller_cannot_see_is_refused_not_skipped(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_item_cannot_be_its_own_closure_basis(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let server_agent = bootstrap_server_agent(&server, &pool).await;
     let original = seed_backlog_claim(&pool, server_agent).await;
 
@@ -230,7 +230,7 @@ async fn an_item_cannot_be_its_own_closure_basis(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn omitting_the_basis_stays_wire_compatible(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let server_agent = bootstrap_server_agent(&server, &pool).await;
     let original = seed_backlog_claim(&pool, server_agent).await;
 

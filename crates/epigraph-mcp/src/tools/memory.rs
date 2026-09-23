@@ -123,10 +123,17 @@ pub async fn memorize(
         }
     }
 
+    // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
+    // Identical construction, identical reasoning and the same two defects as
+    // `tools::claims::submit_claim` — see the long comment at that call site for
+    // why claim + labels + Trace + Evidence + `update_trace_id` must share one
+    // author-stamped transaction, and why the DS auto-wire and the embedding stay
+    // outside it.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, agent_id, "memorize").await?;
+
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "memorize")
-            .await?;
+        crate::claim_helper::create_claim_idempotent(&mut tx, viewer, &claim, "memorize").await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
@@ -137,15 +144,31 @@ pub async fn memorize(
     // silently vanished is unfindable by the `query_claims_by_label` call the
     // caller stored it for, so reporting success would be a lie; and because
     // `create_claim_idempotent` dedupes on (content_hash, agent_id) and
-    // `update_labels` unions labels, a caller that retries on this error lands
-    // on the same claim and gets its tags applied rather than a duplicate.
+    // `update_labels_conn` unions labels, a caller that retries on this error
+    // lands on the same claim and gets its tags applied rather than a duplicate.
+    // In the transaction now, so a rejected tag set also rolls the claim back
+    // rather than leaving an untagged one behind.
     if !tags.is_empty() {
-        ClaimRepository::update_labels(&server.pool, claim_uuid, &tags, &[])
+        ClaimRepository::update_labels_conn(&mut tx, claim_uuid, &tags, &[])
             .await
             .map_err(db_caller_error)?;
     }
 
-    let (final_truth, ds, embedded) = if was_created {
+    // `was_created` alone used to gate the whole provenance block, which is why
+    // `memory.rs`'s own doc recorded that a dedup hit "skips Evidence + Trace +
+    // update_trace_id + DS + embed". For a claim that is a PRE-EXISTING ORPHAN
+    // — committed by a submission whose trace was refused with 42501 — that made
+    // every retry return `{"embedded": false}` and HTTP success for a row with
+    // no provenance at all, so the retry a caller performs to repair the row
+    // could not repair it. The provenance half is now gated on
+    // `was_created || claim.trace_id.is_none()`, and the embed below on
+    // `was_created || <the canonical row has no vector>` — an orphan lost its
+    // embedding to the same refusal, and repairing provenance while leaving
+    // `embedding IS NULL` leaves the claim unrecallable. Only DS auto-wire stays
+    // gated on `was_created` alone, because re-running it on an existing claim
+    // would combine the same mass twice.
+    let needs_provenance = was_created || claim.trace_id.is_none();
+    if needs_provenance {
         let evidence_text = if tags.is_empty() {
             "Memory stored via MCP memorize tool".to_string()
         } else {
@@ -175,17 +198,26 @@ pub async fn memorize(
             format!("Memory stored via memorize tool. Tags: {}", tags.join(", ")),
         );
 
-        ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
+        ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&server.pool, &evidence)
+        EvidenceRepository::create(&mut *tx, &evidence)
             .await
             .map_err(internal_error)?;
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+        ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
+    }
 
-        let ds = match ds_auto::auto_wire_ds_for_claim(
+    // COMMIT. Everything below this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
+
+    // DS auto-wire: FIRST-CREATE ONLY (re-running would combine the same mass
+    // twice). The embed below is deliberately NOT gated the same way — see the
+    // comment there and `tools::claims::submit_claim`, which carries the long
+    // form of both halves.
+    let ds = if was_created {
+        match ds_auto::auto_wire_ds_for_claim(
             &server.pool,
             viewer,
             claim_uuid,
@@ -204,30 +236,61 @@ pub async fn memorize(
                 tracing::warn!(claim_id = %claim_uuid, "ds auto-wire memorize failed: {e}");
                 None
             }
-        };
-
-        // Reuse the novelty gate's already-generated vector when available,
-        // matching submit_claim's pattern — avoids a second OpenAI call.
-        let embedded = if let Some(pgvec) = pending_embedding.take() {
-            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                    false
-                }
-            }
-        } else {
-            server
-                .embedder
-                .embed_and_store(claim_uuid, &params.content)
-                .await
-        };
-
-        (raw_truth, ds, embedded)
+        }
     } else {
-        // Option A: skip Evidence + Trace + update_trace_id + DS + embed.
-        // AUTHORED already fired in the helper. Report canonical truth.
-        (claim.truth_value.value(), None, false)
+        // Option A: a dedup hit. AUTHORED already fired in the helper, and Trace
+        // + Evidence + `update_trace_id` ran above IF and only if the canonical
+        // claim had no trace. No DS: it would double-count.
+        None
+    };
+
+    // EMBEDDING. `was_created` OR "the canonical row is missing its vector" —
+    // the repaired orphan is exactly the row for which those differ, and
+    // `submit_claim` carries the full argument. Telemetry and sealed rows are
+    // excluded inside `claim_text_if_embedding_missing`; an unreadable answer is
+    // treated as "do not embed" and left to the maintenance backfill.
+    let embed_text: Option<String> = if was_created {
+        Some(params.content.clone())
+    } else {
+        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %claim_uuid,
+                    "could not read whether the canonical claim still needs an embedding; \
+                     skipping the repair embed: {e}"
+                );
+                None
+            }
+        }
+    };
+
+    // Reuse the novelty gate's already-generated vector when available, matching
+    // submit_claim's pattern — avoids a second OpenAI call.
+    let embedded = match embed_text {
+        None => false,
+        Some(text) => {
+            if let Some(pgvec) = pending_embedding.take() {
+                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                server.embedder.embed_and_store(claim_uuid, &text).await
+            }
+        }
+    };
+
+    // A dedup hit reports the CANONICAL truth, not this call's raw value.
+    let final_truth = if was_created {
+        raw_truth
+    } else {
+        claim.truth_value.value()
     };
 
     success_json(&MemorizeResponse {

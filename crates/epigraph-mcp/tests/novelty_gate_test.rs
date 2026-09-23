@@ -71,10 +71,17 @@ use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn build_test_server(pool: PgPool, signer_seed: [u8; 32]) -> EpiGraphMcpFull {
+/// Scoped, because the canonical write path requires it: `submit_claim` /
+/// `memorize` run their claim + trace + evidence + `update_trace_id` in ONE
+/// transaction stamped from the author's viewer, and `ScopedPool::begin_as` is
+/// the only thing that can open one. A server with no `ScopedPool` REFUSES those
+/// tools rather than falling back to the unstamped pool, which is how a `42501`
+/// on `reasoning_traces` used to become a committed claim with no provenance.
+async fn build_test_server(pool: PgPool, signer_seed: [u8; 32]) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&signer_seed).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None); // mock — no API key
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let scoped = fixture::scoped_pool(&pool).await;
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 async fn claims_with_content_hash_count(pool: &PgPool, content: &str) -> i64 {
@@ -124,7 +131,7 @@ async fn exact_resubmit_still_dedups_with_novelty_threshold_param_present() {
     let pool = test_pool_or_skip!();
     let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
-    let server = build_test_server(pool.clone(), [0x61u8; 32]);
+    let server = build_test_server(pool.clone(), [0x61u8; 32]).await;
 
     let content = format!("novelty-gate exact-resubmit test {}", Uuid::new_v4());
 
@@ -177,7 +184,7 @@ async fn distinct_content_inserts_normally_when_embedder_unavailable() {
     let pool = test_pool_or_skip!();
     let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
-    let server = build_test_server(pool.clone(), [0x62u8; 32]);
+    let server = build_test_server(pool.clone(), [0x62u8; 32]).await;
 
     for (i, threshold) in [None, Some(0.05), Some(0.0)].into_iter().enumerate() {
         let content = format!("novelty-gate distinct content {i} {}", Uuid::new_v4());
@@ -215,7 +222,7 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
     let pool = test_pool_or_skip!();
     let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
-    let server = build_test_server(pool.clone(), [0x63u8; 32]);
+    let server = build_test_server(pool.clone(), [0x63u8; 32]).await;
 
     let content = format!("novelty-gate memorize distinct {}", Uuid::new_v4());
     let params = MemorizeParams {

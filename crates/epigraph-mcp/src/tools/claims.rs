@@ -13,7 +13,7 @@ use epigraph_core::{
 };
 use epigraph_crypto::ContentHasher;
 use epigraph_db::PatchClaimInput;
-use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
 use uuid::Uuid;
 
 /// Resolve an agent-supplied methodology string to a [`Methodology`].
@@ -272,18 +272,48 @@ pub async fn submit_claim(
         // feature existed — insert, then embed best-effort post-insert.
     }
 
+    // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
+    //
+    // Claim + labels + Trace + Evidence + the two verb-edges + `update_trace_id`
+    // all run on ONE connection stamped from the AUTHOR's viewer. Two defects
+    // are closed by the same construction, which is why it is one change:
+    //
+    // 1. **42501.** Nothing on the MCP path stamped the session GUCs migration
+    //    077's policies read, so `epigraph_writable_groups` was `{}` and the
+    //    `reasoning_traces` INSERT was refused — on a connection where the claim
+    //    INSERT had already been admitted by an orphan `claims_privacy` policy.
+    // 2. **Non-atomic writes.** Every step used to take its own pool checkout,
+    //    so a refused trace left a COMMITTED claim with no trace, no evidence
+    //    and no AUTHORED edge, and returned an error carrying no claim id — the
+    //    caller could not even find what it had created.
+    //
+    // Follows `epigraph-api/src/routes/groups.rs::rotate_key`'s "why the whole
+    // body runs on `ScopedPool::begin_as`"; this is that pattern, not a new one.
+    //
+    // WHAT IS DELIBERATELY *OUTSIDE* IT, below the commit: the DS auto-wire and
+    // the embedding. The embedding is CLAUDE.md's policy (best-effort,
+    // post-commit, warn on failure, never block the write). The DS auto-wire is
+    // a larger conversion — it writes `claim_frames` / `mass_functions` through
+    // a pool-bound helper — and it also READS the claim back, which a sibling
+    // connection cannot do before this transaction commits. It therefore stays
+    // post-commit and stays warn-only; `claim_frames` / `mass_functions` remain
+    // in the unstamped-write blast radius until that conversion lands.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_claim").await?;
+
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "submit_claim")
+        crate::claim_helper::create_claim_idempotent(&mut tx, viewer, &claim, "submit_claim")
             .await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Already validated above, before the claim write. This call can now only
     // fail for server-side reasons; `db_caller_error` keeps those
     // INTERNAL_ERROR while still reporting a caller-caused `InvalidData`
-    // correctly if a future label rule is added to the repo layer.
+    // correctly if a future label rule is added to the repo layer. Inside the
+    // transaction, so a rejected label no longer leaves a labelled-nothing claim.
     if !params.labels.is_empty() {
-        ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
+        ClaimRepository::update_labels_conn(&mut tx, claim_uuid, &params.labels, &[])
             .await
             .map_err(db_caller_error)?;
     }
@@ -322,11 +352,13 @@ pub async fn submit_claim(
         explanation,
     );
 
-    // Persist Trace + Evidence on every submission.
-    ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
+    // Persist Trace + Evidence on every submission. In the transaction: a
+    // refusal here now rolls the claim back instead of committing it as an
+    // orphan.
+    ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
         .await
         .map_err(internal_error)?;
-    EvidenceRepository::create(&server.pool, &evidence_with_sig)
+    EvidenceRepository::create(&mut *tx, &evidence_with_sig)
         .await
         .map_err(internal_error)?;
 
@@ -336,40 +368,63 @@ pub async fn submit_claim(
     // The was_created marker on properties lets queries distinguish
     // first-create from resubmit edges.
     //
-    // Note: the API handler at routes/claims.rs:585-614 still follows the
-    // pre-S3a skip-on-resubmit rule. Aligning the API to MCP's accumulating
-    // semantics is spec backlog item #10.
-    let _ = EdgeRepository::create(
-        &server.pool,
+    // SAVEPOINT-wrapped rather than `let _ =`: inside a transaction a failed
+    // INSERT aborts everything that follows, so a swallowed edge error would
+    // surface at COMMIT as `current transaction is aborted` with the real cause
+    // lost. `emit_verb_edge_best_effort` keeps the architecture doc's
+    // best-effort policy without that trade.
+    //
+    // Note: the API handler at routes/claims.rs still follows the pre-S3a
+    // skip-on-resubmit rule. Aligning the API to MCP's accumulating semantics is
+    // spec backlog item #10.
+    crate::claim_helper::emit_verb_edge_best_effort(
+        &mut tx,
         claim_uuid,
         "claim",
         evidence_with_sig.id.as_uuid(),
         "evidence",
         "DERIVED_FROM",
         Some(serde_json::json!({"was_created": was_created})),
-        None,
-        None,
+        "submit_claim",
     )
-    .await;
-    let _ = EdgeRepository::create(
-        &server.pool,
+    .await?;
+    crate::claim_helper::emit_verb_edge_best_effort(
+        &mut tx,
         claim_uuid,
         "claim",
         trace.id.as_uuid(),
         "trace",
         "HAS_TRACE",
         Some(serde_json::json!({"was_created": was_created})),
-        None,
-        None,
+        "submit_claim",
     )
-    .await;
+    .await?;
 
-    let (final_truth, ds, embedded) = if was_created {
-        // First-create: full lineage. update_trace_id, DS auto-wire, embed.
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+    // A resubmit whose canonical claim has NO `trace_id` is a PRE-EXISTING
+    // ORPHAN — the residue of a submission that committed the claim and then
+    // lost its trace to the 42501. `was_created` is false for it, so the old
+    // code skipped `update_trace_id` and returned bare HTTP success forever: the
+    // retry a caller performs precisely to repair the row could not repair it.
+    // This submission already wrote a fresh Trace and Evidence above, so linking
+    // them is the repair. Gated on `trace_id.is_none()` alone, never widened to
+    // every resubmit: relinking a claim that already has a canonical trace would
+    // rewrite settled provenance.
+    let needs_trace_link = was_created || claim.trace_id.is_none();
+    if needs_trace_link {
+        ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
+    }
 
+    // COMMIT. Everything below this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
+
+    // DS auto-wire: FIRST-CREATE ONLY, and that asymmetry with the embed below is
+    // deliberate. Re-running it on an existing claim would combine the same mass
+    // into the same frame twice, so a resubmit must not; re-embedding a claim that
+    // has no vector is idempotent and is the only way a repaired orphan becomes
+    // recallable again.
+    let ds = if was_created {
         let ds_result = ds_auto::auto_wire_ds_for_claim(
             &server.pool,
             viewer,
@@ -401,39 +456,79 @@ pub async fn submit_claim(
                 );
             }
         }
-        let ds = ds_result.ok();
-
-        // Reuse the novelty gate's already-generated vector when we have
-        // one (avoids a second OpenAI call for the same content). Only the
-        // gate's own embedder-failure path (`pending_embedding = None`)
-        // falls back to `embed_and_store`'s independent generate-and-store.
-        let embedded = if let Some(pgvec) = pending_embedding.take() {
-            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                    false
-                }
-            }
-        } else {
-            server
-                .embedder
-                .embed_and_store(claim_uuid, &params.content)
-                .await
-        };
-
-        let final_truth = ds
-            .as_ref()
-            .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
-            .unwrap_or(raw_truth);
-
-        (final_truth, ds, embedded)
+        ds_result.ok()
     } else {
-        // Resubmit (Option B): verb-edges already emitted above. Skip
-        // update_trace_id (canonical trace immutable), skip DS auto-wire
-        // (canonical truth set on first create), skip embed (canonical
-        // embedding already exists). Report canonical truth, not raw.
-        (claim.truth_value.value(), None, false)
+        // Resubmit (Option B): verb-edges already emitted above, and the canonical
+        // trace stays as it is unless the claim had none (the orphan-repair arm
+        // above). No DS: canonical truth was set on first create.
+        None
+    };
+
+    // EMBEDDING. Gated on `was_created` OR "the canonical row is missing its
+    // vector", never on `was_created` alone.
+    //
+    // `was_created` alone is what made the orphan repair half a repair. A
+    // production orphan committed its claim and lost its trace to the 42501
+    // BEFORE this post-commit embed ran, so it carries `is_current = true` AND
+    // `embedding IS NULL` — CLAUDE.md's `live_missing` violation. The retry that
+    // repairs its provenance took the `was_created == false` branch, which
+    // returned `{"embedded": false}` with HTTP success and a comment asserting
+    // "canonical embedding already exists". For that row the comment was false
+    // and the claim stayed invisible to `recall()` forever.
+    //
+    // `claim_text_if_embedding_missing` is the gate rather than a bare
+    // `embedding IS NULL` read because the embedded population excludes
+    // telemetry and sealed rows — see `EMBEDDABLE_POPULATION` in
+    // `epigraph-db/src/repos/claim.rs`. A read failure means we cannot tell, and
+    // the conservative answer is not to embed (the maintenance backfill
+    // enumerates the same population and will pick it up).
+    let embed_text: Option<String> = if was_created {
+        Some(params.content.clone())
+    } else {
+        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %claim_uuid,
+                    "could not read whether the canonical claim still needs an embedding; \
+                     skipping the repair embed: {e}"
+                );
+                None
+            }
+        }
+    };
+
+    // Reuse the novelty gate's already-generated vector when we have one
+    // (avoids a second OpenAI call for the same content). Only the gate's own
+    // embedder-failure path (`pending_embedding = None`) and the repair arm —
+    // where the exact-resubmit shortcut means the gate never ran — fall back to
+    // `embed_and_store`'s independent generate-and-store.
+    let embedded = match embed_text {
+        None => false,
+        Some(text) => {
+            if let Some(pgvec) = pending_embedding.take() {
+                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                server.embedder.embed_and_store(claim_uuid, &text).await
+            }
+        }
+    };
+
+    // A resubmit reports the CANONICAL truth, not this submission's raw value.
+    let final_truth = if was_created {
+        ds.as_ref()
+            .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
+            .unwrap_or(raw_truth)
+    } else {
+        claim.truth_value.value()
     };
 
     success_json(&SubmitClaimResponse {

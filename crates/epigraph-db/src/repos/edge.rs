@@ -103,7 +103,7 @@ impl EdgeRepository {
     /// Create a new edge relationship
     ///
     /// # Arguments
-    /// * `pool` - Database connection pool
+    /// * `executor` - A pool, connection, or transaction handle
     /// * `source_id` - Source entity UUID
     /// * `source_type` - Source entity type (e.g., "claim", "agent")
     /// * `target_id` - Target entity UUID
@@ -111,12 +111,30 @@ impl EdgeRepository {
     /// * `relationship` - Relationship label (e.g., "supports", "refutes")
     /// * `properties` - Optional JSONB properties for the edge
     ///
+    /// # Why the executor is generic
+    ///
+    /// A verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted about a
+    /// row that the same submission just wrote. Once that row's INSERT lives in a
+    /// transaction, an edge emitted on a DIFFERENT connection points at a row no
+    /// other session can see yet — so the edge has to be able to join the
+    /// transaction. `&PgPool` and `&mut PgConnection` both satisfy
+    /// [`sqlx::PgExecutor`], so the existing pool-taking callers compile
+    /// unchanged.
+    ///
+    /// **If you pass a transaction and want the edge to stay BEST-EFFORT, wrap it
+    /// in a SAVEPOINT.** A failed statement aborts the whole PostgreSQL
+    /// transaction, so a `let _ = EdgeRepository::create(&mut *tx, …)` that
+    /// swallows the error does not preserve the old warn-and-continue behaviour —
+    /// it defers the failure to `COMMIT`, where it surfaces as
+    /// `current transaction is aborted` with the real cause gone. See
+    /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, properties))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, properties))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         source_id: Uuid,
         source_type: &str,
         target_id: Uuid,
@@ -143,7 +161,7 @@ impl EdgeRepository {
             valid_from,
             valid_to
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.id)
