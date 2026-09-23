@@ -865,40 +865,50 @@ pub async fn update_with_evidence(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    // ── THE EVIDENCE WRITE, ON AN AUTHOR-STAMPED CONNECTION ─────────────
+    // ── THE EVIDENCE WRITE IS DELIBERATELY *NOT* STAMPED YET ────────────
     //
-    // `evidence` is tier-A with migration 077's strict
-    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on the
-    // unstamped pool this INSERT was refused — MEASURED on a cleanly-migrated
-    // schema: `new row violates row-level security policy for table "evidence"`,
-    // which was this tool's FIRST write and therefore its whole outcome.
+    // `evidence` is tier-A under migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on this
+    // unstamped pool the INSERT is refused on a cleanly-migrated schema — MEASURED
+    // as `new row violates row-level security policy for table "evidence"`. It is
+    // this tool's FIRST write, so today that refusal is also its whole outcome:
+    // the call fails and **nothing is written**.
     //
-    // IT COMMITS ON ITS OWN, and that is forced rather than chosen. Migration 046
-    // gives `mass_functions.evidence_id` a FK to `evidence(id)`, and the DS wiring
-    // below runs on a SIBLING pool connection which cannot see an uncommitted
-    // row — so the evidence must be committed before `auto_wire_ds_update` can
-    // reference it. Putting the whole tool in one transaction requires converting
-    // `ds_auto` itself (the DS-wiring change, D2); until then the shape is
-    // evidence -> DS -> {truth_value, labels}, three units rather than one.
+    // A revision of this branch DID stamp it, and that change was MEASURED to be a
+    // regression rather than an improvement. The reason is that stamping this one
+    // INSERT cannot make the tool whole: migration 046 gives
+    // `mass_functions.evidence_id` a FK to `evidence(id)`, and `ds_auto`'s wiring
+    // below runs on a SIBLING pool connection that cannot see an uncommitted row,
+    // so a stamped evidence INSERT has to COMMIT ON ITS OWN before the DS wiring
+    // can reference it. The DS wiring is itself unconverted (it writes
+    // `claim_frames`, which has no orphan `*_privacy` policy), so the tool still
+    // fails immediately afterwards — now with the evidence row committed.
     //
-    // CONSEQUENCE, stated plainly: on a clean schema this tool still fails at the
-    // DS wiring, and it now fails with the evidence row COMMITTED instead of
-    // failing before writing anything. That is not a new failure mode — it is
-    // exactly what production does today, where `evidence_privacy` admits the
-    // INSERT and `claim_frames` then refuses the BBA (MEASURED: after the failed
-    // call, `evidence` had gained its row). A retry mints a fresh evidence UUID
-    // rather than upserting, so retries accumulate evidence rows; that is also
-    // pre-existing, and it is the reason this tool's conversion is the LAST of the
-    // three rather than the first.
-    {
-        let mut tx =
-            crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
-                .await?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
-    }
+    // The two configurations, measured with the real binary as `epigraph_app`:
+    //
+    // * CONFIG B (prod-faithful, `evidence_privacy` present): the INSERT is
+    //   admitted either way and the call fails at `claim_frames` either way. The
+    //   stamp changes nothing.
+    // * CONFIG A (clean 001→head): unstamped fails at `evidence` having written
+    //   nothing; stamped commits the evidence row and then fails at `claim_frames`.
+    //
+    // So the stamp buys nothing on either configuration today, and on CONFIG A it
+    // converts a clean refusal into a committed orphan. That orphan is unbounded,
+    // not merely untidy: `Evidence::new` mints `EvidenceId::new()` (a fresh v4
+    // UUID) and `EvidenceRepository::create` has NO `ON CONFLICT`, so every agent
+    // retry of a call that is certain to fail appends another evidence row for the
+    // same assertion. Its sibling in `submit_ds_evidence` was KEPT for exactly the
+    // opposite reason — `assign_claim` is `ON CONFLICT … DO UPDATE` and
+    // `store_with_perspective` upserts, so a retry there re-states rather than
+    // accumulates.
+    //
+    // This site therefore converts WITH the DS wiring (D2), in the one commit that
+    // can put evidence → BBA → truth_value → labels in a single stamped unit, and
+    // not before. `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` carries
+    // it in the residual register so it cannot be forgotten.
+    EvidenceRepository::create(&server.pool, &evidence)
+        .await
+        .map_err(internal_error)?;
 
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
@@ -953,6 +963,17 @@ pub async fn update_with_evidence(
     // because a label rejection must not leave the claim's belief moved on the
     // strength of a submission the caller was told had failed — the placement rule
     // the caller-label validation at the top of this function already follows.
+    //
+    // WHY THIS ONE IS STAMPED WHILE THE EVIDENCE INSERT ABOVE IS NOT, which is
+    // otherwise an inconsistency a reader is right to challenge: these are the
+    // tool's LAST writes, so a self-committing stamped unit here opens no orphan
+    // window — there is nothing after it that can fail with them half-landed. The
+    // evidence INSERT is the FIRST write and is followed by an unconverted step
+    // that is certain to fail on a clean schema, so stamping it would have
+    // committed a row the call then reports as failed, and retries would
+    // accumulate. Today neither reaches execution on either configuration: the DS
+    // wiring above refuses first (MEASURED on both). This block is therefore
+    // correct-and-unreachable until D2, rather than active.
     let after_truth = TruthValue::clamped(ds.pignistic_prob);
     {
         let mut tx =
