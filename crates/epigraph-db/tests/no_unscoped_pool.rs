@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (303 today; the assertions below measure the tree and
+//! deletes in week two. (300 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 303 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 300 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,10 +120,10 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 303 is not 0 — and no shard in the series may be
+//!      discharged the gate — 300 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
 //!      decision: 113 of the 416 sites the series began with are converted, and
-//!      303 are not.
+//!      300 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 303;
+const HIGH_WATER: usize = 300;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -579,11 +579,16 @@ const HIGH_WATER: usize = 303;
 /// temporarily set to 1 — never by subtracting the count the shard believed it
 /// had converted, which is the method every shard since 5 has used and the one
 /// that catches a miscount.
+///
+/// The workflow-ingest executor conversion did not move it either:
+/// `routes/workflows.rs` falls 30 -> 27 and keeps 27 sites, so no key is
+/// deleted. Its three sites came off `HIGH_WATER` alone, 303 -> 300, read off
+/// `the_scanner_is_not_vacuous`'s own failure on the converted tree.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 303 sites across 44 files as of this commit. Lower an entry when a shard
+/// 300 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -803,7 +808,17 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `add_step`, `delete_step`) and two in `get_workflow`, a routed GET that
     // holds no `Viewer` at all — the same no-Viewer class shard 6 declined in
     // `routes/agents.rs`.
-    ("routes/workflows.rs", 30),
+    //
+    // 30 -> 27: the workflow-ingest executor conversion moved `POST /workflows`,
+    // `POST /workflows/ingest`, `POST /workflows/steps` and
+    // `/workflows/steps/delete` off `state.db_pool` and onto a transaction
+    // stamped from the `workflow-ingest-system` agent's viewer
+    // (`begin_system_ingest_stamped_tx` in that file). FOUR call sites became
+    // THREE removals because the new helper reads `state.db_pool` once itself,
+    // to resolve that agent's write authority — a read the SECURITY DEFINER
+    // `epigraph_live_memberships` makes non-blind on an unstamped session, which
+    // is exactly why it is the bootstrap and cannot be stamped.
+    ("routes/workflows.rs", 27),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

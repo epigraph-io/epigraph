@@ -72,11 +72,17 @@ precisely why production admits writes a clean schema refuses.
 | `set-config.sh a\|b` | Switches the schema configuration. Reads `helper.sql` and `fn2.sql`. |
 
 `probe-workflow.sh`'s `b2a` mode **seeds on B, then drops the orphan policies and
-measures on A**. That is the R3 remediation itself, and it is the only mode that
-can answer anything about the workflow tools: on a clean series `store_workflow`
-is *itself* refused (`new row violates row-level security policy for table
-"claims"`, from the pool-bound ingest executor), so there is nothing to deprecate
-and every downstream arm is vacuous by absence.
+measures on A**. That is the R3 remediation itself.
+
+It used to be the only mode that could answer anything about the workflow tools,
+because on a clean series `store_workflow` was *itself* refused (`new row
+violates row-level security policy for table "claims"`, from the pool-bound
+ingest executor), leaving nothing to deprecate and every downstream arm vacuous
+by absence. **That is fixed**: the ingest executor now takes a connection stamped
+from the `workflow-ingest-system` agent's viewer, so mode `a` seeds successfully
+and is the primary mode. The old refusal is what mode `a` now regression-tests —
+run it against a binary built before the conversion and it reproduces verbatim,
+which is how the fixed and unfixed binaries are distinguished.
 
 ## Comparing two binaries
 

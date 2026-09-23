@@ -142,8 +142,15 @@ impl WorkflowRepository {
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails for reasons other
     /// than a duplicate-key conflict on the UNIQUE constraint.
-    pub async fn insert_root(
-        pool: &PgPool,
+    /// `workflows` is MEASURED `relrowsecurity = false` with no policy at
+    /// migration head 101, so this write needs no stamp to be admitted. It takes
+    /// an executor anyway so the workflow-ingest plan walk can run it on the SAME
+    /// connection as the tier-A `claims` and `edges` writes it is atomic with —
+    /// an `insert_root` on a sibling pool checkout would leave a `workflows` row
+    /// behind when the claim walk rolled back, which is the zombie-row shape the
+    /// executor's own pre-flight content guard exists to avoid.
+    pub async fn insert_root<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         canonical_name: &str,
         generation: i32,
@@ -162,14 +169,14 @@ impl WorkflowRepository {
         .bind(goal)
         .bind(parent_id)
         .bind(metadata)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
-    pub async fn find_root_by_canonical(
-        pool: &PgPool,
+    pub async fn find_root_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         canonical_name: &str,
         generation: i32,
     ) -> Result<Option<Uuid>, sqlx::Error> {
@@ -178,7 +185,7 @@ impl WorkflowRepository {
         )
         .bind(canonical_name)
         .bind(generation)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row.map(|(id,)| id))
     }

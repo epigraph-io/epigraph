@@ -218,15 +218,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          and the static arm covers it for the same reason.",
     ),
     (
-        "tools/step_ops.rs",
-        "epigraph_ingest_executor::delete_step",
-        1,
-        "`delete_step`. Deletes a step claim and rewrites the workflow's step list; `claims` is \
-         tier-A, so it is admitted in production by the orphan `claims_privacy` policy and \
-         refused on a clean migrate. Its sibling `add_step` no longer appears here: its embed now \
-         goes through the declared `StorePath`.",
-    ),
-    (
         "tools/supersede.rs",
         "ClaimRepository::supersede",
         1,
@@ -256,21 +247,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          unlike the `claims` embed this one is not refused, and converting it would be cohesion \
          rather than a fix. Kept unstamped deliberately; see `visibility_lint.rs`'s \
          `workflow.rs::set_truth_value` entry for the same argument.",
-    ),
-    (
-        "tools/workflow_ingest.rs",
-        "execute_workflow_ingest_with_inserted",
-        1,
-        "`ingest_workflow`'s executor call. Inserts step claims authored by \
-         `get_or_create_system_agent`, so a conversion has to stamp the SYSTEM agent's viewer, \
-         not the MCP server's — the same trap the embedder's author lookup exists to avoid. D5.",
-    ),
-    (
-        "tools/workflow_ingest.rs",
-        "improve_workflow_hierarchy_with_inserted",
-        1,
-        "`improve_workflow_hierarchy`'s executor call. Same shape and same system-agent \
-         authorship as `execute_workflow_ingest_with_inserted`.",
     ),
     (
         "tools/workflows.rs",
@@ -303,12 +279,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`store_workflow`'s goal embedding. Same `relrowsecurity = false` argument as the two in \
          `workflow_ingest.rs`.",
-    ),
-    (
-        "tools/workflows.rs",
-        "workflow_ingest::execute_workflow_ingest_with_inserted",
-        1,
-        "`store_workflow`'s executor call, via the shared helper. Same system-agent authorship.",
     ),
     (
         "tools/workflows.rs",
@@ -742,4 +712,230 @@ fn the_production_embedder_scan_sees_the_two_known_sites() {
         declared += 1;
     }
     assert_eq!(declared, 2);
+}
+
+// ===========================================================================
+// THE EXECUTOR ENTRY POINTS MUST BE CALLED ON A STAMPED TRANSACTION.
+//
+// # Why this arm had to exist the moment the register shrank
+//
+// The scan above matches the literal `server.pool`. Four entries left the
+// register in this change — `store_workflow`'s, `ingest_workflow`'s and
+// `improve_workflow_hierarchy`'s executor calls, and `delete_step` — and every
+// one of them left by ceasing to NAME a pool at all: the call now reads
+// `execute_workflow_ingest_plan(&mut tx, …)`. A revert to `&server.pool` would
+// re-add an entry and be caught, but a revert to
+// `&mut pool.acquire().await?` would NOT: it names no pool, so the scan sees
+// nothing and the ratchet passes over a site that is unstamped again.
+//
+// That is the "coverage quietly ends" failure the register's own header warns
+// about, in the direction shrinking creates. This arm closes it by pinning the
+// ARGUMENT rather than the absence of a pool: every production call to an
+// `epigraph-ingest-executor` entry point must pass `&mut tx`, and every file
+// that makes one must also contain the helper that produces that `tx`.
+//
+// It covers `epigraph-api` as well as `epigraph-mcp`, because both surfaces call
+// the same executor and the HTTP twin was converted in the same change.
+//
+// THE HOLE IN AN ARGUMENT-SPELLING SCAN, and how much of it is closed.
+// MEASURED, by writing the adversarial revert and running this arm against it:
+// `let mut tx = server.pool.acquire().await?;` followed by the unchanged
+// `add_step(&mut tx, …)` is unstamped and still spelled `&mut tx`, so the
+// spelling check alone passes it. The second assertion below is what catches it:
+// a file is required to CALL the stamp helper at least once per stamped executor
+// call it makes, so a `tx` that did not come from the helper leaves the counts
+// short. It is not airtight — one helper call and two executor calls in the same
+// function would satisfy it — but it is the difference between "a rename defeats
+// this" and "you have to work at it".
+//
+// WHAT IT STILL DOES NOT PIN, stated so the next reader does not over-trust it:
+// that the `tx` came from the SYSTEM agent's viewer rather than some other one.
+// A stamped-from-the-wrong-author transaction is spelled `&mut tx` too. That
+// axis remains `scripts/e2e/probe-workflow.sh`'s, exactly as the header above
+// says for the first ratchet.
+// ===========================================================================
+
+/// The executor entry points whose first argument decides whether the ingest is
+/// stamped. Named rather than pattern-matched: a new entry point should be a
+/// deliberate addition here, not silently uncovered.
+const EXECUTOR_ENTRY_POINTS: &[&str] = &[
+    "execute_workflow_ingest_plan(",
+    "epigraph_ingest_executor::add_step(",
+    "epigraph_ingest_executor::delete_step(",
+];
+
+/// **The executor-call register**: `(file, total calls, calls that pass `&mut
+/// tx`, why the remainder does not)`.
+///
+/// A full register rather than a per-file exemption, and the difference is
+/// load-bearing. An exemption keyed on the FILE would have covered
+/// `workflow_ingest.rs` entirely — and that file holds both the unstamped test
+/// fixture AND the production entry point every workflow ingest goes through, so
+/// the production call could revert to a pool and this ratchet would still pass.
+/// Pinning the COUNTS means the fixture stays exempt and the production call
+/// does not.
+const EXECUTOR_CALL_REGISTER: &[(&str, usize, usize, &str)] = &[
+    (
+        "epigraph-api/src/routes/workflows.rs",
+        4,
+        4,
+        "The HTTP twin: `POST /api/v1/workflows` and `POST /api/v1/workflows/ingest` (one \
+         `execute_workflow_ingest_plan` each) plus `POST /workflows/steps` and \
+         `/workflows/steps/delete`. All four stamp through this module's own \
+         `begin_system_ingest_stamped_tx`; none is exempt.",
+    ),
+    (
+        "epigraph-mcp/src/tools/step_ops.rs",
+        2,
+        2,
+        "`add_step` and `delete_step`, both stamped. Neither has a fixture variant — the \
+         executor's own `#[sqlx::test]` suite calls `epigraph_ingest_executor::add_step` \
+         directly rather than through this module.",
+    ),
+    (
+        "epigraph-mcp/src/tools/workflow_ingest.rs",
+        2,
+        1,
+        "TWO calls, ONE stamped, and that asymmetry is the point. The stamped one is \
+         `execute_workflow_ingest_with_inserted`, which every production ingest \
+         (`store_workflow`, `ingest_workflow`, `improve_workflow_hierarchy`) routes through. The \
+         unstamped one is `do_ingest_workflow_via_pool`, a fixture for `#[sqlx::test]` — which \
+         connects as `epigraph`, a BYPASSRLS superuser that owns every protected table, so a \
+         stamp there is inert. If the production call reverts to a pool this count reads 2/0 and \
+         the ratchet fails, which a file-level exemption would not have caught.",
+    ),
+];
+
+/// The helper each production caller must use to obtain its `tx`. One NAME, two
+/// definitions: `epigraph-mcp`'s lives in `claim_helper.rs` and `epigraph-api`'s
+/// in `routes/workflows.rs`, with the same semantics and the same stamp.
+const STAMP_HELPER_NAME: &str = "begin_system_ingest_stamped_tx";
+
+/// Spellings that count as "this file names the stamp helper at all".
+const STAMP_HELPERS: &[&str] = &[
+    "claim_helper::begin_system_ingest_stamped_tx",
+    "begin_system_ingest_stamped_tx",
+];
+
+/// `(relative file, total executor calls, calls passing `&mut tx`)`.
+fn executor_callers() -> Vec<(String, usize, usize)> {
+    let root = workspace_crates_root();
+    let mut out = Vec::new();
+    for krate in ["epigraph-mcp", "epigraph-api"] {
+        let src = root.join(krate).join("src");
+        for path in rust_files(&src) {
+            let rel = format!(
+                "{krate}/src/{}",
+                path.strip_prefix(&src)
+                    .expect("strip prefix")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            );
+            let stripped = strip_comments(&std::fs::read_to_string(&path).expect("read source"));
+            let prod = production_prefix(&stripped);
+            let mut total = 0usize;
+            let mut stamped = 0usize;
+            for entry in EXECUTOR_ENTRY_POINTS {
+                for (idx, _) in prod.match_indices(entry) {
+                    total += 1;
+                    // The first argument, whitespace-insensitively.
+                    let rest: String = prod[idx + entry.len()..]
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .take(8)
+                        .collect();
+                    if rest.starts_with("&muttx") {
+                        stamped += 1;
+                    }
+                }
+            }
+            if total > 0 {
+                out.push((rel, total, stamped));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// **The second ratchet.** The measured executor-call shape must be EXACTLY the
+/// register.
+#[test]
+fn every_production_executor_call_takes_a_stamped_transaction() {
+    let measured = executor_callers();
+    assert!(
+        !measured.is_empty(),
+        "no executor entry-point call was found in epigraph-mcp or epigraph-api production \
+         source; the names in EXECUTOR_ENTRY_POINTS have moved and this ratchet is watching \
+         nothing"
+    );
+
+    let mut registered: Vec<(String, usize, usize)> = EXECUTOR_CALL_REGISTER
+        .iter()
+        .map(|(f, total, stamped, _)| ((*f).to_string(), *total, *stamped))
+        .collect();
+    registered.sort();
+
+    assert_eq!(
+        measured, registered,
+        "\nThe shape of epigraph-ingest-executor calls in production source has changed.\n\
+         Each tuple is (file, total calls, calls passing `&mut tx`).\n\
+         * A file whose STAMPED count dropped has an executor call back on an unstamped \
+           connection: the rows it writes are owned by the workflow-ingest-system agent's \
+           personal group, and migration 077's claims_tenancy WITH CHECK refuses them on a \
+           cleanly-migrated schema. Convert it (`begin_system_ingest_stamped_tx`).\n\
+         * A file whose TOTAL changed gained or lost a call site; update \
+           EXECUTOR_CALL_REGISTER with a reason.\n"
+    );
+}
+
+/// Every register entry carries a reason, and every file that makes a stamped
+/// call still contains the helper that produces the `tx`.
+#[test]
+fn the_executor_call_register_states_why_and_still_names_a_stamp_helper() {
+    let root = workspace_crates_root();
+    for (rel, total, stamped, reason) in EXECUTOR_CALL_REGISTER {
+        assert!(
+            reason.len() > 80,
+            "{rel} needs a reason a reader can act on, got {} chars",
+            reason.len()
+        );
+        assert!(
+            stamped <= total,
+            "{rel}: {stamped} stamped of {total} total is not a coherent count"
+        );
+        if *stamped == 0 {
+            continue;
+        }
+        let stripped = strip_comments(&std::fs::read_to_string(root.join(rel)).expect("read"));
+        let prod = production_prefix(&stripped);
+        assert!(
+            STAMP_HELPERS.iter().any(|h| prod.contains(h)),
+            "{rel} is registered as making {stamped} stamped executor call(s), but its \
+             production source no longer names a stamp helper at all — so whatever `tx` those \
+             calls receive is not coming from the system agent's viewer"
+        );
+
+        // AT LEAST ONE HELPER CALL PER STAMPED EXECUTOR CALL. This is what
+        // closes the rename hole described in the header: `let mut tx =
+        // server.pool.acquire().await?` keeps the `&mut tx` spelling and is
+        // unstamped, but it does not add a helper call, so the count falls
+        // short. Counted over the BARE NAME minus its `fn` declarations: the
+        // HTTP surface defines its own helper in the same file it calls it from,
+        // and a `(`-anchored pattern misses that definition's generic parameter
+        // list (`begin_system_ingest_stamped_tx<'s>(`) while an unanchored one
+        // counts it. Subtracting the declarations handles both spellings.
+        let helper_calls: usize = prod
+            .matches(STAMP_HELPER_NAME)
+            .count()
+            .saturating_sub(prod.matches(&format!("fn {STAMP_HELPER_NAME}")).count());
+        assert!(
+            helper_calls >= *stamped,
+            "{rel} makes {stamped} executor call(s) spelled `&mut tx` but calls a stamp helper \
+             only {helper_calls} time(s). A `tx` that did not come from \
+             `begin_system_ingest_stamped_tx` is not stamped from the workflow-ingest-system \
+             agent's viewer, however it is spelled — and `let mut tx = \
+             server.pool.acquire().await?` is the exact revert this counts against."
+        );
+    }
 }

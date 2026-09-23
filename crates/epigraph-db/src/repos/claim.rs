@@ -5138,6 +5138,26 @@ impl ClaimRepository {
     /// skipped via `ON CONFLICT (id) DO NOTHING`). Used by ingest paths that
     /// generate deterministic UUIDs and rely on idempotent re-runs.
     ///
+    /// # Why this takes an `Acquire` rather than a `&PgPool`
+    ///
+    /// Migration 077's `claims_tenancy` `WITH CHECK` asks
+    /// `owner_group_id = ANY(epigraph_writable_groups())`, and on an unstamped
+    /// pool checkout that set is `{}` — so on a cleanly-migrated schema this
+    /// INSERT is **refused**, which is how `store_workflow` came to be entirely
+    /// unavailable (`new row violates row-level security policy for table
+    /// "claims"`, raised from `epigraph-ingest-executor`). MEASURED as
+    /// `epigraph_app` (`rolbypassrls = false`) on a database migrated 001→head
+    /// from empty: this statement is refused unstamped, refused when stamped
+    /// from a *different* real group, and admitted when stamped from the group
+    /// the row is owned by.
+    ///
+    /// A generic `Acquire` rather than `&mut PgConnection` because every
+    /// existing caller passes `&pool` and `&PgPool` implements `Acquire`: the
+    /// twelve unconverted call sites keep their current behaviour verbatim,
+    /// while a converted caller passes `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` and both statements below ride
+    /// that one stamped transaction.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` for non-conflict failures, or
     /// `DbError::InvalidData` if a label carries unexpanded shell syntax.
@@ -5148,9 +5168,46 @@ impl ClaimRepository {
     // thinking about the field — which is the shape a `Default` impl grows out
     // of, and D1 is the rule that says there must not be one.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
+        id: Uuid,
+        content: &str,
+        content_hash: &[u8; 32],
+        agent_id: Uuid,
+        truth: TruthValue,
+        labels: &[String],
+        decl: TenancyDecl,
+    ) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_with_id_if_absent_conn(
+            &mut conn,
+            id,
+            content,
+            content_hash,
+            agent_id,
+            truth,
+            labels,
+            decl,
+        )
+        .await
+    }
+
+    /// [`Self::create_with_id_if_absent`] on a connection the caller owns — the
+    /// form a stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one statement
+    /// pair and one tenancy argument. A concrete `&mut PgConnection` rather than
+    /// a generic `Acquire`: the workflow-ingest path reaches this through
+    /// `#[tool_router]`'s boxed `dyn Future + Send`, and an `Acquire<'a>` bound
+    /// there fails to prove `for<'x> &'x mut PgConnection: Acquire<'x>`
+    /// ("implementation of `sqlx::Acquire` is not general enough"). Measured, not
+    /// anticipated.
+    ///
+    /// # Errors
+    /// As [`Self::create_with_id_if_absent`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_id_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         content: &str,
         content_hash: &[u8; 32],
@@ -5179,7 +5236,7 @@ impl ClaimRepository {
         .bind(labels)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
         let was_inserted = row.map(|(b,)| b).unwrap_or(false);
@@ -5188,10 +5245,18 @@ impl ClaimRepository {
         // insertion. ON CONFLICT (id) DO NOTHING swallows duplicate-id paths,
         // and we rely on `was_inserted` (xmax=0 only on freshly-inserted rows)
         // to skip emission for idempotent re-runs.
+        //
+        // `publish_or_log_conn`, NOT `publish_or_log`: this is a swallowed
+        // failure, and once the caller can hand us a transaction a swallowed
+        // failure stops being fire-and-forget and becomes a DEFERRED abort —
+        // PostgreSQL answers the eventual `COMMIT` with `ROLLBACK` and no error,
+        // so the tool reports success having written nothing. The `_conn`
+        // variant wraps the INSERT in a SAVEPOINT, which keeps "the event is
+        // best-effort" true inside a transaction instead of only outside one.
         if was_inserted {
             let truth_value = truth.value();
-            let _ = crate::repos::EventRepository::publish_or_log(
-                pool,
+            let _ = crate::repos::EventRepository::publish_or_log_conn(
+                &mut *conn,
                 "claim.created",
                 Some(agent_id),
                 &serde_json::json!({

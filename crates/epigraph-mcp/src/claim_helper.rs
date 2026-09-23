@@ -206,6 +206,87 @@ pub async fn begin_author_stamped_tx<'p>(
     })
 }
 
+/// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
+/// **`workflow-ingest-system`** agent's viewer — *not* from `server.agent_id()`.
+///
+/// # Why this is a second entry point rather than a call to the one above
+///
+/// [`begin_author_stamped_tx`] resolves the author it is handed. The whole
+/// difficulty on this path is knowing WHICH author to hand it, and the answer is
+/// not the one every sibling tool uses. `store_workflow`, `ingest_workflow`,
+/// `improve_workflow_hierarchy`, `add_step` and `delete_step` all route through
+/// `epigraph-ingest-executor`, which authors every row as
+/// `get_or_create_system_agent` and owns it with
+/// `default_decl_for_author(system_agent)`. Migration 077's `WITH CHECK` asks
+/// about the ROW's owner group, so the caller's identity is the wrong question —
+/// MEASURED: stamping from the MCP server's own agent is refused exactly as
+/// being unstamped is. `epigraph_ingest_executor::system_agent_write_authority`
+/// carries that measurement and the bootstrap argument.
+///
+/// It returns the system agent id alongside the transaction because callers need
+/// it for the post-commit embed: `embed_claim_author_stamped` must stamp from
+/// the SAME author that owns the row, and passing `server.agent_id()` there
+/// would render a `{WRITABLE:c}` predicate no row satisfies.
+///
+/// # Errors
+/// * `McpError::internal_error` if the system agent has no write authority (see
+///   `system_agent_write_authority`) — a loud refusal, nothing written.
+/// * `McpError::internal_error` if this process was not built from a
+///   [`epigraph_db::ScopedPool`], or if `BEGIN` / the GUC stamp fails. Never a
+///   fallback to the unstamped pool.
+pub async fn begin_system_ingest_stamped_tx<'p>(
+    server: &'p EpiGraphMcpFull,
+    tool_name: &'static str,
+) -> Result<(uuid::Uuid, epigraph_db::ScopedTx<'p>), McpError> {
+    let authority = epigraph_ingest_executor::system_agent_write_authority(&server.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                error = %e,
+                "write refused: could not establish the workflow-ingest-system agent's write \
+                 authority. Nothing was written."
+            );
+            internal_error(format!(
+                "{tool_name}: could not establish the workflow-ingest-system agent's write \
+                 authority: {e}. Nothing was written."
+            ))
+        })?;
+
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            "write refused: this MCP process was not built from a ScopedPool, so no connection \
+             can be stamped with the ingest system agent's tenancy context. Refusing rather than \
+             walking the plan on the unstamped pool, where a cleanly-migrated schema refuses the \
+             first claim INSERT and leaves the workflows row behind."
+        );
+        internal_error(format!(
+            "{tool_name}: this MCP server was not built from a ScopedPool, so the workflow \
+             ingest path cannot stamp a connection with the ingest system agent's tenancy \
+             context. Nothing was written. Construct the server with \
+             EpiGraphMcpFull::with_scoped_pool."
+        ))
+    })?;
+
+    let tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            author = %authority.agent_id,
+            error = %e,
+            "could not begin a system-agent-stamped transaction"
+        );
+        internal_error(format!(
+            "{tool_name}: could not begin a system-agent-stamped transaction: {e}"
+        ))
+    })?;
+
+    Ok((authority.agent_id, tx))
+}
+
 /// Generate (or reuse) a claim's embedding vector and store it on a connection
 /// stamped from the **author's** viewer. Post-commit, best-effort, and
 /// deliberately NOT inside the submission's write transaction.

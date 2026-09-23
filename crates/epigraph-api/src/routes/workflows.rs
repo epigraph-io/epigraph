@@ -329,12 +329,16 @@ pub async fn store_workflow(
     };
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
     let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&state.db_pool, &plan, &extraction)
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflow ingest: {e}"),
             })?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("workflow ingest: could not commit: {e}"),
+    })?;
 
     auto_wire_inserted_edges(&state.db_pool, &viewer, &result).await;
 
@@ -1552,12 +1556,16 @@ pub async fn ingest_workflow(
     Json(extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/ingest").await?;
     let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&state.db_pool, &plan, &extraction)
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflow ingest: {e}"),
             })?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("workflow ingest: could not commit: {e}"),
+    })?;
 
     auto_wire_inserted_edges(&state.db_pool, &viewer, &result).await;
 
@@ -1616,6 +1624,69 @@ pub async fn ingest_workflow(
 }
 
 // ── Internal helpers ──
+
+/// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
+/// **`workflow-ingest-system`** agent's viewer.
+///
+/// The HTTP twin of `epigraph-mcp`'s
+/// `claim_helper::begin_system_ingest_stamped_tx`, and identical in substance:
+/// `epigraph_ingest_executor` authors every row as
+/// `get_or_create_system_agent` and owns it with that agent's personal group, so
+/// migration 077's `WITH CHECK` on `claims` refuses the walk on an unstamped
+/// connection and refuses it just as firmly when stamped from the HTTP
+/// PRINCIPAL. The principal's viewer is the wrong answer here for exactly the
+/// reason `server.agent_id()` is on the MCP side — see
+/// `epigraph_ingest_executor::system_agent_write_authority` for the measurement.
+///
+/// # Errors
+/// `ApiError::InternalError` if the system agent has no write authority, if the
+/// process was not built through `AppState::with_scoped_pool`, or if the stamp
+/// fails. Never a fallback to `state.db_pool`.
+#[cfg(feature = "db")]
+pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
+    state: &'s AppState,
+    route: &'static str,
+) -> Result<epigraph_db::ScopedTx<'s>, ApiError> {
+    let authority = epigraph_ingest_executor::system_agent_write_authority(&state.db_pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                route = route,
+                error = %e,
+                "write refused: could not establish the workflow-ingest-system agent's write \
+                 authority. Nothing was written."
+            );
+            ApiError::InternalError {
+                message: format!(
+                    "{route}: could not establish the workflow-ingest-system agent's write \
+                     authority: {e}. Nothing was written."
+                ),
+            }
+        })?;
+
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            route = route,
+            "write refused: this process was not built from a ScopedPool, so no connection can \
+             be stamped with the ingest system agent's tenancy context."
+        );
+        ApiError::InternalError {
+            message: format!(
+                "{route}: this server was not built from a ScopedPool, so the workflow ingest \
+                 path cannot stamp a connection. Nothing was written."
+            ),
+        }
+    })?;
+
+    scoped
+        .begin_as(&authority.viewer)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{route}: could not begin a system-agent-stamped transaction: {e}"),
+        })
+}
 
 #[cfg(feature = "db")]
 pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uuid, ApiError> {
@@ -1772,14 +1843,18 @@ pub async fn add_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps").await?;
     let r = epigraph_ingest_executor::add_step(
-        &state.db_pool,
+        &mut tx,
         &req.canonical_name,
         &req.step_text,
         req.position,
     )
     .await
     .map_err(map_step_err)?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("add_step: could not commit: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": r.workflow_id,
@@ -1802,13 +1877,14 @@ pub async fn delete_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    let r = epigraph_ingest_executor::delete_step(
-        &state.db_pool,
-        &req.canonical_name,
-        req.step_lineage_id,
-    )
-    .await
-    .map_err(map_step_err)?;
+    let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps/delete").await?;
+    let r =
+        epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
+            .await
+            .map_err(map_step_err)?;
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("delete_step: could not commit: {e}"),
+    })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": r.workflow_id,
@@ -1952,9 +2028,22 @@ mod tests {
         }
     }
 
-    fn test_router(pool: sqlx::PgPool) -> axum::Router {
+    /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
+    /// `state.db_pool`: the rows the executor writes are owned by the
+    /// `workflow-ingest-system` agent's personal group, and a connection that
+    /// cannot be stamped with that group's write authority is not one this
+    /// handler will write on. So the router needs a state carrying a
+    /// `ScopedPool`; `AppState::with_db` leaves `scoped: None` and the handler
+    /// answers 500 with "this server was not built from a ScopedPool", which is
+    /// the conversion working rather than an inconvenience to route around.
+    ///
+    /// Same caveat as [`scoped_test_state`]: this is NOT a conversion control.
+    /// `with_scoped_pool` sets `db_pool = scoped.inner().clone()`, and
+    /// `#[sqlx::test]` connects as a BYPASSRLS superuser, so the stamp is inert
+    /// here. `scripts/e2e/probe-workflow.sh` is the instrument that observes it.
+    async fn test_router(pool: sqlx::PgPool) -> axum::Router {
         use axum::routing::post;
-        let state = AppState::with_db(pool, ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         axum::Router::new()
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
             .layer(axum::Extension(test_auth()))
@@ -2077,7 +2166,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
-        let app = test_router(pool);
+        let app = test_router(pool).await;
 
         let body = serde_json::to_vec(&ingest_payload("http-test-ingest-workflow")).unwrap();
         let req = Request::builder()

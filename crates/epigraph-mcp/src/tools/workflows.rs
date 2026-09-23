@@ -366,7 +366,7 @@ pub async fn store_workflow(
 
     let (response, inserted) =
         crate::tools::workflow_ingest::execute_workflow_ingest_with_inserted(
-            &server.pool,
+            server,
             viewer,
             &extraction,
         )

@@ -10,17 +10,24 @@
 #   b     seed and measure on the prod-faithful series (A + the orphan policies).
 #   b2a   SEED on B, then drop the orphan policies and MEASURE on A.
 #
-# `a` cannot answer anything about these two tools, and this is MEASURED, not
-# assumed: on the clean series `store_workflow` is itself refused --
+# `a` USED TO answer nothing about these two tools, and this was MEASURED, not
+# assumed: on the clean series `store_workflow` was itself refused --
 #
 #   "workflow ingest: repository error: Query failed: error returned from
 #    database: new row violates row-level security policy for table \"claims\""
 #
-# -- because `epigraph_ingest_executor` writes on the unstamped pool as the
-# system agent. So there is no workflow to deprecate and every downstream arm is
-# vacuous by absence.
+# -- because `epigraph_ingest_executor` wrote on the unstamped pool as the
+# system agent. So there was no workflow to deprecate and every downstream arm
+# was vacuous by absence.
 #
-# `b2a` is the R3 remediation itself: production's workflow claims were all
+# THAT IS NO LONGER TRUE, and `a` is now the primary mode. The executor takes a
+# connection the caller has stamped from the `workflow-ingest-system` agent's
+# viewer, so `store_workflow` lands on a clean migration series. The refusal
+# above is retained verbatim because it is what this mode is now the regression
+# test FOR: running `a` against a binary from before that conversion reproduces
+# it exactly, which is how the two binaries are told apart.
+#
+# `b2a` remains the R3 remediation itself: production's workflow claims were all
 # written under B, and the remediation drops the orphan policies underneath them.
 # That is the state in which `deprecate_workflow` and `report_workflow_outcome`
 # must still work, and the state their conversion was supposed to reach.
@@ -136,16 +143,30 @@ WFID=$(echo "$SW" | grep -oE '"workflow_id\\": \\"[0-9a-f-]{36}' | head -1 | gre
 echo "--- workflow_id: $WFID ---"
 
 echo "=== IDENTITY CHECK (read this BEFORE any verdict below) ==="
+# THE COLUMN IS `display_name`. `agents.name` and `groups.name` DO NOT EXIST --
+# an earlier revision of this block asked for them, every statement here failed
+# with `column a.name does not exist`, and because `q` runs psql WITHOUT
+# ON_ERROR_STOP the errors printed and the probe carried on to report verdicts
+# under an IDENTITY CHECK that had measured nothing. That is precisely the
+# "a vacuous check that looks like a measurement" failure the README's trap list
+# collects, in the one block the README tells the reader to consult FIRST.
 q "SELECT 'as_claim='   ||(SELECT count(*) FROM claims    WHERE id='$WFID')
         ||' as_workflow='||(SELECT count(*) FROM workflows WHERE id='$WFID')
         ||' owner_group='||COALESCE((SELECT owner_group_id::text FROM claims WHERE id='$WFID'),'n/a')
-        ||' author='     ||COALESCE((SELECT a.name FROM claims c JOIN agents a ON a.id=c.agent_id WHERE c.id='$WFID'),'n/a')"
+        ||' author='     ||COALESCE((SELECT a.display_name FROM claims c JOIN agents a ON a.id=c.agent_id WHERE c.id='$WFID'),'n/a')"
+echo "--- the thesis claim the workflow ingest wrote, which IS a claim ---"
+q "SELECT '   thesis_claims='||count(*)
+        ||' owner_groups='||COALESCE(string_agg(DISTINCT c.owner_group_id::text,','),'-')
+        ||' authors='||COALESCE(string_agg(DISTINCT a.display_name,','),'-')
+     FROM claims c JOIN agents a ON a.id=c.agent_id
+     JOIN edges e ON e.target_id=c.id AND e.source_type='workflow' AND e.relationship='executes'
+    WHERE e.source_id='$WFID'"
 echo "--- the MCP server process's own agent, for contrast ---"
-q "SELECT 'mcp_agent='||COALESCE((SELECT name FROM agents WHERE name='mcp-agent'),'absent')
-        ||' mcp_group='||COALESCE((SELECT g.id::text FROM groups g JOIN agents a ON g.name='personal:'||a.id::text
-                                     WHERE a.name='mcp-agent' LIMIT 1),'n/a')"
+q "SELECT 'mcp_agent='||COALESCE((SELECT display_name FROM agents WHERE display_name='mcp-agent' LIMIT 1),'absent')
+        ||' mcp_group='||COALESCE((SELECT g.id::text FROM groups g JOIN agents a ON g.display_name='personal:'||a.id::text
+                                     WHERE a.display_name='mcp-agent' LIMIT 1),'n/a')"
 echo "--- every claim this seed created, by author ---"
-q "SELECT a.name||' x'||count(*) FROM claims c JOIN agents a ON a.id=c.agent_id GROUP BY a.name ORDER BY 1"
+q "SELECT a.display_name||' x'||count(*) FROM claims c JOIN agents a ON a.id=c.agent_id GROUP BY a.display_name ORDER BY 1"
 
 echo
 echo "=== REACHABILITY: can any DISCOVERY tool hand deprecate_workflow a"
@@ -238,7 +259,17 @@ if [ -z "$MCP_AGENT" ]; then
 else
   echo "mcp-agent rows sharing that display_name: $(q "SELECT count(*) FROM agents WHERE display_name='mcp-agent'")"
   OWN_GROUP=$(q "SELECT public.epigraph_ensure_personal_group('$MCP_AGENT')")
-  FOREIGN_AGENT=$(q "SELECT id FROM agents WHERE display_name = 'workflow-ingest-system' LIMIT 1")
+  # THE SYSTEM AGENT, DERIVED FROM A WRITE IT MADE -- never by display_name, for
+  # the same measured reason as `mcp-agent` above: `display_name` is not unique,
+  # and picking an arbitrary row named `workflow-ingest-system` seeds the FOREIGN
+  # arm into a group nothing authored, which yields a refusal that looks exactly
+  # like the defect. The workflow ingest authors its claims as the real system
+  # agent, so reading `claims.agent_id` back off one of them cannot drift.
+  FOREIGN_AGENT=$(q "SELECT c.agent_id FROM claims c
+                       JOIN edges e ON e.target_id=c.id AND e.source_type='workflow'
+                                   AND e.relationship='executes'
+                      WHERE e.source_id='$WFID' LIMIT 1")
+  [ -n "$FOREIGN_AGENT" ] || FOREIGN_AGENT=$(q "SELECT id FROM agents WHERE display_name = 'workflow-ingest-system' LIMIT 1")
   FOREIGN_GROUP=$(q "SELECT public.epigraph_ensure_personal_group('$FOREIGN_AGENT')")
   echo "mcp-agent=$MCP_AGENT own_group=$OWN_GROUP"
   echo "workflow-ingest-system=$FOREIGN_AGENT foreign_group=$FOREIGN_GROUP"
