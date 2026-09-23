@@ -498,7 +498,7 @@ pub struct RecallParams {
 
     #[schemars(
         description = "Optional lens frame UUID (from list_frames). Must be paired with perspective_id. \
-                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking and min_truth stay on the global truth_value."
+                       When both are set, each returned claim carries an additive lensed_belief computed under that (frame, perspective) lens. Ranking stays on the global truth_value; min_truth gates on the UNFRAMED DS pignistic probability (falling back to truth_value for a claim with no DS cache), so it is not the lensed value and not the authored scalar."
     )]
     #[serde(default)]
     pub frame_id: Option<String>,
@@ -581,6 +581,41 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
+                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       not contested), `open_question` (is_contested — any live \
+                       contradicts/refutes), and `uncertain` (everything else). Contest is \
+                       checked FIRST, so a high-truth claim carrying a live refutation is \
+                       reported as an open question rather than as confirmed. Ranking is \
+                       UNCHANGED: each bucket keeps the RRF order the flat list would have had, \
+                       and the union of the three buckets is exactly the flat list — this \
+                       regroups the page, it does not filter or re-rank it. `results` is OMITTED \
+                       when this is true, so a caller opts into the new shape explicitly. \
+                       Default false: output is byte-identical to recall without this parameter."
+    )]
+    #[serde(default)]
+    pub epistemic_partition: bool,
+
+    #[schemars(
+        description = "Optional intra-result diversity constraint, as a COSINE DISTANCE in \
+                       (0.0, 2.0] over claims.embedding. When set, a greedy MMR pass walks the \
+                       ranked page top-down and DROPS any hit sitting closer than this to a hit \
+                       already kept above it, so a query cannot come back as ten paraphrases of \
+                       one fact. 0.15 is a reasonable starting value; larger = more aggressive \
+                       de-duplication. SHRINKS the page rather than back-filling — the SQL page \
+                       is already truncated to limit, so there is nothing below to promote, and \
+                       this matches how min_truth and exclude_contested already behave. Use \
+                       paging.more_available, not a short page, as the stop condition. Hits \
+                       whose distance cannot be MEASURED are always KEPT, never dropped: that \
+                       covers workflow hits (include_workflows=true — they are not claims rows) \
+                       and any claim with no embedding, as on the embedder-down lexical \
+                       fallback, where this parameter therefore does nothing. A value outside \
+                       the range is REJECTED, not clamped. Default: no diversity filtering."
+    )]
+    #[serde(default)]
+    pub diversity_radius: Option<f64>,
 }
 
 // ── Ingestion ──
@@ -1269,7 +1304,22 @@ pub struct MemorizeResponse {
 pub struct RecallResult {
     pub claim_id: String,
     pub content: String,
+    /// The claim's independently authored `claims.truth_value`, reported
+    /// unchanged. NOT what `min_truth` gates on — see `belief_score`.
     pub truth_value: f64,
+    /// The scalar `min_truth` was actually compared against (backlog
+    /// `14b98adc`): the Dempster–Shafer pignistic probability when the claim
+    /// carries a DS cache, and `truth_value` when it does not.
+    ///
+    /// `belief_score == truth_value` means the claim has no DS state and the
+    /// gate fell back; a divergence means epistemic edges have moved the claim
+    /// away from its authored value, which no DS write path copies back into
+    /// `truth_value`.
+    ///
+    /// Workflow-origin hits (`result_type == "workflow"`) are not claims and
+    /// carry no DS cache, so their `belief_score` always equals their
+    /// `truth_value`.
+    pub belief_score: f64,
     /// Dense cosine similarity in `[0,1]`; `0.0` for a lexical-only hit.
     pub similarity: f64,
     /// Reciprocal Rank Fusion score (primary ordering).
@@ -1337,6 +1387,185 @@ pub(crate) fn is_zero_u32(v: &u32) -> bool {
 /// `skip_serializing_if` helper — see [`is_zero_u32`].
 pub(crate) fn is_false(v: &bool) -> bool {
     !*v
+}
+
+/// Score at or above which a NON-contested result is reported as `confirmed`
+/// by [`EpistemicPartition`] (backlog e7736ff6).
+///
+/// One constant, shared by `recall` and `recall_with_context`, so "confirmed"
+/// cannot come to mean two different things on the two recall surfaces.
+pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
+
+/// A post-RRF recall page grouped by the epistemic status of each hit, rather
+/// than returned as one flat ranked list (backlog e7736ff6).
+///
+/// The three buckets are exhaustive and mutually exclusive, and the rule is
+/// deliberately contest-first:
+///
+/// * `open_question` — `is_contested` (any live `contradicts`/`refutes`).
+///   Checked FIRST, so a high-scoring claim that is actively disputed is
+///   reported as unsettled rather than as `confirmed`. Score and dispute are
+///   independent signals; a corpus can hold a 0.9 claim and a live refutation
+///   of it at the same time, and that pair is precisely what the caller must
+///   not be told is settled.
+/// * `confirmed` — not contested AND score `>= `[`CONFIRMED_SCORE`].
+/// * `uncertain` — everything else.
+///
+/// Within each bucket the caller's ranking order is PRESERVED (items are
+/// pushed in the order they were given), so bucketing re-groups the page
+/// without re-ranking it.
+///
+/// # The partition never changes which hits are returned
+///
+/// It is a regrouping of a list already fully filtered by `min_truth`,
+/// `exclude_contested` and every other post-filter. That is why `recall`'s
+/// audit row does not record the flag: the returned SET is identical with and
+/// without it, and only the JSON shape differs.
+#[derive(Debug, Clone, Serialize)]
+pub struct EpistemicPartition<T> {
+    /// Uncontested and scoring at or above [`CONFIRMED_SCORE`].
+    pub confirmed: Vec<T>,
+    /// Neither confirmed nor contested — believed, but not settled.
+    pub uncertain: Vec<T>,
+    /// Actively contested: `dispute_count >= 1`.
+    pub open_question: Vec<T>,
+}
+
+impl<T> EpistemicPartition<T> {
+    /// Bucket `items` by `(score, is_contested)`, as read out of each item by
+    /// `signals`.
+    ///
+    /// `signals` is a closure rather than a trait bound because the two recall
+    /// surfaces carry the same two numbers under different field names
+    /// (`RecallResult::truth_value` / `RecallHit::truth_value`) on types that
+    /// live in different modules — and because the score this partitions on
+    /// must stay the SAME score `min_truth` gates on, which is a decision the
+    /// call site owns, not this type.
+    pub fn from_ranked<I>(items: I, signals: impl Fn(&T) -> (f64, bool)) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut out = Self {
+            confirmed: Vec::new(),
+            uncertain: Vec::new(),
+            open_question: Vec::new(),
+        };
+        for item in items {
+            let (score, is_contested) = signals(&item);
+            if is_contested {
+                out.open_question.push(item);
+            } else if score >= CONFIRMED_SCORE {
+                out.confirmed.push(item);
+            } else {
+                out.uncertain.push(item);
+            }
+        }
+        out
+    }
+}
+
+/// Widest cosine distance `diversity_radius` will accept.
+///
+/// pgvector's `<=>` is cosine distance on `[0, 2]`, so 2.0 is "drop everything
+/// not diametrically opposed to an already-selected hit" — already absurd, and
+/// the ceiling past which the value cannot mean anything at all.
+pub(crate) const MAX_DIVERSITY_RADIUS: f64 = 2.0;
+
+/// Validate a caller-supplied `diversity_radius`.
+///
+/// REJECTS rather than clamps. A silently clamped radius produces a page that
+/// looks filtered and is not, and this parameter's whole job is to change which
+/// hits come back — the one class of mistake a caller most needs told. `0.0` is
+/// rejected too: nothing is ever strictly nearer than zero, so it is a no-op
+/// spelled like a setting, and `None` is the way to say "off".
+///
+/// # Errors
+/// Returns the caller-facing message when the value is not finite, or is
+/// outside `(0.0, 2.0]`.
+pub(crate) fn validate_diversity_radius(radius: f64) -> Result<f64, String> {
+    if !radius.is_finite() || radius <= 0.0 || radius > MAX_DIVERSITY_RADIUS {
+        return Err(format!(
+            "diversity_radius must be a finite value in (0.0, {MAX_DIVERSITY_RADIUS}] — \
+             cosine distance is bounded on [0, 2], and 0.0 would drop nothing. \
+             Got {radius}. Omit the parameter to disable diversity filtering."
+        ));
+    }
+    Ok(radius)
+}
+
+/// Greedy maximal-marginal-relevance pass over a ranked page (backlog
+/// a9397e8a): walk the page in rank order and drop any hit that sits within
+/// `diversity_radius` cosine distance of a hit ALREADY selected above it.
+///
+/// `too_similar` is the set of unordered id pairs the DB measured as closer
+/// than the radius — i.e. `ClaimRepository::pairwise_cosine_distance_at_dim`'s
+/// output, which already applies the `< max_distance` cut in SQL.
+///
+/// Returns the ids to KEEP, in the input order.
+///
+/// # A pair that is not in `too_similar` is KEPT
+///
+/// This is the load-bearing default, and it is the opposite of the one that
+/// looks natural. A pair is missing from the measured set for two very
+/// different reasons — it is genuinely far apart, OR it could not be measured
+/// at all (an unembedded hit from the embedder-down lexical leg, a workflow hit
+/// whose id is not in `claims`, a row the viewer cannot see). Defaulting an
+/// unmeasurable pair to "distance 0" would make every such hit a duplicate of
+/// everything and silently empty the page down to one row. Keeping is the
+/// honest reading: not known to be near.
+///
+/// # Shrink-only, never back-fill
+///
+/// The candidate list this runs on has already been truncated to `limit` by
+/// SQL, so dropping a redundant hit returns a SHORTER page rather than pulling
+/// a more diverse hit up from below. That matches `min_truth` and
+/// `exclude_contested`, which are documented on both recall surfaces as
+/// returning a short page rather than back-filling with worse-ranked material,
+/// and it leaves `paging.more_available` — derived from the SQL page size, not
+/// from `results.len()` — correct without modification.
+pub(crate) fn greedy_diversity_keep(
+    ranked_ids: &[uuid::Uuid],
+    too_similar: &std::collections::HashSet<(uuid::Uuid, uuid::Uuid)>,
+) -> Vec<uuid::Uuid> {
+    let mut kept: Vec<uuid::Uuid> = Vec::with_capacity(ranked_ids.len());
+    for &candidate in ranked_ids {
+        let redundant = kept
+            .iter()
+            .any(|&selected| too_similar.contains(&unordered_pair(selected, candidate)));
+        if !redundant {
+            kept.push(candidate);
+        }
+    }
+    kept
+}
+
+/// Normalise an unordered id pair so lookups cannot miss by argument order.
+pub(crate) fn unordered_pair(a: uuid::Uuid, b: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Split a ranked page into the two mutually-exclusive response shapes the
+/// `epistemic_partition` flag selects between.
+///
+/// Returns `(flat, partitioned)` where exactly one side is `Some`. Both
+/// envelope fields carry `skip_serializing_if = "Option::is_none"`, so with
+/// the flag off the response is byte-identical to what it was before this
+/// parameter existed — `Some(vec![])` still serializes as `"results": []`,
+/// which an empty-page caller relies on.
+pub(crate) fn split_epistemic<T>(
+    items: Vec<T>,
+    partition: bool,
+    signals: impl Fn(&T) -> (f64, bool),
+) -> (Option<Vec<T>>, Option<EpistemicPartition<T>>) {
+    if partition {
+        (None, Some(EpistemicPartition::from_ranked(items, signals)))
+    } else {
+        (Some(items), None)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1788,7 +2017,17 @@ pub struct TraverseNode {
     pub id: String,
     pub node_type: String,
     pub label: Option<String>,
+    /// The node's independently authored `claims.truth_value`, reported
+    /// unchanged. `None` for a non-claim node. NOT what `min_truth` gates on.
     pub truth_value: Option<f64>,
+    /// The scalar `min_truth` was compared against (backlog `14b98adc`): the
+    /// Dempster–Shafer pignistic probability when the node carries a DS cache,
+    /// else `truth_value`. `None` for a non-claim node.
+    ///
+    /// On the default `min_truth = 0.0` path the DS lookup is skipped — no
+    /// value of it could change which nodes are kept — so this equals
+    /// `truth_value` there.
+    pub belief_score: Option<f64>,
     pub depth: i32,
 }
 
@@ -1938,6 +2177,38 @@ pub struct ResolveBacklogItemParams {
         description = "Methodology for the resolution claim (default: 'expert_elicitation'). Use 'inductive_generalization' if the resolution generalizes from an observed pattern."
     )]
     pub methodology: Option<String>,
+
+    /// The CLOSURE BASIS: the claims whose content justified closing the item.
+    ///
+    /// Without it a closure records no basis at all, so nothing can even
+    /// identify a reopen candidate when later evidence contradicts whatever the
+    /// resolution rested on. Each id becomes a
+    /// `basis -justifies-> resolution` edge.
+    ///
+    /// WHAT THIS DOES AND DOES NOT BUY, measured rather than assumed — the
+    /// backlog item that requested this asserted the stronger claim, and it is
+    /// false on two independent counts today:
+    ///   * `sheaf::restriction_kind_with_profile` does not name `"justifies"`,
+    ///     so it takes the `_ => RestrictionKind::Neutral` arm;
+    ///     `auto_wire_edge_if_epistemic` short-circuits on Neutral, so the edge
+    ///     carries no BBA. `invalidate_and_rewire`'s own doc says "Only edges
+    ///     that actually carried a BBA become targets", so `retraction_cascade`
+    ///     skips it.
+    ///   * `semantic_graph_neighbors` hard-codes its relationship set and does
+    ///     not include `justifies`, so no existing traversal consumes it.
+    ///
+    /// What it DOES buy: the basis is recorded durably and is reverse-queryable
+    /// — given a retracted basis, a query on `edges.source_id` finds every
+    /// closure that rested on it. Making the cascade act on that automatically
+    /// is a separate change (it requires giving `justifies` a non-Neutral
+    /// restriction kind, which is a belief-semantics decision).
+    ///
+    /// Optional and defaulted so every existing caller stays wire-compatible.
+    #[schemars(
+        description = "UUIDs of the claims that justified this resolution (the closure basis). Each becomes a `basis -justifies-> resolution` edge, recording WHY the item was closed so that a later retraction of a basis can be reverse-queried to find the closures resting on it. It does NOT by itself reopen anything: `justifies` carries no belief mass today, so retraction_cascade and recompute_beliefs do not act on it. Must be visible to the caller."
+    )]
+    #[serde(default)]
+    pub basis_claim_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

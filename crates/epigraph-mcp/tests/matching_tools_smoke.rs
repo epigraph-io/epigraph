@@ -837,3 +837,150 @@ async fn decide_match_candidate_unknown_verdict_points_at_the_retire_tool(pool: 
         "must no longer advertise 'retire' as a valid verdict: {msg}"
     );
 }
+
+// ── Sweep coverage (backlog 4194b4a7 ask 3 / 9a513d47) ──────────────────────
+//
+// `find_cross_source_matches` returned `{claim_id, candidates, corroborates}`
+// and nothing else, so `candidates: []` was ambiguous between "the matcher
+// scanned this claim and found nothing" and "the matcher has never looked at
+// it". Only the second is actionable. The per-claim marker already existed
+// (`claims.last_match_scan_at`, migration 037, stamped by the
+// `cross_source_sweep` CLI); the read never surfaced it.
+
+/// Never-scanned claim: `never_swept: true`, `last_swept_at: null`.
+///
+/// This is the state the backlog was filed from — empty candidates on a
+/// freshly-ingested claim — and the whole point is that the response now says
+/// which of the two states it is in.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_cross_source_matches_reports_never_swept_for_an_unscanned_claim(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+
+    let out = tools::matching::find_cross_source_matches(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        FindCrossSourceMatchesParams {
+            claim_id: a.to_string(),
+        },
+    )
+    .await
+    .expect("find");
+    let json: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json");
+
+    assert_eq!(
+        json["candidates"],
+        serde_json::json!([]),
+        "precondition: no candidates, which is exactly the ambiguous case"
+    );
+    assert_eq!(
+        json["never_swept"],
+        serde_json::json!(true),
+        "a claim with last_match_scan_at IS NULL has never been swept; without \
+         this field the empty candidate list above is uninterpretable: {json}"
+    );
+    assert_eq!(
+        json["last_swept_at"],
+        serde_json::Value::Null,
+        "never swept means no timestamp: {json}"
+    );
+}
+
+/// Scanned claim with no matches: `never_swept: false` plus the stamp. Same
+/// empty `candidates` as the test above — the two responses must differ.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_cross_source_matches_reports_last_swept_at_for_a_scanned_claim(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+
+    // What `cross_source_sweep.rs` does to every seed it scans.
+    sqlx::query(
+        "UPDATE claims SET last_match_scan_at = TIMESTAMPTZ '2026-09-01 12:00:00+00' \
+         WHERE id = $1",
+    )
+    .bind(a)
+    .execute(&pool)
+    .await
+    .expect("stamp");
+
+    let out = tools::matching::find_cross_source_matches(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        FindCrossSourceMatchesParams {
+            claim_id: a.to_string(),
+        },
+    )
+    .await
+    .expect("find");
+    let json: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json");
+
+    assert_eq!(
+        json["candidates"],
+        serde_json::json!([]),
+        "precondition: the matcher ran and found nothing"
+    );
+    assert_eq!(
+        json["never_swept"],
+        serde_json::json!(false),
+        "this claim WAS swept — reporting it as unswept would send an agent to \
+         re-run a sweep that already covered it: {json}"
+    );
+    assert!(
+        json["last_swept_at"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("2026-09-01")),
+        "must report the stamp the sweep wrote, got {json}"
+    );
+}
+
+/// A claim the viewer cannot read yields NEITHER coverage field.
+///
+/// The fail-open this pins: treating "no visible row" as "never swept". That
+/// arm is reachable for every private claim id a stranger can guess, and it
+/// would (a) assert something false — a group claim may well have been swept,
+/// the sweep runs corpus-wide on a maintenance pool — and (b) be an existence
+/// signal about a row the caller has no right to. The pre-existing contract for
+/// an unreadable claim is empty arrays and no error; the coverage fields must
+/// not break it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_cross_source_matches_omits_sweep_coverage_for_an_invisible_claim(pool: PgPool) {
+    let server = build_server(pool.clone(), false).await;
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "xsm-coverage").await;
+    let private = fixture::seed_group_claim(&pool, owner, group, "private xsm claim").await;
+
+    // Swept, so a leaking implementation has a real timestamp to hand back.
+    sqlx::query("UPDATE claims SET last_match_scan_at = now() WHERE id = $1")
+        .bind(private)
+        .execute(&pool)
+        .await
+        .expect("stamp");
+
+    let out = tools::matching::find_cross_source_matches(
+        &server,
+        // Public-only viewer: not a member of `group`.
+        &fixture::public_viewer(&pool).await,
+        FindCrossSourceMatchesParams {
+            claim_id: private.to_string(),
+        },
+    )
+    .await
+    .expect("an unreadable claim is empty, not an error");
+    let json: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json");
+
+    assert!(
+        json.get("never_swept").is_none(),
+        "must not answer a sweep-coverage question about a claim this viewer \
+         cannot read: {json}"
+    );
+    assert!(
+        json.get("last_swept_at").is_none(),
+        "must not leak the sweep stamp of an invisible claim: {json}"
+    );
+    assert_eq!(
+        json["candidates"],
+        serde_json::json!([]),
+        "the pre-existing non-leaking shape is preserved: {json}"
+    );
+}

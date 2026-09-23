@@ -136,6 +136,7 @@ async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(po
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by a stdio agent with no declared signer".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         None,
     )

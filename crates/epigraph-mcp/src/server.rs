@@ -398,6 +398,54 @@ impl EpiGraphMcpFull {
         Ok(())
     }
 
+    /// Error for a tool name that **no route owns**: neither the static
+    /// `tool_router` nor any mounted federation route.
+    ///
+    /// # Why this is not `enforce_tool_scope`'s job
+    ///
+    /// Before this existed, such a name fell through to
+    /// [`enforce_tool_scope`](Self::enforce_tool_scope), whose deny-by-default
+    /// arm answered `"Forbidden: tool 'X' is not authorized (no scope
+    /// mapping)"`. That message describes the caller's credentials, and the
+    /// caller's credentials were never consulted — the name simply does not
+    /// route. Backlog ee50d10d is that misattribution reported as an
+    /// authorization regression: `attach_blob` is a FEDERATED episcience tool
+    /// with zero occurrences in this crate, so every call for it while the
+    /// extension was unmounted produced an authz-shaped 403 and read as "the
+    /// tool lost its authorization mid-session".
+    ///
+    /// `enforce_tool_scope` KEEPS its deny-by-default arm: it is the
+    /// fail-closed gate for any name absent from `SCOPE_MAP`, and narrowing it
+    /// to "known tools only" would be a fail-open. This function runs earlier
+    /// and only for names that provably route nowhere, so the gate's behaviour
+    /// is unchanged for every name it still sees.
+    ///
+    /// `unhealthy_extensions` comes from
+    /// [`SharedFederation::unhealthy_extension_candidates`](crate::federation::SharedFederation::unhealthy_extension_candidates)
+    /// — names only, never addresses. A configured-but-unreachable extension is
+    /// the single most likely reason a name that *should* route does not, and
+    /// saying so converts a dead end into a diagnosis.
+    #[must_use]
+    pub fn unknown_tool_error(tool_name: &str, unhealthy_extensions: &[String]) -> McpError {
+        let mut message = format!(
+            "Unknown or unavailable tool '{tool_name}': it is not a kernel tool and no mounted \
+             extension provides it. This is a ROUTING failure, not an authorization failure — \
+             your token's scopes were never consulted."
+        );
+        if !unhealthy_extensions.is_empty() {
+            message.push_str(&format!(
+                " Configured extension(s) currently unreachable: {}. If one of them owns this \
+                 tool, it will route again once the gateway reconnects.",
+                unhealthy_extensions.join(", ")
+            ));
+        }
+        McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::Owned(message),
+            data: None,
+        }
+    }
+
     /// Scope gate for FEDERATED tools, kept deliberately separate from
     /// [`enforce_tool_scope`](Self::enforce_tool_scope).
     ///
@@ -734,7 +782,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Returns {resolution_claim_id, original_id, original_labels}."
+        description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}."
     )]
     async fn resolve_backlog_item(
         &self,
@@ -891,7 +939,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart."
+        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — and contest wins over truth_value, so a 0.9 claim with a live refutation lands in open_question."
     )]
     async fn recall(
         &self,
@@ -904,7 +952,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Paragraph-primary semantic search over the claim graph with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, and CORROBORATES neighbors. Auto-detects centroid_dim (1536 vs 3072) by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN when the corpus has no themes yet."
+        description = "Paragraph-primary semantic search over the claim graph with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, and CORROBORATES neighbors. Auto-detects centroid_dim (1536 vs 3072) by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN when the corpus has no themes yet. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — and contest wins over truth_value, so a 0.9 paragraph with a live refutation lands in open_question."
     )]
     async fn recall_with_context(
         &self,
@@ -1724,7 +1772,7 @@ impl EpiGraphMcpFull {
     // ── Cross-source matching (3 tools) ──
 
     #[tool(
-        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status) plus any CORROBORATES edges already written. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
+        description = "Look up existing cross-source matches for a claim. Returns match_candidates rows (any status), any CORROBORATES edges already written, and sweep coverage for the claim: `never_swept: true` means the matcher has not scanned it yet (an empty candidate list says nothing), `last_swept_at` is when it last did. Both coverage fields are omitted entirely for a claim you cannot read. Read-only — to *run* the matcher across new claims, use the `cross_source_sweep` CLI."
     )]
     async fn find_cross_source_matches(
         &self,
@@ -1881,8 +1929,9 @@ impl ServerHandler for EpiGraphMcpFull {
         // so a stdio federated call reaches `enforce_federated_scope` and fails
         // closed there (no `AuthContext`) rather than falling through to a bare
         // "unknown tool" from the router. A genuinely-unknown name (neither
-        // static nor federated) still falls through to the static path and its
-        // fail-closed gate, exactly as before.
+        // static nor federated) is reported as a ROUTING failure at the bottom
+        // of this block — see `unknown_tool_error` — rather than borrowing the
+        // static gate's authz-shaped "no scope mapping" (backlog ee50d10d).
         if self.tool_router.get(&request.name).is_none() {
             // `route_config` returns an OWNED config and releases the registry
             // lock before returning, so nothing below holds a guard across the
@@ -1920,6 +1969,35 @@ impl ServerHandler for EpiGraphMcpFull {
                     .invoke(&request.name, &token, request.arguments)
                     .await
                     .map_err(crate::errors::internal_error);
+            }
+
+            // Neither a kernel tool nor a federated route: a ROUTING failure.
+            //
+            // GATED ON THE CALLER ALREADY BEING AUTHENTICATED ON THE HTTP PATH,
+            // and that is not decoration. `main.rs` has a router arm that
+            // layers NEITHER auth middleware (given neither `--jwt-secret` nor
+            // `--allow-unauthenticated-http` the `/mcp` service is nested
+            // bare), so an unauthenticated HTTP call does reach here, and
+            // `enforce_tool_scope`'s no-auth branch below is the only thing
+            // refusing it — the property
+            // `http_calls_cannot_reach_a_tool_without_an_auth_context.rs`
+            // locks. Answering "unknown tool" ahead of that branch would turn
+            // this into a PRE-AUTH tool-name oracle on exactly that arm. For a
+            // caller who IS authenticated nothing new is disclosed: the old
+            // "no scope mapping" answer already meant "absent from SCOPE_MAP",
+            // and `scope_map_coverage` makes SCOPE_MAP total over kernel tools,
+            // so the same name/no-name bit was already readable.
+            //
+            // stdio (`!is_http_call`) takes this arm too. It previously fell
+            // through to the macro dispatcher's bare "unknown tool", so the
+            // two transports now give the same, more useful answer.
+            if !is_http_call || auth_owned.is_some() {
+                return Err(Self::unknown_tool_error(
+                    &request.name,
+                    &self
+                        .federation
+                        .unhealthy_extension_candidates(&request.name),
+                ));
             }
         }
 
