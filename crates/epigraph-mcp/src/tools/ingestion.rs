@@ -738,11 +738,6 @@ pub async fn do_ingest_document(
         let _ = &source_url;
     }
 
-    // ONE connection for every DS-wiring statement below, acquired here rather
-    // than per call. See the D4 note at the first use: this is not a stamp, it is
-    // the difference between N tenancy contexts and one.
-    let mut ds_conn = pool.acquire().await.map_err(internal_error)?;
-
     // ── 5. Plan edges (decomposes_to / section_follows / supports / authored placeholders) ──
     let mut relationships_created = 0_usize;
     for edge in &plan.edges {
@@ -799,12 +794,30 @@ pub async fn do_ingest_document(
         // reaches no caller at all. Converting it onto a stamped transaction
         // FIRST would make the path fail atomically into a void — the same
         // outcome, still unobservable — so D4's first obligation is to make that
-        // task's outcome observable, and this site converts with it. The
-        // `&mut *ds_conn` below is a mechanical consequence of the engine
-        // signature change: it moves N pool checkouts onto ONE connection, which
-        // is a coherence improvement and NOT a tenancy stamp.
+        // task's outcome observable, and this site converts with it.
+        //
+        // A FRESH CHECKOUT PER CALL, DELIBERATELY, and an earlier revision of this
+        // change did it the other way and was reverted. Hoisting one `ds_conn`
+        // above the loop looked like a free coherence win, but
+        // `auto_wire_edge_if_epistemic` and `auto_wire_ds_batch` now take a
+        // SAVEPOINT via `conn.begin()`, and `sqlx`'s `Acquire` issues a real
+        // `BEGIN` — not a `SAVEPOINT` — when the connection is not already inside
+        // a transaction. So a shared bare connection silently converted this
+        // path's auto-committing statements into explicit transactions, and
+        // `auto_wire_ds_batch`'s per-entry loop `break`s where it used to
+        // `continue` if a rollback fails. That is a behaviour change on the one
+        // path whose failures are unobservable by construction, which is the last
+        // place to make one. Per-call acquire is byte-identical to what this code
+        // did before the engine signature changed.
+        let mut edge_conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("edge auto-wire skipped: could not acquire: {e}");
+                continue;
+            }
+        };
         ds_auto::auto_wire_edge_if_epistemic(
-            &mut ds_conn,
+            &mut edge_conn,
             viewer,
             was_created,
             row.id,
@@ -822,6 +835,8 @@ pub async fn do_ingest_document(
     let (claims_ds_wired, ds_frame_id) = if ds_entries.is_empty() {
         (None, None)
     } else {
+        // Per-call acquire, for the reason recorded at the edge site above.
+        let mut ds_conn = pool.acquire().await.map_err(internal_error)?;
         match ds_auto::auto_wire_ds_batch(&mut ds_conn, viewer, &ds_entries, agent_id).await {
             Ok((fid, count)) => (Some(count), Some(fid.to_string())),
             Err(e) => {
