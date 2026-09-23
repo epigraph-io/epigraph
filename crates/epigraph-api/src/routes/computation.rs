@@ -563,8 +563,13 @@ pub async fn sheaf_reconcile(
 /// filtered by the caller's `Viewer`:
 ///
 /// * factors: `FactorRepository::list_readable`, which drops a factor unless
-///   EVERY variable is a claim the caller may read, so hidden evidence never
-///   reaches a visible claim through a message;
+///   EVERY variable is a claim the caller may read, the edge the
+///   `edges_auto_factor` trigger derived it from (`source_edge_id`) is an edge
+///   the caller may read, and its frame is a frame the caller may read. So
+///   neither a hidden claim nor a hidden edge or frame between visible claims
+///   reaches a visible claim through a message. A factor that names no source
+///   edge is gated by its claims and frame alone: `routes/edges.rs`'s own
+///   factor INSERT stamps none, a residual recorded on `F-SHARD4-A2`;
 /// * prior beliefs: `ClaimRepository::pignistic_probs_for`;
 /// * mass functions: `MassFunctionRepository::get_for_claims`, loaded once;
 /// * alternative sets: `AlternativeSetRepository::members_for_claims`, which
@@ -1162,7 +1167,9 @@ pub async fn belief_at_time(
 
 // `FactorRow` was deleted with the inline factor load in `propagate_beliefs`;
 // its replacement is `epigraph_db::FactorRow`, returned by
-// `FactorRepository::list_readable`, whose query carries `/* {VISIBILITY:c} */`.
+// `FactorRepository::list_readable`, whose query carries `/* {VISIBILITY:c} */`,
+// `/* {EDGE_VISIBILITY:e} */` (the factor's source edge) and
+// `/* {VISIBILITY:fr} */` (its frame).
 
 // `EvidenceAtRow` was deleted with the inline evidence read in
 // `belief_at_time`; its replacement is `epigraph_db::EvidenceAtTimeRow`, whose

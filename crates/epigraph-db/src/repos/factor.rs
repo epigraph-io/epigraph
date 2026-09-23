@@ -184,8 +184,16 @@ impl FactorRepository {
             .collect())
     }
 
-    /// The factors in frame `frame_id` (every frame when `None`) whose EVERY
-    /// variable is a claim the viewer may READ, oldest first.
+    /// The factors in frame `frame_id` (every frame when `None`) that the
+    /// viewer may READ in full, oldest first. A factor is returned only when
+    /// all three of the things it is built from are readable:
+    ///
+    /// 1. EVERY variable is a claim the viewer may read (`{VISIBILITY:c}`);
+    /// 2. the edge it was derived from, when it names one in
+    ///    `properties->>'source_edge_id'`, is an edge the viewer may read
+    ///    (`{EDGE_VISIBILITY:e}`);
+    /// 3. its frame, when it has one, is a frame the viewer may read
+    ///    (`{VISIBILITY:fr}`).
     ///
     /// The factor load of `POST /api/v1/bp/propagate`
     /// (`routes/computation.rs::propagate_beliefs`, `F-SHARD4-A2`). The route
@@ -204,16 +212,75 @@ impl FactorRepository {
     /// visible beliefs. Dropping it means the propagation the caller sees is
     /// computed only from what the caller can read.
     ///
+    /// # Why the source edge is gated, not only the variables
+    ///
+    /// Most factors are not written by a handler. The `edges_auto_factor`
+    /// AFTER INSERT trigger (migration 001, function re-created in 038)
+    /// derives one from every epistemic claim→claim edge (`SUPPORTS`,
+    /// `CONTRADICTS`, `CORROBORATES`, `decomposes_to`, …; the list is
+    /// `edge_to_factor_type`) and stamps the edge's id into
+    /// `properties->>'source_edge_id'`. The trigger never looks at the edge's
+    /// tenancy. `epigraph_edges_tenancy`'s no-widening rule keeps an edge
+    /// declared group-private even when both endpoints are public, so a
+    /// private edge between two PUBLIC claims yields a factor whose every
+    /// variable passes rule 1. Without rule 2 a stranger's `factors_count` and
+    /// propagated BetPs would show that the private edge exists and what
+    /// strength it carries: the same disclosure
+    /// `AlternativeSetRepository::members_for_claims` closes for alt-sets with
+    /// its own `{EDGE_VISIBILITY:e}`.
+    ///
+    /// A factor with no `source_edge_id` passes rule 2 unexamined. That is
+    /// every factor written by `FactorRepository::insert` and by
+    /// `routes/edges.rs`'s belt-and-braces INSERT, which stamps no edge id.
+    /// Those are gated by rules 1 and 3 only; see `F-SHARD4-A2` in
+    /// `docs/tenancy/progress.json` for that residual.
+    ///
+    /// # A dangling `source_edge_id` drops the factor, for everyone
+    ///
+    /// Decided, not incidental, and the same answer rule 1 gives a dangling
+    /// variable. `edges` is under row-level security (policies in migration
+    /// 077, FORCE in 079), so on a policy-subject connection an edge the
+    /// session cannot see and an edge that does not exist are the same empty
+    /// subquery. The gate must therefore be the positive `EXISTS (a readable
+    /// edge)`; the negative spelling, `NOT EXISTS (a hidden edge)`, finds no
+    /// hidden edge under the policy and would KEEP the factor, which is the
+    /// leak. A positive `EXISTS` drops a dangling id as well, and keeping the
+    /// answer the same before and after the app-role cutover means dropping it
+    /// on the superuser pool too. It is also the right epistemic answer: no
+    /// delete trigger removes a derived factor with its edge (see
+    /// `MatchCandidateRepo::retire`), so a factor whose edge is gone stands
+    /// for a relationship the graph no longer asserts. A value that is not a
+    /// UUID matches no edge and drops the factor the same way; the regex guard
+    /// makes it a non-match instead of a cast error that would 500 the run.
+    /// The comparison is on `uuid`, not `e.id::text`, so each probe is a
+    /// primary-key lookup: this `EXISTS` sits under an `OR` and cannot be
+    /// pulled up into a semi-join.
+    ///
+    /// Rule 2 asks only whether the edge is READABLE. A retracted edge
+    /// (`valid_to` set) still admits its factor, as a retracted edge still
+    /// counts in `members_for_claims` and in the `alternative_set` view;
+    /// whether retraction should retire a derived factor is a belief question,
+    /// not a tenancy one, and is unchanged here.
+    ///
+    /// # Why the frame is gated
+    ///
+    /// `frames` is a tenancy registry table (`frames_tenancy`, migration 077)
+    /// and a frame may be declared group-private. A factor in a private frame
+    /// records that group's modelling choice. `factors.frame_id` is a foreign
+    /// key, so it cannot dangle; a frame the viewer cannot read drops its
+    /// factors, including when the caller names that frame in `frame_id`,
+    /// which then reads exactly like an empty frame.
+    ///
     /// # No database backstop, stated
     ///
     /// `factors` has no tenancy columns and row-level security is off (measured
-    /// at migration head 100: `relrowsecurity` false), so the `{VISIBILITY:c}`
-    /// predicate on the `claims` subquery is the only gate this read has. A
-    /// variable id that names no claim at all fails the predicate too. That is
-    /// deliberate: under migration 077's policies a claim the session cannot
-    /// see and a claim that does not exist are the same empty subquery, so
-    /// treating them alike keeps this read's answer the same before and after
-    /// the request path connects as an application role.
+    /// at migration head 100: `relrowsecurity` false), so the three predicates
+    /// above are the only gate this read has. A variable id that names no
+    /// claim at all fails rule 1 too. That is deliberate: under migration
+    /// 077's policies a claim the session cannot see and a claim that does not
+    /// exist are the same empty subquery, so treating them alike keeps this
+    /// read's answer the same before and after the request path connects as
+    /// an application role. All three markers resolve to the one `$2` bind.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -235,6 +302,22 @@ impl FactorRepository {
                             /* {VISIBILITY:c} */ \
                      ) \
                 ) \
+                AND (f.properties->>'source_edge_id' IS NULL \
+                     OR EXISTS ( \
+                         SELECT 1 FROM edges e \
+                          WHERE e.id = CASE \
+                                WHEN f.properties->>'source_edge_id' \
+                                     ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+                                THEN (f.properties->>'source_edge_id')::uuid \
+                                END \
+                            /* {EDGE_VISIBILITY:e} */ \
+                     )) \
+                AND (f.frame_id IS NULL \
+                     OR EXISTS ( \
+                         SELECT 1 FROM frames fr \
+                          WHERE fr.id = f.frame_id \
+                            /* {VISIBILITY:fr} */ \
+                     )) \
               ORDER BY f.created_at",
             2,
         );

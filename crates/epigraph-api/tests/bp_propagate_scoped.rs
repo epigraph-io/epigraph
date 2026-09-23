@@ -7,7 +7,8 @@
 //! checked no scope. So any bearer:
 //!
 //! * got a propagated BetP for every claim any factor named, the caller's
-//!   unreadable claims included;
+//!   unreadable claims included, and took in factors derived from edges or
+//!   filed in frames it cannot read;
 //! * could overwrite `pignistic_prob` / `belief` / `plausibility` on any such
 //!   claim with `apply_updates: true`, with or without `claims:write`;
 //! * got no failure count from the scalar branch at all, which discarded its
@@ -114,6 +115,61 @@ async fn seed_factor(pool: &PgPool, frame: Uuid, vars: &[Uuid]) {
     .execute(pool)
     .await
     .expect("seed factor");
+}
+
+/// A `CONTRADICTS` edge from `source` to `target`, DECLARED private to
+/// `author`'s personal group in the INSERT, and the factor the
+/// `edges_auto_factor` trigger derives from it, moved into `frame`.
+///
+/// The trigger writes the factor, as it does for every epistemic claim->claim
+/// edge in production, and stamps `properties->>'source_edge_id'`.
+/// `epigraph_edges_tenancy`'s no-widening rule keeps the declaration even
+/// though both endpoints are public. Both are asserted, so a trigger that
+/// stopped doing either fails here rather than passing vacuously.
+///
+/// The trigger writes the factor with no frame. It is moved into the test's
+/// frame, as `promote_hypothesis` moves factors in production, because a
+/// `frame_id`-less run would take in every factor in the shared database.
+async fn seed_private_edge_factor(
+    pool: &PgPool,
+    author: Uuid,
+    source: Uuid,
+    target: Uuid,
+    frame: Uuid,
+) {
+    let group = common::personal_group_of(pool, author).await;
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            visibility, owner_group_id) \
+         VALUES ($1, 'claim', $2, 'claim', 'CONTRADICTS', 'group', $3) RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("seed private CONTRADICTS edge");
+    let visibility: String = sqlx::query_scalar("SELECT visibility FROM edges WHERE id = $1")
+        .bind(edge)
+        .fetch_one(pool)
+        .await
+        .expect("read edge visibility");
+    assert_eq!(
+        visibility, "group",
+        "CALIBRATION: the tenancy trigger must keep the edge's private declaration"
+    );
+    let moved =
+        sqlx::query("UPDATE factors SET frame_id = $2 WHERE properties->>'source_edge_id' = $1")
+            .bind(edge.to_string())
+            .bind(frame)
+            .execute(pool)
+            .await
+            .expect("move the derived factor into the test's frame")
+            .rows_affected();
+    assert_eq!(
+        moved, 1,
+        "CALIBRATION: edges_auto_factor must derive exactly one factor from the edge"
+    );
 }
 
 /// `(belief, plausibility, pignistic_prob, belief_frame_id)`.
@@ -230,6 +286,65 @@ async fn a_stranger_gets_no_belief_for_a_claim_it_cannot_read() {
     }
 
     for id in [p, q, h] {
+        assert_unchanged(&pool, id, frame, "a run without apply_updates").await;
+    }
+}
+
+/// A stranger's run never takes in a factor derived from an edge it cannot
+/// read, even when both of the factor's claims are public.
+///
+/// Most factors are written by the `edges_auto_factor` trigger, not by a
+/// handler, and the trigger ignores the edge's tenancy. Here the owner's
+/// public claims `p` and `q` are joined only by a `CONTRADICTS` edge private
+/// to the owner's group. If its factor reached the stranger's run,
+/// `factors_count` and the propagated BetPs would disclose that the private
+/// edge exists and what it asserts. The owner's run over the same frame counts
+/// the factor, which is what makes the stranger's zero a filter and not an
+/// empty fixture.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_gets_no_factor_from_an_edge_it_cannot_read() {
+    let (url, pool) = test_pool().await;
+    let owner = seed_principal(&pool).await;
+    let stranger = seed_principal(&pool).await;
+    let frame = fresh_frame(&pool).await;
+    let p = seed_claim(&pool, owner, "public", frame).await;
+    let q = seed_claim(&pool, owner, "public", frame).await;
+    seed_private_edge_factor(&pool, owner, p, q, frame).await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    for mode in ["scalar", "cdst"] {
+        let body = json!({ "frame_id": frame, "mode": mode });
+
+        let stranger_token = common::test_bearer_token_for_principal(stranger, &["graph:read"]);
+        let (status, got) = propagate(addr, &stranger_token, body.clone()).await;
+        assert_eq!(status, 200, "{mode}: body={got}");
+        assert_eq!(
+            got["factors_count"], 0,
+            "{mode}: the factor derived from the owner's private edge must not reach a \
+             stranger's run; body={got}"
+        );
+        assert!(
+            reported(&got).is_empty(),
+            "{mode}: the stranger's run must propagate nothing; body={got}"
+        );
+
+        let owner_token = common::test_bearer_token_for_principal(owner, &["graph:read"]);
+        let (status, got) = propagate(addr, &owner_token, body).await;
+        assert_eq!(status, 200, "{mode}: body={got}");
+        assert_eq!(
+            got["factors_count"], 1,
+            "{mode}: CALIBRATION, the owner's run over the same frame takes in the factor; \
+             body={got}"
+        );
+        assert_eq!(
+            reported(&got),
+            HashSet::from([p, q]),
+            "{mode}: CALIBRATION; body={got}"
+        );
+    }
+
+    for id in [p, q] {
         assert_unchanged(&pool, id, frame, "a run without apply_updates").await;
     }
 }

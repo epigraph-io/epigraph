@@ -776,6 +776,12 @@ pub async fn create_edge(
         // Belt-and-suspenders: DB trigger (migration 044/049) also fires on INSERT,
         // but this Rust path ensures factor creation even if the trigger is absent
         // (e.g. dev environments that haven't run all migrations).
+        //
+        // RESIDUAL, recorded on F-SHARD4-A2.fix_2026_09_22 in
+        // docs/tenancy/progress.json: unlike the trigger, this INSERT stamps no
+        // `properties.source_edge_id`, so `FactorRepository::list_readable`'s edge
+        // gate cannot see the edge this factor came from. The factor is gated by
+        // its claims and its frame only.
         if matches!(
             request.relationship.to_uppercase().as_str(),
             "SUPPORTS" | "CONTRADICTS"
