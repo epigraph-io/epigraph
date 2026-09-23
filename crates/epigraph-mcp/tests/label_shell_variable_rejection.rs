@@ -41,7 +41,7 @@ async fn claim_count_for_content(pool: &PgPool, content: &str) -> i64 {
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let content = "mcp submit_claim label guard subject";
 
     let err = epigraph_mcp::tools::claims::submit_claim(
@@ -89,7 +89,7 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let content = "mcp submit_claim label guard negative control";
 
     epigraph_mcp::tools::claims::submit_claim(
@@ -132,7 +132,7 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let content = "mcp memorize tag guard subject";
 
     let err = epigraph_mcp::tools::memory::memorize(
@@ -172,7 +172,7 @@ async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let good = "mcp batch good entry";
     let bad = "mcp batch bad entry";
 
@@ -234,7 +234,7 @@ async fn update_labels_tool_rejects_unexpanded_add_and_changes_nothing(pool: PgP
     let claim_id =
         seed_claim_with_labels(&pool, "update_labels tool guard subject", &["keeper"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let err = epigraph_mcp::tools::claims::update_labels(
         &server,
@@ -277,7 +277,7 @@ async fn update_with_evidence_rejects_unexpanded_label_before_writing_evidence(p
     let claim_id =
         seed_claim_with_labels(&pool, "update_with_evidence guard subject", &["keeper"]).await;
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let err = epigraph_mcp::tools::claims::update_with_evidence(
         &server,

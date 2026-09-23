@@ -198,19 +198,6 @@ pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
 }
 
-/// The canonical viewer fixture, included HERE in addition to each test binary's
-/// own `mod fixture;`.
-///
-/// Why not reach `crate::fixture::scoped_pool` instead: `mod fixture;` is
-/// declared per test BINARY, and not every binary that declares `mod common;`
-/// declares it — a path through the crate root would compile in some binaries and
-/// not others. This is a second COMPILATION of the one canonical body, not a
-/// second copy of it: `epigraph-db/tests/viewer_fixture_single_source.rs` asserts
-/// that exactly one file named `viewer_fixture.rs` carries a body, and this adds
-/// no file it would see.
-#[path = "../../../epigraph-db/tests/viewer_fixture.rs"]
-mod canonical_fixture;
-
 /// [`build_test_server`] plus the [`epigraph_db::ScopedPool`] that the canonical
 /// write path now REQUIRES.
 ///
@@ -224,21 +211,39 @@ mod canonical_fixture;
 /// `reasoning_traces` becomes a committed claim with no provenance. So a write
 /// test needs this; a read test does not, and making the ~230 `build_test_server`
 /// call sites async to give every one of them a pool they will not use would be
-/// churn with a cost (each `ScopedPool::connect` opens its own connections).
+/// churn with a running cost (each `ScopedPool::connect` opens its own
+/// connections).
 ///
-/// Async where `build_test_server` is sync, because building a `ScopedPool`
-/// means connecting: it owns pool construction so that `after_release` — the
-/// tenancy-GUC scrub — can be installed at build time, which sqlx permits only
-/// there.
-pub async fn build_scoped_test_server(pool: PgPool) -> EpiGraphMcpFull {
-    let scoped = canonical_fixture::scoped_pool(&pool).await;
+/// # Why `scoped` is a PARAMETER and not built in here
+///
+/// The pool has to come from `fixture::scoped_pool`, and this module cannot reach
+/// it. Two routes were tried and both are worse:
+///
+/// * `#[path]`-including the canonical fixture here as well — MEASURED to fail
+///   `clippy::duplicate_mod` under `-D warnings`, because every test binary that
+///   uses this helper also declares its own `mod fixture;` over the same file
+///   ("file is loaded as a module multiple times").
+/// * `crate::fixture::scoped_pool` — `mod fixture;` is declared per test BINARY,
+///   so this would compile in some binaries and not others, and the error would
+///   surface in THIS file rather than in the test that forgot the declaration.
+///
+/// Passing it in keeps the derivation single-sourced in the canonical fixture and
+/// makes each call site say where its pool came from:
+///
+/// ```ignore
+/// let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+/// ```
+pub fn build_scoped_test_server(pool: PgPool, scoped: epigraph_db::ScopedPool) -> EpiGraphMcpFull {
     build_test_server(pool).with_scoped_pool(scoped)
 }
 
 /// [`build_test_server_generated_signer`] plus a `ScopedPool`. See
-/// [`build_scoped_test_server`] for why the scoped variant exists at all.
-pub async fn build_scoped_test_server_generated_signer(pool: PgPool) -> EpiGraphMcpFull {
-    let scoped = canonical_fixture::scoped_pool(&pool).await;
+/// [`build_scoped_test_server`] for why the scoped variant exists and why the
+/// pool is a parameter.
+pub fn build_scoped_test_server_generated_signer(
+    pool: PgPool,
+    scoped: epigraph_db::ScopedPool,
+) -> EpiGraphMcpFull {
     build_test_server_generated_signer(pool).with_scoped_pool(scoped)
 }
 

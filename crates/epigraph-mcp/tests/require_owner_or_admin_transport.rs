@@ -53,7 +53,8 @@ use common::{build_scoped_test_server, build_scoped_test_server_generated_signer
 /// Ok.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_permits_cross_agent_supersede_without_auth(pool: PgPool) {
-    let server = build_scoped_test_server_generated_signer(pool.clone()).await;
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;
@@ -89,7 +90,8 @@ async fn generated_signer_permits_cross_agent_supersede_without_auth(pool: PgPoo
 /// dedup blocked while supersede worked.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_permits_cross_agent_mark_duplicate_without_auth(pool: PgPool) {
-    let server = build_scoped_test_server_generated_signer(pool.clone()).await;
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let duplicate = seed_claim(&pool, foreign_agent).await;
@@ -124,7 +126,8 @@ async fn generated_signer_permits_cross_agent_mark_duplicate_without_auth(pool: 
 /// the mandated verb blocked.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(pool: PgPool) {
-    let server = build_scoped_test_server_generated_signer(pool.clone()).await;
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_backlog_claim(&pool, foreign_agent).await;
@@ -161,7 +164,7 @@ async fn generated_signer_permits_cross_agent_backlog_retirement_without_auth(po
 /// would make the change a blanket grant rather than a narrow one.
 #[sqlx::test(migrations = "../../migrations")]
 async fn declared_signer_still_denies_cross_agent_supersede_without_auth(pool: PgPool) {
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;
@@ -207,7 +210,8 @@ async fn declared_signer_still_denies_cross_agent_supersede_without_auth(pool: P
 async fn generated_signer_does_not_relax_the_authenticated_path(pool: PgPool) {
     use epigraph_auth::{AuthContext, ClientType};
 
-    let server = build_scoped_test_server_generated_signer(pool.clone()).await;
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_agent_row(&pool).await;
     let foreign_claim = seed_claim(&pool, foreign_agent).await;

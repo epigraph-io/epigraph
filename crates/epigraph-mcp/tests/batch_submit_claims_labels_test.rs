@@ -14,7 +14,7 @@ use common::*;
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_scoped_test_server(pool.clone()).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let content = "batched claim carrying a label";
     let result = epigraph_mcp::tools::batch::batch_submit_claims(
