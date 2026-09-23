@@ -87,9 +87,12 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/claims.rs",
         "ClaimRepository::update_labels",
         1,
-        "`update_with_evidence`'s label merge. Reached only AFTER the DS wiring below, which is \
-         itself unconverted and refuses first on a clean schema, so this line does not execute \
-         on either configuration today. Converts with D2.",
+        "`update_with_evidence`'s label merge. Sequenced AFTER the DS wiring below, which is \
+         itself unconverted. RE-MEASURED once that wiring became best-effort: on CONFIG B \
+         (prod-faithful) this line now DOES execute — the wire is dropped with a warn and the \
+         merge commits, deliberately ungated on the wire's success so submitted labels are not \
+         silently lost (backlog f14592cb). On CONFIG A the evidence INSERT above still refuses \
+         first, so it stays unreached there. Converts with D2.",
     ),
     (
         "tools/claims.rs",
@@ -116,8 +119,11 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`update_with_evidence`'s DS wiring. Writes `claim_frames` + `mass_functions`, neither of \
          which has an orphan `*_privacy` policy, so it is refused in PRODUCTION as well as on a \
-         clean migrate — this is why `mass_functions` stopped growing. D2. Gated on `was_created` \
-         asymmetrically ON PURPOSE: re-running it double-counts mass.",
+         clean migrate — this is why `mass_functions` stopped growing. D2. Its FAILURE is now \
+         best-effort and DISCLOSED (`tracing::warn!` + `belief_wired: false` in the response), \
+         matching `submit_claim`; that changed how the refusal is reported, NOT that the site \
+         takes the unstamped pool, so the entry stands until D2 converts it. Gated on \
+         `was_created` asymmetrically ON PURPOSE: re-running it double-counts mass.",
     ),
     (
         "tools/claims.rs",

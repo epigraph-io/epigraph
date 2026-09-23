@@ -1272,6 +1272,41 @@ pub struct UpdateResponse {
     pub truth_before: f64,
     pub truth_after: f64,
     pub evidence_id: String,
+    /// Whether the Dempster-Shafer wiring for this submission actually landed.
+    ///
+    /// `true` means a fresh BBA was materialized and the claim's belief was
+    /// recomputed, so `truth_after` and the three `belief` / `plausibility` /
+    /// `pignistic_prob` fields describe a NEW epistemic state.
+    ///
+    /// `false` means the evidence row was attached and committed — the claim
+    /// genuinely carries this submission — but the DS wiring failed, so **this
+    /// call moved no belief**: neither the claim's `truth_value` nor its cached
+    /// belief columns were recomputed. On that path `truth_after ==
+    /// truth_before`, the three measure fields are ABSENT rather than stale
+    /// (there are no fresh measures to report, and echoing the persisted
+    /// columns would dress a no-op as a delta), and the underlying error is in
+    /// the server log as a `ds auto-wire failed` WARN.
+    ///
+    /// What `false` does NOT promise is that no DS row at all was written.
+    /// `ds_auto::auto_wire_ds_update` is a sequence of separate pool writes
+    /// (`claim_frames` → evidence perspective → `mass_functions` → cached
+    /// belief), so a failure at a LATER step can leave the earlier rows behind.
+    /// The production failure is at the FIRST step (`assign_claim` refused on
+    /// `claim_frames`), where nothing lands — measured on the prod-faithful e2e
+    /// configuration as `claim_frames=0 mass_functions=0` after the call.
+    ///
+    /// Out-of-band repair of the cached belief is `epigraph-cli
+    /// recompute_claim_belief` (which runs on `MaintenancePool::connect`, not on
+    /// this tool's pool) — **not** the `recompute_beliefs` MCP tool, which
+    /// `maintenance_tools_run_on_the_maintenance_connection() -> false` refuses
+    /// by construction. `recompute_claim_belief` recomputes from the claim's
+    /// STORED mass functions, so it cannot restore a BBA that was never stored
+    /// (the first-step failure above); that contribution needs the evidence
+    /// re-submitted once the DS wiring is converted.
+    ///
+    /// Same disclosure contract as [`LinkEpistemicResponse::belief_wired`]: the
+    /// call succeeded, and the caller is told exactly which half of it did.
+    pub belief_wired: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

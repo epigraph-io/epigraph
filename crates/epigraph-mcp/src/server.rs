@@ -733,7 +733,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Add new evidence to an existing claim and run a Bayesian belief update. Returns the before/after truth values."
+        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The evidence row is always attached on success; the belief update is BEST-EFFORT (same policy as submit_claim). belief_wired=false means the evidence was attached but the belief update did not complete, so this call moved NO belief: truth_after equals truth_before and belief/plausibility/pignistic_prob are omitted rather than reported stale. The cached belief is repaired out-of-band with `epigraph-cli recompute_claim_belief`, which recomputes from stored mass functions only (NOT the recompute_beliefs tool, which refuses by construction)."
     )]
     async fn update_with_evidence(
         &self,
