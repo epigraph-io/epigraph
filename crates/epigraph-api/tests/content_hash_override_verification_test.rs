@@ -110,11 +110,12 @@ async fn matching_content_hash_override_is_accepted() {
         resp.text().await.unwrap_or_default()
     );
 
-    let stored_hash: Vec<u8> = sqlx::query_scalar("SELECT content_hash FROM claims WHERE content = $1")
-        .bind(&content)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let stored_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT content_hash FROM claims WHERE content = $1")
+            .bind(&content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let expected_hash = blake3::hash(content.as_bytes()).as_bytes().to_vec();
     assert_eq!(
         stored_hash, expected_hash,
