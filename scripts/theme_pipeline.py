@@ -8,7 +8,15 @@ Subcommands:
   label     run label_themes_llm
 
 All grow writes happen in Model B under one consolidated run_id; project
-materialises Model A; label names it. --dry-run reports the plan without writing.
+materialises Model A; label names it.
+
+--dry-run (grow only) writes nothing. Without --from-run-id it reports the plan
+and creates no base run: the split plan cannot be previewed until a base run
+exists, so preview an existing one with `discover --run-id X` or
+`grow --from-run-id X --dry-run`. With --from-run-id it reports which clusters
+the first iteration would split. The connection is opened read-only, so a write
+that slips into the dry-run path fails instead of committing. project and label
+refuse --dry-run.
 """
 import argparse
 import json
@@ -138,12 +146,50 @@ def run_label_step(database_url):
     )
 
 
+def fresh_run_plan(args):
+    """What a fresh `grow` would do, reported without touching the database.
+
+    A dry run cannot preview the split plan of a run that does not exist yet,
+    and building the base run to preview it IS the write a dry run must not
+    make. `seed_phase` writes a new run's cluster_centroids and cluster_labels
+    and replaces data/umap_reducer.pkl. `assign_batch` then upserts
+    claim_clusters, which holds ONE row per claim (UNIQUE (claim_id)), so it
+    replaces every claim's live assignment, and the matcher reads that table
+    directly. The new run would also become the newest cluster_centroids run,
+    which `project` and `discover` pick when given no --run-id.
+    """
+    scope = "all" if args.all_claims else "atomic"
+    k = args.k if args.k is not None else "auto (silhouette over 8..20)"
+    return {
+        "status": "dry-run",
+        "run_id": None,
+        "would": [
+            f"seed: fit UMAP-32 + k-means (k={k}) on a {args.sample_size}-claim {scope} "
+            "sample; write cluster_centroids and cluster_labels under a new run id; "
+            "replace data/umap_reducer.pkl",
+            f"assign: upsert claim_clusters for every claim with an embedding, in batches "
+            f"of {args.batch_size}, replacing each claim's existing assignment",
+            f"split: until k >= {args.target_k} and no cluster holds >= {args.max_size} "
+            f"claims (min size {args.min_size}, at most {args.max_iter} iterations)",
+            "project: replace claim_themes and claims.theme_id with the new run",
+            "label: relabel every theme with the LLM",
+        ],
+        "preview": "the split plan needs a base run: `discover --run-id X` or "
+                   "`grow --from-run-id X --dry-run` previews an existing one",
+    }
+
+
 def grow(conn, args):
     # --from-run-id resumes the split/project/label phases on an existing base
     # run (skips the ~40-min base assign); otherwise start a fresh consolidated run.
     if getattr(args, "from_run_id", None):
         run_id = args.from_run_id
         print(f"== resuming run {run_id} (skipping base clustering) ==", file=sys.stderr)
+    elif args.dry_run:
+        # Checked BEFORE the base phase. It used to be checked only inside the
+        # split loop, after seed_phase and assign_batch had already committed.
+        print("== [dry-run] no base run is created; nothing is written ==", file=sys.stderr)
+        return fresh_run_plan(args)
     else:
         run_id = theme_lib.new_run_id()
         print(f"== base clustering (run {run_id}) ==", file=sys.stderr)
@@ -199,12 +245,25 @@ def main():
     p.add_argument("--run-id", default=None)
     p.add_argument("--from-run-id", default=None,
                    help="grow: resume split/project/label on an existing base run (skip base)")
-    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--dry-run", action="store_true",
+                   help="grow: report the plan and write nothing (read-only connection); "
+                        "project and label refuse it")
     args = p.parse_args()
+    if args.dry_run and args.command in ("project", "label"):
+        # Both used to ignore the flag and write for real: project replaces
+        # claim_themes, label relabels every theme from a child process.
+        p.error(f"--dry-run is not supported by {args.command}; it writes. "
+                "Preview with `discover` or `grow --dry-run`.")
     # Resolved once, here, so the label child runs on the same database.
     args.database_url = args.database_url or theme_lib.maintenance_dsn()
 
     conn = theme_lib.connect(args.database_url)
+    if args.dry_run:
+        # Before the first statement: psycopg2 refuses set_session inside an
+        # open transaction. From here a stray write raises instead of
+        # committing. It covers this connection only; the label child opens
+        # its own, which is why grow's dry-run path returns before spawning it.
+        conn.set_session(readonly=True)
     theme_lib.set_statement_timeout(conn, ms=900000)
 
     if args.command == "grow":

@@ -125,6 +125,39 @@ without redoing it:
 python3 scripts/theme_pipeline.py grow --from-run-id <run_id> --batch-size 2000 --max-size 8000
 ```
 
+### Previewing a rebuild: `grow --dry-run`
+
+`grow --dry-run` writes nothing (fixed 2026-09-22). It opens its connection read-only.
+Without `--from-run-id` it prints the parameters of the run it would make and stops,
+because there is no base run yet to preview a split plan on. To preview splits, point it
+at an existing run: `grow --from-run-id <run_id> --dry-run`, or `discover --run-id <run_id>`.
+`project` and `label` refuse `--dry-run`, because both write.
+
+**Before that fix, `grow --dry-run` was destructive.** It ran the whole base phase before
+it checked the flag. That wrote a new run into `cluster_centroids` and `cluster_labels`,
+replaced `data/umap_reducer.pkl`, and upserted `claim_clusters`. `claim_clusters` holds
+one row per claim (`UNIQUE (claim_id)`), so every claim the assign reached was moved off
+the promoted run onto the unsplit base run. The matcher reads `claim_clusters` directly.
+`claim_themes` was not touched, so recall kept looking healthy. The new run also became
+the newest `cluster_centroids` run, which is what `project` and `discover` pick when no
+`--run-id` is given.
+
+If anyone ran it from an older checkout, compare the run `claim_clusters` holds with the
+run projected into `claim_themes`:
+
+```sql
+SELECT cluster_run_id, count(*) FROM claim_clusters GROUP BY 1 ORDER BY 2 DESC;
+SELECT DISTINCT properties->>'cluster_run_id' FROM claim_themes;
+```
+
+If `claim_clusters` is mostly a run that `claim_themes` does not name, it was overwritten.
+Do **not** recover with `grow --from-run-id <promoted run>`. The promoted run's rows were
+replaced, not copied, so what is left of it is only the claims the accidental assign never
+reached. Projecting that would replace `claim_themes` with a subset, or refuse if nothing
+is left. Either finish the accidental base run with `grow --from-run-id <accidental run>`,
+which skips the base assign but still splits, projects and relabels (a rebuild), or run a
+full `grow`. Pass an explicit `--run-id` to any later `project` or `discover`.
+
 ### Verify after the run
 
 ```sql

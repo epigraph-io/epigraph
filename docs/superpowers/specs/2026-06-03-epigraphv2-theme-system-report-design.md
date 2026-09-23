@@ -205,7 +205,12 @@ prod (433,606 claims; the 3 pgvector indexes didn't restore under parallel
 small assign batches (`--batch-size 2000`) under a ~1.9 GB cgroup cap; 20K
 batches caused a global OOM. A swapfile would relax this but was not authorized.
 
-**Known follow-ups (non-blocking):** `grow --dry-run` still writes a base run
-(misleading name); `cluster_centroids` holds only base centroids (cosmetic —
+**Known follow-ups (non-blocking):** ~~`grow --dry-run` still writes a base run
+(misleading name)~~ DISCHARGED 2026-09-22: worse than a spare run, since its
+base assign overwrote `claim_clusters` for every claim; `grow --dry-run` now
+returns before the base phase on a read-only connection and `project`/`label`
+refuse the flag (`scripts/theme_pipeline.py`, pinned by
+`scripts/tests/test_theme_pipeline_dry_run.py`; damage check in
+`docs/ops/theme-v2-promotion-runbook.md`); `cluster_centroids` holds only base centroids (cosmetic —
 projection recomputes true 1536-d centroids, matcher reads `claim_clusters`);
 re-run `label` to clear the ~6 fallback labels.
