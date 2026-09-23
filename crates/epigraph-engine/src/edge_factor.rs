@@ -282,36 +282,7 @@ pub async fn auto_wire_edge_if_epistemic(
     if source_type != "claim" || target_type != "claim" {
         return None;
     }
-    // A retracted edge must never be woken back into a BBA. Without this, a
-    // recompute after retirement re-derives from the closed edge and undoes the
-    // retraction silently — the failure mode that makes soft retraction useless
-    // and is why retirement resorted to DELETE. Fail CLOSED on a lookup error:
-    // re-wiring an edge we cannot prove is live is the worse outcome.
-    match EdgeRepository::is_in_force(&mut *conn, edge_id).await {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(e) => {
-            tracing::warn!(
-                edge = %edge_id,
-                "edge auto-wire skipped: in-force check failed: {e}",
-            );
-            return None;
-        }
-    }
-    if !was_created {
-        match MassFunctionRepository::exists_for_perspective(&mut *conn, viewer, edge_id).await {
-            Ok(true) => return None,
-            Ok(false) => {} // never wired — attempt the wake-up below
-            Err(e) => {
-                tracing::warn!(
-                    edge = %edge_id,
-                    "edge auto-wire wake-up check failed: {e}",
-                );
-                return None;
-            }
-        }
-    }
-    // SAVEPOINT, because this function SWALLOWS the error below and its callers
+    // SAVEPOINT, because this function SWALLOWS every error below and its callers
     // now hand it a transaction. Inside a PostgreSQL transaction a failed statement
     // aborts the whole transaction, so swallowing does not preserve
     // "best-effort" — it DEFERS the failure to `COMMIT`, which PostgreSQL then
@@ -320,6 +291,11 @@ pub async fn auto_wire_edge_if_epistemic(
     // caller's transaction had written (not correct). Rolling back to a savepoint
     // keeps both properties: the wiring lands or is undone alone, and the outer
     // transaction stays usable either way.
+    //
+    // Opened BEFORE the two gate reads below, not after them: they swallow their
+    // errors too (`None` on `Err`), so a failed read outside the savepoint would
+    // abort the caller's transaction exactly as a failed write would. The first
+    // revision opened it after them.
     let mut sp = match conn.begin().await {
         Ok(sp) => sp,
         Err(e) => {
@@ -331,6 +307,46 @@ pub async fn auto_wire_edge_if_epistemic(
             return None;
         }
     };
+    // A retracted edge must never be woken back into a BBA. Without this, a
+    // recompute after retirement re-derives from the closed edge and undoes the
+    // retraction silently — the failure mode that makes soft retraction useless
+    // and is why retirement resorted to DELETE. Fail CLOSED on a lookup error:
+    // re-wiring an edge we cannot prove is live is the worse outcome.
+    let proceed = match EdgeRepository::is_in_force(&mut *sp, edge_id).await {
+        Ok(true) => true,
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!(
+                edge = %edge_id,
+                "edge auto-wire skipped: in-force check failed: {e}",
+            );
+            false
+        }
+    };
+    let proceed = proceed
+        && (was_created
+            || match MassFunctionRepository::exists_for_perspective(&mut *sp, viewer, edge_id).await
+            {
+                Ok(true) => false,
+                Ok(false) => true, // never wired — attempt the wake-up below
+                Err(e) => {
+                    tracing::warn!(
+                        edge = %edge_id,
+                        "edge auto-wire wake-up check failed: {e}",
+                    );
+                    false
+                }
+            });
+    if !proceed {
+        // Roll back rather than release: a failed read leaves the savepoint
+        // aborted, and rolling it back is what restores the caller's
+        // transaction. On the Ok(false) arms it is equally correct — nothing
+        // was written.
+        if let Err(e) = sp.rollback().await {
+            tracing::warn!(edge = %edge_id, "savepoint rollback failed: {e}");
+        }
+        return None;
+    }
     match auto_wire_ds_for_edge(
         &mut sp,
         viewer,
@@ -1061,20 +1077,40 @@ pub async fn ensure_binary_frame(
         return Ok(row.id);
     }
     let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
-    match FrameRepository::create(
-        &mut *conn,
+    // Under its own SAVEPOINT because the failure below is swallowed into a
+    // fallback read, and callers hand this a transaction: an unsavepointed
+    // `23505` (a lost first-creation race, or a same-named frame the viewer
+    // cannot see) would abort the caller's transaction, fail the fallback with
+    // `25P02`, and turn the caller's COMMIT into a silent ROLLBACK. Same shape
+    // and reason as `epigraph_mcp::tools::ds_auto::ensure_axis_frame`.
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("binary_truth: could not open a savepoint for the create: {e}"))?;
+    let created = FrameRepository::create(
+        &mut *sp,
         BINARY_FRAME_NAME,
         Some("Canonical binary frame: {TRUE, FALSE}"),
         &hyps,
     )
-    .await
-    {
-        Ok(row) => Ok(row.id),
-        Err(_) => FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
-            .await
-            .map_err(|e| format!("fallback get_by_name: {e}"))?
-            .map(|r| r.id)
-            .ok_or_else(|| "binary_truth frame missing after create attempt".to_string()),
+    .await;
+    match created {
+        Ok(row) => {
+            sp.commit().await.map_err(|e| {
+                format!("binary_truth: could not release the create savepoint: {e}")
+            })?;
+            Ok(row.id)
+        }
+        Err(_) => {
+            sp.rollback()
+                .await
+                .map_err(|e| format!("binary_truth: could not roll back the failed create: {e}"))?;
+            FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
+                .await
+                .map_err(|e| format!("fallback get_by_name: {e}"))?
+                .map(|r| r.id)
+                .ok_or_else(|| "binary_truth frame missing after create attempt".to_string())
+        }
     }
 }
 

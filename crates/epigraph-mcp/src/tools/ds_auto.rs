@@ -115,9 +115,38 @@ pub async fn ensure_axis_frame(
         return Ok(row.id);
     }
 
-    match FrameRepository::create(&mut *conn, name, description, hypotheses).await {
-        Ok(row) => Ok(row.id),
+    // The create runs under its OWN savepoint, and that is not hygiene. Its
+    // failure is SWALLOWED — the arm below falls back to a re-read — and a
+    // swallowed failure inside a caller's transaction aborts that transaction:
+    // the fallback read then fails with `25P02`, every later statement fails,
+    // and the caller's `COMMIT` is answered with `ROLLBACK` and NO error (brief
+    // hard constraint #6). MEASURED by review on `ingest_document`'s post-commit
+    // DS transaction: a declared axis whose frame name exists but is invisible
+    // to the ingesting agent took the document from 3 atom BBAs to 0 — the
+    // binary atoms' BBAs, wired earlier in the same transaction, vanished at
+    // COMMIT — with one WARN and no error. The same abort happens on the race
+    // this fallback was written for (two first creations of one name; the loser
+    // gets `23505`).
+    //
+    // `Connection::begin` on a connection already in a transaction is a
+    // SAVEPOINT; on an autocommit checkout it is a plain transaction. Both are
+    // correct here.
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("frame {name:?}: could not open a savepoint for the create: {e}"))?;
+    let created = FrameRepository::create(&mut *sp, name, description, hypotheses).await;
+    match created {
+        Ok(row) => {
+            sp.commit().await.map_err(|e| {
+                format!("frame {name:?}: could not release the create savepoint: {e}")
+            })?;
+            Ok(row.id)
+        }
         Err(_) => {
+            sp.rollback().await.map_err(|e| {
+                format!("frame {name:?}: could not roll back the failed create: {e}")
+            })?;
             // Race: another connection created it first — re-fetch and re-verify.
             let row = FrameRepository::get_by_name(&mut *conn, viewer, name)
                 .await
