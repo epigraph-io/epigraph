@@ -125,12 +125,16 @@ pub async fn candidates_in_themes_at_dim(
         centroid_dim,
         paragraph_only,
         None,
+        None,
     )
     .await
 }
 
 /// [`candidates_in_themes_at_dim`] plus an optional `created_at >= since`
-/// candidate window.
+/// candidate window and an optional `paper_doi` filter (a candidate survives
+/// only if a paper with that DOI `asserts` it). Both are applied in SQL before
+/// the candidate `LIMIT`; see
+/// `ClaimThemeRepository::claims_in_themes_at_dim_since`.
 ///
 /// Added as a sibling rather than a seventh parameter on the existing function
 /// so that the callers of [`candidates_in_themes_at_dim`] kept the exact call
@@ -151,6 +155,7 @@ pub async fn candidates_in_themes_at_dim_since(
     centroid_dim: u32,
     paragraph_only: bool,
     since: Option<DateTime<Utc>>,
+    paper_doi: Option<&str>,
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
     ClaimThemeRepository::claims_in_themes_at_dim_since(
         pool,
@@ -161,6 +166,7 @@ pub async fn candidates_in_themes_at_dim_since(
         centroid_dim,
         paragraph_only,
         since,
+        paper_doi,
     )
     .await
     .map_err(db_error_to_sqlx)
@@ -212,8 +218,13 @@ pub fn build_similarity_neighbors(candidates: &[(Uuid, String, f64)], k: usize) 
 }
 
 /// Configuration for [`run_diverse_pipeline`].
+///
+/// Carries a lifetime because [`Self::paper_doi_filter`] borrows its DOI:
+/// `Option<&'a str>` rather than `Option<String>` keeps the struct `Copy`,
+/// which it has been since it was introduced, and matches the `Option<&str>`
+/// the repo layer takes for the same filter.
 #[derive(Debug, Clone, Copy)]
-pub struct DiverseRetrievalConfig {
+pub struct DiverseRetrievalConfig<'a> {
     pub centroid_dim: u32,
     pub max_themes: i32,
     /// Hard cap on candidates pulled from themes before
@@ -256,6 +267,24 @@ pub struct DiverseRetrievalConfig {
     /// compile error for a runtime `InvalidData`, which is strictly worse.
     /// Recorded as a decision, not an oversight.
     pub since: Option<DateTime<Utc>>,
+    /// Optional paper scope: keep only candidates a paper with this DOI
+    /// `asserts`. `None` is today's behaviour exactly. Applied in SQL before
+    /// the candidate `LIMIT`, like [`Self::since`].
+    ///
+    /// Added for deferred commitment `paper-doi-filter-diverse`: MCP
+    /// `recall_with_context` accepted `paper_doi_filter` alongside
+    /// `diverse=true` and silently dropped it here, so a paper-scoped call
+    /// returned paragraphs from every paper in the selected themes.
+    ///
+    /// **Theme selection is NOT DOI-scoped**, for the same reason it is not
+    /// windowed (see [`Self::since`]): the `max_themes` themes are picked by
+    /// centroid similarity alone. A theme holding none of the paper's
+    /// paragraphs still consumes a slot, so the pipeline can return fewer than
+    /// `budget` rows — never a row from another paper. Unlike the window, a
+    /// single paper is a tiny slice of the corpus, so for a DOI this shortfall
+    /// is the common case rather than an edge; a caller that needs a full page
+    /// must top it up from a DOI-filtered flat search.
+    pub paper_doi_filter: Option<&'a str>,
 }
 
 /// Run the diverse-retrieval pipeline against the corpus.
@@ -274,7 +303,7 @@ pub async fn run_diverse_pipeline(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     query_pgvec: &str,
-    config: DiverseRetrievalConfig,
+    config: DiverseRetrievalConfig<'_>,
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
     let themes =
         find_similar_themes_at_dim(pool, query_pgvec, config.max_themes, config.centroid_dim)
@@ -294,6 +323,7 @@ pub async fn run_diverse_pipeline(
         config.centroid_dim,
         config.paragraph_only,
         config.since,
+        config.paper_doi_filter,
     )
     .await?;
 

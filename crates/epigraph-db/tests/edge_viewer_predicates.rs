@@ -1072,3 +1072,129 @@ async fn search_by_embedding_doi_filter_ignores_a_private_attribution_edge(pool:
     );
     assert_eq!(unfiltered, vec![para], "the paragraph itself is public");
 }
+
+// ── ClaimThemeRepository::claims_in_themes_at_dim_since's DOI filter ────────
+
+/// A public level-2 paragraph in `theme`, embedded at `vec`, that a new paper
+/// with `doi` `asserts`. Returns `(paragraph, asserts_edge)`.
+async fn themed_attributed_paragraph(
+    pool: &PgPool,
+    agent: Uuid,
+    theme: Uuid,
+    vec: &str,
+    doi: &str,
+) -> (Uuid, Uuid) {
+    let para = fixture::seed_public_claim(pool, agent, &format!("themed paragraph of {doi}")).await;
+    sqlx::query(
+        "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || '{\"level\": 2}', \
+         theme_id = $2 WHERE id = $1",
+    )
+    .bind(para)
+    .bind(theme)
+    .execute(pool)
+    .await
+    .expect("level 2 + theme");
+    fixture::set_claim_embedding(pool, para, vec).await;
+    let paper: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 't') RETURNING id")
+            .bind(doi)
+            .fetch_one(pool)
+            .await
+            .expect("paper");
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'paper', $2, 'claim', 'asserts') RETURNING id",
+    )
+    .bind(paper)
+    .bind(para)
+    .fetch_one(pool)
+    .await
+    .expect("asserts edge");
+    (para, edge)
+}
+
+/// `claims_in_themes_at_dim_since` over one theme, as sorted ids.
+async fn theme_candidates(
+    pool: &PgPool,
+    viewer: &Viewer,
+    theme: Uuid,
+    vec: &str,
+    doi: Option<&str>,
+) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = epigraph_db::ClaimThemeRepository::claims_in_themes_at_dim_since(
+        pool,
+        viewer,
+        &[theme],
+        vec,
+        10,
+        1536,
+        /*paragraph_only=*/ true,
+        /*since=*/ None,
+        doi,
+    )
+    .await
+    .expect("theme candidates")
+    .into_iter()
+    .map(|(id, _, _)| id)
+    .collect();
+    ids.sort();
+    ids
+}
+
+/// The diverse-retrieval candidate pull's `paper_doi` filter (deferred
+/// commitment `paper-doi-filter-diverse`) mirrors the flat path's above: a
+/// candidate survives only if an `asserts` edge the VIEWER can read ties it to
+/// that paper.
+///
+/// Two public level-2 paragraphs share one theme. X is attributed to its paper
+/// through a PRIVATE edge, Y through a public one. The owner's X-scoped pull
+/// returns X and not Y (the filter narrows); the stranger's X-scoped pull
+/// returns nothing (the hidden attribution does not match); the stranger's
+/// Y-scoped pull returns Y (so the empty result above is the edge predicate,
+/// not a filter that matches nothing); and the unscoped pull returns both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claims_in_themes_doi_filter_narrows_and_ignores_a_private_attribution_edge(pool: PgPool) {
+    let t = tenants(&pool).await;
+    let theme: Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, description) VALUES ('doi-theme', 't') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("theme");
+    let v = unit_ish(0.5);
+
+    let (para_x, private_attribution) =
+        themed_attributed_paragraph(&pool, t.agent, theme, &v, "10.0/doi-tx").await;
+    let (para_y, _) = themed_attributed_paragraph(&pool, t.agent, theme, &v, "10.0/doi-ty").await;
+    sqlx::query("UPDATE edges SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(private_attribution)
+        .bind(t.group)
+        .execute(&pool)
+        .await
+        .expect("privatise asserts edge");
+
+    assert_eq!(
+        theme_candidates(&pool, &t.owner, theme, &v, Some("10.0/doi-tx")).await,
+        vec![para_x],
+        "the owner reads the private attribution edge, and the DOI filter drops the \
+         other paper's paragraph from the same theme"
+    );
+    let stranger_x = theme_candidates(&pool, &t.stranger, theme, &v, Some("10.0/doi-tx")).await;
+    assert!(
+        stranger_x.is_empty(),
+        "the only attribution to 10.0/doi-tx is a private edge: the stranger's DOI \
+         filter must not match through it. Got {stranger_x:?}"
+    );
+    assert_eq!(
+        theme_candidates(&pool, &t.stranger, theme, &v, Some("10.0/doi-ty")).await,
+        vec![para_y],
+        "a publicly attributed paragraph matches its DOI for the stranger too"
+    );
+    let mut both = vec![para_x, para_y];
+    both.sort();
+    assert_eq!(
+        theme_candidates(&pool, &t.stranger, theme, &v, None).await,
+        both,
+        "unscoped, both public paragraphs are candidates"
+    );
+}

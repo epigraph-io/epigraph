@@ -1423,6 +1423,130 @@ async fn diverse_true_spreads_across_themes_versus_flat(pool: PgPool) {
     );
 }
 
+/// `(paragraph_id, paper.doi)` for every top-level hit, in page order.
+fn hits_with_doi(result: rmcp::model::CallToolResult) -> Vec<(Uuid, Option<String>)> {
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    let v: serde_json::Value = serde_json::from_str(&text).expect("parse response JSON");
+    v["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|h| {
+            let id = h["paragraph_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .expect("paragraph_id");
+            (id, h["paper"]["doi"].as_str().map(str::to_string))
+        })
+        .collect()
+}
+
+/// `paper_doi_filter` must reach the diverse candidate query
+/// (deferred-commitment `paper-doi-filter-diverse`, formerly
+/// `TODO(diverse-recall)`). Before the fix the filter was dropped whenever
+/// `diverse=true` and themes existed, so a "paper-scoped" call returned
+/// paragraphs from every paper in the selected themes, with no error.
+///
+/// Paper B's paragraphs point exactly along the query and paper A's drift
+/// away, so on similarity alone B outranks A inside the one shared theme.
+/// The unfiltered control proves the fixture DOES put B on a diverse page, so
+/// B's absence from the filtered page is the filter's doing and not the
+/// fixture's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_honours_paper_doi_filter(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper_a = diverse_fixture::seed_paper(&pool, "10.1/doi-a", "Paper A").await;
+    let paper_b = diverse_fixture::seed_paper(&pool, "10.1/doi-b", "Paper B").await;
+    let theme = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "shared-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+    let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let mut a_ids = Vec::new();
+    for i in 0..2 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 5, 0.3 + (i as f32) * 0.1);
+        a_ids.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper_a,
+                &format!("doi-a-{i}"),
+                &v,
+                Some(theme),
+            )
+            .await,
+        );
+    }
+    let mut b_ids = Vec::new();
+    for i in 0..3 {
+        let v = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 5, 0.01 * (i as f32));
+        b_ids.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper_b,
+                &format!("doi-b-{i}"),
+                &v,
+                Some(theme),
+            )
+            .await,
+        );
+    }
+
+    let server = build_test_server(pool.clone());
+
+    // Control: the unfiltered diverse page carries paper B.
+    let unfiltered = hits_with_doi(
+        recall_with_context_with_pgvec(
+            &server,
+            &viewer,
+            diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 10),
+            1536,
+            &query_pgvec,
+        )
+        .await
+        .expect("unfiltered diverse recall"),
+    );
+    assert!(
+        unfiltered.iter().any(|(id, _)| b_ids.contains(id)),
+        "fixture invariant: without a DOI filter the diverse page must carry paper B, \
+         or B's absence below proves nothing; got {unfiltered:?}"
+    );
+
+    let mut params = diverse_params(/*diverse=*/ true, Some(5), Some(0.4), 10);
+    params.paper_doi_filter = Some("10.1/doi-a".to_string());
+    let filtered = hits_with_doi(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
+            .await
+            .expect("DOI-filtered diverse recall"),
+    );
+
+    for (id, doi) in &filtered {
+        assert_eq!(
+            doi.as_deref(),
+            Some("10.1/doi-a"),
+            "diverse=true + paper_doi_filter returned paragraph {id} from {doi:?}: the \
+             filter was ignored on the diverse path. Page: {filtered:?}"
+        );
+    }
+    let returned: std::collections::HashSet<Uuid> = filtered.iter().map(|(id, _)| *id).collect();
+    let expected: std::collections::HashSet<Uuid> = a_ids.iter().copied().collect();
+    assert_eq!(
+        returned, expected,
+        "the filter must narrow the diverse pool to paper A, not empty it"
+    );
+}
+
 /// F3 (backlog 34d3400d): a contested paragraph hit carries the dispute
 /// annotation through `recall_with_context`, and an uncontested hit on the
 /// same page omits the fields entirely.

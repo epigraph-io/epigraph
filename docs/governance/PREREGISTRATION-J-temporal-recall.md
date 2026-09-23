@@ -362,6 +362,13 @@ Silently ignoring `since` on any surface is a refute, not a documented limitatio
 `paper_doi_filter`-on-diverse `TODO(diverse-recall)` is precedent for exactly this bug
 class — do not add a second one).
 
+> *Post-registration annotation (2026-09-23), not part of the pre-registered text:* the
+> `TODO(diverse-recall)` precedent cited above is **DISCHARGED** (deferred commitment
+> `paper-doi-filter-diverse`). `paper_doi_filter` now binds in
+> `ClaimThemeRepository::claims_in_themes_at_dim_since`; regression test
+> `crates/epigraph-mcp/tests/recall_with_context.rs::diverse_honours_paper_doi_filter`.
+> The criterion above is unchanged.
+
 **How checked.**
 ```
 DATABASE_URL=$TESTDB SQLX_OFFLINE=true cargo test -p epigraph-mcp --test recall_temporal
@@ -593,6 +600,13 @@ pass_criteria:
 score_history:
   - {version: pre-J, score: 0, date: "2026-08-17", notes: "baseline"}
 ```
+
+> *Post-registration annotation (2026-09-23), outside the benchmark block so the answer
+> key above stays byte-identical:* BCH-J03's `ground_truth` cites `paper_doi_filter`
+> being silently ignored on the diverse path (`TODO(diverse-recall)`) as live precedent.
+> It was true when the key was written. It is now **DISCHARGED** (deferred commitment
+> `paper-doi-filter-diverse`): the filter binds in
+> `ClaimThemeRepository::claims_in_themes_at_dim_since`.
 
 ```yaml
 id: BCH-J04

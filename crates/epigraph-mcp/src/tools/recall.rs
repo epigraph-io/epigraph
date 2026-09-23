@@ -117,6 +117,13 @@ pub struct RecallWithContextParams {
     pub limit: Option<u32>,
     pub min_truth: Option<f64>,
     pub centroid_dim: Option<u32>,
+    /// Restrict top-level hits to paragraphs that a paper with this DOI
+    /// `asserts`. Honoured on the flat path AND with `diverse=true`, where it
+    /// narrows the in-theme candidate pool. Theme selection itself is not
+    /// DOI-scoped, so a `diverse=true` page can come back shorter than `limit`
+    /// when the paper's paragraphs fall outside the selected themes. Not
+    /// applied to claims that `graph_expansion_depth` folds in: expansion
+    /// follows edges from the DOI-scoped seeds and can reach other papers.
     pub paper_doi_filter: Option<String>,
     pub siblings_limit: Option<u32>,
     pub corroborates_limit: Option<u32>,
@@ -736,12 +743,12 @@ async fn recall_with_context_post_embed(
     //  - `diverse=false` (default): flat paragraph-primary ANN over
     //    `claims.embedding[_3072]`. Unchanged from pre-diverse behaviour.
     //
-    // The `paper_doi_filter` does NOT apply to the diverse path —
-    // candidates_in_themes_at_dim has no DOI predicate. If the caller
-    // provides BOTH `diverse=true` AND `paper_doi_filter`, the filter is
-    // currently ignored on the diverse path. TODO(diverse-recall): wire
-    // paper_doi_filter into candidates_in_themes_at_dim or reject the
-    // combination at param-parse time.
+    // `paper_doi_filter` binds on BOTH paths: the flat ANN's DOI shape and,
+    // via `DiverseRetrievalConfig::paper_doi_filter`, the diverse candidate
+    // query `ClaimThemeRepository::claims_in_themes_at_dim_since`.
+    // (DISCHARGED: deferred commitment `paper-doi-filter-diverse`, formerly
+    // `TODO(diverse-recall)` — the diverse path used to drop the filter and
+    // return paragraphs from every paper in the selected themes.)
     let diverse = params.diverse.unwrap_or(false);
     // Stage 3 sizing. When rerank is on, OVER-FETCH the flat candidate pool
     // (`want * pool_factor`, clamped to [want, 200]) so the cross-encoder has a
@@ -783,6 +790,9 @@ async fn recall_with_context_post_embed(
             // so the window has to reach it here or `diverse=true` would
             // silently ignore `since`.
             since: params.since,
+            // Same reasoning as `since`: without this the diverse path
+            // silently ignored the DOI and returned other papers' paragraphs.
+            paper_doi_filter: params.paper_doi_filter.as_deref(),
         };
         let selected = epigraph_engine::diverse_retrieval::run_diverse_pipeline(
             &server.pool,

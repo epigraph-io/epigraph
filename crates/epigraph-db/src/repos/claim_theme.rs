@@ -342,19 +342,35 @@ impl ClaimThemeRepository {
             centroid_dim,
             paragraph_only,
             None,
+            None,
         )
         .await
     }
 
     /// [`Self::claims_in_themes_at_dim`] plus an optional
-    /// `created_at >= since` window.
+    /// `created_at >= since` window and an optional `paper_doi` filter.
     ///
     /// This is the diverse-retrieval candidate source, and it bypasses
-    /// `ClaimRepository::search_by_embedding` entirely — so a `since` wired
-    /// only into the flat ANN would be silently ignored whenever
-    /// `diverse=true`. That is precisely the bug class the existing
-    /// `paper_doi_filter` `TODO(diverse-recall)` already exhibits on this
-    /// path; the window must not become the second instance of it.
+    /// `ClaimRepository::search_by_embedding` entirely — so any filter wired
+    /// only into the flat ANN is silently ignored whenever `diverse=true`.
+    /// `paper_doi_filter` WAS that bug (`TODO(diverse-recall)`, deferred
+    /// commitment `paper-doi-filter-diverse`): until `paper_doi` was added
+    /// here, MCP `recall_with_context` with `diverse=true` returned paragraphs
+    /// from every paper in the selected themes. Both filters now bind in this
+    /// statement, before `LIMIT`, so they narrow the candidate pool rather than
+    /// trim a truncated page. (The `_since` name predates the DOI parameter.)
+    ///
+    /// `paper_doi` keeps a claim only if a paper with that DOI `asserts` it —
+    /// the same `EXISTS` the flat path's DOI shape in
+    /// `ClaimRepository::search_by_embedding_since` uses, including its
+    /// `{EDGE_VISIBILITY:e}` marker: a match through an `asserts` edge the
+    /// viewer cannot read would confirm that hidden attribution, so the
+    /// semi-join is filtered too (it can only NARROW the result).
+    ///
+    /// One SQL shape rather than the flat path's two: `$5` is always bound
+    /// (`NULL` = no filter), which keeps the group bind at a fixed `$6`.
+    /// `c.theme_id = ANY($1)` already bounds the scan, so there is no
+    /// index-shape reason to split it.
     #[allow(clippy::too_many_arguments)]
     pub async fn claims_in_themes_at_dim_since<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -365,6 +381,7 @@ impl ClaimThemeRepository {
         centroid_dim: u32,
         paragraph_only: bool,
         since: Option<DateTime<Utc>>,
+        paper_doi: Option<&str>,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
         let (_, claim_col) =
             centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
@@ -382,21 +399,31 @@ impl ClaimThemeRepository {
              FROM claims c \
              WHERE c.theme_id = ANY($1) \
                AND c.{claim_col} IS NOT NULL \
-               AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz)\
+               AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz) \
+               AND ($5::text IS NULL OR EXISTS ( \
+                   SELECT 1 FROM edges e \
+                   JOIN papers p ON p.id = e.source_id \
+                   WHERE e.target_id = c.id \
+                     AND e.relationship = 'asserts' \
+                     AND p.doi = $5::text \
+                     /* {{EDGE_VISIBILITY:e}} */ \
+               ))\
                {level_clause} \
                /* {{VISIBILITY:c}} */ \
              ORDER BY c.{claim_col} <=> $2::vector \
              LIMIT $3"
         );
         // Doubled braces above: this is a `format!` template, so `{{` emits the
-        // single brace `Viewer::splice` looks for.
-        let sql = viewer.splice(&sql, 5);
+        // single brace `Viewer::splice` looks for. Both markers resolve to the
+        // one group bind at `$6`.
+        let sql = viewer.splice(&sql, 6);
 
         let mut vq = sqlx::query(&sql)
             .bind(theme_ids)
             .bind(query_vec)
             .bind(limit)
-            .bind(since);
+            .bind(since)
+            .bind(paper_doi);
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }

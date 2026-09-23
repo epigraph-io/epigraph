@@ -731,11 +731,13 @@ pub async fn semantic_search(
                 // MCP. REST passes `paragraph_only=false` to preserve
                 // pre-helper behaviour.
                 //
-                // `claims_in_themes_at_dim_since(.., since = None)` is exactly
-                // what the `candidates_in_themes_at_dim` wrapper this file used
-                // to call delegates to — the wrapper's whole body is that call
-                // with `None`. Calling it directly removes a hop rather than
-                // changing behaviour.
+                // `claims_in_themes_at_dim_since(.., since = None,
+                // paper_doi = None)` is exactly what the
+                // `candidates_in_themes_at_dim` wrapper this file used to call
+                // delegates to — the wrapper's whole body is that call with
+                // both filters `None`. Calling it directly removes a hop rather
+                // than changing behaviour. This route exposes no DOI filter, so
+                // `paper_doi` stays `None` and the statement's DOI arm is inert.
                 let candidates = epigraph_db::ClaimThemeRepository::claims_in_themes_at_dim_since(
                     &mut *read,
                     &viewer,
@@ -745,6 +747,7 @@ pub async fn semantic_search(
                     centroid_dim_used,
                     /*paragraph_only=*/ false,
                     /*since=*/ None,
+                    /*paper_doi=*/ None,
                 )
                 .await
                 .map_err(|e| ApiError::InternalError {
