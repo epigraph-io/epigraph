@@ -310,6 +310,26 @@ pub struct UpdateWithEvidenceParams {
 pub struct GetProvenanceParams {
     #[schemars(description = "The UUID of the claim to get provenance for")]
     pub claim_id: String,
+
+    #[schemars(
+        description = "Maximum ancestor depth to walk. Default 5, clamped to 1..=20. \
+                       The bundle reports `truncated: true` when the walk stopped early."
+    )]
+    pub max_depth: Option<i32>,
+
+    #[schemars(
+        description = "Maximum number of claim nodes kept in the bundle. Default 50, \
+                       clamped to 1..=500. The target claim plus its nearest ancestors \
+                       are kept; `truncated: true` when the cap bit."
+    )]
+    pub max_nodes: Option<usize>,
+
+    #[schemars(
+        description = "Per-claim content character budget. Default 500, clamped to \
+                       50..=20000. Entities whose content was cut carry \
+                       `content_truncated: true` and the original `content_chars`."
+    )]
+    pub max_content_chars: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -521,6 +541,46 @@ pub struct RecallParams {
     )]
     #[serde(default)]
     pub since: Option<chrono::DateTime<chrono::Utc>>,
+
+    #[schemars(
+        description = "Optional theme UUID (from list_themes / get_theme). When set, the CANDIDATE \
+                       POOL of every claims retrieval surface — the hybrid dense leg, the hybrid \
+                       lexical leg, and the embedder-down lexical fallback — is narrowed in SQL to \
+                       that theme's members BEFORE each leg's LIMIT, so no off-theme claim can \
+                       reach the caller and no off-theme claim consumes pool budget. Distinct from \
+                       recall_with_context's diverse=true, which picks themes internally by \
+                       centroid similarity and lets you pin none of them. Mutually exclusive with \
+                       theme_label. A malformed UUID or an unknown theme is REJECTED, never \
+                       silently ignored — a dropped scope filter would widen recall to the whole \
+                       corpus while you believe it is scoped."
+    )]
+    #[serde(default)]
+    pub theme_id: Option<String>,
+
+    #[schemars(
+        description = "Optional exact theme label, resolved to a theme UUID. Mutually exclusive \
+                       with theme_id. Rejected when it matches zero themes, and rejected (listing \
+                       the candidates) when it matches more than one — claim_themes has no \
+                       UNIQUE(label) constraint, so 'the first match' could be any of several \
+                       distinct themes."
+    )]
+    #[serde(default)]
+    pub theme_label: Option<String>,
+
+    #[schemars(
+        description = "Skip the first N ranked claims (default 0). Combine with limit to walk a \
+                       theme to exhaustion; the response carries next_offset and more_available. \
+                       Applied in SQL on the fused ranking, whose ORDER BY carries a claim_id \
+                       tiebreaker so a page boundary cannot show one claim twice and another \
+                       never. CAVEAT: min_truth and exclude_contested are applied in Rust AFTER \
+                       the SQL page, so a page can come back SHORTER than limit while more pages \
+                       remain — use more_available, not an empty page, as the stop condition. \
+                       Rejected together with include_workflows=true: workflows are a separate \
+                       id-space with no ranking continuity across claim pages, so paging them \
+                       alongside claims would re-serve the same workflows on every page."
+    )]
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 // ── Ingestion ──
@@ -531,6 +591,16 @@ pub struct RecallParams {
 pub struct QueryPaperParams {
     #[schemars(description = "DOI of the paper (e.g. '10.48550/arXiv.2508.16798')")]
     pub doi: String,
+
+    #[schemars(
+        description = "Maximum asserted claims to return in this page. Default 25, \
+                       clamped to 1..=200. `claim_count` remains the full total, so \
+                       `claim_count > offset + returned` means there are more pages."
+    )]
+    pub limit: Option<i64>,
+
+    #[schemars(description = "Asserted claims to skip (paging). Default 0.")]
+    pub offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1561,6 +1631,18 @@ pub struct LinkEpistemicResponse {
     pub was_created: bool,
     pub relationship: String,
     pub belief_wired: bool,
+    /// The claim `target_belief` describes, and the one the belief wire
+    /// recomputed.
+    ///
+    /// Normally equals the request's `target_claim_id`. It is the request's
+    /// `source_claim_id` in exactly one case: a SYMMETRIC relationship
+    /// (`contradicts` / `corroborates`) that deduped against an edge already
+    /// stored in the opposite direction. Those two orderings are one fact, so
+    /// only one row exists, and both the wire and this readback follow the
+    /// row's recorded orientation rather than the caller's argument order.
+    /// Always echoed so a caller never has to infer which claim the interval
+    /// belongs to.
+    pub belief_target_claim_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_belief: Option<LinkEpistemicBelief>,
 }
@@ -1615,7 +1697,17 @@ pub struct PaperResponse {
     pub doi: String,
     pub title: String,
     pub authors: Vec<AuthorResponse>,
+    /// Total asserted claims for the paper, independent of paging. Compare
+    /// against `offset + returned` to decide whether another page exists.
     pub claim_count: i64,
+    /// `claims.len()` — the size of THIS page, not the total.
+    pub returned: usize,
+    /// Echo of the applied `offset` (after clamping).
+    pub offset: i64,
+    /// Echo of the applied `limit` (after clamping).
+    pub limit: i64,
+    /// `true` when `offset + returned < claim_count`, i.e. another page exists.
+    pub has_more: bool,
     pub claims: Vec<ClaimResponse>,
 }
 

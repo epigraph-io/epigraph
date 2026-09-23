@@ -2495,6 +2495,91 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_hybrid_scoped_since_in_theme(
+            executor,
+            viewer,
+            query_embedding_pgvector,
+            query_text,
+            candidate_pool,
+            k_rrf,
+            limit,
+            0,
+            tags,
+            agent_id,
+            since,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_hybrid_scoped_since`] plus an optional `claims.theme_id`
+    /// narrowing and an `offset` for paging the fused output.
+    ///
+    /// `theme_id` is pushed into **both** the `dense` and `lex` CTEs, above
+    /// their `LIMIT $3`, for exactly the reason spelled out on
+    /// `search_hybrid_scoped_since` for `since`: a theme predicate applied to
+    /// the fused output would let `candidate_pool` off-theme rows consume the
+    /// whole pool and then be discarded, returning `[]` for a theme that has a
+    /// real answer. Off-theme rows must never enter the pool in the first
+    /// place.
+    ///
+    /// `offset` pages the fused output so a caller can walk one theme to
+    /// exhaustion (the stated requirement of backlog `c95a2509`). For that walk
+    /// to be sound the final `ORDER BY` must be TOTAL, so it carries a
+    /// `claim_id` tiebreaker: `rrf_score` is a sum of `1/(k+rank)` terms and
+    /// ties are common (two claims appearing in the same pair of legs at
+    /// mirrored ranks collide exactly), and under a non-total sort Postgres may
+    /// return tied rows in a different order per page — showing the caller one
+    /// claim twice and another never.
+    ///
+    /// ## The tiebreaker is on the FUSED output only, deliberately
+    ///
+    /// The two CTEs' own `ORDER BY`s are left alone. An earlier revision added
+    /// `, c.id` to each CTE's `row_number()` window and `LIMIT` as well, on the
+    /// theory that a deterministic candidate-pool cut is strictly better. It is
+    /// not free: the dense and lexical legs then break their ties on
+    /// *independent* keys, so a claim can be 2nd in one leg and 3rd in the
+    /// other where previously the two arbitrary orders were correlated, and the
+    /// RRF sum flips. That regressed
+    /// `claim_search_hybrid::hybrid_fuses_both_legs_ranking_the_overlap_first`
+    /// in 2 of 6 runs (6 of 6 green before, 6 of 6 green again after this was
+    /// reverted). Making the pool cut deterministic is a real improvement but
+    /// it is a RANKING change, not a paging one, and it belongs in its own
+    /// commit with its own analysis of which tied row deserves the pool slot.
+    ///
+    /// ## Residual, recorded rather than fixed
+    ///
+    /// The fused `ORDER BY` is total WITHIN one execution. A walk spans several
+    /// executions, and across them two things are still arbitrary:
+    ///
+    ///  - which rows of a tie group enter the pool when `candidate_pool`
+    ///    truncates it (needs a tie group straddling the 200th candidate at
+    ///    `HYBRID_CANDIDATE_POOL = 200`); and
+    ///  - the `row_number()` ranks assigned inside a tie group, which feed
+    ///    `rrf_score`, so two executions could in principle score a tied group
+    ///    differently and reorder it.
+    ///
+    /// In practice the legs stay correlated — each sees the same physical scan
+    /// order, so a fully tied group scores `2/(k+r)`, monotone in the same `r`
+    /// — which is why the paging walk is stable. Both hazards predate this
+    /// change; neither is introduced by it. Closing them properly means an
+    /// explicit deterministic key inside each leg, which is the ranking change
+    /// described above.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_hybrid_scoped_since_in_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        query_text: &str,
+        candidate_pool: i64,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -2503,7 +2588,7 @@ impl ClaimRepository {
         // BOTH CTEs are marked. The recursive hazard's flat cousin: filtering
         // only `dense` would let `lex` re-admit a row the viewer cannot read,
         // and the FULL OUTER JOIN would surface it. `splice` asserts both
-        // markers resolve to the same bind ($9).
+        // markers resolve to the same bind ($11).
         let sql = viewer.splice(
             r#"
             WITH dense AS (
@@ -2515,6 +2600,7 @@ impl ClaimRepository {
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
+                  AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                   /* {VISIBILITY:c} */
                 ORDER BY c.embedding <=> $1::vector
                 LIMIT $3
@@ -2527,6 +2613,7 @@ impl ClaimRepository {
                   AND ($6::text[] IS NULL OR c.labels @> $6::text[])
                   AND ($7::uuid IS NULL OR c.agent_id = $7::uuid)
                   AND ($8::timestamptz IS NULL OR c.created_at >= $8::timestamptz)
+                  AND ($10::uuid IS NULL OR c.theme_id = $10::uuid)
                   /* {VISIBILITY:c} */
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC
                 LIMIT $3
@@ -2538,10 +2625,10 @@ impl ClaimRepository {
                    (l.rank IS NOT NULL) AS in_lexical
             FROM dense d
             FULL OUTER JOIN lex l ON d.id = l.id
-            ORDER BY rrf_score DESC
-            LIMIT $5
+            ORDER BY rrf_score DESC, claim_id
+            LIMIT $5 OFFSET $9
             "#,
-            9,
+            11,
         );
         let mut q = sqlx::query_as::<_, HybridHit>(&sql)
             .bind(query_embedding_pgvector) // $1
@@ -2551,9 +2638,11 @@ impl ClaimRepository {
             .bind(limit) // $5
             .bind(tags_owned) // $6
             .bind(agent_id) // $7
-            .bind(since); // $8
+            .bind(since) // $8
+            .bind(offset) // $9
+            .bind(theme_id); // $10
         if let Some(g) = viewer.group_bind() {
-            q = q.bind(g); // $9
+            q = q.bind(g); // $11
         }
         let rows = q.fetch_all(executor).await?;
 
@@ -2601,6 +2690,39 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Vec<HybridHit>, DbError> {
+        Self::search_lexical_scoped_since_in_theme(
+            executor, viewer, query_text, k_rrf, limit, 0, tags, agent_id, since, None,
+        )
+        .await
+    }
+
+    /// [`Self::search_lexical_scoped_since`] plus the same optional
+    /// `claims.theme_id` narrowing and `offset` paging as
+    /// [`Self::search_hybrid_scoped_since_in_theme`].
+    ///
+    /// This is `recall`'s embedder-down fallback. The theme filter has to hold
+    /// HERE as well as on the hybrid path, or the scope would silently widen to
+    /// the whole corpus exactly when the embedder is unavailable — the same
+    /// argument that put `since` on both surfaces.
+    ///
+    /// `row_number()` is evaluated over the whole filtered set before
+    /// `LIMIT`/`OFFSET`, so the reported `rrf_score` stays on the global rank
+    /// rather than restarting at 1 on each page. Its window and the outer
+    /// `ORDER BY` share the `c.id` tiebreaker so the two agree and the walk is
+    /// repeat-free.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_lexical_scoped_since_in_theme<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_text: &str,
+        k_rrf: i64,
+        limit: i64,
+        offset: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        since: Option<DateTime<Utc>>,
+        theme_id: Option<Uuid>,
+    ) -> Result<Vec<HybridHit>, DbError> {
         let tags_owned: Option<Vec<String>> = match tags {
             Some(t) if !t.is_empty() => Some(t.to_vec()),
             _ => None,
@@ -2610,7 +2732,7 @@ impl ClaimRepository {
             r#"
             SELECT c.id AS claim_id,
                    (1.0 / ($2 + row_number() OVER (
-                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC)))::float8 AS rrf_score,
+                       ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id)))::float8 AS rrf_score,
                    NULL::float8 AS dense_similarity,
                    true AS in_lexical
             FROM claims c, websearch_to_tsquery('english', $1) q
@@ -2618,11 +2740,12 @@ impl ClaimRepository {
               AND ($4::text[] IS NULL OR c.labels @> $4::text[])
               AND ($5::uuid IS NULL OR c.agent_id = $5::uuid)
               AND ($6::timestamptz IS NULL OR c.created_at >= $6::timestamptz)
+              AND ($8::uuid IS NULL OR c.theme_id = $8::uuid)
               /* {VISIBILITY:c} */
-            ORDER BY ts_rank_cd(c.content_tsv, q) DESC
-            LIMIT $3
+            ORDER BY ts_rank_cd(c.content_tsv, q) DESC, c.id
+            LIMIT $3 OFFSET $7
             "#,
-            7,
+            9,
         );
         let mut q = sqlx::query_as::<_, HybridHit>(&sql)
             .bind(query_text) // $1
@@ -2630,9 +2753,11 @@ impl ClaimRepository {
             .bind(limit) // $3
             .bind(tags_owned) // $4
             .bind(agent_id) // $5
-            .bind(since); // $6
+            .bind(since) // $6
+            .bind(offset) // $7
+            .bind(theme_id); // $8
         if let Some(g) = viewer.group_bind() {
-            q = q.bind(g); // $7
+            q = q.bind(g); // $9
         }
         let rows = q.fetch_all(executor).await?;
 
@@ -4393,6 +4518,74 @@ impl ClaimRepository {
     /// — must preserve this single-statement invariant.  See also
     /// [`ClaimRepository::mark_duplicate`] which is subject to the same
     /// constraint.
+    ///
+    /// # Edge migration policy (issue #398)
+    ///
+    /// Edges are re-pointed at the replacement in both directions, with one
+    /// exception: the WEAKENING relationships
+    /// ([`crate::repos::edge::WEAKENING_RELATIONSHIPS`] — `refutes`,
+    /// `contradicts`) do NOT migrate, in either direction. They stay on
+    /// `old_claim_id`.
+    ///
+    /// The rule follows from what an edge asserts. `A -refutes-> B` is a claim
+    /// about a *specific pair of contents*. Supersession replaces one of those
+    /// contents, so the relation has to be re-established, not assumed — and
+    /// the same reasoning already stated fifty lines below for `properties`
+    /// ("blanket copy would propagate the bug the supersede was meant to
+    /// correct") applies with more force here, because a migrated weakening
+    /// edge does not merely carry a stale value forward, it *suppresses the
+    /// correction*: [`ClaimRepository::dispute_batch`] reads exactly these two
+    /// relationships into `is_contested`, and `recall(exclude_contested: true)`
+    /// drops contested rows.
+    ///
+    /// Both directions are excluded because both were observed corrupting
+    /// production (issue #398):
+    ///
+    /// * **Incoming.** Refute the false claim, then correct it — the natural
+    ///   correction workflow — and the refutation lands on the correction. The
+    ///   fix arrives pre-refuted, by the very claim that motivated it.
+    /// * **Outgoing.** A claim holding two `contradicts` edges was superseded
+    ///   by a replacement that *retracted* those objections; the edges followed,
+    ///   recording the retraction as contesting the claims it declared correct.
+    ///   That instance was cleaned up by hand with `DELETE /api/v1/edges/:id`.
+    ///
+    /// Leaving an outgoing weakening edge on the superseded source is not a
+    /// leak, because `dispute_batch` joins `claims src ON … AND src.is_current`:
+    /// a retired contester stops counting automatically. The cost of the rule is
+    /// therefore bounded and one-directional — a supersession that merely
+    /// *sharpens* an existing refutation must re-file it via `link_epistemic`,
+    /// exactly as it must re-set `properties`. The cost of the opposite default
+    /// is unbounded and silent.
+    ///
+    /// Incoming STRENGTHENING edges still migrate, unchanged. They are the
+    /// mirror-image judgement call, but their failure mode is the loss of a
+    /// positive signal rather than the manufacture of a negative one, and
+    /// changing them is not this function's decision to make.
+    ///
+    /// ## Self-loop guards — deliberately unreachable
+    ///
+    /// Both statements also carry [`ClaimRepository::mark_duplicate`]'s
+    /// `source_id`/`target_id` self-loop guards, and unlike there they are
+    /// **defence in depth, not a live defect fix**. Issue #398 reports the
+    /// guards as missing; they are, but nothing can currently reach them:
+    ///
+    /// * `supersede` MINTS `new_uuid` in this transaction, so no pre-existing
+    ///   edge can already name it (the only one that does is the `supersedes`
+    ///   edge inserted above, excluded by `relationship != 'supersedes'`).
+    ///   Contrast `mark_duplicate`, whose canonical claim pre-exists and
+    ///   routinely already has edges — there the guards are load-bearing.
+    /// * The remaining shape — a pre-existing `old -rel-> old` self-edge that
+    ///   the two statements would compose into `new -rel-> new` — cannot be
+    ///   stored at all: `edges_no_self_loop`
+    ///   (`CHECK (source_id <> target_id OR source_type <> target_type)`,
+    ///   migration 001) rejects claim→claim self-edges on insert.
+    ///
+    /// They are kept anyway because the schema CHECK's failure mode is worse
+    /// than the guards': were a future migration to relax it, an ungarded
+    /// UPDATE that produced a self-loop would abort the whole transaction and
+    /// turn a bad edge into a failed supersession. The guard degrades that to
+    /// "this one edge does not migrate". There is no test pinning them, because
+    /// the precondition cannot be constructed through the schema.
     #[instrument(skip(pool))]
     pub async fn supersede(
         pool: &PgPool,
@@ -4485,23 +4678,46 @@ impl ClaimRepository {
         .execute(&mut *tx)
         .await?;
 
-        // Migrate incoming edges: redirect edges pointing TO old claim to point to new claim
+        // Edge migration. Both directions carry the STRENGTHENING relationships
+        // forward and leave the WEAKENING ones
+        // (`crate::repos::edge::WEAKENING_RELATIONSHIPS` — `refutes`,
+        // `contradicts`) attached to the claim they were filed against or by.
+        // See the "Edge migration policy" section of this function's doc comment
+        // for why (issue #398).
+        let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+
+        // Migrate incoming edges: redirect edges pointing TO old claim to point
+        // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
+        // mark_duplicate's self-loop guard, carried over so the two replacement
+        // paths share one rule; see the doc comment for the one shape that
+        // reaches it here.
         sqlx::query(
             "UPDATE edges SET target_id = $1 \
-             WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes'",
+             WHERE target_id = $2 AND target_type = 'claim' \
+               AND relationship != 'supersedes' \
+               AND NOT (relationship = ANY($3)) \
+               AND NOT (source_type = 'claim' AND source_id = $1)",
         )
         .bind(new_uuid)
         .bind(old_uuid)
+        .bind(&weakening)
         .execute(&mut *tx)
         .await?;
 
         // Migrate outgoing edges: redirect edges FROM old claim to come from new claim
         sqlx::query(
             "UPDATE edges SET source_id = $1 \
-             WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes'",
+             WHERE source_id = $2 AND source_type = 'claim' \
+               AND relationship != 'supersedes' \
+               AND NOT (relationship = ANY($3)) \
+               AND NOT (target_type = 'claim' AND target_id = $1)",
         )
         .bind(new_uuid)
         .bind(old_uuid)
+        .bind(&weakening)
         .execute(&mut *tx)
         .await?;
 

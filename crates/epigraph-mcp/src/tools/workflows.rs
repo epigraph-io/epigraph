@@ -492,32 +492,105 @@ async fn find_workflow_post_embed(
             std::collections::HashMap::new()
         };
 
-    // Build results, enriching with behavioral data
-    let mut results = Vec::new();
-    for hit in semantic_hits {
-        if let Ok(Some(claim)) = ClaimRepository::get_by_id(
+    // Hierarchical leg (backlog 18168514). `store_workflow` writes a row in the
+    // `workflows` table and labels its claims `workflow_thesis` / `workflow_step`
+    // — never `workflow` — so the label-scoped passes above could NEVER return
+    // anything `store_workflow` produced. Searching only the flat store made
+    // that tool's output permanently invisible to the tool named to find it,
+    // which is the long-standing convention in epiclaw scheduled-task prompts.
+    //
+    // Best-effort: a failure here degrades to the flat-only behaviour rather
+    // than blanking the whole tool.
+    let hierarchical_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
+        WorkflowRepository::search_hierarchical_by_embedding_scored(
             &server.pool,
-            viewer,
-            epigraph_core::ClaimId::from_uuid(hit.claim_id),
+            pgvec,
+            min_truth,
+            limit * 3,
         )
         .await
-        {
-            if let Some(r) = enrich_workflow_result(
-                &server.pool,
-                viewer,
-                hit.claim_id,
-                &claim,
-                hit.similarity,
-                min_truth,
-                &affinity_map,
-            )
+        .unwrap_or_else(|e| {
+            tracing::warn!("hierarchical workflow embedding search failed: {e}");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
+    // Step texts for the hierarchical candidates, resolved in ONE query before
+    // ranking. A `workflows` row carries no inline steps, and a result with an
+    // empty `steps` array is precisely what caused the 2026-08-18 incident, so
+    // rows whose steps cannot be resolved are dropped below rather than
+    // surfaced hollow.
+    let hierarchical_ids: Vec<uuid::Uuid> = hierarchical_hits.iter().map(|r| r.id).collect();
+    let mut hierarchical_steps =
+        WorkflowRepository::step_texts_for_hierarchical(&server.pool, viewer, &hierarchical_ids)
             .await
-            {
-                results.push(r);
-            }
-        }
+            .unwrap_or_else(|e| {
+                tracing::warn!("hierarchical step resolution failed: {e}");
+                std::collections::HashMap::new()
+            });
+
+    // Merge both stores onto ONE ranked list before truncating to `limit`.
+    // Appending the hierarchical leg after the flat leg had already consumed
+    // the budget would leave the measured failure untouched: the two
+    // content-free flat records (305050d2, d32ee4e8) outrank everything for
+    // theme-maintenance queries, so they would still fill the window. Both
+    // legs score `1 - cosine_distance` from the SAME query embedding, so the
+    // similarities are directly comparable.
+    enum Candidate {
+        Flat(epigraph_db::ClaimEmbeddingHit),
+        Hierarchical(epigraph_db::ScoredHierarchicalWorkflowRow),
+    }
+    let mut candidates: Vec<(f64, Candidate)> =
+        Vec::with_capacity(semantic_hits.len() + hierarchical_hits.len());
+    for hit in semantic_hits {
+        candidates.push((hit.similarity, Candidate::Flat(hit)));
+    }
+    for row in hierarchical_hits {
+        candidates.push((row.similarity, Candidate::Hierarchical(row)));
+    }
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+    // Build results, enriching with behavioral data
+    let mut results = Vec::new();
+    for (_, candidate) in candidates {
         if results.len() >= limit as usize {
             break;
+        }
+        match candidate {
+            Candidate::Flat(hit) => {
+                if let Ok(Some(claim)) = ClaimRepository::get_by_id(
+                    &server.pool,
+                    viewer,
+                    epigraph_core::ClaimId::from_uuid(hit.claim_id),
+                )
+                .await
+                {
+                    if let Some(r) = enrich_workflow_result(
+                        &server.pool,
+                        viewer,
+                        hit.claim_id,
+                        &claim,
+                        hit.similarity,
+                        min_truth,
+                        &affinity_map,
+                    )
+                    .await
+                    {
+                        results.push(r);
+                    }
+                }
+            }
+            Candidate::Hierarchical(row) => {
+                let steps = hierarchical_steps.remove(&row.id).unwrap_or_default();
+                if let Some(r) =
+                    hierarchical_workflow_result(&server.pool, viewer, &row, steps, &affinity_map)
+                        .await
+                {
+                    results.push(r);
+                }
+            }
         }
     }
 
@@ -572,7 +645,153 @@ async fn find_workflow_post_embed(
         }
     }
 
+    // Hierarchical half of the same fallback. Needed for more than symmetry:
+    // the embedding leg above is skipped entirely when the embedder is
+    // unavailable (`pgvec_opt` is None), which is also the configuration the
+    // integration tests run in — without this leg the union would be
+    // unreachable exactly where it is cheapest to verify.
+    if results.len() < half {
+        let text_rows = WorkflowRepository::search_hierarchical_by_text(
+            &server.pool,
+            &params.goal,
+            limit * 2,
+            min_truth,
+            false, // frozen steps, not lineage heads — see step_texts_for_hierarchical
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("search_hierarchical_by_text fallback failed: {e}");
+            Vec::new()
+        });
+
+        let already_seen: std::collections::HashSet<String> =
+            results.iter().map(|r| r.workflow_id.clone()).collect();
+        let text_ids: Vec<uuid::Uuid> = text_rows
+            .iter()
+            .filter(|r| !already_seen.contains(&r.id.to_string()))
+            .map(|r| r.id)
+            .collect();
+        let mut text_steps =
+            WorkflowRepository::step_texts_for_hierarchical(&server.pool, viewer, &text_ids)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("hierarchical step resolution failed: {e}");
+                    std::collections::HashMap::new()
+                });
+
+        for row in text_rows {
+            if results.len() >= limit_usize {
+                break;
+            }
+            if already_seen.contains(&row.id.to_string()) {
+                continue;
+            }
+            let scored = epigraph_db::ScoredHierarchicalWorkflowRow {
+                id: row.id,
+                canonical_name: row.canonical_name,
+                generation: row.generation,
+                goal: row.goal,
+                parent_id: row.parent_id,
+                metadata: row.metadata,
+                created_at: row.created_at,
+                truth_value: row.truth_value,
+                similarity: 0.0, // text-fallback hit; no semantic similarity score
+            };
+            let steps = text_steps.remove(&scored.id).unwrap_or_default();
+            if let Some(r) =
+                hierarchical_workflow_result(&server.pool, viewer, &scored, steps, &affinity_map)
+                    .await
+            {
+                results.push(r);
+            }
+        }
+    }
+
     success_json(&results)
+}
+
+/// Render a hierarchical `workflows` row into the same `FindWorkflowResult`
+/// shape the flat workflow claims use, so `find_workflow` can return both
+/// stores in one ranked list.
+///
+/// Returns `None` when `steps` is empty. That guard is the whole reason this
+/// function takes resolved steps rather than resolving them lazily: a
+/// `workflows` row holds no inline steps, and `FindWorkflowResult.steps` is a
+/// `Vec<String>` the caller is expected to execute. Emitting `[]` is exactly
+/// the shape that caused the 2026-08-18 incident — an agent instructed to
+/// "follow the best-matching workflow steps" got an empty array, fell back to
+/// a bare `theme_cluster` with `wipe_first=true`, and destroyed 76 themes. A
+/// step-less workflow is not a usable answer to "find me a workflow", so it is
+/// withheld rather than surfaced hollow.
+///
+/// The truth floor is NOT re-applied here: both hierarchical queries already
+/// filter on `truth_value >= min_truth` in SQL, which is also what drops
+/// `deprecate_workflow`'s 0.05 rows.
+async fn hierarchical_workflow_result(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    row: &epigraph_db::ScoredHierarchicalWorkflowRow,
+    steps: Vec<String>,
+    affinity_map: &std::collections::HashMap<uuid::Uuid, (f64, i64)>,
+) -> Option<FindWorkflowResult> {
+    if steps.is_empty() {
+        tracing::debug!(
+            workflow_id = %row.id,
+            "find_workflow: withholding hierarchical workflow with no resolvable steps"
+        );
+        return None;
+    }
+
+    // Counters live in `workflows.metadata`, written by
+    // `report_hierarchical_outcome`; the flat store keeps the equivalents
+    // inside the claim's JSON content.
+    let use_count = row
+        .metadata
+        .get("use_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let success_count = row
+        .metadata
+        .get("success_count")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
+    let lineage_root = WorkflowRepository::find_lineage_root(pool, viewer, row.id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(workflow_id = %row.id, "find_lineage_root failed: {e}");
+            row.id
+        });
+    let (behavioral_affinity, behavioral_execution_count) = match affinity_map.get(&lineage_root) {
+        Some(&(sim, count)) => (Some(sim), Some(count)),
+        None => (None, None),
+    };
+
+    let behavioral_success_rate = if use_count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        Some(success_count as f64 / use_count as f64)
+    } else {
+        None
+    };
+
+    Some(FindWorkflowResult {
+        workflow_id: row.id.to_string(),
+        goal: row.goal.clone(),
+        steps,
+        truth_value: row.truth_value,
+        similarity: row.similarity,
+        use_count,
+        success_count,
+        generation: i64::from(row.generation),
+        parent_id: row.parent_id.map(|id| id.to_string()),
+        behavioral_affinity,
+        behavioral_success_rate,
+        behavioral_execution_count,
+        // `promotable` is written by `refresh_workflow_promotion` onto the FLAT
+        // claim's `properties.promotion`; hierarchical rows have no equivalent
+        // field, so it stays absent rather than being faked as `false`.
+        promotable: None,
+    })
 }
 
 /// Build a `FindWorkflowResult` from a workflow claim, applying the shared

@@ -23,9 +23,16 @@
 //!   design — belief-wiring already no-ops on Neutral, so accepting them
 //!   here just lets citation/provenance edges be created MCP-natively
 //!   without a doomed detour through the raw HTTP edges route.
-//! - idempotent on `(source, target, relationship)`: a re-hit returns the
-//!   existing edge with `was_created=false` and never re-creates the durable
-//!   edge row or re-emits `edge.added`. Belief wiring, however, is NOT gated
+//! - idempotent on `(source, target, relationship)` — and for the SYMMETRIC
+//!   relationships (`contradicts`, `corroborates`, see
+//!   [`SYMMETRIC_RELATIONSHIPS`]) on the UNORDERED pair, so filing one in both
+//!   directions yields one row rather than two descriptions of one fact. A
+//!   re-hit returns the existing edge with `was_created=false` and never
+//!   re-creates the durable edge row or re-emits `edge.added`. On a symmetric
+//!   re-hit against the reverse direction the response's
+//!   `belief_target_claim_id` is the caller's SOURCE, because both the wire and
+//!   the belief readback follow the row's stored orientation rather than the
+//!   caller's argument order. Belief wiring, however, is NOT gated
 //!   on `was_created` alone: a re-hit still attempts the wire, and
 //!   `belief_wired=true` on that re-hit exactly when no BBA has ever been
 //!   materialized for this edge_id AND the source now has a belief interval
@@ -93,6 +100,38 @@ pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites"];
 
 fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
+}
+
+/// The subset of [`EPISTEMIC_RELATIONSHIPS`] that is SEMANTICALLY SYMMETRIC:
+/// "A contradicts B" and "B contradicts A" are the same fact about the same
+/// pair, as are the two orderings of `corroborates`. Edges for these are
+/// deduped in BOTH directions via
+/// [`EdgeRepository::create_symmetric_if_absent_oriented`]; everything else
+/// keeps the directional `create_if_not_exists` path.
+///
+/// Why it matters (backlog 9a0bd3e2): `link_epistemic` wrote every
+/// relationship through the directional repo, so an agent filing `contradicts`
+/// in both orders produced two `edges` rows for one disagreement. Every
+/// conflict-density measure counts rows — `silence_alarm`'s
+/// `check_conflict_density` included — so one dispute read as two.
+///
+/// The five excluded epistemic relations are genuinely directional and MUST
+/// NOT be added here: `supports`, `elaborates`, `generalizes`, `specializes`
+/// and `refutes` all assert something about `source` that is false of
+/// `target` (A generalizes B is not B generalizes A), and collapsing their
+/// orderings would erase real information rather than a duplicate.
+///
+/// **Casing caveat.** Dedup is a byte-exact `relationship = $3` comparison.
+/// The cross-source matcher writes `CORROBORATES` (upper) and `contradicts`
+/// (lower) — see `epigraph_engine::matching::verifier`'s two relationship
+/// constants. So listing lowercase `corroborates` here collapses the two call
+/// ORDERS of `link_epistemic`'s own `corroborates`; it does NOT unify a
+/// `link_epistemic` `corroborates` with a matcher-written `CORROBORATES`.
+/// That casing split is pre-existing and out of scope here.
+pub const SYMMETRIC_RELATIONSHIPS: &[&str] = &["contradicts", "corroborates"];
+
+fn is_symmetric_relationship(s: &str) -> bool {
+    SYMMETRIC_RELATIONSHIPS.contains(&s)
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -165,19 +204,51 @@ pub async fn do_link_epistemic(
         )));
     }
 
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
-        pool,
-        source_id,
-        "claim",
-        target_id,
-        "claim",
-        &params.relationship,
-        params.properties.clone(),
-        None,
-        None,
-    )
-    .await
-    .map_err(internal_error)?;
+    // Symmetric relationships (`contradicts`, `corroborates`) dedup in BOTH
+    // directions, so the two call orders collapse to ONE row; everything else
+    // keeps the directional `(source, target, relationship)` idempotency.
+    // See `SYMMETRIC_RELATIONSHIPS`.
+    //
+    // `wire_source` / `wire_target` are the endpoints AS STORED on the
+    // surviving row. They differ from the caller's `(source_id, target_id)`
+    // in exactly one case — a symmetric dedup hit against the reverse
+    // direction — and the belief wiring below must follow the row, not the
+    // caller: the BBA is keyed on `edge_id`, so materializing the caller's
+    // direction onto a row recording the opposite one would attach a factor
+    // the row does not describe.
+    let (edge_id, was_created, wire_source, wire_target) =
+        if is_symmetric_relationship(&params.relationship) {
+            let upsert = EdgeRepository::create_symmetric_if_absent_oriented(
+                pool,
+                source_id,
+                target_id,
+                &params.relationship,
+                params.properties.clone().unwrap_or(serde_json::json!({})),
+            )
+            .await
+            .map_err(internal_error)?;
+            (
+                upsert.edge_id,
+                upsert.was_created,
+                upsert.source_id,
+                upsert.target_id,
+            )
+        } else {
+            let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
+                pool,
+                source_id,
+                "claim",
+                target_id,
+                "claim",
+                &params.relationship,
+                params.properties.clone(),
+                None,
+                None,
+            )
+            .await
+            .map_err(internal_error)?;
+            (edge_row.id, was_created, source_id, target_id)
+        };
 
     // Belief wiring fires whenever no BBA has ever been materialized for this
     // edge yet — NOT simply on first creation. An edge can be written durably
@@ -195,16 +266,23 @@ pub async fn do_link_epistemic(
     // (no `query!` macro → zero .sqlx offline-data churn).
     let mut belief_wired = false;
     let source_agent_id: Option<uuid::Uuid> = {
-        // PR-09: an authorship oracle over a caller-supplied uuid —
-        // it names the `agents.id` behind any claim. Filtered rather than
-        // exempted; `fetch_optional` already handles "no row", so an
+        // PR-09: an authorship oracle over a uuid that derives from caller
+        // input — it names the `agents.id` behind any claim. Filtered rather
+        // than exempted; `fetch_optional` already handles "no row", so an
         // invisible source simply skips the best-effort belief recompute.
+        //
+        // Bound on `wire_source`, NOT the caller's `source_id`: after a
+        // symmetric dedup hit the surviving row records the reverse
+        // orientation, and the BBA is keyed on that row's `edge_id`. Attributing
+        // it to the caller's direction would name an author the row does not
+        // describe. Both endpoints were viewer-checked above, so following the
+        // row cannot widen what this read can see.
         let sql = viewer.splice(
             "SELECT c.agent_id FROM claims c \
                  WHERE c.id = $1 /* {VISIBILITY:c} */",
             2,
         );
-        let mut q = sqlx::query_scalar(&sql).bind(source_id);
+        let mut q = sqlx::query_scalar(&sql).bind(wire_source);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -221,10 +299,10 @@ pub async fn do_link_epistemic(
             pool,
             viewer,
             was_created,
-            edge_row.id,
-            source_id,
+            edge_id,
+            wire_source,
             "claim",
-            target_id,
+            wire_target,
             "claim",
             &params.relationship,
             agent_id,
@@ -245,11 +323,11 @@ pub async fn do_link_epistemic(
             "edge.added",
             actor_id,
             &serde_json::json!({
-                "edge_id": edge_row.id,
+                "edge_id": edge_id,
                 "source_type": "claim",
-                "source_id": source_id,
+                "source_id": wire_source,
                 "target_type": "claim",
-                "target_id": target_id,
+                "target_id": wire_target,
                 "relationship": params.relationship,
             }),
         )
@@ -260,39 +338,44 @@ pub async fn do_link_epistemic(
     // recompute wrote (belief / plausibility / pignistic_prob). NOT the unframed
     // `belief_query::get_belief`, which reads `truth_value` and so would NOT
     // reflect the wire.
-    let target_belief = match ClaimRepository::get_belief_columns(
-        pool,
-        viewer,
-        ClaimId::from_uuid(target_id),
-    )
-    .await
-    {
-        Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
-            (Some(belief), Some(plausibility), Some(pignistic_prob)) => Some(LinkEpistemicBelief {
-                belief,
-                plausibility,
-                pignistic_prob,
-            }),
-            // Claim with no BBA yet → NULL DS columns → belief not reportable.
-            _ => None,
-        },
-        // Missing row: belief not reportable.
-        Ok(None) => None,
-        Err(e) => {
-            tracing::warn!(
-                target = %target_id,
-                error = ?e,
-                "link_epistemic: target belief readback failed (non-fatal)"
-            );
-            None
-        }
-    };
+    //
+    // Keyed on `wire_target`, the claim the recompute actually touched, which
+    // on a reverse symmetric dedup hit is the caller's SOURCE. The response
+    // echoes it as `belief_target_claim_id` so the caller never has to guess
+    // which claim the interval belongs to.
+    let target_belief =
+        match ClaimRepository::get_belief_columns(pool, viewer, ClaimId::from_uuid(wire_target))
+            .await
+        {
+            Ok(Some(cols)) => match (cols.belief, cols.plausibility, cols.pignistic_prob) {
+                (Some(belief), Some(plausibility), Some(pignistic_prob)) => {
+                    Some(LinkEpistemicBelief {
+                        belief,
+                        plausibility,
+                        pignistic_prob,
+                    })
+                }
+                // Claim with no BBA yet → NULL DS columns → belief not reportable.
+                _ => None,
+            },
+            // Missing row: belief not reportable.
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target = %wire_target,
+                    error = ?e,
+                    "link_epistemic: target belief readback failed (non-fatal)"
+                );
+                None
+            }
+        };
 
     success_json(&LinkEpistemicResponse {
-        edge_id: edge_row.id.to_string(),
+        edge_id: edge_id.to_string(),
         was_created,
         relationship: params.relationship,
         belief_wired,
+        belief_target_claim_id: wire_target.to_string(),
         target_belief,
     })
 }

@@ -85,7 +85,7 @@ pub use claim::{
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
-    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow,
+    DistantClaimsRow, RecomputedThemeRow, SplitCandidateRow, ThemeMemberRow, ThemeSummaryRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use community::{CommunityRepository, MembershipOutcome};
@@ -98,7 +98,8 @@ pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventRepository, EventRow};
 pub use evidence::{
-    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceRepository, EvidenceSearchResult,
+    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow,
+    EvidenceRepository, EvidenceSearchResult,
 };
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
@@ -140,8 +141,8 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    HierarchicalWorkflowRow, ResolvedStep, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository,
+    HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit,
+    WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories

@@ -233,15 +233,18 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
 async fn update_labels_tool_rejects_unexpanded_add_and_changes_nothing(pool: PgPool) {
     let claim_id =
         seed_claim_with_labels(&pool, "update_labels tool guard subject", &["keeper"]).await;
+    let viewer = fixture::public_viewer(&pool).await;
     let server = build_test_server(pool.clone());
 
     let err = epigraph_mcp::tools::claims::update_labels(
         &server,
+        &viewer,
         epigraph_mcp::types::UpdateLabelsParams {
             claim_id: claim_id.to_string(),
             add: vec!["good-label".into(), BAD_LABEL.into()],
             remove: vec![],
         },
+        None,
     )
     .await
     .expect_err("an unexpanded shell variable must be refused");

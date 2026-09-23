@@ -107,6 +107,30 @@ pub struct ResolvedStep {
     pub pending_resolution: bool,
 }
 
+/// A [`HierarchicalWorkflowRow`] carrying the cosine similarity that retrieved
+/// it, so a caller can rank hierarchical hits against hits from another store
+/// on one comparable scale.
+///
+/// Exists because the two existing embedding searches over
+/// `workflows.goal_embedding` each drop half of what a cross-store ranker
+/// needs: `find_hierarchical_by_embedding` returns the full row but discards
+/// the distance column, and `search_by_goal_embedding` returns a similarity but
+/// only `(id, goal, truth_value)`. Merging flat workflow CLAIMS with
+/// hierarchical workflow ROWS in `find_workflow` needs both at once.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ScoredHierarchicalWorkflowRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub metadata: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub truth_value: f64,
+    /// `1 - cosine_distance` against the query embedding.
+    pub similarity: f64,
+}
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -961,6 +985,114 @@ impl WorkflowRepository {
         .bind(since)
         .fetch_all(pool)
         .await
+    }
+
+    /// Cosine-similarity search over `workflows.goal_embedding` that keeps BOTH
+    /// the full row and its similarity score — see
+    /// [`ScoredHierarchicalWorkflowRow`] for why neither existing sibling does.
+    ///
+    /// Takes a pre-formatted pgvector literal (like
+    /// `ClaimRepository::search_by_embedding_scoped`) so a caller can reuse ONE
+    /// query embedding across the claims and workflows stores. `min_truth`
+    /// filters out deprecated rows (`deprecate_workflow` writes 0.05). No
+    /// similarity floor: the caller ranks and truncates, so imposing one here
+    /// would silently drop rows it may still want to consider.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    ///
+    /// Takes NO `&Viewer`, and no lint sees it either — it takes a `&PgPool`,
+    /// which is neither of the two spellings `visibility_lint.rs` scans. The
+    /// reason is recorded here so the next reader does not have to re-derive
+    /// it: the statement's `FROM` is `workflows` alone and it joins no other
+    /// relation, and `workflows` carries neither a `visibility` nor an
+    /// `owner_group_id` column, so there is no predicate to write. This is the
+    /// scored sibling of `find_hierarchical_by_embedding`, whose identical
+    /// posture is registered in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    /// Contrast `step_texts_for_hierarchical` below, which joins `claims` and
+    /// therefore DOES take a viewer.
+    pub async fn search_hierarchical_by_embedding_scored(
+        pool: &PgPool,
+        query_embedding_pgvector: &str,
+        min_truth: f64,
+        limit: i64,
+    ) -> Result<Vec<ScoredHierarchicalWorkflowRow>, sqlx::Error> {
+        sqlx::query_as::<_, ScoredHierarchicalWorkflowRow>(
+            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, \
+                    truth_value, \
+                    (1 - (goal_embedding <=> $1::vector))::float8 AS similarity \
+             FROM workflows \
+             WHERE goal_embedding IS NOT NULL \
+               AND truth_value >= $2 \
+             ORDER BY goal_embedding <=> $1::vector \
+             LIMIT $3",
+        )
+        .bind(query_embedding_pgvector)
+        .bind(min_truth)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+
+    /// Step texts for hierarchical workflows, in plan order, keyed by workflow.
+    ///
+    /// A `workflows` row carries no inline steps — its steps are level-2 claims
+    /// reached through `executes` edges. A caller that renders a hierarchical
+    /// workflow into a steps-bearing shape MUST resolve them: handing back an
+    /// empty `steps` array is the failure mode that caused the 2026-08-18
+    /// incident, where an agent told to "follow the best-matching workflow
+    /// steps" received `[]`, fell back to a bare `theme_cluster` with
+    /// `wipe_first=true`, and destroyed 76 themes.
+    ///
+    /// Ordering is `(edge created_at ASC, claim id ASC)` — the same plan order
+    /// [`Self::resolve_steps_to_heads`] and `do_report_hierarchical_outcome`
+    /// use, so step N means the same step in all three.
+    ///
+    /// Returns the FROZEN step claims attached to the workflow, not lineage
+    /// heads. `find_workflow` advertises the workflow as stored; callers that
+    /// need head resolution have `find_workflow_hierarchical(resolve_to_latest)`.
+    /// Workflows with no steps are simply absent from the map.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn step_texts_for_hierarchical(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        workflow_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<String>>, sqlx::Error> {
+        if workflow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // This projects `c.content` — claim TEXT, not a scalar — so it is a
+        // first-class claim read and carries the viewer predicate on `c`.
+        // `$1` is the id array, so the viewer bind is `$2`.
+        //
+        // No `/* {EDGE_VISIBILITY:e} */`: the `edges` leg here has never
+        // carried a predicate, and PR-13 deliberately converted only the reads
+        // that already had one. Adding an edge filter needs its own
+        // JOIN-vs-WHERE reasoning and belongs to the tracked open finding
+        // `F-edges-unfiltered`, not to this merge.
+        let sql = viewer.splice(
+            "SELECT e.source_id, c.content \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = ANY($1) \
+               AND e.relationship = 'executes' \
+               AND (c.properties->>'level')::int = 2 /* {VISIBILITY:c} */ \
+             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q = sqlx::query_as(&sql).bind(workflow_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, String)> = q.fetch_all(pool).await?;
+
+        let mut out: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for (workflow_id, content) in rows {
+            out.entry(workflow_id).or_default().push(content);
+        }
+        Ok(out)
     }
 
     /// Write the embedding vector for a hierarchical workflow's goal text.

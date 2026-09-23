@@ -86,26 +86,27 @@ pub use repos::{
     DivergenceRepository, EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository,
     EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow,
     EventRepository, EventRow, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow,
-    EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult,
-    EvolveStepResult, ExperimentRepository, ExperimentResultRepository, ExperimentResultRow,
-    ExperimentRow, FactorRepository, FrameClaimBeliefHit, FrameRepository, GapAnalysisResult,
-    GapChallengeRow, GapRecord, GapRepository, GraphExpansionHit, GraphViewRepository,
-    GroundedNeighbor, GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository,
-    GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, InstanceAdminRepository,
-    InstanceAdminRow, KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow,
-    LevelAndSourceType, LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo,
-    MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
-    MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
-    MethodSourcePaper, MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository,
-    OAuthClientRow, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
-    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
-    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
-    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
-    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome,
-    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter, EvidenceListRow,
+    EvidenceRepository, EvidenceSearchResult, EvolveStepResult, ExperimentRepository,
+    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository,
+    FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
+    GapRepository, GraphExpansionHit, GraphViewRepository, GroundedNeighbor,
+    GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository, GroupRow,
+    HierarchicalWorkflowRow, HybridHit, IndexCounts, InstanceAdminRepository, InstanceAdminRow,
+    KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow, LevelAndSourceType,
+    LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
+    MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
+    MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
+    MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow,
+    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
+    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
+    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
+    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshTokenRepository,
+    RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome, ScopedBeliefRepository,
+    ScoredHierarchicalWorkflowRow, SecurityEventRepository, SecurityEventRow, SheafRepository,
     SortDirection, StructuralRepository, SweepCandidate, TaskRepository, TaskRow,
-    TenancyPrecondition, TraceProvenanceStep, TripleRepository, TripleRow,
-    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
+    TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow, TraceProvenanceStep, TripleRepository,
+    TripleRow, WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
@@ -119,7 +120,7 @@ pub use repos::activity::ActivityRow;
 pub use repos::community::{CommunityMemberRow, CommunityRow, MembershipOutcome};
 pub use repos::context::ContextRow;
 pub use repos::divergence::DivergenceRow;
-pub use repos::edge::{AttributedClaimRow, EdgeRow, EPISTEMIC_RELATIONSHIPS};
+pub use repos::edge::{AttributedClaimRow, EdgeRow, SymmetricEdgeUpsert, EPISTEMIC_RELATIONSHIPS};
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::graph_view::{

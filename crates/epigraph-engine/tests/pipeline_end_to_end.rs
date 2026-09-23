@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 use epigraph_engine::matching::calibration::MatcherConfig;
 use epigraph_engine::matching::pipeline::{run_pipeline, RunInputs};
-use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
+use epigraph_engine::matching::verifier::{Verdict, VerifierClient, REJECTED_RELATIONSHIP};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -100,21 +100,26 @@ impl VerifierClient for AlwaysContradictsVerifier {
     }
 }
 
-struct AlwaysDerivesFromVerifier;
+/// The model was asked and said NO — `valid: false`, carried by
+/// `REJECTED_RELATIONSHIP`, which maps to `MatchVerdict::Distinct` → Reject.
+/// This is an ANSWER, as distinct from `NoAnswerVerifier`'s silence below.
+///
+/// Spelled with the `derives_from` literal until issue #388: that string
+/// reached `Distinct` only because it was a vocabulary member with no
+/// `map_relationship` arm, and it now maps to `Overlapping`, so it no longer
+/// expresses a rejection at all.
+struct AlwaysRejectsVerifier;
 
 #[async_trait]
-impl VerifierClient for AlwaysDerivesFromVerifier {
+impl VerifierClient for AlwaysRejectsVerifier {
     async fn verify(&self, pairs: &[(Uuid, Uuid)]) -> anyhow::Result<Vec<Option<Verdict>>> {
-        // `derives_from` maps to MatchVerdict::Distinct → Reject branch. This
-        // is an ANSWER — the model was asked and said "related, not the same" —
-        // as distinct from `NoAnswerVerifier`'s silence below.
         Ok(pairs
             .iter()
             .map(|(a, b)| {
                 Some(Verdict {
                     source_id: *a,
                     target_id: *b,
-                    relationship: "derives_from".to_string(),
+                    relationship: REJECTED_RELATIONSHIP.to_string(),
                     strength: 0.7,
                     rationale: "related not same".to_string(),
                 })
@@ -621,7 +626,7 @@ async fn mid_band_distinct_verdict_records_rejected_row_and_no_edge(pool: PgPool
     let inputs = RunInputs {
         seeds: vec![seed],
         cfg: mid_band_config(),
-        verifier: Box::new(AlwaysDerivesFromVerifier),
+        verifier: Box::new(AlwaysRejectsVerifier),
         auto_promote: true,
     };
     let report = run_pipeline(&pool, inputs).await.expect("pipeline");
@@ -682,7 +687,7 @@ impl VerifierClient for NoAnswerVerifier {
 /// the stored verdict untouched.
 ///
 /// The verifier's silence is not a finding. Today it is laundered into one: the
-/// fabricated `derives_from` placeholder maps to `MatchVerdict::Distinct` →
+/// fabricated `derives_from` placeholder mapped to `MatchVerdict::Distinct` →
 /// `PolicyAction::Reject` → `patch_verdict`, which destructively overwrites a
 /// prior `same` with `distinct` — and under the promotion rules from #382 a
 /// `distinct` row is permanently un-promotable, so the real verdict is not just
