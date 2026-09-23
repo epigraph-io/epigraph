@@ -13,12 +13,16 @@
 
 /// Format `vector` as a pgvector text literal: `"[0.1,0.2,0.3]"`.
 ///
-/// Each component is written with `f32`'s `Display`, which round-trips: the
-/// shortest decimal that parses back to the same `f32`. An empty slice formats
-/// as `"[]"`, which pgvector rejects; callers never hold an empty embedding,
-/// and a zero-dimension vector reaching SQL is an error worth surfacing.
+/// Generic over the component type because the workspace holds vectors as
+/// both `f32` (every embedding) and `f64` (a caller-supplied theme centroid).
+/// Each component is written with its `Display`, which for both float types
+/// round-trips: the shortest decimal that parses back to the same value. That
+/// is also exactly what the `.to_string()`-and-join copies this replaced
+/// produced, so no bound value changes. An empty slice formats as `"[]"`,
+/// which pgvector rejects; callers never hold an empty embedding, and a
+/// zero-dimension vector reaching SQL is an error worth surfacing.
 #[must_use]
-pub fn format_pgvector(vector: &[f32]) -> String {
+pub fn format_pgvector<T: std::fmt::Display>(vector: &[T]) -> String {
     let mut out = String::with_capacity(vector.len() * 12 + 2);
     out.push('[');
     for (i, v) in vector.iter().enumerate() {
@@ -37,7 +41,7 @@ mod tests {
 
     #[test]
     fn formats_the_bracketed_comma_list_pgvector_parses() {
-        assert_eq!(format_pgvector(&[0.1, -0.25, 3.0]), "[0.1,-0.25,3]");
+        assert_eq!(format_pgvector(&[0.1_f32, -0.25, 3.0]), "[0.1,-0.25,3]");
     }
 
     #[test]
@@ -57,6 +61,19 @@ mod tests {
 
     #[test]
     fn a_single_component_has_no_separator() {
-        assert_eq!(format_pgvector(&[0.5]), "[0.5]");
+        assert_eq!(format_pgvector(&[0.5_f32]), "[0.5]");
+    }
+
+    #[test]
+    fn an_f64_centroid_formats_like_its_old_inline_copy() {
+        let v = [0.1_f64, 1.0 / 3.0, -2.5e-10];
+        let old = format!(
+            "[{}]",
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(format_pgvector(&v), old);
     }
 }

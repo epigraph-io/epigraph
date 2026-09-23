@@ -180,7 +180,7 @@ pub async fn gap_analysis(
     let graph_claims = epigraph_db::ClaimRepository::semantic_search_flat(
         &state.db_pool,
         &viewer,
-        &format_embedding(&query_vec),
+        &epigraph_db::format_pgvector(&query_vec),
         GAP_RELEVANCE_FLOOR,
         None,
         None,
@@ -308,18 +308,6 @@ pub async fn gap_analysis(
 /// bare `0.3` inside the SQL literal.
 #[cfg(feature = "db")]
 const GAP_RELEVANCE_FLOOR: f64 = 0.3;
-
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
 
 // ── Internal types ──
 //

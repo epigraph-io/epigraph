@@ -251,19 +251,6 @@ async fn generate_query_embedding(state: &AppState, text: &str) -> (Vec<f32>, bo
     (generate_mock_embedding(text), false)
 }
 
-/// Format embedding vector as pgvector string literal
-#[cfg(feature = "db")]
-fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
 // ============================================================================
 // Handler
 // ============================================================================
@@ -370,7 +357,7 @@ pub async fn rag_context(
     {
         // Step 1: Generate embedding for the query
         let (query_embedding, is_real_embedding) = generate_query_embedding(&state, query).await;
-        let embedding_str = format_embedding_for_pgvector(&query_embedding);
+        let embedding_str = epigraph_db::format_pgvector(&query_embedding);
         let embedding_mode = if is_real_embedding { "real" } else { "mock" }.to_string();
 
         // Step 2: Execute hybrid search combining vector similarity, truth, and
@@ -730,7 +717,7 @@ pub async fn search_evidence(
     }
 
     let (query_embedding, _is_real) = generate_query_embedding(&state, query).await;
-    let embedding_str = format_embedding_for_pgvector(&query_embedding);
+    let embedding_str = epigraph_db::format_pgvector(&query_embedding);
 
     // Acquired AFTER `generate_query_embedding`, for the reason `rag_context`
     // states above: that call leaves the process, this handler runs exactly one

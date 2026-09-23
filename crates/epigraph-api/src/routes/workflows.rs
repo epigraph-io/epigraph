@@ -473,14 +473,7 @@ pub async fn search_workflows(
             })?;
 
             // Behavioral affinity lookup
-            let pgvec = format!(
-                "[{}]",
-                query_vec
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let pgvec = epigraph_db::format_pgvector(&query_vec);
             //
             // PROPAGATE, do not default. This read now shares one connection
             // with every other statement in the handler, so a failure here is
@@ -892,13 +885,7 @@ pub async fn report_outcome(
     let goal_embedding_pgvec = if let Some(embedder) = state.embedding_service() {
         match embedder.generate(&behavioral_goal).await {
             Ok(vec) => {
-                let pgvec = format!(
-                    "[{}]",
-                    vec.iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                let pgvec = epigraph_db::format_pgvector(&vec);
                 Some(pgvec)
             }
             Err(e) => {
@@ -1495,7 +1482,7 @@ pub async fn record_behavioral_execution(
     let mut embedded = false;
     if let Some(embedder) = state.embedding_service() {
         if let Ok(vec) = embedder.generate(&body.goal_text).await {
-            embedding_pgvec = Some(format_embedding(&vec));
+            embedding_pgvec = Some(epigraph_db::format_pgvector(&vec));
             embedded = true;
         }
     }
@@ -1654,18 +1641,6 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
             })?;
         Ok(created.id.as_uuid())
     }
-}
-
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
 }
 
 /// Fire `auto_wire_edge_if_epistemic` for each plan edge the executor newly

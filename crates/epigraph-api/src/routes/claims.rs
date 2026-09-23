@@ -1604,18 +1604,11 @@ pub async fn update_claim(
         current = ClaimRepository::update_trace_id(&state.db_pool, claim_id, trace_id).await?;
     }
 
-    // Update embedding if provided (used by backfill_embeddings.py)
+    // Update embedding if provided (used by backfill_embeddings.py). The repo
+    // helper formats the pgvector literal (deferred-commitment key
+    // embed-on-write-helper).
     if let Some(ref embedding) = request.embedding {
-        // Convert Vec<f32> to pgvector literal format: "[0.1,0.2,...]"
-        let pgvector = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        ClaimRepository::store_embedding(&state.db_pool, id, &pgvector)
+        ClaimRepository::store_embedding_vec(&state.db_pool, id, embedding)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to store embedding: {e}"),

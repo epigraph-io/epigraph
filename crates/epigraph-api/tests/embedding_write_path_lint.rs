@@ -1,4 +1,5 @@
-//! **No `epigraph-api` source file writes a vector column itself.**
+//! **No `epigraph-api` source file writes a vector column itself, or builds
+//! a pgvector literal itself.**
 //!
 //! # Why this file exists (deferred-commitment key `embed-on-write-helper`)
 //!
@@ -18,6 +19,18 @@
 //! directly. No source under `crates/epigraph-api/src` may assign
 //! `embedding` or `embedding_3072`. The repo helpers are the only writers,
 //! and the seal and write predicates live there.
+//!
+//! # One formatter
+//!
+//! The pgvector literal (`[v1,v2,...]`) had eight private copies in this
+//! crate (`format_embedding` in five route files, `format_embedding_for_pgvector`
+//! in two, `format_pgvector` in `embedding_restore.rs`) plus seven inline
+//! `format!("[{}]", ….join(","))` blocks. All of them are now
+//! `epigraph_db::format_pgvector`, the function the repo helpers call.
+//! [`no_api_source_builds_a_pgvector_literal`] keeps it that way. It is a
+//! HEURISTIC: it catches the `"[{…}]"` + `join(",")` shape every copy used and
+//! any `fn` named like a formatter. A hand-rolled push loop under another name
+//! would pass it.
 //!
 //! # What it deliberately does not catch
 //!
@@ -142,6 +155,108 @@ fn no_api_source_assigns_a_vector_column() {
          policy\" and deferred-commitment key embed-on-write-helper.\n",
         offenders.join("\n")
     );
+}
+
+/// Offsets of a pgvector-literal builder: a `.join(",")` with a `"[{` format
+/// string within 400 normalised bytes before it or 200 after it, or a `fn`
+/// whose name marks it as a vector formatter.
+fn pgvector_literal_builders(src: &str) -> Vec<usize> {
+    let norm = normalise(src);
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = norm[from..].find(".join(\",\")") {
+        let at = from + rel;
+        from = at + 1;
+        // Both directions: the inline blocks put `"[{}]"` BEFORE the join,
+        // `embedding_restore.rs`'s copy joined into `body` first and wrapped
+        // it with `format!("[{body}]")` after.
+        let mut lo = at.saturating_sub(400);
+        while !norm.is_char_boundary(lo) {
+            lo -= 1;
+        }
+        let mut hi = (at + 200).min(norm.len());
+        while !norm.is_char_boundary(hi) {
+            hi += 1;
+        }
+        if norm[lo..hi].contains("\"[{") {
+            hits.push(at);
+        }
+    }
+    for prefix in [
+        "fn format_embedding",
+        "fn format_pgvector",
+        "fn format_as_pgvector",
+    ] {
+        let mut from = 0usize;
+        while let Some(rel) = norm[from..].find(prefix) {
+            hits.push(from + rel);
+            from += rel + prefix.len();
+        }
+    }
+    hits.sort_unstable();
+    hits.dedup();
+    hits
+}
+
+#[test]
+fn no_api_source_builds_a_pgvector_literal() {
+    let mut files = Vec::new();
+    collect(&src_root(), &mut files);
+    assert!(
+        files.len() > 80,
+        "the scan found only {} files",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    for f in &files {
+        let src = std::fs::read_to_string(f).expect("read source");
+        let n = pgvector_literal_builders(&src).len();
+        if n > 0 {
+            offenders.push(format!(
+                "  {} ({n})",
+                f.strip_prefix(src_root()).unwrap_or(f).display()
+            ));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "\n\nA source file under crates/epigraph-api/src builds a pgvector literal \
+         itself:\n{}\n\n\
+         Call `epigraph_db::format_pgvector(&vec)` for a read, or hand the \
+         `&[f32]` to a repo helper that formats it for a write. One formatter is \
+         the point of deferred-commitment key embed-on-write-helper.\n",
+        offenders.join("\n")
+    );
+}
+
+#[test]
+fn the_pgvector_literal_scanner_is_not_vacuous() {
+    for builder in [
+        // The shape of the seven inline blocks.
+        "let s = format!(\n    \"[{}]\",\n    v.iter()\n        .map(|x| x.to_string())\n        .collect::<Vec<_>>()\n        .join(\",\")\n);",
+        // `embedding_restore.rs`'s named-argument spelling.
+        "let body = v.iter().map(ToString::to_string).collect::<Vec<_>>().join(\",\");\nformat!(\"[{body}]\")",
+        // A private formatter, whatever its body.
+        "fn format_embedding(embedding: &[f32]) -> String { todo!() }",
+        "fn format_pgvector(v: &[f32]) -> String { todo!() }",
+    ] {
+        assert!(
+            !pgvector_literal_builders(builder).is_empty(),
+            "the scanner must see a pgvector literal builder in: {builder}"
+        );
+    }
+    for not_a_builder in [
+        "let s = epigraph_db::format_pgvector(&v);",
+        "let csv = names.join(\",\");",
+        "let labels = format!(\"{{{}}}\", xs.join(\";\"));",
+    ] {
+        assert!(
+            pgvector_literal_builders(not_a_builder).is_empty(),
+            "the scanner must not charge: {not_a_builder}"
+        );
+    }
 }
 
 /// The scanner, over synthetic source. Without it, a scanner that matches

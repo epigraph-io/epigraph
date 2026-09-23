@@ -413,21 +413,6 @@ async fn generate_query_embedding_with_dim(
     generate_mock_embedding_with_dim(text, target_dim)
 }
 
-/// Format embedding vector as pgvector string literal
-///
-/// Converts a Vec<f32> to the format "[0.1,0.2,0.3,...]" expected by pgvector.
-#[cfg(feature = "db")]
-fn format_embedding_for_pgvector(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
 // `build_similarity_neighbors` and the diverse-pipeline helpers live in
 // `epigraph_engine::diverse_retrieval` so the MCP `recall_with_context`
 // tool can share the same retrieval logic. See the module docs for the
@@ -695,7 +680,7 @@ pub async fn semantic_search(
             };
             let query_embedding =
                 generate_query_embedding_with_dim(&state, query, target_dim).await;
-            let embedding_str = format_embedding_for_pgvector(&query_embedding);
+            let embedding_str = epigraph_db::format_pgvector(&query_embedding);
 
             // The claim-embedding column name (still used by the post-
             // selection full-row + graph-neighbor queries below). Column
@@ -923,7 +908,7 @@ pub async fn semantic_search(
         // so generate the query embedding at that dim. Diverse-path generates
         // its own (possibly 3072d) embedding above.
         let query_embedding = generate_query_embedding(&state, query).await;
-        let embedding_str = format_embedding_for_pgvector(&query_embedding);
+        let embedding_str = epigraph_db::format_pgvector(&query_embedding);
 
         // Step 2b: Flat pgvector similarity search (DEFAULT path)
         //
@@ -1269,8 +1254,7 @@ mod db_integration_tests {
         for (i, slot) in v.iter_mut().enumerate() {
             *slot = if i == 0 { seed + 0.5 } else { seed * 1e-3 };
         }
-        let inner: Vec<String> = v.iter().map(|x| x.to_string()).collect();
-        format!("[{}]", inner.join(","))
+        epigraph_db::format_pgvector(&v)
     }
 
     /// Insert N themes with `centroid_3072` populated. Returns the inserted ids.

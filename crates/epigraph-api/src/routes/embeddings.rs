@@ -61,14 +61,7 @@ pub async fn neighborhood_density(
             message: format!("Failed to embed query: {e}"),
         })?;
     let embedding_dim = embedding.len() as u32;
-    let embedding_str = format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let embedding_str = epigraph_db::format_pgvector(&embedding);
 
     // Aggregate stats in one round trip. Uses the existing HNSW index on
     // claims.embedding via the `<=>` cosine-distance operator. Cosine

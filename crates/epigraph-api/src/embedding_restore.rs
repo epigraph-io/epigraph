@@ -86,25 +86,6 @@ impl EmbeddingProviderKind {
     }
 }
 
-/// Render a vector as a pgvector literal.
-///
-/// # A duplication, named rather than refactored away
-///
-/// Six private copies of this three-line function already exist across the
-/// workspace (`epigraph-mcp`, `epigraph-engine`, `epigraph-embeddings` and two
-/// `epigraph-cli` binaries). Consolidating them is a worthwhile change and is
-/// not this one: it would touch five crates for no behavioural gain, in a
-/// change whose subject is a job registration.
-#[cfg(feature = "db")]
-fn format_pgvector(vec: &[f32]) -> String {
-    let body = vec
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{body}]")
-}
-
 /// The production [`epigraph_jobs::EmbeddingJobService`].
 ///
 /// # The seal is the whole difficulty
@@ -226,7 +207,7 @@ impl epigraph_jobs::EmbeddingJobService for ClaimEmbeddingJobService {
             &mut conn,
             &bypass,
             claim_id,
-            &format_pgvector(&vector),
+            &epigraph_db::format_pgvector(&vector),
         )
         .await
         .map_err(|e| epigraph_jobs::EmbeddingJobError::ApiError {

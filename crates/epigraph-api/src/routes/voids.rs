@@ -130,7 +130,7 @@ pub async fn detect_voids(
         let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
             &mut *read,
             &viewer,
-            &format_embedding(&embedding),
+            &epigraph_db::format_pgvector(&embedding),
             NO_SIMILARITY_FLOOR,
             None,
             None,
@@ -241,7 +241,7 @@ pub async fn embedding_density(
     let (claim_count, avg_similarity) = epigraph_db::ClaimRepository::embedding_density_stats(
         &mut *read,
         &viewer,
-        &format_embedding(&embedding),
+        &epigraph_db::format_pgvector(&embedding),
         radius,
     )
     .await
@@ -253,7 +253,7 @@ pub async fn embedding_density(
     let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
         &mut *read,
         &viewer,
-        &format_embedding(&embedding),
+        &epigraph_db::format_pgvector(&embedding),
         NO_SIMILARITY_FLOOR,
         None,
         None,
@@ -289,18 +289,6 @@ pub async fn embedding_density(
 /// than written as a bare `-1.0` so the reason is at the call site.
 #[cfg(feature = "db")]
 const NO_SIMILARITY_FLOOR: f64 = -1.0;
-
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
 
 // ── Internal types ──
 //

@@ -1823,14 +1823,7 @@ pub async fn create_theme_with_centroid(
     // vectors for it to average itself.
     match request.centroid.as_ref().filter(|c| !c.is_empty()) {
         Some(centroid) => {
-            let centroid_str = format!(
-                "[{}]",
-                centroid
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let centroid_str = epigraph_db::format_pgvector(centroid.as_slice());
             ClaimThemeRepository::set_centroid(&state.db_pool, theme.id, &centroid_str).await?;
         }
         None => {

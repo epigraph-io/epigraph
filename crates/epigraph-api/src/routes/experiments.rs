@@ -153,7 +153,7 @@ pub async fn hypothesize(
     let similar = epigraph_db::ClaimRepository::semantic_search_flat(
         &state.db_pool,
         &viewer,
-        &format_embedding(&embedding),
+        &epigraph_db::format_pgvector(&embedding),
         search_radius,
         None,
         None,
@@ -220,7 +220,7 @@ pub async fn hypothesize(
             let neighborhood = epigraph_db::ClaimRepository::neighborhood_embeddings(
                 &state.db_pool,
                 &viewer,
-                &format_embedding(&embedding),
+                &epigraph_db::format_pgvector(&embedding),
                 search_radius,
                 200,
             )
@@ -696,18 +696,6 @@ pub async fn design_experiment(
 use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use chrono::Datelike;
-
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
 
 // ── Internal types ──
 
