@@ -20,6 +20,10 @@ use crate::state::AppState;
 
 // ── Request types ──
 
+/// Body of `POST /api/v1/voids/detect`.
+///
+/// `concepts` is bounded by [`MAX_DETECT_VOIDS_CONCEPTS`] and each entry by
+/// [`MAX_CONCEPT_BYTES`]; see [`detect_voids`]'s `# Footprint` for why.
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
 pub struct DetectVoidsRequest {
@@ -70,17 +74,36 @@ pub struct DensityQuery {
 /// purpose: deref coercion does not fire against a generic `E`, so `&mut read`
 /// would infer `E = &mut ScopedRead<'_>` and fail the bound.
 ///
-/// # Footprint: one connection across N embed round trips
+/// # Footprint: embed everything first, then N short statements on one handle
 ///
-/// The acquire is hoisted above the concept loop so that every concept in one
-/// request is answered from the same stamped session — a request that returned
-/// `void` for one concept and `covered` for another because the two sampled
-/// different sessions would be describing two different corpora. The cost is
-/// that the connection is held across `request.concepts.len()` outbound
-/// embedding calls, and `concepts` is caller-supplied and unbounded. That is a
-/// real footprint cost and it is recorded here rather than left implicit; it is
-/// the same shape `F-PR26-lineage-holds-one-connection-for-n-round-trips`
-/// names, and this shard does NOT discharge that finding.
+/// Every concept in one request is still answered from the SAME stamped
+/// session — a request that returned `void` for one concept and `covered` for
+/// another because the two sampled different sessions would be describing two
+/// different corpora. What changed is WHEN that session is taken.
+///
+/// PR-29 acquired it above the concept loop and embedded inside the loop, so
+/// the connection sat idle across `request.concepts.len()` outbound embedding
+/// round trips (and across any rate-limiter sleep inside them), with `concepts`
+/// caller-supplied and unbounded. The request pool is shared by every route, so
+/// a handful of large requests could pin all of it for as long as the provider
+/// took. That was `F-PR29-A1`, a second instance of the shape
+/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` names. The order is
+/// now:
+///
+/// 1. **Bound the request** before any other work: at most
+///    [`MAX_DETECT_VOIDS_CONCEPTS`] concepts, each non-blank and at most
+///    [`MAX_CONCEPT_BYTES`] bytes. A violation is a 400, and no embedding call
+///    and no acquire happen.
+/// 2. **Embed with no connection checked out**: one
+///    [`EmbeddingService::batch_generate`](epigraph_embeddings::EmbeddingService::batch_generate)
+///    call for the whole request, then each vector formatted into its probe
+///    literal.
+/// 3. **Only then acquire**, run exactly one nearest-claim statement per
+///    concept back to back, and release.
+///
+/// So the handle spans at most [`MAX_DETECT_VOIDS_CONCEPTS`] short statements
+/// and no external I/O. This discharges `F-PR29-A1` and the `detect_voids`
+/// instance of `F-PR26`; `F-PR26` itself stays open for `routes/lineage.rs`.
 #[cfg(feature = "db")]
 pub async fn detect_voids(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -91,13 +114,27 @@ pub async fn detect_voids(
         message: "Embedding service not configured".into(),
     })?;
 
+    // Step 1 of `# Footprint`: nothing below runs for an out-of-bounds request.
+    validate_concepts(&request.concepts)?;
+
     let threshold = request.threshold.unwrap_or(0.70);
     let sparse_threshold = 0.50;
+
+    // Step 2: every outbound call happens HERE, before the acquire, so no
+    // connection is checked out while the provider (or its rate limiter) runs.
+    let probes: Vec<String> = embed_concepts(embedder.as_ref(), &request.concepts)
+        .await?
+        .iter()
+        .map(Vec::as_slice)
+        .map(format_embedding)
+        .collect();
 
     let mut voids = Vec::new();
     let mut sparse = Vec::new();
     let mut covered = Vec::new();
 
+    // Step 3: acquire only now.
+    //
     // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/claims_query.rs`).
     // `read_as`'s refusal reason is internal design prose aimed at whoever
     // mis-built the `AppState`; `errors.rs` serialises
@@ -115,14 +152,7 @@ pub async fn detect_voids(
         }
     })?;
 
-    for concept in &request.concepts {
-        let embedding = embedder
-            .generate(concept)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to embed concept '{concept}': {e}"),
-            })?;
-
+    for (concept, probe) in request.concepts.iter().zip(&probes) {
         // Find nearest VISIBLE claim. `min_similarity = NO_SIMILARITY_FLOOR`
         // reproduces the old unbounded `ORDER BY embedding <=> $1 LIMIT 1`:
         // cosine similarity is bounded below by -1, so the floor excludes
@@ -130,7 +160,7 @@ pub async fn detect_voids(
         let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
             &mut *read,
             &viewer,
-            &format_embedding(&embedding),
+            probe,
             NO_SIMILARITY_FLOOR,
             None,
             None,
@@ -201,8 +231,7 @@ pub async fn detect_voids(
 ///
 /// The acquire sits AFTER the outbound embedding call rather than at the top of
 /// the handler, so the connection is not held across the network round trip.
-/// This handler embeds exactly one string, unlike [`detect_voids`], so the
-/// hoist that handler needs is not needed here.
+/// [`detect_voids`] follows the same order for its whole batch.
 #[cfg(feature = "db")]
 pub async fn embedding_density(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -277,6 +306,120 @@ pub async fn embedding_density(
         "nearest_claim": nearest.map(|n| n.statement.chars().take(200).collect::<String>()),
         "nearest_similarity": nearest.map_or(0.0, |n| n.similarity),
     })))
+}
+
+// ── Request bounds ──
+
+/// The most concepts one `POST /api/v1/voids/detect` may carry.
+///
+/// This caps the only caller-controlled multiplier in the handler: the number
+/// of texts in its one embedding batch and the number of statements its one
+/// stamped handle runs. Before it existed the only limit was the router's
+/// `DefaultBodyLimit` (10 MB by default), room for roughly 10^5 short concepts,
+/// each a separate paid embedding call. 100 matches `routes/batch.rs`'s
+/// `MAX_BATCH_SIZE` and sits far under the 2048-text batch ceiling the OpenAI
+/// and Jina providers enforce, so a bounded request can never be refused by
+/// the provider for its size.
+#[cfg(feature = "db")]
+pub const MAX_DETECT_VOIDS_CONCEPTS: usize = 100;
+
+/// The longest single concept, in bytes.
+///
+/// A concept is a short phrase. The bound keeps the one batched provider call
+/// small: a BPE token covers at least one byte, so a concept of at most 512
+/// bytes is at most 512 tokens, which is within the smallest per-input
+/// `max_tokens` any `EmbeddingConfig` preset sets (`local`, 512). A bounded
+/// request therefore cannot fail the provider's own length check (which would
+/// otherwise surface as a 500) and totals at most
+/// `MAX_DETECT_VOIDS_CONCEPTS * 512` tokens.
+#[cfg(feature = "db")]
+pub const MAX_CONCEPT_BYTES: usize = 512;
+
+/// Reject a request whose concept list is out of bounds, before any embedding
+/// call or acquire.
+///
+/// A blank concept is refused here as a 400 rather than passed on: the
+/// providers refuse an empty text with `EmbeddingError::EmptyText`, which would
+/// otherwise reach the caller as a 500, and a whitespace-only concept has no
+/// meaning to measure coverage for.
+#[cfg(feature = "db")]
+fn validate_concepts(concepts: &[String]) -> Result<(), ApiError> {
+    if concepts.len() > MAX_DETECT_VOIDS_CONCEPTS {
+        return Err(ApiError::ValidationError {
+            field: "concepts".to_string(),
+            reason: format!(
+                "Too many concepts: {}, maximum is {MAX_DETECT_VOIDS_CONCEPTS}",
+                concepts.len()
+            ),
+        });
+    }
+    for (i, concept) in concepts.iter().enumerate() {
+        if concept.trim().is_empty() {
+            return Err(ApiError::ValidationError {
+                field: "concepts".to_string(),
+                reason: format!("Concept {i} is empty or whitespace-only"),
+            });
+        }
+        if concept.len() > MAX_CONCEPT_BYTES {
+            return Err(ApiError::ValidationError {
+                field: "concepts".to_string(),
+                reason: format!(
+                    "Concept {i} is too long: {} bytes, maximum is {MAX_CONCEPT_BYTES} bytes",
+                    concept.len()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Embed every concept in ONE provider call, with no connection checked out.
+///
+/// An empty list returns an empty result without calling the provider, because
+/// not every provider accepts an empty batch (Jina would send an API request
+/// with no input).
+///
+/// Both failure paths answer with an opaque message and log the detail. The
+/// per-concept loop this replaced rendered `"Failed to embed concept '<c>': <e>"`
+/// into the response body, where `errors.rs` serialises `InternalError`
+/// verbatim, which handed provider error text to the caller.
+#[cfg(feature = "db")]
+async fn embed_concepts(
+    embedder: &dyn epigraph_embeddings::EmbeddingService,
+    concepts: &[String],
+) -> Result<Vec<Vec<f32>>, ApiError> {
+    if concepts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let texts: Vec<&str> = concepts.iter().map(String::as_str).collect();
+    let embeddings = embedder.batch_generate(&texts).await.map_err(|e| {
+        tracing::error!(
+            error = %e,
+            handler = "detect_voids",
+            concepts = concepts.len(),
+            "could not embed the request's concepts"
+        );
+        ApiError::InternalError {
+            message: "Failed to embed concepts".to_string(),
+        }
+    })?;
+
+    // The zip in `detect_voids` pairs concept i with vector i. A provider that
+    // returned a different count would silently drop concepts from the
+    // response (or pair them with the wrong vector), so a mismatch is an
+    // error rather than something the zip is allowed to absorb.
+    if embeddings.len() != concepts.len() {
+        tracing::error!(
+            handler = "detect_voids",
+            expected = concepts.len(),
+            actual = embeddings.len(),
+            "embedding provider returned a batch of the wrong length"
+        );
+        return Err(ApiError::InternalError {
+            message: "Failed to embed concepts".to_string(),
+        });
+    }
+    Ok(embeddings)
 }
 
 // ── Internal helpers ──

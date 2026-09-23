@@ -48,7 +48,7 @@
 //! | `search.rs` | inline `full_sql` claim fetch | the same |
 //! | `search.rs` | `ClaimRepository::semantic_graph_neighbors` | the same |
 //! | `search.rs` | `ClaimRepository::semantic_search_flat` | [`the_flat_path_serves_the_viewers_own_group_private_claim`] and [`the_diverse_path_falls_through_to_flat_on_the_same_connection`] |
-//! | `voids.rs` | `ClaimRepository::semantic_search_flat` | [`detect_voids_covers_the_concept_the_viewer_can_actually_see`] |
+//! | `voids.rs` | `ClaimRepository::semantic_search_flat` | [`detect_voids_covers_the_concept_the_viewer_can_actually_see`] and [`detect_voids_holds_no_connection_while_it_embeds`] |
 //! | `voids.rs` | `ClaimRepository::embedding_density_stats` | [`embedding_density_separates_its_two_reads`] |
 //! | `voids.rs` | `ClaimRepository::semantic_search_flat` | the same |
 //! | `methods.rs` | `MethodRepository::get_evidence_strength` | [`method_evidence_counts_only_the_claims_the_viewer_can_see`] |
@@ -84,6 +84,18 @@
 //! between the two arms. It is a PLUMBING assertion, not a tenancy one, which is
 //! the honest thing to assert about a table that has no tenancy.
 //!
+//! # `detect_voids`'s FOOTPRINT, which is not a tenancy property
+//!
+//! `F-PR29-A1`: PR-29 held `detect_voids`'s stamped connection across one
+//! outbound embedding call per caller-supplied concept, with no bound on the
+//! count. The handler now bounds the request, embeds the whole batch with no
+//! connection checked out, and only then acquires. Three arms pin that:
+//! [`detect_voids_holds_no_connection_while_it_embeds`] (a one-connection
+//! stamped pool, probed from INSIDE the embedder),
+//! [`detect_voids_refuses_an_out_of_bounds_request_before_embedding`] and
+//! [`detect_voids_answers_a_provider_failure_opaquely`]. They sit here because
+//! [`split_state`] is the instrument they need.
+//!
 //! # What is still NOT proven here
 //!
 //! `ScopedPoolOptions` exposes no `after_connect`, so the SCOPED arm is still a
@@ -104,14 +116,22 @@ use epigraph_api::routes::search::{
     semantic_search, SemanticSearchRequest, SemanticSearchResponse,
 };
 use epigraph_api::routes::voids::{
-    detect_voids, embedding_density, DensityQuery, DetectVoidsRequest,
+    detect_voids, embedding_density, DensityQuery, DetectVoidsRequest, MAX_CONCEPT_BYTES,
+    MAX_DETECT_VOIDS_CONCEPTS,
 };
 use epigraph_api::state::{ApiConfig, AppState};
-use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode};
+use epigraph_embeddings::{
+    EmbeddingConfig, EmbeddingError, EmbeddingService, MockProvider, SimilarClaim, TokenUsage,
+};
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
-use viewer_fixture::{downgraded_pool, scoped_pool, seed_agent_with_group, seed_group_claim};
+use viewer_fixture::{
+    database_url_for, downgraded_pool, scoped_pool, seed_agent_with_group, seed_group_claim,
+};
 
 /// The dimension every seeded vector and every mock embedding in this file uses.
 ///
@@ -132,8 +152,14 @@ const DIM: usize = 1536;
 /// RLS policies filter, with no `epigraph.group_ids` to admit the viewer's own
 /// group, and loses the rows.
 async fn split_state(pool: &PgPool) -> AppState {
+    split_state_on(pool, scoped_pool(pool).await).await
+}
+
+/// [`split_state`] over a `ScopedPool` the caller built, for the arms that need
+/// the stamped pool's SIZE under their control (see
+/// [`detect_voids_holds_no_connection_while_it_embeds`]).
+async fn split_state_on(pool: &PgPool, scoped: ScopedPool) -> AppState {
     let raw = downgraded_pool(pool, "epigraph_app").await;
-    let scoped = scoped_pool(pool).await;
 
     let mut state = AppState::with_db(raw, ApiConfig::default());
     state.scoped = Some(scoped);
@@ -685,6 +711,405 @@ async fn embedding_density_separates_its_two_reads(pool: PgPool) {
         seeded, 2,
         "CALIBRATION: both claims must exist, or `claim_count == 1` is arithmetic \
          rather than suppression"
+    );
+}
+
+// ── voids.rs: detect_voids's footprint and bounds (F-PR29-A1) ──
+
+/// How long anything waits for a connection from the one-connection stamped
+/// pool before giving up.
+///
+/// It is the pool's `acquire_timeout`, so it bounds the embedder's probe AND
+/// the handler's own `read_as`. Long enough that a connection being returned
+/// through the `after_release` scrub (asynchronous in sqlx) is always back in
+/// time; short enough that the unfixed handler, which starves the probe once per
+/// concept, fails in seconds rather than at sqlx's 30s default.
+const PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// An embedder that asks, on EVERY call, whether another request could get a
+/// connection from the stamped pool right now.
+///
+/// Built over a `ScopedPool` of ONE connection, "could another request acquire"
+/// is exactly "is the handler holding its connection across this call". That
+/// is `F-PR29-A1` observed at the moment it happens, from inside the call it is
+/// about, with no timing assumption beyond [`PROBE_ACQUIRE_TIMEOUT`].
+///
+/// All three text entry points are counted, because a handler that moved from
+/// `generate` to `batch_generate` (or to `generate_query`) would otherwise
+/// escape a counter that watched only one of them. `MockProvider`'s own
+/// `batch_generate` calls its own `generate`, not this wrapper's, so one batch
+/// call counts once.
+struct ProbingEmbedder {
+    inner: Arc<MockProvider>,
+    /// The one-connection pool to probe. `None` makes this a plain counter.
+    probe_pool: Option<PgPool>,
+    /// Drop the last vector of every batch, to model a provider that returns
+    /// the wrong count.
+    short_batch: bool,
+    calls: AtomicUsize,
+    starved: AtomicUsize,
+}
+
+impl ProbingEmbedder {
+    fn counting(inner: Arc<MockProvider>) -> Self {
+        Self {
+            inner,
+            probe_pool: None,
+            short_batch: false,
+            calls: AtomicUsize::new(0),
+            starved: AtomicUsize::new(0),
+        }
+    }
+
+    fn probing(inner: Arc<MockProvider>, probe_pool: PgPool) -> Self {
+        Self {
+            probe_pool: Some(probe_pool),
+            ..Self::counting(inner)
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn starved(&self) -> usize {
+        self.starved.load(Ordering::SeqCst)
+    }
+
+    async fn record_call(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(pool) = &self.probe_pool {
+            if !another_request_can_acquire(pool).await {
+                self.starved.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Whether a connection can be checked out of `pool` within its
+/// `acquire_timeout`. The connection is released again immediately.
+async fn another_request_can_acquire(pool: &PgPool) -> bool {
+    pool.acquire().await.is_ok()
+}
+
+#[async_trait::async_trait]
+impl EmbeddingService for ProbingEmbedder {
+    async fn generate(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.record_call().await;
+        self.inner.generate(text).await
+    }
+
+    async fn generate_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.record_call().await;
+        self.inner.generate_query(text).await
+    }
+
+    async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.record_call().await;
+        let mut out = self.inner.batch_generate(texts).await?;
+        if self.short_batch {
+            out.pop();
+        }
+        Ok(out)
+    }
+
+    async fn store(&self, claim_id: Uuid, embedding: &[f32]) -> Result<(), EmbeddingError> {
+        self.inner.store(claim_id, embedding).await
+    }
+
+    async fn get(&self, claim_id: Uuid) -> Result<Vec<f32>, EmbeddingError> {
+        self.inner.get(claim_id).await
+    }
+
+    async fn similar(
+        &self,
+        embedding: &[f32],
+        k: usize,
+        min_similarity: f32,
+    ) -> Result<Vec<SimilarClaim>, EmbeddingError> {
+        self.inner.similar(embedding, k, min_similarity).await
+    }
+
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+
+    fn token_usage(&self) -> TokenUsage {
+        self.inner.token_usage()
+    }
+
+    fn reset_token_usage(&self) {
+        self.inner.reset_token_usage();
+    }
+
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        self.inner.health_check().await
+    }
+}
+
+async fn run_detect_voids(
+    pool: &PgPool,
+    state: AppState,
+    agent: Uuid,
+    concepts: Vec<String>,
+) -> Result<serde_json::Value, ApiError> {
+    let viewer = viewer_for(pool, agent).await;
+    detect_voids(
+        ViewerExtractor(viewer),
+        State(state),
+        axum::Json(DetectVoidsRequest {
+            concepts,
+            threshold: None,
+        }),
+    )
+    .await
+    .map(|j| j.0)
+}
+
+fn bucket_concepts(out: &serde_json::Value, bucket: &str) -> Vec<String> {
+    out[bucket]
+        .as_array()
+        .unwrap_or_else(|| panic!("{bucket} is an array; got {out}"))
+        .iter()
+        .map(|e| e["concept"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// THE HOLD ITSELF. With a stamped pool of ONE connection, every embedding call
+/// the handler makes asks whether another request could acquire right now.
+///
+/// PR-29's handler acquired above its concept loop and embedded inside it, so
+/// each of its per-concept calls found the only connection checked out and
+/// `starved` counted every one of them. Embedding before the acquire makes
+/// every probe succeed.
+///
+/// The request also carries TWO concepts, the covered one SECOND, so the same
+/// response pins that moving the embed out of the loop kept concept i paired
+/// with vector i: a zip that dropped or shifted a vector would put the wrong
+/// concept in `covered_concepts`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn detect_voids_holds_no_connection_while_it_embeds(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "svm-voids-footprint").await;
+
+    let mock = mock_embedder();
+    let unseen = "footprint: a concept no claim is seeded at";
+    let seen = "footprint: the concept the viewer's own claim covers";
+    let vec = probe(&mock, seen).await;
+    let mine = seed_group_claim(&pool, agent, group, "footprint: my claim").await;
+    set_embedding(&pool, mine, &vec).await;
+
+    let scoped = ScopedPool::connect_with_options(
+        &database_url_for(&pool).await,
+        SessionGucMode::Session,
+        ScopedPoolOptions {
+            max_connections: 1,
+            acquire_timeout: PROBE_ACQUIRE_TIMEOUT,
+            statement_timeout: None,
+        },
+    )
+    .await
+    .expect("one-connection ScopedPool");
+    let probe_pool = scoped.inner().clone();
+
+    // CALIBRATION: the probe must be able to SEE a held connection, or a zero
+    // `starved` below is the probe being blind rather than the handler being
+    // fixed.
+    {
+        let held = probe_pool
+            .acquire()
+            .await
+            .expect("take the pool's only connection");
+        assert!(
+            !another_request_can_acquire(&probe_pool).await,
+            "CALIBRATION: with the pool's only connection checked out, the probe must \
+             report that another request CANNOT acquire. If it can, the pool is not \
+             size 1 and the arm below cannot observe a hold"
+        );
+        drop(held);
+    }
+
+    let embedder = Arc::new(ProbingEmbedder::probing(mock, probe_pool));
+    let state = split_state_on(&pool, scoped)
+        .await
+        .with_embedding_service(embedder.clone());
+    let out = run_detect_voids(&pool, state, agent, vec![unseen.into(), seen.into()])
+        .await
+        .expect("detect_voids must serve on the one-connection stamped pool");
+
+    assert!(
+        embedder.calls() >= 1,
+        "CALIBRATION: the embedder must have been called, or `starved == 0` is \
+         vacuous; got {} calls",
+        embedder.calls()
+    );
+    assert_eq!(
+        embedder.starved(),
+        0,
+        "every embedding call must run with NO connection checked out. A non-zero \
+         count is the number of provider calls during which the handler held the \
+         pool's only connection, i.e. during which every other request on the pool \
+         would have waited (F-PR29-A1); {} of {} calls starved",
+        embedder.starved(),
+        embedder.calls()
+    );
+
+    assert_eq!(out["total_concepts"].as_u64(), Some(2), "got {out}");
+    assert_eq!(
+        bucket_concepts(&out, "covered_concepts"),
+        vec![seen.to_string()],
+        "the concept at the viewer's claim must be COVERED and the other must not. \
+         The wrong concept here means the batch's vectors were paired with the wrong \
+         concepts; got {out}"
+    );
+    // Not asserted as `void`: `MockProvider`'s vectors are not centred, so two
+    // unrelated strings score ~0.5 and may land in `sparse`. What matters for
+    // the pairing is that the other concept is NOT covered.
+    let uncovered = [
+        bucket_concepts(&out, "void_concepts"),
+        bucket_concepts(&out, "sparse_concepts"),
+    ]
+    .concat();
+    assert_eq!(
+        uncovered,
+        vec![unseen.to_string()],
+        "the concept away from the viewer's claim must be answered, and answered as \
+         NOT covered; got {out}"
+    );
+}
+
+/// THE BOUND. Every out-of-bounds shape is a 400 with NO embedding call made,
+/// and the largest in-bounds request is served with ONE.
+///
+/// Before the bound the only limit on `concepts` was the router's body limit,
+/// and every concept was its own embedding round trip.
+#[sqlx::test(migrations = "../../migrations")]
+async fn detect_voids_refuses_an_out_of_bounds_request_before_embedding(pool: PgPool) {
+    let (agent, _group) = seed_agent_with_group(&pool, "svm-voids-bounds").await;
+
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "one concept more than MAX_DETECT_VOIDS_CONCEPTS",
+            (0..=MAX_DETECT_VOIDS_CONCEPTS)
+                .map(|i| format!("bound concept {i}"))
+                .collect(),
+        ),
+        (
+            "a concept one byte longer than MAX_CONCEPT_BYTES",
+            vec!["ok".to_string(), "x".repeat(MAX_CONCEPT_BYTES + 1)],
+        ),
+        ("an empty concept", vec!["ok".to_string(), String::new()]),
+        (
+            "a whitespace-only concept",
+            vec!["ok".to_string(), " \t\n ".to_string()],
+        ),
+    ];
+
+    for (shape, concepts) in cases {
+        let embedder = Arc::new(ProbingEmbedder::counting(mock_embedder()));
+        let state = split_state(&pool)
+            .await
+            .with_embedding_service(embedder.clone());
+        let out = run_detect_voids(&pool, state, agent, concepts).await;
+        match out {
+            Err(ApiError::ValidationError { ref field, .. }) => assert_eq!(
+                field, "concepts",
+                "{shape}: the refusal must name the `concepts` field"
+            ),
+            other => panic!(
+                "{shape}: must be refused with a 400 ValidationError before any work; \
+                 got {other:?}"
+            ),
+        }
+        assert_eq!(
+            embedder.calls(),
+            0,
+            "{shape}: the refusal must come BEFORE the provider is called; a non-zero \
+             count is paid embedding work done for a request that was then refused"
+        );
+    }
+
+    // CALIBRATION, and the other half of the claim: the bound is inclusive, and
+    // a full-size request costs ONE provider call, not one per concept.
+    let mut concepts: Vec<String> = (0..MAX_DETECT_VOIDS_CONCEPTS)
+        .map(|i| format!("bound concept {i}"))
+        .collect();
+    concepts[0] = "y".repeat(MAX_CONCEPT_BYTES);
+    let embedder = Arc::new(ProbingEmbedder::counting(mock_embedder()));
+    let state = split_state(&pool)
+        .await
+        .with_embedding_service(embedder.clone());
+    let out = run_detect_voids(&pool, state, agent, concepts)
+        .await
+        .expect(
+            "exactly MAX_DETECT_VOIDS_CONCEPTS concepts, one of exactly MAX_CONCEPT_BYTES \
+             bytes, is IN bounds and must be served",
+        );
+    assert_eq!(
+        out["total_concepts"].as_u64(),
+        Some(MAX_DETECT_VOIDS_CONCEPTS as u64),
+        "got {out}"
+    );
+    assert_eq!(
+        embedder.calls(),
+        1,
+        "the whole request must be embedded in ONE provider call. {} calls means the \
+         handler is back to one round trip per concept",
+        embedder.calls()
+    );
+}
+
+/// A provider failure, and a provider that answers with the wrong number of
+/// vectors, are both an OPAQUE 500.
+///
+/// The per-concept loop this replaced answered a failed embed with
+/// `"Failed to embed concept '<c>': <provider error>"`, and `errors.rs`
+/// serialises `InternalError`'s message into the response body verbatim. A
+/// short batch has no pre-fix counterpart: it is the one new way the batched
+/// call can go wrong, and the zip that consumes it must not absorb it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn detect_voids_answers_a_provider_failure_opaquely(pool: PgPool) {
+    let (agent, _group) = seed_agent_with_group(&pool, "svm-voids-opaque").await;
+
+    let failing = Arc::new(MockProvider::new(EmbeddingConfig::openai(DIM)).with_failures(1.0));
+    // CALIBRATION: the provider really fails, and its error carries text of its own.
+    let provider_text = failing
+        .generate("calibration")
+        .await
+        .expect_err("CALIBRATION: failure_rate 1.0 must fail")
+        .to_string();
+    assert!(
+        provider_text.contains("Simulated"),
+        "CALIBRATION: the provider's own error text must be recognisable, or the \
+         leak assertion below cannot fail; got {provider_text:?}"
+    );
+
+    let state = split_state(&pool).await.with_embedding_service(failing);
+    let out = run_detect_voids(&pool, state, agent, vec!["opaque failure".into()]).await;
+    match out {
+        Err(ApiError::InternalError { ref message }) => assert!(
+            !message.contains("Simulated") && !message.contains("opaque failure"),
+            "the response must not carry the provider's error text or echo the \
+             concept; got {message:?}"
+        ),
+        other => panic!("a failing provider must be a 500; got {other:?}"),
+    }
+
+    let short = Arc::new(ProbingEmbedder {
+        short_batch: true,
+        ..ProbingEmbedder::counting(mock_embedder())
+    });
+    let state = split_state(&pool).await.with_embedding_service(short);
+    let out = run_detect_voids(
+        &pool,
+        state,
+        agent,
+        vec!["short batch one".into(), "short batch two".into()],
+    )
+    .await;
+    assert!(
+        matches!(out, Err(ApiError::InternalError { .. })),
+        "a batch with fewer vectors than concepts must be a 500, not a response that \
+         silently omits a concept; got {out:?}"
     );
 }
 
