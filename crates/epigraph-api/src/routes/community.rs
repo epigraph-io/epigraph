@@ -451,6 +451,12 @@ pub async fn add_member(
 /// - 403 Forbidden: missing `groups:admin`, or neither a live member nor the
 ///   perspective's owner
 /// - 404 Not Found: no such membership
+/// - 500: row-level security filters `group_memberships` on the pool this
+///   handler passes. `CommunityRepository::remove_member` refuses there rather
+///   than committing the `community_members` DELETE without the revocation. It
+///   cannot happen while the raw pool's role bypasses RLS, and from plan §9.2
+///   step 11d it is what an unconverted handler gets. That repo doc says what
+///   converting this handler must replace.
 #[cfg(feature = "db")]
 pub async fn remove_member(
     _scope: crate::middleware::bearer::RequireScopeGroupsAdmin,

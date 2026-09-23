@@ -847,6 +847,76 @@ async fn removing_the_last_member_does_not_reopen_bootstrap_to_a_stranger(pool: 
     assert!(!in_community(&pool, row.id, strangers).await);
 }
 
+/// Where row-level security filters `group_memberships`, `remove_member`
+/// refuses, and changes nothing.
+///
+/// Its rule reads the group's roster and writes one row of it. On a session RLS
+/// filters, both see only what the policy admits. The two tables then diverge:
+/// `community_members` has no policy and its DELETE commits, while the
+/// membership `UPDATE` quietly matches nothing, so the member leaves the
+/// community and keeps the group grant. The roster read also inverts: its
+/// `NOT EXISTS` bootstrap disjunct is TRUE over a roster it cannot see, which
+/// is the direction migration 092 section 5 warns about. The pool below is an
+/// UNSTAMPED `epigraph_app` session, which is what the route's raw pool becomes
+/// at plan section 9.2 step 11d.
+#[sqlx::test(migrations = "../../migrations")]
+async fn remove_member_refuses_where_rls_filters_the_roster(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
+    let row = CommunityRepository::create(&pool, "filtered", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let theirs = seed_perspective(&pool, Some(member), "theirs").await;
+    CommunityRepository::add_member(&pool, Some(creator), row.id, theirs)
+        .await
+        .expect("add member");
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let result = CommunityRepository::remove_member(&app, Some(member), row.id, theirs).await;
+
+    assert!(
+        result.is_err(),
+        "remove_member must refuse on a session whose roster read RLS filters; got {result:?}"
+    );
+    assert!(
+        in_community(&pool, row.id, theirs).await,
+        "the refusal must leave the community_members row"
+    );
+    assert_eq!(
+        live_membership(&pool, row.id, member).await,
+        1,
+        "and the projected membership, so the two tables still agree"
+    );
+}
+
+/// The refusal is about the roster read being incomplete, not about the role.
+/// A maintenance session is RLS-subject too, and `epigraph_bypass()` admits
+/// every row to it, so its roster read is complete and the removal proceeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn remove_member_proceeds_on_a_maintenance_session(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
+    let row = CommunityRepository::create(&pool, "maintained", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let theirs = seed_perspective(&pool, Some(member), "theirs").await;
+    CommunityRepository::add_member(&pool, Some(creator), row.id, theirs)
+        .await
+        .expect("add member");
+
+    // A fresh `#[sqlx::test]` database carries no table grants for the
+    // maintenance role; what is under test is the guard, not the grant.
+    fixture::grant_app_privileges(&pool, "epigraph_maintenance").await;
+    let maintenance = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let outcome = CommunityRepository::remove_member(&maintenance, Some(member), row.id, theirs)
+        .await
+        .expect("a bypass session reads the whole roster and may proceed");
+
+    assert_eq!(outcome, MembershipOutcome::Applied);
+    assert!(!in_community(&pool, row.id, theirs).await);
+    assert_eq!(live_membership(&pool, row.id, member).await, 0);
+}
+
 /// Two removals of one agent's two perspectives cannot BOTH skip the
 /// revocation.
 ///

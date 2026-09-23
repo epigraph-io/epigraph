@@ -516,8 +516,34 @@ impl CommunityRepository {
     /// to be, a member whose own revocation was in flight could pass the check
     /// on the pre-revocation roster and then evict someone.
     ///
+    /// # Refused where row-level security filters the roster
+    ///
+    /// Everything above reads `group_memberships` in full and writes one row of
+    /// it. On a session where RLS filters that table (any RLS-subject role
+    /// without `epigraph_bypass()`, stamped or not), the reads and the write
+    /// see only what the policy admits, and the function would go wrong in two
+    /// ways without an error. `community_members` has no policy, so its DELETE
+    /// commits while the membership `UPDATE` matches nothing: the member leaves
+    /// the community and keeps the group grant. And the bootstrap disjunct of
+    /// [`MAY_MANAGE_MEMBERSHIP_SQL`] is `NOT EXISTS` over a roster it cannot
+    /// see, so it admits (migration 092 section 5 names this direction). So the
+    /// function REFUSES with an error on such a session, before reading
+    /// anything.
+    ///
+    /// Today the route hands this a raw pool on a role RLS does not filter, and
+    /// the refusal never fires. It fires from plan section 9.2 step 11d on, if
+    /// the route has not been converted by then. Converting the route belongs to
+    /// `D-PR17-request-path-never-stamps-session-gucs`. Whoever converts it
+    /// must replace this refusal with a roster read that is complete under RLS
+    /// (092's `epigraph_group_roster_admits_principal` is that rule, bound to
+    /// the session principal). They must also decide how a `reader` leaves
+    /// under 077's `WITH CHECK`, which admits only a group admin or creator: a
+    /// definer function, or admin-only removal. Stamping the connection alone
+    /// does not fix this. It moves the wrong answer, it does not remove it.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any statement fails.
+    /// Returns `DbError::QueryFailed` if any statement fails, or if row-level
+    /// security filters `group_memberships` on this session (see above).
     #[instrument(skip(pool))]
     pub async fn remove_member(
         pool: &PgPool,
@@ -526,6 +552,29 @@ impl CommunityRepository {
         perspective_id: Uuid,
     ) -> Result<MembershipOutcome, DbError> {
         let mut tx = pool.begin().await?;
+
+        // Is the roster read complete on this session? `row_security_active`
+        // is false for a superuser, a BYPASSRLS role, or an owner of a table
+        // that is not FORCEd. `epigraph_bypass()` is the maintenance arm every
+        // policy on this table admits first. Either one means the reads below
+        // see every row. See the doc comment for why anything else is refused.
+        let roster_read_is_complete: bool = sqlx::query_scalar(
+            "SELECT NOT row_security_active('public.group_memberships') \
+                    OR public.epigraph_bypass()",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !roster_read_is_complete {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(
+                    "CommunityRepository::remove_member refused: row-level security filters \
+                     group_memberships on this session, so the roster this removal is decided \
+                     on and writes to is incomplete; the route must be converted before plan \
+                     9.2 step 11d (see the function's doc comment)"
+                        .into(),
+                ),
+            });
+        }
 
         // THE ROSTER LOCK, taken before anything is read. Same statement as
         // `GroupMembershipRepository::revoke_member_unless_last_admin` and

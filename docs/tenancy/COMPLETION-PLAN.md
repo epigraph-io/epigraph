@@ -291,6 +291,15 @@ defect, and it was fixed: `routes/audit.rs` reads through `AppState::read_as` an
 `closed_findings::F-PR18a-B1`. Copying it to the private record is still an operator step.
 Five remain.
 
+`F-PR20-B` is DISCHARGED (2026-09-23, fix/deferred-2026-09-22-lane-b, screen key
+`f-pr20-b`). It was re-derived and turned out to be real: the community removal path broke
+the group roster's invariants, and it was fixed. `CommunityRepository::remove_member` now
+retracts only `reader` rows. It decides under the group's roster lock. It refuses on a
+session where RLS filters `group_memberships`. The membership bootstrap opens only to a
+group that has never had a membership row. The re-derivation is in
+`closed_findings::F-PR20-B`. Copying it to the private record is still an operator step.
+Four remain.
+
 ---
 
 ## §6 — Decisions only the operator can make
