@@ -131,9 +131,36 @@ impl InstanceAdminRepository {
     /// failure and is mapped to `false`; see above.
     #[instrument(skip(pool))]
     pub async fn is_active(pool: &PgPool, agent_id: Uuid) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::is_active_conn(&mut conn, agent_id).await
+    }
+
+    /// [`Self::is_active`] on a caller-supplied connection.
+    ///
+    /// For a request handler that already holds a viewer-stamped connection
+    /// from `AppState::read_as` and must ask about its OWN principal on it.
+    /// `routes/audit.rs` does this to refuse a non-admin's filter on another
+    /// principal's events. On that connection the argument IS the session
+    /// principal, so 083's subject binding lets the function answer truthfully
+    /// in either posture: through the principal arm on an `epigraph_app`
+    /// session, and through the bypass arm on a superuser one.
+    ///
+    /// Passing any agent other than the connection's principal on an app-role
+    /// session gets `false`, for the reason [`Self::is_active`] gives. That is
+    /// the function refusing to act as a roster oracle, not a fault.
+    /// [`Self::is_active`] delegates here, so the statement is written once.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails. A NULL result is
+    /// `false`, as for [`Self::is_active`].
+    #[instrument(skip(conn))]
+    pub async fn is_active_conn(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
         let row: (Option<bool>,) = sqlx::query_as("SELECT public.epigraph_is_instance_admin($1)")
             .bind(agent_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
         Ok(row.0.unwrap_or(false))
     }

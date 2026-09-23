@@ -1026,6 +1026,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorisation decision rather than protect it.",
     ),
     (
+        "instance_admin.rs",
+        "is_active_conn",
+        "READ of one boolean through `epigraph_is_instance_admin(uuid)`, which is SECURITY \
+         DEFINER and never exposes an `instance_admins` row. The table has no `visibility` and \
+         no `owner_group_id`, and the question is an authority check on the caller's own \
+         principal, not a corpus read, so there is nothing for a Viewer to filter. 083 binds the \
+         function's subject to the session principal, so on a stamped app connection it cannot \
+         be used to probe the roster for another agent.",
+    ),
+    (
         "oauth_client.rs",
         "set_agent_id",
         "WRITE of one column, write-once. `oauth_clients` has no tenancy at all — neither \

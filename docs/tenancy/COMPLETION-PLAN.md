@@ -284,6 +284,13 @@ the redaction half without the recording half.
 **Do not size these alongside measured work.** Yield is unknown; one may be nothing and one
 may be a §3 item.
 
+`F-PR18a-B1` is DISCHARGED (2026-09-23, fix/deferred-2026-09-22-lane-b, screen key
+`f-pr18a-b1-audit-scoped-read`). It was re-derived, it turned out to be a real read-scoping
+defect, and it was fixed: `routes/audit.rs` reads through `AppState::read_as` and
+`SecurityEventRepository::query_for_principal_conn`. The re-derivation is in
+`closed_findings::F-PR18a-B1`. Copying it to the private record is still an operator step.
+Five remain.
+
 ---
 
 ## §6 — Decisions only the operator can make
