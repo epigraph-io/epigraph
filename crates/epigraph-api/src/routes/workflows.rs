@@ -114,7 +114,8 @@
 //! `{WRITABLE:c}`. Pinned by `tests/workflow_deprecate_test.rs` and
 //! `epigraph-db/tests/deprecate_flat_workflow.rs`. The MCP twin
 //! (`epigraph-mcp/src/tools/workflows.rs::deprecate_workflow`) is NOT changed
-//! here — see the closed entry in `docs/tenancy/progress.json`.
+//! here. It is the open finding `F-DEFERRED-0922-A1` in
+//! `docs/tenancy/progress.json`.
 //!
 //! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
 //! `("workflows.rs", 4)` and `ROUTE_LAYER_WRITES` still carries

@@ -6372,9 +6372,10 @@ impl ClaimRepository {
     /// `DELETE /api/v1/workflows/:id` no longer calls it: it uses
     /// `WorkflowRepository::deprecate_flat_workflow`, which carries
     /// `{WRITABLE:c}` (F-write-authz-reads-unfiltered). The remaining request
-    /// caller is the MCP `deprecate_workflow` tool. It has no per-id gate on its
-    /// root, and the policy for its cascade children is the open
-    /// `D-PR16-per-id-claim-oracles-write-half`.
+    /// caller is the MCP `deprecate_workflow` tool. Its root is the open finding
+    /// `F-DEFERRED-0922-A1`, and its cascade children are the open
+    /// `D-PR16-per-id-claim-oracles-write-half` (both in
+    /// `docs/tenancy/progress.json`).
     ///
     /// Uses the runtime `sqlx::query` (string) form — NOT the compile-time
     /// `query!` macro — to match the existing deprecation call-sites and to

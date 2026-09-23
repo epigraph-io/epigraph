@@ -899,6 +899,10 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
+    // Register (docs/tenancy/progress.json): this root is the open finding
+    // F-DEFERRED-0922-A1, and the cascade's handling of an unreadable child
+    // below is the open D-PR16-per-id-claim-oracles-write-half.
+    //
     // Deprecate the target workflow (A4: also set is_current = false).
     // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
     // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
