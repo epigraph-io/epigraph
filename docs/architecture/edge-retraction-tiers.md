@@ -1,7 +1,11 @@
 # Edge retraction: which reads hide a retracted edge
 
-**Status:** Normative. Every `edges` read belongs to exactly one of the three
-tiers below; a new read must pick one and follow its rule.
+**Status:** Normative for the reads it tables, and NOT YET EXHAUSTIVE. The
+intent is that every `edges` read belongs to exactly one of the three tiers
+below, and a new read must pick one and follow its rule. That is not true of
+the codebase yet: the reads under [Not yet classified](#not-yet-classified)
+have no tier and do not filter on `valid_to` today. Treat that list as open
+work, not as a fourth tier.
 **Related:** `EDGE_IN_FORCE` / `EDGE_IN_FORCE_UNALIASED`
 (`crates/epigraph-db/src/repos/edge.rs`), commits 4331efb6, 7e870b69, a6adf739.
 
@@ -107,11 +111,59 @@ retraction was not about (a6adf739, 7e870b69).
 | `ClaimRepository::list_undecomposed`, `latest_in_lineage`, `resolve_steps_to_heads_batched` | global exclusion probes over work queues / lineage heads |
 | PROV export (`epigraph-engine/src/export/prov.rs`) | provenance must keep every assertion. It does NOT yet mark a retracted relation (no `prov:invalidatedAtTime`); flagging rather than hiding is the right fix and is an open follow-up |
 
+## Not yet classified
+
+These `edges` reads have been assigned to NO tier and do not apply
+`EDGE_IN_FORCE`, so each one still returns (or counts, or walks through) a
+retracted edge. The "likely tier" column is a first reading, not a decision.
+Each entry needs one: filter it (belief-bearing / display), or record it under
+structural with its reason.
+
+The list was derived mechanically on the valid-to-display-tier branch: every
+function under `crates/*/src` whose body reads `FROM`/`JOIN edges` and has no
+`valid_to` filter, minus the ones tabled above and the write paths (dedup
+probes inside an `INSERT`, the retraction writers' own snapshots). Re-run that
+scan before relying on the list being complete.
+
+**Likely belief-bearing (highest priority).** These look like siblings of reads
+the belief tier already filters.
+
+| Read | Where | Why it looks belief-bearing |
+|---|---|---|
+| Sheaf claim-neighbour belief pairs | `SheafRepository::get_claim_neighbor_betp_pairs` (`repos/sheaf.rs`) | sibling of the filtered `get_epistemic_edge_pairs`; feeds sheaf consistency |
+| Conflict scan / silence check `CONTRADICTS` counts | `scan_conflicts`, `silence_check` (`epigraph-api/src/routes/conflicts.rs`) | the same frame silence alarm `belief.rs` computes in force |
+| Reasoning-engine edge load | `load_edges_from_db` (`epigraph-api/src/routes/reasoning.rs`) | feeds the reasoning endpoints the same way the G8 pre-screen's reads feed Ascent |
+
+**Likely display.**
+
+| Read | Where | Note |
+|---|---|---|
+| `POST /api/v1/graph/compose` neighbourhood walk | `extract_neighborhood` (`epigraph-api/src/routes/computation.rs`) | a recursive walk, so the follow-vs-return rule above applies. It also has no tenancy predicate |
+| Paragraph bridge graph | the `decomposes_to` reads in `build_from_bridges` (`epigraph-api/src/routes/clusters.rs`) | the `cluster_graph` job already treats `decomposes_to` classification as in-force |
+| Graph statistics | `StructuralRepository::{edge_counts, degrees, clustering_coefficients}` (`repos/structural.rs`) | "structural" names the statistics here, not this doc's tier |
+| Semantic-link reads | `SemanticLinkRepository::{get_by_id, get_by_source, get_by_target, get_between, get_by_type, list, count}` (`repos/semantic_link.rs`) | `SemanticLinkRepository::retract` is one of the retraction writers above, so a removed link is still listed by its own repository |
+| Evidence views | `get_evidence`, `build_evidence_chains` (`epigraph-api/src/routes/edges.rs`); `EvidenceRepository::{provided_for_claim_as_of, by_relationship_for_claim}` | |
+| `GET /api/v1/edges` (`list_edges`) and the other `EdgeRepository` reads `get_by_relationship`, `get_between` | `repos/edge.rs` | these SELECT `valid_to`, so a caller can see the retraction, but they do not hide it |
+
+**Undecided (attribution / provenance / analytics).**
+
+| Read | Where |
+|---|---|
+| Propagation genealogy and agent profiles | `PoliticalRepository::{get_claim_genealogy, get_agent_profile_claims, get_agent_evidence_distribution, get_agent_position_timeline, get_originated_claims_with_amplification, get_claim_techniques}` (`repos/political.rs`) |
+| Claim lineage walks | `LineageRepository` (`repos/lineage.rs`) — probably structural, on the same argument as workflow lineage, but not recorded as such |
+| Attribution | `EdgeRepository::{get_claims_attributed_to, count_claims_attributed_to, count_for_entity}` |
+| Grounding and evidence counts | `ClaimRepository::{grounded_neighborhood, count_all_evidence_for_claim, has_grounded_evidence}` |
+| Method, analysis, experiment, hypothesis | `MethodRepository` evidence reads, `AnalysisRepository`, `ExperimentRepository::count_completed_with_analysis`, `hypothesis_status` (`epigraph-api/src/routes/hypothesis.rs`) |
+| Match-candidate and behavioural reads | `MatchCandidateRepo::corroborates_edges_for_claim`, `behavioral_affinity_lineage`, `corpus_stats::tenant_counts` |
+| Operator CLIs | `crates/epigraph-cli/src/bin/*`, `bridge/components.rs`, `rerank/core.rs` |
+
 ## Enforcement
 
 * `crates/epigraph-db/tests/edge_in_force_lint.rs` — every `edges` read in a
   display-tier file or function spells `EDGE_IN_FORCE` for its own alias, once
-  per read; the spelling is derived from the constant, so it cannot drift.
+  per read; the spelling is derived from the constant, so it cannot drift. It
+  checks only the scopes it LISTS: it cannot notice a read that was never
+  classified (see above), so a new display read must be added to it by hand.
 * `crates/epigraph-db/tests/edge_retraction_display.rs` — behavioural: each
   `GraphViewRepository` projection, and the recall-side reads
   (`graph_expand_seeds`, `semantic_graph_neighbors`, `rag_hybrid_context`,
