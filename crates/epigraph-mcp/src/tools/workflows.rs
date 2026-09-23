@@ -984,24 +984,47 @@ pub async fn report_workflow_outcome(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    // The evidence row, on an author-stamped connection: `evidence` is tier-A
-    // with 077's strict WITH CHECK, so this INSERT is refused on the unstamped
-    // pool. It commits on its own for the reason
-    // `tools::claims::update_with_evidence` documents at length — migration 046
-    // gives `mass_functions.evidence_id` a FK to `evidence(id)` and the DS wiring
-    // below runs on a sibling connection, which cannot see an uncommitted row.
-    {
-        let mut tx = crate::claim_helper::begin_author_stamped_tx(
-            server,
-            agent_id,
-            "report_workflow_outcome",
-        )
-        .await?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
-    }
+    // ── THE EVIDENCE WRITE IS DELIBERATELY *NOT* STAMPED YET ────────────
+    //
+    // Same site, same argument and the same measurement as
+    // `tools::claims::update_with_evidence`, which was unstamped for this reason
+    // earlier in this branch. `evidence` is tier-A under migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on the
+    // unstamped pool this INSERT is refused on a cleanly-migrated schema — and
+    // that refusal is currently the tool's WHOLE outcome, because nothing has
+    // been written before it.
+    //
+    // Stamping it cannot make this tool whole, and the obstruction is structural:
+    // migration 046 gives `mass_functions.evidence_id` a FK to `evidence(id)`, and
+    // `ds_auto::auto_wire_ds_update` below runs on a SIBLING pool connection that
+    // cannot see an uncommitted row. So a stamped evidence INSERT is forced to
+    // COMMIT ON ITS OWN, and the DS wiring that follows is itself unconverted —
+    // it writes `claim_frames`, which carries no orphan `*_privacy` policy and is
+    // therefore refused on BOTH configurations.
+    //
+    // MEASURED with the real binary over a unix socket as `epigraph_app`
+    // (`rolbypassrls = false`), on a legacy flat workflow claim owned by the MCP
+    // server agent's own group — the only ownership shape this stamp could ever
+    // serve — via `scripts/e2e/probe-workflow.sh`:
+    //
+    //   CONFIG A, stamped:   `evidence_rows=1`, then
+    //                        `assign_claim: … row-level security policy for table
+    //                        "claim_frames"`.            ← committed orphan
+    //   CONFIG A, unstamped: `evidence_rows=0`, and
+    //                        `… policy for table "evidence"`. ← clean refusal
+    //   CONFIG B, either:    `evidence_rows=1`, then the same `claim_frames`
+    //                        failure.                     ← the stamp changes nothing
+    //
+    // So the stamp buys nothing on either configuration and, on the one this
+    // programme exists to make reachable, trades a clean refusal for a committed
+    // orphan. `Evidence::new` mints a fresh `EvidenceId` per call and
+    // `EvidenceRepository::create` has no `ON CONFLICT`, so each retry of a call
+    // that is CERTAIN to fail appends another row: a retry amplifier, not just a
+    // one-off orphan. Re-adding the stamp belongs in D2, which has to put
+    // evidence → BBA → truth_value into one unit anyway.
+    EvidenceRepository::create(&server.pool, &evidence)
+        .await
+        .map_err(internal_error)?;
 
     let before = claim.truth_value.value();
 
@@ -1024,8 +1047,16 @@ pub async fn report_workflow_outcome(
     .map_err(internal_error)?;
 
     // Derive truth_value from CDST pignistic probability. `UPDATE claims`, so
-    // stamped for the same reason as the evidence INSERT above; after the DS
-    // wiring necessarily, because the value comes from it.
+    // stamped — and this one STAYS stamped even though the evidence INSERT above
+    // did not. The asymmetry is the same one `update_with_evidence` records, and
+    // it is about position rather than preference: this is the tool's last HARD
+    // write, so a self-committing stamped unit here opens no orphan window —
+    // nothing after it can fail with it half-landed. What does follow is
+    // `BehavioralExecutionRepository::create`, which is warn-only and targets
+    // `behavioral_executions`: `relrowsecurity = f` with zero policies, so it is
+    // refused on neither configuration. That site is registered as a residual in
+    // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
+    // After the DS wiring necessarily, because the value comes from it.
     let after = TruthValue::clamped(ds.pignistic_prob);
     {
         let mut tx = crate::claim_helper::begin_author_stamped_tx(

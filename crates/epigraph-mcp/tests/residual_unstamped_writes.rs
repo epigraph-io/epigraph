@@ -258,6 +258,23 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/workflows.rs",
+        "EvidenceRepository::create",
+        1,
+        "`report_workflow_outcome`'s evidence INSERT, on the LEGACY FLAT path. Stamped in an \
+         earlier revision of this branch and DELIBERATELY REVERTED, for the reason and on the \
+         measurement that reverted `update_with_evidence`'s sibling INSERT two entries above: \
+         migration 046's FK from `mass_functions.evidence_id` forces it to commit alone, and \
+         `ds_auto` — which runs next on a sibling pool connection — writes `claim_frames`, a \
+         table with no orphan `*_privacy` policy and therefore refused on BOTH configurations. \
+         MEASURED as `epigraph_app` (`rolbypassrls = false`) via `scripts/e2e/probe-workflow.sh`, \
+         on a flat workflow claim in the server agent's OWN group: stamped leaves \
+         `evidence_rows=1` and then fails at `claim_frames`; unstamped leaves `evidence_rows=0` \
+         and fails at `evidence`; CONFIG B is `evidence_rows=1` either way. `Evidence::new` mints \
+         a fresh id and `create` has no `ON CONFLICT`, so the committed orphan also accumulates \
+         per retry. Converts with D2.",
+    ),
+    (
+        "tools/workflows.rs",
         "WorkflowRepository::set_goal_embedding",
         1,
         "`store_workflow`'s goal embedding. Same `relrowsecurity = false` argument as the two in \
