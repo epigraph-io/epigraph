@@ -12,6 +12,13 @@
 //! If `embedder.generate_query` fails (e.g. no API key), the function falls
 //! back to text search via `ClaimRepository::list`. This matches the existing
 //! MCP behaviour.
+//!
+//! # Filters
+//!
+//! The semantic leg returns `is_current` claims only and applies `min_truth`
+//! in SQL ahead of the ANN `LIMIT`, so the truth floor narrows the candidate
+//! pool rather than trimming an already-truncated page.
+//! `tests/recall_test.rs` pins it.
 
 use epigraph_core::ClaimId;
 use epigraph_db::{ClaimRepository, PgPool};
@@ -94,7 +101,23 @@ pub async fn recall(
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
         // downstream callers (episcience synthesis stage-1 seeding).
-        match ClaimRepository::search_by_embedding_current(pool, viewer, &pgvec, limit_i64).await {
+        //
+        // `min_truth` goes INTO the ANN statement, ahead of its LIMIT. Fetching
+        // `limit` hits and filtering afterwards returned a short or empty page
+        // whenever the nearest `limit` claims were low-truth, which is the same
+        // starvation by another route (`tests/recall_test.rs`,
+        // `semantic_leg_min_truth_does_not_starve_limit`).
+        match ClaimRepository::search_by_embedding_scoped_min_truth(
+            pool,
+            viewer,
+            &pgvec,
+            limit_i64,
+            None,
+            None,
+            Some(min_truth),
+        )
+        .await
+        {
             Ok(hits) => {
                 let mut results = Vec::new();
                 for hit in hits {
@@ -103,6 +126,9 @@ pub async fn recall(
                             .await
                     {
                         let tv = claim.truth_value.value();
+                        // Re-checked on the row just read: a belief recompute
+                        // between the ANN statement and this read can lower
+                        // the value the SQL floor saw.
                         if tv >= min_truth {
                             results.push(RecallResult {
                                 claim_id: hit.claim_id.to_string(),

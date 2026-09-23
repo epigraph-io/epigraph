@@ -2006,7 +2006,10 @@ impl ClaimRepository {
 
     /// Search **current** claims by embedding similarity across **all levels**.
     ///
-    /// This is the search backing the simple `recall` MCP tool. Unlike
+    /// This was the search backing the simple `recall` MCP tool. The library
+    /// `epigraph_engine::recall` now calls
+    /// [`Self::search_by_embedding_scoped_min_truth`] instead, so its truth
+    /// floor narrows the candidate pool before `LIMIT`. Unlike
     /// [`search_by_embedding`] — which is paper-paragraph-primary and
     /// restricts to `(properties->>'level')::int = 2` — memorized claims have
     /// no `level` property and store their vector on the 1536d
@@ -2036,6 +2039,10 @@ impl ClaimRepository {
     /// so the two compose with AND. Scoping at the DB keeps it correct and
     /// index-friendly rather than over-fetching and filtering in Rust.
     ///
+    /// Retained at its original arity as a delegating wrapper over
+    /// [`Self::search_by_embedding_scoped_min_truth`]; `None` = no truth
+    /// floor = today's behaviour.
+    ///
     /// # Errors
     /// Returns [`DbError::QueryFailed`] on database errors.
     #[instrument(skip(executor, viewer, query_embedding_pgvector))]
@@ -2047,6 +2054,49 @@ impl ClaimRepository {
         tags: Option<&[String]>,
         agent_id: Option<Uuid>,
     ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        Self::search_by_embedding_scoped_min_truth(
+            executor,
+            viewer,
+            query_embedding_pgvector,
+            limit,
+            tags,
+            agent_id,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::search_by_embedding_scoped`] plus an optional
+    /// `truth_value >= min_truth` floor.
+    ///
+    /// The floor sits in the same WHERE clause as the scope predicates, i.e.
+    /// before `ORDER BY … LIMIT`, so it narrows the candidate pool rather than
+    /// trimming an already-truncated top-K. A caller that fetched `limit` hits
+    /// and dropped the low-truth ones afterwards got a short or empty page
+    /// whenever the nearest `limit` claims were low-truth, even though
+    /// qualifying claims sat just past the cut — the library `recall` did
+    /// exactly that (`crates/epigraph-engine/tests/recall_test.rs`).
+    ///
+    /// What this does NOT guarantee: when the planner serves the statement
+    /// from `idx_claims_embedding_hnsw`, every predicate here — the floor, the
+    /// scope filters and the visibility fragment alike — filters the index's
+    /// `ef_search` candidate set, so a highly selective floor can still
+    /// under-fill a page on a large corpus unless `hnsw.iterative_scan` is on.
+    /// That is `docs/tenancy/FINAL-PLAN.md` §10.1 R1, shared with the
+    /// visibility predicate, not a property of this floor.
+    ///
+    /// # Errors
+    /// Returns [`DbError::QueryFailed`] on database errors.
+    #[instrument(skip(executor, viewer, query_embedding_pgvector))]
+    pub async fn search_by_embedding_scoped_min_truth<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        query_embedding_pgvector: &str,
+        limit: i64,
+        tags: Option<&[String]>,
+        agent_id: Option<Uuid>,
+        min_truth: Option<f64>,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
         // Empty tag slice scopes to nothing meaningful (`@> '{}'` is all rows);
         // collapse it to None so the IS NULL branch short-circuits.
         let tags_owned: Option<Vec<String>> = match tags {
@@ -2054,6 +2104,9 @@ impl ClaimRepository {
             _ => None,
         };
 
+        // `min_truth` is $5, so the group bind the splice emits moves to $6 and
+        // is bound LAST. Splicing at 5 would give $5 two types (float8 and
+        // uuid[]) and the statement would fail to prepare.
         let sql = viewer.splice(
             r#"
             SELECT c.id AS claim_id,
@@ -2063,17 +2116,19 @@ impl ClaimRepository {
               AND c.is_current
               AND ($3::text[] IS NULL OR c.labels @> $3::text[])
               AND ($4::uuid IS NULL OR c.agent_id = $4::uuid)
+              AND ($5::float8 IS NULL OR c.truth_value >= $5::float8)
               /* {VISIBILITY:c} */
             ORDER BY c.embedding <=> $1::vector
             LIMIT $2
             "#,
-            5,
+            6,
         );
         let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
             .bind(query_embedding_pgvector)
             .bind(limit)
             .bind(tags_owned)
-            .bind(agent_id);
+            .bind(agent_id)
+            .bind(min_truth);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

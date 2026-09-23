@@ -7,15 +7,38 @@
 //! `recall_claims_embedding_test.rs`) already do — but the suite itself was
 //! never written, so nothing pinned WHERE recall applies its filters.
 //!
+//! That turned out to matter. The semantic leg fetched exactly `limit` ANN
+//! candidates and only then dropped rows below `min_truth` in Rust, so a page
+//! whose nearest `limit` candidates were low-truth came back short, or empty,
+//! while qualifying claims sat just past the cut. That is the "seed recall
+//! returned no claims" starvation episcience synthesis has hit before.
+//!
 //! # What each test pins
 //!
 //! * `min_truth` excludes, on both legs.
-//! * The viewer's group bind reaches the semantic leg — a group member sees
-//!   their own private claim, a stranger does not. recall swallows an ANN
-//!   statement error into the text fallback, so a broken semantic statement
-//!   looks like a working recall; every semantic-leg test therefore also
-//!   asserts `similarity > 0`, which the fallback never produces.
+//! * `min_truth` narrows the semantic candidate pool BEFORE `LIMIT` —
+//!   `semantic_leg_min_truth_does_not_starve_limit`. It carries a calibration
+//!   assertion (the same query at `min_truth = 0.0`) proving the low-truth
+//!   decoys really are the top-`limit` candidates, so the test cannot pass
+//!   vacuously on a fixture where the qualifying claims happened to rank
+//!   first anyway.
+//! * The `min_truth` bind composes with the viewer's group bind — a group
+//!   member sees their own private claim through the semantic leg, a stranger
+//!   does not. A mis-numbered bind makes the ANN statement ERROR, and recall
+//!   swallows that error into the text fallback; every semantic-leg test
+//!   therefore also asserts `similarity > 0`, which the fallback never
+//!   produces.
 //! * Dispute annotation on both legs.
+//!
+//! # A limit of the starvation test
+//!
+//! On these tiny throwaway databases the ANN statement sees every row, so
+//! "filter before LIMIT" is exact. On a large corpus served by
+//! `idx_claims_embedding_hnsw` the predicate is a filter over the index's
+//! `ef_search` candidate set, and a highly selective `min_truth` can still
+//! under-fill without `hnsw.iterative_scan` — the same limitation the
+//! visibility predicate carries (`docs/tenancy/FINAL-PLAN.md` §10.1 R1).
+//! This test pins placement, not that.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -47,6 +70,25 @@ fn pgvec(v: &[f32]) -> String {
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    dot / (na * nb)
+}
+
+/// `q` pushed off-axis along basis vector `axis`: strictly less similar to `q`
+/// than `q` itself, and still well inside the neighbourhood.
+fn perturbed(q: &[f32], axis: usize) -> Vec<f32> {
+    let mut v = q.to_vec();
+    v[axis] += 0.6;
+    v
 }
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
@@ -183,9 +225,76 @@ async fn semantic_leg_drops_claims_below_min_truth(pool: PgPool) {
     );
 }
 
-/// The viewer's group bind reaches the semantic leg alongside `min_truth`: a
-/// member reads their own group-private claim, filtered by `min_truth`, and a
-/// stranger reads neither.
+/// `min_truth` must narrow the candidate pool BEFORE `LIMIT`, not trim an
+/// already-truncated top-`limit`.
+///
+/// Three low-truth decoys sit exactly on the query vector; two qualifying
+/// claims sit slightly off it. Filtering after a `limit = 2` fetch sees only
+/// decoys and returns nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_leg_min_truth_does_not_starve_limit(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let mock = embedder();
+    let query = "brindlewort catalysis pathway";
+    let qv = mock.generate_query(query).await.expect("embed");
+    let q = pgvec(&qv);
+    let far_a = perturbed(&qv, 0);
+    let far_b = perturbed(&qv, 1);
+    for far in [&far_a, &far_b] {
+        let c = cosine(&qv, far);
+        assert!(
+            c < 0.99 && c > 0.5,
+            "fixture geometry: a qualifying claim must be strictly further from \
+             the query than the decoys, yet still a neighbour; cosine was {c}"
+        );
+    }
+    let (far_a, far_b) = (pgvec(&far_a), pgvec(&far_b));
+    let agent = seed_agent(&pool).await;
+
+    let mut decoys = HashSet::new();
+    for i in 0..3 {
+        let content = format!("brindlewort decoy {i}");
+        decoys.insert(seed(&pool, agent, Seed::new(&content, 0.1).embedded(&q)).await);
+    }
+    let a = seed(
+        &pool,
+        agent,
+        Seed::new("brindlewort a", 0.9).embedded(&far_a),
+    )
+    .await;
+    let b = seed(
+        &pool,
+        agent,
+        Seed::new("brindlewort b", 0.9).embedded(&far_b),
+    )
+    .await;
+
+    // Calibration: with no truth floor, the top 2 are decoys. Without this the
+    // assertion below could pass on a fixture that never exercised placement.
+    let unfiltered = recall(&pool, &viewer, &mock, query, 2, 0.0)
+        .await
+        .expect("recall");
+    assert_semantic(&unfiltered);
+    assert!(
+        ids(&unfiltered).is_subset(&decoys) && unfiltered.len() == 2,
+        "calibration: the nearest 2 candidates must be decoys"
+    );
+
+    let results = recall(&pool, &viewer, &mock, query, 2, 0.5)
+        .await
+        .expect("recall");
+    assert_semantic(&results);
+    assert_eq!(
+        ids(&results),
+        HashSet::from([a, b]),
+        "min_truth must be applied before LIMIT: both qualifying claims exist \
+         within the neighbourhood, so a limit-2 page must hold both"
+    );
+}
+
+/// The `min_truth` bind must not displace the viewer's group bind: a member
+/// reads their own group-private claim through the semantic leg, filtered by
+/// `min_truth`, and a stranger reads neither.
 #[sqlx::test(migrations = "../../migrations")]
 async fn semantic_leg_min_truth_composes_with_group_visibility(pool: PgPool) {
     let mock = embedder();
