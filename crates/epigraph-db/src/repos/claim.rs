@@ -1,6 +1,7 @@
 //! Claim repository for database operations
 
 use crate::errors::DbError;
+use crate::repos::edge::EDGE_IN_FORCE;
 use chrono::{DateTime, Utc};
 use epigraph_core::{AgentId, Claim, ClaimId, TenancyDecl, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
@@ -1259,6 +1260,10 @@ impl ClaimRepository {
     /// join, so `WHERE` placement drops exactly the unreadable edge rows. Both
     /// markers render to the same `$3`, so the bind arity is unchanged.
     ///
+    /// `EDGE_IN_FORCE` sits beside them: a neighbour reached only through an
+    /// edge that was deleted (retracted) is not a graph neighbour. Display tier
+    /// of `docs/architecture/edge-retraction-tiers.md`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails, or
     /// `DbError::InvalidData` for an unrecognised `embedding_col`.
@@ -1294,6 +1299,7 @@ impl ClaimRepository {
                   AND e.source_type = 'claim' AND e.target_type = 'claim'
                   AND e.relationship IN ('CORROBORATES', 'supports', 'refines',
                                          'continues_argument', 'contradicts')
+                  AND {EDGE_IN_FORCE}
                   /* {{VISIBILITY:c}} */
                   /* {{EDGE_VISIBILITY:e}} */
                 ORDER BY c.{embedding_col} <=> $1::vector
@@ -1473,6 +1479,10 @@ impl ClaimRepository {
     /// the viewer cannot read is itself unreadable, and edges to endpoints that
     /// carry no tenancy (agents, frames, papers) keep counting as before.
     ///
+    /// The count is also over edges IN FORCE only: a deleted (retracted) edge
+    /// no longer raises a claim's degree, and so no longer moves its
+    /// `hybrid_score`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, query_embedding_pgvector))]
@@ -1503,6 +1513,7 @@ impl ClaimRepository {
                         SELECT COUNT(*)
                         FROM edges e
                         WHERE (e.source_id = c.id OR e.target_id = c.id)
+                          AND (e.valid_to IS NULL OR e.valid_to > now())
                           /* {EDGE_VISIBILITY:e} */
                     ), 0) as edge_count
                 FROM claims c, query_vec q
@@ -5379,7 +5390,7 @@ impl ClaimRepository {
     /// (`.clamp(1, 100)`, default 50). Depth-clamping alone does NOT bound
     /// the work: supports/corroborates/elaborates fan-out over up to 4 hops
     /// on a dense graph can reach thousands of claims, each costing one
-    /// sequential `EdgeRepository::get_by_source` round-trip inside a
+    /// sequential `EdgeRepository::get_by_source_in_force` round-trip inside a
     /// synchronous `recall_with_context` call. The caller's final
     /// `raw_hits.truncate(want)` bounds the OUTPUT size, not the work done
     /// to produce it — this cap bounds the work itself.
@@ -5395,7 +5406,7 @@ impl ClaimRepository {
     /// the call returns `[]`. Unwindowed, emitted == visited, so
     /// `MAX_EXPANSION_NODES` binds first and behaviour is bit-identical to
     /// before this budget existed. Windowed, the walk may cost up to
-    /// `MAX_EXPANSION_VISITS` sequential `get_by_source` round-trips — 5× the
+    /// `MAX_EXPANSION_VISITS` sequential `get_by_source_in_force` round-trips — 5× the
     /// old worst case, paid only on the path where the old bound produced
     /// wrong answers rather than slow ones.
     const MAX_EXPANSION_VISITS: usize = 1_000;
@@ -5404,7 +5415,8 @@ impl ClaimRepository {
     /// edges whose relationship is in [`EXPANSION_RELATIONSHIPS`].
     ///
     /// Mirrors what the `traverse` MCP tool does internally (BFS over
-    /// `EdgeRepository::get_by_source`, filtering relationship in Rust) rather
+    /// `EdgeRepository::get_by_source_in_force`, filtering relationship in
+    /// Rust — a retracted edge is neither followed nor emitted) rather
     /// than round-tripping through the MCP tool layer — `traverse` only
     /// supports a single relationship string and returns a serialized
     /// `CallToolResult`, neither of which fit a per-seed multi-relationship
@@ -5499,9 +5511,13 @@ impl ClaimRepository {
             let mut next_frontier = Vec::new();
             let mut level_new: Vec<Uuid> = Vec::new();
             'level: for &node in &frontier {
-                let outgoing =
-                    crate::repos::edge::EdgeRepository::get_by_source(pool, viewer, node, "claim")
-                        .await?;
+                // In force only: a deleted (retracted) supports/corroborates/
+                // elaborates edge must neither pull its target into recall nor
+                // bridge the walk to claims behind it.
+                let outgoing = crate::repos::edge::EdgeRepository::get_by_source_in_force(
+                    pool, viewer, node, "claim",
+                )
+                .await?;
                 for e in outgoing {
                     if !EXPANSION_RELATIONSHIPS.contains(&e.relationship.as_str()) {
                         continue;

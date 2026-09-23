@@ -289,3 +289,221 @@ async fn traverse_neither_returns_nor_follows_a_deleted_edge(pool: PgPool) {
     assert_eq!(flagged[0]["target_id"], b.to_string());
     assert!(flagged[0].get("valid_to").is_some());
 }
+
+// ── recall_with_context's batched context (fetch_batched_context) ───────────
+//
+// Every one of the fifteen `edges` aliases, with the same fixture shape
+// `tenant_isolation_mcp.rs` uses for the tenancy predicate — except that each
+// "hidden" relation is a RETRACTED edge between public claims rather than a
+// private one. An in-force sibling of each class is kept so the absence
+// assertions cannot pass on an empty context.
+
+async fn edge_of(
+    pool: &PgPool,
+    source: Uuid,
+    source_type: &str,
+    target: Uuid,
+    relationship: &str,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, 'claim', $4) RETURNING id",
+    )
+    .bind(source)
+    .bind(source_type)
+    .bind(target)
+    .bind(relationship)
+    .fetch_one(pool)
+    .await
+    .expect("insert edge")
+}
+
+async fn retracted_of(
+    pool: &PgPool,
+    source: Uuid,
+    source_type: &str,
+    target: Uuid,
+    relationship: &str,
+) {
+    let id = edge_of(pool, source, source_type, target, relationship).await;
+    let closed = epigraph_db::repos::edge::EdgeRepository::retract(pool, &[id])
+        .await
+        .expect("retract");
+    assert_eq!(closed, vec![id], "fixture: the edge must be retracted");
+}
+
+async fn leveled(pool: &PgPool, agent: Uuid, label: &str, level: Option<i32>) -> Uuid {
+    let id = fixture::seed_public_claim(pool, agent, label).await;
+    if let Some(l) = level {
+        sqlx::query(
+            "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) \
+                                            || jsonb_build_object('level', $2::int) \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(l)
+        .execute(pool)
+        .await
+        .expect("set level");
+    }
+    id
+}
+
+async fn paper(pool: &PgPool, doi: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'fixture') RETURNING id")
+        .bind(doi)
+        .fetch_one(pool)
+        .await
+        .expect("insert paper")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_context_omits_every_retracted_edge(pool: PgPool) {
+    use epigraph_mcp::tools::recall::__test_only::fetch_batched_context;
+
+    let (a, _g) = fixture::seed_agent_with_group(&pool, "recall-retraction").await;
+    let s = leveled(&pool, a, "section S", Some(1)).await;
+    let s2 = leveled(&pool, a, "section S2", Some(1)).await;
+    let p = leveled(&pool, a, "paragraph P", Some(2)).await;
+    let q = leveled(&pool, a, "paragraph Q", Some(2)).await;
+    let p2 = leveled(&pool, a, "sibling P2", Some(2)).await;
+    let p3 = leveled(&pool, a, "continuation P3", Some(2)).await;
+    let p4 = leveled(&pool, a, "continued-from P4", Some(2)).await;
+    let x = leveled(&pool, a, "other parent X", Some(2)).await;
+    let y = leveled(&pool, a, "atom-b parent Y", Some(2)).await;
+    let a0 = leveled(&pool, a, "atom A0", Some(3)).await;
+    let a1 = leveled(&pool, a, "atom A1", Some(3)).await;
+    let b0 = leveled(&pool, a, "atom B0", Some(3)).await;
+    let b1 = leveled(&pool, a, "atom B1", Some(3)).await;
+    let b2 = leveled(&pool, a, "atom B2", Some(3)).await;
+    let n1 = leveled(&pool, a, "corroborator N1", None).await;
+    let n2 = leveled(&pool, a, "contradicted N2", None).await;
+    let n3 = leveled(&pool, a, "corroborator N3", None).await;
+    let n4 = leveled(&pool, a, "corroborating-in N4", None).await;
+    let n5 = leveled(&pool, a, "refuting-in N5", None).await;
+
+    edge_of(&pool, s, "claim", p, "decomposes_to").await;
+    retracted_of(&pool, s, "claim", p2, "decomposes_to").await; // 6. sibling
+    retracted_of(&pool, s2, "claim", q, "decomposes_to").await; // 3. section parent
+    edge_of(&pool, p, "claim", a0, "decomposes_to").await;
+    retracted_of(&pool, p, "claim", a1, "decomposes_to").await; // 4. atom
+    retracted_of(&pool, x, "claim", a0, "decomposes_to").await; // 5. bridge
+    retracted_of(&pool, p, "claim", n1, "CORROBORATES").await; // 7. source arm
+    retracted_of(&pool, n4, "claim", p, "CORROBORATES").await; // 7. target arm
+    edge_of(&pool, p, "claim", n3, "CORROBORATES").await;
+    let paper_n3 = paper(&pool, "10.0/retracted-n3").await;
+    retracted_of(&pool, paper_n3, "paper", n3, "asserts").await; // 7. asserts_e
+    retracted_of(&pool, p, "claim", n2, "contradicts").await; // 7b. source arm
+    retracted_of(&pool, n5, "claim", p, "refutes").await; // 7b. target arm
+    retracted_of(&pool, p, "claim", p3, "continues_argument").await; // 8. source arm
+    retracted_of(&pool, p4, "claim", p, "continues_argument").await; // 8. target arm
+    retracted_of(&pool, a0, "claim", b0, "supports").await; // 9. forward
+    retracted_of(&pool, b2, "claim", a0, "supports").await; // 9. backward
+    edge_of(&pool, a0, "claim", b1, "supports").await;
+    retracted_of(&pool, y, "claim", b1, "decomposes_to").await; // 10. atom_b parent
+    let paper_p = paper(&pool, "10.0/retracted-p").await;
+    retracted_of(&pool, paper_p, "paper", p, "asserts").await; // 2. paper
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let ctx = fetch_batched_context(&pool, &viewer, &[p, q], 8, 8, 8)
+        .await
+        .expect("batched context");
+
+    let atoms = ctx.atoms_by_paragraph.get(&p).cloned().unwrap_or_default();
+    let corr = ctx
+        .corroborates_by_paragraph
+        .get(&p)
+        .cloned()
+        .unwrap_or_default();
+    let epi = ctx
+        .epistemic_edges_by_paragraph
+        .get(&p)
+        .cloned()
+        .unwrap_or_default();
+    let siblings = ctx
+        .siblings_by_paragraph
+        .get(&p)
+        .cloned()
+        .unwrap_or_default();
+    let cont = ctx
+        .continues_argument_by_paragraph
+        .get(&p)
+        .cloned()
+        .unwrap_or_default();
+    let links = ctx
+        .atom_atom_links_by_atom
+        .get(&a0)
+        .cloned()
+        .unwrap_or_default();
+    let b1_parents = ctx.paragraphs_by_atom.get(&b1).cloned().unwrap_or_default();
+    let a0_atom = atoms.iter().find(|z| z.atom_id == a0);
+
+    let shown: Vec<(&str, bool)> = vec![
+        ("3. section parent of Q", ctx.section_meta.contains_key(&q)),
+        ("4. atom A1 of P", atoms.iter().any(|z| z.atom_id == a1)),
+        (
+            "4. atoms_total of P counts A1",
+            ctx.atoms_total_by_paragraph.get(&p) == Some(&2),
+        ),
+        (
+            "5. bridge A0 -> X",
+            a0_atom.is_some_and(|z| z.bridge_to_paragraphs.contains(&x)),
+        ),
+        (
+            "6. sibling P2 of P",
+            siblings.iter().any(|z| z.paragraph_id == p2),
+        ),
+        (
+            "7. CORROBORATES P -> N1",
+            corr.iter().any(|z| z.claim_id == n1),
+        ),
+        (
+            "7. CORROBORATES N4 -> P",
+            corr.iter().any(|z| z.claim_id == n4),
+        ),
+        (
+            "7. paper_doi of N3 via asserts_e",
+            corr.iter()
+                .any(|z| z.claim_id == n3 && z.paper_doi.is_some()),
+        ),
+        (
+            "7b. contradicts P -> N2",
+            epi.iter().any(|z| z.claim_id == n2),
+        ),
+        ("7b. refutes N5 -> P", epi.iter().any(|z| z.claim_id == n5)),
+        ("8. continues_argument P -> P3", cont.contains(&p3)),
+        ("8. continues_argument P4 -> P", cont.contains(&p4)),
+        ("9. atom link A0 -> B0", links.iter().any(|(b, _)| *b == b0)),
+        ("9. atom link B2 -> A0", links.iter().any(|(b, _)| *b == b2)),
+        ("10. parent Y of B1", b1_parents.contains(&y)),
+        ("2. paper of P", ctx.paper_meta.contains_key(&p)),
+    ];
+    let resurrected: Vec<&str> = shown
+        .into_iter()
+        .filter_map(|(what, s)| s.then_some(what))
+        .collect();
+    assert!(
+        resurrected.is_empty(),
+        "each listed relation rests on a RETRACTED edge; recall context must show \
+         none of them. Shown: {resurrected:?}"
+    );
+
+    // The in-force relations beside them still arrive.
+    assert!(
+        corr.iter().any(|z| z.claim_id == n3),
+        "in-force N3 still corroborates P"
+    );
+    assert!(
+        links.iter().any(|(b, _)| *b == b1),
+        "in-force A0 -> B1 still links"
+    );
+    assert_eq!(
+        ctx.atoms_total_by_paragraph.get(&p),
+        Some(&1),
+        "P's atom total counts only its in-force child"
+    );
+    assert!(
+        ctx.section_meta.contains_key(&p),
+        "P's in-force section parent still resolves"
+    );
+}

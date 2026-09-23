@@ -66,6 +66,20 @@ const DISPLAY_TIER_FNS: &[(&str, &str)] = &[
     ),
     // GET /api/v1/graph/edges and /graph/full.
     ("crates/epigraph-db/src/repos/edge.rs", "list_all_in_force"),
+    // Search / RAG context: graph neighbours and the edge_count ranking input.
+    (
+        "crates/epigraph-db/src/repos/claim.rs",
+        "semantic_graph_neighbors",
+    ),
+    (
+        "crates/epigraph-db/src/repos/claim.rs",
+        "rag_hybrid_context",
+    ),
+    // recall_with_context's structural context (15 aliases).
+    (
+        "crates/epigraph-mcp/src/tools/recall.rs",
+        "fetch_batched_context",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -433,11 +447,6 @@ const UNFILTERED_ENDPOINT_READERS: &[(&str, &str, &str)] = &[
         "neighborhood_hop",
         "OPT-IN: the `?include_retracted=true` branch of GET \
          /api/v1/claims/:id/neighborhood; every returned edge carries its valid_to",
-    ),
-    (
-        "crates/epigraph-db/src/repos/claim.rs",
-        "graph_expand_seeds_since",
-        "PENDING: recall graph expansion, converted by a later commit in this series",
     ),
     (
         "crates/epigraph-engine/src/export/prov.rs",

@@ -1314,6 +1314,18 @@ pub struct BatchedContext {
 /// only consumer is the nullable `paper_doi` — a hidden attribution edge yields
 /// `paper_doi: None`, it cannot drop or add a neighbour.
 ///
+/// # Retracted edges are not context
+///
+/// Each of the fifteen aliases also carries the static spelling of
+/// `EDGE_IN_FORCE` — `AND (<alias>.valid_to IS NULL OR <alias>.valid_to >
+/// now())` — directly above its visibility term and in the same clause (so in
+/// the `ON` of `asserts_e`). Edge removal is a retraction, so without it a
+/// neighbour, sibling, section parent or paper attribution whose edge was
+/// deleted (MCP `delete_edge`, a `mark_duplicate` collapse) kept arriving as
+/// context. This is the display tier of
+/// `docs/architecture/edge-retraction-tiers.md`; `edge_in_force_lint.rs` pins
+/// the predicate per alias.
+///
 /// # A deliberate deviation, recorded
 ///
 /// The SQL stays in `crates/epigraph-mcp/src/tools/` rather than moving to
@@ -1392,6 +1404,7 @@ pub async fn fetch_batched_context(
               AND (c.properties->>'level')::int = 1
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
+              AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::bool OR e.visibility = 'public'
                    OR (e.owner_group_id = ANY($3::uuid[])
                        AND (e.co_owner_group_id IS NULL
@@ -1435,6 +1448,7 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 3
                   AND ($3::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($4::uuid[]))
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1488,6 +1502,7 @@ pub async fn fetch_batched_context(
                   AND e.relationship = 'decomposes_to'
                   AND ($2::bool OR cp.visibility = 'public'
                        OR cp.owner_group_id = ANY($3::uuid[]))
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($2::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($3::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1538,6 +1553,7 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 2
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($2::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($3::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1592,6 +1608,7 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship = 'CORROBORATES'
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1601,6 +1618,7 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship = 'CORROBORATES'
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1620,6 +1638,7 @@ pub async fn fetch_batched_context(
                   ON asserts_e.target_id = c.id
                   AND asserts_e.relationship = 'asserts'
                   AND asserts_e.source_type = 'paper'
+                  AND (asserts_e.valid_to IS NULL OR asserts_e.valid_to > now())
                   AND ($3::bool OR asserts_e.visibility = 'public'
                        OR (asserts_e.owner_group_id = ANY($4::uuid[])
                            AND (asserts_e.co_owner_group_id IS NULL
@@ -1692,6 +1711,7 @@ pub async fn fetch_batched_context(
                        e.relationship, 'outgoing' AS direction
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship = ANY($3)
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($4::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($5::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1701,6 +1721,7 @@ pub async fn fetch_batched_context(
                        e.relationship, 'incoming' AS direction
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship = ANY($3)
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($4::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($5::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1773,6 +1794,7 @@ pub async fn fetch_batched_context(
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
+              AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::bool OR e.visibility = 'public'
                    OR (e.owner_group_id = ANY($3::uuid[])
                        AND (e.co_owner_group_id IS NULL
@@ -1784,6 +1806,7 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
+              AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::bool OR e.visibility = 'public'
                    OR (e.owner_group_id = ANY($3::uuid[])
                        AND (e.co_owner_group_id IS NULL
@@ -1825,6 +1848,7 @@ pub async fn fetch_batched_context(
                       AND (cb.properties->>'level')::int = 3
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
+                      AND (e.valid_to IS NULL OR e.valid_to > now())
                       AND ($2::bool OR e.visibility = 'public'
                            OR (e.owner_group_id = ANY($3::uuid[])
                                AND (e.co_owner_group_id IS NULL
@@ -1841,6 +1865,7 @@ pub async fn fetch_batched_context(
                       AND (cb.properties->>'level')::int = 3
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
+                      AND (e.valid_to IS NULL OR e.valid_to > now())
                       AND ($2::bool OR e.visibility = 'public'
                            OR (e.owner_group_id = ANY($3::uuid[])
                                AND (e.co_owner_group_id IS NULL
@@ -1885,6 +1910,7 @@ pub async fn fetch_batched_context(
                   AND (c.properties->>'level')::int = 2
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($2::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($3::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -1972,6 +1998,7 @@ pub async fn fetch_batched_context(
               AND e.source_type = 'paper'
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
+              AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::bool OR e.visibility = 'public'
                    OR (e.owner_group_id = ANY($3::uuid[])
                        AND (e.co_owner_group_id IS NULL

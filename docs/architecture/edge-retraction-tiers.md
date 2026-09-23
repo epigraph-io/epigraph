@@ -65,6 +65,9 @@ compound and atomic halves disagree is worse than either.
 | MCP `get_neighborhood`, `traverse` | `EdgeRepository::get_by_{source,target}_in_force` via `crates/epigraph-mcp/src/tools/graph.rs` | `include_retracted: true` — rows flagged `retracted: true` with `valid_to`; `traverse` then also follows them |
 | `GET /api/v1/claims/:id/neighborhood` (multi-hop BFS) | `neighborhood_hop` in `crates/epigraph-api/src/routes/edges.rs` | `?include_retracted=true` — every edge already carries `valid_to` |
 | `GET /api/v1/graph/edges`, `GET /api/v1/graph/full` | `EdgeRepository::list_all_in_force` (renamed from `list_all`) | none |
+| `recall_with_context` graph expansion | `ClaimRepository::graph_expand_seeds_since` (in-force endpoint read) | none |
+| `recall_with_context` structural context (sections, atoms, siblings, CORROBORATES / epistemic neighbours, `continues_argument`, atom bridges, paper attribution) | all 15 `edges` aliases in `fetch_batched_context` (`crates/epigraph-mcp/src/tools/recall.rs`) | none |
+| Semantic-search graph neighbours; RAG `edge_count` (a ranking input) | `ClaimRepository::semantic_graph_neighbors`, `rag_hybrid_context` | none |
 
 The in-force endpoint reads are separate functions, not a flag on
 `get_by_source` / `get_by_target`, because those stay the structural read (see
@@ -99,7 +102,8 @@ retraction was not about (a6adf739, 7e870b69).
   reason, because the neighbourhood walks reach `edges` through those Rust
   calls rather than SQL text.
 * `crates/epigraph-mcp/tests/edge_retraction_display.rs` — `get_neighborhood`
-  and `traverse` after `delete_edge`, default and opt-in.
+  and `traverse` after `delete_edge`, default and opt-in; and every relation
+  of `fetch_batched_context` resting on a retracted edge.
 * `crates/epigraph-api/tests/edge_retraction_display_http.rs` — the claim
   neighbourhood, `graph/edges` and `graph/full` after the `DELETE` handler.
 * `crates/epigraph-db/tests/edge_retraction_enforcement.rs` — the belief tier.

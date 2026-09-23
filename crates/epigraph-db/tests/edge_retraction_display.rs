@@ -613,3 +613,121 @@ async fn in_force_endpoint_reads_drop_retracted_edges_and_keep_the_viewer_predic
         Vec::<Uuid>::new()
     );
 }
+
+// ── recall / search context (ClaimRepository) ───────────────────────────────
+
+/// A 1536-d pgvector literal with every component `v`.
+fn unit_ish(v: f32) -> String {
+    let body: Vec<String> = (0..1536).map(|_| v.to_string()).collect();
+    format!("[{}]", body.join(","))
+}
+
+/// recall_with_context's graph expansion. A deleted supports edge must neither
+/// emit its target nor bridge the walk to the claim behind it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_expand_seeds_neither_emits_nor_walks_a_retracted_edge(pool: PgPool) {
+    let w = world(&pool).await;
+    let ids = claims(&pool, w.agent, &["seed", "live", "gone", "behind gone"]).await;
+    let (seed, live, gone, behind) = (ids[0], ids[1], ids[2], ids[3]);
+    edge(&pool, seed, live, "supports").await;
+    let e = edge(&pool, seed, gone, "supports").await;
+    edge(&pool, gone, behind, "elaborates").await;
+
+    let reached = |hits: Vec<epigraph_db::GraphExpansionHit>| {
+        let mut v: Vec<Uuid> = hits.into_iter().map(|h| h.claim_id).collect();
+        v.sort();
+        v
+    };
+    let mut all = vec![live, gone, behind];
+    all.sort();
+    assert_eq!(
+        reached(
+            epigraph_db::ClaimRepository::graph_expand_seeds(&pool, &w.viewer, &[seed], 3)
+                .await
+                .expect("expand before")
+        ),
+        all,
+        "precondition: every claim is reached before the retraction"
+    );
+
+    EdgeRepository::retract(&pool, &[e]).await.expect("retract");
+    assert_eq!(
+        reached(
+            epigraph_db::ClaimRepository::graph_expand_seeds(&pool, &w.viewer, &[seed], 3)
+                .await
+                .expect("expand after")
+        ),
+        vec![live],
+        "`gone` was reached only through the retracted edge and `behind` only through `gone`"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_graph_neighbors_omit_a_retracted_edge(pool: PgPool) {
+    let w = world(&pool).await;
+    let ids = claims(
+        &pool,
+        w.agent,
+        &["seed S", "live N1", "gone N2", "gone-in N3"],
+    )
+    .await;
+    let (s, n1, n2, n3) = (ids[0], ids[1], ids[2], ids[3]);
+    let v = unit_ish(0.5);
+    for c in &ids {
+        fixture::set_claim_embedding(&pool, *c, &v).await;
+    }
+    edge(&pool, s, n1, "supports").await;
+    retracted(&pool, s, n2, "contradicts").await;
+    retracted(&pool, n3, s, "refines").await;
+
+    let got: Vec<Uuid> = epigraph_db::ClaimRepository::semantic_graph_neighbors(
+        &pool,
+        &w.viewer,
+        "embedding",
+        &v,
+        &[s],
+    )
+    .await
+    .expect("neighbours")
+    .into_iter()
+    .map(|r| r.neighbor_id)
+    .collect();
+    assert_eq!(
+        got,
+        vec![n1],
+        "only the in-force supports edge yields a neighbour; the retracted outbound \
+         `contradicts` and inbound `refines` do not"
+    );
+}
+
+/// Retracted edges on BOTH sides of the claim, so a predicate that bound to
+/// only one arm of `source_id = c.id OR target_id = c.id` would be caught.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rag_hybrid_context_edge_count_counts_only_in_force_edges(pool: PgPool) {
+    let w = world(&pool).await;
+    let ids = claims(&pool, w.agent, &["R", "A", "B", "C"]).await;
+    let (r, a, b, c) = (ids[0], ids[1], ids[2], ids[3]);
+    let v = unit_ish(0.5);
+    fixture::set_claim_embedding(&pool, r, &v).await;
+    sqlx::query("UPDATE claims SET truth_value = 0.9 WHERE id = $1")
+        .bind(r)
+        .execute(&pool)
+        .await
+        .expect("truth");
+    edge(&pool, r, a, "supports").await;
+    retracted(&pool, r, b, "contradicts").await; // source side
+    retracted(&pool, c, r, "refines").await; // target side
+
+    let count =
+        epigraph_db::ClaimRepository::rag_hybrid_context(&pool, &w.viewer, &v, 0.0, None, 10)
+            .await
+            .expect("rag")
+            .into_iter()
+            .find(|h| h.claim_id == r)
+            .map(|h| h.edge_count)
+            .expect("R is retrieved");
+    assert_eq!(
+        count, 1,
+        "R's degree counts its one in-force edge, not the two retracted ones"
+    );
+}
