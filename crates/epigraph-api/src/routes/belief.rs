@@ -1009,6 +1009,41 @@ async fn predict_contradiction(
 /// Pipeline: discount → store → retrieve all → combine → update claim → emit events → compute divergence
 ///
 /// `POST /api/v1/frames/:id/evidence`
+///
+/// # Attribution (review follow-up to `events-actor-id-binding`)
+///
+/// Every event this handler pushes into the in-process ring buffer
+/// (`contradiction.predicted`, `frame.incomplete`, `conflict.genuine`,
+/// `evidence.submitted`, `belief.updated`, `velocity.suspicious`,
+/// `conflict.detected`, `silence.suspicious`, `divergence.spike`) carries the
+/// **authenticated principal** as its `actor_id`. Before this change all nine
+/// pushed `request.agent_id`, an unchecked body field, although the handler
+/// already held the viewer. The db build's `GET /api/v1/events` merges that
+/// ring buffer into its response, and `retain_visible_events` filters on
+/// payload uuids, never on the actor. So any caller could file those events as
+/// any agent on a claim it can see, without even the `events_actor_id_fkey`
+/// bound the persisted table has. It was the forgery
+/// `D-PR25-event-actor-id-unbound` closed on `POST /api/v1/events`, MCP
+/// `publish_event` and `POST /api/v1/claims/:id/challenge`, through a fourth
+/// door. An omitted `agent_id` used to push unattributed events. They are now
+/// the caller's too.
+///
+/// **What this does NOT decide.** The mass function's `source_agent_id`, its
+/// `GENERATED_BY` edge and the competence discount all still read
+/// `request.agent_id`, and the `evidence.submitted` payload's `agent_id` field
+/// still reports it. Naming another agent as the evidence's source is still
+/// accepted. That is delegated authorship, the same question as
+/// `claims.agent_id` and `challenges.challenger_id`, and it is the open
+/// operator decision `D-PR16-claim-authorship-is-not-a-credential`. So on a
+/// delegated submission the events' actor (who made the request) and the
+/// payload's `agent_id` (who was named) disagree, which is the split
+/// `routes/challenge.rs::submit_challenge` makes.
+///
+/// No extractor changes. `ViewerExtractor` already 401s a request with no
+/// `AuthContext` or with a principal-less token, and it only ever builds a
+/// scoped viewer, so `viewer.principal()` is `Some` here by construction. The
+/// `None` arm is refused rather than pushed as an unattributed event, so a
+/// future extractor that could yield a bypass viewer fails closed.
 #[cfg(feature = "db")]
 pub async fn submit_evidence(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -1018,6 +1053,14 @@ pub async fn submit_evidence(
 ) -> Result<(StatusCode, Json<EvidenceSubmissionResponse>), ApiError> {
     use epigraph_ds::{combination, FrameOfDiscernment, MassFunction};
     use std::collections::BTreeSet;
+
+    // The actor of every event pushed below. Resolved before anything is
+    // written. See `# Attribution` above.
+    let Some(event_actor) = viewer.principal() else {
+        return Err(ApiError::Unauthorized {
+            reason: "evidence submission requires an authenticated principal".into(),
+        });
+    };
 
     let pool = &state.db_pool;
 
@@ -1208,7 +1251,7 @@ pub async fn submit_evidence(
         event_store
             .push(
                 "contradiction.predicted".to_string(),
-                request.agent_id,
+                Some(event_actor),
                 serde_json::json!({
                     "claim_id": request.claim_id,
                     "contradicting_claims": [
@@ -1384,7 +1427,7 @@ pub async fn submit_evidence(
             event_store
                 .push(
                     "frame.incomplete".to_string(),
-                    request.agent_id,
+                    Some(event_actor),
                     serde_json::json!({
                         "claim_id": request.claim_id,
                         "frame_id": frame_id,
@@ -1399,7 +1442,7 @@ pub async fn submit_evidence(
             event_store
                 .push(
                     "conflict.genuine".to_string(),
-                    request.agent_id,
+                    Some(event_actor),
                     serde_json::json!({
                         "claim_id": request.claim_id,
                         "frame_id": frame_id,
@@ -1795,7 +1838,7 @@ pub async fn submit_evidence(
     event_store
         .push(
             "evidence.submitted".to_string(),
-            request.agent_id,
+            Some(event_actor),
             serde_json::json!({
                 "mass_function_id": mf_id,
                 "claim_id": request.claim_id,
@@ -1811,7 +1854,7 @@ pub async fn submit_evidence(
     event_store
         .push(
             "belief.updated".to_string(),
-            request.agent_id,
+            Some(event_actor),
             serde_json::json!({
                 "claim_id": request.claim_id,
                 "frame_id": frame_id,
@@ -1871,7 +1914,7 @@ pub async fn submit_evidence(
                 event_store
                     .push(
                         "velocity.suspicious".to_string(),
-                        request.agent_id,
+                        Some(event_actor),
                         serde_json::json!({
                             "claim_id": request.claim_id,
                             "frame_id": frame_id,
@@ -1891,7 +1934,7 @@ pub async fn submit_evidence(
             event_store
                 .push(
                     "conflict.detected".to_string(),
-                    request.agent_id,
+                    Some(event_actor),
                     serde_json::json!({
                         "frame_id": frame_id,
                         "claim_id": request.claim_id,
@@ -1942,7 +1985,7 @@ pub async fn submit_evidence(
                 event_store
                     .push(
                         "silence.suspicious".to_string(),
-                        request.agent_id,
+                        Some(event_actor),
                         serde_json::json!({
                             "frame_id": frame_id,
                             "claim_id": request.claim_id,
@@ -1978,7 +2021,7 @@ pub async fn submit_evidence(
             event_store
                 .push(
                     "divergence.spike".to_string(),
-                    request.agent_id,
+                    Some(event_actor),
                     serde_json::json!({
                         "claim_id": request.claim_id,
                         "frame_id": frame_id,

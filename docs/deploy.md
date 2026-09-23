@@ -1134,19 +1134,21 @@ it is on every deployment today, a wrong owner has NO runtime symptom. That is
 why the `verify` run above is required and not optional: it is the only thing
 that finds the wrong owner before step 11d turns it into an outage.
 
-## Event attribution: `POST /api/v1/events`, MCP `publish_event` and `POST /api/v1/claims/:id/challenge` bind the event's actor to the caller
+## Event attribution: `POST /api/v1/events`, MCP `publish_event`, `POST /api/v1/claims/:id/challenge` and `POST /api/v1/frames/:id/evidence` bind the event's actor to the caller
 
 Deferred-commitment batch `fix/deferred-2026-09-22-lane-b`, screen key
 `events-actor-id-binding`. This is a code-only change. It ships no migration and
 takes effect when the binaries roll. The two write surfaces of the event log,
-and the challenge route that writes to it directly, now apply one rule: **the
-event's `actor_id` is the authenticated principal.** On the two event surfaces
-an omitted (or `null`) `actor_id` is filled from the principal, an `actor_id`
-equal to it is accepted, and any other value is refused before anything is
-written. Before this change all three persisted whatever actor they were sent
-(the challenge route used the body's `challenger_id`).
-`events_actor_id_fkey` only required that it name a real agent, so any caller
-could record an event as any existing agent.
+and the challenge and evidence routes that write to it directly, now apply one
+rule: **the event's `actor_id` is the authenticated principal.** On the two
+event surfaces an omitted (or `null`) `actor_id` is filled from the principal,
+an `actor_id` equal to it is accepted, and any other value is refused before
+anything is written. Before this change all four recorded whatever actor they
+were sent (the challenge route used the body's `challenger_id`, the evidence
+route the body's `agent_id`). `events_actor_id_fkey` only required that it name
+a real agent, and the in-process ring buffer the evidence route writes to has
+no such check at all, so any caller could record an event as any existing
+agent.
 
 **One writer of the event log is NOT covered, and operators reading
 `actor_id` should know it.** `claim.created` events are written by the claim
@@ -1206,6 +1208,35 @@ extractor and wrote its `claim.challenged` event with `actor_id` = the body's
 
 MCP `challenge_claim` is unchanged. It never took a caller-supplied actor: it
 files both the challenge and the event under the MCP server's own agent.
+
+### 1d. `POST /api/v1/frames/:id/evidence` files its events under the caller
+
+This route was found in the second review of the change above. It already took
+`ViewerExtractor`, but pushed its events into the in-process ring buffer that
+`GET /api/v1/events` merges into its response with `actor_id` = the body's
+`agent_id`. The events are `contradiction.predicted`, `frame.incomplete`,
+`conflict.genuine`, `evidence.submitted`, `belief.updated`,
+`velocity.suspicious`, `conflict.detected`, `silence.suspicious` and
+`divergence.spike`. Their `actor_id` is now the caller's own agent.
+
+* **Nothing new is refused, and this is not a breaking change for callers.**
+  The route already returned `401` for a missing token and for a token with no
+  `agent_id`. Naming another agent as the evidence's source is still accepted:
+  the mass function's `source_agent_id`, its `GENERATED_BY` edge and the
+  competence discount still use the body's `agent_id`, because whether a caller
+  may submit evidence on another agent's behalf is the open operator decision
+  `D-PR16-claim-authorship-is-not-a-credential`.
+* **What readers see differently.** A delegated submission's events used to
+  carry the named agent, and a submission without `agent_id` produced events
+  with `actor_id` = `null`. Both now carry the requesting principal.
+  **The affected reader** is anything that treated these events' `actor_id` as
+  the evidence's source agent. **Remedy:** read `evidence.submitted`'s payload
+  `agent_id`, which still reports the named source, or join on its
+  `mass_function_id`.
+
+These events live only in the process's ring buffer. They are not written to
+the `events` table, so they are absent from MCP `list_events` and lost on
+restart, as before.
 
 Rows written before this change are not rewritten. An event whose `actor_id` was
 forged, or left `NULL`, keeps it.
