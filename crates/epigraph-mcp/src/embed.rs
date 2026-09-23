@@ -14,7 +14,13 @@ pub struct McpEmbedder {
     api_key: Option<String>,
     pool: PgPool,
     http: reqwest::Client,
+    /// Where `generate` / `generate_at_dim` POST. [`OPENAI_EMBEDDINGS_URL`] from
+    /// every constructor; only [`McpEmbedder::with_endpoint`] changes it.
+    endpoint: String,
 }
+
+/// The provider endpoint every production `McpEmbedder` calls.
+pub const OPENAI_EMBEDDINGS_URL: &str = "https://api.openai.com/v1/embeddings";
 
 /// Whether an OpenAI API key string is unusable for embedding generation:
 /// absent, empty, or the literal `"mock"`. Mirrors the disabled-condition that
@@ -44,7 +50,25 @@ impl McpEmbedder {
             api_key,
             pool,
             http: reqwest::Client::new(),
+            endpoint: OPENAI_EMBEDDINGS_URL.to_string(),
         }
+    }
+
+    /// Point `generate` / `generate_at_dim` at a different OpenAI-compatible
+    /// embeddings endpoint.
+    ///
+    /// A TEST SEAM, hidden from the docs: nothing in `main` calls it, so the
+    /// shipped binary always talks to [`OPENAI_EMBEDDINGS_URL`]. It exists so an
+    /// integration test can stand a local stub in for the provider and drive
+    /// `backfill_embeddings`' generate→store path end to end — the half of that
+    /// tool which writes a row, and therefore the half a row-security
+    /// regression would silently turn into a no-op. The request and response
+    /// shapes are unchanged; only the URL moves.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
     }
 
     #[must_use]
@@ -81,6 +105,7 @@ impl McpEmbedder {
         let truncated = truncate_embedding_input(text);
         generate_openai_embedding_with_model(
             &self.http,
+            &self.endpoint,
             api_key,
             &truncated,
             "text-embedding-3-small",
@@ -103,7 +128,8 @@ impl McpEmbedder {
         // Truncate the embedding input to the model token limit (stored content
         // is untouched); see `generate` for the verbatim-spine rationale.
         let truncated = truncate_embedding_input(text);
-        generate_openai_embedding_with_model(&self.http, api_key, &truncated, model).await
+        generate_openai_embedding_with_model(&self.http, &self.endpoint, api_key, &truncated, model)
+            .await
     }
 
     /// Generate embedding and store it for a claim. Returns true if embedding succeeded.
@@ -345,12 +371,13 @@ pub fn format_pgvector(vec: &[f32]) -> String {
 
 async fn generate_openai_embedding_with_model(
     http: &reqwest::Client,
+    endpoint: &str,
     api_key: &str,
     text: &str,
     model: &str,
 ) -> Result<Vec<f32>, String> {
     let resp = http
-        .post("https://api.openai.com/v1/embeddings")
+        .post(endpoint)
         .header("Authorization", format!("Bearer {api_key}"))
         .json(&serde_json::json!({
             "model": model,
@@ -379,6 +406,43 @@ async fn generate_openai_embedding_with_model(
 #[cfg(test)]
 mod tests {
     use super::model_for_dim;
+
+    /// A pool that never connects: `McpEmbedder::new` needs one, and neither
+    /// test below touches the database.
+    fn unused_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
+            .expect("a lazy pool performs no I/O")
+    }
+
+    /// Every production constructor talks to OpenAI; only the test seam moves it.
+    #[tokio::test]
+    async fn the_default_endpoint_is_openai() {
+        let e = super::McpEmbedder::new(unused_pool(), None);
+        assert_eq!(e.endpoint, super::OPENAI_EMBEDDINGS_URL);
+    }
+
+    /// `with_endpoint` redirects `generate` and nothing else changes: same
+    /// request, same `data[0].embedding` parse.
+    #[tokio::test]
+    async fn with_endpoint_redirects_generate_to_the_given_url() {
+        use axum::{routing::post, Json, Router};
+        let app = Router::new().route(
+            "/v1/embeddings",
+            post(|| async { Json(serde_json::json!({ "data": [{ "embedding": [0.5, 0.25] }] })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let e = super::McpEmbedder::new(unused_pool(), Some("stub-key".into()))
+            .with_endpoint(format!("http://{addr}/v1/embeddings"));
+        assert_eq!(e.generate("anything").await, Ok(vec![0.5_f32, 0.25]));
+    }
 
     #[test]
     fn model_for_dim_picks_small_at_1536() {
