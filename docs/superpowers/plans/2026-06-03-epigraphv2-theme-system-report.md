@@ -11,7 +11,7 @@
 **Worktree:** `/home/jeremy/epigraph/.worktrees/theme-v2-report` on branch `feat/theme-v2-full-report` (off `origin/main` @ 169a85c). All paths below are relative to it. Run every command from this directory.
 
 **Conventions that bind this plan:**
-- Writes to clustering tables use the `epigraph_admin` role (no API endpoints exist for Model B), per repo CLAUDE.md. Default DSN `postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph`.
+- Writes to clustering tables use the `epigraph_admin` role (no API endpoints exist for Model B), per repo CLAUDE.md. Default DSN `postgres://epigraph_admin:PASS@localhost:5432/epigraph`.
 - Tests use `epigraph_db_repo_test` per CLAUDE.md (`postgres://epigraph:epigraph@localhost/epigraph_db_repo_test`).
 - Memory: heavy runs execute under `systemd-run --user --scope -p MemoryMax=2500M` so the job, never postgres, is the OOM victim (the trial run OOM-thrashed at the 1.6 GB cap; 2.5 GB is safe with ~3 GB free).
 - Commit messages follow the repo Epistemic Commit Protocol (type(scope): claim + Evidence/Reasoning/Verification). End with `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
@@ -198,7 +198,7 @@ import uuid
 import numpy as np
 import psycopg2
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
+DEFAULT_DATABASE_URL = "postgres://epigraph_admin:PASS@localhost:5432/epigraph"
 
 
 def connect(database_url=None):
@@ -1262,7 +1262,7 @@ Run:
 ```bash
 cd /home/jeremy/epigraph/.worktrees/theme-v2-report
 systemd-run --user --scope -p MemoryMax=2500M --quiet bash -c \
- "DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \
+ "DATABASE_URL=postgres://epigraph_admin:PASS@localhost:5432/epigraph \
   python3 -u scripts/theme_pipeline.py grow --dry-run --all-claims --batch-size 20000 \
   > /tmp/grow_dry.log 2>&1"
 tail -20 /tmp/grow_dry.log
@@ -1274,7 +1274,7 @@ Expected: base clustering runs, prints `[dry-run] would split clusters [...]` an
 Run (background) and watch with a Monitor that covers progress AND failure signatures (`Traceback|Killed|OOM|Error|grow stopped|grown`):
 ```bash
 systemd-run --user --scope -p MemoryMax=2500M --quiet bash -c \
- "DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \
+ "DATABASE_URL=postgres://epigraph_admin:PASS@localhost:5432/epigraph \
   python3 -u scripts/theme_pipeline.py grow --all-claims --batch-size 20000 --target-k 72 \
   > /tmp/grow_full.log 2>&1"
 ```

@@ -3,7 +3,7 @@
 //! Unlike `#[sqlx::test]` fixtures this test connects to the DATABASE_URL pool
 //! directly, so it works with a restricted user (no CREATE DATABASE needed).
 //! Run with:
-//!   DATABASE_URL=postgres://epigraph_dev:epigraph_dev@127.0.0.1:5432/epigraph \
+//!   DATABASE_URL=postgres://epigraph_dev:PASS@127.0.0.1:5432/epigraph \
 //!     cargo test -p epigraph-ingest-executor --test e2e_empty_content_guard
 
 use epigraph_ingest::common::schema::ThesisDerivation;

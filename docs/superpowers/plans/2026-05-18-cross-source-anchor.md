@@ -908,7 +908,7 @@ import psycopg2
 import psycopg2.extras
 
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph_admin:PASS@127.0.0.1:5432/epigraph"
 )
 
 PROMPT_TEMPLATE = """\
@@ -1127,7 +1127,7 @@ import psycopg2
 import psycopg2.extras
 
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph_admin:PASS@127.0.0.1:5432/epigraph"
 )
 
 LABEL_PROMPT = """\
@@ -1466,7 +1466,7 @@ import psycopg2
 import psycopg2.extras
 
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph_admin:PASS@127.0.0.1:5432/epigraph"
 )
 
 JUDGE_MODEL = "claude-haiku-4-5"  # informational only; the CLI picks the model
@@ -1847,7 +1847,7 @@ import sys
 import psycopg2
 
 DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
+    "postgres://epigraph_admin:PASS@127.0.0.1:5432/epigraph"
 )
 
 UPDATES = {

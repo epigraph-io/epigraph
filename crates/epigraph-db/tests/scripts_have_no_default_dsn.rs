@@ -210,22 +210,24 @@ fn every_script_that_connects_refuses_without_a_dsn() {
 /// than "there is nothing".
 #[test]
 fn the_credential_scanner_is_not_vacuous() {
+    // The shapes are the ones this tree actually carried; the passwords are
+    // invented, so the calibration does not re-publish the leaked ones.
     for (line, want) in [
         (
-            r#"DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph""#,
-            "epigraph_admin:epigraph_admin@",
+            r#"DEFAULT_DATABASE_URL = "postgres://some_admin:hunter2@localhost:5432/epigraph""#,
+            "some_admin:hunter2@",
         ),
         (
-            "    \"postgres://epigraph:epigraph@127.0.0.1:5432/epigraph\"",
-            "epigraph:epigraph@",
+            "    \"postgres://someone:hunter2@127.0.0.1:5432/epigraph\"",
+            "someone:hunter2@",
         ),
         (
-            "default='postgresql://epigraph_ro:epigraph_ro@db:5432'",
-            "epigraph_ro:epigraph_ro@",
+            "default='postgresql://some_ro:hunter2@db:5432'",
+            "some_ro:hunter2@",
         ),
         (
-            "#   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/<testdb> ./x.sh",
-            "epigraph:epigraph@",
+            "#   DATABASE_URL=postgres://someone:hunter2@localhost:5432/<testdb> ./x.sh",
+            "someone:hunter2@",
         ),
         (
             "psql postgres://u:s3cr3t@host/db -c 'select 1'",

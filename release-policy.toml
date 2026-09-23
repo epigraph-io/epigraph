@@ -8,7 +8,7 @@
 # rationale and evidence, then update this file in the same commit.
 #
 # Query gate status:
-#   psql postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph -c \
+#   psql postgres://epigraph_ro:PASS@localhost:5432/epigraph -c \
 #     "SELECT c.content, b.pignistic_prob FROM claims c
 #      JOIN belief_states b ON b.claim_id = c.id
 #      WHERE c.labels @> ARRAY['contract','repo-split']

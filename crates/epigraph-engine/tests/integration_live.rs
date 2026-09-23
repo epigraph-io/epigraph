@@ -1,6 +1,6 @@
 //! Live integration tests for the epistemic engine.
 //!
-//! Run: DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \
+//! Run: DATABASE_URL=postgres://epigraph_admin:PASS@localhost:5432/epigraph \
 //!      cargo test -p epigraph-engine --test integration_live -- --nocapture
 
 use sqlx::PgPool;
