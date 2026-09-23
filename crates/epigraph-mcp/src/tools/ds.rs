@@ -168,19 +168,8 @@ pub async fn submit_ds_evidence(
         }
     }
 
-    // Ensure claim-frame assignment exists
-    FrameRepository::assign_claim(
-        &server.pool,
-        claim_id,
-        frame_id,
-        Some(params.hypothesis_index),
-    )
-    .await
-    .map_err(internal_error)?;
-
     let agent_id = server.agent_id().await?;
 
-    // Store the BBA
     let masses_json = serde_json::to_value(
         mass_fn
             .masses()
@@ -190,13 +179,48 @@ pub async fn submit_ds_evidence(
     )
     .map_err(internal_error)?;
 
+    // ── THE TWO TIER-A WRITES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // `claim_frames` and `mass_functions` both carry migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` and neither
+    // has an orphan `*_privacy` policy to fall back on, so on the unstamped pool
+    // this tool was refused with `42501` on its FIRST write — MEASURED on both
+    // schema configurations, `new row violates row-level security policy for
+    // table "claim_frames"`. That is also why `mass_functions` stayed 0 through
+    // every e2e run.
+    //
+    // The two belong together: a `claim_frames` assignment with no BBA is a frame
+    // membership that moves no belief, and a BBA whose claim is not assigned to
+    // the frame is unreachable from `recompute_claim_belief_on_frame`'s own
+    // enumeration. Before this they were two pool checkouts and therefore two
+    // tenancy contexts.
+    //
+    // WHAT IS DELIBERATELY OUTSIDE IT: the recompute below. It is
+    // `epigraph_engine::edge_factor`'s pool-bound DS machinery, it READS these two
+    // rows back, and a sibling connection cannot see them before this transaction
+    // commits. Converting that machinery is the DS-wiring change, not this one —
+    // so on a clean schema this tool still fails there, after these rows land.
+    // That failure is SAFE TO RETRY, and that is the reason this half was worth
+    // converting on its own: `assign_claim` is `ON CONFLICT … DO UPDATE` and
+    // `store_with_perspective` upserts on
+    // `(claim_id, frame_id, source_agent_id, perspective_id)`, so a repeat call
+    // re-stores the same BBA instead of combining its mass twice, and
+    // `recompute_beliefs` can finish the job for a row already stored.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
+            .await?;
+
+    FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
+        .await
+        .map_err(internal_error)?;
+
     // source_strength stays NULL either way: the calibrated path derives
     // reliability dynamically from evidence_type at recompute time
     // (effective_source_strength), and the legacy path already baked the
     // raw `reliability` float into the pre-discounted masses above rather
     // than caching it here — unchanged from pre-change behavior.
     let mf_id = MassFunctionRepository::store_with_perspective(
-        &server.pool,
+        &mut *tx,
         claim_id,
         frame_id,
         Some(agent_id),
@@ -211,6 +235,8 @@ pub async fn submit_ds_evidence(
     )
     .await
     .map_err(internal_error)?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     // Count stored BBAs for the response (bba_count is informational only).
     let bba_count =

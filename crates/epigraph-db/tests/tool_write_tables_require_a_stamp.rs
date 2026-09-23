@@ -1,5 +1,6 @@
-//! The tables the loudly-refused MCP tools write — `challenges` (challenge_claim)
-//! — are tier-A, and on an UNSTAMPED application session their INSERT is refused.
+//! The tables the loudly-refused MCP tools write — `challenges`
+//! (challenge_claim), `claim_frames` and `mass_functions` (submit_ds_evidence) —
+//! are tier-A, and on an UNSTAMPED application session their INSERT is refused.
 //!
 //! # Why these arms exist separately from the tools
 //!
@@ -13,7 +14,7 @@
 //!
 //! # The group the stamp must carry is the CLAIM's, not the writer's
 //!
-//! `challenges` is claim-derived, so migration 074's
+//! All three tables are claim-derived, so migration 074's
 //! `epigraph_derived_require_tenancy` (BEFORE INSERT ROW) fills
 //! `(visibility, owner_group_id)` from the parent claim and 070 arm (c) re-stamps
 //! it unconditionally on AFTER INSERT STATEMENT. The `WITH CHECK` is therefore
@@ -25,7 +26,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::repos::ChallengeRepository;
+use epigraph_db::repos::{ChallengeRepository, FrameRepository, MassFunctionRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -219,4 +220,189 @@ async fn a_challenge_against_a_foreign_groups_claim_is_still_refused(pool: PgPoo
          derived-tenancy triggers changed and `challenge_claim`'s doc must be revisited: {out:?}"
     );
     assert_eq!(challenge_count(&pool, claim).await, 0);
+}
+
+// ===========================================================================
+// submit_ds_evidence's two tables: `claim_frames` and `mass_functions`.
+//
+// `mass_functions` is the one whose emptiness was the original symptom — its
+// last successful production write was 2026-09-22 and it stayed 0 through every
+// e2e run, which is why every `supports` / `refutes` edge created since the DSN
+// moved to `epigraph_app` has moved NO belief mass.
+// ===========================================================================
+
+/// A frame to hang the BBA on. `frames` is one of migration 077 §2b's four
+/// instance-wide registries, so it has a STATIC widening arm and is NOT part of
+/// what these arms measure — it is fixture, seeded on the superuser connection.
+async fn seed_frame(pool: &PgPool, name: &str) -> Uuid {
+    FrameRepository::create(
+        pool,
+        name,
+        Some("fixture frame for the stamped-write arms"),
+        &["true".to_string(), "false".to_string()],
+    )
+    .await
+    .expect("seed frame")
+    .id
+}
+
+async fn claim_frame_count(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count claim_frames")
+}
+
+async fn mass_function_count(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count mass_functions")
+}
+
+/// `submit_ds_evidence`'s FIRST write, refused on the unstamped session — the
+/// `42501` the tool returned verbatim on both schema configurations.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_frame_assignment_is_refused_on_an_unstamped_app_session(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "cf-unstamped").await;
+    let claim =
+        seed_author_owned_public_claim(&pool, author, author_group, "claim_frames gate: unstamped")
+            .await;
+    let frame = seed_frame(&pool, "cf-unstamped-frame").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", "").await;
+        let out = FrameRepository::assign_claim(&mut *conn, claim, frame, Some(0)).await;
+        (conn, out)
+    })
+    .await;
+
+    let msg = out
+        .expect_err("an unstamped app session must not be able to assign a claim to a frame")
+        .to_string();
+    assert!(
+        msg.contains("42501") || msg.to_lowercase().contains("row-level security"),
+        "the refusal must be the row-level security one: {msg}"
+    );
+    assert_eq!(claim_frame_count(&pool, claim).await, 0);
+}
+
+/// The converted shape: same role, same function, same row, GUCs stamped from a
+/// viewer that can write the claim's group. The ONLY difference is the stamp.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_frame_assignment_lands_when_the_session_carries_the_claims_group(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "cf-stamped").await;
+    let claim =
+        seed_author_owned_public_claim(&pool, author, author_group, "claim_frames gate: stamped")
+            .await;
+    let frame = seed_frame(&pool, "cf-stamped-frame").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(
+            &mut conn,
+            &author_group.to_string(),
+            &author_group.to_string(),
+            &author.to_string(),
+        )
+        .await;
+        let out = FrameRepository::assign_claim(&mut *conn, claim, frame, Some(0)).await;
+        (conn, out)
+    })
+    .await;
+
+    assert!(out.is_ok(), "stamped assign_claim must land: {out:?}");
+    assert_eq!(claim_frame_count(&pool, claim).await, 1);
+}
+
+/// `mass_functions` — the table that stayed 0 — refused on the unstamped session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mass_function_insert_is_refused_on_an_unstamped_app_session(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "mf-unstamped").await;
+    let claim = seed_author_owned_public_claim(
+        &pool,
+        author,
+        author_group,
+        "mass_functions gate: unstamped",
+    )
+    .await;
+    let frame = seed_frame(&pool, "mf-unstamped-frame").await;
+    assert_app_role_does_not_bypass(&pool).await;
+    let masses = serde_json::json!({"true": 0.6, "true,false": 0.4});
+
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", "").await;
+        let out = MassFunctionRepository::store_with_perspective(
+            &mut *conn,
+            claim,
+            frame,
+            Some(author),
+            None,
+            &masses,
+            None,
+            Some("Dempster"),
+            None,
+            None,
+            "unknown",
+            None,
+        )
+        .await;
+        (conn, out)
+    })
+    .await;
+
+    let msg = out
+        .expect_err("an unstamped app session must not be able to store a BBA")
+        .to_string();
+    assert!(
+        msg.contains("42501") || msg.to_lowercase().contains("row-level security"),
+        "the refusal must be the row-level security one: {msg}"
+    );
+    assert_eq!(mass_function_count(&pool, claim).await, 0);
+}
+
+/// The converted shape for `mass_functions`, and the calibration for the arm
+/// above: identical call, identical role, stamp added, row lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mass_function_insert_lands_when_the_session_carries_the_claims_group(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "mf-stamped").await;
+    let claim =
+        seed_author_owned_public_claim(&pool, author, author_group, "mass_functions gate: stamped")
+            .await;
+    let frame = seed_frame(&pool, "mf-stamped-frame").await;
+    assert_app_role_does_not_bypass(&pool).await;
+    let masses = serde_json::json!({"true": 0.6, "true,false": 0.4});
+
+    let out = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(
+            &mut conn,
+            &author_group.to_string(),
+            &author_group.to_string(),
+            &author.to_string(),
+        )
+        .await;
+        let out = MassFunctionRepository::store_with_perspective(
+            &mut *conn,
+            claim,
+            frame,
+            Some(author),
+            None,
+            &masses,
+            None,
+            Some("Dempster"),
+            None,
+            None,
+            "unknown",
+            None,
+        )
+        .await;
+        (conn, out)
+    })
+    .await;
+
+    assert!(out.is_ok(), "stamped BBA store must land: {out:?}");
+    assert_eq!(mass_function_count(&pool, claim).await, 1);
 }
