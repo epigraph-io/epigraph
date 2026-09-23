@@ -218,9 +218,35 @@ Current reservation:
   surfaced only on reading. Renumbered here rather than on main because it has
   never been applied to a deployed database — production is at 59.
 
-- **101+**: public next
+- **101**: public `null_retired_claim_embedding_3072` (deferred-commitment
+  batch `fix/deferred-2026-09-22-lane-b`, screen key `stale-embedding-sweeper`;
+  backlog 92eedc8b follow-up / 9217b3fb). Backfills `embedding_3072 = NULL` on
+  every retired claim, then adds `chk_deprecated_no_embedding_3072 CHECK
+  (is_current OR embedding_3072 IS NULL)`. This extends 052's invariant to the
+  second ANN column, which 052 had excused as "always NULL in practice" until
+  `epigraph-cli reembed` started filling it on retired claims. It replaces the
+  daily stale-embedding sweeper that the 2026-05-18 embedding-pipeline plan
+  asked for: a per-statement CHECK leaves no stale window, and it fails the
+  write that forgot the null instead of cleaning up after it.
+  **Callers ship first.** The commit before this file made all five retirement
+  UPDATEs in `ClaimRepository` null the column in the same statement, and made
+  `reembed` re-check `is_current` in its write. A binary older than that commit
+  fails with `23514` when it retires a claim that carries a 3072-d vector. Both
+  fail loud and write nothing, so migrate and restart together.
+  **Deploy precondition:** none beyond the runner seeing every row. The runner
+  is the superuser `epigraph`. A runner that row security filtered would fail
+  the ADD CONSTRAINT instead of recording success over a stale vector.
+  **No undo runbook ships**: reversing it is one
+  `ALTER TABLE claims DROP CONSTRAINT chk_deprecated_no_embedding_3072`, and the
+  nulled vectors belonged to retired claims, which must not carry one. Pinned by
+  `crates/epigraph-db/tests/retirement_nulls_embedding_3072.rs` (constraint
+  refusal in both directions, backfill-before-constrain re-applying the file
+  itself, and one test per retirement path). **Applied to the lane throwaway
+  database only, NOT to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `100` or
+- **102+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `102` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in
@@ -514,6 +540,7 @@ The following invariants MUST be maintained:
 3. **Hash lengths correct**: BLAKE3 = 32 bytes, Ed25519 keys = 32 bytes, Ed25519 sigs = 64 bytes
 4. **Signatures require signers**: `signature IS NOT NULL` implies `signer_id IS NOT NULL`
 5. **No self-referencing traces**: `trace_id != parent_id` in `trace_parents`
+6. **Retired claims carry no vector**: `is_current OR embedding IS NULL` (052) and `is_current OR embedding_3072 IS NULL` (101). Both CHECKs apply per statement, so a retirement must null both columns in the same UPDATE that sets `is_current = false`
 
 ### Test Queries
 
