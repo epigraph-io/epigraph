@@ -318,3 +318,84 @@ async fn claims_rs_refuses_without_auth() {
     )];
     assert_refused(router, &cases).await;
 }
+
+#[tokio::test]
+async fn crud_rs_refuses_without_auth() {
+    use routes::crud;
+    let router = Router::new()
+        .route("/api/v1/evidence", post(crud::create_evidence))
+        .route(
+            "/api/v1/reasoning-traces",
+            post(crud::create_reasoning_trace),
+        )
+        .route("/api/v1/analyses", post(crud::create_analysis))
+        .route(
+            "/api/v1/clusters/boundary-claims",
+            get(crud::get_boundary_claims),
+        )
+        .route(
+            "/api/v1/themes/split-candidates",
+            get(crud::get_split_candidates),
+        )
+        .route(
+            "/api/v1/themes/distant-claims",
+            get(crud::get_distant_claims),
+        )
+        .with_state(unreachable_state());
+    let cases = [
+        case(
+            "crud.rs::create_evidence",
+            Method::POST,
+            "/api/v1/evidence".into(),
+            Some(json!({
+                "agent_id": Uuid::new_v4(),
+                "claim_id": Uuid::new_v4(),
+                "raw_content": "r",
+                "evidence_type": "document",
+            })),
+        ),
+        case(
+            "crud.rs::create_reasoning_trace",
+            Method::POST,
+            "/api/v1/reasoning-traces".into(),
+            Some(json!({
+                "claim_id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "methodology": "deductive",
+                "confidence": 0.5,
+                "explanation": "e",
+            })),
+        ),
+        case(
+            "crud.rs::create_analysis",
+            Method::POST,
+            "/api/v1/analyses".into(),
+            Some(json!({
+                "analysis_type": "a",
+                "method_description": "m",
+                "inference_path": "i",
+                "agent_id": Uuid::new_v4(),
+                "input_evidence_ids": [],
+            })),
+        ),
+        viewer_case(
+            "crud.rs::get_boundary_claims",
+            Method::GET,
+            "/api/v1/clusters/boundary-claims".into(),
+            None,
+        ),
+        viewer_case(
+            "crud.rs::get_split_candidates",
+            Method::GET,
+            "/api/v1/themes/split-candidates".into(),
+            None,
+        ),
+        viewer_case(
+            "crud.rs::get_distant_claims",
+            Method::GET,
+            "/api/v1/themes/distant-claims".into(),
+            None,
+        ),
+    ];
+    assert_refused(router, &cases).await;
+}

@@ -333,14 +333,20 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // checks `claims:write` unconditionally. Its `ViewerExtractor` already
     // 401'd first, so this row was never reachable fail-open; it is converted so
     // the handler's correctness does not rest on that extractor staying put.
-    // 7 before PR-16/16b. `update_evidence` moved its `raw_content` UPDATE into
+    // `("crud.rs", 6)` REMOVED by the fail-open-scope-sites conversion. It was 7
+    // before PR-16/16b: `update_evidence` moved its `raw_content` UPDATE into
     // `EvidenceRepository::update_raw_content` behind the write-side predicate,
     // and took the prescribed
     // `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
-    // shape on the way. Its `record_provenance` block is a SEPARATE `if let`
-    // and is deliberately untouched — it is still counted, in the other
-    // register, where the count stays 4.
-    ("crud.rs", 6),
+    // shape on the way. The other six (`create_evidence`,
+    // `create_reasoning_trace`, `create_analysis`, `get_boundary_claims`,
+    // `get_split_candidates`, `get_distant_claims`) took the same shape later.
+    // `create_evidence`'s check is ANY-OF (`evidence:write` or
+    // `evidence:submit`) and stays an in-handler `has_scope` pair rather than a
+    // single-scope extractor, which would narrow which clients pass. The four
+    // `record_provenance` blocks are SEPARATE `if let`s, deliberately
+    // untouched — still counted, in the other register, where the count
+    // stays 4.
     ("edges.rs", 5),
     // `("papers.rs", 1)` REMOVED by the fail-open-scope-sites conversion:
     // `create_paper` refuses 401 without an `AuthContext` and checks
