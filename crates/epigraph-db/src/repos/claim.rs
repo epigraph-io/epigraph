@@ -5590,6 +5590,15 @@ impl ClaimRepository {
     /// calls this once per page over its (already small, ≤200) candidate
     /// pool, not once per claim.
     ///
+    /// Counts only IN-FORCE edges (display tier,
+    /// `docs/architecture/edge-retraction-tiers.md`). The degree is a ranking
+    /// input — `apply_graph_expansion`'s `similarity * (1 + 0.1 * degree)`
+    /// rerank — so a retracted edge (MCP `delete_edge`, `DELETE
+    /// /api/v1/edges/:id`) that still counted would keep lifting its target
+    /// in recall after the delete. The predicate is `EDGE_IN_FORCE_UNALIASED`
+    /// spelled statically because `sqlx::query!` needs a literal;
+    /// `tests/edge_in_force_lint.rs` pins the spelling to the constant.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
     #[instrument(skip(executor, viewer, claim_ids))]
@@ -5612,6 +5621,7 @@ impl ClaimRepository {
             WHERE target_id = ANY($1)
               AND source_type = 'claim' AND target_type = 'claim'
               AND relationship = ANY($2)
+              AND (valid_to IS NULL OR valid_to > now())
               AND ($3::bool OR visibility = 'public'
                    OR (owner_group_id = ANY($4::uuid[])
                        AND (co_owner_group_id IS NULL
@@ -5653,6 +5663,16 @@ impl ClaimRepository {
     /// deliberately NOT a join inside the ANN/RRF SQL, which would put the
     /// HNSW plan at risk for a signal that does not affect ranking.
     ///
+    /// Only IN-FORCE edges count (display tier,
+    /// `docs/architecture/edge-retraction-tiers.md`). A `contradicts` /
+    /// `refutes` edge removed with MCP `delete_edge` or `DELETE
+    /// /api/v1/edges/:id` is retracted, not deleted — the row stays with
+    /// `valid_to` set — so without the predicate recall kept reporting the
+    /// target `is_contested` and naming the removed edge's source as a
+    /// contester, and `exclude_contested` kept dropping it. The
+    /// `is_current` join above answers "the contester was superseded"; this
+    /// answers "the contesting EDGE was withdrawn", which is independent.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
     #[instrument(skip(executor, viewer, claim_ids))]
@@ -5675,6 +5695,7 @@ impl ClaimRepository {
             WHERE e.target_id = ANY($1)
               AND e.source_type = 'claim' AND e.target_type = 'claim'
               AND e.relationship IN ('contradicts', 'refutes')
+              AND (e.valid_to IS NULL OR e.valid_to > now())
               AND ($2::bool OR e.visibility = 'public'
                    OR (e.owner_group_id = ANY($3::uuid[])
                        AND (e.co_owner_group_id IS NULL
@@ -5708,8 +5729,8 @@ impl ClaimRepository {
 /// [`ClaimRepository::dispute_batch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimDispute {
-    /// Total number of `is_current` claims contesting this one via
-    /// `contradicts`/`refutes`. Uncapped.
+    /// Total number of `is_current` claims contesting this one via in-force
+    /// `contradicts`/`refutes` edges. Uncapped.
     pub dispute_count: i64,
     /// The three strongest contesters (by their own `truth_value` DESC).
     pub contesting_claim_ids: Vec<Uuid>,

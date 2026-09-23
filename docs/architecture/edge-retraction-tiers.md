@@ -73,6 +73,8 @@ compound and atomic halves disagree is worse than either.
 | `recall_with_context` graph expansion | `ClaimRepository::graph_expand_seeds_since` (in-force endpoint read) | none |
 | `recall_with_context` structural context (sections, atoms, siblings, CORROBORATES / epistemic neighbours, `continues_argument`, atom bridges, paper attribution) | all 15 `edges` aliases in `fetch_batched_context` (`crates/epigraph-mcp/src/tools/recall.rs`) | none |
 | Semantic-search graph neighbours; RAG `edge_count` (a ranking input) | `ClaimRepository::semantic_graph_neighbors`, `rag_hybrid_context` | none |
+| Recall dispute annotation — `is_contested`, `dispute_count`, `contesting_claim_ids`, and the `exclude_contested` filter — on MCP `recall`, `recall_with_context` and engine recall | `ClaimRepository::dispute_batch` | none |
+| `recall_with_context` graph rerank degree (`similarity * (1 + 0.1 * degree)`, a ranking input — `edge_count`'s twin) | `ClaimRepository::in_epistemic_degree_batch` | none |
 | Precomputed communities and per-theme neighborhoods (`graph_clusters`, `cluster_edges`, `graph_neighborhoods`, `neighborhood_edges`) | every `edges` read in `crates/epigraph-jobs/src/cluster_graph/{runner,neighborhood}.rs`, including the leaf (`decomposes_to`) classification | none |
 
 The `cluster_graph` rows change what the job computes, not only what is shown:
@@ -106,15 +108,19 @@ retraction was not about (a6adf739, 7e870b69).
   display-tier file or function spells `EDGE_IN_FORCE` for its own alias, once
   per read; the spelling is derived from the constant, so it cannot drift.
 * `crates/epigraph-db/tests/edge_retraction_display.rs` — behavioural: each
-  `GraphViewRepository` projection before/after a retraction, each with an
-  in-force sibling so no assertion passes on an empty result.
+  `GraphViewRepository` projection, and the recall-side reads
+  (`graph_expand_seeds`, `semantic_graph_neighbors`, `rag_hybrid_context`,
+  `dispute_batch`, `in_epistemic_degree_batch`), before/after a retraction,
+  each with an in-force sibling so no assertion passes on an empty result.
 * `edge_in_force_lint.rs` also pins the exact set of callers of the
   UNFILTERED `EdgeRepository::get_by_source` / `get_by_target`, each with its
   reason, because the neighbourhood walks reach `edges` through those Rust
   calls rather than SQL text.
 * `crates/epigraph-mcp/tests/edge_retraction_display.rs` — `get_neighborhood`
-  and `traverse` after `delete_edge`, default and opt-in; and every relation
-  of `fetch_batched_context` resting on a retracted edge.
+  and `traverse` after `delete_edge`, default and opt-in; every relation
+  of `fetch_batched_context` resting on a retracted edge; and `recall`'s
+  dispute annotation and `exclude_contested` after `delete_edge` on the only
+  `contradicts` edge (contested asserted first).
 * `crates/epigraph-api/tests/edge_retraction_display_http.rs` — the claim
   neighbourhood, `graph/edges` and `graph/full` after the `DELETE` handler.
 * `crates/epigraph-jobs/tests/cluster_graph_retraction_test.rs` — communities

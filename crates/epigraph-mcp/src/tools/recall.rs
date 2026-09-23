@@ -618,8 +618,9 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    for every expanded claim rather than tracking per-seed provenance.
 /// 4. Rerank the combined (seed ∪ expansion) set by
 ///    `similarity * (1 + 0.1 * in_epistemic_degree)`, where
-///    `in_epistemic_degree` is the claim's in-degree over the full
-///    `link_epistemic` allowlist ([`epigraph_db::EPISTEMIC_RELATIONSHIPS`] —
+///    `in_epistemic_degree` is the claim's in-degree over IN-FORCE edges of
+///    the full `link_epistemic` allowlist (a retracted edge — MCP
+///    `delete_edge` — no longer lifts its target) ([`epigraph_db::EPISTEMIC_RELATIONSHIPS`] —
 ///    all 7 types, not just the 3 traversal types: a claim's authority is a
 ///    function of everyone who has weighed in on it, including
 ///    `contradicts`/`refutes`, not only the reinforcing subset), computed in

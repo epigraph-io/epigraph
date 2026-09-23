@@ -731,3 +731,146 @@ async fn rag_hybrid_context_edge_count_counts_only_in_force_edges(pool: PgPool) 
         "R's degree counts its one in-force edge, not the two retracted ones"
     );
 }
+
+// ── Recall annotations and ranking inputs ──────────────────────────────────
+
+/// Recall's dispute annotation (`is_contested` / `dispute_count` /
+/// `contesting_claim_ids`, from `ClaimRepository::dispute_batch`). A deleted
+/// `contradicts` edge must stop marking its target contested AND stop naming
+/// its source as a contester — otherwise the delete looks like it failed.
+///
+/// `sole` is contested ONLY through the edge that gets retracted, so it must
+/// drop out of the map entirely; `shared` keeps an in-force `refutes`
+/// sibling, so its row must survive with the retracted contester removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dispute_batch_ignores_a_retracted_contradicts_edge(pool: PgPool) {
+    let w = world(&pool).await;
+    let ids = claims(
+        &pool,
+        w.agent,
+        &[
+            "sole",
+            "shared",
+            "gone contester",
+            "live contester",
+            "gone-2",
+        ],
+    )
+    .await;
+    let (sole, shared, gone_src, live_src, gone2_src) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+    let sole_edge = edge(&pool, gone_src, sole, "contradicts").await;
+    let shared_gone = edge(&pool, gone2_src, shared, "contradicts").await;
+    edge(&pool, live_src, shared, "refutes").await;
+
+    let sorted_ids = |mut v: Vec<Uuid>| {
+        v.sort();
+        v
+    };
+
+    let before = epigraph_db::ClaimRepository::dispute_batch(&pool, &w.viewer, &[sole, shared])
+        .await
+        .expect("dispute_batch before");
+    let sole_before = before
+        .get(&sole)
+        .expect("precondition: `sole` is contested before the retraction");
+    assert_eq!(sole_before.dispute_count, 1);
+    assert_eq!(sole_before.contesting_claim_ids, vec![gone_src]);
+    let shared_before = before
+        .get(&shared)
+        .expect("precondition: `shared` is contested before the retraction");
+    assert_eq!(shared_before.dispute_count, 2);
+    assert_eq!(
+        sorted_ids(shared_before.contesting_claim_ids.clone()),
+        sorted_ids(vec![gone2_src, live_src]),
+        "precondition: both contesters are named before the retraction"
+    );
+
+    let closed = EdgeRepository::retract(&pool, &[sole_edge, shared_gone])
+        .await
+        .expect("retract");
+    assert_eq!(
+        closed.len(),
+        2,
+        "fixture: both edges are actually retracted"
+    );
+
+    let after = epigraph_db::ClaimRepository::dispute_batch(&pool, &w.viewer, &[sole, shared])
+        .await
+        .expect("dispute_batch after");
+    assert!(
+        !after.contains_key(&sole),
+        "`sole` was contested only by the retracted edge and must read uncontested: {:?}",
+        after.get(&sole)
+    );
+    let shared_after = after
+        .get(&shared)
+        .expect("`shared` keeps its in-force refutes edge and stays contested");
+    assert_eq!(
+        shared_after.dispute_count, 1,
+        "only the in-force refutes edge counts"
+    );
+    assert_eq!(
+        shared_after.contesting_claim_ids,
+        vec![live_src],
+        "the source of the retracted edge is no longer named as a contester"
+    );
+}
+
+/// The in-epistemic degree behind `recall_with_context`'s graph rerank
+/// (`similarity * (1 + 0.1 * degree)`) — the ranking-input twin of
+/// `rag_hybrid_context`'s `edge_count`. A retracted edge stops lifting its
+/// target; a future-dated one is in force until then and still counts (which
+/// also guards the predicate against being simplified to `valid_to IS NULL`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn in_epistemic_degree_batch_counts_only_in_force_edges(pool: PgPool) {
+    let w = world(&pool).await;
+    let ids = claims(&pool, w.agent, &["T", "U", "A", "B", "C", "D", "E"]).await;
+    let (t, u, a, b, c, d, e) = (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6]);
+    edge(&pool, a, t, "supports").await;
+    let t_gone_1 = edge(&pool, b, t, "contradicts").await;
+    let t_gone_2 = edge(&pool, c, t, "corroborates").await;
+    let until_next_year = edge(&pool, d, t, "elaborates").await;
+    sqlx::query("UPDATE edges SET valid_to = now() + interval '1 year' WHERE id = $1")
+        .bind(until_next_year)
+        .execute(&pool)
+        .await
+        .expect("future-date");
+    let u_gone = edge(&pool, e, u, "refutes").await;
+
+    let before = epigraph_db::ClaimRepository::in_epistemic_degree_batch(&pool, &w.viewer, &[t, u])
+        .await
+        .expect("degree before");
+    assert_eq!(
+        before.get(&t).copied(),
+        Some(4),
+        "precondition: T's four incoming epistemic edges all count before the retraction"
+    );
+    assert_eq!(
+        before.get(&u).copied(),
+        Some(1),
+        "precondition: U's one incoming edge counts before the retraction"
+    );
+
+    let closed = EdgeRepository::retract(&pool, &[t_gone_1, t_gone_2, u_gone])
+        .await
+        .expect("retract");
+    assert_eq!(
+        closed.len(),
+        3,
+        "fixture: all three edges are actually retracted"
+    );
+
+    let after = epigraph_db::ClaimRepository::in_epistemic_degree_batch(&pool, &w.viewer, &[t, u])
+        .await
+        .expect("degree after");
+    assert_eq!(
+        after.get(&t).copied(),
+        Some(2),
+        "T counts the in-force supports edge and the future-dated elaborates edge only"
+    );
+    assert!(
+        !after.contains_key(&u),
+        "U's only incoming edge was retracted, so it has degree 0 (absent key): {:?}",
+        after.get(&u)
+    );
+}

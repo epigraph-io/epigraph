@@ -19,7 +19,8 @@ mod fixture;
 use common::{build_test_server, first_text};
 use epigraph_mcp::tools::edge_mutation::do_delete_edge;
 use epigraph_mcp::tools::graph::{get_neighborhood, traverse};
-use epigraph_mcp::types::{DeleteEdgeParams, GetNeighborhoodParams, TraverseParams};
+use epigraph_mcp::tools::memory::recall;
+use epigraph_mcp::types::{DeleteEdgeParams, GetNeighborhoodParams, RecallParams, TraverseParams};
 use epigraph_mcp::EpiGraphMcpFull;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -505,5 +506,105 @@ async fn recall_context_omits_every_retracted_edge(pool: PgPool) {
     assert!(
         ctx.section_meta.contains_key(&p),
         "P's in-force section parent still resolves"
+    );
+}
+
+// ── recall's dispute annotation (ClaimRepository::dispute_batch) ────────────
+
+fn recall_params(query: &str, exclude_contested: bool) -> RecallParams {
+    RecallParams {
+        query: query.to_string(),
+        min_truth: Some(0.0),
+        limit: Some(10),
+        tags: vec![],
+        agent_id: None,
+        frame_id: None,
+        perspective_id: None,
+        include_workflows: false,
+        exclude_contested,
+        since: None,
+    }
+}
+
+/// The recall row for `claim`, if the page returned it.
+fn recall_row(resp: &serde_json::Value, claim: Uuid) -> Option<serde_json::Value> {
+    resp["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .find(|r| r["claim_id"] == claim.to_string())
+        .cloned()
+}
+
+/// `recall` annotates a hit `is_contested` / `dispute_count` /
+/// `contesting_claim_ids` from `dispute_batch`, and `exclude_contested` drops
+/// it. After `delete_edge` on the only `contradicts` edge against the target,
+/// recall must read it as uncontested — the annotation fields omitted exactly
+/// as for a never-contested hit, the removed edge's source no longer named,
+/// and `exclude_contested` no longer dropping it. Before the in-force predicate
+/// reached `dispute_batch`, all three kept reporting the deleted edge.
+///
+/// Lexical leg (mock embedder), as in `recall_dispute_awareness.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_reads_a_claim_uncontested_after_delete_edge(pool: PgPool) {
+    let server = build_test_server(pool.clone());
+    let (agent, _g) = fixture::seed_agent_with_group(&pool, "recall-dispute-retraction").await;
+    let target =
+        fixture::seed_public_claim(&pool, agent, "zelphorine lattice stability claim").await;
+    let contester =
+        fixture::seed_public_claim(&pool, agent, "zelphorine lattice stability rebuttal").await;
+    let contradicts = edge(&pool, contester, target, "contradicts").await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let query = "zelphorine lattice stability";
+
+    let before = first_text(
+        &recall(&server, &viewer, recall_params(query, false))
+            .await
+            .expect("recall before"),
+    );
+    let row = recall_row(&before, target).expect("precondition: the target is recalled");
+    assert_eq!(
+        row["is_contested"],
+        serde_json::json!(true),
+        "precondition: the target is contested before the delete: {row}"
+    );
+    assert_eq!(row["dispute_count"], serde_json::json!(1));
+    assert_eq!(
+        row["contesting_claim_ids"],
+        serde_json::json!([contester.to_string()]),
+        "precondition: the contester is named before the delete"
+    );
+    let excluded_before = first_text(
+        &recall(&server, &viewer, recall_params(query, true))
+            .await
+            .expect("recall exclude_contested before"),
+    );
+    assert!(
+        recall_row(&excluded_before, target).is_none(),
+        "precondition: exclude_contested drops the contested target"
+    );
+
+    delete(&server, contradicts).await;
+
+    let after = first_text(
+        &recall(&server, &viewer, recall_params(query, false))
+            .await
+            .expect("recall after"),
+    );
+    let row = recall_row(&after, target).expect("the target is still recalled");
+    for field in ["is_contested", "dispute_count", "contesting_claim_ids"] {
+        assert!(
+            row.get(field).is_none(),
+            "after delete_edge the target must read uncontested; `{field}` is still set: {row}"
+        );
+    }
+    let excluded_after = first_text(
+        &recall(&server, &viewer, recall_params(query, true))
+            .await
+            .expect("recall exclude_contested after"),
+    );
+    assert!(
+        recall_row(&excluded_after, target).is_some(),
+        "exclude_contested must no longer drop a target whose only contradicts edge was deleted"
     );
 }

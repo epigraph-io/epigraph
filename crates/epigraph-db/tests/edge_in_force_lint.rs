@@ -78,6 +78,14 @@ const DISPLAY_TIER_FNS: &[(&str, &str)] = &[
         "crates/epigraph-db/src/repos/claim.rs",
         "rag_hybrid_context",
     ),
+    // Recall annotations and ranking: `is_contested` / `dispute_count` /
+    // `contesting_claim_ids` (MCP recall, recall_with_context, engine recall)
+    // and the in-epistemic degree behind recall_with_context's graph rerank.
+    ("crates/epigraph-db/src/repos/claim.rs", "dispute_batch"),
+    (
+        "crates/epigraph-db/src/repos/claim.rs",
+        "in_epistemic_degree_batch",
+    ),
     // recall_with_context's structural context (15 aliases).
     (
         "crates/epigraph-mcp/src/tools/recall.rs",
