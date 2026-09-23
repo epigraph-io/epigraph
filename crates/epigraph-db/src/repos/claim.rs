@@ -1331,6 +1331,141 @@ impl ClaimRepository {
         Ok(q.execute(executor).await?.rows_affected() > 0)
     }
 
+    /// `(id, pignistic_prob)` for each claim in `ids` the viewer may read.
+    ///
+    /// The prior-belief read of `POST /api/v1/bp/propagate`
+    /// (`routes/computation.rs::propagate_beliefs`, `F-SHARD4-A2`), which ran
+    /// `SELECT id, pignistic_prob FROM claims WHERE id = ANY($1)` inline on the
+    /// raw pool. A claim the viewer cannot read is simply absent, which is the
+    /// shape the handler already takes for a claim with no `pignistic_prob`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn pignistic_probs_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Option<f64>)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.pignistic_prob \
+               FROM claims c \
+              WHERE c.id = ANY($1) \
+                /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Option<f64>)>(&sql).bind(ids);
+        // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so the
+        // statement has no `$2` to fill.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Persist one belief-propagation result on claim `id`, but only if the
+    /// viewer may WRITE it.
+    ///
+    /// The two `apply_updates` writes of `POST /api/v1/bp/propagate`
+    /// (`routes/computation.rs::propagate_beliefs`, `F-SHARD4-A2`). Both ran
+    /// inline on the raw pool, constrained by id alone, so any bearer could
+    /// overwrite the cached belief of any claim a factor named. The CDST
+    /// branch's statement set `pignistic_prob`, `belief` and `plausibility`;
+    /// the scalar branch's set `pignistic_prob` and discarded its result. Both
+    /// branches now call this statement, which carries `/* {WRITABLE:c} */`,
+    /// spliced by [`crate::visibility::Viewer::splice_write`] and bound from
+    /// `writable_bind()`. That is the predicate migration 077's
+    /// `claims_tenancy` `WITH CHECK` applies, so this refuses today what the
+    /// policy will refuse once the request path connects as an application
+    /// role. It refuses with `false`, which the route counts, rather than with
+    /// a zero-row `UPDATE` nobody reads.
+    ///
+    /// `interval` is `Some((belief, plausibility))` for the CDST branch. It is
+    /// `None` for the scalar branch, which leaves those two columns unchanged.
+    ///
+    /// # What else the statement writes, and why
+    ///
+    /// * **Every value goes through
+    ///   [`epigraph_ds::measures::clamp_claim_belief_measures`].** That
+    ///   helper's own doc makes it mandatory for any `UPDATE claims SET
+    ///   belief|plausibility|pignistic_prob`; the route's two inline statements
+    ///   bypassed it.
+    /// * **`belief_frame_id` is set to `NULL`.** Migration 100 made that column
+    ///   name the frame the cached belief columns summarize. A propagation run
+    ///   is not one frame's combined belief: it combines the mass functions of
+    ///   every frame for its variables and then moves them by message passing.
+    ///   Leaving the column unchanged would make the cache claim to summarize a
+    ///   frame it no longer summarizes. `NULL` is the column's documented
+    ///   "provenance unknown" value. The scalar branch nulls it as well,
+    ///   because `pignistic_prob` is one of the columns the frame is named for.
+    ///
+    /// # Returns
+    ///
+    /// `true` when the row was written. `false` when no row matched: no such
+    /// claim, or a claim the viewer may not write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails. That
+    /// includes a `claims_bel_pl_order` violation for an interval whose clamped
+    /// belief exceeds its clamped plausibility.
+    #[instrument(skip(executor, viewer))]
+    pub async fn apply_propagated_belief<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+        pignistic_prob: f64,
+        interval: Option<(f64, f64)>,
+    ) -> Result<bool, DbError> {
+        // The helper clamps five fields and this statement writes at most
+        // three, so the two mass fields are placeholders whose output is
+        // discarded. In the scalar arm the interval is a placeholder too.
+        let (belief, plausibility, pignistic_prob) = match interval {
+            Some((bel, pl)) => {
+                let (bel, pl, betp, _, _) = epigraph_ds::measures::clamp_claim_belief_measures(
+                    bel,
+                    pl,
+                    Some(pignistic_prob),
+                    0.0,
+                    0.0,
+                );
+                (Some(bel), Some(pl), betp)
+            }
+            None => {
+                let (_, _, betp, _, _) = epigraph_ds::measures::clamp_claim_belief_measures(
+                    0.0,
+                    1.0,
+                    Some(pignistic_prob),
+                    0.0,
+                    0.0,
+                );
+                (None, None, betp)
+            }
+        };
+
+        let sql = viewer.splice_write(
+            "UPDATE claims AS c \
+                SET pignistic_prob = $2, \
+                    belief = COALESCE($3::float8, c.belief), \
+                    plausibility = COALESCE($4::float8, c.plausibility), \
+                    belief_frame_id = NULL, \
+                    updated_at = NOW() \
+              WHERE c.id = $1 \
+                /* {WRITABLE:c} */",
+            5,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(id)
+            .bind(pignistic_prob)
+            .bind(belief)
+            .bind(plausibility);
+        // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so
+        // the statement has no `$5` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(executor).await?.rows_affected() > 0)
+    }
+
     /// Corpus-wide embedding-neighbourhood cardinality and mean similarity.
     ///
     /// Backs `GET /api/v1/voids/density`, which ran this aggregate inline and

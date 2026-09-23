@@ -1,5 +1,7 @@
 //! Candidate `alternative_of` pair discovery — the read behind MCP
-//! `suggest_alternative_sets`.
+//! `suggest_alternative_sets` — and the viewer-filtered `alternative_of`
+//! equivalence classes belief propagation groups its messages by
+//! ([`AlternativeSetRepository::members_for_claims`]).
 //!
 //! # Why this moved here (PR-09)
 //!
@@ -192,5 +194,87 @@ impl AlternativeSetRepository {
                 reason,
             })
             .collect())
+    }
+
+    /// The `alternative_of` equivalence class of each claim in `claim_ids`,
+    /// computed over the edges and claims the viewer may read.
+    ///
+    /// Returns `(claim_id, alt_members)` for each claim in `claim_ids` that has
+    /// at least one readable `alternative_of` edge. `alt_members` is sorted and
+    /// deduplicated, and contains the claim itself when the class is non-empty,
+    /// which is what the `alternative_set` view (migration 042) returns too.
+    ///
+    /// The alt-set read of `POST /api/v1/bp/propagate`
+    /// (`routes/computation.rs::propagate_beliefs`, `F-SHARD4-A2`). The route
+    /// ran `SELECT claim_id, alt_members FROM alternative_set` inline on the
+    /// raw pool. That scanned the transitive closure of every `alternative_of`
+    /// edge in the corpus and swallowed any error as an empty map.
+    ///
+    /// # Why this re-derives the closure instead of reading the view
+    ///
+    /// The view is `security_invoker`, so once the request path connects as an
+    /// application role, `edges`' own policy filters it. Until then it filters
+    /// nothing. It also cannot carry a marker, because its body is fixed in the
+    /// migration. So this statement is the view's definition restated with
+    /// three predicates added: the edge must be readable
+    /// (`{EDGE_VISIBILITY:e}`), and so must BOTH of its endpoints
+    /// (`{VISIBILITY:ca}`, `{VISIBILITY:cb}`).
+    ///
+    /// Filtering the endpoints as well as the edge is what keeps hidden
+    /// structure out of the class. A readable claim A that is an alternative
+    /// of a hidden claim H, which is in turn an alternative of a readable
+    /// claim B, would otherwise put A and B in one class through H. The engine
+    /// groups supporter messages by class, so that would change A's and B's
+    /// propagated beliefs because of a claim the caller cannot see.
+    ///
+    /// The closure is seeded from `claim_ids` only, where the view computes it
+    /// for every claim. Each class it does return is the same as the view's
+    /// class for that claim, restricted to readable rows. Retracted edges
+    /// (`valid_to` set) are included, as they are in the view; this read
+    /// changes who can see the class, not what an edge counts for.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn members_for_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Vec<Uuid>)>, crate::DbError> {
+        // $1 is the seed set; $2 is the viewer group array. All three markers
+        // resolve to $2.
+        let sql = viewer.splice(
+            r#"
+        WITH RECURSIVE pairs AS (
+            SELECT e.source_id AS a, e.target_id AS b
+              FROM edges e
+              JOIN claims ca ON ca.id = e.source_id
+              JOIN claims cb ON cb.id = e.target_id
+             WHERE e.relationship = 'alternative_of'
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:ca} */ /* {VISIBILITY:cb} */
+        ),
+        sym AS (
+            SELECT a, b FROM pairs
+            UNION
+            SELECT b, a FROM pairs
+        ),
+        closure AS (
+            SELECT a, b FROM sym WHERE a = ANY($1)
+            UNION
+            SELECT cl.a, s.b FROM closure cl JOIN sym s ON cl.b = s.a
+        )
+        SELECT a AS claim_id, array_agg(DISTINCT b ORDER BY b) AS alt_members
+          FROM closure
+         GROUP BY a
+        "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Vec<Uuid>)>(&sql).bind(claim_ids);
+        // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders no
+        // predicate, so the statement has no `$2` to fill.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 }

@@ -184,6 +184,107 @@ impl FactorRepository {
             .collect())
     }
 
+    /// The factors in frame `frame_id` (every frame when `None`) whose EVERY
+    /// variable is a claim the viewer may READ, oldest first.
+    ///
+    /// The factor load of `POST /api/v1/bp/propagate`
+    /// (`routes/computation.rs::propagate_beliefs`, `F-SHARD4-A2`). The route
+    /// ran `SELECT … FROM factors WHERE ($1::uuid IS NULL OR frame_id = $1)`
+    /// inline on the raw pool, so a propagation run took in every factor in
+    /// the corpus. Its response names every variable of every factor it ran
+    /// over, each with a propagated BetP, so the unfiltered load disclosed the
+    /// ids, and a belief-shaped summary, of claims the caller cannot read.
+    ///
+    /// # Why the whole factor is dropped, not only its hidden variables
+    ///
+    /// A factor is a potential over ALL of its variables. Removing a hidden
+    /// variable would change the potential the factor encodes. Keeping the
+    /// factor whole would carry the hidden claim's belief into the messages
+    /// its visible neighbours receive, so hidden evidence would still move
+    /// visible beliefs. Dropping it means the propagation the caller sees is
+    /// computed only from what the caller can read.
+    ///
+    /// # No database backstop, stated
+    ///
+    /// `factors` has no tenancy columns and row-level security is off (measured
+    /// at migration head 100: `relrowsecurity` false), so the `{VISIBILITY:c}`
+    /// predicate on the `claims` subquery is the only gate this read has. A
+    /// variable id that names no claim at all fails the predicate too. That is
+    /// deliberate: under migration 077's policies a claim the session cannot
+    /// see and a claim that does not exist are the same empty subquery, so
+    /// treating them alike keeps this read's answer the same before and after
+    /// the request path connects as an application role.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn list_readable<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        frame_id: Option<Uuid>,
+    ) -> Result<Vec<FactorRow>, crate::DbError> {
+        let sql = viewer.splice(
+            "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description, \
+                    f.frame_id, f.properties, f.created_at \
+               FROM factors f \
+              WHERE ($1::uuid IS NULL OR f.frame_id = $1) \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM unnest(f.variable_ids) AS v(id) \
+                     WHERE NOT EXISTS ( \
+                         SELECT 1 FROM claims c \
+                          WHERE c.id = v.id \
+                            /* {VISIBILITY:c} */ \
+                     ) \
+                ) \
+              ORDER BY f.created_at",
+            2,
+        );
+        let mut q = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Vec<Uuid>,
+                JsonValue,
+                Option<String>,
+                Option<Uuid>,
+                JsonValue,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(&sql)
+        .bind(frame_id);
+        // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so the
+        // statement has no `$2` to fill.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await.map_err(crate::DbError::from)?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    factor_type,
+                    variable_ids,
+                    potential,
+                    description,
+                    frame_id,
+                    properties,
+                    created_at,
+                )| FactorRow {
+                    id,
+                    factor_type,
+                    variable_ids,
+                    potential,
+                    description,
+                    frame_id,
+                    properties,
+                    created_at,
+                },
+            )
+            .collect())
+    }
+
     /// Move the factors in frame `from_frame` that name `claim_id` into frame
     /// `to_frame`, but only those whose EVERY variable is a claim the viewer
     /// may WRITE. Returns how many moved.
