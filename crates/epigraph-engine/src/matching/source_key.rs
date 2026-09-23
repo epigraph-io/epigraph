@@ -1,11 +1,15 @@
 //! Provenance key used to filter cross-source pairs.
 
+use std::collections::BTreeSet;
+
+use epigraph_db::repos::DerivationRepository;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Provenance identity of a claim. Two claims are "same source" iff any
-/// non-null component matches — see [`is_same_source`].
+/// non-null component matches, or their derivation lineages overlap — see
+/// [`is_same_source`].
 ///
 /// There is deliberately no ingestion-run component. The design spec's
 /// `ingestion_run_id` was read from `claims.properties->>'ingestion_run_id'`,
@@ -16,7 +20,18 @@ use uuid::Uuid;
 pub struct SourceKey {
     pub paper_doi: Option<String>,
     pub agent_id: Uuid,
-    pub derivation_root: Option<Uuid>,
+    /// The claim itself plus every claim it was derived from, transitively,
+    /// over claim-to-claim `derived_from` edges of any spelling and case (see
+    /// [`DerivationRepository::lineage_ids`]).
+    ///
+    /// A SET, compared by overlap, rather than the single `derivation_root`
+    /// it replaced. The single root returned `None` for a claim with no parent,
+    /// so a root never matched its own child; it followed one `LIMIT 1` parent
+    /// per hop, so a multi-parent claim's root depended on the query plan; and
+    /// it walked onto evidence ids. Overlap makes a parent/child pair, siblings
+    /// under any shared ancestor, and a multi-parent claim's siblings through
+    /// every parent all "same source", deterministically.
+    pub derivation_lineage: BTreeSet<Uuid>,
 }
 
 /// Configurable rule for what counts as "same source".
@@ -30,8 +45,9 @@ pub struct SourceFilterConfig {
     pub include_agent_id: bool,
 }
 
-/// True when `a` and `b` share a non-null source component (or, if
-/// `cfg.include_agent_id`, share an `agent_id`).
+/// True when `a` and `b` share a non-null source component, when their
+/// derivation lineages overlap, or (if `cfg.include_agent_id`) when they share
+/// an `agent_id`.
 pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> bool {
     fn both_eq<T: PartialEq>(x: &Option<T>, y: &Option<T>) -> bool {
         matches!((x, y), (Some(xv), Some(yv)) if xv == yv)
@@ -39,7 +55,7 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     if both_eq(&a.paper_doi, &b.paper_doi) {
         return true;
     }
-    if both_eq(&a.derivation_root, &b.derivation_root) {
+    if !a.derivation_lineage.is_disjoint(&b.derivation_lineage) {
         return true;
     }
     if cfg.include_agent_id && a.agent_id == b.agent_id {
@@ -48,8 +64,8 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     false
 }
 
-/// Look up a claim's [`SourceKey`] by querying its row and chasing the
-/// `derived_from` edge chain to a root (acyclic, capped at depth 32).
+/// Look up a claim's [`SourceKey`]: its row, its asserting paper's DOI, and its
+/// derivation lineage.
 pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKey, sqlx::Error> {
     let agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
         .bind(claim_id)
@@ -78,37 +94,19 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     .await?
     .flatten();
 
-    // Walk the derived_from chain. Stop when there's no parent, when we
-    // detect a cycle (parent == current), or when we hit the depth cap.
-    let mut current = claim_id;
-    let mut depth = 0_usize;
-    let derivation_root = loop {
-        if depth >= 32 {
-            break Some(current);
-        }
-        // Also deliberately unfiltered: `derived_from` is lineage, not evidence.
-        // Retracting an evidential edge must not sever a decomposition chain.
-        let parent: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT target_id FROM edges
-             WHERE source_id = $1 AND relationship = 'derived_from'
-             LIMIT 1",
-        )
-        .bind(current)
-        .fetch_optional(pool)
-        .await?;
-        match parent {
-            Some((p,)) if p != current => {
-                current = p;
-                depth += 1;
-            }
-            _ => break if depth == 0 { None } else { Some(current) },
-        }
-    };
+    // Also deliberately unfiltered on `valid_to`: `derived_from` is lineage,
+    // not evidence. Retracting an evidential edge must not sever a derivation
+    // chain. Direction, spelling and the claim-to-claim restriction are
+    // documented on `epigraph_db::repos::derivation`.
+    let derivation_lineage = DerivationRepository::lineage_ids(pool, claim_id)
+        .await?
+        .into_iter()
+        .collect();
 
     Ok(SourceKey {
         paper_doi,
         agent_id,
-        derivation_root,
+        derivation_lineage,
     })
 }
 
@@ -116,11 +114,11 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
 mod tests {
     use super::*;
 
-    fn k(p: Option<&str>, a: Uuid, dr: Option<Uuid>) -> SourceKey {
+    fn k(p: Option<&str>, a: Uuid, lineage: &[Uuid]) -> SourceKey {
         SourceKey {
             paper_doi: p.map(str::to_string),
             agent_id: a,
-            derivation_root: dr,
+            derivation_lineage: lineage.iter().copied().collect(),
         }
     }
 
@@ -128,24 +126,24 @@ mod tests {
     fn same_paper_doi_is_same_source() {
         let a1 = Uuid::new_v4();
         let a2 = Uuid::new_v4();
-        let l = k(Some("10.1/x"), a1, None);
-        let r = k(Some("10.1/x"), a2, None);
+        let l = k(Some("10.1/x"), a1, &[]);
+        let r = k(Some("10.1/x"), a2, &[]);
         assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 
     #[test]
     fn different_paper_same_agent_is_cross_source_by_default() {
         let a = Uuid::new_v4();
-        let l = k(Some("10.1/x"), a, None);
-        let r = k(Some("10.1/y"), a, None);
+        let l = k(Some("10.1/x"), a, &[]);
+        let r = k(Some("10.1/y"), a, &[]);
         assert!(!is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 
     #[test]
     fn different_paper_same_agent_is_same_source_with_strict_flag() {
         let a = Uuid::new_v4();
-        let l = k(Some("10.1/x"), a, None);
-        let r = k(Some("10.1/y"), a, None);
+        let l = k(Some("10.1/x"), a, &[]);
+        let r = k(Some("10.1/y"), a, &[]);
         assert!(is_same_source(
             &l,
             &r,
@@ -159,16 +157,34 @@ mod tests {
     fn null_paper_doesnt_match_null_paper() {
         let a1 = Uuid::new_v4();
         let a2 = Uuid::new_v4();
-        let l = k(None, a1, None);
-        let r = k(None, a2, None);
+        let l = k(None, a1, &[]);
+        let r = k(None, a2, &[]);
         assert!(!is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 
     #[test]
-    fn shared_derivation_root_is_same_source() {
-        let root = Uuid::new_v4();
-        let l = k(None, Uuid::new_v4(), Some(root));
-        let r = k(None, Uuid::new_v4(), Some(root));
+    fn shared_derivation_ancestor_is_same_source() {
+        let (x, y, root) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let l = k(None, Uuid::new_v4(), &[x, root]);
+        let r = k(None, Uuid::new_v4(), &[y, root]);
         assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
+    }
+
+    /// A root's lineage is just itself, and its child's lineage contains it.
+    /// The single-root key this replaced gave the root `None` and so never
+    /// matched a parent with its own child.
+    #[test]
+    fn parent_and_child_are_same_source() {
+        let (parent, child) = (Uuid::new_v4(), Uuid::new_v4());
+        let l = k(None, Uuid::new_v4(), &[parent]);
+        let r = k(None, Uuid::new_v4(), &[child, parent]);
+        assert!(is_same_source(&l, &r, SourceFilterConfig::default()));
+    }
+
+    #[test]
+    fn disjoint_derivation_lineages_are_cross_source() {
+        let l = k(None, Uuid::new_v4(), &[Uuid::new_v4(), Uuid::new_v4()]);
+        let r = k(None, Uuid::new_v4(), &[Uuid::new_v4(), Uuid::new_v4()]);
+        assert!(!is_same_source(&l, &r, SourceFilterConfig::default()));
     }
 }
