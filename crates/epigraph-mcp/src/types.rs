@@ -1904,6 +1904,18 @@ pub struct IngestDocumentResponse {
     /// still `asserts` each of them; only the label is missing. Disclosed rather
     /// than swallowed, so a caller counting a paper's claim set by label can
     /// see the gap.
+    ///
+    /// **Who actually sees it.** This response reaches a caller only from the
+    /// operator `ingest-document` CLI, which calls `do_ingest_document`
+    /// synchronously (`ingest_document_spine` returns its own response type
+    /// with the same field). The two DETACHED MCP tools, `ingest_document` and
+    /// `ingest_document_inline`, answer `queued` and run `do_ingest_document`
+    /// in a spawned task whose response is dropped — for them the count reaches
+    /// only the server log (one WARN per unlabelled claim, target
+    /// `tenancy.scoped_write`). A caller
+    /// of those tools that needs the gap must compare the paper's `asserts`
+    /// edges against its `doi:` label set itself. Stated because an earlier
+    /// summary described this field as the disclosure for every ingest path.
     pub converged_claims_unlabelled: usize,
     pub already_ingested: bool,
 }
