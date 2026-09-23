@@ -10,6 +10,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use epigraph_db::visibility::SystemReason;
 use epigraph_mcp::tools::dedup_sweep::sweep_semantic_duplicates;
 use epigraph_mcp::types::SweepSemanticDuplicatesParams;
 use sqlx::PgPool;
@@ -78,6 +79,26 @@ fn params(dry_run: bool) -> SweepSemanticDuplicatesParams {
     }
 }
 
+/// Run the sweep on a REAL maintenance session over this test's database.
+///
+/// That is the value the dispatch body hands the tool in production
+/// (`maintenance::maintenance_viewer`), and the tool runs every statement on it
+/// — the reads on its pinned connection and the cascade on its `pool()` — not
+/// on the server's application pool. A fresh `ScopedPool` per call keeps each
+/// sweep's session independent, as two dispatches would be.
+async fn sweep(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    pool: &PgPool,
+    p: SweepSemanticDuplicatesParams,
+) -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
+    let scoped = fixture::scoped_pool(pool).await;
+    let mut session = scoped
+        .maintenance_session(SystemReason::DedupSweep)
+        .await
+        .expect("maintenance session");
+    sweep_semantic_duplicates(server, &mut session, p).await
+}
+
 fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
     let text = out
         .content
@@ -91,7 +112,6 @@ fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
 /// claims on a default-arg call would be the worst possible failure here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn dry_run_reports_without_mutating(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     // Identical content REQUIRES distinct agents: uq_claims_content_hash_agent
     // makes an exact within-agent duplicate impossible, which is precisely why
     // the real duplicate corpus is cross-agent.
@@ -101,11 +121,7 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
     let b = seed(&pool, a2, "identical text", 0.5, &pgvec(0, 0.001), &[]).await;
 
     let server = build_server(pool.clone());
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(true))
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, params(true)).await.expect("sweep"));
 
     assert_eq!(j["dry_run"], serde_json::json!(true));
     assert_eq!(j["pairs_marked"], serde_json::json!(0));
@@ -128,18 +144,13 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
 /// claim and forwarding the other at it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     let strong = seed(&pool, a1, "same words", 0.9, &pgvec(0, 0.0), &[]).await;
     let weak = seed(&pool, a2, "same words", 0.4, &pgvec(0, 0.001), &[]).await;
 
     let server = build_server(pool.clone());
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(false))
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, params(false)).await.expect("sweep"));
 
     assert_eq!(j["pairs_marked"], serde_json::json!(1));
     assert!(j["failures"].as_array().unwrap().is_empty());
@@ -171,7 +182,6 @@ async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool
 /// merge_candidates for consolidate_claims instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let a = seed(
         &pool,
@@ -193,11 +203,7 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
     .await;
 
     let server = build_server(pool.clone());
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(false))
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, params(false)).await.expect("sweep"));
 
     assert_eq!(
         j["pairs_marked"],
@@ -224,7 +230,6 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
 /// directly compared. A pairwise-only implementation would emit two clusters.
 #[sqlx::test(migrations = "../../migrations")]
 async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let (a1, a2, a3) = (
         seed_agent(&pool).await,
         seed_agent(&pool).await,
@@ -235,11 +240,7 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
     seed(&pool, a3, "chain text", 0.7, &pgvec(0, 0.020), &[]).await;
 
     let server = build_server(pool.clone());
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(true))
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, params(true)).await.expect("sweep"));
 
     let clusters = j["clusters"].as_array().unwrap();
     assert_eq!(
@@ -254,7 +255,6 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
 /// the sweep, and neither do already-superseded claims.
 #[sqlx::test(migrations = "../../migrations")]
 async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let a1 = seed_agent(&pool).await;
     let a2 = seed_agent(&pool).await;
     seed(
@@ -290,11 +290,7 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
     }
 
     let server = build_server(pool.clone());
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(true))
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, params(true)).await.expect("sweep"));
 
     assert_eq!(
         j["scanned"],
@@ -307,7 +303,6 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
 /// Paging is resumable: next_offset advances by what was scanned.
 #[sqlx::test(migrations = "../../migrations")]
 async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     for i in 0..3 {
         seed(
@@ -324,11 +319,7 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
     let server = build_server(pool.clone());
     let mut p = params(true);
     p.limit = Some(2);
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, p)
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, p).await.expect("sweep"));
 
     assert_eq!(j["scanned"], serde_json::json!(2));
     assert_eq!(
@@ -399,11 +390,7 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
             .unwrap();
     assert!(weak_betp_before.is_some(), "fixture: duplicate has a BetP");
 
-    let j = json_of(
-        sweep_semantic_duplicates(&server, &viewer, params(false))
-            .await
-            .expect("sweep"),
-    );
+    let j = json_of(sweep(&server, &pool, params(false)).await.expect("sweep"));
     assert_eq!(j["pairs_marked"], serde_json::json!(1));
     assert!(
         j["failures"].as_array().unwrap().is_empty(),

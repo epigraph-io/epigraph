@@ -7,6 +7,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
+use epigraph_db::visibility::SystemReason;
 use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
@@ -183,9 +184,14 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
         "all 5 hierarchy-level claims must carry the paper's doi label"
     );
 
+    let scoped = fixture::scoped_pool(&pool).await;
+    let mut session = scoped
+        .maintenance_session(SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
     let result = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut session,
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![doi_label.to_string()]),

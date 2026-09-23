@@ -119,19 +119,42 @@ pub struct BackfillEmbeddingsParams {
 ///
 /// Selection reuses `ClaimRepository::find_claims_needing_embeddings`, which
 /// excludes host-provenance telemetry and `is_current = false` rows per the
-/// invariant. Each vector is stored via `ClaimRepository::store_embedding`
-/// (an `UPDATE claims SET embedding`), so a failure on one claim is reported,
-/// not fatal — mirroring the CLI's per-row accounting.
+/// invariant. Each vector is stored via
+/// `ClaimRepository::store_embedding_if_unsealed`, so a failure on one claim is
+/// reported, not fatal — mirroring the CLI's per-row accounting.
+///
+/// # Where the statements run, and why the store is the `_if_unsealed` one
+///
+/// Both the selection and every store run on the maintenance `session`'s pinned
+/// connection, never on `server.pool`. The bypass viewer emits no predicate, so
+/// on an application connection under row security the selection would see
+/// only public rows — every group-private claim would stay unembedded, and the
+/// run would report success.
+///
+/// The store is `store_embedding_if_unsealed` rather than `store_embedding`
+/// because the provider round trip separates the read from the write, and a
+/// claim sealed (or superseded) inside that window must not receive a vector
+/// derived from its plaintext — CLAUDE.md's `sealed_with_embedding` audit calls
+/// that a confidentiality violation. It locks the row in a separate statement
+/// first, so its `claim_encryption` check reads a snapshot that includes a seal
+/// committed during the wait; `store_embedding`'s single statement does not.
+///
+/// The connection stays pinned across the provider calls. That costs one
+/// maintenance-pool slot for the run's duration, which
+/// `crate::maintenance::MAINTENANCE_POOL_CONNECTIONS` already budgets per
+/// admitted call; re-acquiring per store would only trade that for a
+/// `maintenance connection issued` log line per claim.
 pub async fn backfill_embeddings(
     server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
     params: BackfillEmbeddingsParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(200).clamp(1, 2000);
     let dry_run = params.dry_run.unwrap_or(false);
+    let (conn, viewer) = session.split();
 
     let rows =
-        epigraph_db::ClaimRepository::find_claims_needing_embeddings(&server.pool, viewer, limit)
+        epigraph_db::ClaimRepository::find_claims_needing_embeddings(&mut *conn, viewer, limit)
             .await
             .map_err(internal_error)?;
     let candidates = rows.len();
@@ -165,13 +188,21 @@ pub async fn backfill_embeddings(
         match server.embedder.generate(&content).await {
             Ok(vec) => {
                 let pgvec = crate::embed::format_pgvector(&vec);
-                match epigraph_db::ClaimRepository::store_embedding(&server.pool, claim_id, &pgvec)
-                    .await
+                match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+                    &mut *conn, viewer, claim_id, &pgvec,
+                )
+                .await
                 {
                     Ok(true) => embedded += 1,
                     Ok(false) => {
                         failed += 1;
-                        push_capped(&mut errors, format!("{claim_id}: store affected 0 rows"));
+                        push_capped(
+                            &mut errors,
+                            format!(
+                                "{claim_id}: store affected 0 rows (sealed or superseded \
+                                 since selection, or gone)"
+                            ),
+                        );
                     }
                     Err(e) => {
                         failed += 1;

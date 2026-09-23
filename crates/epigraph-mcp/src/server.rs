@@ -829,14 +829,15 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<crate::types::SweepSemanticDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        // Refuse before the mint, so a refused call pins no maintenance
+        // connection and takes no gate permit.
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::DedupSweep,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        tools::dedup_sweep::sweep_semantic_duplicates(self, viewer, params).await
+        tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
     }
 
     // ── Alternative-set candidate finder (1 tool) ──
@@ -1099,14 +1100,13 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<RecomputeBeliefsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::BeliefRecomputation,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        tools::cdst_maintenance::recompute_beliefs(self, viewer, params).await
+        tools::cdst_maintenance::recompute_beliefs(self, &mut session, params).await
     }
 
     // ── Workflows (8 tools) ──
@@ -1611,14 +1611,13 @@ impl EpiGraphMcpFull {
         &self,
         Parameters(params): Parameters<crate::tools::embeddings::BackfillEmbeddingsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let session = crate::maintenance::maintenance_viewer(
+        self.reject_if_read_only()?;
+        let mut session = crate::maintenance::maintenance_viewer(
             self,
             epigraph_db::visibility::SystemReason::EmbeddingBackfill,
         )
         .await?;
-        let viewer = session.viewer();
-        self.reject_if_read_only()?;
-        crate::tools::embeddings::backfill_embeddings(self, viewer, params).await
+        crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
     // ── Themes (1 tool) ──

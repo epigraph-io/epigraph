@@ -44,50 +44,105 @@
 //! If a future tool reaches for this to read *content* on a caller's behalf,
 //! that is the abuse, and the fix is `tools::viewer::request_viewer`.
 
+use std::ops::{Deref, DerefMut};
+
 use epigraph_db::visibility::SystemReason;
 use epigraph_db::MaintenanceSession;
 use rmcp::model::ErrorData as McpError;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::server::EpiGraphMcpFull;
 
+/// How many maintenance tool calls may hold a [`MaintenanceSession`] at once,
+/// process-wide.
+///
+/// Each admitted call pins ONE connection for its whole run (the session), and
+/// two of the three tools — `sweep_semantic_duplicates` and `recompute_beliefs`
+/// — additionally check out ONE transient connection at a time from the same
+/// pool, through [`MaintenanceSession::pool`], for the engine callees that
+/// still take `&PgPool` (`mark_duplicate_with_cascade`,
+/// `recompute_claim_cached_belief`). Neither callee holds a transaction open
+/// while acquiring another connection, so one transient slot per call is the
+/// peak, not an estimate.
+///
+/// Without a bound, N concurrent calls against an N-connection pool pin every
+/// connection and then each waits out the acquire timeout for a transient slot
+/// that can never free — once per claim or per pair, which across a 2000-item
+/// page is hours, not an error. See [`MAINTENANCE_POOL_CONNECTIONS`] for the
+/// other half of the arithmetic.
+pub const MAINTENANCE_TOOL_CONCURRENCY: usize = 3;
+
+/// The size `epigraph-mcp-full` gives its maintenance pool: one pinned
+/// connection per admitted call plus ONE shared slot for the transient
+/// checkouts. With every admitted call pinning one and needing at most one
+/// more at a time, that last slot is always eventually released, so the
+/// transients are served in turn rather than starved.
+///
+/// A pool at least this large is what makes [`MAINTENANCE_TOOL_CONCURRENCY`]
+/// sufficient; a smaller one reintroduces the starvation.
+pub const MAINTENANCE_POOL_CONNECTIONS: u32 = MAINTENANCE_TOOL_CONCURRENCY as u32 + 1;
+
+/// Process-wide rather than per server: the HTTP transport builds one
+/// `EpiGraphMcpFull` per MCP session, all over clones of one `ScopedPool`, so a
+/// per-server gate would bound nothing.
+static MAINTENANCE_GATE: Semaphore = Semaphore::const_new(MAINTENANCE_TOOL_CONCURRENCY);
+
+/// A [`MaintenanceSession`] plus the gate permit that admitted it.
+///
+/// Derefs to the session, so a dispatch body passes `&mut session` straight to
+/// a tool function taking `&mut MaintenanceSession<'_>`. Field order is drop
+/// order: the session (and its pinned connection) goes back to the pool before
+/// the permit admits the next caller.
+pub(crate) struct GatedMaintenanceSession<'a> {
+    session: MaintenanceSession<'a>,
+    _permit: SemaphorePermit<'static>,
+}
+
+impl<'a> Deref for GatedMaintenanceSession<'a> {
+    type Target = MaintenanceSession<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl DerefMut for GatedMaintenanceSession<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
 /// A bypass viewer plus the maintenance connection it is inseparable from.
 ///
-/// # PR-15 status: DEFERRED, deliberately, and the reason is not "we forgot"
+/// # Where the three tools spend it
 ///
-/// `EpiGraphMcpFull::with_scoped_pool` has zero callers. The shipped
-/// `epigraph-mcp-full` binary builds its pool with `create_pool` and never
-/// attaches a `ScopedPool`, so this function returns its "was not built from a
-/// `ScopedPool`" error on every call and the three maintenance tools cannot run
-/// at all today. That is a live functional gap — and it is **fail-closed**.
+/// `tools::dedup_sweep`, `tools::embeddings::backfill_embeddings` and
+/// `tools::cdst_maintenance` take the session itself (`&mut
+/// MaintenanceSession<'_>`), not a bare `&Viewer`, and run every statement on
+/// it: the reads and the embedding stores on the pinned connection
+/// ([`MaintenanceSession::split`]), and the two engine callees that still take
+/// `&PgPool` on [`MaintenanceSession::pool`] — the pool that connection came
+/// from. None of them names `server.pool`.
 ///
-/// PR-15 did not close it by calling `with_scoped_pool` in `main`, because
-/// doing only that would make it *worse*. The three tools take `&self` and run
-/// their queries on `self.pool`, the ordinary application pool; attaching a
-/// `ScopedPool` would let them mint a privileged viewer and then spend it on an
-/// unprivileged connection — the privileged-viewer/ordinary-pool hybrid this PR
-/// exists to delete from eleven CLI binaries. Under FORCE that trades a hard
-/// error for a silent no-op, which plan §4.3's R2 is explicit about being the
-/// worse failure: *"fail-closed regressions look like data loss, not errors."*
+/// That is what makes attaching a `ScopedPool` safe. Before it, the tools took
+/// `&self` and a `&Viewer` and queried `self.pool`, the ordinary application
+/// pool, so attaching one would have let them mint a privileged viewer and
+/// spend it on an unprivileged connection — the privileged-viewer/ordinary-pool
+/// hybrid PR-15 deleted from eleven CLI binaries. Under row security that is a
+/// silent no-op, which plan §4.3's R2 is explicit about being the worse
+/// failure: *"fail-closed regressions look like data loss, not errors."*
 ///
-/// Closing it properly means routing the three tools' queries onto the
-/// maintenance connection, which is a change to `tools::dedup_sweep`,
-/// `tools::embeddings` and `tools::cdst_maintenance`'s query plumbing rather
-/// than to the pool wiring. That is PR-17's to do, alongside the RLS work that
-/// makes it matter. Until then the failure mode is a clear error naming the
-/// missing constructor, which is the right thing for it to be.
-///
-/// Returns one [`MaintenanceSession`], which owns the connection and the viewer
-/// together and hands the viewer out only by reference — so a call site can no
-/// longer drop the connection and keep the bypass
-/// (`D-PR17-maintenance-lease-coupling-is-a-convention`). A previous revision
-/// of this parenthesis said that covered only the ACCIDENTAL shape, because
-/// `Viewer` was `Clone`; it is no longer, so the deliberate one is closed too.
-/// The mint is `ScopedPool::maintenance_session`, shared with the CLI and API
-/// wrappers.
+/// Returns one [`MaintenanceSession`] (behind the concurrency gate above),
+/// which owns the connection and the viewer together and hands the viewer out
+/// only by reference — so a call site can no longer drop the connection and
+/// keep the bypass (`D-PR17-maintenance-lease-coupling-is-a-convention`). A
+/// previous revision of this parenthesis said that covered only the ACCIDENTAL
+/// shape, because `Viewer` was `Clone`; it is no longer, so the deliberate one
+/// is closed too. The mint is `ScopedPool::maintenance_session`, shared with
+/// the CLI and API wrappers.
 ///
 /// ```ignore
-/// let session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
-/// let viewer = session.viewer();
+/// let mut session = maintenance::maintenance_viewer(self, SystemReason::DedupSweep).await?;
+/// tools::dedup_sweep::sweep_semantic_duplicates(self, &mut session, params).await
 /// ```
 ///
 /// # Errors
@@ -100,7 +155,7 @@ use crate::server::EpiGraphMcpFull;
 pub(crate) async fn maintenance_viewer(
     server: &EpiGraphMcpFull,
     reason: SystemReason,
-) -> Result<MaintenanceSession<'_>, McpError> {
+) -> Result<GatedMaintenanceSession<'_>, McpError> {
     let scoped = server.scoped.as_ref().ok_or_else(|| {
         McpError::internal_error(
             "this MCP server was not built from a ScopedPool, so no maintenance \
@@ -108,8 +163,19 @@ pub(crate) async fn maintenance_viewer(
             None,
         )
     })?;
-    scoped
+    // Admission BEFORE the checkout, so a call waiting its turn holds nothing.
+    // The semaphore is a `static` that is never closed, so `acquire` cannot
+    // fail; the arm exists only because the signature is fallible.
+    let permit = MAINTENANCE_GATE
+        .acquire()
+        .await
+        .map_err(|e| McpError::internal_error(format!("maintenance gate closed: {e}"), None))?;
+    let session = scoped
         .maintenance_session(reason)
         .await
-        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))
+        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))?;
+    Ok(GatedMaintenanceSession {
+        session,
+        _permit: permit,
+    })
 }

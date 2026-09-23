@@ -63,57 +63,73 @@ struct RecomputeBeliefsResult {
 /// all labels) > bulk enumeration of every claim that has a BBA. Each target
 /// claim is recomputed on **every frame it carries BBAs on**, in frame-name
 /// order, so the frame-agnostic cached scalars converge deterministically.
+///
+/// # Where the statements run
+///
+/// On the maintenance `session`, never on `server.pool`: target selection and
+/// the per-claim frame lookup on its pinned connection, and the recompute —
+/// `recompute_claim_cached_belief`, which still takes a `&PgPool` — on
+/// [`epigraph_db::MaintenanceSession::pool`], the privileged pool that
+/// connection came from. The bypass viewer emits no predicate, so on an
+/// application connection under row security every group-private claim would
+/// be counted as `claims_skipped_no_bba` and its cache left stale, with no
+/// error. `_server` is unused and kept only so every tool function has the
+/// same shape.
 pub async fn recompute_beliefs(
-    server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _server: &EpiGraphMcpFull,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
     params: RecomputeBeliefsParams,
 ) -> Result<CallToolResult, McpError> {
-    let pool = &server.pool;
+    // Taken before `split`: `pool()` returns the session's `'a` borrow, not one
+    // tied to `&self`, so it coexists with the mutable connection borrow.
+    let maint_pool = session.pool();
+    let (conn, viewer) = session.split();
     let limit = params.limit.unwrap_or(500).clamp(1, 2000);
     let offset = params.offset.unwrap_or(0).max(0);
 
     let claim_ids_param = params.claim_ids.unwrap_or_default();
     let labels_param = params.labels.unwrap_or_default();
 
-    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) =
-        if !claim_ids_param.is_empty() {
-            let mut ids = Vec::with_capacity(claim_ids_param.len());
-            for s in &claim_ids_param {
-                ids.push(
-                    Uuid::parse_str(s.trim())
-                        .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
-                );
-            }
-            ("claim_ids", ids, false)
-        } else if !labels_param.is_empty() {
-            // Fetch limit+1 to distinguish "exactly limit, none remain" from
-            // "limit reached, more remain" (same trick as the bulk path).
-            let mut rows = ClaimRepository::list_by_labels(
-                pool,
-                viewer,
-                epigraph_db::LabelQuery {
-                    labels: &labels_param,
-                    current_only: true,
-                    limit: limit + 1,
-                    offset,
-                    ..Default::default()
-                },
-            )
+    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) = if !claim_ids_param
+        .is_empty()
+    {
+        let mut ids = Vec::with_capacity(claim_ids_param.len());
+        for s in &claim_ids_param {
+            ids.push(
+                Uuid::parse_str(s.trim())
+                    .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
+            );
+        }
+        ("claim_ids", ids, false)
+    } else if !labels_param.is_empty() {
+        // Fetch limit+1 to distinguish "exactly limit, none remain" from
+        // "limit reached, more remain" (same trick as the bulk path).
+        let mut rows = ClaimRepository::list_by_labels(
+            &mut *conn,
+            viewer,
+            epigraph_db::LabelQuery {
+                labels: &labels_param,
+                current_only: true,
+                limit: limit + 1,
+                offset,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+        let truncated = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
+        ("labels", ids, truncated)
+    } else {
+        // Fetch limit+1 to detect truncation, then trim back to limit.
+        let mut ids = MassFunctionRepository::list_claim_ids(&mut *conn, viewer, limit + 1, offset)
             .await
             .map_err(internal_error)?;
-            let truncated = rows.len() as i64 > limit;
-            rows.truncate(limit as usize);
-            let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
-            ("labels", ids, truncated)
-        } else {
-            // Fetch limit+1 to detect truncation, then trim back to limit.
-            let mut ids = MassFunctionRepository::list_claim_ids(pool, viewer, limit + 1, offset)
-                .await
-                .map_err(internal_error)?;
-            let truncated = ids.len() as i64 > limit;
-            ids.truncate(limit as usize);
-            ("all_with_bbas", ids, truncated)
-        };
+        let truncated = ids.len() as i64 > limit;
+        ids.truncate(limit as usize);
+        ("all_with_bbas", ids, truncated)
+    };
 
     let claims_considered = claim_ids.len();
     let mut claims_recomputed = 0usize;
@@ -122,7 +138,7 @@ pub async fn recompute_beliefs(
     let mut errors: Vec<RecomputeError> = Vec::new();
 
     for claim_id in claim_ids {
-        let frames = MassFunctionRepository::list_frames_for_claim(pool, viewer, claim_id)
+        let frames = MassFunctionRepository::list_frames_for_claim(&mut *conn, viewer, claim_id)
             .await
             .map_err(internal_error)?;
         if frames.is_empty() {
@@ -139,8 +155,10 @@ pub async fn recompute_beliefs(
             .next()
             .expect("frames is non-empty: checked above");
         let mut wrote_any = false;
-        match epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id)
-            .await
+        match epigraph_engine::edge_factor::recompute_claim_cached_belief(
+            maint_pool, viewer, claim_id,
+        )
+        .await
         {
             Ok(true) => {
                 frame_writes += 1;

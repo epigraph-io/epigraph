@@ -13,6 +13,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
+use epigraph_db::visibility::SystemReason;
 use epigraph_db::PerspectiveRepository;
 use epigraph_mcp::tools::ds_auto::ensure_binary_frame;
 use epigraph_mcp::types::{RecomputeBeliefsParams, SubmitDsEvidenceParams};
@@ -124,9 +125,14 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
 
     // No new evidence submitted — recompute_beliefs must reproduce the exact
     // same number from the exact same stored BBA rows.
+    let scoped = fixture::scoped_pool(&pool).await;
+    let mut session = scoped
+        .maintenance_session(SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut session,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -237,9 +243,14 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
 
     let submit_pignistic = cached_pignistic(&pool, claim).await;
 
+    let scoped = fixture::scoped_pool(&pool).await;
+    let mut session = scoped
+        .maintenance_session(SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
     let recompute_out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut session,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

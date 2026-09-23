@@ -100,11 +100,25 @@ struct SweepResponse {
     next_offset: i64,
 }
 
+/// # Where the statements run
+///
+/// Every statement runs on the maintenance `session`, never on `server.pool`:
+/// the enumeration, the neighbour probes and the hash lookup on its pinned
+/// connection, and the collapse — whose retraction cascade still takes a
+/// `&PgPool` — on [`epigraph_db::MaintenanceSession::pool`], the privileged pool
+/// that connection came from. The bypass viewer emits no predicate, so on an
+/// application connection under row security the sweep would enumerate only
+/// public rows and collapse nothing in any group, without erroring. `_server`
+/// is unused and kept only so every tool function has the same shape.
 pub async fn sweep_semantic_duplicates(
-    server: &EpiGraphMcpFull,
-    viewer: &epigraph_db::visibility::Viewer,
+    _server: &EpiGraphMcpFull,
+    session: &mut epigraph_db::MaintenanceSession<'_>,
     params: SweepSemanticDuplicatesParams,
 ) -> Result<CallToolResult, McpError> {
+    // Taken before `split`: `pool()` returns the session's `'a` borrow, not one
+    // tied to `&self`, so it coexists with the mutable connection borrow.
+    let maint_pool = session.pool();
+    let (conn, viewer) = session.split();
     let threshold = params.similarity_threshold.unwrap_or(0.10).clamp(0.0, 2.0);
     let limit = params.limit.unwrap_or(500).clamp(1, 2000);
     let offset = params.offset.unwrap_or(0).max(0);
@@ -120,7 +134,7 @@ pub async fn sweep_semantic_duplicates(
     };
 
     let candidates = ClaimRepository::enumerate_current_embedded(
-        &server.pool,
+        &mut *conn,
         viewer,
         agent_scope.as_deref(),
         params.labels_scope.as_deref(),
@@ -137,7 +151,7 @@ pub async fn sweep_semantic_duplicates(
 
     for c in &candidates {
         meta.insert(c.id, (c.truth_value, c.created_at));
-        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&server.pool, viewer, c.id, 5)
+        let neighbors = ClaimRepository::nearest_neighbors_of_claim(&mut *conn, viewer, c.id, 5)
             .await
             .map_err(internal_error)?;
         for n in neighbors {
@@ -165,7 +179,7 @@ pub async fn sweep_semantic_duplicates(
     }
 
     let all_ids: Vec<Uuid> = meta.keys().copied().collect();
-    let hashes = ClaimRepository::content_hashes_for(&server.pool, viewer, &all_ids)
+    let hashes = ClaimRepository::content_hashes_for(&mut *conn, viewer, &all_ids)
         .await
         .map_err(internal_error)?;
 
@@ -227,10 +241,7 @@ pub async fn sweep_semantic_duplicates(
                 // do not undo an already-committed collapse, so `pairs_marked`
                 // still counts the pair.
                 match epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-                    &server.pool,
-                    viewer,
-                    *dup,
-                    *survivor,
+                    maint_pool, viewer, *dup, *survivor,
                 )
                 .await
                 {

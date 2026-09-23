@@ -10,6 +10,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
+use epigraph_db::visibility::SystemReason;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::types::{GetClaimParams, RecomputeBeliefsParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
@@ -63,9 +64,14 @@ async fn recompute_and_label(
     claim: Uuid,
 ) -> Option<String> {
     let viewer = fixture::public_viewer(pool).await;
+    let scoped = fixture::scoped_pool(pool).await;
+    let mut session = scoped
+        .maintenance_session(SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
     tools::cdst_maintenance::recompute_beliefs(
         server,
-        &viewer,
+        &mut session,
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
