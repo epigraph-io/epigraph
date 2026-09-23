@@ -5008,14 +5008,46 @@ impl ClaimRepository {
     ///
     /// Takes `&mut PgConnection` for transactional composition.
     ///
+    /// # Why the insert attempt runs inside a SAVEPOINT
+    ///
+    /// The race-handling above is only expressible if the connection is still
+    /// usable after the failed INSERT, and inside a transaction it is not:
+    /// PostgreSQL aborts the whole transaction on the first failed statement, so
+    /// the `find_by_content_hash_and_agent` re-read in the catch path could not
+    /// run at all. MEASURED, by removing this savepoint and running
+    /// `claim_repo_helpers.rs::the_dedup_race_is_absorbed_inside_a_caller_transaction`:
+    /// the call fails with `25P02 current transaction is aborted, commands
+    /// ignored until end of transaction block`. So a genuine
+    /// `(content_hash, agent_id)` race — the only thing this method's dedup
+    /// contract exists for — stopped de-duplicating and started failing the
+    /// caller's whole unit of work the moment a writer wrapped it in a
+    /// transaction. `epigraph-mcp`'s submission path is that writer.
+    ///
+    /// The savepoint restores the contract without changing it: the refused
+    /// INSERT is rolled back alone, the re-find runs on a usable connection, and
+    /// the caller gets `(existing, false)`. Same construction as
+    /// `EventRepository::publish_or_log_conn` and
+    /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`, for the
+    /// same reason.
+    ///
+    /// On a connection that is NOT already in a transaction, `conn.begin()` is a
+    /// real `BEGIN`/`COMMIT` pair around the one INSERT — same durability, one
+    /// extra round trip, and the same visible behaviour the pre-savepoint code
+    /// had.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` for non-unique-violation database errors.
+    /// Returns `DbError::QueryFailed` for non-unique-violation database errors,
+    /// and for a failure to take or release the savepoint (the caller's
+    /// transaction is then already unusable and must not be handed back as if
+    /// the write had succeeded).
     pub async fn create_or_get(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
+        use sqlx::Acquire;
+
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
@@ -5030,7 +5062,28 @@ impl ClaimRepository {
             return Ok((existing, false));
         }
 
-        match Self::create_strict(&mut *conn, claim, decl).await {
+        let attempt = {
+            let mut sp = conn
+                .begin()
+                .await
+                .map_err(|source| DbError::QueryFailed { source })?;
+            match Self::create_strict(&mut sp, claim, decl).await {
+                Ok(c) => {
+                    sp.commit()
+                        .await
+                        .map_err(|source| DbError::QueryFailed { source })?;
+                    Ok(c)
+                }
+                Err(e) => {
+                    sp.rollback()
+                        .await
+                        .map_err(|source| DbError::QueryFailed { source })?;
+                    Err(e)
+                }
+            }
+        };
+
+        match attempt {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
                 // Post-107 race: another writer won. Re-find and return.
