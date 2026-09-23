@@ -399,3 +399,54 @@ async fn crud_rs_refuses_without_auth() {
     ];
     assert_refused(router, &cases).await;
 }
+
+#[tokio::test]
+async fn edges_rs_refuses_without_auth() {
+    use routes::edges;
+    let router = Router::new()
+        .route("/api/v1/edges", post(edges::create_edge))
+        .route(
+            "/api/v1/edges/:id",
+            axum::routing::delete(edges::delete_edge).patch(edges::patch_edge),
+        )
+        .route(
+            "/api/v1/edges/hierarchical",
+            post(edges::create_hierarchical_edge),
+        )
+        .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
+        .with_state(unreachable_state());
+    let id = Uuid::new_v4();
+    let cases = [
+        viewer_case(
+            "edges.rs::create_edge",
+            Method::POST,
+            "/api/v1/edges".into(),
+            Some(json!({})),
+        ),
+        case(
+            "edges.rs::delete_edge",
+            Method::DELETE,
+            format!("/api/v1/edges/{id}"),
+            None,
+        ),
+        viewer_case(
+            "edges.rs::create_hierarchical_edge",
+            Method::POST,
+            "/api/v1/edges/hierarchical".into(),
+            Some(json!({})),
+        ),
+        case(
+            "edges.rs::patch_edge",
+            Method::PATCH,
+            format!("/api/v1/edges/{id}"),
+            Some(json!({"properties": {"k": 1}})),
+        ),
+        case(
+            "edges.rs::relate_claims",
+            Method::POST,
+            format!("/api/v1/claims/{id}/relate"),
+            Some(json!({"target_claim_id": Uuid::new_v4()})),
+        ),
+    ];
+    assert_refused(router, &cases).await;
+}

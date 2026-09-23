@@ -54,9 +54,28 @@
 //! * `is_valid_entity_type`, `entity_exists` — reached only from `create_edge`,
 //!   as above.
 //!
-//! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES` and
-//! `AUTH_OPTIONAL_PROVENANCE_SITES` rows for this file all sit in those write
-//! handlers and are unchanged.
+//! `viewer_route_table_lint.rs`'s `AUTH_OPTIONAL_PROVENANCE_SITES` rows for this
+//! file sit in those write handlers and are unchanged. Its five
+//! `FAIL_OPEN_SCOPE_SITES` rows are gone: the fail-open-scope-sites conversion
+//! made all five write handlers refuse 401 when no `AuthContext` reached them,
+//! instead of skipping the `edges:write` check.
+//!
+//! # What that conversion did NOT decide: may-see vs may-modify
+//!
+//! A scope check says the caller may write edges; it says nothing about WHICH
+//! edges. `delete_edge`, `patch_edge` and `relate_claims` pass no `Viewer` and
+//! their repo calls (`EdgeRepository::retract_by_id`,
+//! `update_valid_to_and_properties`, `create`) carry no write-side ownership
+//! predicate, so at the application layer any holder of `edges:write` can
+//! retract or patch an edge it can only read, or cannot see. `edges` is the one
+//! co-owned table (migration 072, `Viewer::edge_predicate_fragment`), so its
+//! write predicate forces a decision no other table asks: whether "may modify"
+//! is the INTERSECTION of the read predicate with a writable-group predicate
+//! over BOTH endpoints' owners, or something narrower. That is a semantic
+//! authorization change that can refuse writes legitimate co-owners make today,
+//! so it is deliberately NOT bundled with the mechanical conversion. It is
+//! registered as `F-edges-write-predicate-undecided` in
+//! `docs/tenancy/progress.json`.
 //!
 //! `claim_provenance` carries an open finding, `F-SEC14-A`. Converting its
 //! executor does NOT discharge it — that entry's remedy is a different change to
@@ -569,10 +588,12 @@ pub async fn create_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateEdgeRequest>,
 ) -> Result<(StatusCode, Json<EdgeResponse>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     // Validate entity types against the registry cache (single source of truth).
     if !is_valid_entity_type(&state, &request.source_type).await {
@@ -868,10 +889,12 @@ pub async fn delete_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     let deleted = EdgeRepository::retract_by_id(&state.db_pool, id).await?;
 
@@ -997,10 +1020,12 @@ pub async fn create_hierarchical_edge(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<LinkHierarchicalRequest>,
 ) -> Result<(StatusCode, Json<LinkHierarchicalResponse>), ApiError> {
-    // Enforce scope when OAuth2-authenticated (mirrors generic POST /api/v1/edges).
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     // Tight relationship allow-list — narrower than VALID_RELATIONSHIPS by design.
     if !is_hierarchical_relationship(&request.relationship) {
@@ -1111,10 +1136,12 @@ pub async fn patch_edge(
     Path(id): Path<Uuid>,
     Json(request): Json<PatchEdgeRequest>,
 ) -> Result<Json<EdgeResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated (mirrors create_edge / delete_edge).
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     if request.is_empty() {
         return Err(ApiError::ValidationError {
@@ -1267,10 +1294,12 @@ pub async fn relate_claims(
     Path(source_id): Path<Uuid>,
     Json(request): Json<RelateClaimsRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
 
     if source_id == request.target_claim_id {
         return Err(ApiError::ValidationError {

@@ -347,7 +347,12 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // `record_provenance` blocks are SEPARATE `if let`s, deliberately
     // untouched — still counted, in the other register, where the count
     // stays 4.
-    ("edges.rs", 5),
+    // `("edges.rs", 5)` REMOVED by the fail-open-scope-sites conversion: the
+    // five write handlers refuse 401 without an `AuthContext` and check
+    // `edges:write` unconditionally. That settles who may call, NOT which
+    // edges they may modify — the may-see-vs-may-modify predicate on the
+    // co-owned `edges` table is still undecided and is registered separately
+    // as `F-edges-write-predicate-undecided` in `docs/tenancy/progress.json`.
     // `("papers.rs", 1)` REMOVED by the fail-open-scope-sites conversion:
     // `create_paper` refuses 401 without an `AuthContext` and checks
     // `claims:write` unconditionally.
