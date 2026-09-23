@@ -3,9 +3,10 @@
 //!
 //! `GET /claims/:id` is required (404 page / 502 page / login redirect).
 //! Everything else is an optional section fetched concurrently under the
-//! global upstream semaphore and degraded independently. When the claim
-//! comes back `"[REDACTED]"` no other sub-call is made at all: several of
-//! them (`/evidence`, `/challenges`, …) do not redact upstream.
+//! global upstream semaphore and degraded independently. A claim this
+//! viewer may not read 404s upstream, so `compose` never returns for one:
+//! the page is the ordinary not-found page (`68b8a8b1` — absent, not
+//! blanked).
 
 use serde::Serialize;
 use uuid::Uuid;
@@ -20,7 +21,7 @@ use crate::links::{with_centre_claim, Links};
 use crate::upstream::core::{ChallengeList, ClaimEvidence, ClaimProvenance, EvidenceEdgeList};
 use crate::upstream::{
     degrade, truncate_chars, Api, BeliefResponse, ClaimResponse, Degraded, PlacementResponse,
-    DEFAULT_EGO_DEGREE, REDACTED,
+    DEFAULT_EGO_DEGREE,
 };
 
 /// Longest evidence / challenge text rendered inline; the entity page has
@@ -30,9 +31,6 @@ const INLINE_TEXT_CHARS: usize = 600;
 pub const OG_TITLE_CHARS: usize = 100;
 /// Labels quoted in `og:description`.
 const OG_LABELS: usize = 3;
-
-/// Reason given for every section of a redacted claim.
-pub const HIDDEN: &str = "Hidden: you cannot see this claim's content.";
 
 /// Links from the claim to its other views.
 #[derive(Debug, Clone, Serialize)]
@@ -47,8 +45,6 @@ pub struct ClaimUrls {
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaimView {
     pub id: Uuid,
-    /// Upstream withheld the content from this viewer.
-    pub redacted: bool,
     pub claim: ClaimResponse,
     pub urls: ClaimUrls,
     pub belief: Degraded<BeliefResponse>,
@@ -137,7 +133,7 @@ impl PlacementView {
 }
 
 impl ClaimView {
-    /// The claim text for display (never called for a redacted claim).
+    /// The claim text for display.
     pub fn content(&self) -> &str {
         &self.claim.content
     }
@@ -190,23 +186,6 @@ pub async fn compose(api: &Api<'_>, links: &Links, id: Uuid) -> Result<ClaimView
         agent: claim.agent_id.map(|a| links.agent(a)),
     };
 
-    if claim.is_redacted() {
-        return Ok(ClaimView {
-            id,
-            redacted: true,
-            claim,
-            urls,
-            belief: Degraded::unavailable(HIDDEN),
-            outlinks: Degraded::unavailable(HIDDEN),
-            evidence: Degraded::unavailable(HIDDEN),
-            supporting: Degraded::unavailable(HIDDEN),
-            contradicting: Degraded::unavailable(HIDDEN),
-            challenges: Degraded::unavailable(HIDDEN),
-            provenance: Degraded::unavailable(HIDDEN),
-            placement: Degraded::unavailable(HIDDEN),
-        });
-    }
-
     let (belief, ego, evidence, supporting, contradicting, challenges, provenance, placement) = tokio::join!(
         api.belief(id),
         api.ego(id, DEFAULT_EGO_DEGREE, None),
@@ -220,7 +199,6 @@ pub async fn compose(api: &Api<'_>, links: &Links, id: Uuid) -> Result<ClaimView
 
     Ok(ClaimView {
         id,
-        redacted: false,
         claim,
         urls,
         belief: degrade(belief)?,
@@ -302,9 +280,7 @@ fn provenance_rows(p: ClaimProvenance, links: &Links) -> Vec<ProvenanceRow> {
                 .into_iter()
                 .map(|s| {
                     let entity_type = s.entity_type.to_ascii_lowercase();
-                    let text = if s.label == REDACTED {
-                        "Content hidden".to_string()
-                    } else if s.label.trim().is_empty() {
+                    let text = if s.label.trim().is_empty() {
                         format!("{entity_type} {}", short_id(s.id))
                     } else {
                         one_line(&s.label)
@@ -349,8 +325,10 @@ pub struct Og {
     pub url: String,
 }
 
-/// A card that says nothing about the claim: for anonymous viewers without
-/// `PUBLIC_UNFURL`, and for redacted claims.
+/// A card that says nothing about the claim. Every anonymous `/claim/:id`
+/// request gets this one: under tenancy there is no anonymous read at all
+/// (the API's public allowlist is `/health`, `/api/v1/openapi.json` and the
+/// OAuth paths), so there is nothing else it could say.
 pub fn og_generic(url: String) -> Og {
     Og {
         title: "A claim in EpiGraph".into(),
@@ -359,9 +337,9 @@ pub fn og_generic(url: String) -> Og {
     }
 }
 
-/// A card for a readable claim. Never call it with a redacted claim.
+/// A card for a claim this viewer read. Reaching it means upstream returned
+/// the claim, so the text is the viewer's to see.
 pub fn og_for_claim(claim: &ClaimResponse, belief: Option<&BeliefResponse>, url: String) -> Og {
-    debug_assert!(!claim.is_redacted());
     let text = one_line(&claim.content);
     let title = if text.is_empty() {
         "A claim in EpiGraph".to_string()

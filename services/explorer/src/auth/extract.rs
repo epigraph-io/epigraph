@@ -75,8 +75,9 @@ impl RequestAuth {
 
     /// A stable, non-secret key for per-viewer caches (plan §3.4 "60 s
     /// cache, keyed per user"): `anon`, `dev`, or `s:<16 hex of
-    /// sha256(session id)>`. Upstream redaction differs per viewer, so any
-    /// cached upstream data must be keyed by this.
+    /// sha256(session id)>`. Upstream visibility differs per viewer — two
+    /// viewers get different result sets from the same URL — so any cached
+    /// upstream data must be keyed by this.
     pub fn cache_key(&self) -> String {
         match self {
             RequestAuth::Anonymous => "anon".into(),

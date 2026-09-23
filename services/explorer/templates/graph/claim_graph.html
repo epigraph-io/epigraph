@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{% if redacted %}Hidden claim{% else %}{{ title }}{% endif %} · Graph · {{ ctx.product_name() }}{% endblock %}
+{% block title %}{{ title }} · Graph · {{ ctx.product_name() }}{% endblock %}
 
 {% block head %}
 <link rel="stylesheet" href="{{ ctx.static_url("graph.css") }}">
@@ -10,11 +10,7 @@
 {% block content %}
 <p class="graph-crumbs small"><a href="{{ claim_href }}">← Back to the claim</a></p>
 <h1 class="graph-title">Claim graph</h1>
-{%- if redacted %}
-<p class="claim-text claim-text--redacted">You do not have access to this claim's text.</p>
-{%- else %}
 <p class="claim-text graph-lead">{{ title }}</p>
-{%- endif %}
 {%- if truncated %}
 <p class="notice notice--warn small">This claim has {{ total_edges }} connections; the graph shows the {{ shown_edges }} most recent.</p>
 {%- endif %}
@@ -32,7 +28,7 @@
     {%- for n in neighbours %}
     <li class="graph-row graph-row--{{ n.family }}">
       <span class="graph-row__rel">{% if n.outgoing %}{{ n.relationship }} →{% else %}← {{ n.relationship }}{% endif %}</span>
-      {% if let Some(href) = n.href %}<a href="{{ href }}"{% if n.redacted %} class="muted"{% endif %}>{{ n.label }}</a>{% else %}<span>{{ n.label }}</span>{% endif %}
+      {% if let Some(href) = n.href %}<a href="{{ href }}">{{ n.label }}</a>{% else %}<span>{{ n.label }}</span>{% endif %}
       <span class="small muted">{{ n.entity_type }}</span>
     </li>
     {%- endfor %}

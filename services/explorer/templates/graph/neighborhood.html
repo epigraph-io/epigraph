@@ -34,7 +34,7 @@
   <ul class="link-list graph-list">
     {%- for c in nodes %}
     <li class="graph-row">
-      <a href="{{ c.href }}"{% if c.redacted %} class="muted"{% endif %}>{{ c.label }}</a>
+      <a href="{{ c.href }}">{{ c.label }}</a>
       <span class="small muted num">belief {{ c.betp }}</span>
     </li>
     {%- endfor %}
@@ -51,7 +51,7 @@
   <ul class="link-list graph-list">
     {%- for g in groups %}
     <li class="graph-row">
-      <a href="{{ g.href }}"{% if g.redacted %} class="muted"{% endif %}>{{ g.label }}</a>
+      <a href="{{ g.href }}">{{ g.label }}</a>
       <span class="small muted num">{{ g.member_count }} atoms here</span>
     </li>
     {%- endfor %}

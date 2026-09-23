@@ -50,8 +50,10 @@ pub struct ClaimEvidence {
 
 // ---- GET /api/v1/claims/:id/{supporting,contradicting}-evidence -------------
 
-/// `{claim_id, relationship, evidence, total}` (edges.rs:2405-2497). An empty
-/// list when the centre claim is redacted for this viewer.
+/// `{claim_id, relationship, evidence, total}` (edges.rs:2405-2497). Empty
+/// when the viewer cannot see the centre claim OR it has no such evidence —
+/// the two are indistinguishable by design: this endpoint never had a
+/// claim-existence check, so a 404 would newly disclose which ids exist.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EvidenceEdgeList {
     pub claim_id: Uuid,
@@ -168,11 +170,10 @@ pub struct SemanticSearchResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct SemanticHit {
     pub claim_id: Uuid,
-    /// `claims.content`, or [`super::REDACTED`] for a hit this viewer may not
-    /// read: since the §2.6 sweep `search::semantic_search` redacts both the
-    /// hits and their `graph_neighbors[].statement` through
-    /// `access_control::redact_claim_fields`. The route takes an optional
-    /// bearer, so an anonymous caller sees only public claims' text.
+    /// `claims.content`. `search::semantic_search` carries a viewer and
+    /// filters in the repo layer, so a hit this viewer may not read is not
+    /// in the result set at all — neither among the hits nor among their
+    /// `graph_neighbors[].statement`.
     #[serde(default)]
     pub statement: String,
     #[serde(default)]

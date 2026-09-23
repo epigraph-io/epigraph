@@ -55,6 +55,9 @@ pub struct StatRow {
     pub value: String,
 }
 
+/// `GET /api/v1/stats` is per-viewer: every count is of rows this viewer
+/// may read, not of rows that exist. Two signed-in readers get different
+/// numbers, and the page must not present them as the corpus size.
 #[derive(Debug, Clone)]
 pub struct StatsView {
     pub rows: Vec<StatRow>,
@@ -113,9 +116,27 @@ async fn landing(State(state): State<AppState>, user: SignedIn) -> Result<Html<S
     })
 }
 
+/// The OG card for a sessionless request: claim text from an anonymous
+/// upstream read when `PUBLIC_UNFURL=true`; otherwise (or on any upstream
+/// failure) a generic card, with no upstream call at all when unfurling is
+/// off.
+async fn anonymous_og(state: &AppState, caller: &Caller, id: Uuid, canonical: String) -> Og {
+    if !state.config.public_unfurl {
+        return og_generic(canonical);
+    }
+    match caller.api(state).claim(id).await {
+        Ok(c) => og_for_claim(&c, None, canonical),
+        Err(e) => {
+            tracing::debug!(error = %e, "anonymous unfurl read failed; generic card");
+            og_generic(canonical)
+        }
+    }
+}
+
 /// Per-viewer TTL cache in front of an upstream call. Only successes are
-/// cached; the key must carry `RequestAuth::cache_key` (redaction differs
-/// per viewer). `call` is not polled on a hit.
+/// cached; the key must carry `RequestAuth::cache_key` (upstream visibility
+/// differs per viewer, so two viewers get different result sets from the
+/// same URL). `call` is not polled on a hit.
 async fn cached<T, F>(state: &AppState, key: String, call: F) -> Result<Arc<T>, UpstreamError>
 where
     T: Send + Sync + 'static,
@@ -314,32 +335,10 @@ async fn claim(
 
     let api = caller.api(&state);
     let view = compose(&api, &state.links, id).await?;
-    let og = if view.redacted {
-        og_generic(canonical)
-    } else {
-        og_for_claim(&view.claim, view.belief.get(), canonical)
-    };
+    let og = og_for_claim(&view.claim, view.belief.get(), canonical);
     render(&ClaimPage {
         ctx: caller.ctx,
         view,
         og,
     })
-}
-
-/// The OG card for a sessionless request: claim text only when
-/// `PUBLIC_UNFURL=true` and an anonymous upstream read is not redacted;
-/// otherwise (or on any upstream failure) a generic card, with no upstream
-/// call at all when unfurling is off.
-async fn anonymous_og(state: &AppState, caller: &Caller, id: Uuid, canonical: String) -> Og {
-    if !state.config.public_unfurl {
-        return og_generic(canonical);
-    }
-    match caller.api(state).claim(id).await {
-        Ok(c) if !c.is_redacted() => og_for_claim(&c, None, canonical),
-        Ok(_) => og_generic(canonical),
-        Err(e) => {
-            tracing::debug!(error = %e, "anonymous unfurl read failed; generic card");
-            og_generic(canonical)
-        }
-    }
 }

@@ -1,7 +1,7 @@
 //! Core area against a wiremock upstream: the landing page, search in all
 //! three modes, the composed claim page (grouped outlinks, evidence,
-//! redaction short-circuit, degraded sections, OG), anonymous unfurls, and
-//! the `/bff/claim` ETag. Upstream JSON is shaped exactly like the mapping
+//! absent-not-blanked claims, degraded sections, OG), the anonymous
+//! sign-in prompt, and the `/bff/claim` ETag. Upstream JSON is shaped exactly like the mapping
 //! reports (`claims-endpoints.md`, `search-overview-endpoints.md`, plan
 //! §2.2–§2.4), including omitted optional fields.
 
@@ -66,7 +66,7 @@ fn belief_json() -> Value {
 }
 
 fn ego_node(id: &str, entity_type: &str, label: &str) -> Value {
-    let mut n = json!({"id": id, "entity_type": entity_type, "label": label, "redacted": false});
+    let mut n = json!({"id": id, "entity_type": entity_type, "label": label});
     if entity_type == "claim" {
         n["content"] = json!(label);
         n["truth_value"] = json!(0.5);
@@ -366,7 +366,7 @@ async fn claim_page_groups_outlinks_by_family_and_direction() {
 }
 
 /// Fewer edges than `total_edges` is not, on its own, truncation: `/ego`
-/// subtracts redaction-dropped edges from `total_edges` and reserves
+/// counts `total_edges` inside its viewer-filtered read and reserves
 /// `truncated` for its degree cap. Raising the notice anyway offered a dead
 /// link (the graph view reads the same `/ego`) and published a count of the
 /// neighbours the viewer may not see.
@@ -382,8 +382,8 @@ async fn short_edge_list_without_upstream_truncation_shows_no_notice() {
     )
     .await;
     // Upstream's own `truncated` is false while `total_edges` (57) exceeds
-    // the seven edges it returned — the shape a redacted neighbourhood has.
-    // Every other sub-call is unmounted and degrades, which the page allows.
+    // the seven edges it returned. Every other sub-call is unmounted and
+    // degrades, which the page allows.
     let mut ego = ego_json();
     ego["truncated"] = json!(false);
     mount_get(&app, &claim_path("/ego"), 200, ego, 1).await;
@@ -527,14 +527,20 @@ async fn placement_links_from_the_claim_page_open_a_shareable_view() {
     app.upstream.verify().await;
 }
 
+/// §8.5: a claim the viewer may not read is ABSENT, not blanked. Upstream
+/// 404s it, byte-identically to a claim that does not exist, and the
+/// Explorer must do the same — a distinct "you may not have access" page
+/// would rebuild in the UI exactly the existence oracle the API deleted
+/// (`68b8a8b1`).
 #[tokio::test]
-async fn redacted_claim_skips_every_other_sub_call() {
+async fn invisible_claim_is_the_same_404_as_a_missing_one() {
     let app = spawn().await;
     mount_get(
         &app,
         &claim_path(""),
-        200,
-        claim_json("[REDACTED]", &["secret-project"]),
+        404,
+        json!({"error": "NotFound", "message": format!("Claim with ID {CLAIM} not found"),
+               "details": {"entity": "Claim", "id": CLAIM}}),
         2,
     )
     .await;
@@ -542,47 +548,48 @@ async fn redacted_claim_skips_every_other_sub_call() {
     let sid = app.sign_in("tok");
 
     let res = app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert!(res
-        .body
-        .contains("You cannot see the content of this claim."));
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.contains("We could not find that claim."));
     assert!(
-        !res.body.contains("[REDACTED]"),
-        "the marker is never shown"
+        !res.body.contains("Hidden") && !res.body.contains("cannot see"),
+        "the page says nothing about access: {}",
+        res.body
     );
-    assert!(
-        !res.body.contains("secret-project"),
-        "labels stay out of the page and OG"
+
+    // A syntactically valid id that upstream has never heard of takes the
+    // same path, and the two pages must not differ by one byte.
+    let unknown = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a99";
+    let missing = app
+        .get_as(&format!("/explorer/claim/{unknown}"), &sid)
+        .await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+    // Byte-identical once the id the caller asked for is substituted: the
+    // only occurrence of it is the `og:url` canonical, which echoes the
+    // request. Nothing else on the page distinguishes the two cases.
+    assert_eq!(
+        res.body.replace(CLAIM, unknown),
+        missing.body,
+        "an invisible claim and an unknown one render the same page"
     );
-    assert!(res
-        .body
-        .contains("<meta property=\"og:title\" content=\"A claim in EpiGraph\">"));
-    assert!(!res.body.contains("Connections"), "no sections rendered");
 
     let res = app
         .get_as(&format!("/explorer/bff/claim/{CLAIM}"), &sid)
         .await;
-    assert_eq!(res.status, StatusCode::OK);
-    let v = res.json();
-    assert_eq!(v["redacted"], true);
-    for section in [
-        "belief",
-        "outlinks",
-        "evidence",
-        "supporting",
-        "contradicting",
-        "challenges",
-        "provenance",
-        "placement",
-    ] {
-        assert_eq!(v[section]["status"], "unavailable", "{section}");
-    }
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert_eq!(res.json()["error"], "not_found");
 
+    // Only `GET /claims/:id` was called, for each of the three requests:
+    // the 404 stops the compose before any other sub-call, exactly as the
+    // old short-circuit did.
     let calls = upstream_paths(&app).await;
     assert_eq!(
         calls,
-        vec![claim_path(""), claim_path("")],
-        "only GET /claims/:id was called"
+        vec![
+            claim_path(""),
+            format!("/api/v1/claims/{unknown}"),
+            claim_path("")
+        ],
+        "no content-bearing sub-call"
     );
 }
 
@@ -763,30 +770,18 @@ async fn anonymous_claim_unfurls_from_an_anonymous_read_when_enabled() {
 }
 
 #[tokio::test]
-async fn anonymous_unfurl_of_a_redacted_or_failing_read_is_generic() {
+async fn anonymous_unfurl_of_a_failing_read_is_generic() {
     let app = spawn_with(&[(ENV_PUBLIC_UNFURL, "true")], Router::new()).await;
-    Mock::given(method("GET"))
-        .and(path(claim_path("")))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(claim_json("[REDACTED]", &["secret-project"])),
-        )
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(&app.upstream)
-        .await;
     Mock::given(method("GET"))
         .and(path(claim_path("")))
         .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
         .mount(&app.upstream)
         .await;
-    for _ in 0..2 {
-        let res = app.get(&format!("/explorer/claim/{CLAIM}")).await;
-        assert_eq!(res.status, StatusCode::OK);
-        assert!(res
-            .body
-            .contains("<meta property=\"og:title\" content=\"A claim in EpiGraph\">"));
-        assert!(!res.body.contains("REDACTED") && !res.body.contains("secret-project"));
-    }
+    let res = app.get(&format!("/explorer/claim/{CLAIM}")).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res
+        .body
+        .contains("<meta property=\"og:title\" content=\"A claim in EpiGraph\">"));
 }
 
 #[tokio::test]
@@ -959,7 +954,7 @@ async fn semantic_search_posts_the_query_and_links_results() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "results": [
                 semantic_hit(CLAIM, CONTENT, 0.923),
-                semantic_hit(SUPPORTED, "[REDACTED]", 0.5)
+                semantic_hit(SUPPORTED, "A second claim.", 0.5)
             ],
             "total": 2, "query_time_ms": 12
         })))
@@ -978,10 +973,11 @@ async fn semantic_search_posts_the_query_and_links_results() {
     assert!(body.contains("92% match"));
     assert!(body.contains("truth 0.80"));
     assert!(body.contains("belief [0.60, 0.90]"));
+    // Every hit upstream returns is one this viewer may read; search
+    // filters in the repo layer, so there are no placeholder rows.
     assert!(body.contains(&format!(
-        "<a href=\"/explorer/claim/{SUPPORTED}\" class=\"result__hidden\">Content hidden</a>"
+        "<a href=\"/explorer/claim/{SUPPORTED}\">A second claim.</a>"
     )));
-    assert!(!body.contains("[REDACTED]"));
     assert!(
         body.contains("the EpiGraph API cannot page further"),
         "unpaged mode says so"

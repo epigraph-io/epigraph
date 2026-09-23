@@ -12,9 +12,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The literal upstream substitutes for content the viewer may not see.
-pub const REDACTED: &str = "[REDACTED]";
-
 /// Error body of every `ApiError` response: `{error, message, details?}`
 /// (`errors.rs:58-148`). NOT RFC 6749 — OAuth errors use this shape too.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -34,7 +31,8 @@ pub struct ApiErrorBody {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ClaimResponse {
     pub id: Uuid,
-    /// Full text (≤ 64 KB), or [`REDACTED`].
+    /// Full text (≤ 64 KB). Always the real text: upstream 404s a claim
+    /// this viewer may not read rather than returning it blanked.
     #[serde(default)]
     pub content: String,
     #[serde(default)]
@@ -60,15 +58,6 @@ pub struct ClaimResponse {
     pub labels: Vec<String>,
     #[serde(default)]
     pub was_created: bool,
-}
-
-impl ClaimResponse {
-    /// True when upstream withheld the content from this viewer. Callers
-    /// must then skip every other content-bearing sub-call and keep the text
-    /// out of OG tags (plan §3.4 "Rules for rendering").
-    pub fn is_redacted(&self) -> bool {
-        self.content == REDACTED
-    }
 }
 
 /// `GET /api/v1/claims/:id/belief` (`belief.rs:35-47`). Every field is
@@ -131,8 +120,6 @@ pub struct EgoNode {
     pub labels: Vec<String>,
     #[serde(default)]
     pub is_current: Option<bool>,
-    #[serde(default)]
-    pub redacted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -233,7 +220,8 @@ pub struct ProvenanceChainResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ChainNode {
     pub id: Uuid,
-    /// [`REDACTED`] when `redacted`.
+    /// The claim text. A node the viewer may not read is absent from
+    /// `nodes` entirely, so this is never a placeholder.
     #[serde(default)]
     pub content: String,
     #[serde(default)]
@@ -244,8 +232,6 @@ pub struct ChainNode {
     pub is_current: Option<bool>,
     #[serde(default)]
     pub depth: u32,
-    #[serde(default)]
-    pub redacted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -276,17 +262,16 @@ mod tests {
         .unwrap();
         assert!(c.labels.is_empty());
         assert!(c.trace_id.is_none());
-        assert!(!c.is_redacted());
         assert!(c.updated_at.is_some());
 
         let r: ClaimResponse = serde_json::from_value(json!({
             "id": "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10",
-            "content": "[REDACTED]",
+            "content": "Sodium is a metal.",
             "labels": ["a", "b"],
             "created_at": "2026-01-02T03:04:05+00:00"
         }))
         .unwrap();
-        assert!(r.is_redacted());
+        assert!(r.updated_at.is_none());
         assert_eq!(r.labels, ["a", "b"]);
     }
 
@@ -308,9 +293,9 @@ mod tests {
         let e: EgoResponse = serde_json::from_value(json!({
             "center": {"id": "00000000-0000-0000-0000-000000000001", "entity_type": "claim",
                        "label": "c", "content": "c", "truth_value": 0.5, "labels": [],
-                       "is_current": true, "redacted": false},
+                       "is_current": true},
             "nodes": [{"id": "00000000-0000-0000-0000-000000000002", "entity_type": "paper",
-                       "label": "paper", "redacted": false}],
+                       "label": "paper"}],
             "edges": [
                 {"id": "00000000-0000-0000-0000-00000000000a",
                  "source_id": "00000000-0000-0000-0000-000000000002",
@@ -358,7 +343,7 @@ mod tests {
             "root": "00000000-0000-0000-0000-000000000001",
             "nodes": [{"id": "00000000-0000-0000-0000-000000000001", "content": "x",
                        "truth_value": 0.5, "labels": ["l"], "is_current": true,
-                       "depth": 0, "redacted": false}],
+                       "depth": 0}],
             "edges": [{"source": "00000000-0000-0000-0000-000000000002",
                        "target": "00000000-0000-0000-0000-000000000001",
                        "relationship": "supports"}],
@@ -376,10 +361,13 @@ mod tests {
     ///
     /// - `crates/epigraph-api/src/routes/ego.rs:52-93` — `EgoNode`'s five
     ///   claim-only fields carry `skip_serializing_if = "Option::is_none"`, so
-    ///   a non-claim neighbour arrives as four keys and nothing else; `label`
-    ///   and `redacted` are always present. `labels` is `Option<Vec<String>>`
-    ///   upstream and `Vec<String>` here, which is only safe because the skip
-    ///   means it is *omitted* rather than `null`.
+    ///   a non-claim neighbour arrives as three keys and nothing else; `label`
+    ///   is always present. `labels` is `Option<Vec<String>>` upstream and
+    ///   `Vec<String>` here, which is only safe because the skip means it is
+    ///   *omitted* rather than `null`.
+    ///
+    /// Neither `EgoNode` nor `ChainNode` carries a `redacted` flag: a node the
+    /// viewer may not read is omitted from the response (`68b8a8b1`).
     /// - `crates/epigraph-api/src/routes/placement.rs:29-40` — the one route
     ///   that deliberately serialises nulls: "no neighbourhood" has to be
     ///   distinguishable from "field not read".
@@ -392,15 +380,14 @@ mod tests {
     ///   increments (`repos/provenance_chain.rs:143,151`).
     #[test]
     fn kernel_routes_serialize_into_these_dtos() {
-        // ego: a redacted centre, an unhydratable neighbour (every optional
-        // key omitted), and the `direction` values the kernel emits.
+        // ego: an unhydratable neighbour (every optional key omitted), and
+        // the `direction` values the kernel emits.
         let e: EgoResponse = serde_json::from_value(json!({
             "center": {"id": "00000000-0000-0000-0000-000000000001",
-                       "entity_type": "claim", "label": "[REDACTED]",
-                       "redacted": true, "content": "[REDACTED]"},
+                       "entity_type": "claim", "label": "Water boils.",
+                       "content": "Water boils."},
             "nodes": [{"id": "00000000-0000-0000-0000-000000000002",
-                       "entity_type": "workflow", "label": "workflow",
-                       "redacted": false}],
+                       "entity_type": "workflow", "label": "workflow"}],
             "edges": [{"id": "00000000-0000-0000-0000-00000000000a",
                        "source_id": "00000000-0000-0000-0000-000000000001",
                        "target_id": "00000000-0000-0000-0000-000000000002",
@@ -409,13 +396,13 @@ mod tests {
             "total_edges": 1, "truncated": false
         }))
         .unwrap();
-        assert!(e.center.redacted && e.center.content.as_deref() == Some(REDACTED));
+        assert_eq!(e.center.content.as_deref(), Some("Water boils."));
         assert!(e.nodes[0].labels.is_empty(), "omitted labels read as empty");
         assert!(e.nodes[0].truth_value.is_none() && e.nodes[0].is_current.is_none());
         assert_eq!(e.edges[0].direction, EdgeDirection::Out);
         assert_eq!(e.edges[0].neighbour_id(), e.nodes[0].id);
 
-        // placement: the redacted / unclustered answer is explicit nulls.
+        // placement: the unclustered answer is explicit nulls.
         let p: PlacementResponse = serde_json::from_value(json!({
             "claim_id": "00000000-0000-0000-0000-000000000001",
             "theme_id": null, "cluster_run_id": null, "cluster_id": null,
@@ -438,9 +425,8 @@ mod tests {
         let c: ProvenanceChainResponse = serde_json::from_value(json!({
             "root": "00000000-0000-0000-0000-000000000001",
             "nodes": [{"id": "00000000-0000-0000-0000-000000000001",
-                       "content": "[REDACTED]", "truth_value": 0.0,
-                       "labels": [], "is_current": false, "depth": 3,
-                       "redacted": true}],
+                       "content": "Derived.", "truth_value": 0.0,
+                       "labels": [], "is_current": false, "depth": 3}],
             "edges": [{"source": "00000000-0000-0000-0000-000000000001",
                        "target": "00000000-0000-0000-0000-000000000002",
                        "relationship": "derived_from"}],
@@ -451,7 +437,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.nodes[0].depth, 3);
         assert_eq!(c.nodes[0].is_current, Some(false));
-        assert!(c.nodes[0].redacted && c.truncated);
+        assert!(c.truncated);
         assert_eq!(c.cycles[0].len(), 2);
     }
 

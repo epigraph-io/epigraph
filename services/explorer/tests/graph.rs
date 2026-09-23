@@ -13,7 +13,10 @@ use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 const CLAIM: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
-const SECRET: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a11";
+const SECOND: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a11";
+/// A neighbour this viewer may not read: upstream returns no node for it,
+/// and the ported `/ego` drops its edges too.
+const ABSENT: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a13";
 const OTHER: &str = "0b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a12";
 const AGENT: &str = "1b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
 const PAPER: &str = "5b9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a10";
@@ -29,24 +32,26 @@ const EDGE4: &str = "7a9a5a4e-5f43-4c4b-9a52-3f0d1e2c7a13";
 
 const HOSTILE: &str = "\"><script>alert(1)</script>";
 
-/// `GET /api/v1/claims/:id/ego` as plan §2.2 specifies it: a redacted
-/// neighbour, a paper (no page), an agent, and optional fields omitted.
+/// `GET /api/v1/claims/:id/ego` as plan §2.2 specifies it, post-tenancy:
+/// every node it returns is one this viewer may read (a claim they may not
+/// read is absent, `68b8a8b1`), a paper (no page), an agent, and optional
+/// fields omitted.
 fn ego_json(center_label: &str) -> Value {
     json!({
         "center": {"id": CLAIM, "entity_type": "claim", "label": center_label,
                    "content": center_label, "truth_value": 0.7, "pignistic_prob": 0.8,
-                   "labels": ["physics"], "is_current": true, "redacted": false},
+                   "labels": ["physics"], "is_current": true},
         "nodes": [
-            {"id": SECRET, "entity_type": "claim", "label": "[REDACTED]",
-             "content": "[REDACTED]", "truth_value": 0.1, "labels": ["private-label"],
-             "is_current": true, "redacted": true},
+            {"id": SECOND, "entity_type": "claim", "label": "A second claim",
+             "content": "A second claim", "truth_value": 0.1, "labels": ["chemistry"],
+             "is_current": true},
             {"id": OTHER, "entity_type": "claim", "label": HOSTILE, "content": HOSTILE,
-             "truth_value": 0.4, "labels": [], "is_current": false, "redacted": false},
-            {"id": PAPER, "entity_type": "paper", "label": "paper", "redacted": false},
-            {"id": AGENT, "entity_type": "agent", "label": "Ada Lovelace", "redacted": false}
+             "truth_value": 0.4, "labels": [], "is_current": false},
+            {"id": PAPER, "entity_type": "paper", "label": "paper"},
+            {"id": AGENT, "entity_type": "agent", "label": "Ada Lovelace"}
         ],
         "edges": [
-            {"id": EDGE1, "source_id": CLAIM, "target_id": SECRET, "source_type": "claim",
+            {"id": EDGE1, "source_id": CLAIM, "target_id": SECOND, "source_type": "claim",
              "target_type": "claim", "relationship": "SUPPORTS", "direction": "out"},
             {"id": EDGE2, "source_id": OTHER, "target_id": CLAIM, "source_type": "claim",
              "target_type": "claim", "relationship": "contradicts", "direction": "in"},
@@ -130,18 +135,15 @@ async fn ego_bff_clamps_degree_and_returns_the_canvas_shape() {
     let paper = node(&body, PAPER);
     assert_eq!(paper["href"], Value::Null, "papers have no page");
 
-    let hidden = node(&body, SECRET);
-    assert_eq!(hidden["redacted"], true);
-    assert_eq!(hidden["label"], "Hidden claim");
-    assert_eq!(hidden["content"], Value::Null);
-    assert_eq!(hidden["labels"], json!([]));
-    assert_eq!(hidden["truth_value"], Value::Null);
-    assert_eq!(hidden["expand_href"], Value::Null);
-    assert!(
-        !res.body.contains("private-label"),
-        "redacted labels never leave"
+    let second = node(&body, SECOND);
+    assert_eq!(second["label"], "A second claim");
+    assert_eq!(second["content"], "A second claim");
+    assert_eq!(second["labels"], json!(["chemistry"]));
+    assert_eq!(second["truth_value"], 0.1);
+    assert_eq!(
+        second["expand_href"],
+        format!("/explorer/bff/graph/ego/{SECOND}")
     );
-    assert!(!res.body.contains("[REDACTED]"));
 
     let edges = body["edges"].as_array().unwrap();
     assert_eq!(edges.len(), 4);
@@ -158,7 +160,7 @@ async fn ego_bff_clamps_degree_and_returns_the_canvas_shape() {
             })
             .unwrap()
     };
-    assert_eq!(fam(EDGE1), (json!("support"), json!(CLAIM), json!(SECRET)));
+    assert_eq!(fam(EDGE1), (json!("support"), json!(CLAIM), json!(SECOND)));
     assert_eq!(fam(EDGE2), (json!("refute"), json!(OTHER), json!(CLAIM)));
     assert_eq!(fam(EDGE4).0, json!("structural"));
     assert!(edges.iter().all(|e| e["directed"] == true));
@@ -624,7 +626,7 @@ async fn theme_upstream_failure_is_the_error_page() {
 // ---- /community/:id ---------------------------------------------------------------
 
 #[tokio::test]
-async fn community_clamps_budget_and_hides_redacted_labels() {
+async fn community_clamps_budget_and_publishes_no_member_count() {
     let app = spawn().await;
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/graph/communities/{CLUSTER}/expand")))
@@ -635,11 +637,11 @@ async fn community_clamps_budget_and_hides_redacted_labels() {
                 {"id": CLAIM, "label": "Visible claim text", "entity_type": "claim",
                  "pignistic_prob": 0.42, "frame_id": null, "cluster_id": CLUSTER,
                  "conflict_k": null},
-                {"id": SECRET, "label": "[REDACTED]", "entity_type": "claim",
+                {"id": SECOND, "label": "A second claim", "entity_type": "claim",
                  "pignistic_prob": 0.9, "frame_id": FRAME, "cluster_id": CLUSTER,
                  "conflict_k": null}
             ],
-            "edges": [{"source": SECRET, "target": CLAIM, "relationship": "SUPPORTS"}],
+            "edges": [{"source": SECOND, "target": CLAIM, "relationship": "SUPPORTS"}],
             "filtered_edge_count": 5
         })))
         .expect(1)
@@ -653,13 +655,16 @@ async fn community_clamps_budget_and_hides_redacted_labels() {
     let b = &res.body;
     assert!(b.contains("Visible claim text"));
     assert!(b.contains("belief 0.42"));
-    assert!(b.contains("Hidden claim"));
-    assert!(!b.contains("[REDACTED]"));
-    assert!(
-        !b.contains("0.90"),
-        "a hidden claim's numbers are not shown"
-    );
-    assert!(b.contains("2 of 900"));
+    assert!(b.contains("A second claim"));
+    assert!(b.contains("belief 0.90"));
+    // `total_size` (900) comes from cluster metadata that carries no tenancy
+    // columns, while `nodes` is viewer-filtered. Publishing the pair would
+    // hand the viewer 900 - 2: a count of the members they cannot see.
+    assert!(!b.contains("900"), "{b}");
+    assert!(!b.contains("2 of "), "{b}");
+    // `truncated` is upstream's alone, so the notice still appears — it just
+    // no longer carries a number.
+    assert!(b.contains("best-connected claims of this community"), "{b}");
     assert!(b.contains("SUPPORTS"));
     assert!(b.contains("graph-row--support"));
     assert!(b.contains("5 connections of other kinds"));
@@ -795,14 +800,13 @@ async fn claim_graph_page_escapes_data_and_uses_no_inline_script() {
         );
     }
     assert!(!b.contains("style="), "CSP forbids inline styles");
-    assert!(!b.contains("[REDACTED]"));
 
     // The <noscript> list: every edge, relationship and direction.
     assert!(b.contains("<noscript>"));
     assert!(b.contains("SUPPORTS →"));
     assert!(b.contains("← contradicts"));
     assert!(b.contains(&format!("href=\"/explorer/agent/{AGENT}\"")));
-    assert!(b.contains("Hidden claim"));
+    assert!(b.contains("A second claim"));
     assert!(b.contains("212 connections"), "degree-cap notice");
 
     // Placement links carry the claim so their share buttons work.
@@ -834,16 +838,47 @@ async fn claim_graph_max_degree_is_clamped_into_the_canvas_source() {
     )));
 }
 
+/// A centre this viewer may not read 404s at `/ego`, so the graph page is
+/// the ordinary not-found page — not a "Hidden claim" page, which would
+/// rebuild in the UI the existence oracle the API deleted (`68b8a8b1`).
 #[tokio::test]
-async fn claim_graph_redacted_centre_shows_no_text() {
+async fn claim_graph_of_an_invisible_claim_is_the_404_page() {
+    let app = spawn().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/ego")))
+        .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+            "error": "NotFound", "message": format!("Claim with ID {CLAIM} not found")
+        })))
+        .mount(&app.upstream)
+        .await;
+    mount_placement(&app).await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/claim/{CLAIM}/graph"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.contains("We could not find that claim."));
+    assert!(!res.body.contains("Hidden claim"), "{}", res.body);
+    assert!(!res.body.contains("do not have access"), "{}", res.body);
+}
+
+/// An edge whose endpoint is not among the nodes upstream returned names a
+/// claim this viewer may not read. The canvas drops it, and the
+/// `<noscript>` list neither lists it nor prints its id.
+#[tokio::test]
+async fn claim_graph_drops_edges_whose_neighbour_is_absent() {
     let app = spawn().await;
     mount_ego(
         &app,
         "40",
         json!({
-            "center": {"id": CLAIM, "entity_type": "claim", "label": "[REDACTED]",
-                       "content": "[REDACTED]", "labels": ["secret-label"], "redacted": true},
-            "nodes": [], "edges": [], "total_edges": 0, "truncated": false
+            "center": {"id": CLAIM, "entity_type": "claim", "label": "Centre claim",
+                       "content": "Centre claim", "labels": [], "is_current": true},
+            "nodes": [],
+            "edges": [{"id": EDGE1, "source_id": CLAIM, "target_id": ABSENT,
+                       "source_type": "claim", "target_type": "claim",
+                       "relationship": "SUPPORTS", "direction": "out"}],
+            "total_edges": 1, "truncated": false
         }),
     )
     .await;
@@ -853,10 +888,9 @@ async fn claim_graph_redacted_centre_shows_no_text() {
         .get_as(&format!("/explorer/claim/{CLAIM}/graph"), &sid)
         .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(res.body.contains("<title>Hidden claim · Graph"));
-    assert!(res.body.contains("You do not have access to this claim"));
-    assert!(!res.body.contains("[REDACTED]"));
-    assert!(!res.body.contains("secret-label"));
+    assert!(res.body.contains("Centre claim"));
+    assert!(!res.body.contains(ABSENT), "{}", res.body);
+    assert!(!res.body.contains("SUPPORTS →"), "{}", res.body);
 }
 
 #[tokio::test]
@@ -1203,7 +1237,7 @@ fn every_node_stays_visible_against_the_stage_in_both_themes() {
         let ratio = contrast(grey, stage);
         assert!(
             ratio >= 1.5,
-            "a redacted node is {ratio:.2}:1 against the {theme} stage"
+            "a node with no belief at all is {ratio:.2}:1 against the {theme} stage"
         );
         assert!(
             (neutral[i] - ramp[0]).abs() <= 10.0,

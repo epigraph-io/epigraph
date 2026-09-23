@@ -10,10 +10,7 @@ use uuid::Uuid;
 
 use crate::links::Links;
 use crate::upstream::entities::ClaimVersion;
-use crate::upstream::{truncate_chars, ChainNode, ProvenanceChainResponse, REDACTED};
-
-/// What a redacted claim reads as on these pages.
-pub const HIDDEN_TEXT: &str = "Content hidden. You do not have access to this claim's text.";
+use crate::upstream::{truncate_chars, ChainNode, ProvenanceChainResponse};
 /// Highest `?page=` honoured; keeps upstream offsets small and finite.
 pub const MAX_PAGE: u32 = 10_000;
 /// `?max_depth=` on the provenance page when absent or unparseable
@@ -64,39 +61,27 @@ pub fn short_id(id: Uuid) -> String {
     s[..8].to_string()
 }
 
-/// Claim text ready for a template: cut on a char boundary, with redaction
-/// made explicit so templates can style it (`.claim-text--redacted`).
+/// Claim text ready for a template: cut on a char boundary. Every claim
+/// that reaches here is one upstream returned, so it is the viewer's to
+/// read — a claim they may not read never arrives at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimText {
     pub text: String,
-    pub redacted: bool,
     /// True when the text was cut to fit.
     pub cut: bool,
 }
 
 pub fn claim_text(content: &str, max_chars: usize) -> ClaimText {
     let trimmed = content.trim();
-    if trimmed == REDACTED {
-        return ClaimText {
-            text: HIDDEN_TEXT.into(),
-            redacted: true,
-            cut: false,
-        };
-    }
     if trimmed.is_empty() {
         return ClaimText {
             text: "(no text recorded)".into(),
-            redacted: false,
             cut: false,
         };
     }
     let text = truncate_chars(trimmed, max_chars);
     let cut = text.len() != trimmed.len();
-    ClaimText {
-        text,
-        redacted: false,
-        cut,
-    }
+    ClaimText { text, cut }
 }
 
 // ---- query parsing ---------------------------------------------------------------
@@ -376,7 +361,6 @@ pub fn duplicate_of(versions: &[ClaimVersion]) -> Vec<Option<usize>> {
 pub struct NodeRef {
     pub url: String,
     pub label: String,
-    pub redacted: bool,
 }
 
 /// One edge, read from the node it is listed under.
@@ -424,10 +408,6 @@ const REF_TEXT_CHARS: usize = 90;
 /// Labels shown per chain node.
 const CHAIN_LABELS: usize = 6;
 
-fn is_hidden(n: &ChainNode) -> bool {
-    n.redacted || n.content.trim() == REDACTED
-}
-
 /// Group the chain by depth and attach every edge to exactly one node.
 ///
 /// Upstream stores evidence relationships ancestor → descendant and
@@ -436,47 +416,49 @@ fn is_hidden(n: &ChainNode) -> bool {
 /// source) — and phrased from that node: "A supports B", "O superseded by
 /// N". So the root (depth 0) shows no edges of its own and every ancestor
 /// says how it feeds the claims below it.
+///
+/// An id that appears in an edge or a cycle but not in `nodes` is a claim
+/// this viewer may not read (`68b8a8b1`: absent, not blanked). Every such
+/// edge and cycle is dropped rather than rendered as `Claim <short-id>`:
+/// that fallback was the last path by which an invisible claim's uuid could
+/// reach a page.
 pub fn layout_chain(chain: &ProvenanceChainResponse, links: &Links) -> ChainLayout {
     let by_id: HashMap<Uuid, &ChainNode> = chain.nodes.iter().map(|n| (n.id, n)).collect();
     let in_cycle: HashSet<Uuid> = chain.cycles.iter().flatten().copied().collect();
 
-    let node_ref = |id: Uuid| -> NodeRef {
-        match by_id.get(&id) {
-            Some(n) if is_hidden(n) => NodeRef {
-                url: links.claim(id),
-                label: format!("Hidden claim {}", short_id(id)),
-                redacted: true,
-            },
-            Some(n) if !n.content.trim().is_empty() => NodeRef {
-                url: links.claim(id),
-                label: truncate_chars(n.content.trim(), REF_TEXT_CHARS),
-                redacted: false,
-            },
-            _ => NodeRef {
-                url: links.claim(id),
-                label: format!("Claim {}", short_id(id)),
-                redacted: false,
-            },
-        }
+    let node_ref = |id: Uuid| -> Option<NodeRef> {
+        let n = by_id.get(&id)?;
+        let label = if n.content.trim().is_empty() {
+            format!("Claim {}", short_id(id))
+        } else {
+            truncate_chars(n.content.trim(), REF_TEXT_CHARS)
+        };
+        Some(NodeRef {
+            url: links.claim(id),
+            label,
+        })
     };
 
     let mut edge_links: HashMap<Uuid, Vec<ChainLink>> = HashMap::new();
     for e in &chain.edges {
         let depth = |id: Uuid| by_id.get(&id).map(|n| n.depth);
-        let holder_is_source = match (depth(e.source), depth(e.target)) {
-            (Some(s), Some(t)) => s >= t,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => continue,
+        // Both endpoints must be nodes the viewer got back; an edge with a
+        // dangling end says the claim exists without naming it, so drop it.
+        let (Some(s), Some(t)) = (depth(e.source), depth(e.target)) else {
+            continue;
         };
+        let holder_is_source = s >= t;
         let (holder, other) = if holder_is_source {
             (e.source, e.target)
         } else {
             (e.target, e.source)
         };
+        let Some(other) = node_ref(other) else {
+            continue;
+        };
         edge_links.entry(holder).or_default().push(ChainLink {
             phrase: relationship_phrase(&e.relationship, holder_is_source),
-            other: node_ref(other),
+            other,
         });
     }
     for v in edge_links.values_mut() {
@@ -492,15 +474,10 @@ pub fn layout_chain(chain: &ProvenanceChainResponse, links: &Links) -> ChainLayo
     let mut levels: BTreeMap<u32, Vec<ChainNodeView>> = BTreeMap::new();
     for n in chain.nodes.iter().rev() {
         let depth = if n.id == chain.root { 0 } else { n.depth };
-        let text = if is_hidden(n) {
-            claim_text(REDACTED, CHAIN_TEXT_CHARS)
-        } else {
-            claim_text(&n.content, CHAIN_TEXT_CHARS)
-        };
         levels.entry(depth).or_default().push(ChainNodeView {
             id: n.id,
             url: links.claim(n.id),
-            text,
+            text: claim_text(&n.content, CHAIN_TEXT_CHARS),
             superseded: n.is_current == Some(false),
             truth: fmt_prob(n.truth_value),
             labels: n
@@ -518,12 +495,14 @@ pub fn layout_chain(chain: &ProvenanceChainResponse, links: &Links) -> ChainLayo
         .cycles
         .iter()
         .filter(|c| !c.is_empty())
-        .map(|c| {
-            let mut walk: Vec<NodeRef> = c.iter().map(|id| node_ref(*id)).collect();
+        // A cycle naming a claim this viewer cannot see is dropped whole:
+        // half a walk would be a lie, and the id is not ours to publish.
+        .filter_map(|c| {
+            let mut walk: Vec<NodeRef> = c.iter().map(|id| node_ref(*id)).collect::<Option<_>>()?;
             if c.len() > 1 && c.first() != c.last() {
-                walk.push(node_ref(c[0]));
+                walk.push(node_ref(c[0])?);
             }
-            walk
+            Some(walk)
         })
         .collect();
 
@@ -607,9 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_text_redacts_and_cuts_on_chars() {
-        let t = claim_text("[REDACTED]", 10);
-        assert!(t.redacted && t.text == HIDDEN_TEXT);
+    fn claim_text_cuts_on_chars() {
         let t = claim_text("μμμμμ", 3);
         assert_eq!(t.text, "μμμ…");
         assert!(t.cut);
@@ -804,7 +781,6 @@ mod tests {
             labels: vec![],
             is_current: Some(true),
             depth,
-            redacted: false,
         }
     }
 
@@ -817,16 +793,14 @@ mod tests {
     }
 
     #[test]
-    fn chain_levels_edges_cycles_and_redaction() {
+    fn chain_levels_edges_and_cycles() {
         let mut old = node(3, 1, "old version");
         old.is_current = Some(false);
-        let mut hidden = node(4, 2, "[REDACTED]");
-        hidden.redacted = true;
         let chain = ProvenanceChainResponse {
             root: uid(1),
             // Evidence first, root last.
             nodes: vec![
-                hidden,
+                node(4, 2, "deep source"),
                 node(2, 1, "evidence claim"),
                 old,
                 node(1, 0, "root"),
@@ -860,37 +834,32 @@ mod tests {
         assert!(old.superseded);
         assert_eq!(old.links[0].phrase, "superseded by");
 
-        let hidden = &l.levels[2].nodes[0];
-        assert!(hidden.text.redacted);
-        assert!(!hidden.text.text.contains("REDACTED"));
+        let deep = &l.levels[2].nodes[0];
+        assert_eq!(deep.text.text, "deep source");
         // The deeper end holds both edges between 2 and 4.
-        let phrases: Vec<_> = hidden.links.iter().map(|x| x.phrase.as_str()).collect();
+        let phrases: Vec<_> = deep.links.iter().map(|x| x.phrase.as_str()).collect();
         assert_eq!(phrases, ["corroborated by", "decomposes to"]);
 
         assert_eq!(l.cycles.len(), 1);
         let walk: Vec<_> = l.cycles[0].iter().map(|r| r.label.as_str()).collect();
-        assert_eq!(
-            walk,
-            ["evidence claim", "Hidden claim 00000000", "evidence claim"]
-        );
-        assert!(l.cycles[0][1].redacted);
+        assert_eq!(walk, ["evidence claim", "deep source", "evidence claim"]);
     }
 
     #[test]
-    fn chain_edges_to_unknown_nodes_still_link() {
+    fn chain_edges_and_cycles_naming_absent_nodes_are_dropped() {
         let chain = ProvenanceChainResponse {
             root: uid(1),
             nodes: vec![node(1, 0, "root")],
             edges: vec![edge(9, 1, "supports"), edge(8, 7, "supports")],
             truncated: true,
-            cycles: vec![],
+            cycles: vec![vec![uid(1), uid(9)]],
         };
         let l = layout_chain(&chain, &links());
-        // Edge 9 → 1: only the target is known, so it is listed on the root.
+        // 9 and 8 are claims this viewer may not read: an edge or a cycle
+        // naming one is dropped rather than rendered as "Claim 00000009".
         let root = &l.levels[0].nodes[0];
-        assert_eq!(root.links.len(), 1);
-        assert_eq!(root.links[0].phrase, "supported by");
-        assert!(root.links[0].other.label.starts_with("Claim "));
+        assert!(root.links.is_empty());
+        assert!(l.cycles.is_empty());
         assert_eq!(l.ancestor_count, 0);
         assert_eq!(
             relationship_phrase("RELATES_TO", false),

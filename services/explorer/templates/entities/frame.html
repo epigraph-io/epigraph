@@ -74,7 +74,7 @@
   <ul class="link-list">
     {%- for c in data.rows %}
     <li>
-      <a class="entity-row__text{% if c.text.redacted %} claim-text--redacted{% endif %}" href="{{ c.url }}">{{ c.text.text }}</a>
+      <a class="entity-row__text" href="{{ c.url }}">{{ c.text.text }}</a>
       <p class="small muted">
         {%- if let Some(h) = c.hypothesis %}Hypothesis: {{ h }} · {% endif -%}
         belief <span class="num">{{ c.belief }}</span> · plausibility <span class="num">{{ c.plausibility }}</span> · ignorance <span class="num">{{ c.ignorance }}</span></p>

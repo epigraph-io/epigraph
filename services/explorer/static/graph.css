@@ -276,10 +276,6 @@
   stroke-dasharray: 3 2;
 }
 
-.gnode--redacted circle {
-  stroke: var(--text-muted);
-}
-
 .gnode--center circle {
   stroke: var(--text);
   stroke-width: 2.5;

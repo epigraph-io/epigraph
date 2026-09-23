@@ -36,7 +36,7 @@
   <ol class="results">
     {%- for h in data %}
     <li class="result result--{{ h.kind }}">
-      <p class="result__text"><a href="{{ h.claim_url }}"{% if h.redacted %} class="result__hidden"{% endif %}>{{ h.text }}</a></p>
+      <p class="result__text"><a href="{{ h.claim_url }}">{{ h.text }}</a></p>
       <p class="result__meta small muted">
         {%- if h.similarity.is_some() %}<span class="result__score">{{ h.similarity_display() }} match</span>{% endif %}
         {%- if h.truth_value.is_some() %} <span>truth {{ h.truth_display() }}</span>{% endif %}

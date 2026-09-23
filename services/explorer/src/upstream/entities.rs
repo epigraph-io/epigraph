@@ -51,10 +51,11 @@ pub struct VersionHistoryResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ClaimVersion {
     pub claim_id: Uuid,
-    /// `[REDACTED]` for a version this viewer may not read: since the §2.6
-    /// sweep `versioning::claim_history` runs the whole chain through
-    /// `access_control::redact_claim_fields`, per version (each one is a
-    /// distinct claim with its own ownership row).
+    /// The version's text. `versioning::claim_history` filters the chain
+    /// per version (each one is a distinct claim with its own ownership
+    /// row) and 404s when nothing is left, so a version this viewer may not
+    /// read is a MISSING ROW, never a blanked one. `version` numbering is
+    /// positional over what came back.
     #[serde(default)]
     pub content: String,
     #[serde(default)]
@@ -114,10 +115,10 @@ pub struct AgentClaimsPage {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AttributedClaim {
     pub id: Uuid,
-    /// `[REDACTED]` for a claim this viewer may not read: since the §2.6
-    /// sweep `agents::agent_claims` redacts the page through
-    /// `access_control::redact_claim_fields` (attribution to a readable agent
-    /// says nothing about who may read the claim).
+    /// The claim's text. `agents::agent_claims` filters the rows AND the
+    /// `total` off one connection (attribution to a readable agent says
+    /// nothing about who may read the claim), so a claim this viewer may
+    /// not read is absent and the paging still terminates.
     #[serde(default)]
     pub content: String,
     #[serde(default)]
@@ -212,7 +213,8 @@ pub struct FrameResponse {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct FrameClaimRow {
     pub claim_id: Uuid,
-    /// May be `[REDACTED]` (this route redacts per requester).
+    /// The claim's text. `frame_claims_sorted` carries a viewer, so a row
+    /// this viewer may not read is absent from the list.
     #[serde(default)]
     pub content: String,
     #[serde(default)]
@@ -242,12 +244,14 @@ pub struct EvidenceDetailResponse {
     /// vocabulary from `/claims/:id/evidence` and `/search/evidence`.
     #[serde(default)]
     pub evidence_type: Option<String>,
-    /// `[REDACTED]` when the linked claim is hidden from the viewer.
+    /// The evidence text. `detail_by_id` carries a viewer and returns
+    /// `None` — a 404, byte-identical to a missing row — rather than a
+    /// blanked body, so this never holds a placeholder.
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
     pub content_hash: Option<String>,
-    /// A URL or a bare DOI; null when redacted.
+    /// A URL or a bare DOI; null when none was recorded.
     #[serde(default)]
     pub source_url: Option<String>,
     #[serde(default)]
@@ -436,7 +440,7 @@ mod tests {
         assert_eq!(f.frame.hypotheses, ["h0", "h1"]);
 
         let rows: Vec<FrameClaimRow> = serde_json::from_value(json!([
-            {"claim_id": B, "content": "[REDACTED]", "hypothesis_index": null,
+            {"claim_id": B, "content": "A frame claim.", "hypothesis_index": null,
              "belief": null, "plausibility": 0.9, "ignorance": null, "mass_on_missing": null}
         ]))
         .unwrap();

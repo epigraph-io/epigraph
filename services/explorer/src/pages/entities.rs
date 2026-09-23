@@ -24,7 +24,6 @@ use crate::upstream::entities::{
 };
 use crate::upstream::{
     degrade, truncate_chars, ClaimResponse, Degraded, UpstreamError, PROVENANCE_DEPTH_RANGE,
-    REDACTED,
 };
 use crate::view::render;
 
@@ -173,17 +172,11 @@ async fn history(
     let id = parse_id(&raw, "claim")?;
     let api = user.api(&state);
     let claim = api.claim(id).await.map_err(not_found_as("claim"))?;
-    // Since the §2.6 sweep `/history` redacts per version upstream
-    // (`versioning::claim_history`), so this is belt and braces rather than
-    // the only guard: a claim hidden from this viewer still gets no
-    // content-bearing sub-call at all (plan §3.4), which also saves the call.
-    let history = if claim.is_redacted() {
-        Degraded::unavailable(
-            "This claim's content is hidden from you, so its version history is not shown.",
-        )
-    } else {
-        degrade(api.claim_versions(id).await)?.map(|h| history_view(&h, id, &state.links))
-    };
+    // `/history` filters per version upstream and 404s when nothing is
+    // visible, so a version this viewer may not read is simply a missing
+    // row; there is nothing to suppress here.
+    let history =
+        degrade(api.claim_versions(id).await)?.map(|h| history_view(&h, id, &state.links));
     render(&HistoryPage {
         claim_url: state.links.claim(id),
         provenance_url: state.links.claim_provenance(id),
@@ -635,19 +628,15 @@ async fn evidence(
         .evidence_detail(id)
         .await
         .map_err(not_found_as("evidence"))?;
-    let redacted = ev.content.as_deref().map(str::trim) == Some(REDACTED);
-
-    // `/evidence/:id` redacts only when its linked claim is hidden, so a
-    // redacted row gets no claim sub-call (plan §3.4 "Rules for rendering").
+    // The evidence row's `claim_id` comes from an unfiltered edge lookup
+    // upstream, so the linked claim can 404 while this row is visible.
+    // `degrade` renders that as an unavailable section rather than turning
+    // the whole page into a 404.
     let linked_claim = match ev.claim_id {
         None => None,
         Some(cid) => {
-            let text = if redacted {
-                Degraded::ok(claim_text(REDACTED, LIST_TEXT_CHARS))
-            } else {
-                degrade(api.claim(cid).await)?
-                    .map(|c: ClaimResponse| claim_text(&c.content, HEADING_TEXT_CHARS))
-            };
+            let text = degrade(api.claim(cid).await)?
+                .map(|c: ClaimResponse| claim_text(&c.content, HEADING_TEXT_CHARS));
             Some(LinkedClaim {
                 url: state.links.claim(cid),
                 short: short_id(cid),

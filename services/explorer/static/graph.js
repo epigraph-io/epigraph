@@ -37,7 +37,7 @@
   const RAMP_SATURATION = [35, 70];
   const RAMP_LIGHTNESS_LIGHT = [72, 38];
   const RAMP_LIGHTNESS_DARK = [36, 76];
-  // Redacted, or no belief at all: a neutral grey, never paler than the ramp.
+  // No belief at all: a neutral grey, never paler than the ramp.
   const NEUTRAL_LIGHTNESS = [70, 44]; // light theme, dark theme
 
   // Layout (world units are CSS px at zoom 1).
@@ -122,13 +122,10 @@
   }
 
   /** Sequential ramp on pignistic_prob, else truth_value; neutral grey when
-   * the node is redacted or has neither. Hue from frame_id, else type. */
+   * the node has neither. Hue from frame_id, else type. */
   function nodeFill(d, dark) {
-    let p = null;
-    if (!d.redacted) {
-      p = num(d.pignistic_prob);
-      if (p === null) p = num(d.truth_value);
-    }
+    let p = num(d.pignistic_prob);
+    if (p === null) p = num(d.truth_value);
     if (p === null) return 'hsl(210, 6%, ' + NEUTRAL_LIGHTNESS[dark ? 1 : 0] + '%)';
     const t = Math.min(1, Math.max(0, p));
     const hue = hueFor(String(d.frame_id || d.entity_type || 'claim').toLowerCase());
@@ -149,7 +146,6 @@
     const parts = [type.charAt(0).toUpperCase() + type.slice(1)];
     if (typeof d.kind === 'string' && d.kind) parts.push(d.kind);
     if (n.centre) parts.push('centre of this graph');
-    if (d.redacted) parts.push('hidden');
     return parts.join(' · ');
   }
 
@@ -595,7 +591,6 @@
       const classes = ['gnode'];
       if (n.centre) classes.push('gnode--center');
       if (type.toLowerCase() !== 'claim') classes.push('gnode--entity');
-      if (d.redacted) classes.push('gnode--redacted');
       const g = svgEl('g', {
         class: classes.join(' '),
         tabindex: 0,
@@ -834,10 +829,7 @@
       p.title.textContent = nodeLabel(d);
       p.type.textContent = describe(n);
 
-      if (d.redacted) {
-        p.content.textContent = 'You do not have access to this claim’s text.';
-        p.content.hidden = false;
-      } else if (typeof d.content === 'string' && d.content && d.content !== d.label) {
+      if (typeof d.content === 'string' && d.content && d.content !== d.label) {
         p.content.textContent = d.content;
         p.content.hidden = false;
       } else {

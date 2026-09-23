@@ -51,7 +51,7 @@
   <ul class="link-list">
     {%- for c in data.rows %}
     <li>
-      <a class="entity-row__text{% if c.text.redacted %} claim-text--redacted{% endif %}" href="{{ c.url }}">{{ c.text.text }}</a>
+      <a class="entity-row__text" href="{{ c.url }}">{{ c.text.text }}</a>
       <p class="small muted">Recorded {{ c.created }} · truth value <span class="num">{{ c.truth }}</span></p>
     </li>
     {%- endfor %}

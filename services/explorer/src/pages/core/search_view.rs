@@ -14,7 +14,7 @@ use super::vocab::{evidence_type_label, fmt_date, fmt_percent, fmt_prob, one_lin
 use crate::error::AppError;
 use crate::links::Links;
 use crate::upstream::core::{EvidenceHit, LabelHit, SemanticHit, MAX_SEARCH_LIMIT};
-use crate::upstream::{degrade, truncate_chars, Api, Degraded, REDACTED};
+use crate::upstream::{degrade, truncate_chars, Api, Degraded};
 
 /// Results per page in the paged (label) mode.
 pub const PAGE_SIZE: u32 = 20;
@@ -124,8 +124,6 @@ pub struct SearchHit {
     pub evidence_url: Option<String>,
     /// Snippet (whitespace collapsed, char-boundary cut).
     pub text: String,
-    /// Upstream sent `"[REDACTED]"`; `text` is a placeholder.
-    pub redacted: bool,
     pub similarity: Option<f64>,
     pub truth_value: Option<f64>,
     pub belief: Option<f64>,
@@ -251,16 +249,15 @@ pub fn label_list(q: &str) -> String {
         .join(",")
 }
 
-fn snippet(raw: &str) -> (String, bool) {
-    if raw.trim() == REDACTED {
-        ("Content hidden".to_string(), true)
-    } else {
-        (truncate_chars(&one_line(raw), SNIPPET_CHARS), false)
-    }
+/// Every hit upstream returns is one this viewer may read: search filters
+/// in the repo layer, so a claim they cannot see is not in the result set
+/// at all.
+fn snippet(raw: &str) -> String {
+    truncate_chars(&one_line(raw), SNIPPET_CHARS)
 }
 
 fn semantic_hit(h: SemanticHit, links: &Links) -> SearchHit {
-    let (text, redacted) = snippet(&h.statement);
+    let text = snippet(&h.statement);
     SearchHit {
         kind: "claim",
         claim_url: links.claim(h.claim_id),
@@ -268,7 +265,6 @@ fn semantic_hit(h: SemanticHit, links: &Links) -> SearchHit {
         evidence_id: None,
         evidence_url: None,
         text,
-        redacted,
         similarity: h.similarity,
         truth_value: h.epistemic.truth_value,
         belief: h.epistemic.belief,
@@ -281,7 +277,7 @@ fn semantic_hit(h: SemanticHit, links: &Links) -> SearchHit {
 }
 
 fn label_hit(h: LabelHit, links: &Links) -> SearchHit {
-    let (text, redacted) = snippet(&h.content);
+    let text = snippet(&h.content);
     SearchHit {
         kind: "claim",
         claim_url: links.claim(h.id),
@@ -289,7 +285,6 @@ fn label_hit(h: LabelHit, links: &Links) -> SearchHit {
         evidence_id: None,
         evidence_url: None,
         text,
-        redacted,
         similarity: None,
         truth_value: h.truth_value,
         belief: None,
@@ -302,9 +297,9 @@ fn label_hit(h: LabelHit, links: &Links) -> SearchHit {
 }
 
 fn evidence_hit(h: EvidenceHit, links: &Links) -> SearchHit {
-    let (text, redacted) = match h.raw_content.as_deref().map(str::trim) {
+    let text = match h.raw_content.as_deref().map(str::trim) {
         Some(c) if !c.is_empty() => snippet(c),
-        _ => ("(no text)".to_string(), false),
+        _ => "(no text)".to_string(),
     };
     SearchHit {
         kind: "evidence",
@@ -313,7 +308,6 @@ fn evidence_hit(h: EvidenceHit, links: &Links) -> SearchHit {
         evidence_url: Some(links.evidence(h.evidence_id)),
         evidence_id: Some(h.evidence_id),
         text,
-        redacted,
         similarity: h.similarity,
         truth_value: None,
         belief: None,
@@ -360,10 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn redacted_snippets_are_placeholders() {
-        assert_eq!(snippet("[REDACTED]"), ("Content hidden".into(), true));
-        let (t, r) = snippet(&"é".repeat(400));
-        assert!(!r);
+    fn snippets_cut_on_char_boundaries() {
+        let t = snippet(&"é".repeat(400));
         assert_eq!(t.chars().count(), SNIPPET_CHARS + 1);
+        assert_eq!(snippet("  a\n b  "), "a b");
     }
 }

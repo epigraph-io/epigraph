@@ -164,7 +164,6 @@ pub struct NeighbourRow {
     pub label: String,
     pub entity_type: String,
     pub href: Option<String>,
-    pub redacted: bool,
 }
 
 /// Where the claim sits in the latest clustering run (all optional).
@@ -200,7 +199,6 @@ impl PlacementLinks {
 struct ClaimGraphPage {
     ctx: PageCtx,
     title: String,
-    redacted: bool,
     claim_href: String,
     canvas: CanvasShell,
     neighbours: Vec<NeighbourRow>,
@@ -240,7 +238,6 @@ async fn claim_graph(
                 label: n.label.clone(),
                 entity_type: n.entity_type.clone(),
                 href: n.href.clone(),
-                redacted: n.redacted,
             })
         })
         .collect::<Vec<_>>();
@@ -252,7 +249,6 @@ async fn claim_graph(
     };
     let page = ClaimGraphPage {
         title: center.label.clone(),
-        redacted: center.redacted,
         claim_href: links.claim(id),
         canvas: CanvasShell {
             source,
@@ -401,17 +397,21 @@ async fn theme(
 pub struct ClaimRow {
     pub href: String,
     pub label: String,
-    pub redacted: bool,
     pub betp: String,
 }
 
+/// `total_size` is deliberately absent. Upstream reads it from the cluster
+/// metadata tables, which carry no tenancy columns and are NOT
+/// viewer-filtered, while `nodes` is read as the caller's `Viewer`.
+/// Publishing the pair — as a "N of M" heading or as a derived "there is
+/// more" notice — hands the viewer `M - N`: a count of the members of this
+/// community they may not see. `truncated` is taken from upstream alone.
 #[derive(askama::Template)]
 #[template(path = "graph/community.html")]
 struct CommunityPage {
     ctx: PageCtx,
     cluster_id: Uuid,
     expired: bool,
-    total_size: i64,
     claims: Vec<ClaimRow>,
     edges: Vec<EdgeRow>,
     more_edges: usize,
@@ -432,7 +432,6 @@ async fn community(
     let mut page = CommunityPage {
         cluster_id: id,
         expired: false,
-        total_size: 0,
         claims: Vec::new(),
         edges: Vec::new(),
         more_edges: 0,
@@ -451,7 +450,7 @@ async fn community(
         Err(e) => return Err(e.into()),
     };
 
-    // Reuse the canvas mapping for labels, redaction and links.
+    // Reuse the canvas mapping for labels and links.
     let graph = CanvasGraph {
         center: None,
         nodes: expand
@@ -475,19 +474,16 @@ async fn community(
         .map(|(raw, n)| ClaimRow {
             href: links.claim(n.id),
             label: n.label.clone(),
-            redacted: n.redacted,
-            betp: if n.redacted {
-                fmt_num(None)
-            } else {
-                fmt_num(raw.pignistic_prob)
-            },
+            betp: fmt_num(raw.pignistic_prob),
         })
         .collect();
     page.edges = edge_rows(&graph);
     page.more_edges = graph.edges.len().saturating_sub(page.edges.len());
-    page.total_size = expand.total_size;
     page.filtered_edge_count = expand.filtered_edge_count;
-    page.truncated = expand.truncated || expand.total_size > expand.nodes.len() as i64;
+    // Upstream's flag alone. `expand.total_size > nodes.len()` is now true
+    // whenever a member is invisible to this viewer, which would turn an
+    // honest "there is more" notice into a count of what they cannot see.
+    page.truncated = expand.truncated;
     Ok(with_status(StatusCode::OK, render(&page)?))
 }
 
@@ -560,7 +556,6 @@ async fn neighborhood(
         .map(|n| ClaimRow {
             href: links.claim(n.id),
             label: n.label.clone(),
-            redacted: n.redacted,
             betp: fmt_num(n.pignistic_prob),
         })
         .collect();

@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{% if view.redacted %}Hidden claim{% else %}{{ og.title }}{% endif %} · {{ ctx.product_name() }}{% endblock %}
+{% block title %}{{ og.title }} · {{ ctx.product_name() }}{% endblock %}
 
 {% block og %}
 {% include "core/og.html" %}
@@ -12,10 +12,6 @@
 <article class="claim" aria-labelledby="claim-title">
   <header class="claim__header">
     <h1 id="claim-title" class="claim__kicker">Claim <code>{{ view.short_id() }}</code></h1>
-    {%- if view.redacted %}
-    <p class="claim-text claim-text--redacted">You cannot see the content of this claim.</p>
-    <p class="muted">Access to it is restricted. Its evidence, connections and other details are hidden as well.</p>
-    {%- else %}
     <blockquote class="claim-text claim__content">{{ view.content() }}</blockquote>
     {%- if !view.claim.labels.is_empty() %}
     <ul class="labels" aria-label="Labels">
@@ -29,10 +25,8 @@
       <a href="{{ view.urls.provenance }}">Derivation chain</a>
       <a href="{{ view.urls.history }}">Version history</a>
     </nav>
-    {%- endif %}
   </header>
 
-  {%- if !view.redacted %}
   <div class="claim-layout">
     <div class="claim-layout__main">
 
@@ -55,7 +49,7 @@
             {%- for n in g.neighbours %}
             <li>
               {%- if let Some(href) = n.href %}
-              <a href="{{ href }}"{% if n.redacted %} class="outlinks__hidden"{% endif %}>{{ n.text }}</a>
+              <a href="{{ href }}">{{ n.text }}</a>
               {%- else %}
               <span class="outlinks__plain">{{ n.text }}</span>
               {%- endif %}
@@ -251,6 +245,5 @@
       </section>
     </aside>
   </div>
-  {%- endif %}
 </article>
 {% endblock %}
