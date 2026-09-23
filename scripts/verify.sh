@@ -8,7 +8,7 @@
 #
 # Usage:
 #   ./scripts/verify.sh            # fmt + clippy + build (+ workspace tests if DATABASE_URL is set)
-#   DATABASE_URL=postgres://epigraph:epigraph@localhost:5432/<testdb> ./scripts/verify.sh
+#   DATABASE_URL=postgres://USER:PASS@localhost:5432/<testdb> ./scripts/verify.sh
 #
 # The DB-backed (#[sqlx::test]) tests require a reachable Postgres; they are run
 # only when DATABASE_URL is set (CI provides a postgres service). Without it,

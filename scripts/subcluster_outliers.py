@@ -9,11 +9,13 @@ back — operator decides whether the surfaced sub-clusters warrant new
 theme creation via `POST /api/v1/themes/create-with-centroid`.
 
 Adaptation vs V2:
-- Default DATABASE_URL uses `epigraph_ro` (script never writes)
+- Connects on DATABASE_URL (or --database-url), which should name the
+  read-only `epigraph_ro` role (script never writes). There is no default
+  database: with neither set it exits rather than guess.
 - No other behavioral changes; UMAP + k-means logic preserved
 
 Usage:
-    DATABASE_URL=postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph \\
+    DATABASE_URL=postgres://epigraph_ro:PASS@HOST:5432/DB \\
         python3 scripts/subcluster_outliers.py --clusters 0,3,6 --sample-size 3000
 """
 
@@ -30,16 +32,11 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
-psycopg2.extras.register_uuid()
+# `require_dsn` only: the no-default-database rule, not the maintenance
+# precedence. See the exemption at `--database-url` in main().
+from maintenance_dsn import require_dsn
 
-# MAINTENANCE-DSN-EXEMPT: read-only by design, on the `epigraph_ro` role, and
-# the module docstring above states "script never writes" as a property callers
-# rely on. Threading MAINTENANCE_DATABASE_URL in would silently escalate it to a
-# writable role whenever that variable is exported for a sibling job — a
-# privilege increase smuggled in as a DSN change. If a FORCEd deployment ever
-# needs this script to see non-public rows, give it its own read-only
-# maintenance role rather than borrowing the writer's.
-DEFAULT_DATABASE_URL = "postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph"
+psycopg2.extras.register_uuid()
 
 
 def load_boundary_claims(conn, cluster_ids, boundary_threshold=0.85,
@@ -144,10 +141,18 @@ def analyze_subclusters(ids, labels, meta, k):
 
 def main():
     parser = argparse.ArgumentParser(description="Sub-cluster outlier-heavy UMAP clusters")
+    # MAINTENANCE-DSN-EXEMPT: read-only by design, on the `epigraph_ro` role, and
+    # the module docstring above states "script never writes" as a property callers
+    # rely on. Threading MAINTENANCE_DATABASE_URL in would silently escalate it to a
+    # writable role whenever that variable is exported for a sibling job — a
+    # privilege increase smuggled in as a DSN change. If a FORCEd deployment ever
+    # needs this script to see non-public rows, give it its own read-only
+    # maintenance role rather than borrowing the writer's.
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=os.environ.get("DATABASE_URL"),
+        help="Postgres URL on the read-only role (default: $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     parser.add_argument("--clusters", default="0,3,6",
                         help="Comma-separated cluster IDs to sub-cluster")
@@ -155,6 +160,9 @@ def main():
     parser.add_argument("--boundary-threshold", type=float, default=0.85)
     parser.add_argument("--distance-percentile", type=float, default=85)
     args = parser.parse_args()
+    args.database_url = require_dsn(
+        args.database_url, "DATABASE_URL (the read-only role) or pass --database-url"
+    )
 
     conn = psycopg2.connect(args.database_url)
     cluster_ids = [int(x) for x in args.clusters.split(",")]

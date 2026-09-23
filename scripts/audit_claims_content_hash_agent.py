@@ -55,9 +55,7 @@ import sys
 
 import psycopg2
 
-from maintenance_dsn import maintenance_dsn
-
-DEFAULT_DATABASE_URL = "postgres://epigraph_dev:epigraph_dev@127.0.0.1:5432/epigraph"
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 CONSTRAINT = "uq_claims_content_hash_agent"
 # Migration 013's exact shape. Option B is an index, not a table constraint,
@@ -309,7 +307,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(),
     )
     ap.add_argument("--json", action="store_true", help="emit the report as JSON")
     ap.add_argument(
@@ -318,6 +316,7 @@ def main() -> int:
         help="add the constraint; refuses unless zero rows violate it",
     )
     args = ap.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     try:

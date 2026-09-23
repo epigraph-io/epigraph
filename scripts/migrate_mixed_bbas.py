@@ -29,18 +29,14 @@ import uuid as uuid_mod
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from maintenance_dsn import maintenance_dsn
-
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(),
     )
     parser.add_argument(
         "--execute",
@@ -48,6 +44,7 @@ def main() -> None:
         help="Commit the migration (default: dry-run only)",
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False

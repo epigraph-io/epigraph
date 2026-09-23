@@ -47,11 +47,8 @@ from datetime import datetime, timezone
 import psycopg2
 import psycopg2.extras
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
 DEFAULT_OUTPUT = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 
 
@@ -232,7 +229,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(),
     )
     parser.add_argument(
         "--threshold", type=float, default=0.95,
@@ -255,6 +252,7 @@ def main() -> int:
         help="Print progress every N claims (default 5000)",
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     if not 0.0 <= args.threshold <= 1.0:
         sys.exit("--threshold must be in [0.0, 1.0]")

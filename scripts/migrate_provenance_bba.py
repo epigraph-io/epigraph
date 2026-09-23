@@ -80,7 +80,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from maintenance_dsn import maintenance_dsn  # noqa: E402
+from maintenance_dsn import maintenance_dsn, require_dsn  # noqa: E402
 
 MARKER = "provenance_migration_v1"
 
@@ -469,11 +469,7 @@ def main() -> None:
 
     if not args.database_url:
         args.database_url = maintenance_dsn()
-    if not args.database_url:
-        sys.exit(
-            "FATAL: set MAINTENANCE_DATABASE_URL (preferred) or DATABASE_URL, "
-            "or pass --database-url"
-        )
+    args.database_url = require_dsn(args.database_url)
     if args.execute and not args.manifest:
         sys.exit("FATAL: --execute requires --manifest. An unjournalled write is not reversible.")
     if not args.rollback and not (args.frame_ids and args.perspective_id and args.source_agent_id):

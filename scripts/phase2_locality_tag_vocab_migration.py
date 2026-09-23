@@ -73,7 +73,7 @@ from typing import Dict
 
 import psycopg2  # type: ignore[import-untyped]
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 # Rename existing 'intra' rows to the more specific 'intra_self_cite' tag.
 # The Phase 1a/1b detection was DOI-match → self-cite by definition.
@@ -103,13 +103,11 @@ def main() -> int:
     parser.add_argument(
         "--database-url",
         default=maintenance_dsn(),
-        help="postgres DSN (default: $DATABASE_URL)",
+        help="postgres DSN (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     args = parser.parse_args()
-
-    if not args.database_url:
-        print("ERROR: --database-url or $DATABASE_URL required", file=sys.stderr)
-        return 1
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False

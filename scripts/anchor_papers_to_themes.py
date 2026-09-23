@@ -41,11 +41,7 @@ import psycopg2.extras
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _api_client import EpiGraphClient
 
-from maintenance_dsn import maintenance_dsn
-
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
-)
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 JUDGE_MODEL = "claude-haiku-4-5"  # informational only; the CLI picks the model
 
@@ -323,7 +319,7 @@ def anchor_worker(claim: dict, args: argparse.Namespace, api: EpiGraphClient) ->
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--database-url", default=maintenance_dsn(DEFAULT_DATABASE_URL))
+    ap.add_argument("--database-url", default=maintenance_dsn())
     ap.add_argument("--layer", choices=["textbook", "review", "both"], default="both")
     ap.add_argument("--level", type=int, default=3, help="Paper claim level to anchor (default 3 = atoms).")
     ap.add_argument("--top-k", type=int, default=8)
@@ -334,6 +330,7 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=8,
                     help="Number of parallel worker threads (default 8).")
     args = ap.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     # API client for edge POST + claim PATCH. `claims:write` covers the
     # anchored_at PATCH; `edges:write` covers INSTANTIATES edge creation;

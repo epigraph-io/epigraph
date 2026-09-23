@@ -13,20 +13,19 @@ import numpy as np
 import psycopg2
 
 from maintenance_dsn import maintenance_dsn as _maintenance_dsn
+from maintenance_dsn import require_dsn
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
+def maintenance_dsn():
+    """Resolve the DSN a corpus-wide script should connect on, or exit.
 
-def maintenance_dsn(default=DEFAULT_DATABASE_URL):
-    """Resolve the DSN a corpus-wide script should connect on.
-
-    A thin binding of `maintenance_dsn.maintenance_dsn` to this family's
-    default. The RULE — `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`,
-    then `default`, and a refusal when the two name different databases — lives
-    in `scripts/maintenance_dsn.py` and is stated once there, because nineteen
-    scripts share it and nineteen copies of a guard is nineteen places for it to
-    drift. Read that module for why the precedence needs a guard at all and why
-    privilege is deliberately not asserted in Python.
+    A fail-closed binding of `maintenance_dsn.maintenance_dsn`. The RULE —
+    `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`, and a refusal when the
+    two name different databases — lives in `scripts/maintenance_dsn.py` and is
+    stated once there, because nineteen scripts share it and nineteen copies of
+    a guard is nineteen places for it to drift. Read that module for why the
+    precedence needs a guard at all and why privilege is deliberately not
+    asserted in Python.
 
     Why the theme pipeline in particular needs it: it enumerates, re-clusters
     and UPDATEs the whole claim corpus, so once RLS is active (PR-17) an
@@ -34,16 +33,20 @@ def maintenance_dsn(default=DEFAULT_DATABASE_URL):
     subset — the SELECTs see less, the UPDATEs touch nothing, and the script
     exits 0.
 
-    NOTE — pre-existing and NOT changed here: `DEFAULT_DATABASE_URL` hardcodes
-    a production role and database. That is a long-standing property of this
-    script family, not something PR-15 introduced, and changing it would alter
-    where a dozen operator scripts point by default. Flagged, not fixed.
+    There is no default database. This used to fall back to a credentialed
+    `epigraph_admin` DSN for the live `epigraph` database when neither variable
+    was set; it now exits instead (`require_dsn`).
     """
-    return _maintenance_dsn(default)
+    return require_dsn(_maintenance_dsn())
 
 
 def connect(database_url=None):
-    """Open a psycopg2 connection (admin role by default)."""
+    """Open a psycopg2 connection on `database_url`, else the maintenance DSN.
+
+    Exits when neither is given. An empty `database_url` counts as not given,
+    so `--database-url ''` cannot hand libpq an empty DSN to fill in from its
+    own environment.
+    """
     url = database_url or maintenance_dsn()
     return psycopg2.connect(url)
 

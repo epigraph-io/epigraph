@@ -19,13 +19,11 @@ bulk cluster writes exists. Permitted per CLAUDE.md's "operations not
 yet exposed via API" carve-out.
 
 Usage:
-    DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \\
+    DATABASE_URL=postgres://USER:PASS@HOST:5432/DB \\
         python3 scripts/evidential_clustering.py --limit 500
     # With agent filter:
     python3 scripts/evidential_clustering.py --limit 500 --agent-filter 'textbook-extractor:%'
 """
-
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
 import argparse
 import json
@@ -39,7 +37,7 @@ import psycopg2
 import psycopg2.extras
 from sklearn.cluster import MiniBatchKMeans
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 psycopg2.extras.register_uuid()
 
@@ -382,8 +380,9 @@ def main():
     parser = argparse.ArgumentParser(description="Evidential clustering with compound claim structure")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=maintenance_dsn(),
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument("--k", type=int, default=8, help="Initial proto-clusters for parent claims")
@@ -391,6 +390,7 @@ def main():
     parser.add_argument("--agent-filter", type=str, default=None)
     parser.add_argument("--atomic-only", action="store_true", help="(default behavior, kept for compat)")
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     run_id = str(uuid.uuid4())

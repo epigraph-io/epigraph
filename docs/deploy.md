@@ -817,7 +817,7 @@ rolsuper, rolbypassrls FROM pg_roles`:
 | `epigraph_seed` | **no** | no | no | Migration 074 arm 4's fixture escape hatch (PR-16). |
 | `epigraph_ro` | yes | no | no | Read-only. Used by `scripts/subcluster_outliers.py` and `run_assessment_worker.py`'s read side, both of which PR-15 deliberately left alone. |
 | `epigraph_dev` | yes | no | no | Developer convenience. |
-| **`epigraph_admin`** | yes | no | no | **A deliberate fourth role, not an accident.** It is the operator identity the Python scripts default to (`scripts/theme_lib.py` and eleven siblings) and the natural home for `MAINTENANCE_DATABASE_URL`: of the three login-capable non-superusers (`epigraph_ro`, `epigraph_dev`, `epigraph_admin`) it is the only one intended for writes. PR-15 does **not** grant it `epigraph_maintenance` — that is a privilege change, it needs no code, and doing it inside a code-only PR would put a security-relevant GRANT somewhere nobody would look for it. It is a PR-17 runbook step. |
+| **`epigraph_admin`** | yes | no | no | **A deliberate fourth role, not an accident.** It is the operator identity the writing Python scripts are meant to run as (they no longer DEFAULT to it, or to anything; see below) and the natural home for `MAINTENANCE_DATABASE_URL`: of the three login-capable non-superusers (`epigraph_ro`, `epigraph_dev`, `epigraph_admin`) it is the only one intended for writes. PR-15 does **not** grant it `epigraph_maintenance` — that is a privilege change, it needs no code, and doing it inside a code-only PR would put a security-relevant GRANT somewhere nobody would look for it. It is a PR-17 runbook step. |
 
 **The consequence, stated plainly:** until `GRANT epigraph_maintenance TO
 epigraph_admin` is run, the only role that both connects and satisfies
@@ -825,22 +825,46 @@ epigraph_admin` is run, the only role that both connects and satisfies
 row security being active at all — an unconditional assertion would refuse to
 start on every correctly-configured cluster that exists today.
 
-**Pre-existing, flagged not fixed:** twelve scripts under `scripts/` hardcode a
-**production** DSN (`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph`
-and two `epigraph_ro` variants) as the default when `DATABASE_URL` is unset.
-PR-15 added `MAINTENANCE_DATABASE_URL` ahead of that default in the precedence
-chain but did **not** change the default itself: that is a long-standing
-property of this script family, and changing where a dozen operator scripts
-point by default is not a decision to make inside a pool-plumbing PR.
+**DISCHARGED: the scripts no longer have a default database.** PR-15 flagged,
+and did not fix, that scripts under `scripts/` fell back to a **production** DSN,
+password included, when `DATABASE_URL` was unset. PR-15 put
+`MAINTENANCE_DATABASE_URL` ahead of that default. It left the default alone
+because where a dozen operator scripts point is not a pool-plumbing decision.
+The real scope was larger than the flag said. It was twenty-one Python files
+and four role/password pairs (`epigraph_admin`, `epigraph`, `epigraph_ro`,
+`epigraph_dev`), all pointing at the live `epigraph` database. Branch
+`fix/deferred-2026-09-22-lane-d` (deferred-commitment screen key
+`script-hardcoded-prod-dsn`) removed every one of them. Each connecting script
+now passes its DSN through `scripts/maintenance_dsn.py::require_dsn` and exits
+when none is configured. It does not hand `None` to libpq, which would fill the
+gap from `PG*` variables and `~/.pgpass`. CI holds both rules through
+`crates/epigraph-db/tests/scripts_have_no_default_dsn.rs`, and
+`scripts/tests/test_no_default_database.py` proves the refusal end to end.
+
+**Removing the literals did not replace these operator steps:**
+
+- **Rotate the passwords.** The literals are still in git history, so removing
+  them un-leaked nothing. On any long-lived cluster (not the disposable CI and
+  test databases) where `epigraph_admin`, `epigraph`, `epigraph_ro` or
+  `epigraph_dev` still has the password spelled by the old default (its own
+  role name), rotate it. Keep the new secret in the operator's environment or
+  `~/.pgpass`, never in this repository.
+- **Configure a DSN for anything that relied on the default.** Such a job, for
+  example a scheduled `run_assessment_worker.py`, now exits with
+  `FATAL: no database configured` until its environment names a database. That
+  worker needs `DATABASE_URL` (read-only role) and, unless it runs with
+  `--dry-run`, `MAINTENANCE_DATABASE_URL` or `DATABASE_ADMIN_URL`.
 
 **Where the Python rule lives.** `scripts/maintenance_dsn.py` — standard library
 only, so the seventeen scripts that need the rule but not numpy do not acquire a
 numpy dependency to get it. `scripts/theme_lib.py::maintenance_dsn` is now a thin
-binding of it to this family's default. The refusal it carries is not optional
+fail-closed binding of it. It used to bind this family's default, which is gone.
+The database-name refusal the module carries is not optional
 politeness: giving `MAINTENANCE_DATABASE_URL` precedence means an operator
 pointing `DATABASE_URL` at a scratch database, while a sibling job has that
 variable exported, would otherwise have every write in this family silently
-redirected — and several of these scripts write.
+redirected — and several of these scripts write. The same module also holds
+`require_dsn`, the no-default-database rule above.
 
 ### 1d. Deleting a group is a maintenance-window operation
 

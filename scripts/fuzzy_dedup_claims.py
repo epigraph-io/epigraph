@@ -49,11 +49,8 @@ from dataclasses import dataclass, field
 import psycopg2
 import psycopg2.extras
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
 DEFAULT_INPUT_PATH = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 
 
@@ -287,8 +284,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help="Postgres connection string (env DATABASE_URL overrides default)",
+        default=maintenance_dsn(),
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     parser.add_argument(
         "--execute",
@@ -313,6 +311,7 @@ def main() -> int:
         help="Print one line per cluster.",
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     psycopg2.extras.register_uuid()
     groups = load_groups(args.input)

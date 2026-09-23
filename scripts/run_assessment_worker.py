@@ -33,7 +33,7 @@ import psycopg2
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from lib.tiered_enrichment import auto_tier, EnrichmentResult
-from maintenance_dsn import require_same_database
+from maintenance_dsn import require_dsn, require_same_database
 
 log = logging.getLogger(__name__)
 
@@ -45,10 +45,11 @@ log = logging.getLogger(__name__)
 # purpose: that keyword is paired with an entry in
 # `no_unmaintained_dsn.rs::EXEMPT`, and this file is NOT exempt — its writing
 # connection is converted, which is what that lint checks.
-DATABASE_RO_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph",
-)
+#
+# Neither half has a default. Both used to fall back to a credentialed DSN for
+# the live `epigraph` database; now an unset half is None here and `main()`
+# refuses before the first query (`require_dsn`).
+DATABASE_RO_URL = os.environ.get("DATABASE_URL")
 # Admin DB for UPDATE assessment_queue (status transitions only).
 # PR-15: MAINTENANCE_DATABASE_URL takes precedence, because this is the writing
 # connection and its UPDATEs are what silently match zero rows once RLS is
@@ -58,10 +59,7 @@ DATABASE_RO_URL = os.environ.get(
 # unset. The precedence is spelled out; only the guard is shared.
 DATABASE_ADMIN_URL = (
     os.environ.get("MAINTENANCE_DATABASE_URL")
-    or os.environ.get(
-        "DATABASE_ADMIN_URL",
-        "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph",
-    )
+    or os.environ.get("DATABASE_ADMIN_URL")
 )
 # The read/write split is only a safety property while both halves are the same
 # DATABASE. An exported MAINTENANCE_DATABASE_URL naming a different one would
@@ -402,6 +400,17 @@ async def main():
     parser.add_argument("--dry-run", action="store_true", help="Show pending entries without processing")
     parser.add_argument("--retry-failed", action="store_true", help="Also retry previously failed entries")
     args = parser.parse_args()
+
+    # Refuse up front, before the queue is read or an LLM is called, rather
+    # than at the first write. A dry run never writes, so it needs only the
+    # read half.
+    require_dsn(DATABASE_RO_URL, "DATABASE_URL (the read-only role)")
+    if not args.dry_run:
+        require_dsn(
+            DATABASE_ADMIN_URL,
+            "MAINTENANCE_DATABASE_URL (preferred) or DATABASE_ADMIN_URL for the "
+            "status UPDATEs, or pass --dry-run",
+        )
 
     logging.basicConfig(
         level=logging.INFO,

@@ -30,11 +30,7 @@ import json
 
 import psycopg2
 
-from maintenance_dsn import maintenance_dsn
-
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
-)
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 MEANINGFUL_THRESHOLD = 0.10  # m({1}) above this = genuinely opposing signal
 
@@ -56,7 +52,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(),
     )
     parser.add_argument(
         "--threshold",
@@ -65,6 +61,7 @@ def main() -> None:
         help=f"m({{1}}) above this is 'meaningfully opposing' (default {MEANINGFUL_THRESHOLD})",
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = True

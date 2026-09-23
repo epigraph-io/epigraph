@@ -19,7 +19,7 @@ on disk. `--dangerously-skip-permissions` is required so the Write tool
 runs unattended.
 
 Usage:
-    DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \\
+    DATABASE_URL=postgres://USER:PASS@HOST:5432/DB \\
     python3 scripts/label_themes_llm.py
 
     # Limit how many themes to label
@@ -46,11 +46,10 @@ import time
 import psycopg2
 import psycopg2.extras
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 psycopg2.extras.register_uuid()
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 RESULT_DIR = "/tmp/theme_labels"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
@@ -182,8 +181,9 @@ def main():
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=maintenance_dsn(),
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -201,6 +201,7 @@ def main():
              "looks like an LLM-generated short string already.",
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     os.makedirs(RESULT_DIR, exist_ok=True)

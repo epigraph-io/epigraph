@@ -50,10 +50,8 @@ import sys
 
 import psycopg2
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
-
-DEFAULT_DATABASE_URL = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 
 # Predicate fragments. The "intra" predicate matches BBAs whose claim has at
 # least one evidence row whose DOI matches the paper asserting the claim. The
@@ -193,7 +191,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(),
     )
     parser.add_argument(
         "--execute",
@@ -201,6 +199,7 @@ def main() -> int:
         help="Commit the UPDATEs. Default is dry-run (no writes).",
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     conn.autocommit = False

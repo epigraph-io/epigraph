@@ -17,11 +17,9 @@ Direct DB INSERT — `epigraph_admin` role required (no API endpoint
 for bulk claim_clusters writes), same as evidential_clustering.py.
 
 Usage:
-    DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \\
+    DATABASE_URL=postgres://USER:PASS@HOST:5432/DB \\
         python3 scripts/refine_clusters.py --cluster-id 2
 """
-
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 
 import argparse
 import json
@@ -41,7 +39,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 import umap
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 psycopg2.extras.register_uuid()
 
@@ -393,14 +391,16 @@ def main():
     parser = argparse.ArgumentParser(description="Interactive cluster refinement")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=maintenance_dsn(),
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     parser.add_argument("--cluster-id", type=int, required=False)
     parser.add_argument("--run-id", default=None, help="Cluster run ID (default: latest)")
     parser.add_argument("--auto", action="store_true",
                         help="Non-interactive: embedding-subcluster + LLM label")
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = get_connection(args.database_url)
 

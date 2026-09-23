@@ -17,6 +17,17 @@ dependency to seventeen files as a side effect of a DSN change.
 `scripts/` is on `sys.path` when a script in it is run directly (the mode every
 one of these is written for), so `from maintenance_dsn import maintenance_dsn`
 resolves the same way `import theme_lib` already does.
+
+It also holds `require_dsn`, the rule that there is NO DEFAULT DATABASE. Until
+the deferred-commitment screen removed them, twenty-one scripts here fell back
+to a credentialed DSN for the live `epigraph` database (four different role and
+password pairs, the admin role's among them) whenever the environment named
+none, so forgetting one `export` ran a writing script against production. That
+rule applies to every script that opens a connection, including the read-only
+ones that deliberately do not take the maintenance precedence; importing
+`require_dsn` from here does not make a script "consult" the maintenance DSN,
+and `no_unmaintained_dsn.rs` keys on the `maintenance_dsn(` call, not on this
+module's name, for exactly that reason.
 """
 import os
 import urllib.parse
@@ -70,10 +81,14 @@ def require_same_database(dsn_a, name_a, dsn_b, name_b):
         )
 
 
-def maintenance_dsn(default=None):
+def maintenance_dsn():
     """Resolve the DSN a corpus-wide script should connect on.
 
-    `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`, then `default`.
+    `MAINTENANCE_DATABASE_URL` wins, then `DATABASE_URL`, then None. There is
+    no third tier: this function used to take a `default`, and every caller
+    passed a credentialed production DSN through it. The parameter is gone so
+    that shape cannot come back through here. A None return must never reach
+    the driver: pass the resolved value through `require_dsn` first.
 
     THE DATABASE-NAME GUARD IS THE REASON THIS IS A FUNCTION. Giving
     `MAINTENANCE_DATABASE_URL` precedence is a footgun on its own: an operator
@@ -102,9 +117,46 @@ def maintenance_dsn(default=None):
     maintenance = os.environ.get("MAINTENANCE_DATABASE_URL")
     application = os.environ.get("DATABASE_URL")
     if not maintenance:
-        return application if application else default
+        return application if application else None
 
     require_same_database(
         maintenance, "MAINTENANCE_DATABASE_URL", application, "DATABASE_URL"
     )
     return maintenance
+
+
+# Where to find a DSN, named in the refusal. Callers whose DSN comes from
+# somewhere else (the read-only scripts, the assessment worker's two halves)
+# pass their own spelling.
+MAINTENANCE_DSN_SOURCES = (
+    "MAINTENANCE_DATABASE_URL (preferred) or DATABASE_URL, or pass --database-url"
+)
+
+
+def require_dsn(dsn, sources=MAINTENANCE_DSN_SOURCES):
+    """Return `dsn`, or exit naming where one should have come from.
+
+    There is deliberately NO DEFAULT DATABASE. Every script in `scripts/` that
+    opens a connection passes its resolved DSN through here before anything
+    else happens -- before a file is read, a token minted or an LLM called --
+    so a run with nothing configured stops at the top rather than after work
+    it cannot finish.
+
+    The check is not optional even for a script whose argparse default is
+    already `maintenance_dsn()` and no literal. Handing None, or an empty
+    string, to psycopg2 does NOT raise: libpq falls back to the PG*
+    environment variables, `~/.pgpass`, the local socket and a database named
+    after the OS user, which can silently be a local `epigraph`. Refusing here
+    is the only way "no default" actually means no connection.
+
+    Raises:
+        SystemExit: when `dsn` is None or empty.
+    """
+    if dsn:
+        return dsn
+    raise SystemExit(
+        f"FATAL: no database configured. Set {sources}. There is deliberately "
+        "no default database: these scripts used to fall back to a credentialed "
+        "DSN for the live `epigraph` database, so a forgotten export ran them "
+        "against production."
+    )

@@ -30,7 +30,7 @@ Memory profile:
 
 Usage:
     # Full run: seed + assign all claims (requires admin DB role for writes)
-    DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \\
+    DATABASE_URL=postgres://USER:PASS@HOST:5432/DB \\
         python3 scripts/cluster_claims.py
 
     # Seed only
@@ -66,11 +66,10 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
 
 import theme_lib  # noqa: E402  (scripts/ is on sys.path when run as a script)
-from maintenance_dsn import maintenance_dsn  # noqa: E402  (same sys.path assumption)
+from maintenance_dsn import maintenance_dsn, require_dsn  # noqa: E402  (same sys.path assumption)
 
 psycopg2.extras.register_uuid()
 
-DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
 REDUCER_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "umap_reducer.pkl")
 
 
@@ -445,8 +444,9 @@ def main():
         description="UMAP-based claim clustering with coordinate frame")
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
+        default=maintenance_dsn(),
+        help="Postgres URL (default: $MAINTENANCE_DATABASE_URL, then $DATABASE_URL). "
+        "Required: there is no default database.",
     )
     parser.add_argument("--sample-size", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=100000)
@@ -460,6 +460,7 @@ def main():
     parser.add_argument("--all-claims", action="store_true",
                         help="Seed from all current claims (default: atomic leaves only)")
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     conn = psycopg2.connect(args.database_url)
     theme_lib.set_statement_timeout(conn, ms=900000)  # 15 min ceiling per statement

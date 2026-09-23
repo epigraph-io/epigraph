@@ -93,10 +93,9 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for older interpreter
 
 import psycopg2
 
-from maintenance_dsn import maintenance_dsn
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 
-DEFAULT_DATABASE_URL = "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 DEFAULT_CALIBRATION = Path(__file__).resolve().parent.parent / "calibration.toml"
 
 # Scope flag maps to a tier filter on `mf.source_strength`. `all` means
@@ -386,7 +385,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--database-url",
-        default=maintenance_dsn(DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(),
     )
     parser.add_argument(
         "--calibration",
@@ -415,6 +414,7 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     intra_factor = load_intra_factor(args.calibration)
     scope_tiers = SCOPE_TIERS[args.scope]

@@ -58,11 +58,7 @@ from typing import Optional
 import psycopg2
 import psycopg2.extras
 
-from maintenance_dsn import maintenance_dsn
-
-DEFAULT_DATABASE_URL = (
-    "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
-)
+from maintenance_dsn import maintenance_dsn, require_dsn
 
 LABEL_PROMPT = """\
 You are labeling a textbook section that will serve as a "concept anchor" \
@@ -268,7 +264,7 @@ def seed_one(section: dict, args: argparse.Namespace) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--database-url", default=maintenance_dsn(DEFAULT_DATABASE_URL))
+    ap.add_argument("--database-url", default=maintenance_dsn())
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--drop-auto-after", action="store_true",
@@ -276,6 +272,7 @@ def main() -> int:
     ap.add_argument("--concurrency", type=int, default=8,
                     help="Number of parallel worker threads (default 8).")
     args = ap.parse_args()
+    args.database_url = require_dsn(args.database_url)
 
     # Main-thread connection: used only for the initial section list and the
     # final --drop-auto-after audit. Each worker opens its own connection.

@@ -218,9 +218,17 @@ fn rel(root: &Path, p: &Path) -> String {
 }
 
 /// Does this script consult the maintenance DSN in CODE (not in a comment)?
+///
+/// Keyed on the CALL, `maintenance_dsn(`, not on the bare name. The
+/// `maintenance_dsn` module also exports `require_dsn`, the no-default-database
+/// rule that every connecting script needs, the read-only exempt ones included
+/// (`scripts_have_no_default_dsn.rs`). `from maintenance_dsn import require_dsn`
+/// names the module without consulting `MAINTENANCE_DATABASE_URL`. Counting it
+/// would certify both exempt scripts as converted and fail the exemption table
+/// for the wrong reason.
 fn python_consults_maintenance_dsn(src: &str) -> bool {
     code_lines(src)
-        .any(|(_, l)| l.contains("MAINTENANCE_DATABASE_URL") || l.contains("maintenance_dsn"))
+        .any(|(_, l)| l.contains("MAINTENANCE_DATABASE_URL") || l.contains("maintenance_dsn("))
 }
 
 fn exempt_names() -> BTreeSet<&'static str> {
@@ -389,6 +397,33 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
             "{name} is listed in EXEMPT but no longer builds an unmaintained pool. \
              Delete the entry and the `{MARKER}` comment: an exemption list that outlives its \
              subjects stops being a list of decisions and becomes a list of nobody-checked."
+        );
+    }
+}
+
+/// Calibration for the Python predicate: the call counts, the import of the
+/// no-default helper from the same module does not.
+#[test]
+fn python_conversion_evidence_is_the_call_not_the_module_name() {
+    for converted in [
+        "    ap.add_argument(\"--database-url\", default=maintenance_dsn())\n",
+        "    url = database_url or maintenance_dsn()\n",
+        "DATABASE_ADMIN_URL = os.environ.get(\"MAINTENANCE_DATABASE_URL\")\n",
+    ] {
+        assert!(
+            python_consults_maintenance_dsn(converted),
+            "must count as consulting the maintenance DSN: {converted}"
+        );
+    }
+    for not_converted in [
+        "from maintenance_dsn import require_dsn\n",
+        "        from maintenance_dsn import require_dsn\n",
+        "# MAINTENANCE_DATABASE_URL is deliberately not read here\n",
+        "# see maintenance_dsn() for the precedence\n",
+    ] {
+        assert!(
+            !python_consults_maintenance_dsn(not_converted),
+            "must NOT count as consulting the maintenance DSN: {not_converted}"
         );
     }
 }

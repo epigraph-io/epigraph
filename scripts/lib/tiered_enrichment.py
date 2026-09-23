@@ -318,13 +318,22 @@ def main():
     # for FORCE to silently truncate. It is also a library entry point invoked
     # by hand, not a scheduled background writer.
     parser.add_argument("--database-url", type=str,
-        default="postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph")
+        default=os.environ.get("DATABASE_URL"),
+        help="Postgres URL on the read-only role, used only with --claim-id "
+        "(default: $DATABASE_URL). There is no default database.")
     args = parser.parse_args()
 
     claim_text = args.claim_text
     evidence_text = args.evidence_text
 
     if args.claim_id:
+        # `require_dsn` only (the no-default-database rule, not the maintenance
+        # precedence); `scripts/` is on sys.path from the insert at the top.
+        from maintenance_dsn import require_dsn
+        args.database_url = require_dsn(
+            args.database_url,
+            "DATABASE_URL (the read-only role) or pass --database-url with --claim-id",
+        )
         import psycopg2
         import uuid as uuid_mod
         try:
