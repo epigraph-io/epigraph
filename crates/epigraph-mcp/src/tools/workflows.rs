@@ -984,6 +984,44 @@ pub async fn report_workflow_outcome(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
+    // ── THE EVIDENCE WRITE IS DELIBERATELY *NOT* STAMPED YET ────────────
+    //
+    // Same site, same argument and the same measurement as
+    // `tools::claims::update_with_evidence`, which was unstamped for this reason
+    // earlier in this branch. `evidence` is tier-A under migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on the
+    // unstamped pool this INSERT is refused on a cleanly-migrated schema — and
+    // that refusal is currently the tool's WHOLE outcome, because nothing has
+    // been written before it.
+    //
+    // Stamping it cannot make this tool whole, and the obstruction is structural:
+    // migration 046 gives `mass_functions.evidence_id` a FK to `evidence(id)`, and
+    // `ds_auto::auto_wire_ds_update` below runs on a SIBLING pool connection that
+    // cannot see an uncommitted row. So a stamped evidence INSERT is forced to
+    // COMMIT ON ITS OWN, and the DS wiring that follows is itself unconverted —
+    // it writes `claim_frames`, which carries no orphan `*_privacy` policy and is
+    // therefore refused on BOTH configurations.
+    //
+    // MEASURED with the real binary over a unix socket as `epigraph_app`
+    // (`rolbypassrls = false`), on a legacy flat workflow claim owned by the MCP
+    // server agent's own group — the only ownership shape this stamp could ever
+    // serve — via `scripts/e2e/probe-workflow.sh`:
+    //
+    //   CONFIG A, stamped:   `evidence_rows=1`, then
+    //                        `assign_claim: … row-level security policy for table
+    //                        "claim_frames"`.            ← committed orphan
+    //   CONFIG A, unstamped: `evidence_rows=0`, and
+    //                        `… policy for table "evidence"`. ← clean refusal
+    //   CONFIG B, either:    `evidence_rows=1`, then the same `claim_frames`
+    //                        failure.                     ← the stamp changes nothing
+    //
+    // So the stamp buys nothing on either configuration and, on the one this
+    // programme exists to make reachable, trades a clean refusal for a committed
+    // orphan. `Evidence::new` mints a fresh `EvidenceId` per call and
+    // `EvidenceRepository::create` has no `ON CONFLICT`, so each retry of a call
+    // that is CERTAIN to fail appends another row: a retry amplifier, not just a
+    // one-off orphan. Re-adding the stamp belongs in D2, which has to put
+    // evidence → BBA → truth_value into one unit anyway.
     EvidenceRepository::create(&server.pool, &evidence)
         .await
         .map_err(internal_error)?;
@@ -1008,15 +1046,34 @@ pub async fn report_workflow_outcome(
     .await
     .map_err(internal_error)?;
 
-    // Derive truth_value from CDST pignistic probability
+    // Derive truth_value from CDST pignistic probability. `UPDATE claims`, so
+    // stamped — and this one STAYS stamped even though the evidence INSERT above
+    // did not. The asymmetry is the same one `update_with_evidence` records, and
+    // it is about position rather than preference: this is the tool's last HARD
+    // write, so a self-committing stamped unit here opens no orphan window —
+    // nothing after it can fail with it half-landed. What does follow is
+    // `BehavioralExecutionRepository::create`, which is warn-only and targets
+    // `behavioral_executions`: `relrowsecurity = f` with zero policies, so it is
+    // refused on neither configuration. That site is registered as a residual in
+    // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
+    // After the DS wiring necessarily, because the value comes from it.
     let after = TruthValue::clamped(ds.pignistic_prob);
-    ClaimRepository::update_truth_value(
-        &server.pool,
-        epigraph_core::ClaimId::from_uuid(workflow_id),
-        after,
-    )
-    .await
-    .map_err(internal_error)?;
+    {
+        let mut tx = crate::claim_helper::begin_author_stamped_tx(
+            server,
+            agent_id,
+            "report_workflow_outcome",
+        )
+        .await?;
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+            after,
+        )
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+    }
 
     // Update use counts in workflow JSON
     let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
@@ -1118,18 +1175,91 @@ pub async fn deprecate_workflow(
 
     let mut deprecated_ids = Vec::new();
 
+    // ── THE WHOLE DEPRECATION, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // `deprecate_claim` is an `UPDATE claims`, so `claims_tenancy`'s WITH CHECK
+    // governs it and an unstamped session is refused with `42501`. The cascade
+    // makes that worse than a single refusal: it walks a tree deprecating one
+    // claim at a time, so a refusal partway through used to leave a HALF-
+    // DEPRECATED hierarchy — some variants flipped, some still current, and
+    // `find_workflow_hierarchical` returning the ones that were missed.
+    //
+    // THE STAMP IS LOAD-BEARING, AND THAT IS MEASURED RATHER THAN ARGUED.
+    //
+    // A review finding held that this conversion is INERT for its own target
+    // population, because every workflow claim is authored by the
+    // `workflow-ingest-system` agent while this tool stamps from
+    // `server.agent_id()`. The authorship half is correct —
+    // `epigraph_ingest_executor::execute_workflow_ingest_plan` resolves
+    // `get_or_create_system_agent` and passes that id to
+    // `create_with_id_if_absent` — but the population half does not survive
+    // measurement. Taken as `epigraph_app` (`rolbypassrls = false`) with the real
+    // binary over a unix socket, via `scripts/e2e/probe-workflow.sh`, on a
+    // cleanly-migrated schema, differing only in the binary:
+    //
+    //   flat workflow claim owned by the server agent's OWN group
+    //     stamped   -> succeeds, `is_current = false`
+    //     unstamped -> `new row violates row-level security policy for table
+    //                   "claims"`, `is_current = true`
+    //   the same claim owned by a FOREIGN group
+    //     stamped   -> refused;  unstamped -> refused
+    //
+    // Revert the stamp and the write fails; restore it and the write lands. On
+    // CONFIG B both binaries succeed, so production sees no change.
+    //
+    // WHY THE FOREIGN CASE IS NOT THE ANSWER HERE. The reviewer reached it with
+    // raw SQL. Through the tool it is not reachable: `store_workflow` returns a
+    // `workflows` ROW id, and `find_workflow` and `find_workflow_hierarchical`
+    // both return that same id (MEASURED: the id they returned was present in
+    // `workflows` and absent from `claims`). No discovery tool in this surface
+    // hands `deprecate_workflow` a system-agent-owned CLAIM id.
+    //
+    // THE RESIDUAL THAT IS REAL, stated so the green above is not over-read: for a
+    // HIERARCHICAL workflow this tool deprecates nothing in `claims` at all. It is
+    // handed the `workflows` row id, `deprecate_claim` matches zero rows, and the
+    // thesis and step claims stay `is_current = true` while the response reports
+    // that id as deprecated. MEASURED: `deprecated_ids: ["3d99ce3a-…"]` with
+    // `SELECT … FROM claims WHERE id = '3d99ce3a-…'` returning no row and all four
+    // seeded workflow claims still current. Fixing that means deprecating claims
+    // the system agent owns, which is the author-stamping question (#493) rather
+    // than a rename — it is recorded here, not silently widened.
+    //
+    // TWO AUTHORITIES IN ONE LOOP, deliberately. The transaction's session GUCs
+    // carry the SERVER AGENT's groups (the write authority), while the traversal
+    // below splices the CALLER's `viewer` (the read authority). That divergence is
+    // intentional and neither half may take the other's: stamping the caller would
+    // refuse the write this tool exists to perform, and reading with the server
+    // agent's viewer would let a caller cascade into workflow claims it cannot
+    // see. The widened USING side does mean the cascade can ENUMERATE rows the
+    // caller's viewer would not reach on the unstamped pool; the `viewer.splice`
+    // label oracle below is what keeps that from turning into a write, and it is
+    // filtered rather than exempted for exactly this reason. On stdio the caller
+    // and the server agent coincide, so this only differs on authenticated HTTP.
+    //
+    // The traversal reads run on the same stamped connection as the writes, which
+    // is the correct direction: an unstamped read returns FEWER rows, so a
+    // cascade planned on one connection and executed on another could silently
+    // skip a child it was entitled to deprecate.
+    let agent_id = server.agent_id().await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "deprecate_workflow")
+            .await?;
+
     // Deprecate the target workflow (A4: also set is_current = false).
     // ClaimRepository::deprecate_claim ALSO nulls the embedding in the same
     // statement — required by CLAUDE.md "Embedding policy → Cleanup paths"
     // so the deprecated workflow drops out of semantic recall and does not
     // inflate the `stale_present` audit count.
-    ClaimRepository::deprecate_claim(&server.pool, epigraph_core::ClaimId::from_uuid(workflow_id))
+    ClaimRepository::deprecate_claim(&mut *tx, epigraph_core::ClaimId::from_uuid(workflow_id))
         .await
         .map_err(internal_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
-    epigraph_db::WorkflowRepository::set_truth_value(&server.pool, workflow_id, 0.05)
+    // `workflows` is NOT RLS-protected (measured: no policy, not in 062's
+    // tier-A), so this half was never refused — it is in the transaction so the
+    // two halves of one deprecation cannot land apart.
+    epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, workflow_id, 0.05)
         .await
         .map_err(internal_error)?;
     deprecated_ids.push(workflow_id.to_string());
@@ -1144,9 +1274,38 @@ pub async fn deprecate_workflow(
         visited.insert(workflow_id);
         let mut queue = vec![workflow_id];
         while let Some(current) = queue.pop() {
-            let edges = EdgeRepository::get_by_target(&server.pool, viewer, current, "claim")
+            // PROPAGATED, not swallowed. This read was `.unwrap_or_default()`
+            // before the branch, and on `&server.pool` that was harmless: the
+            // target's deprecation had already autocommitted and a failed read
+            // merely skipped the children. INSIDE the transaction the same swallow
+            // is a poison pill, and the failure it produces is WORSE than the
+            // `25P02` one might expect.
+            //
+            // MEASURED, by dropping `edges` inside a `#[sqlx::test]` database and
+            // calling this tool with `cascade: true` on the swallowing revision:
+            //
+            //     {"deprecated_ids": ["dc975b42-…"], "reason": "cascade read failure"}
+            //     is_error: false
+            //
+            // — success, with nothing written. The mechanism is PostgreSQL's, not
+            // sqlx's: after an error inside a transaction block, `COMMIT` is
+            // accepted and returns the `ROLLBACK` command tag rather than an error
+            // (verified directly: `BEGIN; INSERT…; SELECT FROM <missing>; COMMIT;`
+            // leaves zero rows and raises nothing on the COMMIT). So the swallow
+            // aborts the transaction, the loop exits with an empty edge list,
+            // `tx.commit()` returns `Ok`, and the tool reports a deprecation that
+            // was discarded in full. A caller cannot tell, and neither can a log.
+            //
+            // That is the failure mode #494's SAVEPOINT discipline exists to
+            // prevent (`EventRepository::publish_or_log_conn` opens one;
+            // `create_or_get`'s duplicate-key re-find opens one). A SAVEPOINT would
+            // work here too, but propagation is the better answer for THIS read: a
+            // savepoint preserves the "skip the children" behaviour, and that
+            // behaviour was only ever an accident of running outside a transaction.
+            // A cascade that cannot enumerate its children has not completed.
+            let edges = EdgeRepository::get_by_target(&mut *tx, viewer, current, "claim")
                 .await
-                .unwrap_or_default();
+                .map_err(internal_error)?;
 
             for edge in edges {
                 if !DESCENDANT_REL.contains(&edge.relationship.as_str()) {
@@ -1168,7 +1327,7 @@ pub async fn deprecate_workflow(
                     if let Some(g) = viewer.group_bind() {
                         q = q.bind(g);
                     }
-                    q.fetch_optional(&server.pool)
+                    q.fetch_optional(&mut *tx)
                         .await
                         .map_err(internal_error)?
                         .unwrap_or(false)
@@ -1181,21 +1340,35 @@ pub async fn deprecate_workflow(
                     continue;
                 }
 
-                ClaimRepository::deprecate_claim(
-                    &server.pool,
+                let child_rows = ClaimRepository::deprecate_claim(
+                    &mut *tx,
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
                 .await
                 .map_err(internal_error)?;
                 // Mirror onto the hierarchical row, if any.
-                epigraph_db::WorkflowRepository::set_truth_value(&server.pool, child_id, 0.05)
+                epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
                     .map_err(internal_error)?;
-                deprecated_ids.push(child_id.to_string());
+                // REPORT ONLY WHAT ACTUALLY FLIPPED. `deprecate_claim` returns
+                // `rows_affected`, and a cascade child can legitimately yield 0:
+                // `claims_tenancy`'s USING side filters the UPDATE's target, so a
+                // row this session may not write is silently not written rather
+                // than refused. Pushing the id regardless made the response assert
+                // a deprecation that did not happen — and unlike a `42501`, a
+                // USING-filtered miss raises nothing for the caller to notice.
+                // The traversal still descends: `is_workflow` above proved this is
+                // a workflow claim, and a child that was skipped here may still
+                // have descendants that are not.
+                if child_rows > 0 {
+                    deprecated_ids.push(child_id.to_string());
+                }
                 queue.push(child_id);
             }
         }
     }
+
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,

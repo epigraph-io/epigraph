@@ -10,6 +10,93 @@ use sqlx::{Acquire, PgConnection};
 use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 
+/// The two things every author-stamped write needs and neither can be faked:
+/// the [`epigraph_db::ScopedPool`] that can stamp a connection at all, and the
+/// author's own [`Viewer`](epigraph_db::visibility::Viewer), proven to carry
+/// write authority.
+///
+/// Extracted from [`begin_author_stamped_tx`] when the post-commit embed became
+/// the second caller. It is ONE function rather than two copies because the
+/// three refusals below are the whole safety argument — a second site that
+/// resolved a viewer and skipped the empty-writable check would stamp a session
+/// with an empty writable set and get a bare `42501` from whichever statement
+/// ran first, which is precisely the diagnosis-free failure this module exists
+/// to remove.
+///
+/// # Why it takes the pool and the `ScopedPool` rather than the server
+///
+/// Because [`crate::embed::McpEmbedder`] is the third caller and is not the
+/// server: it holds its own `ScopedPool` (declared via
+/// `McpEmbedder::with_scoped_pool`) and is cloned into detached background tasks
+/// where no `&EpiGraphMcpFull` survives — `tools/ingestion.rs`'s embed queue is
+/// `tokio::spawn`ed with `Arc::clone(&server.embedder)` alone. Parameterising
+/// here is what lets all three write paths share ONE refusal triple instead of a
+/// second copy that resolved a viewer and skipped the empty-writable check.
+///
+/// # Errors
+/// * `McpError::internal_error` if this process was not built from a
+///   [`epigraph_db::ScopedPool`] — never a fallback to the unstamped pool.
+/// * `McpError::internal_error` if the author's viewer cannot be resolved.
+/// * `McpError::internal_error` if that viewer has no writable group.
+async fn author_write_authority<'p>(
+    scoped: Option<&'p epigraph_db::ScopedPool>,
+    pool: &sqlx::PgPool,
+    author_agent_id: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<(&'p epigraph_db::ScopedPool, epigraph_db::visibility::Viewer), McpError> {
+    let scoped = scoped.ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            "write refused: this MCP process was not built from a ScopedPool, so no \
+             connection can be stamped with the author's tenancy context. Refusing rather \
+             than writing on the unstamped pool, which commits the claim and then loses its \
+             trace, evidence and AUTHORED edge to a 42501. Construct the server with \
+             EpiGraphMcpFull::with_scoped_pool."
+        );
+        internal_error(format!(
+            "{tool_name}: this MCP server was not built from a ScopedPool, so the write \
+             path cannot stamp a connection with the author's tenancy context. Nothing was \
+             written. Construct the server with EpiGraphMcpFull::with_scoped_pool."
+        ))
+    })?;
+
+    let author_viewer = epigraph_db::visibility::Viewer::resolve(pool, author_agent_id)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                author = %author_agent_id,
+                error = %e,
+                "could not resolve the author's viewer"
+            );
+            internal_error(format!(
+                "{tool_name}: could not resolve the author's viewer: {e}"
+            ))
+        })?;
+
+    if author_viewer.writable_groups().is_empty() {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            author = %author_agent_id,
+            "write refused: the author's viewer carries NO writable group, so the session \
+             would be stamped with an empty writable set and every tier-A WITH CHECK would \
+             refuse this submission from inside the transaction. What is missing is a live \
+             `admin`/`writer` membership in a group the submission's rows would be owned by. \
+             Nothing was written."
+        );
+        return Err(internal_error(format!(
+            "{tool_name}: the author ({author_agent_id}) has no live writable group membership, \
+             so no connection can be stamped with write authority for the rows this submission \
+             would own. Nothing was written."
+        )));
+    }
+
+    Ok((scoped, author_viewer))
+}
+
 /// Begin the ONE transaction an MCP submission runs in, stamped from the
 /// **author's** viewer.
 ///
@@ -97,55 +184,13 @@ pub async fn begin_author_stamped_tx<'p>(
     author_agent_id: uuid::Uuid,
     tool_name: &'static str,
 ) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
-    let scoped = server.scoped.as_ref().ok_or_else(|| {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            "write refused: this MCP process was not built from a ScopedPool, so no \
-             connection can be stamped with the author's tenancy context. Refusing rather \
-             than writing on the unstamped pool, which commits the claim and then loses its \
-             trace, evidence and AUTHORED edge to a 42501. Construct the server with \
-             EpiGraphMcpFull::with_scoped_pool."
-        );
-        internal_error(format!(
-            "{tool_name}: this MCP server was not built from a ScopedPool, so the write \
-             path cannot stamp a connection with the author's tenancy context. Nothing was \
-             written. Construct the server with EpiGraphMcpFull::with_scoped_pool."
-        ))
-    })?;
-
-    let author_viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, author_agent_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                target: "tenancy.scoped_write",
-                tool = tool_name,
-                author = %author_agent_id,
-                error = %e,
-                "could not resolve the author's viewer"
-            );
-            internal_error(format!(
-                "{tool_name}: could not resolve the author's viewer: {e}"
-            ))
-        })?;
-
-    if author_viewer.writable_groups().is_empty() {
-        tracing::error!(
-            target: "tenancy.scoped_write",
-            tool = tool_name,
-            author = %author_agent_id,
-            "write refused: the author's viewer carries NO writable group, so the session \
-             would be stamped with an empty writable set and every tier-A WITH CHECK would \
-             refuse this submission from inside the transaction. What is missing is a live \
-             `admin`/`writer` membership in a group the submission's rows would be owned by. \
-             Nothing was written."
-        );
-        return Err(internal_error(format!(
-            "{tool_name}: the author ({author_agent_id}) has no live writable group membership, \
-             so no connection can be stamped with write authority for the rows this submission \
-             would own. Nothing was written."
-        )));
-    }
+    let (scoped, author_viewer) = author_write_authority(
+        server.scoped.as_ref(),
+        &server.pool,
+        author_agent_id,
+        tool_name,
+    )
+    .await?;
 
     scoped.begin_as(&author_viewer).await.map_err(|e| {
         tracing::error!(
@@ -159,6 +204,213 @@ pub async fn begin_author_stamped_tx<'p>(
             "{tool_name}: could not begin an author-stamped transaction: {e}"
         ))
     })
+}
+
+/// Generate (or reuse) a claim's embedding vector and store it on a connection
+/// stamped from the **author's** viewer. Post-commit, best-effort, and
+/// deliberately NOT inside the submission's write transaction.
+///
+/// Returns whether a vector actually landed on the row — the `embedded` field
+/// both tools report.
+///
+/// # Why this is the release gate rather than a tidy-up
+///
+/// `ClaimRepository::store_embedding(&server.pool, …)` is an `UPDATE claims`,
+/// and migration 077's `claims_tenancy` `WITH CHECK` asks
+/// `owner_group_id = ANY(epigraph_writable_groups())`. On the unstamped pool
+/// that set is `{}`, so on a cleanly-migrated schema the UPDATE is **refused**
+/// — and the refusal was swallowed by design, because the embed is best-effort.
+/// MEASURED end-to-end against the real binary as `epigraph_app`: the tool
+/// returned success with `embedded: false` and the row kept `embedding IS NULL`.
+///
+/// Production does not show this today only because it carries an orphan
+/// PERMISSIVE `claims_privacy` policy that exists in no migration. Dropping
+/// that policy is the remediation; doing it before this site is converted would
+/// make every new claim land unembedded and therefore invisible to `recall()`,
+/// surfacing only as CLAUDE.md's `live_missing` climbing with **no error
+/// anywhere**. Hence: convert first, drop second.
+///
+/// # `begin_as`, not `acquire_as`
+///
+/// A stamped *connection* is what this needs, and `acquire_as` is the one-round-trip
+/// way to get one — but it hard-refuses `SessionGucMode::Transaction`, the
+/// transaction-pooler fallback `bin/server.rs` advertises to operators
+/// (`EPIGRAPH_SESSION_GUC_MODE=transaction`). A site written that way is
+/// unservable in a supported configuration and CI has no pgbouncer fixture to
+/// catch it, which is exactly the rule
+/// `epigraph-db/tests/no_unscoped_pool.rs` states for shard authors: reads
+/// convert onto the mode-dispatching helper, **writes target
+/// `ScopedPool::begin_as`**. `ScopedPool::read_as`'s own doc adds the other half
+/// — it is documented read-only because its `Session` arm is not a transaction.
+/// So the embed's single `UPDATE` runs in its own one-statement transaction.
+///
+/// # The provider round trip stays OUTSIDE the transaction
+///
+/// `generate` is awaited before `begin_as` is called. That is the point of
+/// keeping the embed post-commit at all: an embedding call must not hold a
+/// transaction — nor a pooled connection — open across a network hop to OpenAI.
+///
+/// # Why `store_embedding_if_unsealed` and not `store_embedding`
+///
+/// The pair exists because the read that decided this claim needs a vector and
+/// the write that stores one are separated by that provider round trip, and a
+/// claim can be SEALED inside the window. `store_embedding_if_unsealed` takes
+/// the row lock first and re-checks `claim_encryption` and `is_current` against
+/// a snapshot that includes anything committed during the wait, and it splices
+/// the viewer's `{WRITABLE:c}` predicate so the statement's own qual agrees with
+/// the session GUCs this connection was stamped with. Both halves must be the
+/// AUTHOR's viewer: the row is owned by the author's personal group, so a
+/// caller-viewer splice here would render a predicate no row satisfies while the
+/// GUCs said otherwise — a mismatch `#[sqlx::test]` cannot see, because that
+/// harness connects as a BYPASSRLS superuser.
+///
+/// # Failures are warned, never returned
+///
+/// The claim is already committed. CLAUDE.md's embedding policy is explicit that
+/// a failed embed must not block or unwind the write, so every failure path here
+/// logs and reports `false`. The missing-`ScopedPool` and empty-writable-set
+/// refusals are logged at ERROR on `tenancy.scoped_write` — loud, named, and
+/// never a fallback to `server.pool`, which is how a `42501` becomes a silent
+/// `live_missing` row.
+pub async fn embed_claim_author_stamped(
+    server: &EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    text: &str,
+    pending_embedding: Option<String>,
+    tool_name: &'static str,
+) -> bool {
+    // Reuse the novelty gate's already-generated vector when there is one; only
+    // the gate's embedder-failure path and the repair arm (where an exact
+    // resubmit means the gate never ran) pay a second provider call.
+    let pgvec = match pending_embedding {
+        Some(v) => v,
+        None => match server.embedder.generate(text).await {
+            Ok(v) => crate::embed::format_pgvector(&v),
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %claim_id,
+                    tool = tool_name,
+                    "embedding generation failed (claim still stored): {e}"
+                );
+                return false;
+            }
+        },
+    };
+
+    match store_embedding_author_stamped(
+        server.scoped.as_ref(),
+        &server.pool,
+        author_agent_id,
+        claim_id,
+        &pgvec,
+        tool_name,
+    )
+    .await
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "the post-commit embed could not store a vector: {e}. The claim is stored but \
+                 carries no vector and is invisible to semantic recall until the maintenance \
+                 backfill reaches it"
+            );
+            false
+        }
+    }
+}
+
+/// Run ONE `UPDATE claims SET embedding` on a connection stamped from
+/// `author_agent_id`'s viewer. **The single stamped-store mechanism in this
+/// crate.**
+///
+/// Extracted from [`embed_claim_author_stamped`] when the reviewer of the first
+/// revision of this branch pointed out the real shape of the defect: that
+/// revision converted `submit_claim` and `memorize`'s embed and left
+/// `McpEmbedder::embed_and_store` — used by `store_workflow`, `ingest_workflow`,
+/// `improve_workflow_hierarchy`, `add_step`, `consolidate_claims` and both
+/// `ingest_document` paths — storing through the embedder's own unstamped pool.
+/// Seven callers of a broken store, fixed at two call sites. Both entry points
+/// now land here, so there is one place the tenancy argument has to be right.
+///
+/// # `begin_as`, not `acquire_as`
+///
+/// A stamped *connection* is what this needs, and `acquire_as` is the
+/// one-round-trip way to get one — but it hard-refuses
+/// `SessionGucMode::Transaction`, the transaction-pooler fallback `bin/server.rs`
+/// advertises to operators (`EPIGRAPH_SESSION_GUC_MODE=transaction`). A site
+/// written that way is unservable in a supported configuration and CI has no
+/// pgbouncer fixture to catch it, which is exactly the rule
+/// `epigraph-db/tests/no_unscoped_pool.rs` states for shard authors: reads
+/// convert onto the mode-dispatching helper, **writes target
+/// `ScopedPool::begin_as`**. So the single `UPDATE` runs in its own
+/// one-statement transaction.
+///
+/// # Why `store_embedding_if_unsealed` and not `store_embedding`
+///
+/// The pair exists because the read that decided this claim needs a vector and
+/// the write that stores one are separated by a provider round trip, and a claim
+/// can be SEALED inside the window. `store_embedding_if_unsealed` takes the row
+/// lock first and re-checks `claim_encryption` and `is_current` against a
+/// snapshot that includes anything committed during the wait, and it splices the
+/// viewer's `{WRITABLE:c}` predicate so the statement's own qual agrees with the
+/// session GUCs this connection was stamped with. Both halves must be the
+/// AUTHOR's viewer: the row is owned by the author's personal group, so a
+/// caller-viewer splice here would render a predicate no row satisfies while the
+/// GUCs said otherwise — a mismatch `#[sqlx::test]` cannot see, because that
+/// harness connects as a BYPASSRLS superuser.
+///
+/// # Errors
+///
+/// `Err(String)` when no vector could be stored for a reason the caller may want
+/// to name in its own log line: no `ScopedPool`, an author with no writable
+/// group, a failed stamp, a failed statement, or a failed commit. `Ok(false)`
+/// means the statement ran and matched no row — claim missing, sealed,
+/// superseded, or not writable by its author's viewer. Callers treat both as
+/// "not embedded"; CLAUDE.md's embedding policy forbids either from unwinding an
+/// already-committed claim.
+pub(crate) async fn store_embedding_author_stamped(
+    scoped: Option<&epigraph_db::ScopedPool>,
+    pool: &sqlx::PgPool,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    pgvec: &str,
+    tool_name: &'static str,
+) -> Result<bool, String> {
+    // `author_write_authority` has already logged the specific cause at ERROR on
+    // `tenancy.scoped_write`; its message is re-surfaced here so the caller's own
+    // warn line carries it too.
+    let (scoped, author_viewer) = author_write_authority(scoped, pool, author_agent_id, tool_name)
+        .await
+        .map_err(|e| e.message.to_string())?;
+
+    let mut tx = scoped
+        .begin_as(&author_viewer)
+        .await
+        .map_err(|e| format!("could not begin an author-stamped transaction: {e}"))?;
+
+    match ClaimRepository::store_embedding_if_unsealed(&mut tx, &author_viewer, claim_id, pgvec)
+        .await
+    {
+        Ok(true) => tx
+            .commit()
+            .await
+            .map(|()| true)
+            .map_err(|e| format!("the embedding UPDATE succeeded but could not commit: {e}")),
+        Ok(false) => {
+            // Four indistinguishable causes by construction: no such claim, a
+            // claim sealed or superseded since the text was read, or a row this
+            // viewer may not write. None of them is an error the caller can act
+            // on, and all of them mean "no vector was stored".
+            let _ = tx.commit().await;
+            Ok(false)
+        }
+        Err(e) => Err(format!(
+            "embedding store failed on the author-stamped connection: {e}"
+        )),
+    }
 }
 
 /// Emit a verb-edge whose failure must NOT abort the caller's transaction.

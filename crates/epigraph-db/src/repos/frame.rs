@@ -202,11 +202,30 @@ impl FrameRepository {
     ///
     /// Uses ON CONFLICT to update the hypothesis_index if the assignment exists.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `claim_frames` is in migration 062's tier-A array and carries 077's strict
+    /// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, with no
+    /// orphan `*_privacy` policy anywhere to fall back on — so this INSERT is
+    /// refused with `42501` on an unstamped application session, in production as
+    /// well as on a clean migrate. MEASURED: `submit_ds_evidence` returned
+    /// `new row violates row-level security policy for table "claim_frames"` on
+    /// both schema configurations. Only a connection stamped by
+    /// `ScopedPool::begin_as` can satisfy that check, and it hands back a
+    /// transaction rather than a pool. `&PgPool` and `&mut PgConnection` both
+    /// satisfy [`sqlx::PgExecutor`], so every existing pool-taking caller compiles
+    /// unchanged. Same change and same reasoning as
+    /// [`crate::repos::ReasoningTraceRepository::create`].
+    ///
+    /// The row's `(visibility, owner_group_id)` is inherited from the CLAIM by
+    /// migration 074's BEFORE-row trigger and re-stamped by 070 arm (c), so the
+    /// group the session must be able to write is the claim's, not the caller's.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn assign_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn assign_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         hypothesis_index: Option<i32>,
@@ -222,7 +241,7 @@ impl FrameRepository {
         .bind(claim_id)
         .bind(frame_id)
         .bind(hypothesis_index)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())

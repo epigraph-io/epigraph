@@ -500,25 +500,30 @@ pub async fn submit_claim(
         }
     };
 
-    // Reuse the novelty gate's already-generated vector when we have one
-    // (avoids a second OpenAI call for the same content). Only the gate's own
-    // embedder-failure path (`pending_embedding = None`) and the repair arm —
-    // where the exact-resubmit shortcut means the gate never ran — fall back to
-    // `embed_and_store`'s independent generate-and-store.
+    // The store runs on an AUTHOR-STAMPED connection, not on `server.pool`: the
+    // `UPDATE claims SET embedding` is governed by `claims_tenancy`'s WITH CHECK
+    // and is refused on an unstamped session, silently, because the embed is
+    // best-effort. See `claim_helper::embed_claim_author_stamped` for the
+    // measurement and for why the provider call stays outside the transaction.
+    //
+    // Both arms go through it: the novelty gate's already-generated vector when
+    // there is one (no second OpenAI call), and a fresh `generate` otherwise —
+    // the gate's own embedder-failure path and the repair arm, where the
+    // exact-resubmit shortcut means the gate never ran. The previous fallback,
+    // `McpEmbedder::embed_and_store`, stores through the embedder's OWN
+    // unstamped pool and is therefore refused in exactly the same way.
     let embedded = match embed_text {
         None => false,
         Some(text) => {
-            if let Some(pgvec) = pending_embedding.take() {
-                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                    Ok(stored) => stored,
-                    Err(e) => {
-                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                        false
-                    }
-                }
-            } else {
-                server.embedder.embed_and_store(claim_uuid, &text).await
-            }
+            crate::claim_helper::embed_claim_author_stamped(
+                server,
+                agent_id,
+                claim_uuid,
+                &text,
+                pending_embedding.take(),
+                "submit_claim",
+            )
+            .await
         }
     };
 
@@ -860,6 +865,47 @@ pub async fn update_with_evidence(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
+    // ── THE EVIDENCE WRITE IS DELIBERATELY *NOT* STAMPED YET ────────────
+    //
+    // `evidence` is tier-A under migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on this
+    // unstamped pool the INSERT is refused on a cleanly-migrated schema — MEASURED
+    // as `new row violates row-level security policy for table "evidence"`. It is
+    // this tool's FIRST write, so today that refusal is also its whole outcome:
+    // the call fails and **nothing is written**.
+    //
+    // A revision of this branch DID stamp it, and that change was MEASURED to be a
+    // regression rather than an improvement. The reason is that stamping this one
+    // INSERT cannot make the tool whole: migration 046 gives
+    // `mass_functions.evidence_id` a FK to `evidence(id)`, and `ds_auto`'s wiring
+    // below runs on a SIBLING pool connection that cannot see an uncommitted row,
+    // so a stamped evidence INSERT has to COMMIT ON ITS OWN before the DS wiring
+    // can reference it. The DS wiring is itself unconverted (it writes
+    // `claim_frames`, which has no orphan `*_privacy` policy), so the tool still
+    // fails immediately afterwards — now with the evidence row committed.
+    //
+    // The two configurations, measured with the real binary as `epigraph_app`:
+    //
+    // * CONFIG B (prod-faithful, `evidence_privacy` present): the INSERT is
+    //   admitted either way and the call fails at `claim_frames` either way. The
+    //   stamp changes nothing.
+    // * CONFIG A (clean 001→head): unstamped fails at `evidence` having written
+    //   nothing; stamped commits the evidence row and then fails at `claim_frames`.
+    //
+    // So the stamp buys nothing on either configuration today, and on CONFIG A it
+    // converts a clean refusal into a committed orphan. That orphan is unbounded,
+    // not merely untidy: `Evidence::new` mints `EvidenceId::new()` (a fresh v4
+    // UUID) and `EvidenceRepository::create` has NO `ON CONFLICT`, so every agent
+    // retry of a call that is certain to fail appends another evidence row for the
+    // same assertion. Its sibling in `submit_ds_evidence` was KEPT for exactly the
+    // opposite reason — `assign_claim` is `ON CONFLICT … DO UPDATE` and
+    // `store_with_perspective` upserts, so a retry there re-states rather than
+    // accumulates.
+    //
+    // This site therefore converts WITH the DS wiring (D2), in the one commit that
+    // can put evidence → BBA → truth_value → labels in a single stamped unit, and
+    // not before. `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` carries
+    // it in the residual register so it cannot be forgotten.
     EvidenceRepository::create(&server.pool, &evidence)
         .await
         .map_err(internal_error)?;
@@ -902,23 +948,70 @@ pub async fn update_with_evidence(
     .await
     .map_err(internal_error)?;
 
-    // Derive truth_value from CDST pignistic probability
+    // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // Both are `UPDATE claims`, so both are governed by `claims_tenancy`'s
+    // `WITH CHECK` and both were refused on the unstamped pool. They share a
+    // transaction because they are one decision about one row: the belief this
+    // submission produced, and the labels it was submitted under. Splitting them
+    // is how a successful truth update with dropped labels happens — the shape
+    // backlog f14592cb reported for the labels themselves.
+    //
+    // AFTER the DS wiring, necessarily: `after_truth` is derived from
+    // `ds.pignistic_prob`, so there is nothing to write until the recompute has
+    // run. The label merge stays in the same unit rather than moving earlier,
+    // because a label rejection must not leave the claim's belief moved on the
+    // strength of a submission the caller was told had failed — the placement rule
+    // the caller-label validation at the top of this function already follows.
+    //
+    // WHY THIS ONE IS STAMPED WHILE THE EVIDENCE INSERT ABOVE IS NOT, which is
+    // otherwise an inconsistency a reader is right to challenge: these are the
+    // tool's LAST writes, so a self-committing stamped unit here opens no orphan
+    // window — there is nothing after it that can fail with them half-landed. The
+    // evidence INSERT is the FIRST write and is followed by an unconverted step
+    // that is certain to fail on a clean schema, so stamping it would have
+    // committed a row the call then reports as failed, and retries would
+    // accumulate. Today neither reaches execution on either configuration: the DS
+    // wiring above refuses first (MEASURED on both). This block is therefore
+    // correct-and-unreachable until D2, rather than active.
+    //
+    // AND WHEN IT DOES BECOME REACHABLE IT WILL SERVE ONLY CLAIMS THIS SERVER'S
+    // GROUP OWNS. The stamp carries `server.agent_id()`'s writable set, and
+    // `claims_tenancy`'s `WITH CHECK` asks about the ROW's `owner_group_id` — the
+    // TARGET claim's group, not the evidence author's. So `update_with_evidence`
+    // against another agent's claim stays refused on a cleanly-migrated schema,
+    // exactly as `update_labels` does. That residual is pinned on the non-bypassing
+    // role by `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
+    // relabelling_a_foreign_groups_claim_is_refused_on_a_stamped_app_session` and
+    // its `…_lands_when_the_session_carries_the_claims_own_group` pair; the same
+    // statement holds for `challenge_claim` and `submit_ds_evidence`, and each
+    // states it at its own site. It is a tenancy-model decision, not a defect here.
     let after_truth = TruthValue::clamped(ds.pignistic_prob);
-    ClaimRepository::update_truth_value(&server.pool, ClaimId::from_uuid(claim_id), after_truth)
+    {
+        let mut tx =
+            crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+                .await?;
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            ClaimId::from_uuid(claim_id),
+            after_truth,
+        )
         .await
         .map_err(internal_error)?;
 
-    // Additive label merge on the dedup-match write, mirroring submit_claim's
-    // and memorize's dedup-hit behavior: labels union into the claim's
-    // existing array (ClaimRepository::update_labels dedupes via
-    // array_agg(DISTINCT ...)), never overwriting labels from the claim's
-    // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
-    // norcal-rfp-2026-07-05) were previously dropped on every call because
-    // UpdateWithEvidenceParams had no labels field at all.
-    if !params.labels.is_empty() {
-        ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
-            .await
-            .map_err(db_caller_error)?;
+        // Additive label merge on the dedup-match write, mirroring submit_claim's
+        // and memorize's dedup-hit behavior: labels union into the claim's
+        // existing array (ClaimRepository::update_labels dedupes via
+        // array_agg(DISTINCT ...)), never overwriting labels from the claim's
+        // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
+        // norcal-rfp-2026-07-05) were previously dropped on every call because
+        // UpdateWithEvidenceParams had no labels field at all.
+        if !params.labels.is_empty() {
+            ClaimRepository::update_labels_conn(&mut tx, claim_id, &params.labels, &[])
+                .await
+                .map_err(db_caller_error)?;
+        }
+        tx.commit().await.map_err(internal_error)?;
     }
 
     // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
@@ -1394,9 +1487,27 @@ pub async fn update_labels(
     // `reject_unexpanded_labels` is the caller's input, not a server fault. The
     // repo layer refuses it inside the same statement that would have written
     // it, so nothing is persisted — only the reported code was wrong here.
-    let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
+    //
+    // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
+    // WITH CHECK refuses it on an unstamped session. The stamp is the MCP
+    // server's own agent, which is what makes the SANCTIONED case work: the
+    // stdio ownership gate above degrades to "the claim's author is this server's
+    // agent", so the row is owned by the group this session can write. A
+    // `claims:admin` HTTP caller relabelling ANOTHER agent's claim is still
+    // refused on a cleanly-migrated schema, because the row is owned by that
+    // agent's group and no viewer this process can resolve carries write
+    // authority there — the same residual `challenge_claim` carries, and a
+    // tenancy-model question rather than a stamping one.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "update_labels",
+    )
+    .await?;
+    let labels = ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
         .await
         .map_err(db_caller_error)?;
+    tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
 }
 
@@ -1432,6 +1543,24 @@ pub async fn patch_claim(
         &params.remove_labels,
     )
     .await?;
+    // STILL UNSTAMPED, and named here rather than left silent. This transaction
+    // is ATOMIC but carries no tenancy context, so `patch_claim_atomic_conn`'s
+    // `UPDATE claims` is refused by `claims_tenancy`'s `WITH CHECK` on a session
+    // whose writable set is `{}` — the same refusal the `update_labels` tool
+    // above was converted out of.
+    //
+    // It is not converted with it because the fix is a REPOSITORY SIGNATURE
+    // CHANGE, not a call-site one: `patch_claim_atomic_conn` takes a
+    // `&mut sqlx::Transaction`, which `ScopedTx` is not (it derefs to
+    // `PgConnection`), so the parameter has to become a connection — with an
+    // `epigraph-api` caller to move and a `visibility_lint` register entry to
+    // write, since a `&mut PgConnection` parameter is exactly what that lint's
+    // connection scanner reads.
+    //
+    // Recorded because this site escaped the residual-write inventory
+    // altogether: it takes no `&server.pool` ARGUMENT — it calls
+    // `server.pool.begin()` — so an argument-shaped scan cannot see it. Its
+    // sibling `update_labels`, two functions up, was in that inventory.
     let mut tx = server.pool.begin().await.map_err(internal_error)?;
     let diff = ClaimRepository::patch_claim_atomic_conn(
         &mut tx,

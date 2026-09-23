@@ -1,0 +1,21 @@
+# Run artefacts. Every script writes its server log, unix socket, response
+# headers and advisory-lock FIFO NEXT TO ITSELF, so a run dirties this directory.
+# None of it is source, and a socket cannot be committed at all.
+#
+# Deliberately NOT a blanket `*` with exceptions: a new script must be added
+# explicitly, so it cannot be silently ignored the way an untracked harness was
+# the whole problem this directory exists to fix.
+*.log
+*.sock.*
+.lock.*
+.plock.*
+.elock.*
+.wlock.*
+h.*
+ph.*
+eh.*
+wh.*
+dh.*
+# A local DSN file. The harness reads its credentials from the environment; if
+# you keep one here for convenience it must never be committed.
+dsn

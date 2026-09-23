@@ -233,8 +233,19 @@ pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
 /// ```ignore
 /// let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 /// ```
+/// # The pool is attached TWICE, and both are load-bearing
+///
+/// `EpiGraphMcpFull::with_scoped_pool` is what lets the claim write stamp a
+/// transaction; `McpEmbedder::with_scoped_pool` is what lets the post-commit
+/// embed stamp a connection. A server with the first and not the second writes
+/// claims correctly and embeds NONE of them, silently, because the embed is
+/// best-effort — which is the release gate this branch exists to close. Both are
+/// given the same pool here (`ScopedPool` is `Clone`, and the clone shares the
+/// underlying `PgPool`, so this opens no extra connections).
 pub fn build_scoped_test_server(pool: PgPool, scoped: epigraph_db::ScopedPool) -> EpiGraphMcpFull {
-    build_test_server(pool).with_scoped_pool(scoped)
+    let signer = AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false).with_scoped_pool(scoped)
 }
 
 /// [`build_test_server_generated_signer`] plus a `ScopedPool`. See
@@ -244,7 +255,11 @@ pub fn build_scoped_test_server_generated_signer(
     pool: PgPool,
     scoped: epigraph_db::ScopedPool,
 ) -> EpiGraphMcpFull {
-    build_test_server_generated_signer(pool).with_scoped_pool(scoped)
+    let signer = AgentSigner::generate();
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
+        .with_generated_signer_identity()
+        .with_scoped_pool(scoped)
 }
 
 /// A server in `main::select_signer`'s rung-4 configuration: neither

@@ -105,12 +105,30 @@ impl MassFunctionRepository {
     ///
     /// Uses ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id) to update.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `mass_functions` is tier-A with 077's strict
+    /// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` and no
+    /// orphan `*_privacy` policy to fall back on, so on an unstamped application
+    /// session this INSERT is refused with `42501`. That is why
+    /// `mass_functions`' last successful production write was 2026-09-22 and why
+    /// it stayed **0** through every e2e run. A stamped connection is a
+    /// transaction (`ScopedPool::begin_as`), which a `&PgPool` parameter cannot
+    /// accept; `&PgPool` and `&mut PgConnection` both satisfy
+    /// [`sqlx::PgExecutor`], so [`Self::store`] and the CLI callers compile
+    /// unchanged.
+    ///
+    /// The ON CONFLICT is what makes a stamped caller's RETRY safe after a
+    /// failure further down its own pipeline: the row is keyed on
+    /// `(claim_id, frame_id, source_agent_id, perspective_id)` and re-storing the
+    /// same BBA updates it rather than combining mass twice.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, masses_json))]
-    pub async fn store_with_perspective(
-        pool: &PgPool,
+    #[instrument(skip(executor, masses_json))]
+    pub async fn store_with_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         source_agent_id: Option<Uuid>,
@@ -151,7 +169,7 @@ impl MassFunctionRepository {
         .bind(evidence_type)
         .bind(locality_tag)
         .bind(evidence_id)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.0)

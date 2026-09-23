@@ -37,7 +37,11 @@ async fn update_with_evidence_adds_labels_without_dropping_existing(pool: PgPool
     let viewer = fixture::public_viewer(&pool).await;
     let claim_id =
         seed_claim_with_labels(&pool, "norcal-rfp weekly claim", &["norcal-rfp-2026-06-29"]).await;
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value/labels update on author-stamped transactions, and a server
+    // with no `ScopedPool` refuses the tool by name rather than writing on the
+    // unstamped pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let result = epigraph_mcp::tools::claims::update_with_evidence(
         &server,

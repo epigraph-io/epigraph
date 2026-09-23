@@ -147,7 +147,11 @@ async fn supporting_evidence_never_lowers_betp_with_legacy_mixed_bbas(pool: PgPo
         insert_legacy_mixed_bba(&pool, claim_id, frame_id).await;
     }
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Set an initial pignistic_prob to simulate the pre-bug state (~0.88).
     // auto_wire_ds_update will read this before combining and clamp against it.
@@ -226,7 +230,11 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .expect("auto_wire_ds_batch");
     assert_eq!(wired, 3);
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Add opposing evidence to create conflict.
     add_evidence(
@@ -291,7 +299,11 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
     .await
     .expect("batch 2 supports");
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     add_evidence(
         &server,
@@ -401,7 +413,11 @@ async fn monotonicity_clamp_never_exceeds_plausibility(pool: PgPool) {
         .await
         .expect("seed inflated prior");
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Weak supporting evidence: `supports=true` arms the clamp, and the legacy
     // mixed BBAs' opposing + complement mass keeps the combined plausibility
