@@ -302,7 +302,26 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
 /// the SPLIT, and rewriting the number would erase the evidence that the split
 /// was lossless when it was made.
 ///
-/// Asserted exactly for the same monotonicity reason as above.
+/// # EMPTY, and held at zero (the fail-open-scope-sites conversion)
+///
+/// The last 24 scope sites (agent_keys 3, agents 2, claims 1, crud 6, edges 5,
+/// papers 1, tasks 6) were converted to
+/// `let Some(..) = auth_ctx else { return Err(ApiError::Unauthorized { .. }) }`
+/// followed by an unconditional scope check, one file per commit, each row
+/// below removed as its file reached zero. The register is now empty and is no
+/// longer a ratchet with headroom: [`fail_open_scope_check_sites_do_not_increase`]
+/// asserts the measurement is empty AND that this constant is empty, so adding
+/// a row here is not a way to make a new site pass. The constant is kept, not
+/// deleted, because the removal notes below are the record of how each file got
+/// to zero, and other doc comments cross-reference it by name.
+///
+/// `tests/scope_checks_refuse_without_auth.rs` is the behavioural half: it
+/// mounts every converted handler on a router with no bearer layer and asserts
+/// 401 without an `AuthContext` and 403 with a scopeless one.
+///
+/// Emptying it does NOT close the edges.rs may-see-vs-may-modify question the
+/// five edges rows used to stand in for; that is
+/// `F-edges-write-predicate-undecided` in `docs/tenancy/progress.json`.
 const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // `("agent_keys.rs", 3)` REMOVED by the fail-open-scope-sites conversion:
     // list/rotate/revoke now refuse 401 without an `AuthContext`, and
@@ -1330,28 +1349,43 @@ fn a_format_built_statement_is_counted() {
     assert!(reads_claim_content(&resolved_region(raw, offsets[0])));
 }
 
+/// **A hard zero, not a ratchet with headroom.** The register reached empty with
+/// the fail-open-scope-sites conversion; see [`FAIL_OPEN_SCOPE_SITES`].
+///
+/// Two assertions, because either alone is walkable: the measurement must be
+/// empty, and so must the constant. Without the second, a new site could be made
+/// to pass by adding a row, which is how a register that has done its job turns
+/// back into a permission slip.
 #[test]
 fn fail_open_scope_check_sites_do_not_increase() {
-    let actual = measure_fail_open_scope_sites();
     let want = expected(FAIL_OPEN_SCOPE_SITES);
+    assert!(
+        want.is_empty(),
+        "\n\nFAIL_OPEN_SCOPE_SITES has a row again: {want:?}.\n\n\
+         This register reached zero and is held there. A new \
+         `if let Some(..) = auth_ctx {{ check_scopes(..) }}` site is fixed in the \
+         handler, not recorded here — see the fix in the message of the other \
+         assertion in this test.\n"
+    );
+    let actual = measure_fail_open_scope_sites();
     assert_eq!(
         actual,
         want,
-        "\n\nFail-open scope-check ratchet failed.\n{}\n\n\
+        "\n\nFail-open scope-check site found (the register is held at ZERO).\n{}\n\n\
          `if let Some(axum::Extension(ref auth)) = auth_ctx {{ check_scopes(..) }}` \
-         performs NO authorization when `AuthContext` is absent. Where it is \
-         currently harmless, that is because the ROUTE is registered on the \
-         `protected` router in `routes/mod.rs::create_router`, which is layered \
-         with `bearer_auth_middleware` — a total function whose every arm either \
-         injects an `AuthContext` or returns `Unauthorized`, and whose two-route \
-         public allowlist `public_router_allowlist.rs` pins over both router \
-         variants. That control is router-level and ORDER-INDEPENDENT.\n\n\
-         So reordering axum extractors changes NOTHING here, and moving a route \
-         off `protected` changes everything. Do not read this register as a \
-         parameter-order problem.\n\n\
-         Fix: `let auth = auth_ctx.ok_or(ApiError::Unauthorized {{ .. }})?.0;` \
-         then check scopes unconditionally (see \
-         `crud.rs::get_theme_embeddings`). Then LOWER the number here.\n",
+         performs NO authorization when `AuthContext` is absent. A route on the \
+         `protected` router in `routes/mod.rs::create_router` would still be \
+         covered by `bearer_auth_middleware` — a total function whose every arm \
+         either injects an `AuthContext` or returns `Unauthorized` — but that is a \
+         ROUTER-level control, and this shape makes the handler's correctness \
+         depend on which router chain registers it. Reordering axum extractors \
+         changes nothing here; moving a route off `protected` changes \
+         everything.\n\n\
+         Fix: `let Some(axum::Extension(ref auth)) = auth_ctx else {{ return \
+         Err(ApiError::Unauthorized {{ .. }}) }};` then check scopes \
+         unconditionally (see `tasks.rs`, `audit.rs::query_security_events`), \
+         and add the handler to `tests/scope_checks_refuse_without_auth.rs`. Do \
+         NOT add a row to FAIL_OPEN_SCOPE_SITES.\n",
         diff_report(&actual, &want)
     );
 }
