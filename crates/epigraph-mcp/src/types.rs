@@ -1369,11 +1369,14 @@ pub struct DeleteEdgeParams {
 }
 
 /// Response for the `delete_edge` MCP tool. `deleted` is always `true` on
-/// success and means "retracted": the row survives with `valid_to` set and is
-/// hidden from every display and belief read (see
-/// `docs/architecture/edge-retraction-tiers.md`). A missing or already
-/// retracted edge is an error, not `deleted=false`, mirroring the route's 404.
-/// The field name is kept for wire compatibility.
+/// success and means "retracted": the row survives with `valid_to` set. It is
+/// hidden from the belief-bearing and display reads tabled in
+/// `docs/architecture/edge-retraction-tiers.md`, NOT from every read: the
+/// structural reads and the reads that doc lists under "Not yet classified"
+/// (among them `check_sheaf_consistency`, `suggest_alternative_sets`,
+/// `get_provenance_chain` and `GET /api/v1/edges`) still return it. A missing
+/// or already retracted edge is an error, not `deleted=false`, mirroring the
+/// route's 404. The field name is kept for wire compatibility.
 #[derive(Debug, Serialize)]
 pub struct DeleteEdgeResponse {
     pub edge_id: String,

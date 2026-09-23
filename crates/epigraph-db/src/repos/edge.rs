@@ -1152,9 +1152,13 @@ impl EdgeRepository {
     /// therefore also 404 a double-retract, which matches the previous
     /// delete-twice behaviour.
     ///
-    /// The retracted row is hidden from every display and belief-bearing read
-    /// (`docs/architecture/edge-retraction-tiers.md`); the structural endpoint
-    /// reads [`Self::get_by_source`] / [`Self::get_by_target`] still return it.
+    /// The retracted row is hidden from the belief-bearing and display reads
+    /// tabled in `docs/architecture/edge-retraction-tiers.md`, not from every
+    /// read. The structural reads still return it, including the endpoint reads
+    /// [`Self::get_by_source`] / [`Self::get_by_target`], and so does every read
+    /// that doc lists under "Not yet classified" — among them
+    /// [`Self::get_by_relationship`], [`Self::get_between`] and
+    /// `SheafRepository::get_claim_neighbor_betp_pairs`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.

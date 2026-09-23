@@ -203,9 +203,11 @@ pub async fn do_delete_edge(
     let pool = &server.pool;
 
     // A retraction, not a delete (a6adf739): the row keeps `valid_to` and
-    // drops out of every display and belief read. `retract_by_id` reports
-    // "absent or already retracted" as `Ok(false)`, not `DbError::NotFound`, so
-    // the 404-equivalent is raised here.
+    // drops out of the belief-bearing and display reads tabled in
+    // docs/architecture/edge-retraction-tiers.md — not the structural reads,
+    // nor the ones that doc lists as "Not yet classified". `retract_by_id`
+    // reports "absent or already retracted" as `Ok(false)`, not
+    // `DbError::NotFound`, so the 404-equivalent is raised here.
     let deleted = EdgeRepository::retract_by_id(pool, edge_id)
         .await
         .map_err(map_edge_err)?;
