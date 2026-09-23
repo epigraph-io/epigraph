@@ -1080,6 +1080,56 @@ async fn consolidate_sources(
     out
 }
 
+/// A `kind = 'team'` group with no members. Members are added with
+/// [`add_member`], so each test states the ROLE it is about.
+async fn team_group(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, did_key, public_key, kind, display_name) \
+         VALUES ($1, $2, $3, 'team', 'consolidate-role-test')",
+    )
+    .bind(id)
+    .bind(format!("did:key:consolidate-role-{id}"))
+    .bind(&pk)
+    .execute(pool)
+    .await
+    .expect("seed team group");
+    id
+}
+
+/// A live membership of `agent` in `group` at `role`.
+async fn add_member(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, $3, 0, $4)",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(vec![0u8; 48])
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("seed membership");
+}
+
+/// `(rows carrying merged_content, sources still current)`. A refused merge
+/// must leave `(0, src.len())`.
+async fn merge_residue(pool: &PgPool, merged_content: &str, src: &[Uuid]) -> (i64, i64) {
+    let merged: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM claims WHERE content = $1")
+        .bind(merged_content)
+        .fetch_one(pool)
+        .await
+        .expect("leftover probe");
+    let current: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM claims WHERE id = ANY($1) AND is_current")
+            .bind(src)
+            .fetch_one(pool)
+            .await
+            .expect("source probe");
+    (merged, current)
+}
+
 /// Same group in, same group out.
 #[sqlx::test(migrations = "../../migrations")]
 async fn consolidate_within_one_group_keeps_the_group(pool: PgPool) {
@@ -1602,8 +1652,9 @@ async fn batch_create_stores_the_declared_tenancy_across_row_boundaries(pool: Pg
 /// own content into a foreign group's private corpus while retiring that
 /// group's claims through the `supersedes` forwarding.
 ///
-/// The full write-side gate is 16b. This is the narrow refusal that keeps 16a's
-/// own rule from creating the primitive 16b would have to close.
+/// A non-member holds no role at all, so this is the widest case of the
+/// write-role refusal. The `reader` case, which the earlier membership-only
+/// check let through, is [`consolidate_by_a_reader_member_is_refused`].
 #[sqlx::test(migrations = "../../migrations")]
 async fn consolidate_into_a_group_the_actor_is_not_in_is_refused(pool: PgPool) {
     let (outsider, _own) = fixture::seed_agent_with_group(&pool, "cons-outsider").await;
@@ -1689,5 +1740,96 @@ async fn consolidate_refuses_once_the_actors_membership_is_revoked(pool: PgPool)
     assert!(
         matches!(err, epigraph_db::DbError::Conflict { .. }),
         "{err:?}"
+    );
+}
+
+/// A `reader` member is refused. The earlier membership-only check let this
+/// case through.
+///
+/// A reader can SEE the group's claims, but it has no write authority in the
+/// group. A merge writes its synthesized row into the group's corpus AND
+/// retires the group's claims (`is_current = false`, `supersedes` forwarding,
+/// edges moved). Deferred-commitment screen key consolidate-writable-role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_by_a_reader_member_is_refused(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "cons-reader-author").await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "cons-reader").await;
+    let group = team_group(&pool).await;
+    add_member(&pool, group, author, "writer").await;
+    add_member(&pool, group, reader, "reader").await;
+    let src = consolidate_sources(&pool, author, (Some(group), "rd1"), (Some(group), "rd2")).await;
+
+    // Precondition: the reader is a LIVE member, so a membership-only check
+    // passes and only the role filter can refuse.
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, reader)
+        .await
+        .expect("resolve reader");
+    assert!(viewer.group_bind().is_some_and(|g| g.contains(&group)));
+    assert!(!viewer.writable_groups().contains(&group));
+
+    let err = ClaimRepository::consolidate(
+        &pool,
+        &src,
+        "merged by a reader",
+        0.8,
+        ConsolidateMode::Merge,
+        "test",
+        reader,
+    )
+    .await
+    .expect_err("a reader must not merge into the group");
+    assert!(
+        matches!(err, epigraph_db::DbError::Conflict { .. }),
+        "the refusal must be a Conflict (HTTP 409): {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains(&group.to_string()),
+        "the 409 must not name the group: {msg}"
+    );
+    assert_eq!(
+        merge_residue(&pool, "merged by a reader", &src).await,
+        (0, 2),
+        "a refused merge must write no merged row and retire no source"
+    );
+}
+
+/// A `writer` member merges; the merged row stays in the group and is authored
+/// by the writer. This is the positive twin of the reader case, so the reader
+/// refusal cannot be passing only because every group merge is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_by_a_writer_member_succeeds(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "cons-writer-author").await;
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "cons-writer").await;
+    let group = team_group(&pool).await;
+    add_member(&pool, group, author, "admin").await;
+    add_member(&pool, group, writer, "writer").await;
+    let src = consolidate_sources(&pool, author, (Some(group), "wr1"), (Some(group), "wr2")).await;
+
+    let r = ClaimRepository::consolidate(
+        &pool,
+        &src,
+        "merged by a writer",
+        0.8,
+        ConsolidateMode::Merge,
+        "test",
+        writer,
+    )
+    .await
+    .expect("a writer may merge within its group");
+
+    assert_eq!(
+        tenancy_of(&pool, "claims", r.merged_id).await,
+        (group, "group".to_string())
+    );
+    let merged_author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(r.merged_id)
+        .fetch_one(&pool)
+        .await
+        .expect("merged author");
+    assert_eq!(merged_author, writer);
+    assert_eq!(
+        merge_residue(&pool, "merged by a writer", &src).await,
+        (1, 0)
     );
 }

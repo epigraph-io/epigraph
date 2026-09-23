@@ -171,6 +171,18 @@ pub const WRITABLE_MARKER_PREFIX: &str = "/* {WRITABLE:";
 /// written as separate literals at a call site. Shared by all three spellings.
 const VISIBILITY_MARKER_SUFFIX: &str = "} */";
 
+/// The `group_memberships.role` values that carry WRITE authority.
+///
+/// `group_memberships_role_check` (migration 060) admits exactly `admin`,
+/// `writer` and `reader`; the first two can write and `reader` cannot. This is
+/// the one Rust spelling of that split. [`Viewer::resolve`] builds the writable
+/// set from it, and a repo that must re-check write authority inside its own
+/// transaction binds it as `role = ANY($n)` (see
+/// `ClaimRepository::consolidate`) instead of writing a second literal list that
+/// could drift from this one. Migration 067's `epigraph_writable_groups()` is the
+/// SQL-side definition and states the same set.
+pub const WRITABLE_ROLES: [&str; 2] = ["admin", "writer"];
+
 /// Read authority for one principal, for one request.
 ///
 /// See the [module documentation](self) for the invariants this type enforces.
@@ -381,8 +393,9 @@ impl Viewer {
             // `admin` and `writer` are the two write-capable roles in
             // `group_memberships_role_check` (migration 060:245). `reader` is
             // the third and only other legal value; anything else is a row that
-            // should not exist, and we treat it as read-only.
-            if matches!(role.as_str(), "admin" | "writer") {
+            // should not exist, and we treat it as read-only. The list is
+            // `WRITABLE_ROLES`, shared with the repos that re-check it in SQL.
+            if WRITABLE_ROLES.contains(&role.as_str()) {
                 writable.push(group_id);
             }
             group_ids.push(group_id);

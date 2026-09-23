@@ -7343,8 +7343,10 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` on a bad source set (wrong count,
-    /// duplicates, non-current, already-superseded) and `DbError::NotFound`
-    /// when a source id does not exist.
+    /// duplicates, non-current, already-superseded), `DbError::NotFound`
+    /// when a source id does not exist, and `DbError::Conflict` when the
+    /// sources span two owner groups or the actor holds no live `admin` or
+    /// `writer` membership in a group-private source's owner group.
     #[instrument(skip(pool, merged_content), fields(n_sources = source_ids.len()))]
     #[allow(clippy::too_many_lines)]
     pub async fn consolidate(
@@ -7493,30 +7495,37 @@ impl ClaimRepository {
             }
         })?;
 
-        // ── The actor must be IN the group it is writing into (PR-16) ──
+        // ── The actor must be able to WRITE the group it is merging into ──
         //
-        // `consolidate` takes no `Viewer`. Before migration 074 that was a
-        // DISCLOSURE hole and nothing more: a cross-tenant merge landed on the
-        // world default, so it produced a public row. The meet rule above is
-        // the right rule, but it changes the shape of the hole — the merged row
-        // now lands INSIDE the owning group, so an unrelated caller could write
-        // its own content into a foreign group's private corpus while retiring
-        // that group's claims through the `supersedes` forwarding below. That
-        // is an integrity and availability defect against a group the caller
-        // has no relationship with.
+        // The meet rule above lands the merged row INSIDE the owning group, and
+        // the retirement below sets `is_current = false` and a `supersedes`
+        // forwarding pointer on that group's claims. So a merge that touches a
+        // group-private source is a write to that group twice over, and it
+        // needs the same authority any other write to the group needs: a live
+        // membership whose role is in `WRITABLE_ROLES` (`admin`, `writer`), the
+        // same list `Viewer::resolve` builds `writable_groups()` from. A
+        // `reader` can see the sources but cannot retire them.
         //
-        // The full write-side gate (`viewer.writable_bind()`'s SQL half, the
-        // fail-open scope sites, the MCP write tools) is 16b's territory and is
-        // NOT delivered here. This is the narrow refusal that keeps 16a's own
-        // tenancy rule from creating a primitive 16b would have to close: every
-        // group-visible source's owner must be a live group of the acting
-        // agent. It costs one query, and only on merges that actually touch a
-        // private claim — an all-public merge (`merged_owner == None`) skips it
-        // entirely.
+        // DISCHARGED (deferred-commitment screen key consolidate-writable-role).
+        // 16a shipped a membership-only interim refusal here and deferred the
+        // role check to 16b. 16b shipped the write-side mechanism without this
+        // site, so the deferral had no owner. This block is that check.
         //
-        // Membership, not write-role: role-granularity is `writable_bind`'s
-        // job and arrives with 16b. Refusing a non-member is strictly stronger
-        // than the nothing that stood here before.
+        // It reads `group_memberships` INSIDE this transaction, after the
+        // sources' `FOR UPDATE`, rather than trusting a request-time snapshot.
+        // A revocation or a demotion to `reader` that commits after the
+        // caller resolved its viewer is still refused.
+        //
+        // It keys on `acting_agent_id`. An all-public merge
+        // (`merged_owner == None`) skips it and costs nothing extra.
+        //
+        // NOT a database backstop. This runs on a raw `PgPool`, so no
+        // `epigraph.writable_group_ids` GUC is stamped, and migration 077's
+        // `claims_tenancy` WITH CHECK is inert while the DSN is the superuser.
+        // Once the DSN moves to the app role, that WITH CHECK will require the
+        // GUC. This function must then run on a `ScopedPool` connection stamped
+        // from the request's `Viewer`, NOT on a maintenance connection, which
+        // would erase the gate.
         let private_owners: Vec<Uuid> = source_tenancy
             .iter()
             .filter(|(_, v)| *v == epigraph_core::Visibility::Group)
@@ -7525,26 +7534,30 @@ impl ClaimRepository {
             .into_iter()
             .collect();
         if !private_owners.is_empty() {
-            let member_of: Vec<Uuid> = sqlx::query_scalar(
+            let writable: Vec<Uuid> = sqlx::query_scalar(
                 "SELECT group_id FROM group_memberships \
-                  WHERE agent_id = $1 AND group_id = ANY($2) AND revoked_at IS NULL",
+                  WHERE agent_id = $1 AND group_id = ANY($2) AND revoked_at IS NULL \
+                    AND role = ANY($3)",
             )
             .bind(acting_agent_id)
             .bind(&private_owners)
+            .bind(&crate::visibility::WRITABLE_ROLES[..])
             .fetch_all(&mut *tx)
             .await?;
-            let member_of: std::collections::HashSet<Uuid> = member_of.into_iter().collect();
-            if let Some(foreign) = private_owners.iter().find(|g| !member_of.contains(g)) {
+            let writable: std::collections::HashSet<Uuid> = writable.into_iter().collect();
+            if let Some(unwritable) = private_owners.iter().find(|g| !writable.contains(g)) {
                 // Same disclosure discipline as the cross-group refusal: the
                 // group id goes to the log, not to the caller.
                 tracing::warn!(
-                    owner_group_id = %foreign,
+                    owner_group_id = %unwritable,
                     acting_agent_id = %acting_agent_id,
-                    "consolidate refused: actor is not a live member of a source's owner group"
+                    "consolidate refused: actor holds no live admin/writer membership in a \
+                     source's owner group"
                 );
                 return Err(DbError::Conflict {
-                    reason: "consolidate: at least one source is private to a group you are \
-                             not a member of. Merging would write into that group's corpus \
+                    reason: "consolidate: at least one source is private to a group you \
+                             cannot write to (merging needs a live admin or writer \
+                             membership). Merging would write into that group's corpus \
                              and retire its claims."
                         .to_string(),
                 });
