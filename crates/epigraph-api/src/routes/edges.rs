@@ -1582,6 +1582,13 @@ pub async fn list_edges(
 /// Returns all edges where the claim is either source or target (1-hop),
 /// plus edges connected to those neighbors (2-hop).
 ///
+/// Only edges IN FORCE are returned and walked: an edge removed with
+/// `DELETE /api/v1/edges/:id` is a retraction (the row keeps `valid_to`), and
+/// the neighbourhood must not bring it back. `?include_retracted=true` opts
+/// into the unfiltered read for audit; every edge in the response carries its
+/// `valid_to`, which is how a retracted one is recognised. The choice is made
+/// at each hop's READ, so a hidden edge never widens the frontier.
+///
 /// Requires a Bearer token (PR-03: registered on the `protected` router).
 #[cfg(feature = "db")]
 pub async fn claim_neighborhood(
@@ -1612,14 +1619,15 @@ pub async fn claim_neighborhood(
     })?;
 
     let max_depth = params.depth.unwrap_or(2).min(3); // Cap at 3 hops
+    let include_retracted = params.include_retracted.unwrap_or(false);
 
     // 1-hop: edges where this claim is source or target
     let mut all_edges = Vec::new();
     let mut visited_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     visited_ids.insert(claim_id);
 
-    let outgoing = EdgeRepository::get_by_source(&mut *read, &viewer, claim_id, "claim").await?;
-    let incoming = EdgeRepository::get_by_target(&mut *read, &viewer, claim_id, "claim").await?;
+    let (outgoing, incoming) =
+        neighborhood_hop(&mut read, &viewer, claim_id, include_retracted).await?;
 
     // Collect 1-hop neighbor IDs
     let mut frontier: Vec<Uuid> = Vec::new();
@@ -1640,8 +1648,8 @@ pub async fn claim_neighborhood(
     for _hop in 1..max_depth {
         let mut next_frontier = Vec::new();
         for &node_id in &frontier {
-            let out = EdgeRepository::get_by_source(&mut *read, &viewer, node_id, "claim").await?;
-            let inc = EdgeRepository::get_by_target(&mut *read, &viewer, node_id, "claim").await?;
+            let (out, inc) =
+                neighborhood_hop(&mut read, &viewer, node_id, include_retracted).await?;
 
             for edge in out.iter().chain(inc.iter()) {
                 let neighbor_id = if edge.source_id == node_id {
@@ -1709,9 +1717,43 @@ pub async fn claim_neighborhood(
     }))
 }
 
+/// One hop of [`claim_neighborhood`]: `(outgoing, incoming)` edges of `node`.
+///
+/// In-force reads unless the caller opted into `include_retracted`; the
+/// unfiltered pair is the structural read, which returns retracted rows too.
+#[cfg(feature = "db")]
+async fn neighborhood_hop(
+    read: &mut epigraph_db::ScopedRead<'_>,
+    viewer: &epigraph_db::Viewer,
+    node: Uuid,
+    include_retracted: bool,
+) -> Result<
+    (
+        Vec<epigraph_db::repos::edge::EdgeRow>,
+        Vec<epigraph_db::repos::edge::EdgeRow>,
+    ),
+    ApiError,
+> {
+    if include_retracted {
+        let out = EdgeRepository::get_by_source(&mut **read, viewer, node, "claim").await?;
+        let inc = EdgeRepository::get_by_target(&mut **read, viewer, node, "claim").await?;
+        Ok((out, inc))
+    } else {
+        let out =
+            EdgeRepository::get_by_source_in_force(&mut **read, viewer, node, "claim").await?;
+        let inc =
+            EdgeRepository::get_by_target_in_force(&mut **read, viewer, node, "claim").await?;
+        Ok((out, inc))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct NeighborhoodParams {
     pub depth: Option<u32>,
+    /// Also return and walk RETRACTED edges (default `false`). Each edge
+    /// carries its `valid_to`, which identifies the retracted ones.
+    #[serde(default)]
+    pub include_retracted: Option<bool>,
     /// Optional requester agent ID for partition-aware content filtering
     #[serde(default)]
     pub agent_id: Option<Uuid>,
@@ -1780,7 +1822,8 @@ pub async fn graph_edges(
         }
     })?;
 
-    let rows = EdgeRepository::list_all(&mut *read, &viewer, 5000).await?;
+    // In force only: a retracted (deleted) edge is not part of the graph.
+    let rows = EdgeRepository::list_all_in_force(&mut *read, &viewer, 5000).await?;
 
     // Filter to claim-to-claim edges. `list_all` is spliced with `&viewer`, so
     // the endpoint-visibility half of this loop is now the database's job.
@@ -1928,8 +1971,9 @@ pub async fn graph_full(
         }
     })?;
 
-    // 1. Fetch all edges (capped)
-    let edge_rows = EdgeRepository::list_all(&mut *read, &viewer, 2000).await?;
+    // 1. Fetch all edges in force (capped). A retracted edge is excluded here,
+    //    so it also stops contributing its endpoints as nodes below.
+    let edge_rows = EdgeRepository::list_all_in_force(&mut *read, &viewer, 2000).await?;
 
     // 2. Collect unique entity IDs by type
     let mut claim_ids = std::collections::HashSet::new();

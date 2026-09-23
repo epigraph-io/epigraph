@@ -965,12 +965,20 @@ impl EdgeRepository {
             .collect())
     }
 
-    /// List all edges, optionally filtered by source_type and target_type
+    /// The newest `limit` edges IN FORCE that the viewer may read.
+    ///
+    /// Backs the explorer's whole-graph views (`GET /api/v1/graph/edges`,
+    /// `GET /api/v1/graph/full`), which render the graph as it stands — so a
+    /// retracted edge (anything removed with `DELETE /api/v1/edges/:id` or MCP
+    /// `delete_edge`) is excluded, and in `graph_full` it no longer drags its
+    /// endpoints in as nodes. Named for the filter because an unqualified
+    /// `list_all` read as though it included them. Display tier; see
+    /// `docs/architecture/edge-retraction-tiers.md`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
-    pub async fn list_all<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn list_all_in_force<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         limit: i64,
@@ -987,7 +995,8 @@ impl EdgeRepository {
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
-            WHERE ($2::bool OR visibility = 'public'
+            WHERE (valid_to IS NULL OR valid_to > now())
+              AND ($2::bool OR visibility = 'public'
                    OR (owner_group_id = ANY($3::uuid[])
                        AND (co_owner_group_id IS NULL
                             OR co_owner_group_id = ANY($3::uuid[]))))

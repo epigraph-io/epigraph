@@ -64,6 +64,8 @@ const DISPLAY_TIER_FNS: &[(&str, &str)] = &[
         "crates/epigraph-db/src/repos/edge.rs",
         "get_by_target_in_force",
     ),
+    // GET /api/v1/graph/edges and /graph/full.
+    ("crates/epigraph-db/src/repos/edge.rs", "list_all_in_force"),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -428,8 +430,9 @@ const UNFILTERED_ENDPOINT_READERS: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/epigraph-api/src/routes/edges.rs",
-        "claim_neighborhood",
-        "PENDING: display tier, converted by a later commit in this series",
+        "neighborhood_hop",
+        "OPT-IN: the `?include_retracted=true` branch of GET \
+         /api/v1/claims/:id/neighborhood; every returned edge carries its valid_to",
     ),
     (
         "crates/epigraph-db/src/repos/claim.rs",

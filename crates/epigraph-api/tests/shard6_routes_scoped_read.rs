@@ -504,6 +504,7 @@ async fn claim_neighborhood_serves_the_viewers_own_group_private_edge(pool: PgPo
         Query(NeighborhoodParams {
             depth: Some(1),
             agent_id: None,
+            include_retracted: None,
         }),
     )
     .await
