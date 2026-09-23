@@ -31,11 +31,21 @@
 //! of the request pool's ten connections while a third party answers.
 //!
 //! `generate_claim_embedding` and `generate_evidence_embedding` are NOT
-//! converted: both WRITE, and [`AppState::read_as`] is read-only — a write routed
-//! through a `ScopedRead` type-checks and is then rolled back on drop under
-//! `SessionGucMode::Transaction`. They remain counted, and
-//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
-//! `("rag.rs", 2)` for them, unchanged by this shard.
+//! converted to `read_as`: both WRITE, and [`AppState::read_as`] is read-only —
+//! a write routed through a `ScopedRead` type-checks and is then rolled back on
+//! drop under `SessionGucMode::Transaction`. They remain counted by
+//! `no_unscoped_pool.rs` (each acquires one raw-pool connection).
+//!
+//! **They are write-GATED, though, and no longer write from this file**
+//! (deferred-commitment key `embed-on-write-helper`). Each now takes a
+//! `ViewerExtractor`, requires a write scope, and writes through a repo
+//! function carrying `/* {WRITABLE:..} */` plus a seal predicate
+//! (`ClaimRepository::store_embedding_vec_if_unsealed`,
+//! `EvidenceRepository::store_embedding_vec_if_unsealed`). Both inline
+//! `UPDATE`s left this file, so `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES`
+//! no longer carries a `rag.rs` row. The shard-6 sentence this replaces said
+//! the row stayed at 2 "unchanged by this shard"; that was true of shard 6 and
+//! is recorded here as superseded, not as having been wrong.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -470,6 +480,27 @@ pub struct EmbeddingResponse {
     pub stored: bool,
 }
 
+/// A vector from the CONFIGURED embedding service, or a refusal.
+///
+/// The two PUT handlers below used to call [`generate_query_embedding`] and
+/// ignore its `is_real` flag ("we always store regardless"), so with no
+/// provider configured, or with the provider erroring, they wrote
+/// [`generate_mock_embedding`]'s byte-histogram into the live ANN column.
+/// CLAUDE.md's embedding policy is that only the provider that owns the column
+/// may write it; a mock vector is not in any provider's space, degrades recall
+/// with no error, and would be reported back to the caller as `stored: true`.
+/// A write refuses instead, with the same 503 a missing service gives the
+/// read endpoints that need one.
+#[cfg(feature = "db")]
+async fn real_embedding_or_refuse(state: &AppState, text: &str) -> Result<Vec<f32>, ApiError> {
+    match generate_query_embedding(state, text).await {
+        (embedding, true) => Ok(embedding),
+        (_mock, false) => Err(ApiError::ServiceUnavailable {
+            service: "embedding".to_string(),
+        }),
+    }
+}
+
 /// Generate and store an embedding for a claim.
 ///
 /// `PUT /api/v1/claims/:id/embedding`
@@ -477,13 +508,48 @@ pub struct EmbeddingResponse {
 /// Uses the configured embedding service to generate a vector embedding
 /// for the provided text and stores it in the claim's embedding column.
 ///
-/// Protected route — requires Ed25519 signature verification.
+/// # Authorization (deferred-commitment key `embed-on-write-helper`)
+///
+/// This handler used to take only `State`, `Path` and `Json` and run its own
+/// `UPDATE claims SET embedding` against the raw pool. Any bearer could
+/// therefore overwrite the vector on ANY claim id — another tenant's, or a
+/// sealed one, which CLAUDE.md calls a page-the-on-call condition — and was
+/// told `stored: true` even when no row matched. It now:
+///
+/// * refuses an absent `AuthContext` and requires `claims:write`, in the
+///   prescribed `let .. else` shape;
+/// * writes through `ClaimRepository::store_embedding_vec_if_unsealed` with
+///   the CALLER's viewer, so the `/* {WRITABLE:c} */` predicate, the seal
+///   check and the `is_current` check all apply in SQL;
+/// * answers one indistinguishable **404** for "absent", "sealed",
+///   "superseded" and "not writable", so the route is neither an existence
+///   oracle nor a seal oracle (same mapping as `crud.rs::update_evidence`);
+/// * refuses with 503 rather than store a mock vector (see
+///   [`real_embedding_or_refuse`]).
+///
+/// The connection is a plain `db_pool.acquire()`, NOT `AppState::read_as`: a
+/// write routed through a `ScopedRead` is rolled back on drop under
+/// `SessionGucMode::Transaction`. The write predicate is enforced in the
+/// statement, not by session GUCs.
 #[cfg(feature = "db")]
 pub async fn generate_claim_embedding(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Path(claim_id): axum::extract::Path<Uuid>,
     Json(request): Json<GenerateEmbeddingRequest>,
 ) -> Result<Json<EmbeddingResponse>, ApiError> {
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    if !auth.has_scope("claims:write") {
+        return Err(ApiError::Forbidden {
+            reason: "Missing required scope: claims:write".to_string(),
+        });
+    }
+
     if request.text.trim().is_empty() {
         return Err(ApiError::ValidationError {
             field: "text".to_string(),
@@ -491,22 +557,27 @@ pub async fn generate_claim_embedding(
         });
     }
 
-    // Generate embedding (ignore mode flag — we always store regardless)
-    let (embedding, _is_real) = generate_query_embedding(&state, &request.text).await;
+    let embedding = real_embedding_or_refuse(&state, &request.text).await?;
     let dimension = embedding.len();
 
-    // Format and store in DB
-    let pgvector_str = format_embedding_for_pgvector(&embedding);
-    let pool = &state.db_pool;
-
-    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-        .bind(&pgvector_str)
-        .bind(claim_id)
-        .execute(pool)
+    let mut conn = state
+        .db_pool
+        .acquire()
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to store embedding: {e}"),
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to acquire a database connection: {e}"),
         })?;
+    let stored = epigraph_db::ClaimRepository::store_embedding_vec_if_unsealed(
+        &mut conn, &viewer, claim_id, &embedding,
+    )
+    .await?;
+
+    if !stored {
+        return Err(ApiError::NotFound {
+            entity: "claim".to_string(),
+            id: claim_id.to_string(),
+        });
+    }
 
     Ok(Json(EmbeddingResponse {
         claim_id,
@@ -523,13 +594,30 @@ pub async fn generate_claim_embedding(
 /// for the provided text (typically evidence raw_content) and stores it
 /// in the evidence's embedding column.
 ///
-/// Protected route — requires Ed25519 signature verification.
+/// Same four changes as [`generate_claim_embedding`], with the evidence
+/// scopes `crud.rs::update_evidence` accepts (`evidence:write` or
+/// `evidence:submit`) and `EvidenceRepository::store_embedding_vec_if_unsealed`,
+/// which refuses when the evidence row or its parent claim is sealed and when
+/// the viewer may not write the evidence row.
 #[cfg(feature = "db")]
 pub async fn generate_evidence_embedding(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Path(evidence_id): axum::extract::Path<Uuid>,
     Json(request): Json<GenerateEmbeddingRequest>,
 ) -> Result<Json<EvidenceEmbeddingResponse>, ApiError> {
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
+        return Err(ApiError::Forbidden {
+            reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
+        });
+    }
+
     if request.text.trim().is_empty() {
         return Err(ApiError::ValidationError {
             field: "text".to_string(),
@@ -537,22 +625,30 @@ pub async fn generate_evidence_embedding(
         });
     }
 
-    // Generate embedding (ignore mode flag — we always store regardless)
-    let (embedding, _is_real) = generate_query_embedding(&state, &request.text).await;
+    let embedding = real_embedding_or_refuse(&state, &request.text).await?;
     let dimension = embedding.len();
 
-    // Format and store in DB
-    let pgvector_str = format_embedding_for_pgvector(&embedding);
-    let pool = &state.db_pool;
-
-    sqlx::query("UPDATE evidence SET embedding = $1::vector WHERE id = $2")
-        .bind(&pgvector_str)
-        .bind(evidence_id)
-        .execute(pool)
+    let mut conn = state
+        .db_pool
+        .acquire()
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to store evidence embedding: {e}"),
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to acquire a database connection: {e}"),
         })?;
+    let stored = epigraph_db::repos::EvidenceRepository::store_embedding_vec_if_unsealed(
+        &mut conn,
+        &viewer,
+        evidence_id.into(),
+        &embedding,
+    )
+    .await?;
+
+    if !stored {
+        return Err(ApiError::NotFound {
+            entity: "evidence".to_string(),
+            id: evidence_id.to_string(),
+        });
+    }
 
     Ok(Json(EvidenceEmbeddingResponse {
         evidence_id,

@@ -476,7 +476,12 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // legacy-claim-create-callers). Removed, not zeroed.
     ("hypothesis.rs", 2),
     ("policies.rs", 4),
-    ("rag.rs", 2),
+    // `rag.rs` was 2 -- the inline `UPDATE claims SET embedding` and
+    // `UPDATE evidence SET embedding` in `generate_claim_embedding` and
+    // `generate_evidence_embedding`, which took no Viewer at all. Both moved
+    // to WRITABLE-spliced repo functions (`store_embedding_vec_if_unsealed` on
+    // `ClaimRepository` and `EvidenceRepository`) under deferred-commitment
+    // key embed-on-write-helper. Removed, not zeroed.
     ("reasoning.rs", 2),
     ("revoke_signature.rs", 1),
     // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
