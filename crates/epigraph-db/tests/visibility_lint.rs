@@ -1018,6 +1018,76 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          report success. Nothing crosses to the caller — the return value is the row COUNT, and \
          ids and content are re-filtered under the actor's own viewer by `visible_previews`.",
     ),
+    // ── Unit E (R3 release gate). The `_conn` siblings the ingest executor and
+    // the DS/consolidate conversions needed so their writes can ride ONE stamped
+    // transaction. Each is the pool-taking original's body, moved; the pool form
+    // now delegates. Every one is a WRITE whose control is the connection's
+    // stamped GUCs evaluated by the table's `WITH CHECK`, the argument
+    // `update_labels_conn` states — except the two group_membership.rs READS
+    // at the end, which state their own.
+    (
+        "agent.rs",
+        "create_conn",
+        "WRITE. INSERT INTO `agents` plus its best-effort `agent.registered` event. `agents` is \
+         not tenant-partitioned (authorship must render on a public claim; migration 077's policy \
+         on it admits the provisioning INSERT), so there is no read predicate to splice. The \
+         event emit rides `publish_or_log_conn`'s SAVEPOINT, because a swallowed failure inside \
+         a caller's transaction would otherwise surface as a silent ROLLBACK at COMMIT.",
+    ),
+    (
+        "claim.rs",
+        "consolidate_conn",
+        "WRITE. `ClaimRepository::consolidate`'s body, moved so `consolidate_claims` can run it \
+         inside a transaction stamped from the acting agent. Its reads (`FOR UPDATE` lock of the \
+         sources, the edge-migration candidate scan, the idempotency probe) are VISIBILITY-EXEMPT \
+         write-path reads of rows it is about to mutate; `claims_tenancy`'s USING and WITH CHECK \
+         on the stamped connection are what authorise them (a private foreign source is \
+         invisible to the lock and refuses with NotFound; a public foreign one fails WITH CHECK).",
+    ),
+    (
+        "claim.rs",
+        "create_with_id_if_absent_conn",
+        "WRITE. `INSERT INTO claims ... ON CONFLICT (id) DO NOTHING` for the ingest paths' \
+         deterministic ids, plus the SAVEPOINT-wrapped `claim.created` event. Same argument as \
+         `update_labels_conn`: authorised by claims_tenancy's WITH CHECK on the stamped \
+         connection, not by a read predicate.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_with_repair_conn",
+        "WRITE. `mark_duplicate_with_repair`'s body on a caller's connection; `begin()` inside it \
+         is a SAVEPOINT there. Its reads are the existence/lock probes of the two claims it is \
+         about to mutate, authorised by claims_tenancy on the caller's stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_not_exists_conn",
+        "WRITE. `create_if_not_exists` on a caller's connection so an ingest's edges ride the \
+         same transaction as the claims they join. Its dedup probe is the VISIBILITY-EXEMPT \
+         write-path read `create_or_get` already documents (it must see an existing edge \
+         regardless of who asks, or the get half becomes a duplicate create); the INSERT is \
+         authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "group_membership.rs",
+        "count_own_revoked_rows_conn",
+        "READ of `group_memberships`, and deliberately viewer-less: it is an AUTHORITY BOOTSTRAP \
+         read, run before any viewer with write authority exists, on a connection stamped with \
+         the agent as PRINCIPAL. The filter is migration 077's own-row arm (`agent_id = \
+         epigraph_principal_id()`), which admits only that agent's rows — a spliced viewer \
+         predicate could only narrow it to the same set. It returns a COUNT, never rows, and \
+         its one caller is `system_agent_write_authority`, which refuses to provision when it is \
+         non-zero.",
+    ),
+    (
+        "group_membership.rs",
+        "visible_personal_group_conn",
+        "READ of `groups` by `did_key`, the pure-read half of `personal_group_of` (which mints on \
+         a miss and is registered above for that reason). Viewer-less for the same bootstrap \
+         reason as `count_own_revoked_rows_conn`: groups_tenancy on the caller's stamped \
+         connection is the filter, and 'invisible here' is exactly the answer the caller needs \
+         (no LIVE membership). Returns one id or None.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
@@ -1453,6 +1523,111 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          marked `is_current = false` whose `workflows` row keeps its truth value is exactly the \
          split the cascade exists to prevent — `find_workflow_hierarchical` reads the half that \
          was missed. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    // ── Unit E (R3 release gate). Every entry below was a viewer-less `&PgPool`
+    // function before this branch; ONLY its executor widened, so the ingest
+    // executor's plan walk and the DS belief chain can run on ONE stamped
+    // transaction. The SQL of each is unchanged. Writes rest on the
+    // `trace.rs::create` argument above (the control is the stamped
+    // connection's `WITH CHECK`); reads say what they read.
+    (
+        "agent.rs",
+        "get_by_public_key",
+        "READ of `agents` by public key. `agents` is not tenant-partitioned — authorship must \
+         render on a public claim, so its read policy admits every row — and the lookup is the \
+         get half of an ingest's get-or-create, which must find the row whoever asks. Widened \
+         so the lookup rides the same transaction as the create it guards.",
+    ),
+    (
+        "edge.rs",
+        "is_in_force",
+        "READ of one `edges` row by primary key, returning only whether it is in force. Its \
+         callers are the DS edge-factor wiring deciding whether to fire on an edge the SAME \
+         transaction just created or fetched; the edge's authority was decided by the \
+         statement that produced its id, and `edges_tenancy` on the stamped connection still \
+         backstops the read.",
+    ),
+    (
+        "frame.rs",
+        "create",
+        "WRITE into `frames`, one of migration 077 section 2b's instance-wide REGISTRIES whose \
+         WITH CHECK carries the static `TenancyDecl::instance_wide()` arm. Widened so \
+         `ensure_binary_frame` can run inside the DS wiring's stamped transaction.",
+    ),
+    (
+        "frame.rs",
+        "create_refinement",
+        "WRITE into `frames` (a refinement row); same instance-wide REGISTRY argument as \
+         `frame.rs::create` — the static WITH CHECK arm admits it, and there is no tenant \
+         content to filter.",
+    ),
+    (
+        "frame.rs",
+        "get_intra_evidence_locality_factor",
+        "READ of one `frames` row's property by primary key — registry configuration consumed \
+         by the combination arithmetic, not tenant content. Widened to ride the DS wiring's \
+         transaction.",
+    ),
+    (
+        "frame.rs",
+        "get_per_frame_evidence_type_weights",
+        "READ of one `frames` row's property by primary key; same argument as \
+         `get_intra_evidence_locality_factor`.",
+    ),
+    (
+        "mass_function.rs",
+        "clear_claim_belief",
+        "WRITE: `UPDATE claims` clearing the cached belief columns. Authorised by claims_tenancy's \
+         WITH CHECK on the caller's stamped connection, like `update_claim_belief`.",
+    ),
+    (
+        "mass_function.rs",
+        "delete_for_perspective",
+        "WRITE: DELETE from `mass_functions` for one perspective, the retraction half of a \
+         re-combination. Authorised by the table's policy on the caller's stamped connection.",
+    ),
+    (
+        "mass_function.rs",
+        "update_claim_belief",
+        "WRITE: `UPDATE claims SET belief/plausibility/...`, the statement \
+         `submit_ds_evidence` was refused at on a clean schema. MEASURED as `epigraph_app`: \
+         unstamped -> row-level security refusal; stamped from the claim's owner -> UPDATE 1. \
+         Widened so the BBA and the belief it implies commit as one unit.",
+    ),
+    (
+        "mass_function.rs",
+        "update_claim_classification",
+        "WRITE: `UPDATE claims SET classification`, followed by a mass_functions COUNT that \
+         already carries the `{VISIBILITY:mass_functions}` marker. Same WITH CHECK argument as \
+         `update_claim_belief`.",
+    ),
+    (
+        "perspective.rs",
+        "ensure_edge_perspective",
+        "WRITE: idempotent INSERT INTO `perspectives` for an edge-factor BBA's perspective. \
+         Authorised by the table's WITH CHECK on the caller's stamped connection; widened so it \
+         rides the DS wiring's transaction.",
+    ),
+    (
+        "perspective.rs",
+        "ensure_evidence_perspective",
+        "WRITE: idempotent INSERT INTO `perspectives` for an evidence BBA's perspective; same \
+         argument as `ensure_edge_perspective`.",
+    ),
+    (
+        "workflow.rs",
+        "find_root_by_canonical",
+        "READ of `workflows` by `(canonical_name, generation)`. `workflows` has \
+         `relrowsecurity` and `relforcerowsecurity` both FALSE and no policy (measured at head \
+         101), so there is nothing for a viewer to filter; it is the ingest executor's \
+         idempotency gate and must see every row. Widened to ride the plan walk's transaction.",
+    ),
+    (
+        "workflow.rs",
+        "insert_root",
+        "WRITE: `INSERT INTO workflows ... ON CONFLICT (canonical_name, generation) DO NOTHING`. \
+         `workflows` has no RLS (see `find_root_by_canonical`); widened for COHESION, so a \
+         workflow row cannot survive the rollback of the plan walk that wrote it.",
     ),
 ];
 
