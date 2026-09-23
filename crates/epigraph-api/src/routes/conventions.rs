@@ -144,6 +144,18 @@ pub async fn learn_convention(
             reason: "Convention content cannot be empty".to_string(),
         });
     }
+    // `request.tags` is caller-supplied and is extended onto the label array
+    // below. Refused here, with the other 400s, because the claim row is created
+    // BEFORE the label UPDATE — validating later would leave an orphan claim.
+    epigraph_db::reject_unexpanded_labels(&request.tags).map_err(|e| {
+        ApiError::ValidationError {
+            field: "tags".to_string(),
+            reason: match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            },
+        }
+    })?;
 
     let confidence = request.confidence.clamp(0.0, 1.0);
     let pool = &state.db_pool;

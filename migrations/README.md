@@ -216,9 +216,27 @@ Current reservation:
   surfaced only on reading. Renumbered here rather than on main because it has
   never been applied to a deployed database — production is at 59.
 
-- **101+**: public next
+- **101**: public `seed_method_entity_type` (backlog 895a74e5) — seeds the
+  `method` row in the `entity_types` registry, without which every edge whose
+  `source_type`/`target_type` is `'method'` is refused by the FK migration 055
+  installed.
 
-Next public migration **outside both reserved tenancy ranges** must be `100` or
+  **Why 101 and not 094.** It was authored as `094` against a `main` whose
+  README read "095+: public next", so neither the author nor CI could see that
+  `092–099` had been reserved as the SECOND tenancy block on 2026-09-15 — the
+  same blind spot that put `claims_belief_frame_id` at `093`, recorded one entry
+  up. The renumber also dissolves a second collision the original entry had to
+  document and live with: `epigraph-internal` carries a DIFFERENT
+  `094_stop_truth_value_overwrite.sql`, and the two repos share a
+  `_sqlx_migrations` table, so version 94 was a checksum collision waiting for
+  the first database that saw both. At `101` there is nothing to check for
+  before deploying. Renumbered here rather than on `main` for the same reason
+  `100` was: it has never been applied to a deployed database — production is at
+  59.
+
+- **102+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `102` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

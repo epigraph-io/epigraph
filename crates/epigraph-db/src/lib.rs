@@ -51,6 +51,7 @@
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
 pub mod errors;
+pub mod label_validation;
 pub mod pool;
 pub mod repos;
 pub mod visibility;
@@ -64,6 +65,7 @@ pub mod visibility;
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
 pub use errors::DbError;
+pub use label_validation::reject_unexpanded_labels;
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,
     create_pool_with_options, maintenance_database_url, maintenance_verdict,
@@ -76,36 +78,36 @@ pub use repos::{
     AlternativePairRow, AlternativeSetRepository, AnalysisRecord, AnalysisRepository,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
-    ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow, ClaimNeighbor,
-    ClaimNeighborBetpRow, ClaimRepository, ClaimSummary, ClaimThemeRepository, ClaimThemeRow,
-    ClaimVersionRepository, ClaimVersionRow, CommunityRepository, ConsolidateMode,
-    ConsolidateResult, ContextRepository, CorpusCounts, CorpusStatsRepository,
-    CounterfactualRepository, CounterfactualRow, DedupRepair, DivergenceRepository,
-    EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EntityRepository, EntityRow,
-    EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow, EventRepository, EventRow,
-    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceEncryptionRepository,
-    EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult, EvolveStepResult,
-    ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
-    FactorRepository, FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow,
-    GapRecord, GapRepository, GraphExpansionHit, GraphViewRepository, GroundedNeighbor,
-    GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository, GroupRow,
-    HierarchicalWorkflowRow, HybridHit, IndexCounts, InstanceAdminRepository, InstanceAdminRow,
-    KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow, LevelAndSourceType,
-    LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo, MatchCandidateRow,
-    MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength, MethodFailureModes,
-    MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper,
-    MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository, OAuthClientRow,
-    PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
-    ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
-    ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshTokenRepository,
-    RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome, ScopedBeliefRepository,
-    SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SweepCandidate, TaskRepository, TaskRow, TenancyPrecondition,
-    TraceProvenanceStep, TripleRepository, TripleRow, WebhookSubscriptionRepository,
-    WebhookSubscriptionRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
+    ClaimListFilter, ClaimNeighbor, ClaimNeighborBetpRow, ClaimRepository, ClaimSortField,
+    ClaimSortOrder, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
+    ClaimVersionRow, CommunityRepository, ConsolidateMode, ConsolidateResult, ContextRepository,
+    CorpusCounts, CorpusStatsRepository, CounterfactualRepository, CounterfactualRow, DedupRepair,
+    DivergenceRepository, EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository,
+    EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository, EpistemicEdgePairRow,
+    EventRepository, EventRow, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow,
+    EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceRepository, EvidenceSearchResult,
+    EvolveStepResult, ExperimentRepository, ExperimentResultRepository, ExperimentResultRow,
+    ExperimentRow, FactorRepository, FrameClaimBeliefHit, FrameRepository, GapAnalysisResult,
+    GapChallengeRow, GapRecord, GapRepository, GraphExpansionHit, GraphViewRepository,
+    GroundedNeighbor, GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository,
+    GroupRow, HierarchicalWorkflowRow, HybridHit, IndexCounts, InstanceAdminRepository,
+    InstanceAdminRow, KeyEpochRow, LabelQuery, LearningEventRepository, LearningEventRow,
+    LevelAndSourceType, LineageHead, LineageRepository, MassFunctionRepository, MatchCandidateRepo,
+    MatchCandidateRow, MembershipRow, MentionRow, MethodCapability, MethodEvidenceStrength,
+    MethodFailureModes, MethodForCapability, MethodRecord, MethodRepository, MethodSearchResult,
+    MethodSourcePaper, MethodUsageExample, NearestClaimHit, NewRecallEvent, OAuthClientRepository,
+    OAuthClientRow, PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput,
+    PatternTemplateRepository, PatternTemplateRow, PerspectiveRepository, ProvenanceChain,
+    ProvenanceChainRepository, ProvenanceEdge, ProvenanceLogRow, ProvenanceNode,
+    ProvenanceRepository, ReasoningTraceRepository, RecallEventRepository, RecallEventRow,
+    RefreshTokenRepository, RefreshTokenRow, ResolvedStep, RevokeOutcome, RotateOutcome,
+    ScopedBeliefRepository, SecurityEventRepository, SecurityEventRow, SheafRepository,
+    SortDirection, StructuralRepository, SweepCandidate, TaskRepository, TaskRow,
+    TenancyPrecondition, TraceProvenanceStep, TripleRepository, TripleRow,
+    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
 };
 pub use visibility::{MaintenanceLease, SystemReason, Viewer};
 

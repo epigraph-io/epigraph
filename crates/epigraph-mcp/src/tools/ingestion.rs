@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rmcp::model::*;
 use uuid::Uuid;
 
-use crate::errors::{internal_error, invalid_params, McpError};
+use crate::errors::{db_caller_error, internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto::{self, BatchDsEntry};
 use crate::types::*;
@@ -430,6 +430,14 @@ pub async fn do_ingest_document(
     // set (backlog c9d12a95: neither could ever find it before this label
     // existed).
     let paper_label = format!("doi:{doi}");
+    // Validated ONCE, here, before the paper node or any claim is written.
+    // `doi` comes from the extraction's source metadata, and the per-claim
+    // `update_labels` call that applies this label runs INSIDE the plan walk —
+    // so a `$` in the DOI would fail the ingest partway through, with the paper
+    // row and some claims already landed. Refusing up front keeps the "reject
+    // and write nothing" contract the rest of this branch establishes.
+    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
+        .map_err(db_caller_error)?;
 
     // ── 1. Get-or-create paper node ──
     // (Pipeline-version gate removed: deterministic node ids handle idempotency
@@ -1120,8 +1128,11 @@ pub async fn do_ingest_document_spine(
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
     // See do_ingest_document: attached to every claim so label-based lookup
-    // (recompute_beliefs, query_claims_by_label) can find this paper's set.
+    // (recompute_beliefs, query_claims_by_label) can find this paper's set,
+    // and validated here for the same reason — before the first write.
     let paper_label = format!("doi:{doi}");
+    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
+        .map_err(db_caller_error)?;
 
     // Atom planned IDs — skip these claims and any edges referencing them.
     let atom_planned_ids: HashSet<Uuid> = plan

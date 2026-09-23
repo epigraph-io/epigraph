@@ -260,6 +260,10 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
             min_truth: Some(0.0),
             max_truth: Some(1.0),
             limit: Some(50),
+            // Both populations: the fixture seeds only current rows, and
+            // pinning `None` keeps this test about VISIBILITY rather than
+            // about `a85ee585`'s current-only default.
+            is_current: None,
         },
     )
     .await

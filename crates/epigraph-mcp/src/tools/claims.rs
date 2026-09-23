@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
+use crate::errors::{db_caller_error, internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -145,6 +145,21 @@ pub async fn submit_claim(
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
 
+    // Label validation runs HERE — before any write — not at the
+    // `ClaimRepository::update_labels` call further down. The repo layer
+    // refuses unexpanded shell syntax either way (backlog f6310444), but that
+    // call happens AFTER `create_claim_idempotent` has already persisted the
+    // claim, so a guard there returns an error while leaving an ORPHAN claim
+    // behind: a row with none of the labels the caller asked for, and nothing
+    // marking it as the residue of a failed submission. That is the same
+    // "guard after the write" shape this branch's own HTTP tests assert must
+    // not happen (they check the 400 AND `COUNT(*) = 0`).
+    //
+    // `batch_submit_claims` delegates here per entry, so this also bounds a
+    // bad label's blast radius to its own index instead of leaving one orphan
+    // per rejected row.
+    epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
+
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
@@ -263,10 +278,14 @@ pub async fn submit_claim(
             .await?;
     let claim_uuid = claim.id.as_uuid();
 
+    // Already validated above, before the claim write. This call can now only
+    // fail for server-side reasons; `db_caller_error` keeps those
+    // INTERNAL_ERROR while still reporting a caller-caused `InvalidData`
+    // correctly if a future label rule is added to the repo layer.
     if !params.labels.is_empty() {
         ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
             .await
-            .map_err(internal_error)?;
+            .map_err(db_caller_error)?;
     }
 
     // Build Evidence + Trace from this submission. Both are noun-claims with
@@ -438,11 +457,21 @@ pub async fn query_claims(
     let min = params.min_truth.unwrap_or(0.0);
     let max = params.max_truth.unwrap_or(1.0);
 
-    // Filter by truth range in SQL (before LIMIT) so matching claims outside
-    // the most-recent `limit` rows are still reachable (bug 5a55a48e).
-    let claims = ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, limit, 0)
-        .await
-        .map_err(internal_error)?;
+    // Retirement state defaults to current-only. This tool is used as an
+    // assessment-queue proxy (`query_claims(max_truth=0.4)`), and returning
+    // superseded/refuted claims made already-resolved work resurface every
+    // cycle (backlog a85ee585). `Some(false)` still yields superseded rows for
+    // callers that want them; the schema documents that omission means
+    // current-only.
+    let is_current = params.is_current.or(Some(true));
+
+    // Filter by truth range AND retirement state in SQL (before LIMIT) so
+    // matching claims outside the most-recent `limit` rows are still reachable
+    // (bug 5a55a48e) and excluded rows don't consume the limit budget.
+    let claims =
+        ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, is_current, limit, 0)
+            .await
+            .map_err(internal_error)?;
 
     // No per-id access map. `list_by_truth_range` is spliced with `viewer`, so
     // a claim this caller may not read is not in `claims`. The map existed to
@@ -454,8 +483,8 @@ pub async fn query_claims(
     // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
     // while get_claim on the same id returned them). Batch fetch avoids the
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
-    // is_current so superseded rows (which list_by_truth_range returns) keep
-    // their labels, matching get_labels' label source. A missing id → no labels.
+    // is_current, so an explicit `is_current=false` request keeps its labels,
+    // matching get_labels' label source. A missing id → no labels.
     let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
         .await
         .map_err(internal_error)?;
@@ -472,8 +501,11 @@ pub async fn query_claims(
                 content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
-                is_current: true,
-                supersedes: None,
+                // The row's real retirement state, not a hardcoded `true` /
+                // `None` (backlog a85ee585) — `list_by_truth_range` now
+                // projects both columns.
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
             }
         })
         .collect();
@@ -581,22 +613,75 @@ pub async fn get_claim(
     })
 }
 
+/// Report the crypto state of a claim: does the body still match its stored
+/// digest, and did a known key sign that digest.
+///
+/// # The integrity answer is three-valued, deliberately
+///
+/// `claims.content_hash` is not `blake3(content)` on every row. The canonical
+/// Tier-1 document pipeline binds
+/// `compound_content_hash(blake3(text), artifact_seed)` on every thesis,
+/// section and paragraph node so that migration 013's
+/// `UNIQUE (content_hash, agent_id)` cannot collapse two papers' "Introduction"
+/// rows (`epigraph_ingest::common::plan::PlannedClaim::content_hash` is the
+/// contract; `epigraph_mcp::tools::ingestion` binds it verbatim). For that class
+/// `blake3(content) != stored` holds on *untampered* rows, and the seed is not
+/// carried on the claim, so the comparison decides nothing — reported as
+/// [`HashCheck::NotApplicable`] rather than as a mismatch.
+///
+/// The seed is deliberately NOT guessed back. `verify_claim` was filed as
+/// theatre (backlog `49c17386`) for asserting certainty it did not have;
+/// recomputing a compound digest from an inferred seed would reintroduce
+/// exactly that, one level deeper.
 pub async fn verify_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(id))
+    let claim_id = ClaimId::from_uuid(id);
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
 
-    // Verify content hash
+    // Integrity: BLAKE3 over the body vs. the digest STORED on the row.
+    //
+    // `ClaimRepository::get_by_id` projects `claims.content_hash` (backlog
+    // `49c17386`). It used to inherit `claim_from_row`'s placeholder, which was
+    // itself `ContentHasher::hash(content)` — so this comparison ran a value
+    // against itself, the answer was unconditionally "matches", and a claim
+    // whose body had been mutated without rewriting its digest verified clean.
     let computed_hash = ContentHasher::hash(claim.content.as_bytes());
-    let hash_matches = computed_hash == claim.content_hash;
+    let hash_check = if computed_hash == claim.content_hash {
+        HashCheck::Match
+    } else {
+        // The digest is not blake3(body). Two very different causes, and only
+        // one of them is tampering. Classify by how the row was WRITTEN — the
+        // predicate lives next to the writer that creates the class.
+        //
+        // Second query, on this branch only: the matching case needs no
+        // `properties` read at all, so the common path is unchanged.
+        let properties = ClaimRepository::get_properties(&server.pool, viewer, claim_id)
+            .await
+            .map_err(internal_error)?
+            .unwrap_or(serde_json::Value::Null);
+        if epigraph_ingest::document::stored_content_hash_is_seed_scoped(&properties) {
+            HashCheck::NotApplicable
+        } else {
+            HashCheck::Mismatch
+        }
+    };
 
-    // Verify signature
+    // Authenticity: the stored Ed25519 signature over the stored digest,
+    // checked against the SIGNER's public key (resolved by `get_by_id` through
+    // `claims.signer_id -> agents.public_key`). Previously `public_key` was
+    // hardcoded `[0u8; 32]` and `signature` hardcoded `None`, so this check
+    // could never pass for any claim.
+    //
+    // `signed` keeps "no signature to check" distinguishable from "signature
+    // present and rejected" — both of which report `signature_valid = false`.
+    let signed = claim.signature.is_some();
     let signature_valid = match claim.signature {
         Some(sig) => {
             epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
@@ -608,7 +693,14 @@ pub async fn verify_claim(
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
-        hash_matches,
+        signed,
+        hash_check,
+        hash_matches: match hash_check {
+            HashCheck::Match => Some(true),
+            HashCheck::Mismatch => Some(false),
+            // `null`, never `false`: see `VerifyResponse::hash_matches`.
+            HashCheck::NotApplicable => None,
+        },
         truth_value: claim.truth_value.value(),
     })
 }
@@ -644,6 +736,13 @@ pub async fn update_with_evidence(
     };
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
+
+    // Same placement rule as `submit_claim`: validate the caller's labels
+    // before anything is written. The additive label merge at the bottom of
+    // this function runs AFTER the Evidence insert, the DS/BBA wiring and the
+    // truth_value update, so a rejection there would move the claim's belief
+    // on the strength of a submission the caller was told had failed.
+    epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
 
     let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
         .await
@@ -724,7 +823,7 @@ pub async fn update_with_evidence(
     if !params.labels.is_empty() {
         ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
             .await
-            .map_err(internal_error)?;
+            .map_err(db_caller_error)?;
     }
 
     // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
@@ -992,9 +1091,13 @@ pub async fn update_labels(
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
+    // `db_caller_error`, not `internal_error`: a label refused by
+    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
+    // repo layer refuses it inside the same statement that would have written
+    // it, so nothing is persisted — only the reported code was wrong here.
     let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
         .await
-        .map_err(internal_error)?;
+        .map_err(db_caller_error)?;
     success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
 }
 
@@ -1028,7 +1131,7 @@ pub async fn patch_claim(
         },
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(db_caller_error)?;
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "claim_id": id,

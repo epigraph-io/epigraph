@@ -421,6 +421,19 @@ pub async fn create_claim(
         });
     }
 
+    // Refuse labels-at-creation carrying an unexpanded shell variable. Checked
+    // here with the other 400s rather than at the `UPDATE claims SET labels`
+    // below, so the request is refused before the claim row is written.
+    epigraph_db::reject_unexpanded_labels(&request.labels).map_err(|e| {
+        ApiError::ValidationError {
+            field: "labels".to_string(),
+            reason: match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            },
+        }
+    })?;
+
     // If encrypted, validate group membership and epoch
     if privacy_tier != "public" {
         let group_id = request.group_id.unwrap(); // safe: validated above
@@ -1766,6 +1779,13 @@ pub async fn patch_claim(
                     entity: "Claim".to_string(),
                     id: eid.to_string(),
                 },
+                // Same 400-not-500 reason as the PATCH /labels handler:
+                // `update_labels_conn` refuses an `add_labels` entry carrying
+                // an unexpanded shell variable with `InvalidData`.
+                epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+                    field: "add_labels".to_string(),
+                    reason,
+                },
                 other => ApiError::DatabaseError {
                     message: other.to_string(),
                 },
@@ -1950,6 +1970,13 @@ pub async fn update_labels(
             epigraph_db::DbError::NotFound { .. } => ApiError::NotFound {
                 entity: "Claim".to_string(),
                 id: id.to_string(),
+            },
+            // A refused label is caller error, not a database fault. Without
+            // this arm the `other =>` catch-all below would report the
+            // unexpanded-shell-variable rejection as a 500.
+            epigraph_db::DbError::InvalidData { reason } => ApiError::ValidationError {
+                field: "add".to_string(),
+                reason,
             },
             other => ApiError::DatabaseError {
                 message: other.to_string(),

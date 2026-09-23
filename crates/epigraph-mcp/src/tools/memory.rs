@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, McpError};
+use crate::errors::{db_caller_error, internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -34,6 +34,20 @@ pub async fn memorize(
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.unwrap_or(0.7).clamp(0.0, 1.0);
     let mut tags = params.tags.unwrap_or_default();
+
+    // Validate the caller's tags BEFORE anything is written (backlog
+    // f6310444). `tags` become `claims.labels` via `update_labels` further
+    // down, which refuses unexpanded shell syntax at the repo layer — but that
+    // call sits after `create_claim_idempotent` and its failure used to be
+    // swallowed into a `tracing::warn!`, so `memorize(tags =
+    // ["claude-memory", "group:$EPICLAW_GROUP_ID"])` returned SUCCESS with the
+    // claim stored and ALL tags dropped. That is strictly worse than the
+    // corruption the guard exists to stop: a mislabelled claim is findable by
+    // sweeping for `$`, whereas a silently untagged one is indistinguishable
+    // from a claim never meant to be grouped — the second consequence the
+    // backlog report names. Refusing the call outright makes the failure
+    // visible to the caller that can still fix it.
+    epigraph_db::reject_unexpanded_labels(&tags).map_err(db_caller_error)?;
 
     let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
@@ -118,10 +132,17 @@ pub async fn memorize(
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
     // Apply on dedup-hit too — labels accumulate non-destructively via the repo's
     // SELECT DISTINCT, so re-memorizing existing content with new tags is additive.
+    //
+    // The failure is PROPAGATED, not warned-and-dropped. A memory whose tags
+    // silently vanished is unfindable by the `query_claims_by_label` call the
+    // caller stored it for, so reporting success would be a lie; and because
+    // `create_claim_idempotent` dedupes on (content_hash, agent_id) and
+    // `update_labels` unions labels, a caller that retries on this error lands
+    // on the same claim and gets its tags applied rather than a duplicate.
     if !tags.is_empty() {
-        if let Err(e) = ClaimRepository::update_labels(&server.pool, claim_uuid, &tags, &[]).await {
-            tracing::warn!(claim_id = %claim_uuid, "memorize: update_labels failed: {e}");
-        }
+        ClaimRepository::update_labels(&server.pool, claim_uuid, &tags, &[])
+            .await
+            .map_err(db_caller_error)?;
     }
 
     let (final_truth, ds, embedded) = if was_created {
