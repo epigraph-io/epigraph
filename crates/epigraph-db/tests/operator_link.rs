@@ -308,6 +308,45 @@ async fn a_second_operator_and_a_self_link_are_refused(pool: PgPool) {
             .map(|l| l.operator_id),
         Some(op_j)
     );
+
+    // Single hop, from both ends. `agent -> op_j` exists, so:
+    // (a) op_j, an operator, cannot itself be operated (the review's order:
+    //     link(X, O) then link(O, P) would build X -> O -> P);
+    let op_p = seed_bare_agent(&pool).await;
+    let err = AgentRepository::link_operator(&mut conn, op_j, op_p)
+        .await
+        .expect_err("an agent that already operates others must not become operated");
+    assert!(
+        err.to_string().contains("already operates other agents"),
+        "{err}"
+    );
+    assert!(
+        AgentRepository::operator_links(&mut conn, op_j)
+            .await
+            .expect("links of op_j")
+            .is_empty(),
+        "the refused link must leave op_j unoperated"
+    );
+    let p_group: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(op_p)
+    .fetch_optional(&pool)
+    .await
+    .expect("p group");
+    if let Some(g) = p_group {
+        assert!(
+            membership_rows(&pool, g, op_j).await.is_empty(),
+            "the refused link enrolled op_j in P's group"
+        );
+    }
+    // (b) and the reverse order stays refused: `agent`, operated, cannot be
+    //     an operator.
+    let downstream = seed_bare_agent(&pool).await;
+    let err = AgentRepository::link_operator(&mut conn, downstream, agent)
+        .await
+        .expect_err("an operated agent must not become an operator");
+    assert!(err.to_string().contains("is itself operated"), "{err}");
 }
 
 /// An HTTP server's auth-lineage `OPERATED_BY` edge (no membership) is NOT a

@@ -290,11 +290,19 @@ BEGIN
         RAISE EXCEPTION 'epigraph_link_operator: operator % does not exist', p_operator
             USING ERRCODE = '22023';
     END IF;
-    -- Single hop. An operator that is itself operated would make "who owns
-    -- this" depend on a chain nobody declared as a whole.
+    -- Single hop, enforced from BOTH ends. An operator that is itself
+    -- operated, or an agent that already operates others, would make "who
+    -- owns this" depend on a chain nobody declared as a whole. Checking only
+    -- the first end let the order link(X, O) then link(O, P) build X -> O -> P
+    -- (measured by review); the second check closes that order.
     IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
         RAISE EXCEPTION 'epigraph_link_operator: % is itself operated by another agent and '
                         'cannot be an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.operator_id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_operator: % already operates other agents and cannot '
+                        'itself be operated', p_agent
             USING ERRCODE = '55000';
     END IF;
     -- One operator per agent, ever. A second declaration is a configuration
