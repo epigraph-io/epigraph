@@ -283,7 +283,8 @@ pub struct DiverseRetrievalConfig<'a> {
     /// `budget` rows — never a row from another paper. Unlike the window, a
     /// single paper is a tiny slice of the corpus, so for a DOI this shortfall
     /// is the common case rather than an edge; a caller that needs a full page
-    /// must top it up from a DOI-filtered flat search.
+    /// must top it up from a DOI-filtered flat search (MCP
+    /// `recall_with_context` does).
     pub paper_doi_filter: Option<&'a str>,
 }
 

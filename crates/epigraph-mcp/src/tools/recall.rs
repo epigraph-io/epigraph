@@ -120,8 +120,9 @@ pub struct RecallWithContextParams {
     /// Restrict top-level hits to paragraphs that a paper with this DOI
     /// `asserts`. Honoured on the flat path AND with `diverse=true`, where it
     /// narrows the in-theme candidate pool. Theme selection itself is not
-    /// DOI-scoped, so a `diverse=true` page can come back shorter than `limit`
-    /// when the paper's paragraphs fall outside the selected themes. Not
+    /// DOI-scoped, so when the paper's paragraphs fall mostly outside the
+    /// selected themes a `diverse=true` page is topped up, after its diverse
+    /// picks, from the DOI-filtered flat ANN rather than returned short. Not
     /// applied to claims that `graph_expansion_depth` folds in: expansion
     /// follows edges from the DOI-scoped seeds and can reach other papers.
     pub paper_doi_filter: Option<String>,
@@ -819,7 +820,7 @@ async fn recall_with_context_post_embed(
             .await
             .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
         } else {
-            selected
+            let mut hits: Vec<epigraph_db::ClaimEmbeddingHit> = selected
                 .into_iter()
                 .map(
                     |(id, _content, similarity)| epigraph_db::ClaimEmbeddingHit {
@@ -827,7 +828,45 @@ async fn recall_with_context_post_embed(
                         similarity,
                     },
                 )
-                .collect()
+                .collect();
+            // DOI-scoped top-up. Theme selection is not DOI-scoped (see
+            // `DiverseRetrievalConfig::paper_doi_filter`), so when most of the
+            // paper sits outside the `max_themes` selected themes the diverse
+            // pool holds only the few paragraphs that landed inside them and
+            // the page comes back short. One paper is a tiny slice of the
+            // corpus, so for a DOI that is the common case, not an edge. Fill
+            // the rest of the page from the same DOI- and window-filtered flat
+            // ANN the empty-selection fallback above uses, keeping the diverse
+            // picks first. Fetching `want` rows is enough: at most
+            // `hits.len()` of them can repeat a diverse pick, so at least
+            // `want - hits.len()` are new whenever the paper has that many.
+            // Without a DOI the diverse path is unchanged.
+            if let Some(doi) = params.paper_doi_filter.as_deref() {
+                if hits.len() < want {
+                    let flat = epigraph_db::ClaimRepository::search_by_embedding_since(
+                        &server.pool,
+                        viewer,
+                        pgvec,
+                        centroid_dim,
+                        want as i64,
+                        Some(doi),
+                        params.since,
+                    )
+                    .await
+                    .map_err(|e| internal_error(format!("kNN DOI top-up: {e}")))?;
+                    let mut seen: std::collections::HashSet<Uuid> =
+                        hits.iter().map(|h| h.claim_id).collect();
+                    for h in flat {
+                        if hits.len() >= want {
+                            break;
+                        }
+                        if seen.insert(h.claim_id) {
+                            hits.push(h);
+                        }
+                    }
+                }
+            }
+            hits
         }
     } else {
         // Flat paragraph-primary kNN (level=2 only, optional paper_doi pre-filter).

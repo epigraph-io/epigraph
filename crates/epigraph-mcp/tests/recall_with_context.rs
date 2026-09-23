@@ -1547,6 +1547,167 @@ async fn diverse_honours_paper_doi_filter(pool: PgPool) {
     );
 }
 
+/// Theme selection is not DOI-scoped: `run_diverse_pipeline` picks its
+/// `max_themes` themes by centroid similarity over the whole corpus, and only
+/// then applies the DOI. When most of the paper's paragraphs sit in a theme
+/// that was not selected, the DOI-scoped diverse pool holds only the few that
+/// landed in the selected themes, so the page would come back SHORT with no
+/// fallback. `recall_with_context` tops a short DOI-scoped diverse page up from
+/// the DOI-filtered flat ANN, so it is never smaller than the flat path's page
+/// for the same paper.
+///
+/// Fixture: `max_themes=1`. The near theme (the query's direction) holds one
+/// paper-A paragraph and two paper-B paragraphs; the far theme (orthogonal
+/// centroid, never selected) holds three more paper-A paragraphs. The
+/// unfiltered control pins that the far theme really is out of reach of the
+/// diverse pool, so the far paragraphs on the filtered page came from the
+/// top-up.
+#[sqlx::test(migrations = "../../migrations")]
+async fn diverse_doi_page_is_topped_up_when_the_paper_spans_unselected_themes(pool: PgPool) {
+    let viewer = viewerfx::public_viewer(&pool).await;
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper_a = diverse_fixture::seed_paper(&pool, "10.1/span-a", "Paper A").await;
+    let paper_b = diverse_fixture::seed_paper(&pool, "10.1/span-b", "Paper B").await;
+    let near = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "near-theme",
+        &diverse_fixture::cluster_pgvec(0, 1.0),
+    )
+    .await;
+    let far = diverse_fixture::seed_theme_with_centroid(
+        &pool,
+        "far-theme",
+        &diverse_fixture::cluster_pgvec(3, 1.0),
+    )
+    .await;
+    let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let a_near = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper_a,
+        "span-a-near",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 5, 0.2),
+        Some(near),
+    )
+    .await;
+    let mut b_near = Vec::new();
+    for i in 0..2 {
+        b_near.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper_b,
+                &format!("span-b-near-{i}"),
+                &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 5, 0.01 * (i as f32)),
+                Some(near),
+            )
+            .await,
+        );
+    }
+    let mut a_far = Vec::new();
+    for i in 0..3 {
+        a_far.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper_a,
+                &format!("span-a-far-{i}"),
+                &diverse_fixture::mixed_bucket_pgvec(3, 0.5 - (i as f32) * 0.05),
+                Some(far),
+            )
+            .await,
+        );
+    }
+
+    let server = build_test_server(pool.clone());
+
+    // Control: with max_themes=1 and no DOI, nothing from the far theme can
+    // reach the diverse page, so a far paragraph below is the top-up's doing.
+    let unfiltered = hits_with_doi(
+        recall_with_context_with_pgvec(
+            &server,
+            &viewer,
+            diverse_params(/*diverse=*/ true, Some(1), Some(0.4), 10),
+            1536,
+            &query_pgvec,
+        )
+        .await
+        .expect("unfiltered diverse recall"),
+    );
+    let unfiltered_ids: std::collections::HashSet<Uuid> =
+        unfiltered.iter().map(|(id, _)| *id).collect();
+    let mut near_ids: std::collections::HashSet<Uuid> = b_near.iter().copied().collect();
+    near_ids.insert(a_near);
+    assert_eq!(
+        unfiltered_ids, near_ids,
+        "fixture invariant: max_themes=1 must confine the unfiltered diverse page to \
+         the near theme, and no top-up may run without a DOI"
+    );
+
+    let mut params = diverse_params(/*diverse=*/ true, Some(1), Some(0.4), 10);
+    params.paper_doi_filter = Some("10.1/span-a".to_string());
+    let filtered = hits_with_doi(
+        recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
+            .await
+            .expect("DOI-filtered diverse recall"),
+    );
+
+    for (id, doi) in &filtered {
+        assert_eq!(
+            doi.as_deref(),
+            Some("10.1/span-a"),
+            "the top-up must stay inside the DOI: paragraph {id} came from {doi:?}"
+        );
+    }
+    let returned: std::collections::HashSet<Uuid> = filtered.iter().map(|(id, _)| *id).collect();
+    let mut expected: std::collections::HashSet<Uuid> = a_far.iter().copied().collect();
+    expected.insert(a_near);
+    assert_eq!(
+        returned, expected,
+        "a DOI-scoped diverse page must be topped up to the paper's full reach \
+         (limit 10 > 4 paragraphs), not stop at the one paragraph that sat in the \
+         selected theme. Page: {filtered:?}"
+    );
+    assert_eq!(
+        filtered.first().map(|(id, _)| *id),
+        Some(a_near),
+        "the diverse selection leads the page; the top-up only appends after it"
+    );
+
+    // The top-up is a candidate-producing surface too, so it must honour
+    // `since` as well as the DOI: a pre-window paragraph of the same paper
+    // must not ride in on it.
+    let stale = a_far[0];
+    sqlx::query("UPDATE claims SET created_at = '2020-01-01T00:00:00Z' WHERE id = $1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .expect("backdate one far paragraph");
+    let mut windowed = diverse_params(/*diverse=*/ true, Some(1), Some(0.4), 10);
+    windowed.paper_doi_filter = Some("10.1/span-a".to_string());
+    windowed.since = Some(
+        "2024-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("since"),
+    );
+    let windowed_ids: std::collections::HashSet<Uuid> = hits_with_doi(
+        recall_with_context_with_pgvec(&server, &viewer, windowed, 1536, &query_pgvec)
+            .await
+            .expect("windowed DOI-filtered diverse recall"),
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect();
+    expected.remove(&stale);
+    assert_eq!(
+        windowed_ids, expected,
+        "the DOI top-up must apply the `since` window: pre-window paragraph {stale} leaked"
+    );
+}
+
 /// F3 (backlog 34d3400d): a contested paragraph hit carries the dispute
 /// annotation through `recall_with_context`, and an uncontested hit on the
 /// same page omits the fields entirely.
