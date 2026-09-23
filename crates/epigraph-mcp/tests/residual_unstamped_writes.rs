@@ -285,7 +285,8 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         1,
         "`report_workflow_outcome`'s evidence INSERT, on the LEGACY FLAT path. Stamped in an \
          earlier revision of this branch and DELIBERATELY REVERTED, for the reason and on the \
-         measurement that reverted `update_with_evidence`'s sibling INSERT two entries above: \
+         measurement that reverted its sibling INSERT in `tools/claims.rs` (`update_with_evidence`, \
+         registered under that file's own entry for this same callee): \
          migration 046's FK from `mass_functions.evidence_id` forces it to commit alone, and \
          `ds_auto` — which runs next on a sibling pool connection — writes `claim_frames`, a \
          table with no orphan `*_privacy` policy and therefore refused on BOTH configurations. \
