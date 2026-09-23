@@ -823,7 +823,9 @@ impl EpiGraphMcpFull {
                        earliest wins ties). DRY RUN BY DEFAULT. Exact restatements are \
                        collapsed via mark_duplicate when dry_run=false; clusters that merely \
                        resemble each other are returned as merge_candidates for \
-                       consolidate_claims so no wording is discarded. Resumable via offset."
+                       consolidate_claims so no wording is discarded. Resumable via offset. \
+                       Requires claims:admin: it runs as a corpus-wide maintenance bypass \
+                       across every tenant, not on the caller's view."
     )]
     async fn sweep_semantic_duplicates(
         &self,
@@ -1094,7 +1096,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path."
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Requires claims:admin: it runs as a corpus-wide maintenance bypass across every tenant, not on the caller's view."
     )]
     async fn recompute_beliefs(
         &self,
@@ -1605,7 +1607,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:write."
+        description = "Generate and store the missing claims.embedding vector for current, non-telemetry claims that lack one (the is_current AND embedding IS NULL gap the CLAUDE.md embedding-policy invariant tracks). Server-side, MCP-executable counterpart to the embed_backfill CLI: the embed stage of the decomposition-cycle's decompose→embed→cross-source-match pipeline. Selection is oldest-first so repeated runs drain the backlog monotonically. Params: limit (default 200, clamped 1..=2000), dry_run (default false — count candidates without writing; safe with no OpenAI key). Returns {candidates, embedded, failed, dry_run}. Errors if the server has no OPENAI_API_KEY and dry_run is false. Requires claims:admin: it runs as a corpus-wide maintenance bypass across every tenant, not on the caller's view."
     )]
     async fn backfill_embeddings(
         &self,

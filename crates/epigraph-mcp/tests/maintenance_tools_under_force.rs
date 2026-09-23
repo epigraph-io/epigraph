@@ -37,6 +37,13 @@
 //! lived in the gap between the two. Driving `call_tool` over an in-process
 //! duplex transport exercises both halves and `with_scoped_pool`, with no
 //! `RequestContext` to synthesize by hand.
+//!
+//! That duplex is the STDIO shape: no HTTP `Parts`, so no `AuthContext` and no
+//! scope gate. It therefore says nothing about WHO reaches the bypass, which on
+//! the HTTP transport is decided by `SCOPE_MAP` alone, because `main.rs`
+//! attaches the maintenance pool to every per-session HTTP server.
+//! [`over_http_only_a_claims_admin_token_reaches_the_maintenance_bypass`]
+//! serves the same router behind `bearer_auth_middleware` and answers that.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -521,6 +528,231 @@ async fn stock_epigraph_maintenance_cannot_yet_retire_a_claim(pool: PgPool) {
         is_current(&pool, &[first, second]).await,
         2,
         "a refused collapse must leave both claims current"
+    );
+}
+
+// ── who reaches the bypass: the HTTP scope gate ─────────────────────────────
+
+const JWT_SECRET: &[u8] = b"maintenance-scope-gate-test-secret-at-least-32-bytes";
+
+/// A Bearer token this file's HTTP server accepts, carrying exactly `scopes`
+/// and no agent principal (none of the three maintenance tools resolves one).
+fn bearer(scopes: &[&str]) -> String {
+    epigraph_auth::JwtConfig::from_secret(JWT_SECRET)
+        .issue_access_token(
+            Uuid::new_v4(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "service",
+            None,
+            None,
+            chrono::Duration::minutes(5),
+        )
+        .expect("mint bearer token")
+        .0
+}
+
+/// Serve the real router over streamable HTTP behind `bearer_auth_middleware`,
+/// with every per-session server carrying `scoped` as `main.rs`'s
+/// `with_maintenance` attaches it. Returns the `/mcp` URL.
+async fn serve_http(app: &PgPool, scoped: ScopedPool, embedder: McpEmbedder) -> String {
+    use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+    use std::sync::Arc;
+
+    let pool = app.clone();
+    let signer = Arc::new(AgentSigner::from_bytes(&[0x5au8; 32]).expect("signer"));
+    let embedder = Arc::new(embedder);
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(
+                EpiGraphMcpFull::new_shared(pool.clone(), signer.clone(), embedder.clone(), false)
+                    .with_scoped_pool(scoped.clone()),
+            )
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let auth = epigraph_mcp::auth::McpAuthState {
+        jwt_config: Arc::new(epigraph_auth::JwtConfig::from_secret(JWT_SECRET)),
+        resource_metadata_url: None,
+    };
+    let router = axum::Router::new().nest_service("/mcp", service).layer(
+        axum::middleware::from_fn_with_state(auth, epigraph_mcp::auth::bearer_auth_middleware),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind MCP HTTP listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}/mcp")
+}
+
+/// An MCP client presenting `token` as its Bearer on every request.
+async fn connect_http(url: &str, token: &str) -> RunningService<RoleClient, ()> {
+    use rmcp::transport::streamable_http_client::{
+        StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+    };
+    let mut config =
+        StreamableHttpClientTransportConfig::with_uri(std::sync::Arc::<str>::from(url));
+    config.auth_header = Some(token.to_string());
+    ().serve(StreamableHttpClientTransport::<reqwest::Client>::from_config(config))
+        .await
+        .expect("MCP client handshake over HTTP")
+}
+
+async fn has_embedding(pool: &PgPool, claim: Uuid) -> bool {
+    sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read embedding presence")
+}
+
+/// WHO REACHES THE BYPASS. `main.rs` attaches the maintenance pool to every
+/// per-session HTTP server, so on HTTP a maintenance tool's `SCOPE_MAP` entry is
+/// the only thing between a token and every tenant's rows. The tests above use
+/// the stdio shape and cannot show which scope gets through; this one serves the
+/// real router behind `bearer_auth_middleware`, pool attached as `main.rs`
+/// attaches it.
+///
+/// One server, one fixture, two tokens — the token is the only variable:
+///
+/// * `claims:read` + `claims:write`: all three tools are refused with the scope
+///   error, the refusal names none of the private claims, and every private row
+///   is what it was. The fixture is ARMED so a regression is visible rather
+///   than inferred: the maintenance DELETE grants are applied and the sweep runs
+///   with `dry_run=false`, so a `claims:write` gate would retire one of the
+///   pair, rewrite the belief and embed the claim — MEASURED by mapping the
+///   three tools back to `claims:write`, which fails this test at the first
+///   refusal it expects.
+/// * `claims:admin`: the same calls on the same server modify each row, which
+///   proves the refusals above are the scope gate and not a server that cannot
+///   reach its maintenance pool.
+#[sqlx::test(migrations = "../../migrations")]
+async fn over_http_only_a_claims_admin_token_reaches_the_maintenance_bypass(pool: PgPool) {
+    assert_claims_are_forced(&pool).await;
+    grant_the_maintenance_deletes_deploy_md_requires(&pool).await;
+
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "p5-http-scope").await;
+    let unembedded = fixture::seed_group_claim(
+        &pool,
+        agent,
+        group,
+        "p5 http scope: a group-private claim with no embedding",
+    )
+    .await;
+    let believed = fixture::seed_group_claim(
+        &pool,
+        agent,
+        group,
+        "p5 http scope: a group-private claim with a BBA",
+    )
+    .await;
+    wire_bba(&pool, believed, agent).await;
+    let correct = pignistic(&pool, believed)
+        .await
+        .expect("wired claim has a BetP");
+    sqlx::query("UPDATE claims SET pignistic_prob = 0.123 WHERE id = $1")
+        .bind(believed)
+        .execute(&pool)
+        .await
+        .expect("corrupt cache");
+    assert!(
+        (correct - 0.123).abs() > 1e-6,
+        "fixture: 0.123 must be wrong"
+    );
+    let (first, second) = seed_private_restatement(&pool).await;
+    let private = [unembedded, believed, first, second];
+
+    let p = pools(&pool).await;
+    let embedder = McpEmbedder::new(p.app.clone(), Some("stub-key".into()))
+        .with_endpoint(embedding_stub().await);
+    let url = serve_http(&p.app, p.scoped, embedder).await;
+
+    let calls = [
+        ("sweep_semantic_duplicates", sweep_args()),
+        (
+            "recompute_beliefs",
+            serde_json::json!({ "claim_ids": [believed.to_string()] }),
+        ),
+        (
+            "backfill_embeddings",
+            serde_json::json!({ "limit": 1000, "dry_run": false }),
+        ),
+    ];
+
+    // ── claims:write: refused, and nothing moved ──
+    let writer = connect_http(&url, &bearer(&["claims:read", "claims:write"])).await;
+    for (tool, args) in calls {
+        let err = call(&writer, tool, args)
+            .await
+            .expect_err("a claims:write token must not reach a maintenance bypass");
+        assert!(
+            err.contains(&format!("tool '{tool}' requires scope 'claims:admin'")),
+            "{tool}: the refusal must be the scope gate naming claims:admin; got {err}"
+        );
+        for id in private {
+            assert!(
+                !err.contains(&id.to_string()),
+                "{tool}: the refusal leaked private claim {id}: {err}"
+            );
+        }
+    }
+    assert_eq!(
+        is_current(&pool, &[first, second]).await,
+        2,
+        "a refused sweep must leave the private pair current"
+    );
+    let still_corrupt = pignistic(&pool, believed).await.expect("BetP");
+    assert!(
+        (still_corrupt - 0.123).abs() < 1e-9,
+        "a refused recompute must not rewrite the private belief; got {still_corrupt}"
+    );
+    assert!(
+        !has_embedding(&pool, unembedded).await,
+        "a refused backfill must not embed the private claim"
+    );
+
+    // ── claims:admin: the same calls modify every private row ──
+    // Sweep first: once the backfill has run, `unembedded` and `believed` share
+    // the stub's vector and would join the sweep's candidate set.
+    let admin = connect_http(&url, &bearer(&["claims:admin"])).await;
+    let swept = call(&admin, "sweep_semantic_duplicates", sweep_args())
+        .await
+        .expect("claims:admin reaches sweep_semantic_duplicates");
+    assert_eq!(swept["pairs_marked"], 1, "{swept}");
+    assert_eq!(
+        is_current(&pool, &[first, second]).await,
+        1,
+        "the admin sweep must retire one of the private pair: {swept}"
+    );
+    let recomputed = call(
+        &admin,
+        "recompute_beliefs",
+        serde_json::json!({ "claim_ids": [believed.to_string()] }),
+    )
+    .await
+    .expect("claims:admin reaches recompute_beliefs");
+    assert_eq!(recomputed["claims_recomputed"], 1, "{recomputed}");
+    let rewritten = pignistic(&pool, believed).await.expect("BetP");
+    assert!(
+        (rewritten - correct).abs() < 1e-9,
+        "the admin recompute must rewrite the private belief to {correct}; got {rewritten}"
+    );
+    let backfilled = call(
+        &admin,
+        "backfill_embeddings",
+        serde_json::json!({ "limit": 1000, "dry_run": false }),
+    )
+    .await
+    .expect("claims:admin reaches backfill_embeddings");
+    assert!(
+        has_embedding(&pool, unembedded).await,
+        "the admin backfill must embed the private claim: {backfilled}"
     );
 }
 

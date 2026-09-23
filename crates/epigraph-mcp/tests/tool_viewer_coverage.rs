@@ -296,6 +296,55 @@ fn the_maintenance_bypass_set_is_exactly_what_was_reviewed() {
     );
 }
 
+/// Every tool whose dispatch body mints a maintenance (bypass) viewer is gated
+/// on `claims:admin` in `SCOPE_MAP`.
+///
+/// The set is DERIVED from `server.rs`, not copied from
+/// [`EXPECTED_MAINTENANCE_TOOLS`]: the property is "whatever mints a bypass is
+/// admin-gated", so a fourth bypass tool mapped at `claims:write` must fail here
+/// even if someone also adds it to that list. `main.rs` attaches the
+/// maintenance pool to every per-session HTTP server, so on the HTTP transport
+/// the tool's scope is the only thing between a token and every tenant's rows.
+/// For these three that meant any `claims:write` token could enumerate private
+/// claim ids (`sweep_semantic_duplicates`, FINAL-PLAN §4.9 leak #13), retire
+/// them in bulk, and probe them for BBAs (`recompute_beliefs`), while the
+/// single-shot `mark_duplicate` and the HTTP twin of the backfill read
+/// (`GET /claims/needing-embeddings`) both demand `claims:admin`.
+#[test]
+fn every_maintenance_bypass_tool_is_admin_gated() {
+    let src = server_src();
+    let maint: Vec<String> = tools(&src)
+        .into_iter()
+        .filter(|(_, a)| *a == Acquisition::Maintenance)
+        .map(|(n, _)| n)
+        .collect();
+
+    // Non-vacuous: an empty derived set would pass the check below trivially.
+    assert!(
+        !maint.is_empty(),
+        "no tool in server.rs mints a maintenance viewer — the scanner is broken, \
+         or the bypass moved somewhere this lint does not look"
+    );
+
+    let below_admin: Vec<(String, Option<&'static str>)> = maint
+        .into_iter()
+        .map(|n| {
+            let scope = epigraph_mcp::scope_map::required_scope(&n);
+            (n, scope)
+        })
+        .filter(|(_, scope)| *scope != Some("claims:admin"))
+        .collect();
+
+    assert!(
+        below_admin.is_empty(),
+        "\n\nThese tools mint a maintenance (bypass) viewer but are not gated on \
+         claims:admin in crates/epigraph-mcp/src/scope_map.rs: {below_admin:?}\n\
+         A bypass tool runs on the privileged maintenance connection across every \
+         tenant; reaching it is an operator act, so its scope must be \
+         claims:admin.\n"
+    );
+}
+
 /// The partition is total: every tool falls in exactly one of the three
 /// categories, and the counts add up to the number of `#[tool(` attributes.
 ///

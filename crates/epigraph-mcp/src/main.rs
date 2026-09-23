@@ -294,6 +294,11 @@ fn check_listen_auth_mode(
 /// HTTP one — goes through here, so the three maintenance tools behave the same
 /// on both transports. `None` leaves the server unscoped, and its maintenance
 /// tools fail closed.
+///
+/// What this hands out is a `Viewer::system` on a privileged connection, to
+/// whoever can call those tools. On HTTP that is decided by
+/// `epigraph_mcp::scope_map::SCOPE_MAP`, which gates all three at
+/// `claims:admin`; on stdio it is the process boundary, as for every tool.
 fn with_maintenance(
     server: EpiGraphMcpFull,
     scoped: Option<&epigraph_db::ScopedPool>,
@@ -361,10 +366,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // never on `server.pool` — which is what made attaching it safe; before
     // that change it would have been the privileged-viewer/ordinary-pool hybrid.
     //
+    // WHO REACHES IT is the other half of "safe". The pool is attached to every
+    // per-session HTTP server below, so the scope on those three tools is the
+    // cross-tenant boundary: `SCOPE_MAP` gates them at `claims:admin`, the tier
+    // the single-shot `mark_duplicate` and the api's
+    // `GET /claims/needing-embeddings` already demand. At `claims:write` any
+    // writing agent could have enumerated, retired and re-scored other tenants'
+    // group-private claims. "Operator-invoked" below is that scope, enforced by
+    // `enforce_tool_scope` and pinned by
+    // `tests/tool_viewer_coverage.rs::every_maintenance_bypass_tool_is_admin_gated`,
+    // not an assumption about who calls.
+    //
     // A REFUSAL DOES NOT STOP THE PROCESS, and that is the deliberate opposite
     // of the api's choice. There a bad maintenance DSN blocks boot, because a
     // healthy-looking api whose background writes land nowhere is the worse
-    // outage. Here the only consumers are three operator-invoked tools out of
+    // outage. Here the only consumers are three admin-gated tools out of
     // eighty-three, and each one already FAILS CLOSED, with an error naming the
     // boot log, when nothing is attached — so taking the other eighty down with
     // them would trade a loud, narrow failure for a broad one. The refusal is

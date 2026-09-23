@@ -158,7 +158,14 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   070 grants make every dedup collapse fail on the `claims_deactivate_factors`
   trigger, a gap that needs a migration (pinned by
   `stock_epigraph_maintenance_cannot_yet_retire_a_claim`) — then confirm
-  `maintenance pool attached` in the boot log.
+  `maintenance pool attached` in the boot log. **The three tools are
+  `claims:admin` in `SCOPE_MAP`, moved from `claims:write` in the same
+  change** (`F-mcp-maintenance-bypass-reachable-at-claims-write`): the pool is
+  attached to every per-session HTTP server, so the scope is the cross-tenant
+  boundary, and at `claims:write` it would have handed every writing agent a
+  `Viewer::system` — including FINAL-PLAN §4.9 leak #13, the
+  `sweep_semantic_duplicates` oracle, whose gating is now `claims:admin`.
+  Callers that ran them with a `claims:write` token need an admin token.
 - **PR-17 owes** `GRANT epigraph_maintenance TO epigraph_admin` as a deploy
   runbook step (no migration), **together with the api job path's table
   grants**. `epigraph_maintenance` is NOLOGIN and `epigraph_admin` is not a

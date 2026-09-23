@@ -41,7 +41,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_provenance_chain", "claims:read"),
     ("get_recall_events", "claims:read"),
     ("consolidate_claims", "claims:write"),
-    ("sweep_semantic_duplicates", "claims:write"),
     ("get_workflow_executions", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
@@ -67,7 +66,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("traverse", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
-    ("backfill_embeddings", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
     ("create_frame", "claims:write"),
@@ -93,7 +91,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("patch_edge", "claims:write"),
     ("refresh_workflow_promotion", "claims:write"),
     ("publish_event", "claims:write"),
-    ("recompute_beliefs", "claims:write"),
     ("reconcile_sheaf", "claims:write"),
     ("report_hierarchical_outcome", "claims:write"),
     ("report_workflow_outcome", "claims:write"),
@@ -132,6 +129,31 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("delete_edge", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
+    // The three MAINTENANCE-BYPASS tools: each dispatch body mints a
+    // `Viewer::system` through `crate::maintenance::maintenance_viewer` and
+    // runs on the privileged maintenance connection, so whoever reaches them
+    // reads and writes EVERY tenant's rows, group-private ones included. They
+    // were `claims:write` while that bypass failed closed on every call; the
+    // tier had to move in the same change that attached the maintenance pool.
+    //
+    // * `sweep_semantic_duplicates` returns survivor/duplicate ids and
+    //   pairwise distances for other tenants' private claims, and its
+    //   caller-supplied `labels_scope` / `agent_scope` make it a membership
+    //   oracle over them (FINAL-PLAN §4.9 leak #13). With `dry_run=false` it
+    //   runs the retraction cascade on those claims — the bulk form of
+    //   `mark_duplicate`, which is itself admin-gated above.
+    // * `recompute_beliefs` takes arbitrary `claim_ids` and reports each as
+    //   recomputed or skipped-no-BBA, an existence/BBA oracle on private
+    //   claims, and writes cached belief onto their rows.
+    // * `backfill_embeddings` echoes private claim ids in `errors`. Its HTTP
+    //   twin, `GET /api/v1/claims/needing-embeddings`, is `RequireScopeAdmin`.
+    //
+    // `tests/tool_viewer_coverage.rs::every_maintenance_bypass_tool_is_admin_gated`
+    // derives this set from `server.rs` rather than from this list, so a
+    // fourth bypass tool mapped below admin fails the build.
+    ("backfill_embeddings", "claims:admin"),
+    ("recompute_beliefs", "claims:admin"),
+    ("sweep_semantic_duplicates", "claims:admin"),
 ];
 
 #[cfg(test)]
@@ -208,5 +230,37 @@ mod tests {
         );
         assert_eq!(required_scope("mark_duplicate"), Some("claims:admin"));
         assert_eq!(required_scope("supersede_claim"), Some("claims:admin"));
+    }
+
+    /// The three maintenance-bypass tools are gated on `claims:admin`, not on
+    /// `claims:write`, the tier ordinary agent tokens carry for their own
+    /// writes.
+    ///
+    /// Each one runs on a `Viewer::system` over the privileged maintenance
+    /// connection that `main.rs` attaches to every per-session HTTP server, so
+    /// its scope IS the cross-tenant boundary: at `claims:write` any writing
+    /// agent could enumerate, retire and rewrite other tenants' group-private
+    /// claims. `mark_duplicate` — the single-shot form of the sweep's collapse
+    /// — is asserted admin-gated above; the bulk bypassing form cannot sit a
+    /// tier below it.
+    ///
+    /// Pinned by name here; `tests/tool_viewer_coverage.rs` pins the same rule
+    /// over whatever set `server.rs` actually mints for, and
+    /// `tests/maintenance_tools_under_force.rs` drives it through the Bearer
+    /// middleware with real tokens.
+    #[test]
+    fn maintenance_bypass_tools_are_admin_gated() {
+        for tool in [
+            "backfill_embeddings",
+            "recompute_beliefs",
+            "sweep_semantic_duplicates",
+        ] {
+            assert_eq!(
+                required_scope(tool),
+                Some("claims:admin"),
+                "{tool} runs as a corpus-wide maintenance bypass; a claims:write \
+                 token must not reach it"
+            );
+        }
     }
 }

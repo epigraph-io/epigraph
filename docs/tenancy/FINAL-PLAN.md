@@ -2665,7 +2665,7 @@ Three things change; the constant survives:
 | 10 | MCP `patch_claim` write-guard bypass (`server.rs:533-539`, `claims.rs:940-978`) | major | **major** | **major** | `claims:write` |
 | 11 | Webhook fan-out (`webhooks.rs:255-289`) | major | **major** | major | `list_webhooks(State)` / `get_webhook(State, Path)` take no auth and are **on the protected router**, so anonymity was never the vector. PR-10 is the only fix |
 | 12 | `content_tsv` GIN lexical leg unfiltered (`claim.rs:936-946`) | major | **major** | major | Reached via `recall`'s embedder-down fallback |
-| 13 | `sweep_semantic_duplicates` BLAKE3 oracle (`dedup_sweep.rs:103-121`, `:166`) | major | **major** | **major** | `claims:write` |
+| 13 | `sweep_semantic_duplicates` BLAKE3 oracle (`dedup_sweep.rs:103-121`, `:166`) | major | **major** | **major** | `claims:write` at rating time. **Now `claims:admin`** (2026-09-22, with the MCP maintenance wiring that made the bypass reachable): `progress.json` `F-mcp-maintenance-bypass-reachable-at-claims-write` |
 | 14 | Triples/entities expose facts from private text (`rdf.rs:67-133`, `embed.rs:145`) | major | **major** | major | MCP + public HTTP |
 | 15 | `embedding_neighborhood_density` (`embeddings.rs:96-108`) | major | **major** | major | MCP + public HTTP |
 | 16 | `theme_cluster`, `wipe_first` default true (`themes.rs:60-79`) | major | **major** | **major** | `claims:write` |

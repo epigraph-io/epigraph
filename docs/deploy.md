@@ -682,10 +682,26 @@ DSN, with the same fallback, the same database-name guard and the same
 refusal does not stop the process**: the MCP server boots, logs an ERROR naming
 the reason, and those three tools refuse every call with an error pointing at
 that log line. The other tools are unaffected — taking eighty caller-facing
-tools down because three operator-invoked ones cannot run would widen a loud,
+tools down because three admin-gated ones cannot run would widen a loud,
 narrow failure into a broad one. So after deploying, **check the boot log for
 `maintenance pool attached`** rather than inferring it from the process being
 up, and run `recompute_beliefs(limit=5)` once to confirm.
+
+* **Scope: `claims:admin`, and this is a breaking change for callers.** The
+  three tools run on a `Viewer::system` over the maintenance connection, which
+  is attached to every per-session HTTP server, so whoever reaches them reads
+  and writes every tenant's rows. Over HTTP they therefore require a
+  `claims:admin` token — the tier of `mark_duplicate` and of the api's
+  `GET /api/v1/claims/needing-embeddings` — where they used to take
+  `claims:write` (unreachable in practice then, because the bypass failed
+  closed). A scheduled graph-integrity or backfill job that called them with a
+  `claims:write` token now gets `Forbidden: tool '…' requires scope
+  'claims:admin'`; issue it an admin token, or run it over stdio, whose process
+  boundary is the gate. **The scope does not narrow the unix-socket
+  `--allow-unauthenticated-http` listener:** that listener injects every scope in
+  `SCOPE_MAP`, `claims:admin` included, so there the three tools are reachable to
+  whoever holds that socket (or the credential in front of it) — exactly as
+  `mark_duplicate` and `supersede_claim` already are.
 
 * **Budget:** app(10) + maintenance(4) = **14** connections per MCP process.
   At most three maintenance calls run at once; each pins one connection for its

@@ -43,6 +43,18 @@
 //!
 //! If a future tool reaches for this to read *content* on a caller's behalf,
 //! that is the abuse, and the fix is `tools::viewer::request_viewer`.
+//!
+//! # Who can reach a maintenance tool
+//!
+//! Concentrating the MINT here says nothing about who may TRIGGER it. A tool
+//! that calls [`maintenance_viewer`] runs on a `Viewer::system` over the
+//! privileged connection `main.rs` attaches to every server it builds, so the
+//! tool's entry in `crate::scope_map::SCOPE_MAP` is the cross-tenant boundary
+//! on the HTTP transport. All three are `claims:admin` — the tier of the
+//! single-shot `mark_duplicate` and of the api's `GET /claims/needing-embeddings`
+//! — and `tests/tool_viewer_coverage.rs::every_maintenance_bypass_tool_is_admin_gated`
+//! derives the bypass set from `server.rs` and fails if any member is mapped
+//! lower. On stdio the process boundary is the gate, as for every tool.
 
 use std::ops::{Deref, DerefMut};
 
