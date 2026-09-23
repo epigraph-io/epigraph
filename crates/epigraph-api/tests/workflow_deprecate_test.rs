@@ -307,3 +307,76 @@ async fn cascade_refuses_a_readable_descendant_the_caller_does_not_own() {
         "the descendant owned by another principal",
     );
 }
+
+/// A database failure part-way through the cascade is a 5xx, and it writes
+/// nothing, including the root.
+///
+/// The handler runs its reads and writes on one `ScopedPool::begin_as`
+/// transaction and returns on the first failed statement, so the transaction
+/// is dropped uncommitted. Before that transaction existed, each write was its
+/// own autocommit statement and its error was discarded with `let _ =`: the
+/// root stayed deprecated and the route still answered 200. This test injects a
+/// failure on the DESCENDANT's write, which runs after the root's, so only a
+/// rollback can leave the root untouched. (Deferred-commitment screen key
+/// deprecate-workflow-atomic. The MCP twin's equivalent is
+/// `epigraph-mcp/tests/deprecate_cascade_atomic_test.rs`.)
+///
+/// This test runs against the shared test database, not a per-test one, so the
+/// injected trigger and its function are named after the descendant's id.
+/// They are dropped before any assertion runs, so a failing assertion leaves
+/// nothing behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_database_failure_mid_cascade_is_5xx_and_writes_nothing() {
+    let (url, pool) = test_pool().await;
+    let owner = common::seed_system_agent(&pool).await;
+    let root = seed_workflow(&pool, owner, "public").await;
+    let child = seed_workflow(&pool, owner, "public").await;
+    let owner_group = common::personal_group_of(&pool, owner).await;
+    seed_public_supersedes_edge(&pool, child, root, owner_group).await;
+
+    // `child` is a Uuid, so formatting it into DDL cannot inject anything.
+    let name = format!("wf_deprecate_injected_failure_{}", child.simple());
+    sqlx::query(&format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected failure updating %', NEW.id; END $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create failure-injection function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {name} BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (NEW.id = '{child}'::uuid) EXECUTE FUNCTION {name}()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install failure-injection trigger");
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::test_bearer_token_for_principal(owner, &["claims:write"]);
+    let (status, body) = deprecate(addr, &token, root, true).await;
+    let root_after_failure = row_state(&pool, root).await;
+    let child_after_failure = row_state(&pool, child).await;
+
+    sqlx::query(&format!("DROP TRIGGER {name} ON claims"))
+        .execute(&pool)
+        .await
+        .expect("drop failure-injection trigger");
+    sqlx::query(&format!("DROP FUNCTION {name}()"))
+        .execute(&pool)
+        .await
+        .expect("drop failure-injection function");
+
+    assert_eq!(
+        status, 500,
+        "a failed write inside the cascade must not be reported as success; body={body}"
+    );
+    assert_untouched(root_after_failure, "the root of the failed cascade");
+    assert_untouched(child_after_failure, "the descendant whose write failed");
+
+    // The failure came from the injection and not from the fixture: without it
+    // the same request deprecates both.
+    let (status, body) = deprecate(addr, &token, root, true).await;
+    assert_eq!(status, 200, "the uninjected cascade succeeds; body={body}");
+    assert_deprecated(row_state(&pool, root).await, "the root");
+    assert_deprecated(row_state(&pool, child).await, "the descendant");
+}
