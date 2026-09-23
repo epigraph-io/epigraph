@@ -68,6 +68,16 @@
 --     holds a live membership; stamping the agent as creator would make its
 --     `writer` row admin-equivalent. When this function creates the group it
 --     seeds the operator's own `admin` row, also DO NOTHING.
+--   * an EXISTING group is accepted only if it is `kind = 'personal'` AND
+--     `created_by_agent_id = p_operator`, and `epigraph_operator_of` applies
+--     the same test. The did_key alone is not proof: `groups_tenancy`'s WITH
+--     CHECK lets ANY principal insert a group it creates, including one
+--     carrying `did:epigraph:personal:<someone else>` (measured by review as
+--     `epigraph_app` stamped as a principal Z, for an operator with no personal
+--     group yet), and the link would then have enrolled the agent as a writer
+--     in Z's group. Every in-tree personal-group writer (077's
+--     `epigraph_ensure_personal_group`, 071's shim, `tenancy_backfill`) stamps
+--     the agent itself as creator, so this refuses nothing legitimate.
 --   * the `operator_links` row is keyed on the agent and inserted
 --     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
 --     ever: a row naming a DIFFERENT operator is refused rather than replaced,
@@ -229,6 +239,10 @@ LANGUAGE sql STABLE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
     SELECT l.operator_id, l.operator_group_id
       FROM public.operator_links l
+      JOIN public.groups g
+        ON g.id = l.operator_group_id
+       AND g.kind = 'personal'
+       AND g.created_by_agent_id = l.operator_id
       JOIN public.group_memberships m
         ON m.group_id = l.operator_group_id
        AND m.agent_id = l.agent_id
@@ -317,6 +331,20 @@ BEGIN
     ELSE
         SELECT g.id INTO v_group FROM public.groups g
          WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text;
+    END IF;
+
+    -- The group must BE the operator's: a personal group the operator
+    -- created. See section 3. A row that merely carries the operator's
+    -- did_key -- pre-created by someone else, which `groups_tenancy`'s creator
+    -- WITH CHECK permits for any principal -- is refused rather than joined.
+    IF NOT EXISTS (SELECT 1 FROM public.groups g
+                    WHERE g.id = v_group
+                      AND g.kind = 'personal'
+                      AND g.created_by_agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_operator: the group carrying did:epigraph:personal:% '
+                        'is not a personal group created by that operator; refusing to enrol '
+                        '% in it', p_operator, p_agent
+            USING ERRCODE = '55000';
     END IF;
 
     -- (b) The link record: recorded once. See section 4.

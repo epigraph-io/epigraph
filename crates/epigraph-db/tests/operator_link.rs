@@ -502,6 +502,90 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
     assert_eq!(rows, 0);
 }
 
+/// Personal-group squatting (review attack 2f): a group that merely CARRIES an
+/// operator's `did:epigraph:personal:<operator>` key, created by someone else,
+/// is not the operator's group.
+///
+/// Principal `Z`, on `epigraph_app` stamped as itself, pre-creates
+/// `did:epigraph:personal:D` for an operator `D` that has no personal group yet
+/// (`groups_tenancy`'s creator WITH CHECK admits it — asserted as the premise).
+/// Linking an agent to `D` must then REFUSE, rather than enrol the agent as a
+/// writer in `Z`'s group. The second arm is defense in depth for the read: a
+/// link record pointing at a squatted group (written here on the superuser
+/// harness, since no in-tree path can) still reads as no link.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (z, _) = fixture::seed_agent_with_group(&pool, "squatter").await;
+    let d = seed_bare_agent(&pool).await;
+    let e = seed_bare_agent(&pool).await;
+    let z_viewer = Viewer::resolve(&pool, z).await.expect("resolve Z");
+
+    let squat = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &z_viewer).await;
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('squat', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $2) \
+             RETURNING id",
+        )
+        .bind(d)
+        .bind(z)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    let squatted = squat.expect(
+        "PREMISE: an app session can pre-create a group carrying another agent's personal \
+         did_key; if it cannot, this test no longer replays the attack",
+    );
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_operator(&mut conn, e, d)
+        .await
+        .expect_err(
+            "linking to an operator whose did_key is squatted must be refused, not enrol the \
+             agent in the squatter's group",
+        );
+    assert!(
+        err.to_string()
+            .contains("not a personal group created by that operator"),
+        "{err}"
+    );
+    assert!(
+        membership_rows(&pool, squatted, e).await.is_empty(),
+        "the refused link enrolled the agent in the squatter's group"
+    );
+
+    // Defense in depth: a link record naming the squatted group reads as none.
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(e)
+    .bind(d)
+    .bind(squatted)
+    .execute(&pool)
+    .await
+    .expect("out-of-band link row on the superuser harness");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(squatted)
+    .bind(e)
+    .execute(&pool)
+    .await
+    .expect("membership in the squatted group");
+    assert!(
+        AgentRepository::operator_links(&mut conn, e)
+            .await
+            .expect("links")
+            .is_empty(),
+        "epigraph_operator_of accepted a group the operator did not create"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constraint 4 and the authoring path.
 // ─────────────────────────────────────────────────────────────────────────────
