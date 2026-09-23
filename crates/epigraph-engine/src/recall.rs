@@ -257,23 +257,10 @@ mod tests {
     use super::*;
     use epigraph_embeddings::{config::EmbeddingConfig, providers::MockProvider};
 
-    // NOTE on deferred behavioral tests:
-    //
-    // Plan Task 0.4 specified `#[sqlx::test]`-based behavioral assertions
-    // (e.g. `recall_returns_results_above_min_truth`) seeded via a helper
-    // `epigraph_test_helpers::ingest_claim_via_api`. That helper does not
-    // exist yet — `feedback_no_raw_sql` rules out direct INSERTs, and the
-    // public `POST /claims` route requires a running API server and a valid
-    // service token, neither of which is in scope for Task 0.4.
-    //
-    // Phase 1 introduces episcience's API client (`EpigraphEdgesClient` and
-    // friends) plus a test fixture that spins up the API server with seeded
-    // service credentials. The full behavioral suite for `recall` lands in
-    // `crates/epigraph-engine/tests/recall_test.rs` at that point.
-    //
-    // Until then, the tests below cover the trait-bound and wiring layer
-    // only. They will not catch a regression where, e.g., the `min_truth`
-    // filter is applied at the wrong place — that gap closes in Phase 1.
+    // These cover the trait-bound and wiring layer only. The DB-backed
+    // behavioural suite — what each filter excludes, where it is applied
+    // relative to `LIMIT`, the group-visibility bind, dispute annotation — is
+    // `crates/epigraph-engine/tests/recall_test.rs`.
 
     /// Confirm `MockProvider` satisfies the `EmbeddingService` bound required by
     /// `recall`. This is a compile-time wiring test; it panics with a DB error
@@ -300,9 +287,6 @@ mod tests {
 
     /// Confirm `recall` is callable with a `&dyn EmbeddingService` by checking
     /// that `MockProvider` can be coerced to the trait object type.
-    ///
-    /// Integration tests against a real DB are deferred until episcience adds
-    /// API-based seeding helpers in Phase 1+.
     #[test]
     fn recall_accepts_dyn_embedding_service() {
         // Just confirm the coercion compiles; no async runtime needed.
