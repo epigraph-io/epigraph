@@ -163,6 +163,23 @@ from "which orchestrator shipped the PR." Author name/email are also kept in `pr
   orchestrator/author DID while signing with the ingester key. **Forward-compat risk:**
   if signatures are ever enforced, this breaks and we need a delegated-authorship /
   co-sign protocol extension. Documented as a risk (§9).
+  - **DISCHARGED 2026-09-22 (superseded; `ingest_git` now works with
+    `EPIGRAPH_REQUIRE_SIGNATURES=true`).** No packet is signed by an ingester service
+    key. Each packet is signed over the server's canonical
+    `EpistemicPacket::signable_bytes()` with the key of the agent it names in
+    `claim.agent_id` (`epigraph_cli::packet_signing`):
+    - commit packets are signed with the deterministic git-author key;
+    - the repo root is signed with the repo-root system key;
+    - PR packets are signed with the orchestrator's own key, supplied as
+      `EPIGRAPH_ORCHESTRATOR_KEY` (base64 32-byte seed).
+
+    The §6.1 attribution is unchanged: the PR claim is still authored by the
+    orchestrator. Without that key the PR packet goes out explicitly unsigned. A
+    server enforcing signatures refuses it with a 401, and the ingester adds a
+    hint naming the key. The orchestrator agent must be a registered Ed25519 signer
+    (`key_kind = 'ed25519'`). A keyless OAuth-principal agent cannot author PR
+    claims under enforcement. That case, and a trailer that names a different
+    orchestrator per PR, still need the delegated-authorship / co-sign extension.
 - **Stable author identity (interim).** The current `per-author` mode mints a fresh
   random `Uuid::new_v4()` + key per author **per run**, which would proliferate duplicate
   author agents across runs. Interim fix: derive a **deterministic** author agent id
@@ -211,6 +228,8 @@ logged, not fatal.
    *Recommendation:* add `resolves`.
 2. **`require_signatures = false` dependency** (§6.3) — revisit if signature enforcement
    is ever turned on.
+   *Update 2026-09-22:* discharged for keyed agents. Packets are now really signed, and PR
+   packets need `EPIGRAPH_ORCHESTRATOR_KEY` (see §6.3).
 3. **DID system** (§6.3) — interim deterministic author ids; migrate when the real system
    lands.
 4. **`decomposes_to` semantic liberty** for repo→PR (a repo isn't literally a coarse claim

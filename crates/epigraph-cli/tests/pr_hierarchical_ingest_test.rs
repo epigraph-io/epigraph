@@ -10,6 +10,12 @@
 //!   2. a datestamped `RESOLVED_BY` edge (`backlog -> PR`) is accepted with `valid_from`;
 //!   3. `content_contains` search finds a backlog claim citing "PR #<n>".
 //!
+//! A second test runs the REAL `ingest_git` binary over loopback HTTP against the
+//! same handlers with packet-signature enforcement ON
+//! (`EPIGRAPH_REQUIRE_SIGNATURES=true`). The binary signs its packets, and this is
+//! the only place that proves it: the unit tests check the signing primitive,
+//! this checks the wiring.
+//!
 //! Scaffolding (`ensure_system_agent`, `seed_claim`) is copied verbatim from
 //! `epigraph-api`'s `routes::edges` `db_tests`.
 #![cfg(feature = "db")]
@@ -45,11 +51,15 @@ use epigraph_api::state::{ApiConfig, AppState};
 /// `#[sqlx::test]` database, so the three other mounted routes and the seeding
 /// done on `pool` are unaffected.
 async fn app(pool: PgPool) -> Router {
-    let state = AppState::with_scoped_pool(
-        viewer_fixture::scoped_pool(&pool).await,
-        ApiConfig::default(),
-    );
+    app_with_config(pool, ApiConfig::default()).await
+}
+
+/// [`app`] with an explicit config, plus the agent-registration route the CLI
+/// calls before it submits (`POST /agents`).
+async fn app_with_config(pool: PgPool, config: ApiConfig) -> Router {
+    let state = AppState::with_scoped_pool(viewer_fixture::scoped_pool(&pool).await, config);
     Router::new()
+        .route("/agents", post(routes::agents::create_agent))
         .route("/api/v1/submit/packet", post(routes::submit::submit_packet))
         .route("/api/v1/edges", post(routes::edges::create_edge))
         .route("/api/v1/claims/:id", get(routes::claims::get_claim))
@@ -69,6 +79,7 @@ async fn app(pool: PgPool) -> Router {
                 owner_id: Some(principal),
                 client_type: epigraph_api::middleware::bearer::ClientType::Service,
                 scopes: vec![
+                    "agents:write".to_string(),
                     "epigraph:write".to_string(),
                     "epigraph:read".to_string(),
                     "claims:read".to_string(),
@@ -262,4 +273,201 @@ async fn pr_ingest_builds_hierarchy_and_resolution_edge(pool: PgPool) {
         "PR-number search excludes the non-matching decoy (filter discriminates, \
          found ids: {ids:?})"
     );
+}
+
+/// Run `git` in `dir` with the user's global/system config masked, so a global
+/// `commit.gpgsign` or hook cannot change what the test commits.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn commit_as(dir: &std::path::Path, name: &str, email: &str, file: &str, message: &str) {
+    std::fs::write(dir.join(file), format!("{file}\n")).unwrap();
+    git(dir, &["add", file]);
+    git(
+        dir,
+        &[
+            "-c",
+            &format!("user.name={name}"),
+            "-c",
+            &format!("user.email={email}"),
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+}
+
+/// Run `ingest_git --pr-ingest` against `endpoint` and return (success, stderr).
+async fn run_ingest_git(
+    repo: &std::path::Path,
+    endpoint: &str,
+    orchestrator_id: Uuid,
+    orchestrator_key: Option<&str>,
+    pr_number: u64,
+    merge_sha: &str,
+) -> (bool, String) {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_ingest_git"));
+    cmd.args([
+        "--pr-ingest",
+        "--endpoint",
+        endpoint,
+        "--repo-slug",
+        "sig-test/repo",
+        "--pr-number",
+        &pr_number.to_string(),
+        "--pr-title",
+        "feat(core): add the widget",
+        "--pr-body",
+        "Adds the widget.",
+        "--merge-sha",
+        merge_sha,
+        "--merged-at",
+        "2026-09-22T12:00:00Z",
+        "--pr-author",
+        "tester",
+        "--rev-range",
+        "base..HEAD",
+        "--orchestrator-id",
+        &orchestrator_id.to_string(),
+    ])
+    .arg("--repo")
+    .arg(repo)
+    // Run from the temp repo so the binary's `dotenv()` finds no project `.env`,
+    // and give it only the orchestrator key this test chooses.
+    .current_dir(repo)
+    .env_remove("EPIGRAPH_ORCHESTRATOR_KEY")
+    .env_remove("EPIGRAPH_DEFAULT_ORCHESTRATOR_ID")
+    .env_remove("EPIGRAPH_TOKEN")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    if let Some(key) = orchestrator_key {
+        cmd.env("EPIGRAPH_ORCHESTRATOR_KEY", key);
+    }
+    let out = cmd.output().await.expect("ingest_git runs");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn pr_ingest_binary_is_accepted_with_signature_enforcement_on(pool: PgPool) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    // The orchestrator is a pre-registered Ed25519 agent whose key the ingester
+    // is given through EPIGRAPH_ORCHESTRATOR_KEY.
+    let seed: [u8; 32] = rand::random();
+    let orchestrator = epigraph_crypto::AgentSigner::from_bytes(&seed).unwrap();
+    let orchestrator_id = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(orchestrator.public_key().as_slice())
+    .bind("sig-test-orchestrator")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // A PR with two commits by two authors, so two per-author agents sign.
+    let repo = std::env::temp_dir().join(format!("ingest-git-sig-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    commit_as(&repo, "Base", "base@example.com", "base.txt", "chore: base");
+    git(&repo, &["tag", "base"]);
+    commit_as(
+        &repo,
+        "Alice",
+        "alice@example.com",
+        "widget.rs",
+        "feat(core): add the widget\n\nEvidence:\n- the spec asks for a widget\n\n\
+         Reasoning:\n- smallest change\n\nVerification:\n- widget test passes",
+    );
+    commit_as(
+        &repo,
+        "Bob",
+        "bob@example.com",
+        "widget_test.rs",
+        "test(core): cover the widget\n\nEvidence:\n- widget had no test",
+    );
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let router = app_with_config(
+        pool.clone(),
+        ApiConfig {
+            require_packet_signatures: true,
+            ..ApiConfig::default()
+        },
+    )
+    .await;
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+
+    // 1) Without the orchestrator key, the signed repo-root packet is accepted
+    //    and the unsigned PR packet is refused with 401. The run names the
+    //    missing key in the hint it adds to exactly that failure.
+    let (ok, stderr) = run_ingest_git(&repo, &endpoint, orchestrator_id, None, 4241, &head).await;
+    assert!(
+        !ok,
+        "an unsigned PR packet must be refused under enforcement"
+    );
+    assert!(
+        stderr.contains("submit 401")
+            && stderr.contains(&format!(
+                "hint: the PR claim is authored by orchestrator {orchestrator_id}"
+            )),
+        "the PR packet, not an earlier one, is what was refused: {stderr}"
+    );
+    let repo_roots: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claims WHERE 'node:repo' = ANY(labels) \
+         AND 'repo:sig-test/repo' = ANY(labels)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repo_roots, 1, "the signed repo-root packet was accepted");
+
+    // 2) With it, the whole repo -> PR -> commit run is accepted.
+    let key = STANDARD.encode(seed);
+    let (ok, stderr) =
+        run_ingest_git(&repo, &endpoint, orchestrator_id, Some(&key), 4242, &head).await;
+    assert!(
+        ok,
+        "ingest_git --pr-ingest must succeed with enforcement on: {stderr}"
+    );
+
+    // The PR node is attributed to the orchestrator, and both commits landed
+    // under their authors.
+    let pr_author: Uuid = sqlx::query_scalar(
+        "SELECT agent_id FROM claims WHERE content = '[PR #4242] feat(core): add the widget'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pr_author, orchestrator_id);
+    let commit_claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claims WHERE 'node:commit' = ANY(labels) \
+         AND 'repo:sig-test/repo' = ANY(labels)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(commit_claims, 2, "both commits were ingested");
+
+    server.abort();
+    let _ = std::fs::remove_dir_all(&repo);
 }

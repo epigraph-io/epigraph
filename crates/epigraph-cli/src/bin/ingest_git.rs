@@ -77,6 +77,10 @@ struct Args {
     rev_range: Option<String>,
     /// Explicit orchestrator agent id, overriding trailer/env resolution (PR mode)
     orchestrator_id: Option<Uuid>,
+    /// The orchestrator agent's Ed25519 key (base64 32-byte seed), read from
+    /// `EPIGRAPH_ORCHESTRATOR_KEY` rather than a flag so it stays out of argv and
+    /// `ps` (PR mode). It signs the PR packet, whose author is the orchestrator.
+    orchestrator_key: Option<String>,
 }
 
 impl Args {
@@ -266,6 +270,9 @@ impl Args {
             pr_author,
             rev_range,
             orchestrator_id,
+            orchestrator_key: std::env::var("EPIGRAPH_ORCHESTRATOR_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
         })
     }
 }
@@ -295,7 +302,14 @@ PR-hierarchical mode (build a repo -> PR -> commit claim hierarchy):
       --merged-at <ISO8601>   Merge timestamp (ISO-8601)
       --pr-author <LOGIN>     GitHub login of the PR author
       --rev-range <A..B>      Git revision range covering the PR's commits
-      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides trailer/env)";
+      --orchestrator-id <UUID>  Explicit orchestrator agent id (overrides trailer/env)
+
+Environment (PR-hierarchical mode):
+  EPIGRAPH_DEFAULT_ORCHESTRATOR_ID  Orchestrator agent id when no trailer names one
+  EPIGRAPH_ORCHESTRATOR_KEY         Base64 32-byte Ed25519 key of that orchestrator.
+                                    Signs the PR packet. Without it the PR packet goes
+                                    unsigned, which a server running
+                                    EPIGRAPH_REQUIRE_SIGNATURES=true rejects with 401";
 
 // =============================================================================
 // COMMIT TYPES & PARSING
@@ -1097,6 +1111,19 @@ fn repo_root_signer() -> AgentSigner {
     author_signer("git-ingester-system", "git-ingester@epigraph.system")
 }
 
+/// Parse a base64-encoded 32-byte Ed25519 seed, the `--agent-key` format, into a
+/// signer. Used for `EPIGRAPH_ORCHESTRATOR_KEY`.
+fn parse_signing_key(b64: &str) -> Result<AgentSigner, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let bytes = STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("signing key is not valid base64: {e}"))?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|b: Vec<u8>| format!("signing key must be 32 bytes, got {}", b.len()))?;
+    AgentSigner::from_bytes(&seed).map_err(|e| format!("invalid signing key: {e}"))
+}
+
 /// Resolve (and register if needed) the stable agent id for a git author.
 /// Caches the resolved agent id per email within a run to avoid duplicate POSTs.
 ///
@@ -1574,8 +1601,8 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
             explanation: format!("PR #{} merged at {}", meta.number, meta.merged_at),
             signature: None,
         },
-        // Unsigned: the PR claim is authored by the orchestrator agent, whose
-        // private key this ingester does not hold.
+        // Signed (or explicitly left unsigned) by `submit_find_or_create`, with
+        // the orchestrator's key from EPIGRAPH_ORCHESTRATOR_KEY when one is set.
         signature: epigraph_cli::packet_signing::unsigned_packet_signature(),
     }
 }
@@ -1634,6 +1661,29 @@ fn label_and_sign(packet: &mut EpistemicPacket, labels: &[&str], signer: Option<
     match signer {
         Some(signer) => packet.sign(signer),
         None => packet.signature = epigraph_cli::packet_signing::unsigned_packet_signature(),
+    }
+}
+
+/// Explain a rejected PR-node submit. A 401 there means the server enforces
+/// packet signatures and the PR packet does not verify as the orchestrator,
+/// either because no orchestrator key was supplied or because the supplied key
+/// is not the one `orchestrator_id` is registered with.
+fn pr_submit_error_hint(err: String, orchestrator_id: Uuid, key_supplied: bool) -> String {
+    if !err.starts_with("submit 401") {
+        return err;
+    }
+    if key_supplied {
+        format!(
+            "{err}\nhint: EPIGRAPH_ORCHESTRATOR_KEY is set but its signature did not verify \
+             as orchestrator {orchestrator_id}; it must be the Ed25519 key that agent is \
+             registered with (key_kind 'ed25519')"
+        )
+    } else {
+        format!(
+            "{err}\nhint: the PR claim is authored by orchestrator {orchestrator_id} and was \
+             sent unsigned; set EPIGRAPH_ORCHESTRATOR_KEY to that agent's base64 32-byte \
+             Ed25519 key"
+        )
     }
 }
 
@@ -2174,16 +2224,27 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     }
     let refs = extract_references(&ref_text);
 
+    // The PR claim is authored by the orchestrator (§6.1), so only the
+    // orchestrator's key can produce a packet signature the server will verify.
+    // Parsed before --dry-run so a malformed key fails the dry run too.
+    let orchestrator_signer = args
+        .orchestrator_key
+        .as_deref()
+        .map(parse_signing_key)
+        .transpose()
+        .map_err(|e| format!("EPIGRAPH_ORCHESTRATOR_KEY: {e}"))?;
+
     // --dry-run: parse + print the planned hierarchy and resolution targets, then
     // return BEFORE any POST (the first write is register_agent in section 2).
     // Safe to run on untrusted/unmerged PRs since it makes no network calls.
     if args.dry_run {
         println!(
-            "[dry-run] repo={} pr=#{} commits={} refs={:?}",
+            "[dry-run] repo={} pr=#{} commits={} refs={:?} pr_packet_signed={}",
             meta.repo_slug,
             meta.number,
             commits.len(),
-            refs
+            refs,
+            orchestrator_signer.is_some()
         );
         return Ok(());
     }
@@ -2195,6 +2256,14 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         Some(id) => id,
         None => resolve_orchestrator_agent(&meta.body, &commit_msgs)?,
     };
+    if orchestrator_signer.is_none() {
+        eprintln!(
+            "warning: EPIGRAPH_ORCHESTRATOR_KEY is unset; the PR #{} packet (authored by \
+             orchestrator {orchestrator_id}) is sent unsigned, which a server running \
+             EPIGRAPH_REQUIRE_SIGNATURES=true rejects",
+            meta.number
+        );
+    }
 
     // 2) Repo root node, attributed to a fixed system agent (NOT the per-PR
     //    orchestrator). Keying on the orchestrator made the repo node's
@@ -2220,7 +2289,8 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
     )
     .await?;
 
-    // 3) PR node, attributed to the orchestrator.
+    // 3) PR node, attributed to the orchestrator and signed with its key when
+    //    one is configured. The ingester never signs as an agent it is not.
     let pr_packet = build_pr_packet(&meta, orchestrator_id);
     let pr_label = format!("repo:{repo_slug}");
     let pr_id = submit_find_or_create(
@@ -2228,9 +2298,10 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         &args.endpoint,
         pr_packet,
         &["source:git-history", "node:pr", &pr_label],
-        None,
+        orchestrator_signer.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(|e| pr_submit_error_hint(e, orchestrator_id, orchestrator_signer.is_some()))?;
     // repo --decomposes_to--> PR, stamped at merge time.
     link_edge(
         &client,
@@ -3206,6 +3277,70 @@ mod tests {
         assert_eq!(props["node"], "pr");
         assert_eq!(props["pr_number"], 252);
         assert_eq!(props["merge_sha"], "2a31f8d");
+    }
+
+    fn sample_pr_meta() -> PrMeta {
+        PrMeta {
+            repo_slug: "epigraph-io/epigraph".into(),
+            number: 252,
+            title: "fix(api): stop auto-enqueueing cluster jobs".into(),
+            body: "## Summary\nResolves d531c585".into(),
+            merge_sha: "2a31f8d".into(),
+            merged_at: "2026-06-02T15:10:01Z".into(),
+            author_login: "tylorsama".into(),
+        }
+    }
+
+    #[test]
+    fn pr_packet_signed_with_orchestrator_key_verifies_as_the_orchestrator() {
+        let orchestrator = AgentSigner::generate();
+        let mut packet = build_pr_packet(&sample_pr_meta(), Uuid::new_v4());
+        label_and_sign(
+            &mut packet,
+            &["source:git-history", "node:pr", "repo:epigraph-io/epigraph"],
+            Some(&orchestrator),
+        );
+        assert!(server_verifies(&packet, &orchestrator));
+        // Not as the repo-root system agent: the ingester does not sign as an
+        // agent other than the claim's author.
+        assert!(!server_verifies(&packet, &repo_root_signer()));
+    }
+
+    #[test]
+    fn pr_packet_without_orchestrator_key_is_explicitly_unsigned() {
+        let mut packet = build_pr_packet(&sample_pr_meta(), Uuid::new_v4());
+        label_and_sign(&mut packet, &["node:pr"], None);
+        assert_eq!(
+            packet.signature,
+            epigraph_cli::packet_signing::unsigned_packet_signature()
+        );
+    }
+
+    #[test]
+    fn parse_signing_key_reads_the_agent_key_format() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let seed = [7u8; 32];
+        let parsed = parse_signing_key(&format!("  {}\n", STANDARD.encode(seed))).unwrap();
+        assert_eq!(
+            parsed.public_key(),
+            AgentSigner::from_bytes(&seed).unwrap().public_key()
+        );
+        assert!(parse_signing_key("not base64!").is_err());
+        let short = parse_signing_key(&STANDARD.encode([1u8; 31])).unwrap_err();
+        assert!(short.contains("32 bytes"), "{short}");
+    }
+
+    #[test]
+    fn pr_submit_401_names_the_orchestrator_key() {
+        let id = Uuid::new_v4();
+        let unsigned = pr_submit_error_hint("submit 401 Unauthorized: {}".into(), id, false);
+        assert!(unsigned.contains("EPIGRAPH_ORCHESTRATOR_KEY"));
+        assert!(unsigned.contains(&id.to_string()));
+        let wrong_key = pr_submit_error_hint("submit 401 Unauthorized: {}".into(), id, true);
+        assert!(wrong_key.contains("did not verify"));
+        // Anything that is not a 401 passes through untouched.
+        let other = "submit 400 Bad Request: nope".to_string();
+        assert_eq!(pr_submit_error_hint(other.clone(), id, false), other);
     }
 
     // -------------------------------------------------------------------------

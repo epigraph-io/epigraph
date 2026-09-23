@@ -126,6 +126,14 @@ external CI and no write-token spray. Stdlib-only; idempotent (Plan
 fall back to the host's own `gh auth` token. Writes go to the localhost
 API, not GitHub — **no GitHub write scope is ever used**.
 
+**Packet signatures:** `ingest_git` signs every packet with the key of the
+agent it names. Commit and repo-root keys are derived deterministically. The PR
+claim is authored by the orchestrator, so its packet is signed only when the
+reconciler's environment carries `EPIGRAPH_ORCHESTRATOR_KEY`: the base64 32-byte
+Ed25519 key that `default_orchestrator_id` is registered with. `subprocess.run`
+passes that environment through. Set the key before the API runs with
+`EPIGRAPH_REQUIRE_SIGNATURES=true`. Without it, every PR ingest fails with 401.
+
 **Install:**
 
 ```bash

@@ -12,6 +12,7 @@
 - Linking relationship = **`RESOLVED_BY`** (`backlog/resolution claim → PR claim`); already in `VALID_RELATIONSHIPS`, non-evidential. *No `resolves` server change.*
 - All edges via `POST /api/v1/edges` with `valid_from` + `if_not_exists:true`.
 - Packet signature: reuse existing behavior (per-author signer signs evidence bullets; packet-level signature is the existing placeholder). Valid because prod runs `require_signatures=false`. Proper canonical packet signing + the broader DID system are explicitly **out of scope** (tracked in the spec §6.3).
+  - **DISCHARGED 2026-09-22 (packet signing only; the DID system is still open):** the placeholder is retired. `ingest_git` signs every packet over the server's canonical `EpistemicPacket::signable_bytes()` via `epigraph_cli::packet_signing`. Commit packets are signed as the git author, the repo root as the system agent, and PR packets as the orchestrator using `EPIGRAPH_ORCHESTRATOR_KEY`. See spec §6.3.
 - Find-or-create = `submit` with stable `idempotency_key`.
 
 **Conventions:** Run all `git`/`cargo` with absolute paths in the worktree. Test DB: `export DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test` (superuser per CLAUDE.md). Pre-commit gate every task: `cargo fmt --check` + `cargo clippy -p epigraph-cli --bin ingest_git --locked -- -D warnings`.
@@ -1032,7 +1033,7 @@ git commit -m "feat(cli): --dry-run for PR-ingest mode (parse + plan, no writes)
 
 ## Self-review
 
-**Spec coverage (design §):** §3 trigger — N/A here (CI plan); §4.1/4.2 hierarchy nodes — Tasks 3,4,5,8; §4.3 datestamped decomposes_to edges — Tasks 5,8; §6.1 orchestrator PR attribution — Tasks 2,8; §6.2 commit→git-author — Tasks 1,8; §6.3 require_signatures dependency / interim author DID — Task 1 (placeholder sig retained; deterministic author key); §7 linking — Tasks 6,7; §8 idempotency (git-hash, find-or-create, edge if_not_exists) — Tasks 3,4,5,7; `repo:<slug>` label — Tasks 3,4,5,8. **Gap intentionally deferred:** semantic/LLM enrichment + the `fix→challenges→feat` edges (greenfield per recon) are not in this core plan; not a design requirement for the hierarchy.
+**Spec coverage (design §):** §3 trigger — N/A here (CI plan); §4.1/4.2 hierarchy nodes — Tasks 3,4,5,8; §4.3 datestamped decomposes_to edges — Tasks 5,8; §6.1 orchestrator PR attribution — Tasks 2,8; §6.2 commit→git-author — Tasks 1,8; §6.3 require_signatures dependency / interim author DID — Task 1 (placeholder sig retained, since retired: see the DISCHARGED note under scope decisions; deterministic author key); §7 linking — Tasks 6,7; §8 idempotency (git-hash, find-or-create, edge if_not_exists) — Tasks 3,4,5,7; `repo:<slug>` label — Tasks 3,4,5,8. **Gap intentionally deferred:** semantic/LLM enrichment + the `fix→challenges→feat` edges (greenfield per recon) are not in this core plan; not a design requirement for the hierarchy.
 
 **Placeholder scan:** the few `> notes` flag real verify-at-implementation points (label-patch route body in Task 8 Step 1; `/agents` idempotency in Task 0; handler `pub`/re-export in Task 9) — each carries the command to resolve it, not a blank TODO. `public_key_uuid_stub()` in Task 3 Step 1 is explicitly corrected to `Uuid::nil()` in the same step.
 
