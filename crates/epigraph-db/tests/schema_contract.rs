@@ -1192,6 +1192,12 @@ async fn migration_102_operator_definers_are_owned_and_granted(pool: PgPool) {
             "v",
             false,
         ),
+        (
+            "epigraph_link_retired_agent",
+            "public.epigraph_link_retired_agent(uuid, uuid)",
+            "v",
+            false,
+        ),
     ] {
         let meta: Option<(bool, String, String, Option<String>)> = sqlx::query_as(
             "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text \

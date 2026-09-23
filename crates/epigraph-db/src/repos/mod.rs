@@ -69,7 +69,7 @@ pub mod workflow_execution;
 pub use activity::ActivityRepository;
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, CapabilityFilter,
-    OperatorLink, OperatorLinkOutcome,
+    OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};

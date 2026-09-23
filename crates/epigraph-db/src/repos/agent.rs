@@ -40,6 +40,31 @@ pub struct OperatorLinkOutcome {
     /// the operator's group: a live membership whose role is no longer
     /// `writer`/`admin` is not a link.
     pub link_live: bool,
+    /// The agent's link record is RETIRED (migration 102 section 7). A retired
+    /// link is never promoted: the call inserted no membership, and the agent
+    /// authors into its own group.
+    pub link_retired: bool,
+}
+
+/// What one [`AgentRepository::link_retired_agent`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct RetiredLinkOutcome {
+    /// The operator's personal group.
+    pub operator_group_id: Uuid,
+    /// This call created the operator's personal group.
+    pub group_created: bool,
+    /// This call inserted the `operator_links` row.
+    pub link_created: bool,
+    /// The agent's link record is retired after the call. `false` means the
+    /// agent already had an ACTOR link to this operator, which the call left
+    /// exactly as it was (`ON CONFLICT DO NOTHING`).
+    pub link_retired: bool,
+    /// This call inserted the `OPERATED_BY` edge.
+    pub edge_created: bool,
+    /// The agent holds a live membership in the operator's group. Never created
+    /// or changed by this call — REPORTED, because a retired identity has zero
+    /// write authority only while this is `false`.
+    pub membership_live: bool,
 }
 
 /// A database row combining agent identity fields with capability flags.
@@ -1460,8 +1485,43 @@ impl AgentRepository {
     ) -> Result<OperatorLinkOutcome, DbError> {
         Ok(sqlx::query_as::<_, OperatorLinkOutcome>(
             "SELECT operator_group_id, group_created, membership_created, membership_live, \
-                    edge_created, link_live \
+                    edge_created, link_live, link_retired \
                FROM public.epigraph_link_operator($1, $2)",
+        )
+        .bind(agent_id)
+        .bind(operator_id)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
+    /// Record that the RETIRED agent `agent_id`'s claims belong to
+    /// `operator_id`, through migration 102's `epigraph_link_retired_agent`.
+    ///
+    /// Writes the `operator_links` row with `retired = true` and the
+    /// `OPERATED_BY` edge, and creates NO membership: a retired identity's key
+    /// may be publicly recomputable or exposed, so linking it must confer zero
+    /// write authority. The operator (and the operator's live actors) then own
+    /// its claims through `require_owner_or_admin`'s author resolution; the
+    /// retired agent itself can never act for the operator.
+    ///
+    /// Same authorization as [`Self::link_operator`]: EXECUTE-able by
+    /// `epigraph_maintenance` (and superusers) only. Idempotent, and never
+    /// changes an existing row or membership.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
+    /// self-link, an operator that is itself operated, an agent that already
+    /// operates others or is linked to a DIFFERENT operator, or an operator
+    /// group the operator did not create; the database message names which.
+    pub async fn link_retired_agent(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        operator_id: Uuid,
+    ) -> Result<RetiredLinkOutcome, DbError> {
+        Ok(sqlx::query_as::<_, RetiredLinkOutcome>(
+            "SELECT operator_group_id, group_created, link_created, link_retired, \
+                    edge_created, membership_live \
+               FROM public.epigraph_link_retired_agent($1, $2)",
         )
         .bind(agent_id)
         .bind(operator_id)

@@ -867,3 +867,273 @@ async fn write_claim_trace_evidence_into(
         .await?;
     Ok(claim)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retired links (migration 102 section 7): the operator owns a retired
+// identity's claims, and the identity gains ZERO write authority.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn link_retired(
+    pool: &PgPool,
+    agent: Uuid,
+    operator: Uuid,
+) -> epigraph_db::RetiredLinkOutcome {
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_retired_agent(&mut conn, agent, operator)
+        .await
+        .expect("retired link on the privileged harness connection")
+}
+
+async fn link_row(pool: &PgPool, agent: Uuid) -> Option<(Uuid, bool)> {
+    sqlx::query_as("SELECT operator_id, retired FROM operator_links WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_optional(pool)
+        .await
+        .expect("operator_links row")
+}
+
+/// `epigraph_app` cannot execute `epigraph_link_retired_agent` (42501, nothing
+/// written); `epigraph_maintenance` can, on the same pair.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epigraph_app_cannot_execute_link_retired_agent(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let retired = seed_bare_agent(&pool).await;
+
+    let refused = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query("SELECT * FROM public.epigraph_link_retired_agent($1, $2)")
+            .bind(retired)
+            .bind(operator)
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await;
+    let err = refused.expect_err(
+        "epigraph_app executed epigraph_link_retired_agent: 102 must REVOKE EXECUTE from PUBLIC \
+         and from epigraph_app",
+    );
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
+    assert_eq!(
+        link_row(&pool, retired).await,
+        None,
+        "a refused call writes nothing"
+    );
+
+    // CALIBRATION.
+    let ok = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_retired_agent(&mut conn, retired, operator).await;
+        (conn, r)
+    })
+    .await
+    .expect("epigraph_maintenance must be able to record a retired link");
+    assert!(ok.link_created && ok.link_retired && ok.edge_created && !ok.membership_live);
+}
+
+/// The retired link writes the record (retired) and the graph edge, creates NO
+/// membership, and is idempotent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_link_records_the_row_and_edge_and_no_membership(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "retired").await;
+
+    let first = link_retired(&pool, retired, operator).await;
+    assert_eq!(first.operator_group_id, op_group);
+    assert!(
+        first.link_created && first.link_retired && first.edge_created,
+        "{first:?}"
+    );
+    assert!(!first.membership_live && !first.group_created, "{first:?}");
+    assert_eq!(link_row(&pool, retired).await, Some((operator, true)));
+    assert!(
+        membership_rows(&pool, op_group, retired).await.is_empty(),
+        "a retired link must create NO membership in the operator's group"
+    );
+
+    let again = link_retired(&pool, retired, operator).await;
+    assert!(
+        !again.link_created && again.link_retired && !again.edge_created,
+        "a second call is a no-op: {again:?}"
+    );
+    let (links, edges): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM operator_links WHERE agent_id = $1), \
+                (SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+                    AND relationship = 'OPERATED_BY')",
+    )
+    .bind(retired)
+    .bind(operator)
+    .fetch_one(&pool)
+    .await
+    .expect("counts");
+    assert_eq!((links, edges), (1, 1));
+}
+
+/// A2's security test, as `epigraph_app` with the session stamped from the
+/// RETIRED agent's own `Viewer::resolve`:
+///
+/// * its writable set does NOT include the operator's group, and a write owned
+///   by that group is refused (42501);
+/// * it is not an ACTOR: `epigraph_operator_of` returns nothing;
+/// * and the authoring default for it is its OWN personal group, which it can
+///   write — so a retired identity that runs again still works, in its own lane.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (retired, own_group) = fixture::seed_agent_with_group(&pool, "retired").await;
+    link_retired(&pool, retired, operator).await;
+
+    let viewer = Viewer::resolve(&pool, retired)
+        .await
+        .expect("resolve retired");
+    assert!(
+        !viewer.writable_groups().contains(&op_group),
+        "a retired agent's writable set must not include the operator's group"
+    );
+
+    let (actor, decl, into_operator, into_own) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            set_gucs_from(&mut conn, &viewer).await;
+            let actor = AgentRepository::operator_links(&mut conn, retired)
+                .await
+                .expect("operator_of on an app session");
+            let decl = ClaimRepository::default_decl_for_author(&mut conn, retired)
+                .await
+                .expect("default decl");
+            let into_operator =
+                write_claim_trace_evidence_into(&mut conn, &viewer, retired, op_group).await;
+            let into_own = write_claim_trace_evidence(&mut conn, &viewer, retired).await;
+            (conn, (actor, decl, into_operator, into_own))
+        })
+        .await;
+
+    assert!(
+        actor.is_empty(),
+        "a retired link must never read as an acting link: {actor:?}"
+    );
+    assert_eq!(
+        owner_of(decl),
+        own_group,
+        "a retired agent authors into its OWN personal group"
+    );
+    let err = into_operator.expect_err(
+        "a retired agent wrote a row owned by the operator's group: a retired identity's key may \
+         be public, so it must hold no write authority there",
+    );
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
+    into_own.expect("a retired identity that runs again can still write in its own lane");
+}
+
+/// `epigraph_link_operator` NEVER promotes a retired link: a retired identity
+/// that runs again with `EPIGRAPH_OPERATOR_ID` set gets no membership and is
+/// reported as retired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_operator_never_promotes_a_retired_link(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let retired = seed_bare_agent(&pool).await;
+    link_retired(&pool, retired, operator).await;
+
+    let out = link(&pool, retired, operator).await;
+    assert!(
+        out.link_retired && !out.link_live && !out.membership_created && !out.membership_live,
+        "link_operator promoted a retired link: {out:?}"
+    );
+    assert!(
+        membership_rows(&pool, op_group, retired).await.is_empty(),
+        "link_operator gave a retired identity a membership in the operator's group"
+    );
+    assert_eq!(link_row(&pool, retired).await, Some((operator, true)));
+}
+
+/// The retired link's refusals, and its hands-off rule for an existing
+/// membership: a self-link, a missing agent, an operator that is itself
+/// operated, and an agent linked to a different operator are refused; an
+/// agent whose ACTOR link was revoked keeps its row and its revoked
+/// membership exactly as they were.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_agent_refuses_and_never_touches_a_membership(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (other_op, _) = fixture::seed_agent_with_group(&pool, "other-operator").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+
+    let err = AgentRepository::link_retired_agent(&mut conn, operator, operator)
+        .await
+        .expect_err("self-link");
+    assert!(err.to_string().contains("its own operator"), "{err}");
+
+    let err = AgentRepository::link_retired_agent(&mut conn, Uuid::new_v4(), operator)
+        .await
+        .expect_err("missing agent");
+    assert!(err.to_string().contains("does not exist"), "{err}");
+
+    let operated = seed_bare_agent(&pool).await;
+    link_retired(&pool, operated, operator).await;
+    let err =
+        AgentRepository::link_retired_agent(&mut conn, seed_bare_agent(&pool).await, operated)
+            .await
+            .expect_err("an operator that is itself operated");
+    assert!(err.to_string().contains("is itself operated"), "{err}");
+
+    let err = AgentRepository::link_retired_agent(&mut conn, operated, other_op)
+        .await
+        .expect_err("an agent linked to a different operator");
+    assert!(err.to_string().contains("already has a link"), "{err}");
+
+    // An ACTOR whose membership the operator revoked: the retired call leaves
+    // the actor row and the revoked membership exactly as they were.
+    let former_actor = seed_bare_agent(&pool).await;
+    link(&pool, former_actor, operator).await;
+    GroupMembershipRepository::revoke_member_unless_last_admin(&pool, op_group, former_actor)
+        .await
+        .expect("revoke");
+    let out = link_retired(&pool, former_actor, operator).await;
+    assert!(
+        !out.link_created && !out.link_retired && !out.membership_live,
+        "{out:?}"
+    );
+    assert_eq!(link_row(&pool, former_actor).await, Some((operator, false)));
+    assert_eq!(
+        membership_rows(&pool, op_group, former_actor).await,
+        vec![("writer".to_string(), true, 0)],
+        "the retired link must never revive or otherwise touch an existing membership"
+    );
+}
+
+/// A retired row stays NOT-an-actor even if a live membership appears beside
+/// it. The operator's own session can enrol any agent in the operator's group
+/// (group_memberships_tenancy's creator/admin arm, replayed in
+/// `an_app_session_cannot_forge_a_link_from_an_edge_and_a_membership`), so the
+/// `NOT retired` conjunct in `epigraph_operator_of` — not the absence of a
+/// membership — is what keeps a retired identity from acting for its operator.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_link_with_a_membership_is_still_not_an_actor(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let retired = seed_bare_agent(&pool).await;
+    link_retired(&pool, retired, operator).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(op_group)
+    .bind(retired)
+    .execute(&pool)
+    .await
+    .expect("an out-of-band writer row beside the retired link");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    assert!(
+        AgentRepository::operator_links(&mut conn, retired)
+            .await
+            .expect("operator_of")
+            .is_empty(),
+        "a retired link must never read as an acting link, membership or not"
+    );
+}

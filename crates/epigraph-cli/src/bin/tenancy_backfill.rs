@@ -1014,6 +1014,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // pre-flight must not hide.
     ("epigraph_operator_of", 102),
     ("epigraph_link_operator", 102),
+    ("epigraph_link_retired_agent", 102),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

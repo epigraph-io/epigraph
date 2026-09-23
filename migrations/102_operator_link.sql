@@ -3,9 +3,9 @@
 -- human operator writes into that operator's personal group, and the operator
 -- (and the operator's other agents) own what it writes.
 --
--- One definer-only table (`operator_links`), two SECURITY DEFINER functions,
--- no change to any existing policy, and no rows written by the migration
--- itself.
+-- One definer-only table (`operator_links`), three SECURITY DEFINER
+-- functions, no change to any existing policy, and no rows written by the
+-- migration itself.
 --
 -- ===================================================================
 -- 1. WHY THIS EXISTS
@@ -187,7 +187,42 @@
 -- an unbypassed `epigraph_link_operator` is refused by the tenancy policies.
 --
 -- ===================================================================
--- 7. DEPLOY ORDER AND UNDO
+-- 7. RETIRED LINKS: `epigraph_link_retired_agent`
+--
+-- An agent identity that will never run again (e.g. a job's identity before a
+-- model bump) still AUTHORED claims, and the operator should own them. A
+-- RETIRED link says exactly that and nothing more: it writes the
+-- `operator_links` row with `retired = true` and the `OPERATED_BY` graph edge,
+-- and it creates NO membership and never touches an existing one.
+--
+-- WHY NO MEMBERSHIP. Many historical identities have publicly recomputable or
+-- exposed signing keys: some seeds are built only from public constants,
+-- others were printed to logs. Anyone holding such a key can run as that
+-- agent, so the identity must gain ZERO write authority from being linked. A
+-- retired row therefore:
+--
+--   * is never an ACTOR link: `epigraph_operator_of` requires `NOT retired`
+--     (and a live writer/admin membership, which this function never creates),
+--     so a retired identity never authors into the operator's group and never
+--     acts for the operator;
+--   * is never PROMOTED: `epigraph_link_operator` on an agent whose row is
+--     retired inserts no membership and reports `link_retired = true`. A
+--     retired identity that runs again with `EPIGRAPH_OPERATOR_ID` set gets a
+--     startup WARN and authors into its own group.
+--   * is recorded once: `ON CONFLICT (agent_id) DO NOTHING`, so an existing
+--     row -- retired or actor -- is left exactly as it is.
+--
+-- Its refusals are `epigraph_link_operator`'s, for the same reasons: a
+-- self-link, a missing agent or operator, an operator that is itself operated
+-- (any row), an agent that already operates others, an agent already linked to
+-- a different operator, and an operator group the operator did not create.
+-- EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
+-- two preludes are deliberately written out twice rather than shared through a
+-- third definer, so each function can be reviewed on its own page; both are
+-- exercised by `operator_link.rs`.
+--
+-- ===================================================================
+-- 8. DEPLOY ORDER AND UNDO
 --
 -- `ClaimRepository::default_decl_for_author` calls `epigraph_operator_of`, so a
 -- binary carrying this change FAILS CLOSED on every claim write against a
@@ -195,6 +230,7 @@
 -- 102 before, or with, the binary.
 --
 -- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`,
+-- `DROP FUNCTION IF EXISTS public.epigraph_link_retired_agent(uuid, uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_operator_of(uuid)` and
 -- `DROP TABLE IF EXISTS public.operator_links` -- but only together with a
 -- binary that no longer calls them, and after removing `operator_links` from
@@ -210,6 +246,9 @@ CREATE TABLE IF NOT EXISTS public.operator_links (
     agent_id          uuid PRIMARY KEY REFERENCES public.agents(id) ON DELETE RESTRICT,
     operator_id       uuid NOT NULL REFERENCES public.agents(id) ON DELETE RESTRICT,
     operator_group_id uuid NOT NULL REFERENCES public.groups(id) ON DELETE RESTRICT,
+    -- A RETIRED link (section 7): the operator owns the agent's claims, and the
+    -- agent may never act for the operator.
+    retired           boolean NOT NULL DEFAULT false,
     created_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT operator_links_not_self CHECK (agent_id <> operator_id)
 );
@@ -249,6 +288,7 @@ SET search_path = public, pg_temp AS $$
        AND m.revoked_at IS NULL
        AND m.role IN ('writer', 'admin')
      WHERE l.agent_id = p_agent
+       AND NOT l.retired
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) FROM PUBLIC;
 
@@ -265,7 +305,8 @@ RETURNS TABLE (operator_group_id uuid,
                membership_created boolean,
                membership_live boolean,
                edge_created boolean,
-               link_live boolean)
+               link_live boolean,
+               link_retired boolean)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
@@ -362,12 +403,16 @@ BEGIN
     ON CONFLICT (agent_id) DO NOTHING;
 
     -- (c) The agent's writer membership: recorded once. Both guards are
-    -- load-bearing -- see section 3.
+    -- load-bearing -- see section 3. And NEVER for a RETIRED link (section 7):
+    -- a retired identity's key may be public, so the row being retired is
+    -- checked here, after the DO NOTHING above left any existing row as it was.
     INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
                                           epoch, role)
     SELECT v_group, p_agent, ''::bytea, 0, 'writer'
      WHERE NOT EXISTS (SELECT 1 FROM public.group_memberships m
                         WHERE m.group_id = v_group AND m.agent_id = p_agent)
+       AND NOT EXISTS (SELECT 1 FROM public.operator_links l
+                        WHERE l.agent_id = p_agent AND l.retired)
     ON CONFLICT DO NOTHING;
     GET DIAGNOSTICS v_mem_rows = ROW_COUNT;
 
@@ -397,9 +442,128 @@ BEGIN
                       AND m.revoked_at IS NULL),
            v_edge_rows > 0,
            EXISTS (SELECT 1 FROM public.epigraph_operator_of(p_agent) o
-                    WHERE o.operator_id = p_operator);
+                    WHERE o.operator_id = p_operator),
+           EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.retired);
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_link_operator(uuid, uuid) FROM PUBLIC;
+
+-- The retired link. See section 7. The prelude (validation, single hop, one
+-- operator, the operator's own personal group) is `epigraph_link_operator`'s,
+-- written out again on purpose.
+CREATE OR REPLACE FUNCTION public.epigraph_link_retired_agent(p_agent uuid, p_operator uuid)
+RETURNS TABLE (operator_group_id uuid,
+               group_created boolean,
+               link_created boolean,
+               link_retired boolean,
+               edge_created boolean,
+               membership_live boolean)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_group     uuid;
+    v_other     uuid;
+    v_new_group uuid;
+    v_link_rows integer := 0;
+    v_edge_rows integer := 0;
+BEGIN
+    IF p_agent IS NULL OR p_operator IS NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent and operator are both required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF p_agent = p_operator THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % cannot be its own operator',
+                        p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % does not exist', p_agent
+            USING ERRCODE = '22023';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: operator % does not exist', p_operator
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: % is itself operated by another agent '
+                        'and cannot be an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.operator_links l WHERE l.operator_id = p_agent) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: % already operates other agents and '
+                        'cannot itself be operated', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    SELECT l.operator_id INTO v_other
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent AND l.operator_id <> p_operator;
+    IF v_other IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % already has a link to operator '
+                        '%; an agent is linked to one operator, and re-pointing it is an '
+                        'out-of-band act', p_agent, v_other
+            USING ERRCODE = '55000';
+    END IF;
+
+    INSERT INTO public.groups (display_name, did_key, public_key, kind,
+                               created_by_agent_id)
+    VALUES ('personal:' || p_operator::text,
+            'did:epigraph:personal:' || p_operator::text,
+            ''::bytea, 'personal', p_operator)
+    ON CONFLICT DO NOTHING
+    RETURNING id INTO v_new_group;
+
+    IF v_new_group IS NOT NULL THEN
+        v_group := v_new_group;
+        INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
+                                              epoch, role)
+        VALUES (v_group, p_operator, ''::bytea, 0, 'admin')
+        ON CONFLICT DO NOTHING;
+    ELSE
+        SELECT g.id INTO v_group FROM public.groups g
+         WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text;
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM public.groups g
+                    WHERE g.id = v_group
+                      AND g.kind = 'personal'
+                      AND g.created_by_agent_id = p_operator) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: the group carrying '
+                        'did:epigraph:personal:% is not a personal group created by that '
+                        'operator; refusing to link % to it', p_operator, p_agent
+            USING ERRCODE = '55000';
+    END IF;
+
+    -- The record, retired. No membership: see section 7.
+    INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
+    VALUES (p_agent, p_operator, v_group, true)
+    ON CONFLICT (agent_id) DO NOTHING;
+    GET DIAGNOSTICS v_link_rows = ROW_COUNT;
+
+    INSERT INTO public.edges (source_id, source_type, target_id, target_type,
+                              relationship, properties)
+    SELECT p_agent, 'agent', p_operator, 'agent', 'OPERATED_BY',
+           jsonb_build_object('source', 'epigraph_link_retired_agent')
+     WHERE NOT EXISTS (SELECT 1 FROM public.edges e
+                        WHERE e.source_id = p_agent AND e.target_id = p_operator
+                          AND e.relationship = 'OPERATED_BY');
+    GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
+
+    -- `membership_live` REPORTS a pre-existing live membership (e.g. the agent
+    -- was an actor before it was retired); it is never created or changed
+    -- here. A retired identity has zero write authority only while this is
+    -- false, so the caller must see it.
+    RETURN QUERY
+    SELECT v_group,
+           v_new_group IS NOT NULL,
+           v_link_rows > 0,
+           EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.retired),
+           v_edge_rows > 0,
+           EXISTS (SELECT 1 FROM public.group_memberships m
+                    WHERE m.group_id = v_group AND m.agent_id = p_agent
+                      AND m.revoked_at IS NULL);
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) FROM PUBLIC;
 
 -- Ownership and grants. Guarded, as every such block since 060 is: the roles
 -- exist in a deployed cluster and not in every throwaway.
@@ -409,7 +573,11 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_link_operator(uuid, uuid) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_link_operator(uuid, uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) '
                 'TO epigraph_maintenance';
@@ -417,6 +585,8 @@ DO $$ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_link_operator(uuid, uuid) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
                 'FROM epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of(uuid) '
                 'TO epigraph_app';

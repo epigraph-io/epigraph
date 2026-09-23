@@ -246,7 +246,11 @@ Current reservation:
   edge (EXECUTE: `epigraph_maintenance` only — revoked from `PUBLIC` and from
   `epigraph_app`), and `epigraph_operator_of(agent)` is the read the authoring
   and ownership paths use (EXECUTE: `epigraph_app`), so neither depends on a
-  stamped session. The link is recorded once: the membership is inserted only
+  stamped session. `epigraph_link_retired_agent(agent, operator)` (EXECUTE:
+  `epigraph_maintenance` only) writes a RETIRED row plus the edge and NO
+  membership, so a retired identity whose key may be exposed gains zero write
+  authority while the operator owns its claims; `epigraph_link_operator` never
+  promotes a retired row. The link is recorded once: the membership is inserted only
   when the roster holds no row of any state for the pair, with `ON CONFLICT DO
   NOTHING`, so a revoked link is never revived (the #493 shape
   `epigraph_ensure_personal_group` has is deliberately not reused). The table

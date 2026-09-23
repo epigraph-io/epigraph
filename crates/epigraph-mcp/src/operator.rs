@@ -179,6 +179,14 @@ pub async fn self_link(
             "operator link is REVOKED for this agent and was deliberately NOT restored; this \
              process authors into its own personal group and holds no operator ownership"
         ),
+        LinkStatus::Retired => tracing::warn!(
+            agent = %agent,
+            operator = %operator,
+            operator_group = %outcome.operator_group_id,
+            "operator link is RETIRED for this agent: its claims belong to the operator, but a \
+             retired identity is never promoted to act for it (its key may be exposed). This \
+             process authors into its own personal group and holds no operator ownership"
+        ),
         LinkStatus::NotLive => tracing::warn!(
             agent = %agent,
             operator = %operator,
@@ -203,6 +211,9 @@ pub async fn self_link(
 pub enum LinkStatus {
     /// The link is live: this agent authors into the operator's group.
     Live,
+    /// The agent's link record is RETIRED (migration 102 section 7) and is never
+    /// promoted to an acting link.
+    Retired,
     /// The agent's membership was revoked and deliberately not restored.
     Revoked,
     /// The membership is live but the link is not (its role is no longer
@@ -216,6 +227,8 @@ impl LinkStatus {
     pub fn of(outcome: &OperatorLinkOutcome) -> Self {
         if outcome.link_live {
             Self::Live
+        } else if outcome.link_retired {
+            Self::Retired
         } else if !outcome.membership_live {
             Self::Revoked
         } else {
@@ -238,7 +251,17 @@ mod tests {
             membership_live,
             edge_created: false,
             link_live,
+            link_retired: false,
         }
+    }
+
+    #[test]
+    fn a_retired_link_is_reported_as_retired_not_revoked() {
+        let retired = OperatorLinkOutcome {
+            link_retired: true,
+            ..outcome(false, false)
+        };
+        assert_eq!(LinkStatus::of(&retired), LinkStatus::Retired);
     }
 
     #[test]
