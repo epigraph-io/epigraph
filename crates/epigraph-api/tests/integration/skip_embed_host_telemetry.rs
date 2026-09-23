@@ -23,13 +23,16 @@ use uuid::Uuid;
 fn test_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    // PR-02 binds every authenticated principal to an `agents.id`; PR-06's
+    // `ViewerExtractor` refuses an agentless token with 401 before the handler.
+    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            Uuid::new_v4(),
+            principal,
             vec!["claims:write".to_string(), "epigraph:write".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token");

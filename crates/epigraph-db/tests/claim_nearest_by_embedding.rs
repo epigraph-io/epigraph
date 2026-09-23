@@ -11,6 +11,9 @@
 //! `<->` (L2), but L2 is neither index-accelerated here nor consistent with
 //! the 0.05/0.15 thresholds, which are calibrated as cosine distances.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -76,6 +79,7 @@ async fn seed_claim_with_embedding(
 /// returned as the nearest hit, ordered before a more-distant claim.
 #[sqlx::test(migrations = "../../migrations")]
 async fn nearest_by_embedding_orders_closest_first(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
 
     let close_vec = unit_vec(0, 1.0);
@@ -85,7 +89,7 @@ async fn nearest_by_embedding_orders_closest_first(pool: PgPool) {
         seed_claim_with_embedding(&pool, agent, "close claim", 1, &close_vec, true).await;
     let far_id = seed_claim_with_embedding(&pool, agent, "far claim", 2, &far_vec, true).await;
 
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &close_vec, 5)
+    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &close_vec, 5)
         .await
         .expect("nearest_by_embedding");
 
@@ -118,6 +122,7 @@ async fn nearest_by_embedding_orders_closest_first(pool: PgPool) {
 /// the only thing standing between stale claims and the gate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn nearest_by_embedding_excludes_non_current(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let v = unit_vec(0, 1.0);
 
@@ -134,7 +139,7 @@ async fn nearest_by_embedding_excludes_non_current(pool: PgPool) {
     .await
     .expect("seed stale claim");
 
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &v, 5)
+    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &v, 5)
         .await
         .expect("nearest_by_embedding");
 
@@ -148,6 +153,7 @@ async fn nearest_by_embedding_excludes_non_current(pool: PgPool) {
 /// distance ordering, and semantically a NULL vector has no defined distance).
 #[sqlx::test(migrations = "../../migrations")]
 async fn nearest_by_embedding_excludes_null_embedding(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let id = Uuid::new_v4();
     sqlx::query(
@@ -163,7 +169,7 @@ async fn nearest_by_embedding_excludes_null_embedding(pool: PgPool) {
     .expect("seed claim without embedding");
 
     let v = unit_vec(0, 1.0);
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &v, 5)
+    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &v, 5)
         .await
         .expect("nearest_by_embedding");
 
@@ -177,6 +183,7 @@ async fn nearest_by_embedding_excludes_null_embedding(pool: PgPool) {
 /// only the closest `limit` are returned.
 #[sqlx::test(migrations = "../../migrations")]
 async fn nearest_by_embedding_respects_limit(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let query_vec = unit_vec(0, 1.0);
 
@@ -197,7 +204,7 @@ async fn nearest_by_embedding_respects_limit(pool: PgPool) {
             .await;
     }
 
-    let hits = ClaimRepository::nearest_by_embedding(&pool, &query_vec, 3)
+    let hits = ClaimRepository::nearest_by_embedding(&pool, &viewer, &query_vec, 3)
         .await
         .expect("nearest_by_embedding");
 

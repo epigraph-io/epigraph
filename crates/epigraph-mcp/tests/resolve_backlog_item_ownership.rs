@@ -31,6 +31,9 @@
 //!   same MCP server (auto-registers the signer agent), then retires
 //!   it. Must succeed.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
@@ -42,11 +45,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
-use common::build_test_server;
+use common::build_scoped_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Bootstrap the server's signer agent so `resolve_backlog_item`'s
     // internal `agent_id().await` resolves to a real registered UUID.
@@ -59,10 +63,12 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
 
     let err = resolve_backlog_item(
         &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         None,
     )
@@ -77,7 +83,7 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
     );
 
     // The foreign claim must NOT have been label-patched as a side effect.
-    let labels = ClaimRepository::get_labels(&pool, foreign_claim)
+    let labels = ClaimRepository::get_labels(&pool, &viewer, foreign_claim)
         .await
         .expect("get_labels foreign");
     assert!(
@@ -89,12 +95,14 @@ async fn resolve_backlog_item_refuses_foreign_agent_claim(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Submit a backlog claim THROUGH the server (so its agent_id is the
     // server's own signer). Then retire it: must succeed.
     let result = epigraph_mcp::tools::claims::submit_claim(
         &server,
+        &viewer,
         SubmitClaimParams {
             content: "open backlog item authored by server signer".into(),
             methodology: "deductive_logic".into(),
@@ -118,10 +126,12 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
 
     let result = resolve_backlog_item(
         &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: claim_id.to_string(),
             resolution_content: "retired by own signer".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         None,
     )
@@ -153,7 +163,8 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
 /// `a4cc08a6`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_random_agent(&pool).await;
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
@@ -162,10 +173,12 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
 
     let result = resolve_backlog_item(
         &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "retired by admin token".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         Some(&admin_auth),
     )
@@ -190,7 +203,8 @@ async fn resolve_backlog_item_admin_scope_overrides_foreign_agent(pool: PgPool) 
 /// HTTP `require_owner_or_admin` semantics.
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let agent = seed_random_agent(&pool).await;
     let claim = seed_claim_with_agent(&pool, agent, &["backlog"]).await;
@@ -200,10 +214,12 @@ async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPo
 
     let result = resolve_backlog_item(
         &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: claim.as_uuid().to_string(),
             resolution_content: "retired by owning principal".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         Some(&auth),
     )
@@ -228,7 +244,8 @@ async fn resolve_backlog_item_matching_principal_passes_without_admin(pool: PgPo
 /// negative test for the admin/principal gate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     let foreign_agent = seed_random_agent(&pool).await;
     let foreign_claim = seed_claim_with_agent(&pool, foreign_agent, &["backlog"]).await;
@@ -238,10 +255,12 @@ async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPoo
 
     let err = resolve_backlog_item(
         &server,
+        &viewer,
         ResolveBacklogItemParams {
             original_id: foreign_claim.as_uuid().to_string(),
             resolution_content: "should be rejected".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         Some(&auth),
     )
@@ -254,7 +273,7 @@ async fn resolve_backlog_item_foreign_principal_without_admin_denied(pool: PgPoo
         "denial must cite the required permission, got: {msg:?}"
     );
 
-    let labels = ClaimRepository::get_labels(&pool, foreign_claim)
+    let labels = ClaimRepository::get_labels(&pool, &viewer, foreign_claim)
         .await
         .expect("get_labels foreign");
     assert!(
@@ -289,8 +308,10 @@ fn parse_json(result: &CallToolResult) -> Value {
 /// callers that just want the side-effect (registration); the foreign-
 /// agent test path discards it.
 async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &PgPool) -> Uuid {
+    let viewer = fixture::public_viewer(pool).await;
     let result = epigraph_mcp::tools::claims::submit_claim(
         server,
+        &viewer,
         SubmitClaimParams {
             content: "bootstrap claim for ownership test".into(),
             methodology: "deductive_logic".into(),

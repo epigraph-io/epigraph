@@ -3,6 +3,9 @@
 //! POST /oauth/{provider}/auth-url   — returns the consent URL + PKCE verifier
 //! POST /oauth/{provider}/exchange   — exchanges auth code + verifier for EpiGraph tokens
 
+// UNSCOPED-POOL-EXEMPT: Pre-authentication. The device/redirect exchange endpoint runs on the
+// anonymous OAuth router, before a principal exists.
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,

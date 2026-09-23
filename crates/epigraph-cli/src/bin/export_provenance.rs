@@ -54,13 +54,34 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("export_provenance")
+        .await
+        .expect("maintenance pool");
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance viewer");
+    let viewer = session.viewer();
+    if let Err(e) = run(cli, maint.pool().clone(), viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     if cli.format != "prov-o" {
         return Err(format!(
             "unsupported --format '{}': only 'prov-o' is implemented",
@@ -69,10 +90,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let pool = epigraph_cli::db_connect().await?;
-    let document =
-        epigraph_engine::export::prov::export_provenance_prov_o(&pool, cli.claim_id, cli.max_depth)
-            .await?;
+    let document = epigraph_engine::export::prov::export_provenance_prov_o(
+        &pool,
+        viewer,
+        cli.claim_id,
+        cli.max_depth,
+    )
+    .await?;
     let pretty = serde_json::to_string_pretty(&document)?;
 
     match cli.output {

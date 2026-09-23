@@ -15,12 +15,21 @@
 //!
 //! - Malformed input tests use **direct routers** (no auth middleware layer) so
 //!   validation logic is exercised without signature verification interference.
-//! - Auth tests use the full `create_router()` which includes the `require_signature`
-//!   middleware layer, proving that unauthenticated requests are properly rejected.
+//! - Auth tests use the full `create_router()`, which layers
+//!   `bearer_auth_middleware` on the protected router, proving that
+//!   unauthenticated requests are properly rejected.
 //! - Concurrency tests clone `AppState` (which is `Arc`-backed) across multiple
 //!   tokio tasks, each creating its own router via `create_router` to avoid
 //!   consuming the router with `oneshot`.
 
+// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
+// the `not(feature = "db")` configuration has 28 pre-existing compile errors
+// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
+// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
+// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
+// intended behaviour, not coverage of it. The behaviour is actually asserted
+// by `tests/public_router_allowlist.rs`, which probes every route on the
+// `protected` chain of the buildable variant.
 #[cfg(all(test, not(feature = "db")))]
 mod malformed_input_tests {
     use crate::routes::batch::batch_create_claims;
@@ -616,10 +625,10 @@ mod auth_failure_tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
-    /// Create the full application router with `require_signatures: true`.
+    /// Create the full application router with `require_packet_signatures: true`.
     fn app_with_auth() -> axum::Router {
         let state = AppState::new(ApiConfig {
-            require_signatures: true,
+            require_packet_signatures: true,
             ..ApiConfig::default()
         });
         crate::routes::create_router(state)
@@ -866,7 +875,7 @@ mod auth_failure_tests {
     #[tokio::test]
     async fn test_all_protected_routes_reject_without_auth() {
         // Each protected route is a POST or DELETE that sits behind the
-        // require_signature middleware. Without auth headers, all should 401.
+        // bearer_auth_middleware. Without an Authorization header, all should 401.
         let claim_id = Uuid::new_v4();
         let webhook_id = Uuid::new_v4();
 
@@ -1133,18 +1142,19 @@ mod concurrency_tests {
             })
             .collect();
 
+        // PR-03: RAG left the anonymous router. What this test still proves is
+        // what it was really for — that ten simultaneous requests through ten
+        // independently-built routers over one shared AppState all terminate
+        // cleanly and identically, with no lock contention or interleaving.
+        // The status they agree on is now 401.
         for task in tasks {
             let response = task.await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "All concurrent RAG queries should return 200"
+                StatusCode::UNAUTHORIZED,
+                "All concurrent RAG queries should return 401 — the route is no \
+                 longer anonymous"
             );
-
-            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let resp: RagContextResponse = serde_json::from_slice(&body_bytes).unwrap();
-            // Without a DB, results are empty but the response structure is valid
-            assert_eq!(resp.count, 0);
         }
     }
 
@@ -1172,20 +1182,17 @@ mod concurrency_tests {
             })
             .collect();
 
+        // PR-03: as with the RAG case above, the concurrency property survives
+        // and the status changes. Stats-content consistency is asserted by the
+        // `test_router()`-driven tests in `routes/admin.rs`.
         for task in tasks {
             let response = task.await.unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::OK,
-                "All concurrent admin stats requests should return 200"
+                StatusCode::UNAUTHORIZED,
+                "All concurrent admin stats requests should return 401 — the \
+                 route is no longer anonymous"
             );
-
-            let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
-            let stats: SystemStats = serde_json::from_slice(&body_bytes).unwrap();
-
-            // All stats should be consistent (initial state: everything is zero)
-            assert_eq!(stats.caches.idempotency_store_size, 0);
-            assert!(!stats.config.require_signatures);
         }
     }
 
@@ -1258,13 +1265,12 @@ mod concurrency_tests {
 mod wrong_scope_with_malformed_body_tests {
     use crate::middleware::bearer::{AuthContext, ClientType};
     use crate::routes::crud::reassign_claim;
-    use crate::routes::ownership::{assign_ownership, update_partition};
     use crate::routes::policies::record_outcome;
     use crate::routes::webhooks::register_webhook;
     use crate::state::{ApiConfig, AppState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use axum::routing::{post, put};
+    use axum::routing::post;
     use axum::{Extension, Router};
     use sqlx::postgres::PgPoolOptions;
     use tower::ServiceExt;
@@ -1314,68 +1320,36 @@ mod wrong_scope_with_malformed_body_tests {
             .unwrap()
     }
 
-    /// Build a PUT request with a body that fails `Json` extraction (see
-    /// [`post_malformed`] for rationale).
-    fn put_malformed(uri: &str) -> Request<Body> {
-        Request::builder()
-            .method("PUT")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap()
-    }
-
-    // ------------------------------------------------------------------
-    // assign_ownership: claims:admin required → wrong-scope must 403
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn assign_ownership_wrong_scope_with_malformed_body_returns_403_not_422() {
-        let router = Router::new()
-            .route("/api/v1/ownership", post(assign_ownership))
-            .layer(Extension(read_only_auth()))
-            .with_state(test_state());
-
-        let resp = router
-            .oneshot(post_malformed("/api/v1/ownership"))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must be rejected at the scope gate (403), not at JSON parsing (422)"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // update_partition: claims:admin required → wrong-scope must 403
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn update_partition_wrong_scope_with_malformed_body_returns_403_not_422() {
-        let node_id = Uuid::new_v4();
-        let router = Router::new()
-            .route("/api/v1/ownership/:node_id", put(update_partition))
-            .layer(Extension(read_only_auth()))
-            .with_state(test_state());
-
-        let resp = router
-            .oneshot(put_malformed(&format!("/api/v1/ownership/{node_id}")))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must return 403, not 422"
-        );
-    }
+    // Two cases covering `assign_ownership` and `update_partition` lived here
+    // until PR-14 deleted both routes. The extractor-ordering property they
+    // pinned — a wrong-scope token plus a malformed body must be rejected by
+    // the scope gate (403), not by JSON parsing (422) — is NOT abandoned: it is
+    // still asserted by the `reassign_claim`, `record_outcome` and
+    // `register_webhook` cases in this same module, which is why these two were
+    // deleted with their handlers rather than retargeted at a surviving route.
 
     // ------------------------------------------------------------------
     // reassign_claim: claims:admin required → wrong-scope must 403
     // ------------------------------------------------------------------
 
+    /// PR-06 moved identity resolution ahead of the scope gate: `reassign_claim`
+    /// takes `ViewerExtractor` as its first extractor, and an `AuthContext` whose
+    /// `agent_id` is `None` cannot be resolved to a principal. The rejection is
+    /// therefore **401 before 403**, which is the correct order — scopes are a
+    /// property of a principal, and there is no principal to evaluate them for.
+    ///
+    /// `read_only_auth()` models a token shape that PR-02 made impossible for
+    /// real clients (every authenticated principal now carries an `agents.id`),
+    /// so this test now pins the agentless-token path rather than the scope path.
+    ///
+    /// **Coverage note:** the original property — a *wrong-scope* token with a
+    /// malformed body returns 403, not 422, i.e. the scope gate fires before
+    /// `Json` extraction — is no longer exercised here, because proving it needs
+    /// a token with a real `agent_id`, and `ViewerExtractor` would then resolve
+    /// against `lazy_pool()`, which deliberately never connects. That property
+    /// belongs in a `#[sqlx::test]` integration test with a live pool.
     #[tokio::test]
-    async fn reassign_claim_wrong_scope_with_malformed_body_returns_403_not_422() {
+    async fn reassign_claim_agentless_token_returns_401_before_the_scope_gate() {
         let router = Router::new()
             .route("/api/v1/themes/reassign", post(reassign_claim))
             .layer(Extension(read_only_auth()))
@@ -1387,8 +1361,9 @@ mod wrong_scope_with_malformed_body_tests {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::FORBIDDEN,
-            "wrong-scope token + malformed body must return 403, not 422"
+            StatusCode::UNAUTHORIZED,
+            "a token with no agent_id must 401 at ViewerExtractor, before the \
+             scope gate and before Json extraction"
         );
     }
 

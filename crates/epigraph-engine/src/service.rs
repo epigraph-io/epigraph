@@ -13,7 +13,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```text
 //! let service = EpistemicServiceBuilder::new()
 //!     .with_propagation_config(PropagationConfig::default())
 //!     .with_reputation_config(ReputationConfig::default())
@@ -113,7 +113,7 @@ impl Default for EpistemicServiceConfig {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let service = EpistemicServiceBuilder::new()
 ///     .with_propagation_config(PropagationConfig {
 ///         max_depth: 50,

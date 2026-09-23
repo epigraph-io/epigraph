@@ -36,11 +36,16 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_claim", "claims:read"),
     ("get_divergence", "claims:read"),
     ("get_neighborhood", "claims:read"),
-    ("get_ownership", "claims:read"),
     ("get_perspective", "claims:read"),
     ("get_provenance", "claims:read"),
     ("get_provenance_chain", "claims:read"),
     ("get_recall_events", "claims:read"),
+    // The theme READ path. `claims:read`, deliberately NOT the `claims:write`
+    // its sibling `theme_cluster` carries: these two issue only SELECTs, and
+    // gating them at write level would preserve exactly the gap they close —
+    // a read-only principal unable to see what topics the corpus holds.
+    ("get_theme", "claims:read"),
+    ("list_themes", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("sweep_semantic_duplicates", "claims:write"),
     ("get_workflow_executions", "claims:read"),
@@ -68,7 +73,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("traverse", "claims:read"),
     // ─── claims:write ──────────────────────────────────────────────────
     ("add_step", "claims:write"),
-    ("assign_ownership", "claims:write"),
     ("backfill_embeddings", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
@@ -134,7 +138,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("delete_edge", "claims:admin"),
     ("mark_duplicate", "claims:admin"),
     ("supersede_claim", "claims:admin"),
-    ("update_partition", "claims:admin"),
 ];
 
 #[cfg(test)]
@@ -192,8 +195,34 @@ mod tests {
         );
     }
 
-    /// Sanity-check the three known mutation tools cited in issue #122 are
-    /// gated on `claims:admin`.
+    /// The theme READ tools must sit at `claims:read`, not inherit
+    /// `theme_cluster`'s `claims:write`.
+    ///
+    /// Backlog `ac4d02b9`: the whole point of adding them is that a
+    /// read-scoped principal (pre-access sensitivity screening, partition
+    /// design) could not learn what topics the corpus covers without invoking
+    /// the destructive clusterer. Mapping them to `claims:write` would compile,
+    /// pass `every_registered_tool_has_a_scope`, and silently preserve that
+    /// gap — so it is asserted explicitly rather than left to the coverage
+    /// test.
+    #[test]
+    fn theme_read_tools_are_read_scoped() {
+        assert_eq!(required_scope("list_themes"), Some("claims:read"));
+        assert_eq!(required_scope("get_theme"), Some("claims:read"));
+        // And the writer is still a writer.
+        assert_eq!(required_scope("theme_cluster"), Some("claims:write"));
+    }
+
+    /// Sanity-check the known mutation tools cited in issue #122 are gated on
+    /// `claims:admin`.
+    ///
+    /// `update_partition` was a fourth assertion here until PR-14 deleted the
+    /// tool. It is not merely removed: issue #122's concern was that a
+    /// `claims:write` token could reach a declassification power, and PR-12
+    /// recorded that MCP `assign_ownership` did exactly that at `claims:write`
+    /// while the HTTP route for the same power demanded `claims:admin`.
+    /// Deleting both tools closes that asymmetry at the source rather than by
+    /// levelling the two entries.
     #[test]
     fn issue_122_admin_tools_are_admin_gated() {
         assert_eq!(
@@ -203,6 +232,5 @@ mod tests {
         );
         assert_eq!(required_scope("mark_duplicate"), Some("claims:admin"));
         assert_eq!(required_scope("supersede_claim"), Some("claims:admin"));
-        assert_eq!(required_scope("update_partition"), Some("claims:admin"));
     }
 }

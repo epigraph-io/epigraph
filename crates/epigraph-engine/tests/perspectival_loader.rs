@@ -12,6 +12,9 @@
 //!   SEED_DIR=$SEED_DIR SQLX_OFFLINE=true \
 //!   cargo test -p epigraph-engine --test perspectival_loader -- --nocapture
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{
@@ -59,7 +62,8 @@ async fn assign(pool: &PgPool, claim: Uuid, frame: Uuid) {
 
 /// BetP for hypothesis index 0 (the target: efficacious / safe / holds) under a perspective.
 async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
-    epigraph_engine::belief_query::get_perspective_belief(pool, claim, frame, persp)
+    let viewer = fixture::public_viewer(pool).await;
+    epigraph_engine::belief_query::get_perspective_belief(pool, &viewer, claim, frame, persp)
         .await
         .expect("belief")
         .pignistic_prob
@@ -108,7 +112,10 @@ async fn load_and_validate_open_world() {
         eprintln!("SKIP: DATABASE_URL not set");
         return;
     };
-    let dir = std::env::var("SEED_DIR").expect("set SEED_DIR");
+    let Ok(dir) = std::env::var("SEED_DIR") else {
+        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
+        return;
+    };
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 

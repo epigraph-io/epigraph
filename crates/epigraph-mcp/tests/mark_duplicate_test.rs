@@ -1,9 +1,13 @@
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 mod common;
 use common::*;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_marks_dup_only(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let canonical = seed_claim(&pool, "canonical", 0.5).await;
     let dup = seed_claim(&pool, "duplicate", 0.5).await;
     let server = build_test_server(pool.clone());
@@ -11,6 +15,7 @@ async fn mark_duplicate_marks_dup_only(pool: PgPool) {
 
     epigraph_mcp::tools::supersede::mark_duplicate(
         &server,
+        &viewer,
         epigraph_mcp::types::MarkDuplicateParams {
             claim_id: dup.to_string(),
             canonical_id: canonical.to_string(),

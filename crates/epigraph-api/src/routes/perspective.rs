@@ -5,10 +5,25 @@
 //! - `GET /api/v1/perspectives/:id` — get perspective detail
 //! - `GET /api/v1/agents/:id/perspectives` — list perspectives for an agent
 //!
+//! # Tenancy: 3 of this file's 5 raw-pool sites are converted
+//!
+//! Conversion shard 5. `list_perspectives`, `get_perspective` and
+//! `agent_perspectives` each read through one viewer-stamped connection from
+//! [`AppState::read_as`].
+//!
+//! The two that remain both WRITE and neither repo method takes a `Viewer`:
+//! `create_perspective` (which also materializes a PERSPECTIVE_OF edge) and
+//! `set_source_reliability` (an `UPDATE`). Same owner as `context.rs`'s
+//! residue, and the same note applies about where this shard's behavioural
+//! assertion lives.
+//!
+//! [`AppState::read_as`]: crate::AppState::read_as
+//!
 //! Protected (POST):
 //! - `POST /api/v1/perspectives` — create a perspective
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -184,11 +199,24 @@ pub async fn set_source_reliability(
 /// `GET /api/v1/perspectives`
 #[cfg(feature = "db")]
 pub async fn list_perspectives(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListPerspectivesQuery>,
 ) -> Result<Json<Vec<PerspectiveResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::PerspectiveRepository::list(pool, params.limit, params.offset).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_perspectives",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows =
+        epigraph_db::PerspectiveRepository::list(&mut *read, &viewer, params.limit, params.offset)
+            .await?;
 
     Ok(Json(
         rows.into_iter().map(perspective_to_response).collect(),
@@ -200,11 +228,22 @@ pub async fn list_perspectives(
 /// `GET /api/v1/perspectives/:id`
 #[cfg(feature = "db")]
 pub async fn get_perspective(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<PerspectiveResponse>, ApiError> {
-    let pool = &state.db_pool;
-    let row = epigraph_db::PerspectiveRepository::get_by_id(pool, id)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_perspective",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let row = epigraph_db::PerspectiveRepository::get_by_id(&mut *read, &viewer, id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "perspective".to_string(),
@@ -219,13 +258,25 @@ pub async fn get_perspective(
 /// `GET /api/v1/agents/:id/perspectives`
 #[cfg(feature = "db")]
 pub async fn agent_perspectives(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(agent_id): Path<Uuid>,
     Query(params): Query<ListPerspectivesQuery>,
 ) -> Result<Json<Vec<PerspectiveResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "agent_perspectives",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
     let rows = epigraph_db::PerspectiveRepository::list_by_agent(
-        pool,
+        &mut *read,
+        &viewer,
         agent_id,
         params.limit,
         params.offset,

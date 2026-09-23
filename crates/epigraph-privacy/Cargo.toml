@@ -1,0 +1,30 @@
+[package]
+name = "epigraph-privacy"
+description = "Client-side content sealing for EpiGraph: entity-bound AAD, group roles, cross-group re-wrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No `sqlx`, and deliberately so. Every function here takes keys and bytes and
+# returns keys and bytes; nothing in this crate opens a connection, and the one
+# ported error variant that named `sqlx::Error` was dropped rather than carried
+# (see src/errors.rs). Sealing is a client-side operation — the server never
+# holds a group key — so a crate that could reach a database would be modelling
+# a custody arrangement this system does not have.
+[dependencies]
+epigraph-crypto = { workspace = true }
+# `rewrap` takes agent identity keys, which are Ed25519 everywhere in this
+# system; the X25519 keys the agreement runs on are derived from them inside
+# epigraph-crypto rather than being a second thing callers must hold.
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

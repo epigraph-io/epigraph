@@ -312,6 +312,11 @@ def main():
     parser.add_argument("--abstract", default="")
     parser.add_argument("--output", choices=["json", "text"], default="json")
     parser.add_argument("--claim-id", type=str, help="Load claim from database by UUID")
+    # MAINTENANCE-DSN-EXEMPT: single-claim debug lookup on the read-only role.
+    # `--claim-id` fetches ONE row the operator names on the command line; it is
+    # not a corpus enumeration and has no write path, so there is nothing here
+    # for FORCE to silently truncate. It is also a library entry point invoked
+    # by hand, not a scheduled background writer.
     parser.add_argument("--database-url", type=str,
         default="postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph")
     args = parser.parse_args()

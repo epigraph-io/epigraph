@@ -18,6 +18,93 @@ use epigraph_ingest::workflow::WorkflowExtraction;
 use crate::error::IngestExecutorError;
 use crate::system_agent::get_or_create_system_agent;
 
+/// Labels for one planned claim: always `claim`, plus the plan's `kind` when it
+/// is usable as a label.
+///
+/// `kind` is MACHINE-DERIVED — it is `planned.properties["kind"]`, i.e. whatever
+/// the extraction LLM emitted — not a value a caller typed. Since backlog
+/// f6310444, `ClaimRepository::create_with_id_if_absent` refuses any label
+/// containing `$`, and this executor walks a whole plan on a shared pool with no
+/// enclosing transaction. Passing such a `kind` straight through would therefore
+/// abort the ENTIRE workflow ingest at the first offending claim (e.g. a plan
+/// emitting `kind = "cost_$_per_unit"`), leaving the claims already inserted
+/// behind as a partial ingest, to punish the caller for one cosmetic label on
+/// one node.
+///
+/// So the machine-derived label is DROPPED with a warning rather than escalated
+/// into a write error. That keeps the repo-layer guard absolute — no `$` label
+/// can reach `claims.labels` from any path — while confining the blast radius of
+/// bad LLM output to the label it affects. The `claim` label, which is what the
+/// structural queries filter on, always survives.
+///
+/// Note the asymmetry with the caller-supplied paths (`submit_claim`, `memorize`,
+/// HTTP `POST /claims`), which REFUSE the write outright: there the caller can
+/// see the error and fix the value, and silently dropping their label would be
+/// the "silently ungrouped" failure the backlog names. An extraction plan has no
+/// such caller — nobody is waiting to correct `properties.kind` — so a hard
+/// failure converts a cosmetic defect into data loss for the whole document.
+fn labels_for_planned_kind(kind: &str) -> Vec<String> {
+    let mut labels = vec!["claim".to_string()];
+    let owned = kind.to_string();
+    match epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&owned)) {
+        Ok(()) => labels.push(owned),
+        Err(e) => tracing::warn!(
+            kind,
+            "workflow ingest: dropping unusable machine-derived kind label: {e}"
+        ),
+    }
+    labels
+}
+
+#[cfg(test)]
+mod label_derivation_tests {
+    use super::labels_for_planned_kind;
+
+    /// The normal case must be untouched: `claim` plus the plan's kind.
+    #[test]
+    fn a_usable_kind_is_kept_alongside_claim() {
+        assert_eq!(
+            labels_for_planned_kind("workflow_step"),
+            vec!["claim".to_string(), "workflow_step".to_string()]
+        );
+        // Separators the label vocabulary actually uses must survive — this is
+        // the negative direction, guarding against an over-broad predicate.
+        assert_eq!(
+            labels_for_planned_kind("phase:setup"),
+            vec!["claim".to_string(), "phase:setup".to_string()]
+        );
+    }
+
+    /// An LLM-emitted kind carrying `$` must cost its own label and NOTHING
+    /// else. The pre-fix derivation (`vec!["claim", kind]`) handed exactly this
+    /// array to `create_with_id_if_absent`, whose guard turns it into
+    /// `DbError::InvalidData` — aborting the whole plan walk mid-ingest.
+    #[test]
+    fn a_kind_carrying_shell_syntax_is_dropped_not_escalated() {
+        let kind = "cost_$_per_unit";
+
+        // What the pre-fix code would have written, and what the repo layer
+        // does to it. This is the abort mode being closed, asserted rather
+        // than described.
+        let pre_fix = vec!["claim".to_string(), kind.to_string()];
+        assert!(
+            epigraph_db::reject_unexpanded_labels(&pre_fix).is_err(),
+            "premise of this test: the repo layer refuses the pre-fix array"
+        );
+
+        let derived = labels_for_planned_kind(kind);
+        assert_eq!(
+            derived,
+            vec!["claim".to_string()],
+            "the offending kind must be dropped, and `claim` must survive"
+        );
+        assert!(
+            epigraph_db::reject_unexpanded_labels(&derived).is_ok(),
+            "the derived labels must be writable, i.e. the ingest proceeds"
+        );
+    }
+}
+
 /// A newly inserted plan edge as returned by the executor. Callers iterate
 /// these post-hoc to fire `auto_wire_edge_if_epistemic` (the executor itself
 /// is pure-DB and doesn't depend on epigraph-engine — mirrors the embedding
@@ -211,6 +298,15 @@ pub async fn execute_workflow_ingest_plan(
     let mut inserted: Vec<(Uuid, String)> = Vec::new();
     let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
 
+    // Tenancy declaration (PR-16). One lookup for the whole plan: every claim
+    // in a workflow ingest is authored by the same system agent, and resolving
+    // it per claim would be N identical round trips. The executor is pure-DB
+    // and its callers do not choose a group -- `store_workflow`,
+    // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
+    // instance-wide workflow content -- so the system agent's own group is the
+    // declaration, publicly visible.
+    let decl = ClaimRepository::default_decl_for_author_pool(pool, system_agent_id).await?;
+
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let raw_truth = confidence.clamp(0.01, 0.99);
@@ -222,7 +318,7 @@ pub async fn execute_workflow_ingest_plan(
             .get("kind")
             .and_then(|v| v.as_str())
             .unwrap_or("workflow_claim");
-        let labels = vec!["claim".to_string(), kind.to_string()];
+        let labels = labels_for_planned_kind(kind);
 
         let was_new = ClaimRepository::create_with_id_if_absent(
             pool,
@@ -232,6 +328,7 @@ pub async fn execute_workflow_ingest_plan(
             system_agent_id,
             truth,
             &labels,
+            decl,
         )
         .await?;
 

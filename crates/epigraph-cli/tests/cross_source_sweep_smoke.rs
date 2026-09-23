@@ -25,12 +25,19 @@ fn help_lists_expected_flags() {
 
 #[test]
 fn requires_dry_run_or_apply() {
-    // Without DATABASE_URL the binary would later fail at connect, but the
+    // Without a DSN the binary would later fail at connect, but the
     // mutual-exclusion check fires first because clap parses argv before
     // main() touches env. Pass --limit so we exercise the validation path.
+    //
+    // BOTH DSN variables are removed. PR-15 gave this binary a maintenance
+    // pool, which prefers MAINTENANCE_DATABASE_URL; leaving that inherited
+    // would let the process connect and turn an argv test into a database
+    // test. Removing both keeps the assertion about argv ordering, which is
+    // the contract this file exists to pin.
     let out = Command::new(bin_path())
         .args(["--limit", "1"])
         .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
         .output()
         .unwrap();
     assert!(!out.status.success(), "expected nonzero exit");
@@ -46,6 +53,7 @@ fn mutually_exclusive_flags_rejected() {
     let out = Command::new(bin_path())
         .args(["--dry-run", "--apply"])
         .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
         .output()
         .unwrap();
     assert!(!out.status.success());

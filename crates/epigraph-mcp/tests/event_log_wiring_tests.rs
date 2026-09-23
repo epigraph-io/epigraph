@@ -8,6 +8,9 @@
 //! against a live test DB, exercise the persistence path, then assert the
 //! event log has the expected entry.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 #[macro_use]
 mod common;
 
@@ -21,10 +24,17 @@ use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Scoped, because the canonical write path requires it: `submit_claim` /
+/// `memorize` run their claim + trace + evidence + `update_trace_id` in ONE
+/// transaction stamped from the author's viewer, and `ScopedPool::begin_as` is
+/// the only thing that can open one. A server with no `ScopedPool` REFUSES those
+/// tools rather than falling back to the unstamped pool, which is how a `42501`
+/// on `reasoning_traces` used to become a committed claim with no provenance.
 async fn build_test_server(pool: PgPool, signer_seed: [u8; 32]) -> EpiGraphMcpFull {
     let signer = AgentSigner::from_bytes(&signer_seed).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None); // mock — no API key
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let scoped = fixture::scoped_pool(&pool).await;
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 /// Extract the JSON body from a `list_events` `CallToolResult`. The MCP
@@ -60,6 +70,7 @@ fn count_events_of_type(body: &serde_json::Value, event_type: &str) -> usize {
 #[tokio::test]
 async fn submit_claim_emits_claim_created_event() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
     drop_unique_constraint(&pool).await;
 
     // Use a fresh signer seed so the server agent (and any side-effect
@@ -85,7 +96,7 @@ async fn submit_claim_emits_claim_created_event() {
 
     let before = chrono::Utc::now();
 
-    let submit_result = tools::claims::submit_claim(&server, params)
+    let submit_result = tools::claims::submit_claim(&server, &viewer, params)
         .await
         .expect("submit_claim succeeds");
 
@@ -102,6 +113,7 @@ async fn submit_claim_emits_claim_created_event() {
     // Read back via the canonical surface — `list_events` MCP tool.
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("claim.created".to_string()),
             actor_id: None,
@@ -154,6 +166,7 @@ async fn submit_claim_emits_claim_created_event() {
 #[tokio::test]
 async fn resubmit_does_not_emit_duplicate_claim_created() {
     let pool = test_pool_or_skip!();
+    let viewer = fixture::public_viewer(&pool).await;
 
     let signer_seed = [0xC2u8; 32];
     let server = build_test_server(pool.clone(), signer_seed).await;
@@ -172,7 +185,7 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
     };
 
     // First submit — should create the claim and emit one event.
-    tools::claims::submit_claim(&server, make_params("evidence-resubmit-1"))
+    tools::claims::submit_claim(&server, &viewer, make_params("evidence-resubmit-1"))
         .await
         .expect("first submit_claim");
 
@@ -201,7 +214,7 @@ async fn resubmit_does_not_emit_duplicate_claim_created() {
     // row's own content_hash dedup doesn't collide; each submission emits
     // its own Evidence + Trace per the architecture doc, but the claim
     // itself is the dedup target this test cares about.)
-    tools::claims::submit_claim(&server, make_params("evidence-resubmit-2"))
+    tools::claims::submit_claim(&server, &viewer, make_params("evidence-resubmit-2"))
         .await
         .expect("second submit_claim");
 
@@ -250,13 +263,14 @@ async fn claim_repo_create_emits_claim_created_event() {
 
     let before = chrono::Utc::now();
 
-    let persisted = ClaimRepository::create(&pool, &claim)
+    let persisted = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("ClaimRepository::create succeeds");
     let persisted_id = persisted.id.as_uuid();
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("claim.created".to_string()),
             actor_id: Some(agent_id.to_string()),
@@ -318,6 +332,7 @@ async fn claim_repo_create_with_id_if_absent_emits_once() {
         agent_id,
         TruthValue::new(0.5).unwrap(),
         &["workflow_claim".to_string()],
+        epigraph_core::TenancyDecl::Inherited,
     )
     .await
     .expect("first create_with_id_if_absent");
@@ -332,6 +347,7 @@ async fn claim_repo_create_with_id_if_absent_emits_once() {
         agent_id,
         TruthValue::new(0.5).unwrap(),
         &["workflow_claim".to_string()],
+        epigraph_core::TenancyDecl::Inherited,
     )
     .await
     .expect("second create_with_id_if_absent");
@@ -339,6 +355,7 @@ async fn claim_repo_create_with_id_if_absent_emits_once() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("claim.created".to_string()),
             actor_id: Some(agent_id.to_string()),
@@ -405,6 +422,7 @@ async fn create_agent_emits_agent_registered_event() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("agent.registered".to_string()),
             actor_id: Some(created.id.as_uuid().to_string()),
@@ -475,6 +493,7 @@ async fn tool_dispatch_emits_tool_invoked_event() {
 
     let result = tools::events::list_events(
         &server,
+        &fixture::public_viewer(&pool).await,
         ListEventsParams {
             event_type: Some("tool.invoked".to_string()),
             actor_id: None,

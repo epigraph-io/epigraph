@@ -1,37 +1,54 @@
 #![cfg(feature = "db")]
+//! # Why all three arms take an injected `pool`
+//!
+//! Each arm asserts EXACT counts against the neighborhood-expansion routes --
+//! `edges.len() == 1`, `groups.len() == 1` -- and those counts are the property
+//! under test: they encode induced-edge collapse and "no other nodes leak into
+//! the expansion". Narrowing the route response to self-seeded ids would delete
+//! exactly that property, so scoping to a unique key is not available here.
+//!
+//! All three used to open by truncating `neighborhood_edges`,
+//! `claim_neighborhood_membership`, `graph_neighborhoods` and
+//! `graph_cluster_runs` on a shared database -- so each arm destroyed the other
+//! two's fixtures between their seed and their assert, which is the recorded
+//! finding F-tests-depend-on-accumulated-shared-db-fixtures. They are converted
+//! TOGETHER on purpose: leaving any one on the shared pool keeps its truncation
+//! alive and re-breaks the converted siblings.
+//!
+//! `#[sqlx::test]` supplies the empty database the truncation was faking, so
+//! every assertion below is unchanged. `spawn_app` builds its own pool from a
+//! URL, so each arm passes `fixture::database_url_for(&pool)` -- the per-test
+//! database's URL -- rather than the ambient `DATABASE_URL`, which would seed
+//! one database and assert against another.
+//!
+//! # These arms lost their multi-threaded runtime, deliberately
+//!
+//! They were `#[tokio::test(flavor = "multi_thread")]`. `#[sqlx::test]` drives
+//! the future through sqlx's `rt::test_block_on`, which builds a
+//! CURRENT-THREAD Tokio runtime, so the axum server `spawn_app` spawns and the
+//! reqwest client that drives it are now cooperatively scheduled on ONE thread.
+//! That is fine today -- nothing in the request path blocks: there is no
+//! `block_in_place`, `Handle::block_on` or `futures::executor::block_on`
+//! anywhere in epigraph-api/db/engine `src/`, and `spawn_app` binds an
+//! ephemeral port so there is no fixed-port contention. It is written down
+//! because it is a PRECEDENT: the next shard converts the remaining
+//! `flavor = "multi_thread"` arms in this package the same way, and the day a
+//! handler grows a blocking call it will panic ("can call blocking only when
+//! running on the multi-threaded runtime") or deadlock outright, with nothing
+//! in that diff to explain why.
 
 use serde_json::Value;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use uuid::Uuid;
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
 mod common;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn neighborhoods_expand_compound_returns_compound_nodes_with_induced_edges() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-
-    // Wipe local fixture rows.
-    sqlx::query("DELETE FROM neighborhood_edges")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claim_neighborhood_membership")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_neighborhoods")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(&pool)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhoods_expand_compound_returns_compound_nodes_with_induced_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
 
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(
@@ -175,31 +192,9 @@ async fn neighborhoods_expand_compound_returns_compound_nodes_with_induced_edges
     assert_eq!(direct.len(), 0, "no direct compound-compound edges seeded");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn neighborhoods_expand_atomic_returns_atoms_and_compound_groups() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-
-    sqlx::query("DELETE FROM neighborhood_edges")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claim_neighborhood_membership")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_neighborhoods")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(&pool)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhoods_expand_atomic_returns_atoms_and_compound_groups(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
 
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(
@@ -358,33 +353,9 @@ async fn neighborhoods_expand_atomic_returns_atoms_and_compound_groups() {
 /// empty — the *populated* path (shared-atom + shared-ancestor detection) shipped
 /// untested while a live GUI consumer (`epigraph-gui` `src/api/queries.ts`) renders
 /// it. This exercises BOTH UNION branches with data that must produce rows.
-#[tokio::test(flavor = "multi_thread")]
-async fn neighborhoods_expand_compound_populates_structural_edges() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-
-    // Wipe local fixture rows. Run this file with `-- --test-threads=1`: all
-    // tests here DELETE the same fixture tables, so parallel execution races.
-    sqlx::query("DELETE FROM neighborhood_edges")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claim_neighborhood_membership")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_neighborhoods")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(&pool)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn neighborhoods_expand_compound_populates_structural_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
 
     let agent_id = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
     sqlx::query(

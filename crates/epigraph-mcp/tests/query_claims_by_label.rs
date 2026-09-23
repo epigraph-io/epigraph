@@ -6,6 +6,9 @@
 //! resolved, one superseded pointing at the open one), then exercises the
 //! filter cross-product through the MCP tool entry point.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::ClaimId;
 use epigraph_mcp::tools::paper_queries::query_claims_by_label;
 use epigraph_mcp::types::QueryClaimsByLabelParams;
@@ -19,6 +22,7 @@ use common::build_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = seed_agent(&pool).await;
     let backlog_open = seed_claim(&pool, agent, &["backlog"], true, None).await;
     let backlog_resolved = seed_claim(&pool, agent, &["backlog", "resolved"], true, None).await;
@@ -31,6 +35,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     // is_current/supersedes carried through.
     let result = query_claims_by_label(
         &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec![],
@@ -39,7 +44,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label default");
@@ -76,6 +80,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     // exclude_labels=["resolved"]: drops the resolved one.
     let result = query_claims_by_label(
         &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec!["resolved".into()],
@@ -84,7 +89,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label exclude_labels");
@@ -101,6 +105,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     // current_only=true: drops the superseded one.
     let result = query_claims_by_label(
         &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec![],
@@ -109,7 +114,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label current_only");
@@ -126,6 +130,7 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
     // Both filters combined: only the live open backlog claim survives.
     let result = query_claims_by_label(
         &server,
+        &viewer,
         QueryClaimsByLabelParams {
             labels: vec!["backlog".into()],
             exclude_labels: vec!["resolved".into()],
@@ -134,7 +139,6 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
             limit: Some(10),
             offset: None,
         },
-        None,
     )
     .await
     .expect("query_claims_by_label both filters");
@@ -151,25 +155,32 @@ async fn query_by_label_returns_labels_and_filters(pool: PgPool) {
 /// `redact_content` call; their distinctive failure mode is a branch inversion
 /// (or the content_hash oracle leak), both of which a single private claim
 /// detects. Seeds one `private`-partition labelled claim and asserts the OWNER
-/// sees full content + real hash while a STRANGER sees "[REDACTED]" + blank
-/// hash. The stranger assertions fail if the redaction branch is
-/// deleted/inverted; the blank-hash assertion fails if content_hash
-/// (= BLAKE3(content)) is leaked for a redacted claim.
+/// sees full content + real hash while a STRANGER sees it **not at all**.
+///
+/// **CORRECTED FOR PR-12.** This comment used to say the stranger sees
+/// `"[REDACTED]"` + a blank hash. The claim's tenancy columns carry the
+/// privacy — migration 071 transcribed them from an `ownership` row until PR-22
+/// retired the table, and the fixture writes them directly now — so the
+/// stranger's `Viewer` excludes the row and the result set simply does not
+/// contain it, which subsumes both old assertions and discloses less.
+///
+/// **CORRECTED AGAIN FOR PR-14.** This paragraph used to close by pointing at
+/// `get_claim.rs::get_claim_blanks_the_content_hash_when_it_redacts` and at
+/// `src/tools/redaction.rs`'s unit test as the places the hash-oracle guard
+/// still lived. PR-14 deleted the branch, so both are gone and the guard is not
+/// re-homed anywhere — it does not need to be. The oracle was that
+/// `content_hash = BLAKE3(content)` unsalted, so returning the hash beside a
+/// blanked body confirms a guessable claim. With no branch that returns a row
+/// WITHOUT its content, no response can carry one field and not the other: the
+/// oracle is closed by construction rather than by an assertion somewhere else.
+/// `epigraph-api/tests/no_redaction_sentinel.rs` keeps it that way.
 #[sqlx::test(migrations = "../../migrations")]
-async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
+async fn query_by_label_hides_private_content_from_strangers(pool: PgPool) {
     let owner = seed_agent(&pool).await;
     let claim_id = seed_claim(&pool, owner, &["backlog"], true, None).await;
     let expected_content = format!("test claim {}", claim_id.as_uuid());
 
-    sqlx::query(
-        "INSERT INTO ownership (node_id, node_type, partition_type, owner_id) \
-         VALUES ($1, 'claim', 'private', $2)",
-    )
-    .bind(claim_id.as_uuid())
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("seed private ownership");
+    common::seed_private_tenancy(&pool, claim_id.as_uuid(), owner).await;
 
     let server = build_test_server(pool.clone());
 
@@ -182,9 +193,16 @@ async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
         offset: None,
     };
 
+    // PR-12: resolve the Viewer for the acting principal, as production does.
+    // The claim is group-private in the tenancy columns, so an empty-group
+    // `public_viewer` cannot see it at all — not even as its owner.
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve owner viewer");
+
     // Owner → full content + real hash.
     let owner_claims = parse_claims(
-        &query_claims_by_label(&server, params(), Some(owner))
+        &query_claims_by_label(&server, &owner_viewer, params())
             .await
             .expect("query as owner"),
     );
@@ -199,25 +217,27 @@ async fn query_by_label_redacts_private_content_for_strangers(pool: PgPool) {
         "owner must see the real content_hash: {owner_claim:?}"
     );
 
-    // Stranger → redacted content + blank hash.
+    // Stranger. PR-12 TIGHTENING: absent, not blanked. The claim is now
+    // ('group', <owner's personal group>), so the stranger's Viewer excludes it.
+    // That subsumes BOTH assertions this case used to make — a row that is never
+    // returned leaks neither `content` nor the `content_hash` confirmation
+    // oracle — and leaks strictly less, because the stranger no longer learns
+    // the claim exists.
     let stranger = Uuid::new_v4();
+    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve stranger viewer");
     let stranger_claims = parse_claims(
-        &query_claims_by_label(&server, params(), Some(stranger))
+        &query_claims_by_label(&server, &stranger_viewer, params())
             .await
             .expect("query as stranger"),
     );
-    let stranger_claim = find_claim(&stranger_claims, claim_id);
-    assert_eq!(
-        stranger_claim["content"].as_str().unwrap(),
-        "[REDACTED]",
-        "stranger must NOT see private content — fails if the redaction branch \
-         is deleted or inverted"
-    );
-    assert_eq!(
-        stranger_claim["content_hash"].as_str().unwrap(),
-        "",
-        "stranger must NOT see the content_hash — BLAKE3(content) is a \
-         confirmation oracle for the redacted content"
+    assert!(
+        stranger_claims
+            .iter()
+            .all(|c| c["id"].as_str() != Some(claim_id.as_uuid().to_string().as_str())),
+        "a transcribed private claim must be ABSENT for a stranger, not returned \
+         blanked; got {stranger_claims:?}"
     );
 }
 

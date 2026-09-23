@@ -30,7 +30,6 @@ DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/
 import argparse
 import json
 import math
-import os
 import sys
 import uuid
 from collections import defaultdict
@@ -39,6 +38,8 @@ import numpy as np
 import psycopg2
 import psycopg2.extras
 from sklearn.cluster import MiniBatchKMeans
+
+from maintenance_dsn import maintenance_dsn
 
 psycopg2.extras.register_uuid()
 
@@ -381,7 +382,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evidential clustering with compound claim structure")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
         help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
     )
     parser.add_argument("--limit", type=int, default=500)

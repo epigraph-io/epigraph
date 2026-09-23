@@ -65,6 +65,7 @@ struct RecomputeBeliefsResult {
 /// order, so the frame-agnostic cached scalars converge deterministically.
 pub async fn recompute_beliefs(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: RecomputeBeliefsParams,
 ) -> Result<CallToolResult, McpError> {
     let pool = &server.pool;
@@ -74,37 +75,45 @@ pub async fn recompute_beliefs(
     let claim_ids_param = params.claim_ids.unwrap_or_default();
     let labels_param = params.labels.unwrap_or_default();
 
-    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) = if !claim_ids_param
-        .is_empty()
-    {
-        let mut ids = Vec::with_capacity(claim_ids_param.len());
-        for s in &claim_ids_param {
-            ids.push(
-                Uuid::parse_str(s.trim())
-                    .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
-            );
-        }
-        ("claim_ids", ids, false)
-    } else if !labels_param.is_empty() {
-        // Fetch limit+1 to distinguish "exactly limit, none remain" from
-        // "limit reached, more remain" (same trick as the bulk path).
-        let mut rows =
-            ClaimRepository::list_by_labels(pool, &labels_param, &[], true, 0.0, limit + 1, offset)
-                .await
-                .map_err(internal_error)?;
-        let truncated = rows.len() as i64 > limit;
-        rows.truncate(limit as usize);
-        let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
-        ("labels", ids, truncated)
-    } else {
-        // Fetch limit+1 to detect truncation, then trim back to limit.
-        let mut ids = MassFunctionRepository::list_claim_ids(pool, limit + 1, offset)
+    let (target, claim_ids, truncated): (&'static str, Vec<Uuid>, bool) =
+        if !claim_ids_param.is_empty() {
+            let mut ids = Vec::with_capacity(claim_ids_param.len());
+            for s in &claim_ids_param {
+                ids.push(
+                    Uuid::parse_str(s.trim())
+                        .map_err(|e| invalid_params(format!("invalid claim_id {s:?}: {e}")))?,
+                );
+            }
+            ("claim_ids", ids, false)
+        } else if !labels_param.is_empty() {
+            // Fetch limit+1 to distinguish "exactly limit, none remain" from
+            // "limit reached, more remain" (same trick as the bulk path).
+            let mut rows = ClaimRepository::list_by_labels(
+                pool,
+                viewer,
+                epigraph_db::LabelQuery {
+                    labels: &labels_param,
+                    current_only: true,
+                    limit: limit + 1,
+                    offset,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(internal_error)?;
-        let truncated = ids.len() as i64 > limit;
-        ids.truncate(limit as usize);
-        ("all_with_bbas", ids, truncated)
-    };
+            let truncated = rows.len() as i64 > limit;
+            rows.truncate(limit as usize);
+            let ids: Vec<Uuid> = rows.into_iter().map(|(c, _)| c.id.into()).collect();
+            ("labels", ids, truncated)
+        } else {
+            // Fetch limit+1 to detect truncation, then trim back to limit.
+            let mut ids = MassFunctionRepository::list_claim_ids(pool, viewer, limit + 1, offset)
+                .await
+                .map_err(internal_error)?;
+            let truncated = ids.len() as i64 > limit;
+            ids.truncate(limit as usize);
+            ("all_with_bbas", ids, truncated)
+        };
 
     let claims_considered = claim_ids.len();
     let mut claims_recomputed = 0usize;
@@ -113,31 +122,36 @@ pub async fn recompute_beliefs(
     let mut errors: Vec<RecomputeError> = Vec::new();
 
     for claim_id in claim_ids {
-        let frames = MassFunctionRepository::list_frames_for_claim(pool, claim_id)
+        let frames = MassFunctionRepository::list_frames_for_claim(pool, viewer, claim_id)
             .await
             .map_err(internal_error)?;
         if frames.is_empty() {
             claims_skipped_no_bba += 1;
             continue;
         }
+        // Exactly ONE frame owns the shared claims.* cache (backlog 696d3a1c).
+        // Looping over every frame here wrote that cache once per frame and let
+        // the alphabetically last one win, silently reverting edge-derived
+        // belief. `frame_writes` is consequently now at most 1 per claim.
+        let owner_frame = frames
+            .iter()
+            .map(|(id, _)| *id)
+            .next()
+            .expect("frames is non-empty: checked above");
         let mut wrote_any = false;
-        for (frame_id, _name) in frames {
-            match epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-                pool, claim_id, frame_id,
-            )
+        match epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id)
             .await
-            {
-                Ok(true) => {
-                    frame_writes += 1;
-                    wrote_any = true;
-                }
-                Ok(false) => {}
-                Err(e) => errors.push(RecomputeError {
-                    claim_id: claim_id.to_string(),
-                    frame_id: frame_id.to_string(),
-                    error: e,
-                }),
+        {
+            Ok(true) => {
+                frame_writes += 1;
+                wrote_any = true;
             }
+            Ok(false) => {}
+            Err(e) => errors.push(RecomputeError {
+                claim_id: claim_id.to_string(),
+                frame_id: owner_frame.to_string(),
+                error: e,
+            }),
         }
         if wrote_any {
             claims_recomputed += 1;

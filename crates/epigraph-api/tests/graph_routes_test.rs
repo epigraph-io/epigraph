@@ -1,35 +1,70 @@
 #![cfg(feature = "db")]
+//! # Why the cluster arms here take an injected `pool`
+//!
+//! The four community-graph arms assert **whole-table** properties: "no runs
+//! exist anywhere", "the latest run has exactly 2 clusters / 1 cluster edge",
+//! "this cluster expands to exactly 5 nodes", and "an unknown cluster id is
+//! 404". The routes answer from the LATEST run, so those counts are global by
+//! design and cannot be narrowed to self-created rows without deleting the
+//! run-selection logic from the test.
+//!
+//! They used to manufacture that global precondition by TRUNCATING
+//! `graph_cluster_runs`, `cluster_edges`, `claim_cluster_membership` and
+//! `graph_clusters` on a shared database — which made them destructive to every
+//! sibling binary and dependent on the order they ran in. This is the recorded
+//! finding F-tests-depend-on-accumulated-shared-db-fixtures.
+//!
+//! `#[sqlx::test]` supplies the empty database directly, so the assertions are
+//! UNCHANGED and the truncation is simply unnecessary. One arm was worse than
+//! flaky: `expand_returns_404_for_unknown_cluster` can pass FOR THE WRONG
+//! REASON on a shared database, because the handler returns 404 both for "no
+//! such cluster in the latest run" (the branch under test) and for "no runs at
+//! all" (what a sibling's truncation leaves behind). A private database makes
+//! the seeded run a guarantee rather than a race, so only the intended branch
+//! can produce the 404.
+//!
+//! `spawn_app` builds its own pool FROM A URL, so each arm hands it
+//! `fixture::database_url_for(&pool)` — the per-test database's own URL. Passing
+//! the ambient `DATABASE_URL` here would seed the private database and then
+//! assert against the shared one, which is the silent-vacuous-pass failure this
+//! note exists to prevent.
+//!
+//! # These arms lost their multi-threaded runtime, deliberately
+//!
+//! They were `#[tokio::test(flavor = "multi_thread")]`. `#[sqlx::test]` drives
+//! the future through sqlx's `rt::test_block_on`, which builds a
+//! CURRENT-THREAD Tokio runtime, so the axum server `spawn_app` spawns and the
+//! reqwest client that drives it are now cooperatively scheduled on ONE thread.
+//! That is fine today -- nothing in the request path blocks: there is no
+//! `block_in_place`, `Handle::block_on` or `futures::executor::block_on`
+//! anywhere in epigraph-api/db/engine `src/`, and `spawn_app` binds an
+//! ephemeral port so there is no fixed-port contention. It is written down
+//! because it is a PRECEDENT: the next shard converts the remaining
+//! `flavor = "multi_thread"` arms in this package the same way, and the day a
+//! handler grows a blocking call it will panic ("can call blocking only when
+//! running on the multi-threaded runtime") or deadlock outright, with nothing
+//! in that diff to explain why.
+//!
+//! The two remaining `#[tokio::test]` arms are deliberately left alone:
+//! `legacy_neighborhood_endpoint_returns_410_gone` and
+//! `graph_endpoints_require_bearer` assert 410/401 unconditionally, read no
+//! table and mutate none, so per-test provisioning would cost time and buy no
+//! isolation.
 
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
 mod common;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn overview_with_no_runs_returns_no_clusters_computed() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM cluster_edges")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claim_cluster_membership")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_clusters")
-        .execute(&pool)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_with_no_runs_returns_no_clusters_computed(pool: PgPool) {
+    // No truncation and no seeding: #[sqlx::test] IS the "no runs exist" state
+    // this arm previously tried to create by emptying four shared tables.
+    let url = fixture::database_url_for(&pool).await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
@@ -48,30 +83,9 @@ async fn overview_with_no_runs_returns_no_clusters_computed() {
     assert_eq!(body["supernodes"].as_array().unwrap().len(), 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn overview_returns_seeded_supernodes() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_cluster_runs")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM cluster_edges")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM claim_cluster_membership")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graph_clusters")
-        .execute(&pool)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_returns_seeded_supernodes(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
     let run_id = uuid::Uuid::new_v4();
     let c1 = uuid::Uuid::new_v4();
     let c2 = uuid::Uuid::new_v4();
@@ -114,14 +128,9 @@ async fn overview_returns_seeded_supernodes() {
     assert_eq!(body["degraded"], false);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn expand_returns_cluster_members_with_induced_edges() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn expand_returns_cluster_members_with_induced_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
     let cluster_id = common::seed_one_cluster(&pool, 5).await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
@@ -142,17 +151,18 @@ async fn expand_returns_cluster_members_with_induced_edges() {
     assert_eq!(body["truncated"], false);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn expand_returns_404_for_unknown_cluster() {
-    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .unwrap();
+#[sqlx::test(migrations = "../../migrations")]
+async fn expand_returns_404_for_unknown_cluster(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
     // Need at least one run row so the handler reaches the per-cluster check (404
     // also happens when no run exists, but we want to specifically test the
     // "no such cluster in latest run" branch). seed_one_cluster sets that up.
+    //
+    // On a shared database that was a HOPE, not a guarantee: any sibling arm
+    // truncating graph_cluster_runs between this seed and the request sent the
+    // handler down the "no runs at all" branch, which returns the same 404 and
+    // made the assertion pass while testing nothing. The per-test database is
+    // what makes the seeded run survive to the assertion.
     let _ = common::seed_one_cluster(&pool, 1).await;
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let bogus = uuid::Uuid::new_v4();

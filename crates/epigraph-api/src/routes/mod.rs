@@ -76,16 +76,17 @@ pub mod lineage;
 pub mod mcp_tools;
 #[cfg(feature = "db")]
 pub mod methods;
-#[cfg(feature = "enterprise")]
-pub mod mpc;
 #[cfg(test)]
 mod negative_tests;
-pub mod ownership;
 pub mod papers;
 pub mod perspective;
 #[cfg(feature = "db")]
 pub mod policies;
 pub mod political;
+pub mod privatization;
+/// Deterministic 2-D PCA used by `/themes/:id/embeddings` so that endpoint can
+/// serve theme-splitting clients without disclosing raw embedding vectors.
+pub mod projection;
 #[cfg(feature = "db")]
 pub mod provenance;
 pub mod rag;
@@ -108,10 +109,103 @@ pub mod webhooks;
 #[cfg(feature = "db")]
 pub mod workflows;
 
-use crate::metrics;
+/// Finish a viewer-stamped read, mapping a failed finish to a 500.
+///
+/// # Why this lives here and not in one route file
+///
+/// PR-28 introduced it as a private helper in `claims_query.rs`, correctly, for
+/// a handler with two return paths. PR-29 is the first MULTI-FILE conversion
+/// shard and needs the identical finish on five success paths across three
+/// files, so it is promoted here rather than copied four times. The `handler`
+/// argument is what the private version hard-coded in its log line; it is a
+/// `&'static str` so a caller cannot make the log field caller-controlled data.
+/// `claims_query.rs` now calls this and its private copy is gone — that is a
+/// consolidation, not a behaviour change, and the two log lines it emits are
+/// byte-identical to the ones it emitted before.
+///
+/// # Why an explicit finish at all
+///
+/// [`epigraph_db::ScopedRead`] has no `Drop` impl, so under
+/// `SessionGucMode::Transaction` an un-finished read rolls back silently; the
+/// read is read-only, so nothing is lost, but the connection is returned a round
+/// trip later than it needed to be. The `Session` arm is a bare connection and
+/// finishing it is a no-op — which is exactly why this must not be left to the
+/// mode: a shard that skips it looks correct in one configuration and is
+/// wasteful in the other.
+///
+/// Same error shape as the acquire: the reason goes to the operator's log, the
+/// client gets an opaque message. A `format!`-ed `DbError` here would render its
+/// `#[source]` driver text into the response body, since `errors.rs` serialises
+/// `ApiError::InternalError { message }` verbatim.
+///
+/// # Why the failure is FATAL here, when the primitive says it need not be
+///
+/// A DELIBERATE choice, recorded because this is the shape the remaining
+/// conversion shards copy. [`epigraph_db::ScopedRead::commit`]'s own doc says
+/// skipping the finish on a read is safe — sqlx rolls back on drop and a read
+/// has nothing to lose — so a caller could log a commit failure and still answer
+/// 200 with rows it already holds. This propagates instead, and the reason is
+/// that the two are not the same claim. "The finish is optional" is about
+/// SKIPPING it; this helper RAN it and the server said no. Under
+/// `SessionGucMode::Transaction` that is a failed COMMIT of the very transaction
+/// the tenancy predicate was evaluated in, and a handler cannot distinguish "the
+/// rows are fine, only the bookkeeping failed" from "the session was not in the
+/// state I believed it was" without inspecting driver internals. Answering 500
+/// costs a retry; answering 200 on an unverified session is the failure
+/// direction this whole series exists to remove. The cost is bounded and known:
+/// under `SessionGucMode::Session` the commit is a no-op, so this branch is
+/// unreachable in the default configuration.
+///
+/// # What is NOT owed
+///
+/// An ERROR path may drop the read without finishing it. That is the documented
+/// safe case on a read, and every early `?` return in a converted handler relies
+/// on it. Only success paths call this.
+///
+/// # A RULE FOR CONVERTED HANDLERS THAT NOTHING IN THE GATE ENFORCES
+///
+/// Recorded here because this is the one file every remaining conversion shard
+/// reads, and because the property is NEW: before the conversion each read took
+/// its own pooled connection, so an error was contained to that statement.
+///
+/// Under `SessionGucMode::Transaction` the shared [`epigraph_db::ScopedRead`] is
+/// one transaction, and a statement error ABORTS it — every subsequent statement
+/// on that handle then fails, and the abort is silent if the error was swallowed
+/// with `.ok()` or `.unwrap_or_default()`. So a converted handler may swallow an
+/// error only on its LAST statement; anything that reads afterwards must
+/// propagate. A handler that gets this wrong does not fail loudly: it can return
+/// 200 with an empty result set that is indistinguishable from a legitimate
+/// tenancy suppression.
+///
+/// PR-29 has two swallowed-error sites and both are compliant BY POSITION, which
+/// is exactly why the rule is written down rather than left to the next author's
+/// luck: `search.rs::semantic_search`'s `semantic_graph_neighbors(..)
+/// .unwrap_or_default()` has no read after it (its results are already built
+/// from the full-row fetch), and `methods.rs::get_method`'s
+/// `get_evidence_strength(..).ok()` is that handler's final statement.
+#[cfg(feature = "db")]
+pub(crate) async fn finish_scoped_read(
+    read: epigraph_db::ScopedRead<'_>,
+    handler: &'static str,
+) -> Result<(), crate::errors::ApiError> {
+    read.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = handler,
+            "could not finish a viewer-stamped read"
+        );
+        crate::errors::ApiError::InternalError {
+            message: "Failed to finish the scoped read".to_string(),
+        }
+    })
+}
+
+// `crate::metrics` is deliberately NOT imported here. `/metrics` was removed
+// from both router variants in PR-03 and is served only by the internal
+// listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).
 use crate::middleware::{
     bearer_auth_middleware, optional_bearer_auth_middleware, rate_limit_middleware,
-    require_signature,
 };
 use crate::state::AppState;
 use axum::{
@@ -121,47 +215,57 @@ use axum::{
     Router,
 };
 
-/// Create the main application router with all routes
+/// Create the main application router with all routes.
 ///
-/// # Route Structure
+/// # Route structure — authenticated by default
 ///
-/// Routes are organized into two categories:
+/// Three routers are merged, and the split between them is the security
+/// boundary:
 ///
-/// ## Protected Routes (require Ed25519 signature)
+/// ## `protected` — requires an OAuth2 Bearer token
 ///
-/// Write operations that modify system state:
-/// - `POST /claims` - Create a new claim
-/// - `POST /agents` - Register a new agent
-/// - `POST /api/v1/submit/packet` - Submit an epistemic packet
+/// Everything that reads or writes claim content, claim-derived structure,
+/// ACLs, embeddings or aggregates. `bearer_auth_middleware` rejects a request
+/// with no `Authorization` header, or with a revoked / malformed / expired
+/// token, with 401 and an RFC 6750 `WWW-Authenticate: Bearer …,
+/// error="invalid_token"` challenge.
 ///
-/// ## Public Routes (no authentication required)
+/// ## `public` — the anonymous ALLOWLIST, two routes
 ///
-/// Read-only operations for transparency:
-/// - `GET /health` - Health check endpoint
-/// - `GET /claims` - List claims
-/// - `GET /claims/:id` - Get a specific claim
-/// - `GET /agents` - List agents
-/// - `GET /agents/:id` - Get a specific agent
-/// - `GET /lineage/:claim_id` - Get claim lineage
-/// - `POST /api/v1/search/semantic` - Semantic search (read operation)
-/// - `GET /api/v1/query/rag` - RAG context retrieval (high-truth claims)
+/// - `GET /health` — static, stateless
+/// - `GET /api/v1/openapi.json` — static schema document
 ///
-/// # Security
+/// Enforced by `crates/epigraph-api/tests/public_router_allowlist.rs`, which
+/// fails if a third route appears here.
 ///
-/// Protected routes use the `require_signature` middleware which:
-/// 1. Verifies Ed25519 signatures on requests
-/// 2. Validates request timestamps (prevents replay attacks)
-/// 3. Confirms agent is registered in the system
-/// 4. Injects `VerifiedAgent` into request extensions for handlers
+/// ## `oauth` — anonymous by construction
 ///
-/// # Rate Limiting
+/// The 11 `/oauth/*` and `/.well-known/*` endpoints. Discovery and token
+/// issuance must precede authentication, so they cannot sit behind it.
 ///
-/// All routes (except health endpoints) are subject to rate limiting when
-/// a rate limiter is configured in AppState. Rate limits apply per-agent
-/// for authenticated requests and per-IP for unauthenticated requests.
+/// # What changed in PR-03
+///
+/// Before PR-03 the `public` router held 108 registrations, including
+/// `GET /claims`, `GET /claims/:id`, `GET /agents`, `GET /lineage/:claim_id`,
+/// `POST /api/v1/search/semantic` and `GET /api/v1/query/rag`, all reachable
+/// with no credential. 105 of them moved to `protected`, `/metrics` moved to a
+/// separate internal listener, and the remaining two are the allowlist above.
+/// **The RAG and evidence-search public-access guarantees are revoked.**
+///
+/// The `require_signature` (Ed25519 request-signing) middleware was deleted
+/// rather than moved: it was unreachable through this router. Payload-level
+/// packet signatures are unaffected — see `ApiConfig::require_packet_signatures`
+/// and `routes/submit.rs`.
+///
+/// # Rate limiting
+///
+/// All routes (except health endpoints) are subject to rate limiting when a
+/// rate limiter is configured in `AppState`.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
-    // Protected write operations - require signature verification
+    // Write operations. Read operations are appended below by the PR-03
+    // inversion; the two halves are separate only because of the order the
+    // chain was written in, not because they differ in authority.
     let protected = Router::new()
         .route("/claims", post(claims::create_claim))
         .route("/api/v1/claims", post(claims::create_claim))
@@ -308,11 +412,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/contexts", post(context::create_context))
         .route("/api/v1/frames/:id/refine", post(belief::refine_frame))
-        .route("/api/v1/ownership", post(ownership::assign_ownership))
-        .route(
-            "/api/v1/ownership/:node_id",
-            put(ownership::update_partition),
-        )
         .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
         .route("/api/v1/workflows", post(workflows::store_workflow))
         .route("/api/v1/workflows/ingest", post(workflows::ingest_workflow))
@@ -415,16 +514,24 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/hypothesis/:id/promote",
             post(hypothesis::promote_hypothesis),
         )
-        // Encrypted subgraph group management
+        // Encrypted subgraph group management. ALL group routes are protected,
+        // GET included: PR-02 moved `GET /api/v1/groups/:id` out of the
+        // anonymous `public` router because a group's roster size and epoch
+        // state describe a tenancy boundary. The `protected` router layers
+        // `bearer_auth_middleware` unconditionally, so the handler gets a
+        // mandatory AuthContext with no further wiring.
         .route("/api/v1/groups", post(groups::create_group))
+        .route("/api/v1/groups/:id", get(groups::get_group))
         .route("/api/v1/groups/:id/members", post(groups::add_member))
         .route(
             "/api/v1/groups/:id/members/:agent_id",
             delete(groups::remove_member),
         )
-        // /api/v1/groups/:id/rotate-key — enterprise feature (key rotation via epigraph-privacy)
+        // PR-20's rotation, spelled `/rotate` — what FINAL-PLAN §6.7 and its
+        // interface table say. The `/rotate-key` spelling this comment used to
+        // carry was never served by anything.
+        .route("/api/v1/groups/:id/rotate", post(groups::rotate_key))
         // Isomorphism pattern detection (episcience feature)
-        // MPC joint recall (enterprise feature)
         // Admin OAuth client management
         .route(
             "/api/v1/admin/clients/:id/approve",
@@ -461,6 +568,63 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/tasks/:id/fail", post(tasks::fail_task))
         // Security audit log — requires audit:read scope
         .route("/api/v1/audit/security", get(audit::query_security_events))
+        // D4 admin privatization (FINAL-PLAN §6.5.7). PROTECTED, never public:
+        // every one of these carries §6.6's three-condition check, and
+        // `public_router_allowlist.rs` asserts the anonymous surface is exactly
+        // `/health` and `/api/v1/openapi.json`.
+        .route(
+            "/api/v1/admin/privatization/plans",
+            post(privatization::create_plan).get(privatization::list_plans),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id",
+            get(privatization::get_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/items",
+            get(privatization::get_plan_items),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/approve",
+            post(privatization::approve_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/apply",
+            post(privatization::apply_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/abort",
+            post(privatization::abort_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/revert",
+            post(privatization::revert_plan),
+        )
+        // The §6.5.6 seal ceremony. `seal-manifest` is the one route in this
+        // process that streams plaintext the caller may not otherwise read, so
+        // it is protected-router-only and never appears in the anonymous
+        // allowlist. Deliberately NOT exposed over MCP (§6.5.7): an agent tool
+        // is the wrong shape for a key ceremony.
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-manifest",
+            get(privatization::seal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-commit",
+            post(privatization::seal_commit),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-manifest",
+            get(privatization::unseal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-commit",
+            post(privatization::unseal_commit),
+        )
+        .route(
+            "/api/v1/admin/privatization/audit",
+            get(privatization::get_audit),
+        )
         .route("/api/v1/graph/communities/overview", get(graph::overview))
         .route("/api/v1/graph/communities/:id/expand", get(graph::expand))
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
@@ -497,34 +661,30 @@ pub fn create_router(state: AppState) -> Router {
             post(cross_source::decide_candidate),
         );
 
-    // Auth middleware stack (outermost runs first):
-    // 1. bearer_auth_middleware: if Bearer token present, validate JWT + inject AuthContext
-    //    If no Bearer but X-Signature present, falls through to next layer.
-    // 2. require_signature: Ed25519 signature verification (legacy)
+    // ------------------------------------------------------------------
+    // PR-03: THE INVERSION.
     //
-    // Axum layers are applied inner-to-outer, so we apply signature first, then bearer.
-    let protected = if state.config.require_signatures {
-        protected
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_signature,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-    } else {
-        // Even without signature requirement, accept bearer tokens when present
-        protected.layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
-    };
-
-    // Public read operations - no authentication required
-    let public = Router::new()
-        .route("/health", get(health::health_check))
-        .route("/metrics", get(metrics::metrics_handler))
+    // Everything from here to the end of this chain used to live in a
+    // separate `public` Router layered with `optional_bearer_auth_middleware`,
+    // which passes a request with no Authorization header straight through
+    // with no `AuthContext` ("anonymous pass-through", bearer.rs). That made
+    // every route below — verbatim claim text via `/api/v1/search/semantic`
+    // and `/api/v1/query/rag`, the ownership ACL itself via
+    // `/api/v1/ownership/:node_id` (a route PR-14 has since deleted outright,
+    // along with the rest of the legacy `ownership` read/declassify surface),
+    // up to 5000 raw 1536-d embeddings via
+    // `/api/v1/themes/:id/embeddings` — readable by anyone who could reach the
+    // port.
+    //
+    // The rule is not "audit N handlers" — it is invert the split. `public` is
+    // now an ALLOWLIST of two routes (built below); every other registration is
+    // appended to `protected` and inherits `bearer_auth_middleware`.
+    //
+    // Axum permits repeated `.route()` calls on the same path with different
+    // methods, so the GET arms folded in here merge with the PUT/DELETE arms
+    // already registered above (`/api/v1/claims/:id` is the clearest case).
+    // ------------------------------------------------------------------
+    let protected = protected
         .route("/claims", get(claims::list_claims))
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
@@ -593,10 +753,6 @@ pub fn create_router(state: AppState) -> Router {
             get(crud::get_theme_embeddings),
         )
         .route("/api/v1/reasoning/analyze", post(reasoning::analyze))
-        .route(
-            "/api/v1/openapi.json",
-            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
-        )
         .route("/api/v1/events", get(events::list_events))
         .route(
             "/api/v1/graph/snapshot/:version",
@@ -614,6 +770,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/entities/:id/neighborhood",
             get(entities::entity_neighborhood),
         )
+        .route("/api/v1/evidence", get(crud::list_evidence))
         .route("/api/v1/evidence/:id", get(edges::get_evidence))
         .route(
             "/api/v1/claims/:id/provenance",
@@ -672,11 +829,6 @@ pub fn create_router(state: AppState) -> Router {
             get(belief::frame_refinements),
         )
         .route("/api/v1/frames/:id/ancestry", get(belief::frame_ancestry))
-        .route("/api/v1/ownership/:node_id", get(ownership::get_ownership))
-        .route(
-            "/api/v1/agents/:id/owned-nodes",
-            get(ownership::owned_nodes),
-        )
         .route(
             "/api/v1/structural-features/:owner_id",
             get(structural::get_structural_features),
@@ -780,31 +932,64 @@ pub fn create_router(state: AppState) -> Router {
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
         )
-        // Encrypted subgraph read endpoints
-        .route("/api/v1/groups/:id", get(groups::get_group))
         // /api/v1/isomorphism/patterns — episcience feature
         // Task management — read endpoints
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/:id", get(tasks::get_task))
-        // MCP tool discovery — no auth required
+        // MCP tool discovery. Moved behind auth: the same catalog is
+        // available to an authenticated caller over MCP `list_tools`, so an
+        // anonymous copy only gave a scanner a free capability map.
         .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
 
-    // Inject authenticated identity on public reads (no 401 when absent;
-    // 401 on a present-but-invalid token). This makes auth_ctx AVAILABLE to
-    // every public read handler so partition-aware redaction
-    // (check_content_access) can trust it instead of the spoofable ?agent_id
-    // wire param. (A3, spec §7.2)
+    // Authentication for `protected`: OAuth2 Bearer, unconditionally.
     //
-    // NOTE: availability != adoption. As of A3 Tasks 4-7 the following read
-    // handlers now consume auth_ctx (deriving the requester from the
-    // authenticated agent_id, client_id fallback) instead of trusting the
-    // spoofable params.agent_id:
-    //   - claims::{get_claim,list_claims}                     (A3 Tasks 4-5)
-    //   - belief::{claims_by_belief,frame_claims_sorted}      (A3 Task 6)
-    //   - edges.rs read handlers + evidence_by_relationship   (A3 Task 7)
-    // The one remaining read handler still passing the spoofable
-    // params.agent_id (a live bypass until migrated) is:
-    //   - graph_query::execute_graph_query                    -> A3 Task 8
+    // This used to branch on `ApiConfig::require_signatures`, adding a
+    // `require_signature` (Ed25519 request-signing) layer when set. That
+    // middleware short-circuited on any request carrying an `AuthContext` and
+    // bearer auth ran first, so it was unreachable through this router; it has
+    // been deleted. `require_packet_signatures` survives under its new name and
+    // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
+    // a different mechanism at a different layer.
+    let protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        bearer_auth_middleware,
+    ));
+
+    // The anonymous allowlist. Adding a route here is a security decision;
+    // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
+    // until the allowlist in that test is updated to match, which forces the
+    // addition past a reviewer.
+    //
+    //   /health              — `health::health_check` takes no state and
+    //                          returns a static struct. Load balancers need it.
+    //   /api/v1/openapi.json — a static schema document.
+    //
+    // `/metrics` is NOT here: it moved off the public listener entirely to a
+    // separate internal listener bound by `bin/server.rs`
+    // (`EPIGRAPH_METRICS_ADDR`, default 127.0.0.1:9090). Prometheus exposition
+    // is an operational surface, not a public one.
+    //
+    // The `/oauth/*` and `/.well-known/*` router below is the third anonymous
+    // surface, and is anonymous by construction: discovery and token issuance
+    // must precede authentication.
+    let public = Router::new()
+        .route("/health", get(health::health_check))
+        .route(
+            "/api/v1/openapi.json",
+            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
+        );
+
+    // Layered on the two-route allowlist: a request with no Authorization
+    // header passes through, a request with a present-but-invalid token still
+    // 401s. Retained rather than dropped so an allowlisted handler can still
+    // see who is calling when a token happens to be supplied.
+    //
+    // The block that used to stand here catalogued which public read handlers
+    // had adopted `auth_ctx` for partition-aware redaction and which still
+    // trusted the spoofable `?agent_id` wire param. It is gone because the
+    // premise is gone: those handlers are no longer reachable without a
+    // credential at all. The remaining work — deriving a `Viewer` on every read
+    // path rather than an `Option<AuthContext>` — is PR-07.
     let public = public.layer(middleware::from_fn_with_state(
         state.clone(),
         optional_bearer_auth_middleware,
@@ -853,22 +1038,30 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Create a router without database-dependent routes
-/// Used for testing and when db feature is disabled
+/// Create a router without database-dependent routes.
 ///
-/// # Route Structure
+/// # Status: not built in any supported configuration
 ///
-/// ## Protected Routes (require Ed25519 signature)
-/// - `POST /api/v1/submit/packet` - Submit an epistemic packet
+/// `epigraph-api`'s default feature set is `["db"]` and every CI job builds
+/// with defaults. `cargo check -p epigraph-api --no-default-features` has been
+/// failing for some time (28 pre-existing errors: missing `sqlx`, `db_pool`,
+/// `ClaimId`, …), so **no compiler checks this function**. It is kept in sync
+/// with the `db` variant by hand and by
+/// `crates/epigraph-api/tests/public_router_allowlist.rs`, which is a
+/// source-text lint precisely so that it covers the block nothing else does.
 ///
-/// ## Public Routes (no authentication required)
-/// - `GET /health` - Health check endpoint
-/// - `GET /api/v1/query/rag` - RAG context retrieval (high-truth claims)
+/// # Route structure
 ///
-/// # Rate Limiting
+/// Mirrors the `db` variant: `protected` (Bearer required), a two-route
+/// anonymous `public` allowlist (`GET /health`, `GET /api/v1/openapi.json`),
+/// and an `oauth` router — which here has **9** routes rather than 11, lacking
+/// `/oauth/callback` and `/oauth/authorize/consent`. That divergence is
+/// pre-existing and is asserted, not fixed, by the allowlist test.
 ///
-/// All routes (except health endpoints) are subject to rate limiting when
-/// a rate limiter is configured in AppState.
+/// # Rate limiting
+///
+/// All routes (except health endpoints) are subject to rate limiting when a
+/// rate limiter is configured in `AppState`.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
     // Protected write operations
@@ -1003,11 +1196,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/contexts", post(context::create_context))
         .route("/api/v1/frames/:id/refine", post(belief::refine_frame))
-        .route("/api/v1/ownership", post(ownership::assign_ownership))
-        .route(
-            "/api/v1/ownership/:node_id",
-            put(ownership::update_partition),
-        )
         .route("/api/v1/claims/:id/relate", post(edges::relate_claims))
         // Political network monitoring — write endpoints (non-db stubs)
         .route(
@@ -1015,30 +1203,25 @@ pub fn create_router(state: AppState) -> Router {
             post(political::create_technique),
         )
         .route("/api/v1/coalitions", post(political::create_coalition));
-    // /api/v1/mpc/joint-recall is an enterprise route; register via enterprise feature
 
-    // Auth middleware: bearer first, then signature fallback (same as db variant)
-    let protected = if state.config.require_signatures {
-        protected
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                require_signature,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-    } else {
-        protected.layer(middleware::from_fn_with_state(
-            state.clone(),
-            bearer_auth_middleware,
-        ))
-    };
-
-    // Public read operations
-    let public = Router::new()
-        .route("/health", get(health::health_check))
-        .route("/metrics", get(metrics::metrics_handler))
+    // ------------------------------------------------------------------
+    // PR-03: THE INVERSION.
+    //
+    // Everything from here to the end of this chain used to live in a
+    // separate `public` Router layered with `optional_bearer_auth_middleware`,
+    // which passes a request with no Authorization header straight through
+    // with no `AuthContext` ("anonymous pass-through", bearer.rs). That made
+    // every route below readable by anyone who could reach the port.
+    //
+    // The rule is not "audit N handlers" — it is invert the split. `public` is
+    // now an ALLOWLIST of two routes (built below); every other registration
+    // is appended to `protected` and inherits `bearer_auth_middleware`.
+    //
+    // Axum permits repeated `.route()` calls on the same path with different
+    // methods, so the GET arms folded in here merge with the PUT/DELETE arms
+    // already registered above (`/api/v1/claims/:id` is the clearest case).
+    // ------------------------------------------------------------------
+    let protected = protected
         .route("/api/v1/claims", get(claims_query::list_claims_query))
         .route("/api/v1/query/rag", get(rag::rag_context))
         .route("/api/v1/search/evidence", get(rag::search_evidence))
@@ -1083,10 +1266,6 @@ pub fn create_router(state: AppState) -> Router {
             get(crud::get_theme_embeddings),
         )
         .route("/api/v1/reasoning/analyze", post(reasoning::analyze))
-        .route(
-            "/api/v1/openapi.json",
-            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
-        )
         .route("/api/v1/events", get(events::list_events))
         .route(
             "/api/v1/graph/snapshot/:version",
@@ -1094,6 +1273,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/graph/edges", get(edges::graph_edges))
         .route("/api/v1/graph/full", get(edges::graph_full))
+        .route("/api/v1/evidence", get(crud::list_evidence))
         .route("/api/v1/evidence/:id", get(edges::get_evidence))
         .route(
             "/api/v1/claims/:id/provenance",
@@ -1152,11 +1332,6 @@ pub fn create_router(state: AppState) -> Router {
             get(belief::frame_refinements),
         )
         .route("/api/v1/frames/:id/ancestry", get(belief::frame_ancestry))
-        .route("/api/v1/ownership/:node_id", get(ownership::get_ownership))
-        .route(
-            "/api/v1/agents/:id/owned-nodes",
-            get(ownership::owned_nodes),
-        )
         .route(
             "/api/v1/structural-features/:owner_id",
             get(structural::get_structural_features),
@@ -1203,10 +1378,106 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/mirror-narratives",
             get(political::mirror_narratives),
+        )
+        // D4 admin privatization. Registered in BOTH `create_router` variants so
+        // the two chains do not diverge on an admin surface; the handlers here
+        // are the `#[cfg(not(feature = "db"))]` arms and answer 503.
+        .route(
+            "/api/v1/admin/privatization/plans",
+            post(privatization::create_plan).get(privatization::list_plans),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id",
+            get(privatization::get_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/items",
+            get(privatization::get_plan_items),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/approve",
+            post(privatization::approve_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/apply",
+            post(privatization::apply_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/abort",
+            post(privatization::abort_plan),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/revert",
+            post(privatization::revert_plan),
+        )
+        // The §6.5.6 seal ceremony. `seal-manifest` is the one route in this
+        // process that streams plaintext the caller may not otherwise read, so
+        // it is protected-router-only and never appears in the anonymous
+        // allowlist. Deliberately NOT exposed over MCP (§6.5.7): an agent tool
+        // is the wrong shape for a key ceremony.
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-manifest",
+            get(privatization::seal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/seal-commit",
+            post(privatization::seal_commit),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-manifest",
+            get(privatization::unseal_manifest),
+        )
+        .route(
+            "/api/v1/admin/privatization/plans/:id/unseal-commit",
+            post(privatization::unseal_commit),
+        )
+        .route(
+            "/api/v1/admin/privatization/audit",
+            get(privatization::get_audit),
         );
 
-    // Inject authenticated identity on public reads (no 401 when absent;
-    // 401 on a present-but-invalid token). (A3, spec §7.2)
+    // Authentication for `protected`: OAuth2 Bearer, unconditionally.
+    //
+    // This used to branch on `ApiConfig::require_signatures`, adding a
+    // `require_signature` (Ed25519 request-signing) layer when set. That
+    // middleware short-circuited on any request carrying an `AuthContext` and
+    // bearer auth ran first, so it was unreachable through this router; it has
+    // been deleted. `require_packet_signatures` survives under its new name and
+    // gates PAYLOAD-level packet signatures inside `routes/submit.rs`, which is
+    // a different mechanism at a different layer.
+    let protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        bearer_auth_middleware,
+    ));
+
+    // The anonymous allowlist. Adding a route here is a security decision;
+    // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
+    // until the allowlist in that test is updated to match, which forces the
+    // addition past a reviewer.
+    //
+    //   /health             — `health::health_check` takes no state and returns
+    //                         a static struct. Load balancers need it.
+    //   /api/v1/openapi.json — a static schema document.
+    //
+    // `/metrics` is NOT here: it moved off the public listener entirely to a
+    // separate internal listener bound by `bin/server.rs`
+    // (`EPIGRAPH_METRICS_ADDR`, default 127.0.0.1:9090). Prometheus exposition
+    // is an operational surface, not a public one.
+    //
+    // The `/oauth/*` and `/.well-known/*` router below is the third anonymous
+    // surface, and is anonymous by construction: discovery and token issuance
+    // must precede authentication.
+    let public = Router::new()
+        .route("/health", get(health::health_check))
+        .route(
+            "/api/v1/openapi.json",
+            get(|| async { axum::Json(crate::openapi::openapi_spec()) }),
+        );
+
+    // Layered on the two-route allowlist: a request with no Authorization
+    // header passes through, a request with a present-but-invalid token still
+    // 401s. Retained rather than dropped so an allowlisted handler can still
+    // see who is calling when a token happens to be supplied.
     let public = public.layer(middleware::from_fn_with_state(
         state.clone(),
         optional_bearer_auth_middleware,

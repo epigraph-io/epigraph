@@ -9,6 +9,11 @@
 //! Idempotent: re-running over already-populated rows fetches zero rows
 //! (filter is `WHERE embedding_3072 IS NULL`). Resumable: filter
 //! `id > $last_id ORDER BY id` continues from the checkpoint UUID.
+//!
+//! SEALED ROWS ARE NEVER SELECTED. This tool is the documented recovery path
+//! for the vector column an unseal does not restore, so it is run deliberately
+//! over corpora that contain sealed rows; the exclusion is what makes that
+//! safe. See [`ReembedTarget::sealed_predicate`].
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +54,38 @@ impl ReembedTarget {
             Self::Claims => "content",
             // evidence.raw_content is the text column (see migration 001).
             Self::Evidence => "raw_content",
+        }
+    }
+
+    /// The `EXISTS` sub-query identifying a SEALED row of this table.
+    ///
+    /// # Why this predicate is not optional
+    ///
+    /// A privatization seal nulls `embedding_3072` and replaces the text column
+    /// with a constant-shaped sentinel — `[sealed:<uuid>]` for a claim, a fixed
+    /// literal for an evidence row. Both survive `embedding_3072 IS NULL AND
+    /// length(<text>) > 0`, so without this clause the selection set is exactly
+    /// the sealed population plus the genuinely-unembedded one, and a run would
+    /// write a sentinel-derived vector into a live ANN column on every sealed
+    /// row. That is `sealed_with_embedding > 0` in CLAUDE.md's audit — the
+    /// condition that document calls a page-the-on-call one — and it is durable:
+    /// the column is no longer NULL, so no later run revisits the row, and an
+    /// unseal leaves it carrying a vector derived from a stub.
+    ///
+    /// KEYED PER TABLE, which is the part that is easy to get wrong. A claim is
+    /// sealed iff `claim_encryption` holds its id; an evidence row is sealed iff
+    /// `evidence_encryption` holds ITS OWN id (`evidence_encryption.evidence_id`
+    /// is the primary key, migration 060). Keying the evidence case on the
+    /// parent claim instead would skip evidence rows that are NOT sealed and
+    /// whose plaintext is real — a different set, and the wrong one to exclude.
+    fn sealed_predicate(self) -> &'static str {
+        match self {
+            Self::Claims => {
+                "EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)"
+            }
+            Self::Evidence => {
+                "EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = evidence.id)"
+            }
         }
     }
 }
@@ -137,6 +174,7 @@ async fn fetch_batch(
 ) -> Result<Vec<(Uuid, String)>, ReembedError> {
     let table = target.table();
     let content_col = target.content_column();
+    let sealed = target.sealed_predicate();
 
     let sql = format!(
         "SELECT id, {content_col} AS content \
@@ -145,6 +183,7 @@ async fn fetch_batch(
            AND ($1::uuid IS NULL OR id > $1) \
            AND {content_col} IS NOT NULL \
            AND length({content_col}) > 0 \
+           AND NOT {sealed} \
          ORDER BY id \
          LIMIT $2"
     );

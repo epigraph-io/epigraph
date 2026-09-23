@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use epigraph_engine::matching::verifier::{
-    map_relationship, MatchVerdict, Verdict, VerifierClient,
+    map_relationship, MatchVerdict, Verdict, VerifierClient, REJECTED_RELATIONSHIP,
 };
 use uuid::Uuid;
 
@@ -61,8 +61,20 @@ fn map_relationship_covers_reranker_vocabulary() {
         map_relationship("contradicts", 0.7),
         MatchVerdict::Contradicts
     );
+    // AMENDED DELIBERATELY (issue #388). This assertion used to read
+    // `MatchVerdict::Distinct` under a test name claiming to "cover the
+    // reranker vocabulary" — it pinned the defect rather than the contract.
+    // `derives_from` is offered to the model as a legal ENDORSEMENT, so it
+    // cannot share a verdict with strings the model never emits; it takes
+    // `refines`'s verdict, which glosses the same way.
     assert_eq!(
         map_relationship("derives_from", 0.7),
+        MatchVerdict::Overlapping
+    );
+
+    // The rejection sentinel is NOT vocabulary and must stay on `Distinct`.
+    assert_eq!(
+        map_relationship(REJECTED_RELATIONSHIP, 0.0),
         MatchVerdict::Distinct
     );
 }

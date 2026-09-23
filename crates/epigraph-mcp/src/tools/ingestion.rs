@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rmcp::model::*;
 use uuid::Uuid;
 
-use crate::errors::{internal_error, invalid_params, McpError};
+use crate::errors::{db_caller_error, internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto::{self, BatchDsEntry};
 use crate::types::*;
@@ -152,6 +152,7 @@ fn effective_pipeline_version(extraction: &DocumentExtraction) -> String {
 
 pub async fn ingest_document(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentParams,
 ) -> Result<CallToolResult, McpError> {
     let canonical = std::fs::canonicalize(&params.file_path)
@@ -171,6 +172,37 @@ pub async fn ingest_document(
 
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+
+    // The ingest is handed to a task DETACHED from this request, so it needs an
+    // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
+    // `Viewer` is not `Clone`; `detach_scoped` is the narrow replacement, and
+    // what it yields is the caller's own scoped read authority and nothing
+    // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
+    // over-reading is wrong: it constrains the VIEWER the detached task holds,
+    // not the task's database reach. `do_ingest_document` takes this `&Viewer`
+    // and spends it at two places; its remaining statements run on
+    // `&server.pool` with no viewer at all. Those are the registered
+    // `epigraph-mcp` limit in `no_unscoped_pool.rs` (a `PgPool`-mention count,
+    // not a converted crate), pre-existing and untouched here — this refusal
+    // does not cover them and must not be read as covering them.
+    //
+    // ABOVE `ensure_paper_node`, not below it, which is the file's own stated
+    // convention two guards up in `do_ingest_document`: fail closed BEFORE any
+    // DB write. On the refusal arm nothing has been written, so no `papers` row
+    // survives an ingest that was refused. `request_viewer` resolves an
+    // `agents.id` on both transports, so the arm is not reachable today — it is
+    // written as a refusal rather than an `expect` because the state it would
+    // represent is a widening, and those fail closed. `invalid_request` rather
+    // than `internal_error` for the same reason `request_viewer` uses it one
+    // frame up: a denial of authority is not a server fault, and classifying it
+    // as one would send an operator hunting a crash.
+    let viewer = viewer.detach_scoped().ok_or_else(|| {
+        McpError::invalid_request(
+            "ingest_document requires the caller's own read authority",
+            None,
+        )
+    })?;
+
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
@@ -178,9 +210,21 @@ pub async fn ingest_document(
         Arc::clone(&server.embedder),
         server.read_only,
     );
+    // The detached task inherits the parent's `ScopedPool` when there is one.
+    // `new_shared` sets `scoped: None`, and a background server that cannot
+    // stamp a connection is the shape that produced the one confirmed orphan on
+    // this path: the ingest's DB writes run where no caller can see the error,
+    // so a refused write reaches nobody. Propagating does not by itself convert
+    // `do_ingest_document`'s statements — they still run on `server.pool` and
+    // remain the registered `epigraph-mcp` limit — but it is what makes that
+    // conversion a change to this file alone rather than to the wiring too.
+    let bg = match server.scoped.as_ref() {
+        Some(scoped) => bg.with_scoped_pool(scoped.clone()),
+        None => bg,
+    };
     let doi_log = doi.clone();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &extraction).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
             tracing::warn!(doi = doi_log, "background ingest_document failed: {e:?}");
         }
     });
@@ -194,11 +238,22 @@ pub async fn ingest_document(
 /// Identical graph result and idempotency gate as the file-path path.
 pub async fn ingest_document_inline(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: IngestDocumentInlineParams,
 ) -> Result<CallToolResult, McpError> {
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+
+    // Same detached-task ownership requirement, the same refusal and the same
+    // before-any-DB-write placement as `ingest_document` above.
+    let viewer = viewer.detach_scoped().ok_or_else(|| {
+        McpError::invalid_request(
+            "ingest_document_inline requires the caller's own read authority",
+            None,
+        )
+    })?;
+
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     let bg = EpiGraphMcpFull::new_shared(
         server.pool.clone(),
@@ -206,9 +261,21 @@ pub async fn ingest_document_inline(
         Arc::clone(&server.embedder),
         server.read_only,
     );
+    // The detached task inherits the parent's `ScopedPool` when there is one.
+    // `new_shared` sets `scoped: None`, and a background server that cannot
+    // stamp a connection is the shape that produced the one confirmed orphan on
+    // this path: the ingest's DB writes run where no caller can see the error,
+    // so a refused write reaches nobody. Propagating does not by itself convert
+    // `do_ingest_document`'s statements — they still run on `server.pool` and
+    // remain the registered `epigraph-mcp` limit — but it is what makes that
+    // conversion a change to this file alone rather than to the wiring too.
+    let bg = match server.scoped.as_ref() {
+        Some(scoped) => bg.with_scoped_pool(scoped.clone()),
+        None => bg,
+    };
     let doi_log = doi.clone();
     tokio::spawn(async move {
-        if let Err(e) = do_ingest_document(&bg, &extraction).await {
+        if let Err(e) = do_ingest_document(&bg, &viewer, &extraction).await {
             tracing::warn!(
                 doi = doi_log,
                 "background ingest_document_inline failed: {e:?}"
@@ -275,6 +342,7 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
 /// `pipeline_version`. Mirrors the inline gate used by `do_ingest_document`.
 pub async fn paper_already_ingested(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
@@ -284,7 +352,7 @@ pub async fn paper_already_ingested(
     else {
         return Ok(None);
     };
-    if PaperRepository::has_processed_by_edge(pool, prior.id, pipeline_version)
+    if PaperRepository::has_processed_by_edge(pool, viewer, prior.id, pipeline_version)
         .await
         .map_err(internal_error)?
     {
@@ -309,6 +377,7 @@ pub async fn paper_already_ingested(
 /// must pass the exact stamp to gate a single chunk.
 pub async fn check_already_ingested(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: CheckAlreadyIngestedParams,
 ) -> Result<CallToolResult, McpError> {
     // A placeholder is not an identity. Answering the gate for `doi: "unknown"`
@@ -325,7 +394,7 @@ pub async fn check_already_ingested(
     let pipeline = params
         .pipeline_version
         .unwrap_or_else(|| PIPELINE_VERSION_BASE.to_string());
-    let paper_id = paper_already_ingested(&server.pool, &params.doi, &pipeline).await?;
+    let paper_id = paper_already_ingested(&server.pool, viewer, &params.doi, &pipeline).await?;
 
     success_json(&CheckAlreadyIngestedResponse {
         already_ingested: paper_id.is_some(),
@@ -355,6 +424,7 @@ pub async fn ingest_document_spine(
 #[allow(clippy::too_many_lines)]
 pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     extraction: &DocumentExtraction,
 ) -> Result<CallToolResult, McpError> {
     // D9 writer-side verbatim re-verification: when the extraction carries
@@ -384,6 +454,14 @@ pub async fn do_ingest_document(
     // set (backlog c9d12a95: neither could ever find it before this label
     // existed).
     let paper_label = format!("doi:{doi}");
+    // Validated ONCE, here, before the paper node or any claim is written.
+    // `doi` comes from the extraction's source metadata, and the per-claim
+    // `update_labels` call that applies this label runs INSIDE the plan walk —
+    // so a `$` in the DOI would fail the ingest partway through, with the paper
+    // row and some claims already landed. Refusing up front keeps the "reject
+    // and write nothing" contract the rest of this branch establishes.
+    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
+        .map_err(db_caller_error)?;
 
     // ── 1. Get-or-create paper node ──
     // (Pipeline-version gate removed: deterministic node ids handle idempotency
@@ -510,6 +588,12 @@ pub async fn do_ingest_document(
     let mut dedup_count = 0_usize;
     let mut ds_entries: Vec<BatchDsEntry> = Vec::new();
 
+    // Tenancy declaration (PR-16), hoisted above the loop -- see
+    // `persist_planned_claim`'s `decl` parameter for why. `TenancyDecl` is
+    // `Copy`, so passing it per iteration costs nothing.
+    let decl = ClaimRepository::default_decl_for_author_pool(pool, agent_id)
+        .await
+        .map_err(internal_error)?;
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
@@ -535,6 +619,7 @@ pub async fn do_ingest_document(
             planned,
             agent_id,
             TruthValue::clamped(raw_truth),
+            decl,
         )
         .await?;
         // Idempotent add: also runs on the dedup branch below, so an atom
@@ -704,6 +789,7 @@ pub async fn do_ingest_document(
         // non-claim edges are filtered inside the helper).
         ds_auto::auto_wire_edge_if_epistemic(
             pool,
+            viewer,
             was_created,
             row.id,
             src,
@@ -720,7 +806,7 @@ pub async fn do_ingest_document(
     let (claims_ds_wired, ds_frame_id) = if ds_entries.is_empty() {
         (None, None)
     } else {
-        match ds_auto::auto_wire_ds_batch(pool, &ds_entries, agent_id).await {
+        match ds_auto::auto_wire_ds_batch(pool, viewer, &ds_entries, agent_id).await {
             Ok((fid, count)) => (Some(count), Some(fid.to_string())),
             Err(e) => {
                 tracing::warn!("ds auto-wire batch failed: {e}");
@@ -783,7 +869,39 @@ pub async fn do_ingest_document(
 
 /// Convert a DOI into a slug form safe for use as a URL path segment or
 /// canonical name: every `/` becomes `-`. Casing is left untouched.
-#[allow(dead_code)] // not yet wired into a caller; covered by unit tests below
+///
+/// # Why this has no caller, and must NOT be wired into the label write
+///
+/// It looks like the missing half of backlog 00ad6fee ("Step 14's
+/// `recompute_beliefs(labels=[doi_slug])` is a no-op — ingest writes
+/// `doi:<doi>`, not the slug"), and the obvious repair is to emit
+/// `doi_to_slug(doi)` alongside `doi:{doi}` at both ingest sites. **Do not.**
+/// That backlog was resolved on the WORKFLOW side and this spelling is now the
+/// one the canonical workflow explicitly warns against.
+///
+/// MEASURED against prod on 2026-09-22: workflow
+/// `48c58117-4c96-5e72-805a-cb1ce7193012`
+/// (`ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction`),
+/// step_index 14, lineage `b5bb0b73-…`. The step claim the backlog quotes —
+/// `1ad33d15-e517-5e73-b3dd-c6ff00a0e2d3`, "`recompute_beliefs(labels=[doi_slug]`
+/// … DOI with slashes replaced by hyphens" — is `is_current: false`. Its head
+/// is `d079cc79-1ba2-4aa2-8705-05a072764c77` (2026-09-02):
+///
+/// > The label is the literal prefix 'doi:' joined to the DOI with slashes
+/// > INTACT … VERIFIED 2026-09-02 across 24 papers … The hyphen-slug form
+/// > previously documented here … and the bare DOI without the 'doi:' prefix
+/// > BOTH match zero claims.
+///
+/// So `doi:{doi}` (what `do_ingest_document` and the spine path already write,
+/// pinned by `ingest_document_smoke::ingested_claims_carry_doi_label_for_recompute`)
+/// is the canonical spelling on both sides. Adding a second, hyphenated label
+/// to every ingested claim would re-legitimise a form the workflow head calls a
+/// silent no-op, and `check_already_ingested` is keyed on the `doi:<key>`
+/// spelling besides.
+///
+/// Kept, not deleted: the doc comment above describes a URL/path-segment use
+/// that is unrelated to labels, and the unit tests below pin the transform.
+#[allow(dead_code)] // deliberately uncalled — see the doc comment above, not a gap
 fn doi_to_slug(doi: &str) -> String {
     doi.replace('/', "-")
 }
@@ -969,6 +1087,15 @@ async fn persist_planned_claim(
     planned: &PlannedClaim,
     agent_id: Uuid,
     truth: TruthValue,
+    // Tenancy declaration (PR-16): the ingesting agent's own personal group,
+    // resolved ONCE by the caller above its loop. It was resolved here per
+    // planned claim until review: an N-claim document then performed N
+    // `pool.acquire()` calls and N identical `SELECT id FROM groups WHERE
+    // did_key = ...` round trips for the same agent.
+    // `epigraph-ingest-executor::execute_workflow_ingest_plan` already hoists
+    // the identical lookup, with a comment saying exactly that; the two
+    // siblings now agree.
+    decl: epigraph_core::TenancyDecl,
 ) -> Result<(Uuid, bool), McpError> {
     if planned.id_is_document_scoped() {
         let was_new = ClaimRepository::create_with_id_if_absent(
@@ -979,6 +1106,7 @@ async fn persist_planned_claim(
             agent_id,
             truth,
             &[],
+            decl,
         )
         .await
         .map_err(internal_error)?;
@@ -995,7 +1123,7 @@ async fn persist_planned_claim(
     // `persisted_id != planned.id` catches a hash collision against some other
     // claim; `trace_id.is_some()` catches genuine atom convergence, where the
     // earlier ingestion already wrote the provenance we must not overwrite.
-    let persisted = ClaimRepository::create(pool, claim)
+    let persisted = ClaimRepository::create(pool, claim, decl)
         .await
         .map_err(internal_error)?;
     let persisted_id: Uuid = persisted.id.into();
@@ -1056,8 +1184,11 @@ pub async fn do_ingest_document_spine(
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
     // See do_ingest_document: attached to every claim so label-based lookup
-    // (recompute_beliefs, query_claims_by_label) can find this paper's set.
+    // (recompute_beliefs, query_claims_by_label) can find this paper's set,
+    // and validated here for the same reason — before the first write.
     let paper_label = format!("doi:{doi}");
+    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
+        .map_err(db_caller_error)?;
 
     // Atom planned IDs — skip these claims and any edges referencing them.
     let atom_planned_ids: HashSet<Uuid> = plan
@@ -1191,6 +1322,10 @@ pub async fn do_ingest_document_spine(
     let mut para_dedup_count = 0_usize;
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
+    // Hoisted, as above.
+    let decl = ClaimRepository::default_decl_for_author_pool(pool, agent_id)
+        .await
+        .map_err(internal_error)?;
     for planned in &plan.claims {
         if planned.level == 3 {
             continue;
@@ -1217,6 +1352,7 @@ pub async fn do_ingest_document_spine(
             planned,
             agent_id,
             TruthValue::clamped(raw_truth),
+            decl,
         )
         .await?;
         ClaimRepository::update_labels(pool, persisted_id, std::slice::from_ref(&paper_label), &[])
@@ -1424,19 +1560,33 @@ mod tests {
         let doi = "urn:test:check-gate";
 
         // Unknown DOI → not ingested.
-        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query")
-            .is_none());
+        assert!(paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE
+        )
+        .await
+        .expect("gate query")
+        .is_none());
 
         // Create the paper without a processed_by edge → still not ingested.
         let paper_id = PaperRepository::get_or_create(&pool, doi, Some("test"), None)
             .await
             .expect("create paper");
-        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query")
-            .is_none());
+        assert!(paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE
+        )
+        .await
+        .expect("gate query")
+        .is_none());
 
         // Insert a `processed_by` edge with a *different* pipeline → still not
         // ingested under PIPELINE_VERSION_BASE. Edges enforce target existence, so
@@ -1460,10 +1610,17 @@ mod tests {
         )
         .await
         .expect("create edge with other pipeline");
-        assert!(paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query")
-            .is_none());
+        assert!(paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE
+        )
+        .await
+        .expect("gate query")
+        .is_none());
 
         // Insert a `processed_by` edge with the matching pipeline (different
         // target so it isn't deduped by the (source,target,relationship) key).
@@ -1486,9 +1643,16 @@ mod tests {
         )
         .await
         .expect("create edge with matching pipeline");
-        let hit = paper_already_ingested(&pool, doi, PIPELINE_VERSION_BASE)
-            .await
-            .expect("gate query");
+        let hit = paper_already_ingested(
+            &pool,
+            &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
+                .await
+                .expect("resolve viewer"),
+            doi,
+            PIPELINE_VERSION_BASE,
+        )
+        .await
+        .expect("gate query");
         assert_eq!(hit, Some(paper_id));
     }
 
