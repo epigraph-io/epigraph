@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (301 today; the assertions below measure the tree and
+//! deletes in week two. (300 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 301 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 300 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -121,11 +121,14 @@
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. `routes/audit.rs`'s one site and one of
 //!      `routes/timeline.rs`'s two followed outside the shard series, as the fix
-//!      for `F-PR18a-B1` and its sibling. None
-//!      discharged the gate — 301 is not 0 — and no shard in the series may be
+//!      for `F-PR18a-B1` and its sibling. One of `routes/groups.rs`'s went
+//!      when `add_member`'s separate pool read of the current epoch was folded
+//!      into the repo's locked transaction (`add-member-rotate-race`); that
+//!      site was merged away, not converted. None
+//!      discharged the gate — 300 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 115 of the 416 sites the series began with are converted, and
-//!      301 are not.
+//!      decision: 116 of the 416 sites the series began with are gone, and
+//!      300 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -555,7 +558,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 301;
+const HIGH_WATER: usize = 300;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -588,11 +591,17 @@ const HIGH_WATER: usize = 301;
 /// (`left: 302`), not derived by subtraction. Its sibling, `routes/timeline.rs`'s
 /// security-event read, took `HIGH_WATER` 302 -> 301 (`left: 301`) and did not
 /// move this: the file keeps its activity read.
+///
+/// The `add-member-rotate-race` fix took `HIGH_WATER` 301 -> 300 and did not
+/// move this. `routes/groups.rs` went 12 -> 11 (read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s `measured 11`)
+/// because `add_member` no longer reads the current epoch on the pool before
+/// it inserts; the repo reads it inside the locked transaction.
 const HIGH_WATER_FILES: usize = 43;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 301 sites across 43 files as of this commit. Lower an entry when a shard
+/// 300 sites across 43 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -735,7 +744,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.
     ("routes/graph_query.rs", 1),
-    ("routes/groups.rs", 12),
+    ("routes/groups.rs", 11),
     ("routes/hypothesis.rs", 11),
     ("routes/isomorphism.rs", 3),
     // `routes/lineage.rs` was 7 and is GONE, not zeroed: PR-26, the first

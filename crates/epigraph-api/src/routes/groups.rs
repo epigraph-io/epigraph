@@ -387,32 +387,18 @@ pub async fn add_member(
         }
     })?;
 
-    // Get current epoch. A group with no current epoch is a broken group — it
-    // cannot have been created by `create_group` (which writes epoch 0 in the
-    // same transaction), and pinning the new member to a fabricated epoch 0
-    // would hand them a share that decrypts nothing. "Current" and not "active":
+    // Persist the membership at the group's current epoch. The repo reads that
+    // epoch and INSERTs in ONE transaction, under the group membership lock a
+    // rotation also takes. This handler used to read the epoch on the pool and
+    // INSERT in a second statement, so a rotation committing in between
+    // stamped the newcomer at the retired epoch. "Current" and not "active":
     // the row may be `rotating` while a removal's re-key obligation is
     // outstanding, and a newcomer is pinned to it in that state too.
-    let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to query current epoch: {e}"),
-        })?
-        .ok_or_else(|| ApiError::Conflict {
-            reason: "Group has no current key epoch; rotate or re-provision it \
-                 before adding members"
-                .to_string(),
-        })?;
-
-    let epoch = current_epoch.epoch;
-
-    // Persist membership
-    let membership_id = GroupMembershipRepository::add_member(
+    let outcome = GroupMembershipRepository::add_member(
         &state.db_pool,
         group_id,
         req.agent_id,
         &wrapped_key_bytes,
-        epoch,
         &req.role,
     )
     .await
@@ -434,6 +420,23 @@ pub async fn add_member(
             message: format!("Failed to add member: {other}"),
         },
     })?;
+
+    let (membership_id, epoch) = match outcome {
+        epigraph_db::AddMemberOutcome::Added {
+            membership_id,
+            epoch,
+        } => (membership_id, epoch),
+        // A group with no current epoch is broken. `create_group` writes epoch
+        // 0 in the same transaction as the group, and pinning the new member to
+        // a fabricated epoch 0 would hand them a share that decrypts nothing.
+        epigraph_db::AddMemberOutcome::NoCurrentEpoch => {
+            return Err(ApiError::Conflict {
+                reason: "Group has no current key epoch; rotate or re-provision it \
+                     before adding members"
+                    .to_string(),
+            });
+        }
+    };
 
     tracing::info!(
         group_id = %group_id,

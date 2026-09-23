@@ -536,6 +536,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          077 section 7's group_memberships_tenancy policy, which selects on the CONNECTION.",
     ),
     (
+        "group_membership.rs",
+        "lock_group_membership_conn",
+        "NO TABLE AT ALL. It takes a transaction-scoped advisory lock keyed on a group id and \
+         reads and writes no row, so there is no `visibility` or `owner_group_id` a Viewer could \
+         be spent on. It is the first lock every writer of a group's roster or key epoch takes \
+         (add_member, revoke_member_unless_last_admin, rotate_conn and both community membership \
+         writers), so that an add cannot land behind a rotation's roster snapshot. The writers \
+         that call it are authorised by their own callers before it runs; the lock grants nothing.",
+    ),
+    (
         "group_key_epoch.rs",
         "rotate_conn",
         "Two READs with nothing to filter on. The `group_memberships` read is the live roster the \

@@ -436,6 +436,15 @@ impl CommunityRepository {
 
         let mut tx = pool.begin().await?;
 
+        // The projected group's membership lock, before anything else. The
+        // community id IS the group id (the projection preserves it). See
+        // `GroupMembershipRepository::lock_group_membership_conn`.
+        crate::repos::group_membership::GroupMembershipRepository::lock_group_membership_conn(
+            &mut tx,
+            community_id,
+        )
+        .await?;
+
         sqlx::query(
             r#"
             INSERT INTO community_members (community_id, perspective_id)
@@ -587,6 +596,15 @@ impl CommunityRepository {
                 ),
             });
         }
+
+        // The projected group's membership lock comes before the roster lock,
+        // as in every writer of a group's roster. See
+        // `GroupMembershipRepository::lock_group_membership_conn`.
+        crate::repos::group_membership::GroupMembershipRepository::lock_group_membership_conn(
+            &mut tx,
+            community_id,
+        )
+        .await?;
 
         // THE ROSTER LOCK, taken before anything is read. Same statement as
         // `GroupMembershipRepository::revoke_member_unless_last_admin` and

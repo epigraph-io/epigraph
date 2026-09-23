@@ -254,11 +254,13 @@ impl GroupKeyEpochRepository {
     /// AAD's epoch component binds the wrap message; it is not a substitute.
     ///
     /// The roster is read `FOR UPDATE`, which closes the concurrent-revocation
-    /// race. It does NOT close a concurrent `add_member`: row locks do not
-    /// prevent an INSERT, so a member added after this snapshot lands at epoch
-    /// N and is not re-wrapped here. That is the pre-existing check-then-act in
-    /// `add_member`, not one this function introduces, and the guarantee is
-    /// therefore stated over the roster the transaction saw.
+    /// race. Row locks do not prevent an `INSERT`, so on its own that did NOT
+    /// close a concurrent `add_member`: a member added after the snapshot
+    /// landed at epoch N and was not re-wrapped. The transaction therefore
+    /// takes `GroupMembershipRepository::lock_group_membership_conn` before the
+    /// roster. `add_member` takes the same lock and reads the current epoch
+    /// under it, so an add either committed before this roster was read, and is
+    /// in it, or waits for this rotation and reads epoch N+1.
     ///
     /// The group creator's row is included, and that is deliberate:
     /// `GroupRepository::create_with_admin` writes their `wrapped_key_share`
@@ -286,7 +288,15 @@ impl GroupKeyEpochRepository {
         group_id: Uuid,
         shares: &[(Uuid, Vec<u8>)],
     ) -> Result<RotateOutcome, DbError> {
-        // THE LIVE ROSTER IS LOCKED FIRST, and the order is load-bearing.
+        // THE GROUP MEMBERSHIP LOCK, before any row lock. It is what keeps an
+        // `add_member` from inserting behind the roster snapshot below; see
+        // the doc comment.
+        crate::repos::group_membership::GroupMembershipRepository::lock_group_membership_conn(
+            conn, group_id,
+        )
+        .await?;
+
+        // THEN THE LIVE ROSTER, and the order is load-bearing.
         // `GroupMembershipRepository::revoke_member_unless_last_admin` locks
         // `group_memberships` and then `group_key_epochs`; taking them the
         // other way round here would let a rotation holding the epoch row wait

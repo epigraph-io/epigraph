@@ -34,23 +34,127 @@ pub enum RevokeOutcome {
     LastAdmin,
 }
 
+/// Outcome of [`GroupMembershipRepository::add_member`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddMemberOutcome {
+    /// The membership was written at `epoch`, the group's current key epoch as
+    /// read under the group membership lock.
+    Added { membership_id: Uuid, epoch: i32 },
+    /// The group has no `active` or `rotating` key epoch. It is broken, not
+    /// joinable: pinning the member to a made-up epoch would give them a share
+    /// that decrypts nothing. Nothing was written.
+    NoCurrentEpoch,
+}
+
 /// Repository for GroupMembership operations
 pub struct GroupMembershipRepository;
 
 impl GroupMembershipRepository {
-    /// Add an agent to a group
+    /// Take the group membership lock for the rest of the current transaction.
+    ///
+    /// Every function that writes a group's roster or advances its key epoch
+    /// takes this FIRST, before any row lock: [`Self::add_member`],
+    /// [`Self::revoke_member_unless_last_admin`],
+    /// `GroupKeyEpochRepository::rotate_conn`, and
+    /// `CommunityRepository::add_member` and `::remove_member`. This is what
+    /// closes the race `D-PR20-A` recorded. `rotate_conn` locks the live roster
+    /// `FOR UPDATE`, but a row lock does not stop an `INSERT`, so an
+    /// `add_member` could still land a member at the epoch being retired after
+    /// the rotation had read its roster. The rotation then reported every live
+    /// member re-wrapped while one was not. With this lock held by both sides,
+    /// an add either commits before the rotation reads its roster, and is
+    /// re-wrapped with everyone else, or it starts after the rotation commits
+    /// and reads the new epoch.
+    ///
+    /// # Why an advisory lock and not a `groups` row lock
+    ///
+    /// A `groups` row lock taken first would invert the table order
+    /// `revoke_member_unless_last_admin` documents: `group_memberships`, then
+    /// `groups`, then `group_key_epochs`. `CommunityRepository::remove_member`
+    /// holds `group_memberships` rows while it `UPDATE`s `groups` for the same
+    /// id, so a rotation holding the `groups` row and waiting on the roster
+    /// would deadlock against it. An advisory lock sits outside that order.
+    /// Only the functions above request it, and each requests it before any
+    /// other lock, so a transaction never holds a row lock while it waits for
+    /// this one. It also needs no RLS policy to admit it, which a
+    /// `SELECT ... FOR UPDATE` on `groups` would under FORCEd RLS.
+    ///
+    /// The two-`int4` key is a different key space from the single `bigint`
+    /// key `PrivatizationRepository::begin_batch_conn` takes, so the two never
+    /// collide. Two groups whose ids hash alike share one lock. That serializes
+    /// them for no reason, but it cannot deadlock, because no transaction takes
+    /// this lock for more than one group.
+    ///
+    /// It is transaction-scoped and released at COMMIT or ROLLBACK. Run outside
+    /// an explicit transaction it is released as soon as its own statement ends
+    /// and protects nothing, so every caller runs it on a transaction it has
+    /// already begun.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns `DbError::QueryFailed` if the statement fails.
+    #[instrument(skip(conn))]
+    pub async fn lock_group_membership_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('epigraph.group_membership'), hashtext($1::text))",
+        )
+        .bind(group_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// Add an agent to a group at the group's CURRENT key epoch.
+    ///
+    /// One transaction takes [`Self::lock_group_membership_conn`], reads the
+    /// current epoch and `INSERT`s at it. The route used to read the epoch on
+    /// the pool and `INSERT` in a second autocommit statement with the epoch
+    /// passed in. A rotation that committed between the two stamped the
+    /// newcomer at the retired epoch. No transaction overlap was needed for
+    /// that, and `rotate_conn`'s roster lock could not have caught it. The
+    /// epoch is no longer a parameter, so no caller can reintroduce the gap by
+    /// reading it early.
+    ///
+    /// "Current" means `active` or `rotating`, with the same predicate and
+    /// ordering as `GroupKeyEpochRepository::get_current_epoch`. See that
+    /// function for why a `rotating` epoch still admits members.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any statement fails. A live duplicate
+    /// membership surfaces as `DbError::DuplicateKey` and an unknown agent as
+    /// `DbError::ForeignKeyViolation`, as before.
     #[instrument(skip(pool, wrapped_key_share))]
     pub async fn add_member(
         pool: &PgPool,
         group_id: Uuid,
         agent_id: Uuid,
         wrapped_key_share: &[u8],
-        epoch: i32,
         role: &str,
-    ) -> Result<Uuid, DbError> {
+    ) -> Result<AddMemberOutcome, DbError> {
+        let mut tx = pool.begin().await?;
+
+        Self::lock_group_membership_conn(&mut tx, group_id).await?;
+
+        let current: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT epoch
+            FROM group_key_epochs
+            WHERE group_id = $1 AND status IN ('active', 'rotating')
+            ORDER BY (status = 'active') DESC, epoch DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(group_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((epoch,)) = current else {
+            // Dropping `tx` rolls it back and releases the lock.
+            return Ok(AddMemberOutcome::NoCurrentEpoch);
+        };
+
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
@@ -63,10 +167,14 @@ impl GroupMembershipRepository {
         .bind(wrapped_key_share)
         .bind(epoch)
         .bind(role)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        Ok(row.0)
+        tx.commit().await?;
+        Ok(AddMemberOutcome::Added {
+            membership_id: row.0,
+            epoch,
+        })
     }
 
     /// Revoke a member's access by setting `revoked_at`.
@@ -221,12 +329,15 @@ impl GroupMembershipRepository {
     /// still succeed; they serialise on the shared roster, and neither is
     /// refused.
     ///
-    /// `FOR UPDATE` does not prevent an `INSERT`, so a concurrent `add_member`
-    /// can still add an admin the lock set never saw. That direction is safe
-    /// here — it can only make the guard's `EXISTS` true, i.e. permit a removal
-    /// that leaves the group with the admin just added — and it is the same
-    /// pre-existing check-then-act in `add_member` that `rotate_conn` names.
-    /// This function does not close it and does not claim to.
+    /// `FOR UPDATE` does not prevent an `INSERT`, so the roster lock alone
+    /// could not stop a concurrent `add_member` from adding an admin the lock
+    /// set never saw. That direction was safe here, since it can only make the
+    /// guard's `EXISTS` true. It is closed anyway, by the lock below: the
+    /// transaction takes [`Self::lock_group_membership_conn`] before the roster,
+    /// and `add_member` takes the same lock, so an add either committed before
+    /// this read the roster or waits until this commits. The advisory lock is
+    /// ahead of every table lock, and taking it first leaves the table order
+    /// above unchanged.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails.
@@ -237,6 +348,10 @@ impl GroupMembershipRepository {
         agent_id: Uuid,
     ) -> Result<RevokeOutcome, DbError> {
         let mut tx = pool.begin().await?;
+
+        // The group membership lock comes before every row lock. See
+        // `lock_group_membership_conn` for why it is first everywhere.
+        Self::lock_group_membership_conn(&mut tx, group_id).await?;
 
         // THE ROWS THE GUARD READS AND WRITES, LOCKED BEFORE IT READS THEM.
         // The `UPDATE` below locks only the row it writes; this locks the whole
