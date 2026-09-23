@@ -1120,6 +1120,21 @@ pub async fn update_with_evidence(
 /// (its key may be exposed). An operator's OWN directly authored claims are
 /// not reachable from its agents here: `author_op(operator)` is `None`.
 ///
+/// ### What this arm does NOT reach: claims written through a shared HTTP signer
+///
+/// The rule is keyed on the claim's AUTHOR (`claims.agent_id`). Claims an
+/// operator writes through the shared HTTP MCP servers (`epigraph-mcp-auth` /
+/// `-http`) are authored by that server's ONE signer agent, not by the
+/// operator's own agent id, so they are outside it: no link names the signer
+/// as operated (an HTTP listener refuses to start, and refuses every call, while
+/// its signer has any link — `operator::refuse_operated_http_signer`,
+/// `operator::refuse_linked_http_signer`). Do NOT close that gap by walking the
+/// signer's `OPERATED_BY` auth-lineage edges: `record_auth_lineage` writes one
+/// for every OAuth caller and REST `create_edge` accepts `OPERATED_BY` from any
+/// `edges:write` caller, so those edges are forgeable and would make every
+/// caller an owner of every HTTP-authored claim. Extending ownership to
+/// HTTP-authored claims needs its own design.
+///
 /// It is keyed on AUTHORS, never on the claim's owner group. "The owner group is
 /// writable by the caller" would be the wrong generalisation: most pre-tenancy
 /// claims are world-owned, and an agent's writable set would make it an owner

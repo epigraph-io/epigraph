@@ -262,6 +262,15 @@
 -- database that has not applied 102 (`42883 function does not exist`). Apply
 -- 102 before, or with, the binary.
 --
+-- HTTP LISTENERS ON FIRST DEPLOY. An HTTP listener refuses to start, and
+-- refuses every call, while its signer has an `operator_links` row
+-- (`epigraph_mcp::operator`). A freshly applied 102 creates the table EMPTY and
+-- writes no row, so no existing HTTP signer can be refused by it on first
+-- deploy; only a later, explicit link of that signer can. (An earlier form of
+-- this file counted "OPERATED_BY edge + live membership" as a link, and every
+-- HTTP signer already carries lineage edges, so that form needed a pre-deploy
+-- measurement of production signers. The record-based form does not.)
+--
 -- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_link_retired_agent(uuid, uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_operator_actor(uuid)`,
