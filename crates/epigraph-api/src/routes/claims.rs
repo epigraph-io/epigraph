@@ -380,18 +380,23 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 pub async fn create_claim(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
-    // Still `Option<Extension<..>>` rather than a required extractor: PR-07
-    // replaces the whole `Option<AuthContext>` idiom with `ViewerExtractor`
-    // across all 39 sites at once. Until then the handler rejects `None`
-    // explicitly below rather than falling open, which is the behavioural half
-    // of that change without the mechanical half.
+    // `Option<Extension<..>>` rather than a required extractor, refused
+    // explicitly on the first line of the body. An earlier comment here said
+    // PR-07 would replace the whole `Option<AuthContext>` idiom with
+    // `ViewerExtractor` "across all 39 sites at once"; that never happened
+    // (PR-07 was a read-path PR and Q7 rescoped the sites out of it). The
+    // fail-open-scope-sites conversion instead gave each site the
+    // `let Some(..) = auth_ctx else { return Err(Unauthorized) }` shape, which
+    // is the behavioural half without the signature change.
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required to create a claim".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
 
     // Validate privacy fields first (needed to know if content check applies)
     let privacy_tier = validate_privacy_fields(&request)?;

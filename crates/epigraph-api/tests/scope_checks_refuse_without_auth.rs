@@ -103,6 +103,16 @@ fn case(site: &'static str, method: Method, uri: String, body: Option<Value>) ->
     }
 }
 
+fn viewer_case(site: &'static str, method: Method, uri: String, body: Option<Value>) -> Case {
+    Case {
+        site,
+        method,
+        uri,
+        body,
+        viewer: true,
+    }
+}
+
 async fn status_of(router: &Router, c: &Case, auth: Option<AuthContext>) -> StatusCode {
     let mut builder = Request::builder().method(c.method.clone()).uri(&c.uri);
     let body = match &c.body {
@@ -292,5 +302,19 @@ async fn agents_rs_refuses_without_auth() {
             Some(json!({"display_name": "x"})),
         ),
     ];
+    assert_refused(router, &cases).await;
+}
+
+#[tokio::test]
+async fn claims_rs_refuses_without_auth() {
+    let router = Router::new()
+        .route("/api/v1/claims", post(routes::claims::create_claim))
+        .with_state(unreachable_state());
+    let cases = [viewer_case(
+        "claims.rs::create_claim",
+        Method::POST,
+        "/api/v1/claims".into(),
+        Some(json!({"content": "c"})),
+    )];
     assert_refused(router, &cases).await;
 }

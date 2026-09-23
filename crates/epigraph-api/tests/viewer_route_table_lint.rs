@@ -327,7 +327,12 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // the sole per-principal narrowing on the table this route reads, and a
     // fail-open scope check on the caller-facing end of a policy being widened in
     // the same commit is not a debt worth carrying forward one more PR.
-    ("claims.rs", 1),
+    //
+    // `("claims.rs", 1)` REMOVED by the fail-open-scope-sites conversion:
+    // `create_claim` refuses 401 without an `AuthContext` on its first line and
+    // checks `claims:write` unconditionally. Its `ViewerExtractor` already
+    // 401'd first, so this row was never reachable fail-open; it is converted so
+    // the handler's correctness does not rest on that extractor staying put.
     // 7 before PR-16/16b. `update_evidence` moved its `raw_content` UPDATE into
     // `EvidenceRepository::update_raw_content` behind the write-side predicate,
     // and took the prescribed
