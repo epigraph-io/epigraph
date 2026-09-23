@@ -115,6 +115,33 @@ async fn tenancy_of(pool: &PgPool, table: &str, id: Uuid) -> (Uuid, String) {
     .unwrap_or_else(|e| panic!("read tenancy of {table}: {e}"))
 }
 
+/// Move a GROUP-PRIVATE claim to `group` through the audited route.
+///
+/// Migration 093 refuses a change of `owner_group_id` on a `group`-visible
+/// claim unless `epigraph.allow_declassify` is armed
+/// (D-PR16-ownership-transfer-is-unguarded). The arm (d) tests in this file use
+/// exactly that move as their stimulus, because it is the one tenancy change
+/// that exercises the meet between two private groups. They arm the GUC for it
+/// rather than switching to a different stimulus. The GUC is session-scoped, so
+/// it is set and reset on ONE connection, the same way this file's
+/// declassification step does it.
+async fn reown_group_claim_audited(pool: &PgPool, claim: Uuid, group: Uuid, what: &str) {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET epigraph.allow_declassify = 'yes'")
+        .await
+        .expect("arm the audit GUC");
+    sqlx::query("UPDATE claims SET owner_group_id = $1 WHERE id = $2")
+        .bind(group)
+        .bind(claim)
+        .execute(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    conn.execute("RESET epigraph.allow_declassify")
+        .await
+        .expect("disarm the audit GUC");
+}
+
 /// [`tenancy_of`] widened with `edges.co_owner_group_id` (migration 072).
 ///
 /// Separate from `tenancy_of` rather than replacing it: `co_owner_group_id`
@@ -715,14 +742,11 @@ async fn a_non_tenancy_update_does_not_trigger_the_propagation_walk(pool: PgPool
     );
 
     // Control: the SAME setup with a real tenancy change must count 1, or the
-    // assertion above is satisfied by a trigger that never fires at all.
+    // assertion above is satisfied by a trigger that never fires at all. The
+    // claim is group-private, so since migration 093 the change goes through
+    // the audited route.
     let (_, other_group) = fixture::seed_agent_with_group(&pool, "other").await;
-    sqlx::query("UPDATE claims SET owner_group_id = $1 WHERE id = $2")
-        .bind(other_group)
-        .bind(claim)
-        .execute(&pool)
-        .await
-        .expect("change tenancy");
+    reown_group_claim_audited(&pool, claim, other_group, "change tenancy").await;
     let passes: i64 = sqlx::query_scalar("SELECT n FROM prop_counter")
         .fetch_one(&pool)
         .await
@@ -1178,13 +1202,9 @@ async fn arm_d_recomputes_the_meet_rather_than_copying_the_changed_endpoint(pool
     let b = fixture::seed_group_claim(&pool, agent_b, group_b, "B").await;
 
     // Both endpoints are in group_a to start, so arm (b) can stamp the edge
-    // without hitting its cross-group RAISE.
-    sqlx::query("UPDATE claims SET owner_group_id = $1 WHERE id = $2")
-        .bind(group_a)
-        .bind(b)
-        .execute(&pool)
-        .await
-        .expect("park B in group_a");
+    // without hitting its cross-group RAISE. B is group-private, so since
+    // migration 093 both of its moves go through the audited route.
+    reown_group_claim_audited(&pool, b, group_a, "park B in group_a").await;
 
     let edge: Uuid = sqlx::query_scalar(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
@@ -1202,12 +1222,7 @@ async fn arm_d_recomputes_the_meet_rather_than_copying_the_changed_endpoint(pool
 
     // Move B to its own group. The edge must FOLLOW the surviving private
     // endpoint, not the world default.
-    sqlx::query("UPDATE claims SET owner_group_id = $1 WHERE id = $2")
-        .bind(group_b)
-        .bind(b)
-        .execute(&pool)
-        .await
-        .expect("move B");
+    reown_group_claim_audited(&pool, b, group_b, "move B").await;
 
     // THE INTERMEDIATE, ASSERTED (PR-13). Before migration 072 this step left
     // the edge unchanged at `group_a` and nothing checked it, so the test

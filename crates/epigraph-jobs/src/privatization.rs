@@ -891,6 +891,13 @@ async fn run_batch(
     // of having been read would put this plan's selection-time pre-image, and
     // `epigraph.allow_declassify`, over a row this plan never touched. `skipped`
     // is migration 080's own vocabulary for the difference.
+    //
+    // It is ALSO the state of a frozen row that is private to a DIFFERENT group.
+    // `restrict_claims_conn` moves only `public` rows, because re-owning another
+    // group's private claim into this plan's target would be a seizure its
+    // owners never agreed to (D-PR16-ownership-transfer-is-unguarded; migration
+    // 093 refuses it in the database too). The row's current `owner_group_id`
+    // against the plan's target says which of the two cases a `skipped` row is.
     let skipped: Vec<Uuid> = ids
         .iter()
         .copied()
@@ -911,7 +918,11 @@ async fn run_batch(
         "claim",
         &skipped,
         "skipped",
-        Some("the row already carried this plan's tenancy; this plan changed nothing about it"),
+        Some(
+            "the row was not public when this batch ran: it already carried this plan's \
+             tenancy, or it is private to another group and not this plan's to move; this plan \
+             changed nothing about it",
+        ),
     )
     .await?;
     // A batch that selected items and decided none of them is a non-terminating

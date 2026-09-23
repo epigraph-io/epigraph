@@ -947,6 +947,302 @@ async fn declassification_is_gated_and_sealed_claims_can_never_be_widened(pool: 
     );
 }
 
+// =============================================================================
+// Ownership transfer — migration 093's arm (c) on `claims_block_widening`
+// (D-PR16-ownership-transfer-is-unguarded)
+// =============================================================================
+
+/// The text 093's arm (c.2) raises. Matched on, not just the SQLSTATE, because
+/// an RLS `WITH CHECK` refusal is ALSO `42501`. A test keyed on the code alone
+/// would pass on a tree without 093 whenever the writer happened to lack write
+/// authority on the target group.
+const TRANSFER_REFUSAL: &str = "Ownership transfer is an audited operation";
+
+/// Make `agent` a live `admin` of `group` as well.
+async fn add_admin_membership(pool: &PgPool, group: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed second membership");
+}
+
+/// Bind the three session GUCs on a connection, the way `ScopedPool` does.
+/// Same body as `rls_enforcement.rs::set_gucs`, and for its reason: the
+/// connection's `session_user` has already been switched, which is a property
+/// of the connection rather than of a pool.
+async fn set_gucs(conn: &mut sqlx::PgConnection, groups: &str, writable: &str, principal: &str) {
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(groups)
+    .bind(writable)
+    .bind(principal)
+    .execute(&mut *conn)
+    .await
+    .expect("set session gucs");
+}
+
+/// **A writer cannot move a group-private claim into another group, even one
+/// it may write to.**
+///
+/// The writer here is an admin of BOTH groups and is stamped writable in both,
+/// so 077's `claims_tenancy` has nothing to refuse: the old row is visible and
+/// writable, and the new row is in a group the session may write. That is the
+/// point. RLS constrains WHICH row a statement touches and says nothing about
+/// WHAT value a SET clause assigns (the 16b triage on this obligation). Before
+/// 093 both statements below committed, and A's members lost the claim to B.
+///
+/// The second statement is `restrict_claims_conn`'s own SET list, which names
+/// `visibility` and therefore always fired 074's trigger. It is included
+/// because the register's ACCEPTED rationale was "the guard fires on it".
+/// Firing and refusing are different things.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writer_in_both_groups_cannot_move_a_private_claim_between_them(pool: PgPool) {
+    let (agent, group_a) = fixture::seed_agent_with_group(&pool, "xfer-a").await;
+    let (_, group_b) = fixture::seed_agent_with_group(&pool, "xfer-b").await;
+    add_admin_membership(&pool, group_b, agent).await;
+    let claim = group_claim(&pool, agent, group_a, "owned by A").await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    let both = format!("{group_a},{group_b}");
+    let (calibration, bare, restrict_shaped) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            set_gucs(&mut conn, &both, &both, &agent.to_string()).await;
+
+            // CALIBRATION: this session may write this row. Without it, a
+            // refusal below could be RLS rather than 093.
+            let calibration = sqlx::query("UPDATE claims SET truth_value = 0.61 WHERE id = $1")
+                .bind(claim)
+                .execute(&mut *conn)
+                .await
+                .expect("the writer may update a column 093 does not govern")
+                .rows_affected();
+
+            let bare = sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+                .bind(claim)
+                .bind(group_b)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected());
+            let restrict_shaped = sqlx::query(
+                "UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1",
+            )
+            .bind(claim)
+            .bind(group_b)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected());
+            (conn, (calibration, bare, restrict_shaped))
+        })
+        .await;
+
+    assert_eq!(
+        calibration, 1,
+        "CALIBRATION: the stamped writer must be able to update this row at all, or the \
+         refusals below prove nothing about 093"
+    );
+    for (label, outcome) in [("bare", bare), ("restrict-shaped", restrict_shaped)] {
+        let err = outcome.expect_err(&format!(
+            "{label}: moving a group-private claim from A to B must be refused even for an \
+             admin of both groups"
+        ));
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("42501"),
+            "{label}: {err}"
+        );
+        assert!(
+            err.to_string().contains(TRANSFER_REFUSAL),
+            "{label}: the refusal must be 093's arm (c), not an RLS WITH CHECK that happens to \
+             share its SQLSTATE: {err}"
+        );
+    }
+    assert_eq!(
+        tenancy_of(&pool, "claims", claim).await,
+        (group_a, "group".to_string()),
+        "the claim must still belong to A"
+    );
+}
+
+/// **The guard binds bypass connections too, and only the audit GUC admits a
+/// transfer.** A sealed claim cannot change owner even with the GUC, and the
+/// shapes 093 must NOT refuse still pass.
+///
+/// The ambient pool is superuser, owner and `BYPASSRLS`, which is the posture
+/// of the privatization handler's maintenance connection. No policy applies
+/// here, so the trigger is the only control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ownership_transfer_is_refused_on_bypass_without_the_audit_guc(pool: PgPool) {
+    let (agent, group_a) = fixture::seed_agent_with_group(&pool, "xfer-bypass-a").await;
+    let (_, group_b) = fixture::seed_agent_with_group(&pool, "xfer-bypass-b").await;
+    let private = group_claim(&pool, agent, group_a, "private to A").await;
+    let sealed = group_claim(&pool, agent, group_a, "sealed in A").await;
+    let public = fixture::seed_public_claim(&pool, agent, "public, world-owned").await;
+    let to_restrict = fixture::seed_public_claim(&pool, agent, "public, to restrict").await;
+
+    // (1) Without the GUC: refused.
+    let err = sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(private)
+        .bind(group_b)
+        .execute(&pool)
+        .await
+        .expect_err("a bypass connection must not move a group-private claim without the GUC");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501")
+    );
+    assert!(err.to_string().contains(TRANSFER_REFUSAL), "{err}");
+
+    // (2) What 093 must still ADMIT without the GUC. Each is a real write path:
+    //     a column 093 does not govern, a same-value SET that fires the trigger,
+    //     tenancy_backfill's public -> public re-own, and restrict's public ->
+    //     group narrowing.
+    for (label, sql, id, bind) in [
+        (
+            "ungoverned column",
+            "UPDATE claims SET truth_value = 0.62 WHERE id = $1 AND $2::uuid IS NOT NULL",
+            private,
+            group_b,
+        ),
+        (
+            "same-owner SET",
+            "UPDATE claims SET owner_group_id = owner_group_id, visibility = visibility \
+             WHERE id = $1 AND $2::uuid IS NOT NULL",
+            private,
+            group_b,
+        ),
+        (
+            "public -> public re-own",
+            "UPDATE claims SET owner_group_id = $2, visibility = 'public' WHERE id = $1",
+            public,
+            group_a,
+        ),
+        (
+            "public -> group narrowing",
+            "UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1",
+            to_restrict,
+            group_b,
+        ),
+    ] {
+        let n = sqlx::query(sql)
+            .bind(id)
+            .bind(bind)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label} must still be admitted after 093: {e}"))
+            .rows_affected();
+        assert_eq!(
+            n, 1,
+            "{label}: CALIBRATION, the statement must match its row"
+        );
+    }
+    assert_eq!(
+        tenancy_of(&pool, "claims", public).await,
+        (group_a, "public".to_string())
+    );
+    assert_eq!(
+        tenancy_of(&pool, "claims", to_restrict).await,
+        (group_b, "group".to_string())
+    );
+
+    // (3) With the GUC, on ONE connection because it is session-scoped: the
+    //     audited surface can transfer an unsealed claim...
+    let epoch: i32 = sqlx::query_scalar(
+        "INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status) \
+         VALUES ($1, 1, ''::bytea, 'active') \
+         ON CONFLICT (group_id, epoch) DO UPDATE SET status = 'active' RETURNING epoch",
+    )
+    .bind(group_a)
+    .fetch_one(&pool)
+    .await
+    .expect("key epoch");
+    sqlx::query(
+        "INSERT INTO claim_encryption (claim_id, group_id, epoch, privacy_tier, encrypted_content) \
+         VALUES ($1, $2, $3, 'fully_private', ''::bytea)",
+    )
+    .bind(sealed)
+    .bind(group_a)
+    .bind(epoch)
+    .execute(&pool)
+    .await
+    .expect("seal the claim");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET epigraph.allow_declassify = 'yes'")
+        .await
+        .expect("set guc");
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(private)
+        .bind(group_b)
+        .execute(&mut *conn)
+        .await
+        .expect("the audited surface may transfer an unsealed group-private claim");
+    assert_eq!(
+        tenancy_of(&pool, "claims", private).await,
+        (group_b, "group".to_string())
+    );
+
+    // ...and still cannot transfer a SEALED one. Its ciphertext is bound to A's
+    // key epoch, so B's members could not read it and A's would lose it.
+    let err = sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(sealed)
+        .bind(group_b)
+        .execute(&mut *conn)
+        .await
+        .expect_err("a SEALED claim must never change owner, GUC or not");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501")
+    );
+    assert!(
+        err.to_string().contains("SEALED"),
+        "the sealed refusal must say so, or an operator will reach for the GUC that cannot \
+         help them: {err}"
+    );
+    conn.execute("RESET epigraph.allow_declassify")
+        .await
+        .expect("reset guc");
+    assert_eq!(
+        tenancy_of(&pool, "claims", sealed).await,
+        (group_a, "group".to_string())
+    );
+}
+
+/// Migration 093 re-applies cleanly and leaves the transfer guard armed.
+///
+/// sqlx records no `_sqlx_migrations` row for a failed migration, so a file
+/// that aborted on its `lock_timeout` is re-run whole, the same reason
+/// [`the_pr16_migrations_can_be_applied_twice`] exists. The refusal after the
+/// replay is what shows the re-run did not leave 074's trigger shape behind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_093_can_be_applied_twice_and_stays_armed(pool: PgPool) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../migrations/093_claims_block_ownership_transfer.sql");
+    let sql =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    pool.execute(sql.as_str())
+        .await
+        .unwrap_or_else(|e| panic!("093 must be idempotent, but re-applying it failed: {e}"));
+
+    let (agent, group_a) = fixture::seed_agent_with_group(&pool, "xfer-replay-a").await;
+    let (_, group_b) = fixture::seed_agent_with_group(&pool, "xfer-replay-b").await;
+    let claim = group_claim(&pool, agent, group_a, "replayed guard").await;
+    let err = sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(group_b)
+        .execute(&pool)
+        .await
+        .expect_err("after a replay of 093 the transfer must still be refused");
+    assert!(err.to_string().contains(TRANSFER_REFUSAL), "{err}");
+}
+
 /// **No sealed claim is `visibility = 'public'`.** A corpus invariant, and the
 /// regression test for a real defect PR-16 introduced and then fixed.
 ///

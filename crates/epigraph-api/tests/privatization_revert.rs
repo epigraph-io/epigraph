@@ -213,16 +213,31 @@ async fn a_revert_leaves_a_claim_another_decision_now_owns_alone(pool: PgPool) {
 
     // AN INDEPENDENT DECISION takes the claim over: it now belongs to a
     // different group, and this plan's selection-time pre-image no longer
-    // describes where it came from. Migration 074's widening guard does not see
-    // this — group -> group is not a widening — so the stamp check is the
-    // control, not the trigger.
+    // describes where it came from.
+    //
+    // Since migration 093 a group -> group move is itself refused unless
+    // `epigraph.allow_declassify` is armed, so the independent decision takes
+    // that audited route here, on one connection because the GUC is
+    // session-scoped. The trigger is still NOT the control for the revert below.
+    // `restore_claims_conn` arms the same GUC, so 093 would admit a restore over
+    // this row. The stamp check is what leaves it alone.
     let (_, other_group) = viewer_fixture::seed_agent_with_group(&pool, "other-owner").await;
-    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
-        .bind(stays)
-        .bind(other_group)
-        .execute(&pool)
-        .await
-        .expect("hand the claim to another group");
+    {
+        use sqlx::Executor;
+        let mut conn = pool.acquire().await.expect("acquire");
+        conn.execute("SET epigraph.allow_declassify = 'yes'")
+            .await
+            .expect("arm the audit GUC");
+        sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+            .bind(stays)
+            .bind(other_group)
+            .execute(&mut *conn)
+            .await
+            .expect("hand the claim to another group");
+        conn.execute("RESET epigraph.allow_declassify")
+            .await
+            .expect("disarm the audit GUC");
+    }
 
     let revert_correlation = fx::dispatch(&pool, &world, plan, "reverting").await;
     fx::run_revert(
@@ -252,9 +267,11 @@ async fn a_revert_leaves_a_claim_another_decision_now_owns_alone(pool: PgPool) {
 ///
 /// # Why an item state has to mean "changed", not "looked at"
 ///
-/// `restrict_claims_conn` carries an `IS DISTINCT FROM` guard so that
+/// `restrict_claims_conn` moves only `visibility = 'public'` rows, so that
 /// re-processing a committed batch fires no trigger and rewrites no derived
-/// table. The same guard makes the statement a NO-OP on a row that is already in
+/// table. (Until migration 093 the guard was an `IS DISTINCT FROM` pair; see
+/// [`an_apply_never_moves_a_claim_private_to_another_group`] for why it
+/// narrowed.) The same guard makes the statement a NO-OP on a row that is already in
 /// the target group — which a plan frozen while that row was public will meet as
 /// an ordinary matter, with no race:
 /// `privatization_one_active_per_group` excludes only CONCURRENT running plans,
@@ -331,6 +348,116 @@ async fn a_revert_unapplies_only_the_items_this_plan_actually_moved(pool: PgPool
             .is_empty(),
         "and no revert audit row may claim otherwise"
     );
+}
+
+/// **An apply never moves a claim that is private to ANOTHER group.** The plan
+/// still applies and reverts around it
+/// (D-PR16-ownership-transfer-is-unguarded).
+///
+/// # How a plan reaches such a row
+///
+/// Selection walks the closure under a bypass viewer, and the freeze records
+/// every id it resolves, with no tenancy filter. That is deliberate: the
+/// preview has to count what is there. So a public seed that another group's
+/// private claims were derived from pulls those claims into the frozen set.
+/// Before this fix `restrict_claims_conn` matched any row whose owner differed
+/// from the target and re-owned them into it. A's members lost them, the
+/// target's members gained them, and A's admins were never asked. The drift
+/// rescan already called that "a seizure the operator did not ask for" and
+/// filtered it. The primary apply path did not.
+///
+/// # What each half of the fix contributes
+///
+/// Migration 093 refuses the move in the database on a connection without the
+/// audit GUC, which the apply never arms. On its own that would turn the
+/// seizure into a batch failing `42501` on every retry. The caller half,
+/// `restrict_claims_conn` moving only `public` rows, is what lets the plan
+/// finish, with the foreign rows `skipped`.
+///
+/// The SEALED foreign row is the sharper case. Its ciphertext is bound to A's
+/// key epoch, so re-owning it would give the target group a row it cannot
+/// decrypt and take it away from the group that can.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_apply_never_moves_a_claim_private_to_another_group(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    let scoped = fx::scoped(&pool).await;
+
+    let seed = viewer_fixture::seed_public_claim(&pool, world.actor, "public seed").await;
+    let (bystander, group_a) = viewer_fixture::seed_agent_with_group(&pool, "bystander").await;
+    let foreign = viewer_fixture::seed_group_claim(&pool, bystander, group_a, "private to A").await;
+    let foreign_sealed =
+        viewer_fixture::seed_group_claim(&pool, bystander, group_a, "sealed in A").await;
+    fx::encrypt_claim(&pool, foreign_sealed, group_a).await;
+    fx::derived_from(&pool, foreign, seed).await;
+    fx::derived_from(&pool, foreign_sealed, seed).await;
+
+    let (plan, _) = fx::create_plan(&pool, &world, &[seed]).await;
+    let frozen: Vec<Uuid> = fx::items(&pool, plan)
+        .await
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    for id in [seed, foreign, foreign_sealed] {
+        assert!(
+            frozen.contains(&id),
+            "CALIBRATION: the frozen set must contain {id}, or this test never offers the \
+             apply a foreign-group row to move. Frozen: {frozen:?}"
+        );
+    }
+
+    let correlation = fx::dispatch(&pool, &world, plan, "applying").await;
+    fx::run_apply(&scoped, &fx::apply_job(plan, world.actor, &correlation), 50)
+        .await
+        .expect("a plan that reaches another group's private claims must still apply");
+    assert_eq!(fx::plan_state(&pool, plan).await, "applied");
+
+    assert_eq!(
+        fx::tenancy(&pool, seed).await,
+        ("group".to_string(), world.target_group),
+        "CALIBRATION: the public seed must have moved, or nothing was applied at all"
+    );
+    for (label, id) in [("private", foreign), ("sealed", foreign_sealed)] {
+        assert_eq!(
+            fx::tenancy(&pool, id).await,
+            ("group".to_string(), group_a),
+            "the {label} claim is group A's; a plan targeting another group must not take it"
+        );
+    }
+    let states: std::collections::HashMap<Uuid, String> = fx::items(&pool, plan)
+        .await
+        .into_iter()
+        .map(|(id, _, s)| (id, s))
+        .collect();
+    assert_eq!(states[&seed], "applied");
+    assert_eq!(
+        states[&foreign], "skipped",
+        "an item this plan did not move must not say `applied`, or the revert would write its \
+         pre-image back over a row this plan never touched"
+    );
+    assert_eq!(states[&foreign_sealed], "skipped");
+
+    let correlation = fx::dispatch(&pool, &world, plan, "reverting").await;
+    fx::run_revert(
+        &scoped,
+        &fx::revert_job(plan, world.actor, &correlation),
+        50,
+    )
+    .await
+    .expect("revert");
+    assert_eq!(fx::plan_state(&pool, plan).await, "reverted");
+    let world_group = viewer_fixture::world_group(&pool).await;
+    assert_eq!(
+        fx::tenancy(&pool, seed).await,
+        ("public".to_string(), world_group),
+        "the revert must still restore the row this plan did move"
+    );
+    for id in [foreign, foreign_sealed] {
+        assert_eq!(
+            fx::tenancy(&pool, id).await,
+            ("group".to_string(), group_a),
+            "and leave group A's claims where they were"
+        );
+    }
 }
 
 /// A `restrict` plan whose frozen set contains an already-encrypted claim is

@@ -1162,3 +1162,84 @@ async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
          REVOKE above without the matching GRANT is a total outage, not a narrowing."
     );
 }
+
+/// **Migration 093: `claims_block_widening` fires on BOTH governed columns, and
+/// its body stays off `PUBLIC`.**
+///
+/// # The firing condition is the control
+///
+/// 074 armed the trigger `BEFORE UPDATE OF visibility`. A statement that
+/// assigned only `owner_group_id` did not fire it at all, so no arm of the body
+/// could refuse a transfer however it was written. That was the whole of
+/// D-PR16-ownership-transfer-is-unguarded. 093 re-arms it
+/// `BEFORE UPDATE OF visibility, owner_group_id`. An edit that dropped
+/// `owner_group_id` from the list would leave arm (c) in the body, unreachable
+/// by exactly the statement it exists for, and every behavioural test that
+/// names `visibility` alongside the owner would still pass.
+///
+/// So the column list is pinned BY NAME, through `pg_attribute`, rather than
+/// by attnum. Attnums differ between a fresh database and a long-lived one that
+/// took the columns through `ALTER TABLE`. An EMPTY `tgattr` (unqualified) is
+/// also accepted: it fires on every UPDATE, which covers both columns, and it
+/// is 081's shape. Only a list that is non-empty and misses one of the two
+/// columns fails.
+///
+/// `tgtype` bits: 1 = ROW, 2 = BEFORE, 16 = UPDATE.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_093_widening_guard_fires_on_visibility_and_owner(pool: PgPool) {
+    let row: Option<(i16, Vec<String>, String, String)> = sqlx::query_as(
+        "SELECT t.tgtype, \
+                COALESCE(ARRAY(SELECT a.attname::text FROM unnest(t.tgattr::int2[]) AS k(n) \
+                                 JOIN pg_attribute a \
+                                   ON a.attrelid = t.tgrelid AND a.attnum = k.n \
+                                ORDER BY a.attname), ARRAY[]::text[]), \
+                p.proname::text, t.tgenabled::text \
+           FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid \
+          WHERE t.tgrelid = 'public.claims'::regclass \
+            AND t.tgname = 'claims_block_widening' AND NOT t.tgisinternal",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_trigger lookup");
+    let (tgtype, cols, func, enabled) =
+        row.expect("claims_block_widening must exist on public.claims (migrations 074, 093)");
+
+    assert_eq!(func, "epigraph_claims_block_widening");
+    assert_eq!(enabled, "O", "claims_block_widening must be ENABLED");
+    assert_eq!(tgtype & 1, 1, "claims_block_widening must be FOR EACH ROW");
+    assert_eq!(tgtype & 2, 2, "claims_block_widening must be BEFORE");
+    assert_eq!(tgtype & 16, 16, "claims_block_widening must cover UPDATE");
+    assert!(
+        cols.is_empty() || cols == ["owner_group_id", "visibility"],
+        "claims_block_widening fires on UPDATE OF {cols:?}. It must fire on every statement \
+         that assigns `owner_group_id` as well as `visibility` (or be unqualified). A list \
+         without owner_group_id is migration 074's shape, under which `UPDATE claims SET \
+         owner_group_id = <another group>` on a group-private claim fires nothing and 093's \
+         arm (c) never runs."
+    );
+
+    let body: String = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' AND p.proname = 'epigraph_claims_block_widening'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("prosrc lookup");
+    assert!(
+        body.contains("NEW.owner_group_id IS DISTINCT FROM OLD.owner_group_id"),
+        "the trigger body must still carry 093's ownership-transfer arm"
+    );
+
+    let public_can_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('public', \
+                'public.epigraph_claims_block_widening()', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("has_function_privilege lookup");
+    assert!(
+        !public_can_execute,
+        "epigraph_claims_block_widening is EXECUTE-able by PUBLIC. 074 and 093 both revoke it, \
+         by the convention 081's closing comment records for trigger bodies"
+    );
+}

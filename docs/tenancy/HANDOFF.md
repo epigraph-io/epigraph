@@ -128,9 +128,15 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   `D-PR16-seed-membership-refusal-downgraded` (the plan's mitigation (2) ships
   as a WARN, and PR-17's acceptance line does **not** name it),
   `D-PR16-claim-authorship-is-not-a-credential`, and
-  `D-PR16-ownership-transfer-is-unguarded` (`claims_block_widening` is
-  `BEFORE UPDATE OF visibility` only). **PR-16 discharged none of the five
-  obligations that named it** — they are re-owned onto the write-gate PR.
+  ~~`D-PR16-ownership-transfer-is-unguarded` (`claims_block_widening` is
+  `BEFORE UPDATE OF visibility` only)~~ — **DISCHARGED 2026-09-22** by migration
+  `093_claims_block_ownership_transfer.sql` (the trigger now fires on
+  `owner_group_id` too and refuses a group-private claim's change of owner
+  without `epigraph.allow_declassify`, and a sealed one's always) together with
+  `restrict_claims_conn` moving only `public` rows. The 2026-09-14 ACCEPTED was
+  invalid: `restrict_claims_conn` was already re-owning other groups' private
+  claims. **PR-16 discharged none of the five obligations that named it** —
+  they are re-owned onto the write-gate PR.
 - ~~**PR-04 owes** an un-ignore of
   `no_anonymous_viewer.rs::resolve_unions_in_the_principals_personal_group`~~ —
   **discharged in PR-04.** The `#[ignore]` is gone and the test has a real body.

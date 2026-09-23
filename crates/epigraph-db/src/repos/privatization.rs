@@ -2534,18 +2534,40 @@ impl PrivatizationRepository {
     /// m.v = 'public')` guard — which is why revert still needs
     /// [`Self::recompute_boundary_meet_conn`] explicitly.
     ///
-    /// # The `IS DISTINCT FROM` guard is what makes a batch re-runnable
+    /// # The `visibility = 'public'` guard is what makes a batch re-runnable
     ///
     /// A re-dispatched job that re-processes a committed batch changes no row,
-    /// fires no trigger (072's firing gate is the same comparison) and writes no
-    /// derived row. §6.5.5's ops-F11 correction requires exactly this, and the
-    /// previous revision's claim that it already held was false for nine of ten
-    /// propagation arms.
+    /// fires no trigger (every row a batch moved is now `group`, so 072's
+    /// firing gate sees no change) and writes no derived row. §6.5.5's ops-F11
+    /// correction requires exactly this, and the previous revision's claim that
+    /// it already held was false for nine of ten propagation arms. Until
+    /// migration 093 the guard was `visibility IS DISTINCT FROM 'group' OR
+    /// owner_group_id IS DISTINCT FROM $2`. The next section says why it
+    /// narrowed.
+    ///
+    /// # IT MOVES ONLY `public` ROWS. A ROW PRIVATE TO ANOTHER GROUP IS NOT
+    /// # THIS PLAN'S TO MOVE
+    ///
+    /// The frozen set is not filtered by tenancy. [`Self::select_closure`] walks
+    /// the graph under a bypass viewer and [`UnfilteredSelection::freeze_into`]
+    /// freezes every id it resolves, so a plan can reach a claim that is
+    /// already private to an unrelated group A. The old guard matched that row
+    /// and this statement re-owned it into the plan's target group B. A's
+    /// members lost it, B's members gained it, and A's admins were never party
+    /// to the plan. That is the seizure [`Self::restatement_drift_conn`]
+    /// already refuses on the drift path (D-PR16-ownership-transfer-is-unguarded).
+    /// The row now joins the `skipped` set below.
+    ///
+    /// Migration 093's arm (c) is the database half of the same rule. It
+    /// refuses the move on any connection that has not armed
+    /// `epigraph.allow_declassify`, and this statement never arms it. So
+    /// without this filter a plan that reached a foreign-group row would fail
+    /// `42501` on every retry instead of skipping the row.
     ///
     /// # IT RETURNS THE IDS IT CHANGED, AND THE CALLER MUST USE THEM
     ///
-    /// The same `IS DISTINCT FROM` guard that makes a batch re-runnable also
-    /// means a row already sitting in the target group is a NO-OP for this plan.
+    /// The same guard that makes a batch re-runnable also means a row already
+    /// sitting in the target group is a NO-OP for this plan.
     /// That is an ordinary thing for a plan frozen while the row was public to
     /// meet — two plans against the same target group with overlapping frozen
     /// sets is not a race, because `privatization_one_active_per_group` excludes
@@ -2555,6 +2577,8 @@ impl PrivatizationRepository {
     /// changed, and that pre-image is typically `public`. So the return value is
     /// the set of rows this statement actually moved, and
     /// `epigraph-jobs::privatization::run_batch` marks the remainder `skipped`.
+    /// The remainder is rows already in the target group plus rows private to
+    /// some other group.
     ///
     /// # Errors
     ///
@@ -2572,8 +2596,7 @@ impl PrivatizationRepository {
             UPDATE public.claims c
                SET visibility = 'group', owner_group_id = $2, updated_at = now()
              WHERE c.id = ANY($1)
-               AND (c.visibility IS DISTINCT FROM 'group'
-                    OR c.owner_group_id IS DISTINCT FROM $2)
+               AND c.visibility = 'public'
             RETURNING c.id
             "#,
         )
@@ -2620,6 +2643,19 @@ impl PrivatizationRepository {
     /// scope `SET` would leave it armed on a pooled connection for whatever ran
     /// next — the hazard [`Self::select`] documents for `statement_timeout`,
     /// with a far worse payload.
+    ///
+    /// # From migration 093 the same GUC also authorizes the OWNER restore
+    ///
+    /// 093's arm (c) refuses any change of `owner_group_id` on a row that is
+    /// `group` unless `epigraph.allow_declassify = 'yes'`. Every row this
+    /// statement touches is `group` (the stamp check above), and restoring the
+    /// pre-image changes its owner back to the one the freeze recorded, so the
+    /// GUC set here is what admits that half too. It is the same decision, one
+    /// row at a time, restoring a value the database recorded, so a second GUC
+    /// would add a name and no boundary. 093's header records the widening of
+    /// what this GUC means. [`Self::restrict_claims_conn`] moves only `public`
+    /// rows, so every pre-image this reaches is `public` and a restore is never
+    /// a group-to-group transfer.
     ///
     /// **The sealed arm of that guard is NOT reachable from here and must not
     /// be.** It has no GUC override by design (sec F11), so a revert of a plan

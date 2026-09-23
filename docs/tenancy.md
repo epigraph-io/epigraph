@@ -397,8 +397,15 @@ protected set and reports a partial flip.
 
 Migration 074's `epigraph_claims_block_widening` refuses an UPDATE that widens a
 claim from `group` to `public` unless the session GUC
-`epigraph.allow_declassify` is set. PR-17 owns writing down who may set it, and
-the honest answer is **nobody is stopped by the database**:
+`epigraph.allow_declassify` is set. **From migration 093 the same GUC also
+gates ownership transfer.** A claim that is `group`-visible may not change
+`owner_group_id` unless it is set, because moving a private row from group A to
+group B changes who can read it as surely as declassifying it does. A SEALED
+claim may not change owner even with it set. The one production setter is still
+`PrivatizationRepository::restore_claims_conn`, which restores both columns from
+the pre-image the freeze recorded (`D-PR16-ownership-transfer-is-unguarded`).
+PR-17 owns writing down who may set the GUC, and the honest answer is **nobody
+is stopped by the database**:
 
 * `REVOKE SET ON PARAMETER "epigraph.allow_declassify" FROM PUBLIC` returns
   `REVOKE` and **records no `pg_parameter_acl` row** — a silent no-op. Measured
@@ -414,7 +421,8 @@ the honest answer is **nobody is stopped by the database**:
 So the control on declassification is **not** a `GRANT`. It is:
 
 1. **The trigger itself**, which is unconditional for a *sealed* claim — arm (a)
-   refuses `sealed ⇒ public` and the GUC deliberately does not reach it.
+   refuses `sealed ⇒ public`, arm (c) (093) refuses a sealed claim's change of
+   owner, and the GUC deliberately reaches neither.
 2. **Reaching the statement at all.** Under 077 an UPDATE of a claim the session
    cannot see matches zero rows, so declassifying somebody else's private claim
    is not available regardless of the GUC.

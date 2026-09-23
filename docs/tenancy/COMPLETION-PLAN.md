@@ -203,6 +203,10 @@ webhook payloads. Highest-severity item in this plan.
 **3.2 `D-PR16-ownership-transfer-is-unguarded`** — `claims_block_widening` is
 `BEFORE UPDATE OF visibility`, so an `UPDATE` changing **only** `owner_group_id` fires no
 guard, and 070 arm (d) then propagates the new owner to all 17 derived tables.
+**DISCHARGED 2026-09-22** by migration 093 (trigger re-armed on `visibility,
+owner_group_id`; a group-private claim cannot change owner without
+`epigraph.allow_declassify`, a sealed one never) and by `restrict_claims_conn` moving only
+`public` rows, which was a live re-owning path the 2026-09-14 ACCEPTED had dismissed.
 
 **3.3 `D-PR16-claim-authorship-is-not-a-credential`** — nothing checks that a caller may
 author as the `agent_id` in the request body, and `routes/hypothesis.rs` derives
