@@ -3129,7 +3129,16 @@ mod tests {
         packet.sign(&signer);
 
         let wire = serde_json::to_value(&packet).unwrap();
-        assert_eq!(wire["claim"]["properties"], serde_json::Value::Null);
+        // `.get`, not indexing: a MISSING key also indexes as Null, and missing
+        // is exactly the drift this test exists to catch.
+        assert_eq!(
+            wire["claim"].get("properties"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            wire["claim"].get("idempotency_key"),
+            Some(&serde_json::Value::Null)
+        );
         assert_eq!(wire["claim"]["labels"], serde_json::json!([]));
         assert!(wire["claim"].get("initial_truth").is_none());
         assert!(server_verifies(&packet, &signer));
