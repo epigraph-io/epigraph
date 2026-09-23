@@ -51,8 +51,10 @@
 //!
 //! # Coverage, stated per SITE because the fraction is otherwise ambiguous
 //!
-//! FOURTEEN of the shard's twenty-five converted `.db_pool` sites — the unit the
-//! ratchet uses — are driven by an arm here. Note the unit before re-deriving
+//! SIXTEEN of the shard's twenty-five converted `.db_pool` sites — the unit the
+//! ratchet uses — are driven by an arm here. It was FOURTEEN at shard 6's land;
+//! the `F-SHARD6-A1` fix added the `get_evidence` arm and one of
+//! `hypothesis_status`'s six sites. Note the unit before re-deriving
 //! that number: `.db_pool` SITES, not handlers and not repo functions.
 //! `get_community` for instance held ONE `let pool = &state.db_pool;` alias and
 //! spends it on two repo calls, so it is one site and not two.
@@ -65,6 +67,8 @@
 //! | `edges.rs::graph_full` | 1 | [`graph_full_serves_the_viewers_own_group_private_claim`] |
 //! | `edges.rs::claim_provenance` | 1 | [`claim_provenance_chains_through_the_viewers_own_group_private_evidence`] |
 //! | `edges.rs::evidence_by_relationship` | 1 | [`supporting_evidence_serves_the_viewers_own_group_private_evidence`] |
+//! | `edges.rs::get_evidence` | 1 | [`get_evidence_withholds_links_the_viewer_may_not_read`] |
+//! | `hypothesis.rs::hypothesis_status` | 1 of 6 (the `analyses` scope check) | [`hypothesis_status_ignores_scope_evidence_the_viewer_may_not_read`] |
 //! | `community.rs::list_communities` | 1 | [`list_communities_serves_the_viewers_own_group_private_community`] |
 //! | `community.rs::get_community` | 1 | [`get_community_serves_a_member_perspective_the_viewer_may_read`] |
 //! | `agents.rs::get_agent_reputation` | 2 | [`agent_reputation_counts_the_viewers_own_group_private_claim`] |
@@ -72,15 +76,18 @@
 //! | `rag.rs::rag_context` | 1 | [`rag_context_returns_the_viewers_own_group_private_claim`] |
 //!
 //! **THE UNCOVERED SET, NAMED BY SITE AND WITH THE REASON, rather than implied
-//! by subtraction.** Eleven sites carry no behavioural arm here:
+//! by subtraction.** Nine sites carry no behavioural arm here:
 //!
-//! * `hypothesis.rs::hypothesis_status` (6) — the largest single prize in the
-//!   shard and the worst fixture story in it. It reads `frames`, `experiments`,
-//!   `mass_functions` and `analyses`; `epigraph-db/tests/viewer_fixture.rs`
-//!   seeds NONE of the four, and there is no inline precedent anywhere in this
-//!   workspace for the last three. Authoring four seeders is a larger and
-//!   separable piece of work than the conversion it would cover. Recorded rather
-//!   than glossed — this is the `F-SHARD4-A4` shape, which already owns the gap.
+//! * `hypothesis.rs::hypothesis_status` (5 of 6) — the largest single prize in
+//!   the shard and the worst fixture story in it. It reads `frames`,
+//!   `experiments`, `mass_functions` and `analyses`;
+//!   `epigraph-db/tests/viewer_fixture.rs` seeds NONE of the four. The
+//!   `analyses` read now has an arm, with a file-local seeder
+//!   ([`seed_scope_limited_analysis`]), because `F-SHARD6-A1` moved it behind a
+//!   viewer and that change needed a proof. The other three tables still have
+//!   no seeder and no inline precedent in this workspace, and authoring them is
+//!   larger and separable work. Recorded rather than glossed — this is the
+//!   `F-SHARD4-A4` shape, which already owns the gap.
 //!   `tenant_isolation_http.rs::hypothesis_status_http_hides_a_group_private_claim_from_a_stranger`
 //!   does exercise the handler end to end, but through `spawn_app`, so it cannot
 //!   observe suppression; it is a counterfactual, not coverage.
@@ -88,11 +95,6 @@
 //!   `method_capabilities` and `papers` seeded before either of its two
 //!   narrowing reads returns anything. One of the three narrows nothing at all
 //!   (`methods`/`method_capabilities` carry no RLS), so an arm would cover two.
-//! * `edges.rs::get_evidence` (1) — its primary object IS the private one, so
-//!   the only cardinality it exposes moves between "a row" and "a 404", which is
-//!   the `.expect(...)` shape this file's acceptance rules out. Its sibling site
-//!   through the same repo function, `detail_by_id`, IS driven by the
-//!   `claim_provenance` arm.
 //! * `rag.rs::search_evidence` (1) — needs `evidence.embedding` populated, which
 //!   the canonical fixture does not do (`set_claim_embedding` writes
 //!   `claims.embedding` only).
@@ -135,6 +137,14 @@
 //! from 2 to 3 when the control is removed — failing on its own `assert_eq!`
 //! rather than inside an `.expect(...)`.
 //!
+//! The two `F-SHARD6-A1` arms have the same shape, with a single linked id or a
+//! single verdict in place of a count, and run the outsider/member pair on each:
+//!
+//! | arm | stranger row | the control it observes |
+//! |---|---|---|
+//! | [`get_evidence_withholds_links_the_viewer_may_not_read`] | a link private to another group from a PUBLIC claim; a PUBLIC link from another group's private claim; a private agent link | the edge and claim markers in `EdgeRepository::first_{claim,agent}_linked_to_evidence` |
+//! | [`hypothesis_status_ignores_scope_evidence_the_viewer_may_not_read`] | a `provides_evidence` link private to another group | the edge marker in `AnalysisRepository::has_scope_limited_evidence_for` |
+//!
 //! # What is still NOT proven here
 //!
 //! `ScopedPoolOptions` exposes no `after_connect`, so the SCOPED arm is still a
@@ -165,9 +175,11 @@ use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::agents::{agent_claims, get_agent_reputation, AgentClaimsParams};
 use epigraph_api::routes::community::{get_community, list_communities, ListCommunitiesQuery};
 use epigraph_api::routes::edges::{
-    claim_neighborhood, claim_provenance, graph_edges, graph_full, list_edges, supporting_evidence,
-    EdgeQueryParams, EvidenceAccessParams, GraphAccessParams, NeighborhoodParams,
+    claim_neighborhood, claim_provenance, get_evidence, graph_edges, graph_full, list_edges,
+    supporting_evidence, EdgeQueryParams, EvidenceAccessParams, GraphAccessParams,
+    NeighborhoodParams,
 };
+use epigraph_api::routes::hypothesis::hypothesis_status;
 use epigraph_api::routes::rag::{rag_context, RagQueryParams};
 use epigraph_api::state::{ApiConfig, AppState};
 use sqlx::PgPool;
@@ -382,6 +394,27 @@ async fn seed_community_member(
         .expect("seed community membership");
 
     perspective
+}
+
+/// An `analyses` row whose `properties.scope_limitations` is non-empty, which
+/// is the property `hypothesis_status`'s `has_explicit_scope` looks for.
+///
+/// File-local because the canonical fixture seeds no `analyses` rows at all.
+/// `F-SHARD4-A4` records that fixture gap. No tenancy columns are declared
+/// because the table has none: `analyses` has no `visibility` or
+/// `owner_group_id` column and no RLS. The tenancy an arm needs goes on the
+/// `provides_evidence` EDGE, through [`seed_typed_edge`].
+async fn seed_scope_limited_analysis(pool: &PgPool, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO analyses (analysis_type, method_description, agent_id, properties) \
+         VALUES ('statistical', 'seeded by shard6_routes_scoped_read', $1, \
+                 '{\"scope_limitations\": [\"n < 30, single site\"]}'::jsonb) \
+         RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("seed scope-limited analysis")
 }
 
 // ── routes/edges.rs ──
@@ -760,6 +793,151 @@ async fn supporting_evidence_serves_the_viewers_own_group_private_evidence(pool:
     );
 }
 
+/// Drive `get_evidence` as `agent` and return the response body.
+///
+/// The viewer is resolved inside, per call, because `Viewer` is not `Clone`.
+async fn evidence_as(
+    pool: &PgPool,
+    state: &AppState,
+    agent: Uuid,
+    evidence: Uuid,
+) -> epigraph_api::routes::edges::EvidenceDetailResponse {
+    get_evidence(
+        State(state.clone()),
+        Path(evidence),
+        Query(EvidenceAccessParams { agent_id: None }),
+        ViewerExtractor(viewer_for(pool, agent).await),
+    )
+    .await
+    .expect(
+        "the evidence row is PUBLIC and hangs off a public claim, so this must SERVE for \
+         every viewer. What an arm below asserts is which LINKED ids come back, not \
+         whether the row does",
+    )
+    .0
+}
+
+/// `GET /api/v1/evidence/:id`: the `claim_id` and `agent_id` it projects from
+/// `edges`. These were two of the three reads registered as `F-SHARD6-A1`.
+///
+/// Shard 6 left this handler without an arm because a private evidence row
+/// only moves between "a row" and "a 404". This arm avoids that shape. The
+/// evidence rows are PUBLIC, so the handler serves both viewers, and the arm is
+/// built on what moves: which linked ids come back. There are two
+/// evidence rows, each seeded so that ONE control alone can withhold its link:
+///
+/// * `edge_hidden`: a PUBLIC claim and an agent link to it through edges forced
+///   private to `member_group`. Both endpoints are readable by everyone, so only
+///   the EDGE predicate (`{EDGE_VISIBILITY:e}`) can withhold them.
+/// * `claim_hidden`: a claim private to `member_group` links to it through an
+///   edge forced PUBLIC. Only the CLAIM predicate (`{VISIBILITY:c}`) can
+///   withhold it.
+///
+/// Before the fix both lookups were inline and took no viewer. The scoped arm
+/// of [`split_state`] is a `BYPASSRLS` session, so the outsider got all three
+/// ids. This is also the production shape while the application DSN is the
+/// superuser (`F-ROLE-MERGE-A1`). What the arm proves is the IN-QUERY predicate,
+/// which is the half this fix adds. It cannot see drift in migration 077's
+/// policy on `edges`, for the reason the module doc gives.
+///
+/// The member arm is the over-suppression direction: the same three ids must
+/// come back to a viewer entitled to them, or a predicate that matched nothing
+/// would pass the outsider half.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_evidence_withholds_links_the_viewer_may_not_read(pool: PgPool) {
+    let (outsider, _outsider_group) = seed_agent_with_group(&pool, "s6-ev-outsider").await;
+    let (member, member_group) = seed_agent_with_group(&pool, "s6-ev-member").await;
+    let world = world_group(&pool).await;
+
+    let host = seed_public_claim(&pool, outsider, "s6 ev: public host").await;
+    let edge_hidden = seed_evidence(&pool, host, "figure").await;
+    let claim_hidden = seed_evidence(&pool, host, "document").await;
+
+    let public_linker = seed_public_claim(&pool, member, "s6 ev: public linker").await;
+    seed_typed_edge(
+        &pool,
+        public_linker,
+        "claim",
+        edge_hidden,
+        "evidence",
+        "derived_from",
+        "group",
+        member_group,
+    )
+    .await;
+    seed_typed_edge(
+        &pool,
+        member,
+        "agent",
+        edge_hidden,
+        "evidence",
+        "submitted",
+        "group",
+        member_group,
+    )
+    .await;
+
+    let private_linker =
+        seed_group_claim(&pool, member, member_group, "s6 ev: private linker").await;
+    seed_typed_edge(
+        &pool,
+        private_linker,
+        "claim",
+        claim_hidden,
+        "evidence",
+        "derived_from",
+        "public",
+        world,
+    )
+    .await;
+
+    let state = split_state(&pool).await;
+
+    // ── the outsider: not in `member_group` ──
+    let out = evidence_as(&pool, &state, outsider, edge_hidden).await;
+    assert_eq!(
+        out.claim_id, None,
+        "the only claim link to {edge_hidden} is an edge private to a group the outsider \
+         is not in. Its claim ({public_linker}) is PUBLIC, so only the edge predicate can \
+         withhold it, and naming it discloses the private link"
+    );
+    assert_eq!(
+        out.agent_id, None,
+        "the only agent link to {edge_hidden} is an edge private to a group the outsider \
+         is not in. Agent ids are world-readable, so the link is the private fact"
+    );
+
+    let out = evidence_as(&pool, &state, outsider, claim_hidden).await;
+    assert_eq!(
+        out.claim_id, None,
+        "the only claim link to {claim_hidden} is a PUBLIC edge from a claim \
+         ({private_linker}) private to a group the outsider is not in. Only the claim \
+         predicate can withhold it. An edge-only filter returns the private claim's id"
+    );
+
+    // ── the member: in `member_group`, so entitled to every link ──
+    let out = evidence_as(&pool, &state, member, edge_hidden).await;
+    assert_eq!(
+        out.claim_id,
+        Some(public_linker),
+        "over-suppression check: the member may read the group-private edge and its \
+         public claim"
+    );
+    assert_eq!(
+        out.agent_id,
+        Some(member),
+        "over-suppression check: the member may read the group-private agent link"
+    );
+
+    let out = evidence_as(&pool, &state, member, claim_hidden).await;
+    assert_eq!(
+        out.claim_id,
+        Some(private_linker),
+        "over-suppression check: the member may read its own group's claim through a \
+         public edge"
+    );
+}
+
 // ── routes/community.rs ──
 
 /// `GET /api/v1/communities` — no HTTP coverage existed for this endpoint.
@@ -1070,5 +1248,99 @@ async fn rag_context_returns_the_viewers_own_group_private_claim(pool: PgPool) {
     assert!(
         out.results.iter().any(|r| r.claim_id == private),
         "over-suppression check: the group-private claim must be present by id"
+    );
+}
+
+// ── routes/hypothesis.rs ──
+
+/// Drive `hypothesis_status` as `agent` and return `promotion.failures`.
+async fn promotion_failures_as(
+    pool: &PgPool,
+    state: &AppState,
+    agent: Uuid,
+    hypothesis: Uuid,
+) -> Vec<String> {
+    let body = hypothesis_status(
+        ViewerExtractor(viewer_for(pool, agent).await),
+        State(state.clone()),
+        Path(hypothesis),
+    )
+    .await
+    .expect(
+        "the hypothesis claim is PUBLIC, so this must SERVE for every viewer. What the arm \
+         asserts is the promotion verdict, not whether the claim is found",
+    )
+    .0;
+    body["promotion"]["failures"]
+        .as_array()
+        .expect("promotion.failures is an array")
+        .iter()
+        .map(|f| {
+            f.as_str()
+                .expect("each failure renders as a string")
+                .to_string()
+        })
+        .collect()
+}
+
+/// `GET /api/v1/hypothesis/:id/status`: the `has_explicit_scope` input to
+/// `evaluate_promotion`. This was the third read registered as `F-SHARD6-A1`.
+///
+/// The hypothesis claim is PUBLIC, so the handler serves both viewers. That
+/// matters: on a claim the outsider could not read, the handler would 404
+/// before `has_explicit_scope` is computed, and the arm would prove nothing.
+/// Its only scope evidence is a `provides_evidence` edge, forced private to
+/// `member_group`, from an analysis with non-empty `scope_limitations`.
+/// `analyses` has no tenancy of its own, so that edge is the one place the link
+/// can be withheld.
+///
+/// * The outsider may not see the link, so its verdict must carry
+///   `NoExplicitScope`. Before the fix the EXISTS was inline and took no viewer;
+///   on [`split_state`]'s `BYPASSRLS` scoped arm it saw the link, and the
+///   outsider got a verdict computed from evidence it cannot read.
+/// * The member may see it, so its verdict must NOT carry `NoExplicitScope`.
+///   This is the over-suppression direction, and it is what shows the outsider
+///   result is a tenancy decision rather than a read that matches nothing.
+///
+/// The claim-side marker on the same statement (`{VISIBILITY:c}` on the target)
+/// cannot be observed here, because the handler 404s on an unreadable claim
+/// first. `epigraph-db/tests/evidence_links_and_scope_scoped_read.rs` observes
+/// it at the repo layer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hypothesis_status_ignores_scope_evidence_the_viewer_may_not_read(pool: PgPool) {
+    let (outsider, _outsider_group) = seed_agent_with_group(&pool, "s6-hs-outsider").await;
+    let (member, member_group) = seed_agent_with_group(&pool, "s6-hs-member").await;
+
+    let hypothesis = seed_public_claim(&pool, outsider, "s6 hs: a public hypothesis").await;
+    let analysis = seed_scope_limited_analysis(&pool, member).await;
+    seed_typed_edge(
+        &pool,
+        analysis,
+        "analysis",
+        hypothesis,
+        "claim",
+        "provides_evidence",
+        "group",
+        member_group,
+    )
+    .await;
+
+    let state = split_state(&pool).await;
+
+    let outsider_failures = promotion_failures_as(&pool, &state, outsider, hypothesis).await;
+    assert!(
+        outsider_failures.iter().any(|f| f == "NoExplicitScope"),
+        "the only scope evidence for {hypothesis} is a provides_evidence edge private to a \
+         group the outsider is not in, so the outsider's verdict must report \
+         NoExplicitScope. Got {outsider_failures:?}. A verdict without it was computed \
+         from a link the outsider cannot see"
+    );
+
+    let member_failures = promotion_failures_as(&pool, &state, member, hypothesis).await;
+    assert!(
+        !member_failures.iter().any(|f| f == "NoExplicitScope"),
+        "over-suppression check: the member may read the provides_evidence edge from \
+         scope-limited analysis {analysis}, so its verdict must not report \
+         NoExplicitScope. Got {member_failures:?}"
     );
 }

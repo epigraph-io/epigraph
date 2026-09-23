@@ -636,6 +636,107 @@ impl EdgeRepository {
             .collect())
     }
 
+    /// The claim linked to an evidence row by a `claim -> evidence` edge, or
+    /// `None` when no such link is visible to `viewer`.
+    ///
+    /// Backs the `claim_id` field of `GET /api/v1/evidence/:id`
+    /// (`routes/edges.rs::get_evidence`). That handler used to project it with
+    /// an inline `SELECT source_id FROM edges ... LIMIT 1` that took no viewer
+    /// (`F-SHARD6-A1`). The evidence row was filtered, but the link was not, so
+    /// the response could name a claim through an edge the viewer may not see.
+    ///
+    /// # Two markers, and both are required
+    ///
+    /// * `{EDGE_VISIBILITY:e}` withholds a link that is private to a group the
+    ///   viewer is not in.
+    /// * `{VISIBILITY:c}` withholds a link whose CLAIM the viewer may not read.
+    ///   An edge's tenancy columns are its own row's, so an edge can be visible
+    ///   while its source claim is not: a PUBLIC edge from a group-private
+    ///   claim is exactly what the tests plant. Filtering only the edge would
+    ///   move the leak from the edge to the claim's id.
+    ///
+    /// Both markers resolve to the one bind `$2`.
+    ///
+    /// # Filter, then pick
+    ///
+    /// The predicates run BEFORE `LIMIT 1`, so a hidden earlier link does not
+    /// mask a visible later one. The order is deterministic: earliest
+    /// `created_at` first, then `id`. The inline read had `LIMIT 1` with no
+    /// `ORDER BY`, so which link it returned was undefined. The earliest link is
+    /// normally the one written when the evidence was attached.
+    ///
+    /// # Not filtered on `valid_to`
+    ///
+    /// A retracted link still counts, exactly as it did in the inline read. This
+    /// function changes tenancy only. Honouring [`EDGE_IN_FORCE`] here is a
+    /// separate decision about what a retracted link means for this response.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn first_claim_linked_to_evidence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        evidence_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.source_id \
+             FROM edges e \
+             JOIN claims c ON c.id = e.source_id \
+             WHERE e.target_id = $1 \
+               AND e.target_type = 'evidence' \
+               AND e.source_type = 'claim' \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY e.created_at, e.id \
+             LIMIT 1",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(evidence_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// The agent linked to an evidence row by an `agent -> evidence` edge, or
+    /// `None` when no such link is visible to `viewer`.
+    ///
+    /// The `agent_id` half of `GET /api/v1/evidence/:id`, and the second of the
+    /// two inline reads `F-SHARD6-A1` registered. Ordering and retraction are
+    /// the same as [`Self::first_claim_linked_to_evidence`].
+    ///
+    /// ONE marker, on the edge, because the endpoint has no tenancy to filter:
+    /// migration 077 gives `agents` the policy `agents_identity FOR SELECT USING
+    /// (true)`, because an agent's identity has to render authorship on public
+    /// claims. So the agent's id is readable to everyone. The only private thing
+    /// here is the LINK: that this agent is attached to this evidence.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn first_agent_linked_to_evidence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        evidence_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.source_id \
+             FROM edges e \
+             WHERE e.target_id = $1 \
+               AND e.target_type = 'evidence' \
+               AND e.source_type = 'agent' \
+               /* {EDGE_VISIBILITY:e} */ \
+             ORDER BY e.created_at, e.id \
+             LIMIT 1",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(evidence_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
     /// Get edges by relationship type
     ///
     /// # Errors

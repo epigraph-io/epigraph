@@ -169,6 +169,62 @@ impl AnalysisRepository {
             .collect())
     }
 
+    /// Whether a `provides_evidence` edge that `viewer` may see links an
+    /// analysis with non-empty `properties.scope_limitations` to `claim_id`.
+    ///
+    /// Backs `has_explicit_scope` in `GET /api/v1/hypothesis/:id/status`
+    /// (`routes/hypothesis.rs::hypothesis_status`). That flag feeds
+    /// `evaluate_promotion`, so it decides `promotion.ready` and whether
+    /// `NoExplicitScope` appears in `promotion.failures`. The handler used to
+    /// run this EXISTS inline with no viewer (`F-SHARD6-A1`), so the verdict was
+    /// computed from links the viewer may not see.
+    ///
+    /// # Where the tenancy comes from
+    ///
+    /// `analyses` has no tenancy of its own. Measured at migration head 100: it
+    /// has no `visibility` or `owner_group_id` column, row-level security is
+    /// off, and `pg_policies` has no rows for it. So no predicate can be written
+    /// on `a`. The predicates go on the two relations that do carry tenancy:
+    ///
+    /// * `{EDGE_VISIBILITY:e}` on the link, which is where a group-private
+    ///   `provides_evidence` edge is withheld;
+    /// * `{VISIBILITY:c}` on the target claim, so the function answers `false`
+    ///   for a claim the viewer may not read, rather than leaking one bit about
+    ///   it. The route already 404s on such a claim before calling this; the
+    ///   marker makes the function safe on its own.
+    ///
+    /// Both markers resolve to the one bind `$2`. The SQL body is otherwise the
+    /// handler's, unchanged. Like the sibling
+    /// `ExperimentRepository::count_completed_with_analysis`, it does not filter
+    /// on `edges.valid_to`, so a retracted link still counts. This function
+    /// changes tenancy only.
+    pub async fn has_scope_limited_evidence_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let sql = viewer.splice(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM analyses a \
+               JOIN edges e ON e.source_id = a.id \
+                           AND e.source_type = 'analysis' \
+                           AND e.target_id = $1 \
+                           AND e.target_type = 'claim' \
+                           AND e.relationship = 'provides_evidence' \
+               JOIN claims c ON c.id = e.target_id \
+               WHERE a.properties->>'scope_limitations' IS NOT NULL \
+                 AND a.properties->'scope_limitations' != '[]'::jsonb \
+                 /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             )",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_one(executor).await
+    }
+
     /// Create an `interpreted_by` edge from evidence to analysis.
     pub async fn link_evidence(
         pool: &PgPool,

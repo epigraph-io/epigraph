@@ -7,13 +7,17 @@
 //! # Tenancy: 10 of this file's 17 raw-pool sites are converted
 //!
 //! Conversion shard 6. `hypothesis_status` is the only wholly-convertible
-//! handler here and it is the shard's densest: all six of its sites — two
+//! handler here and it is the shard's densest: all six of its sites — three
 //! viewer-spliced repo reads, one viewer-less repo read, one viewer-spliced
-//! count and two inline `sqlx` statements — now run on one viewer-stamped
-//! connection from [`AppState::read_as`]. A promotion verdict assembled from six
-//! separate checkouts is a verdict assembled under six independent tenancy
-//! stamps; this makes it one stamp. It does not make it one snapshot — see the
-//! comment at the acquire.
+//! count and one inline `sqlx` statement (the `frames` lookup) — now run on one
+//! viewer-stamped connection from [`AppState::read_as`]. The shard left the
+//! `analyses` scope check as a second inline statement with no viewer; it
+//! became `AnalysisRepository::has_scope_limited_evidence_for`, which splices
+//! the viewer over the link (`F-SHARD6-A1`).
+//!
+//! A promotion verdict assembled from six separate checkouts is a verdict
+//! assembled under six independent tenancy stamps; this makes it one stamp. It
+//! does not make it one snapshot — see the comment at the acquire.
 //!
 //! **One of those six WIDENS what the caller sees rather than narrowing it**, and
 //! the handler comments say which and why rather than letting the diff read as
@@ -372,49 +376,27 @@ pub async fn hypothesis_status(
                 message: format!("{e}"),
             })?;
 
-    // Check scope: find analyses that provide_evidence to this hypothesis with
-    // scope_limitations.
+    // Check scope: is there a provides_evidence link, visible to this viewer,
+    // from an analysis with non-empty scope_limitations?
     //
-    // NO `{VISIBILITY}` MARKER AND NONE TO ADD, stated here in the shape the two
-    // `EXECUTOR_WITHOUT_VIEWER` rows this shard wrote use, so a later reader does
-    // not have to re-derive it. Measured on the throwaway at migration head 92:
-    // `analyses` reports `relrowsecurity` and `relforcerowsecurity` both false,
-    // carries zero rows in `pg_policies`, and has neither a `visibility` nor an
-    // `owner_group_id` column — so there is no column to attach a predicate to
-    // and no policy for a session GUC to select. Stamping this statement
-    // therefore narrows nothing; it shares the connection so the verdict is
-    // assembled under one tenancy stamp. Its JOIN partner `edges` IS FORCEd and
-    // does carry the stamp. The residual — that this is an unspliced read over a
-    // relation with no tenancy of its own — is not new, not created here, and is
-    // registered in `docs/tenancy/progress.json` as `F-SHARD6-A1` with its
-    // location and owner; nothing about its reachability is recorded in this
-    // repository.
-    let has_scope: (bool,) = sqlx::query_as(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM analyses a
-            JOIN edges e ON e.source_id = a.id
-                        AND e.source_type = 'analysis'
-                        AND e.target_id = $1
-                        AND e.target_type = 'claim'
-                        AND e.relationship = 'provides_evidence'
-            WHERE a.properties->>'scope_limitations' IS NOT NULL
-              AND a.properties->'scope_limitations' != '[]'::jsonb
-        )
-        "#,
-    )
-    .bind(id)
-    .fetch_one(&mut *read)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("{e}"),
-    })?;
+    // `analyses` has no tenancy of its own (no `visibility` or
+    // `owner_group_id` column, no RLS), so the predicate goes on the LINK: the
+    // repo function splices `{EDGE_VISIBILITY:e}` over the `provides_evidence`
+    // edge, and `{VISIBILITY:c}` over the target claim. This was an inline
+    // EXISTS with no viewer until `F-SHARD6-A1`, so the verdict could be
+    // computed from a link the caller may not see.
+    let has_scope =
+        epigraph_db::AnalysisRepository::has_scope_limited_evidence_for(&mut *read, &viewer, id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("{e}"),
+            })?;
 
     let promotion_input = epigraph_engine::PromotionInput {
         bel_supported,
         bel_unsupported,
         completed_experiments_with_analysis: completed_with_analysis as usize,
-        has_explicit_scope: has_scope.0,
+        has_explicit_scope: has_scope,
     };
     let promotion = epigraph_engine::evaluate_promotion(&promotion_input);
 

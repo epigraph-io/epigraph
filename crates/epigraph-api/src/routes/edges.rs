@@ -2056,11 +2056,6 @@ pub struct EvidenceDetailResponse {
 // Row types for evidence and provenance queries
 #[cfg(feature = "db")]
 #[derive(sqlx::FromRow)]
-struct SourceIdRow {
-    source_id: Uuid,
-}
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
 struct TargetIdRow {
     target_id: Uuid,
 }
@@ -2119,24 +2114,39 @@ pub async fn get_evidence(
 
     let props = &row.properties;
 
-    // Extract claim_id and agent_id from edges pointing to this evidence
-    let claim_edge: Option<SourceIdRow> = sqlx::query_as(
-        "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'claim' LIMIT 1"
+    // The claim and agent linked to this evidence by an edge. The evidence row
+    // above is filtered, but these LINKS are separate rows with their own
+    // tenancy, so a readable evidence row does not make every link readable.
+    // Both lookups splice the viewer (`F-SHARD6-A1`). The claim lookup filters
+    // the edge AND the claim; see `EdgeRepository::first_claim_linked_to_evidence`.
+    // A link the viewer may not see comes back `None`, which is the same value
+    // an evidence row with no link produces.
+    //
+    // Errors PROPAGATE. They used to be swallowed with `.ok().flatten()`. These
+    // statements share one connection with `detail_by_id`, and under
+    // `SessionGucMode::Transaction` a failed statement aborts the transaction
+    // (25P02). A swallow here would turn that into a 200 with `claim_id` and
+    // `agent_id` silently null. `fetch_optional` returns `Ok(None)` for "no
+    // row", so only a real database error reaches the `?`.
+    let claim_id = epigraph_db::EdgeRepository::first_claim_linked_to_evidence(
+        &mut *read,
+        &viewer,
+        evidence_id,
     )
-    .bind(evidence_id)
-    .fetch_optional(&mut *read)
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| ApiError::InternalError {
+        message: format!("DB error: {e}"),
+    })?;
 
-    let agent_edge: Option<SourceIdRow> = sqlx::query_as(
-        "SELECT source_id FROM edges WHERE target_id = $1 AND target_type = 'evidence' AND source_type = 'agent' LIMIT 1"
+    let agent_id = epigraph_db::EdgeRepository::first_agent_linked_to_evidence(
+        &mut *read,
+        &viewer,
+        evidence_id,
     )
-    .bind(evidence_id)
-    .fetch_optional(&mut *read)
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| ApiError::InternalError {
+        message: format!("DB error: {e}"),
+    })?;
 
     let ev_type = props
         .get("evidence_type")
@@ -2159,8 +2169,8 @@ pub async fn get_evidence(
 
     let response = EvidenceDetailResponse {
         id: row.id,
-        claim_id: claim_edge.map(|r| r.source_id),
-        agent_id: agent_edge.map(|r| r.source_id),
+        claim_id,
+        agent_id,
         evidence_type: ev_type,
         content,
         content_hash: hex::encode(&row.content_hash),
