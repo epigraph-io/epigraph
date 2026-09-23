@@ -6,13 +6,16 @@
 //! compared against a constant and could never match, returning an empty set
 //! with HTTP 200.
 //!
-//! Both handler paths are exercised: the COUNT(*) fast path (no filters) must
-//! report the real currency per row, and the in-memory slow path (reached by
-//! `is_current`, which sets `needs_in_memory_filters`) must actually partition
-//! the seeded rows. `content_contains` is pushed into the SQL `ILIKE`, so the
-//! slow path's 10,000-row working set is already restricted to our marker and
-//! this test is unaffected by the size of the shared test database (that cap
-//! is separately tracked as backlog `2265a67b`).
+//! Two properties are exercised. With no filter, each row must report its real
+//! currency. With `?is_current=`, the filter must actually partition the seeded
+//! rows. `content_contains` confines both requests to this run's marker, so
+//! concurrent runs against a shared database do not see each other's rows.
+//!
+//! This file used to say its `content_contains` also kept it clear of a
+//! 10,000-row working-set cap, "separately tracked as backlog `2265a67b`".
+//! DISCHARGED: the handler now filters and counts in SQL
+//! (`ClaimRepository::list_filtered` / `count_filtered`), so there is no window
+//! to stay inside. `claims_query_filters_past_the_window.rs` pins that.
 #![cfg(feature = "db")]
 
 use serde_json::Value;
@@ -56,7 +59,7 @@ async fn claims_query_is_current_reflects_the_stored_column() {
     // than on the `is_current` projection it exists to check.
     let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:read"]).await;
 
-    // ---- Fast path (no filters): per-row is_current must be the real column ----
+    // ---- No filter: per-row is_current must be the real column ----
     let body: Value = client
         .get(format!(
             "http://{addr}/api/v1/claims?content_contains={marker}&limit=50"
@@ -85,7 +88,7 @@ async fn claims_query_is_current_reflects_the_stored_column() {
          f1992766 fabrication"
     );
 
-    // ---- Slow path: ?is_current=false must return the superseded row ----
+    // ---- ?is_current=false must return the superseded row ----
     let body: Value = client
         .get(format!(
             "http://{addr}/api/v1/claims?content_contains={marker}&is_current=false&limit=50"
@@ -106,7 +109,7 @@ async fn claims_query_is_current_reflects_the_stored_column() {
     assert_eq!(rows[0]["id"].as_str().unwrap(), superseded.to_string());
     assert_eq!(body["total"], Value::from(1));
 
-    // ---- Slow path complement: ?is_current=true excludes the superseded row ----
+    // ---- Complement: ?is_current=true excludes the superseded row ----
     let body: Value = client
         .get(format!(
             "http://{addr}/api/v1/claims?content_contains={marker}&is_current=true&limit=50"

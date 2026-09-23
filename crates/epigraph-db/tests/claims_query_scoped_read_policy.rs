@@ -1,6 +1,17 @@
-//! The POLICY half of PR-28: on a genuinely filtered session, each of the four
-//! reads `GET /api/v1/claims` runs returns the viewer's own rows through a
+//! The POLICY half of PR-28: on a genuinely filtered session, each read
+//! `GET /api/v1/claims` runs, or ran, returns the viewer's own rows through a
 //! viewer-stamped connection and NOTHING through an unstamped one.
+//!
+//! # Which reads the handler runs today
+//!
+//! Since backlog `2265a67b` the handler runs two reads on every request:
+//! `ClaimRepository::count_filtered` and `ClaimRepository::list_filtered`
+//! ([`Read::CountFiltered`], [`Read::ListFiltered`]). Their arms set both the
+//! methodology and the evidence-type filter, so the `EXISTS` subqueries over
+//! `reasoning_traces` and `evidence`, each a FORCEd table with its own policy,
+//! run under the policy too. The four reads PR-28 converted (`count`, `list`
+//! and the two id prefetches) stay pinned below. `list` and `count` still
+//! have other callers, and the prefetches are still public repo functions.
 //!
 //! # Why this file exists separately from the api-crate one
 //!
@@ -30,17 +41,19 @@
 //! fixes.
 //!
 //! Unlike PR-26, this shard authored NO new repo form to make that expressible.
-//! PR-27 widened all four of these functions to `<'e, E: sqlx::PgExecutor<'e>>`,
-//! so a `&mut ScopedRead` and a `&mut PgConnection` are both accepted by the one
-//! body the handler calls — the arms genuinely execute the same SQL text rather
-//! than two texts believed to match.
+//! PR-27 widened all four of PR-28's functions to `<'e, E: sqlx::PgExecutor<'e>>`,
+//! and the two filtered reads take the same bound, so a `&mut ScopedRead` and a
+//! `&mut PgConnection` are both accepted by the one body the handler calls — the
+//! arms genuinely execute the same SQL text rather than two texts believed to
+//! match.
 //!
-//! # All FOUR reads, and both `SessionGucMode` arms
+//! # All SIX reads, and both `SessionGucMode` arms
 //!
-//! Factored over [`Read`] as well as the mode. `count` and `list` are the fast
-//! path; `list` is also the slow path's working-set read;
-//! `claim_ids_by_methodology` and `claim_ids_by_evidence_type` are the two
-//! prefetches. All four are RLS-relevant — `claims`, `reasoning_traces` and
+//! Factored over [`Read`] as well as the mode. `count_filtered` and
+//! `list_filtered` are what the handler runs today. `count` and `list` were
+//! PR-28's fast path (`list` also its slow path's 10,000-row working set), and
+//! `claim_ids_by_methodology` and `claim_ids_by_evidence_type` its two
+//! prefetches. All six are RLS-relevant — `claims`, `reasoning_traces` and
 //! `evidence` are all in 077's owned set and FORCEd by 079 — and the register's
 //! rule is that one function being correct does not cover its siblings.
 //!
@@ -61,7 +74,7 @@
 mod viewer_fixture;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ClaimRepository, SessionGucMode};
+use epigraph_db::{ClaimListFilter, ClaimListSort, ClaimRepository, SessionGucMode, SortDirection};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 use viewer_fixture::{
@@ -78,23 +91,39 @@ struct Observation {
     bypass: bool,
 }
 
-/// Which of the handler's four reads an arm drives.
+/// Which read an arm drives.
 ///
 /// A parameter and not a closure: the arms take `&mut ScopedRead` / `&mut
 /// PgConnection` behind a generic `E: PgExecutor`, which a shared `Fn(..) ->
-/// Fut` cannot thread without an HRTB fight, and the four differ in arity.
+/// Fut` cannot thread without an HRTB fight, and the six differ in arity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Read {
-    /// The fast path's `COUNT(*)`, whose differential is NUMERIC — `1` against
-    /// `0` — rather than an empty vec. That is the sharpest available form of
-    /// "rows vanish from their own owner with a 200".
+    /// PR-28's fast-path `COUNT(*)`, whose differential is NUMERIC — `1`
+    /// against `0` — rather than an empty vec. That is the sharpest available
+    /// form of "rows vanish from their own owner with a 200".
     Count,
-    /// The fast path's page read, and the slow path's 10_000-row working set.
+    /// PR-28's fast-path page read, and its slow path's 10,000-row working set.
     List,
     /// The methodology prefetch.
     Methodology,
     /// The evidence-type prefetch.
     EvidenceType,
+    /// The handler's `total`: `count_filtered` with both `EXISTS` filters set.
+    CountFiltered,
+    /// The handler's page: `list_filtered` with both `EXISTS` filters set.
+    ListFiltered,
+}
+
+/// The filter the two filtered arms use. Both subquery filters are set, so the
+/// statement reads `claims`, `reasoning_traces` and `evidence`, and the one
+/// seeded claim (which carries a `deductive` trace and a `document` evidence
+/// row) is the only match.
+fn both_subquery_filters() -> ClaimListFilter<'static> {
+    ClaimListFilter {
+        methodology: Some("deductive"),
+        evidence_type: Some("document"),
+        ..ClaimListFilter::default()
+    }
 }
 
 impl Read {
@@ -123,6 +152,21 @@ impl Read {
                     .await?
                     .len()
             }
+            Read::CountFiltered => {
+                ClaimRepository::count_filtered(&mut *conn, viewer, &both_subquery_filters())
+                    .await? as usize
+            }
+            Read::ListFiltered => ClaimRepository::list_filtered(
+                &mut *conn,
+                viewer,
+                &both_subquery_filters(),
+                ClaimListSort::CreatedAt,
+                SortDirection::Desc,
+                100,
+                0,
+            )
+            .await?
+            .len(),
         })
     }
 }
@@ -130,7 +174,7 @@ impl Read {
 /// One group-private claim owned by a group `agent` is an `admin` of, carrying
 /// both a `deductive` reasoning trace and a `document` evidence row.
 ///
-/// One claim serves all four reads, which is deliberate: the expected
+/// One claim serves all six reads, which is deliberate: the expected
 /// cardinality is then the same `1` for every arm, and a differential cannot be
 /// an artefact of one arm's fixture being richer than another's.
 ///
@@ -317,4 +361,34 @@ async fn the_stamped_evidence_prefetch_serves_the_viewers_own_rows_and_the_unsta
     pool: PgPool,
 ) {
     coherence_case_for(pool, SessionGucMode::Transaction, Read::EvidenceType).await;
+}
+
+/// The handler's `total` read, with both `EXISTS` subqueries in the statement.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_filtered_count_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Read::CountFiltered).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_filtered_count_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Transaction, Read::CountFiltered).await;
+}
+
+/// The handler's page read, with both `EXISTS` subqueries in the statement.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_filtered_list_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Read::ListFiltered).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_filtered_list_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Transaction, Read::ListFiltered).await;
 }

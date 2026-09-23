@@ -92,8 +92,10 @@ async fn list_reports_real_is_current_on_both_query_paths(pool: PgPool) {
         );
     }
 
-    // The in-memory `retain(|c| c.is_current == false)` that
-    // `list_claims_query`'s slow path performs must now be able to match.
+    // An in-memory `retain(|c| c.is_current == false)` over `list`'s result
+    // must be able to match. `list_claims_query`'s old slow path did exactly
+    // that; it now filters in SQL through `list_filtered`, but other callers
+    // of `list` still read the projected column.
     let only_retired: Vec<Uuid> = searched
         .iter()
         .filter(|c| !c.is_current)

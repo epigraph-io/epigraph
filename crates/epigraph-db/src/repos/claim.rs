@@ -4727,6 +4727,12 @@ impl ClaimRepository {
     ///
     /// Valid values mirror the DB CHECK constraint on reasoning_traces:
     /// deductive, inductive, abductive, analogical, statistical.
+    ///
+    /// `GET /api/v1/claims` no longer calls this. It filters through
+    /// [`ClaimListFilter::methodology`], an `EXISTS` subquery with the same two
+    /// visibility predicates, inside the paginated statement (backlog
+    /// `2265a67b`). An unbounded id set intersected with a capped page is the
+    /// shape that fix removed, so do not reintroduce it.
     pub async fn claim_ids_by_methodology<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -4755,6 +4761,10 @@ impl ClaimRepository {
     ///
     /// Valid values mirror the DB evidence_type column:
     /// document, observation, testimony, computation, reference, figure, conversational.
+    ///
+    /// `GET /api/v1/claims` no longer calls this. It filters through
+    /// [`ClaimListFilter::evidence_type`] inside the paginated statement
+    /// (backlog `2265a67b`); see [`Self::claim_ids_by_methodology`].
     pub async fn claim_ids_by_evidence_type<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,

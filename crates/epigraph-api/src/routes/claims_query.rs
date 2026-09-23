@@ -17,11 +17,9 @@ use crate::errors::ApiError;
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimListFilter, ClaimListSort, ClaimRepository, SortDirection};
 
 use crate::middleware::bearer::ViewerExtractor;
-#[cfg(feature = "db")]
-use std::collections::HashSet;
 
 // ============================================================================
 // Constants
@@ -177,47 +175,58 @@ pub struct ClaimListResponse {
 ///
 /// Queries the claims table with filtering, sorting, and pagination.
 ///
+/// # Every filter, the sort and the count run in SQL
+///
+/// The handler runs exactly two statements, on every request:
+/// [`ClaimRepository::count_filtered`] for `total`, then
+/// [`ClaimRepository::list_filtered`] for the page. Both take the same
+/// [`ClaimListFilter`], and each filter is a `WHERE` predicate evaluated before
+/// `LIMIT`/`OFFSET`. So a match is found however old it is, `sort_by` orders
+/// every match, and `total` is the true number of matches.
+///
+/// That replaced (backlog `2265a67b`) a "slow path" taken by any filter or
+/// non-default sort. It fetched `ClaimRepository::list(10_000, 0)`, the newest
+/// 10,000 rows, and filtered, sorted and counted them in memory. A match older
+/// than that window was missing with HTTP 200, and `total` was the number of
+/// matches inside the window.
+///
+/// `methodology` and `evidence_type` used to be id-set prefetches intersected
+/// with that window. They are now `EXISTS` subqueries inside the same
+/// statement, and each carries its own visibility marker on `reasoning_traces`
+/// / `evidence` (see [`ClaimListFilter`]). Without those markers, a readable
+/// claim could match through a trace or evidence row the viewer cannot read,
+/// which would reveal that the row exists. **Keep every filter an `AND`ed
+/// conjunct.** An `OR` would let a predicate on one table admit a row that
+/// another table's visibility predicate should have excluded.
+///
 /// # Tenancy: ONE viewer-stamped connection for the whole request
 ///
-/// PR-28 is conversion shard 2 against
-/// `D-PR17-request-path-never-stamps-session-gucs`. It moves this handler's five
-/// raw-pool reads onto [`AppState::read_as`]. The connection is acquired ONCE,
-/// below, and threaded into every statement on both paths.
+/// PR-28 (conversion shard 2 against
+/// `D-PR17-request-path-never-stamps-session-gucs`) moved this handler's reads
+/// off the raw pool onto [`AppState::read_as`]. The connection is acquired
+/// ONCE, below, and both statements run on it.
 ///
 /// `read_as` and not `acquire_as`: the latter hard-refuses
 /// `EPIGRAPH_SESSION_GUC_MODE=transaction`, the pooler fallback `bin/server.rs`
 /// advertises to operators, so a site converted that way is unservable in a
 /// configuration this project supports.
 ///
-/// Every one of the five is a READ. `ClaimRepository::{list, count,
-/// claim_ids_by_methodology, claim_ids_by_evidence_type}` were all widened to
-/// `<'e, E: sqlx::PgExecutor<'e>>` by PR-27, so this shard authors ZERO new repo
-/// forms and changes NO SQL — the five call sites simply pass `&mut *read`. The
-/// reborrow is explicit at each site on purpose: deref coercion does not fire
-/// against a generic `E`, so `&mut read` would infer `E = &mut ScopedRead<'_>`
-/// and fail the bound.
+/// Both repo functions take `<'e, E: sqlx::PgExecutor<'e>>`, and the call sites
+/// pass `&mut *read`. The reborrow is explicit on purpose: deref coercion does
+/// not fire against a generic `E`, so `&mut read` would infer
+/// `E = &mut ScopedRead<'_>` and fail the bound.
+///
+/// `count` and `list` are two statements, and `total` only describes `claims`
+/// truthfully if both saw the same corpus. Running them on the one stamped
+/// handle makes that so; under `SessionGucMode::Transaction` they are also the
+/// same transaction.
 ///
 /// # Footprint — bounded, unlike PR-26's
 ///
 /// `F-PR26-lineage-holds-one-connection-for-n-round-trips` is owed before the
 /// next WALK-shaped handler. This one is not walk-shaped and does not multiply
-/// it: the handle spans at most THREE statements and there is no per-node loop
-/// and no unbounded `N`. The fast path runs `count` + `list` (2); the slow path
-/// runs one or two prefetches + `list` (2-3). The two paths cannot combine,
-/// because `methodology_ids.is_some()` and `evidence_type_ids.is_some()` are
-/// themselves terms of `needs_in_memory_filters` — a fired prefetch FORCES the
-/// slow path, so `count` and a prefetch never run on the same request. Every
-/// in-memory `retain` below runs after the last statement, holding nothing.
-///
-/// # The prefetch sets NARROW, and that is load-bearing
-///
-/// Both `methodology_ids` and `evidence_type_ids` are applied as
-/// `claims.retain(|c| ids.contains(..))` — a set INTERSECTION against a working
-/// set that already came from the viewer-predicated `ClaimRepository::list`. The
-/// result's visibility therefore rests on `list`/`count`; the prefetch
-/// predicates are defence in depth. **Do not turn either application into a
-/// union or an `OR`.** That would promote a prefetch predicate to load-bearing,
-/// and neither prefetch predicate is equivalent to `list`'s.
+/// it: the handle spans exactly TWO statements, with no per-node loop and no
+/// unbounded `N`.
 #[cfg(feature = "db")]
 pub async fn list_claims_query(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -248,7 +257,7 @@ pub async fn list_claims_query(
 
     // ---- Validate sort_by ----
     let sort_by = params.sort_by.unwrap_or_else(|| "created_at".to_string());
-    if sort_by != "truth_value" && sort_by != "created_at" {
+    let Some(sort) = ClaimListSort::from_wire(&sort_by) else {
         return Err(ApiError::ValidationError {
             field: "sort_by".to_string(),
             reason: format!(
@@ -256,11 +265,11 @@ pub async fn list_claims_query(
                 sort_by
             ),
         });
-    }
+    };
 
     // ---- Validate sort_order ----
     let sort_order = params.sort_order.unwrap_or_else(|| "desc".to_string());
-    if sort_order != "asc" && sort_order != "desc" {
+    let Some(direction) = SortDirection::from_wire(&sort_order) else {
         return Err(ApiError::ValidationError {
             field: "sort_order".to_string(),
             reason: format!(
@@ -268,7 +277,7 @@ pub async fn list_claims_query(
                 sort_order
             ),
         });
-    }
+    };
 
     // ---- Validate content_contains length ----
     if let Some(ref search) = params.content_contains {
@@ -346,181 +355,44 @@ pub async fn list_claims_query(
         }
     })?;
 
-    // ---- Pre-fetch methodology / evidence_type claim ID sets ----
-    let methodology_ids: Option<HashSet<uuid::Uuid>> = match params.methodology {
-        Some(ref m) => {
-            let ids = ClaimRepository::claim_ids_by_methodology(&mut *read, &viewer, m)
-                .await
-                .map_err(|e| scoped_read_failure(&e, "Methodology filter query failed"))?;
-            Some(ids.into_iter().collect())
-        }
-        None => None,
+    // ---- Every filter goes into SQL, ahead of LIMIT/OFFSET ----
+    let filter = ClaimListFilter {
+        search: params.content_contains.as_deref(),
+        truth_min: params.truth_min,
+        truth_max: params.truth_max,
+        agent_id: params.agent_id,
+        exclude_agent_id: params.exclude_agent_id,
+        is_current: params.is_current,
+        created_after: params.created_after,
+        created_before: params.created_before,
+        methodology: params.methodology.as_deref(),
+        evidence_type: params.evidence_type.as_deref(),
     };
 
-    let evidence_type_ids: Option<HashSet<uuid::Uuid>> = match params.evidence_type {
-        Some(ref et) => {
-            let ids = ClaimRepository::claim_ids_by_evidence_type(&mut *read, &viewer, et)
-                .await
-                .map_err(|e| scoped_read_failure(&e, "Evidence type filter query failed"))?;
-            Some(ids.into_iter().collect())
-        }
-        None => None,
-    };
-
-    // ---- Fast path: no post-fetch filters, default sort ----
-    // The legacy in-memory pipeline below caps the working set at 10_000 rows
-    // and reports `total` as the slice length, which understates the true table
-    // count on large databases. When the request needs no truth/agent/date/
-    // methodology/evidence-type filtering and uses the default sort, we can let
-    // PostgreSQL do COUNT(*) + LIMIT/OFFSET directly.
-    let needs_in_memory_filters = params.truth_min.is_some()
-        || params.truth_max.is_some()
-        || params.agent_id.is_some()
-        || params.exclude_agent_id.is_some()
-        || params.is_current.is_some()
-        || params.created_after.is_some()
-        || params.created_before.is_some()
-        || methodology_ids.is_some()
-        || evidence_type_ids.is_some()
-        || sort_by != "created_at"
-        || sort_order != "desc";
-
-    if !needs_in_memory_filters {
-        // `count` and `list` are two statements, and `total` is only a truthful
-        // description of `claims` if BOTH saw the same corpus. Running them on
-        // the one stamped handle is what makes that so — under
-        // `SessionGucMode::Transaction` they are also the same transaction.
-        let total = ClaimRepository::count(&mut *read, &viewer, params.content_contains.as_deref())
-            .await
-            .map_err(|e| scoped_read_failure(&e, "Database count failed"))?
-            as usize;
-
-        let rows = ClaimRepository::list(
-            &mut *read,
-            &viewer,
-            limit as i64,
-            offset as i64,
-            params.content_contains.as_deref(),
-        )
+    let total = ClaimRepository::count_filtered(&mut *read, &viewer, &filter)
         .await
-        .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
+        .map_err(|e| scoped_read_failure(&e, "Database count failed"))? as usize;
 
-        crate::routes::finish_scoped_read(read, "list_claims_query").await?;
-
-        let paginated: Vec<ClaimSummary> = rows
-            .into_iter()
-            .map(|c| ClaimSummary {
-                id: c.id.as_uuid(),
-                statement: c.content.clone(),
-                content: c.content.clone(),
-                truth_value: c.truth_value.value(),
-                agent_id: c.agent_id.as_uuid(),
-                is_current: c.is_current,
-                created_at: c.created_at,
-                updated_at: c.updated_at,
-            })
-            .collect();
-
-        return Ok(Json(ClaimListResponse {
-            claims: paginated,
-            total,
-            limit,
-            offset,
-        }));
-    }
-
-    // ---- Slow path: filters/sort require fetching a working set into memory ----
-    // Capped at 10_000 rows; the reported `total` reflects the filtered slice.
-    let all_claims = ClaimRepository::list(
+    let rows = ClaimRepository::list_filtered(
         &mut *read,
         &viewer,
-        10_000,
-        0,
-        params.content_contains.as_deref(),
+        &filter,
+        sort,
+        direction,
+        i64::from(limit),
+        i64::from(offset),
     )
     .await
     .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
 
-    // The last statement on this path. Everything below is in-memory, so the
-    // connection is returned before the filtering, the sort and the pagination
-    // rather than after them.
     crate::routes::finish_scoped_read(read, "list_claims_query").await?;
 
-    let mut claims: Vec<_> = all_claims.iter().collect();
-
-    // ---- Apply filters ----
-    if let Some(truth_min) = params.truth_min {
-        claims.retain(|c| c.truth_value.value() >= truth_min);
-    }
-    if let Some(truth_max) = params.truth_max {
-        claims.retain(|c| c.truth_value.value() <= truth_max);
-    }
-    if let Some(agent_id) = params.agent_id {
-        claims.retain(|c| c.agent_id.as_uuid() == agent_id);
-    }
-    // Filter out a specific agent (composes with agent_id above)
-    if let Some(exclude_agent_id) = params.exclude_agent_id {
-        claims.retain(|c| c.agent_id.as_uuid() != exclude_agent_id);
-    }
-    if let Some(is_current) = params.is_current {
-        claims.retain(|c| c.is_current == is_current);
-    }
-    if let Some(created_after) = params.created_after {
-        claims.retain(|c| c.created_at >= created_after);
-    }
-    if let Some(created_before) = params.created_before {
-        claims.retain(|c| c.created_at <= created_before);
-    }
-    if let Some(ref search) = params.content_contains {
-        let search_lower = search.to_lowercase();
-        claims.retain(|c| c.content.to_lowercase().contains(&search_lower));
-    }
-    if let Some(ref ids) = methodology_ids {
-        claims.retain(|c| ids.contains(&c.id.as_uuid()));
-    }
-    if let Some(ref ids) = evidence_type_ids {
-        claims.retain(|c| ids.contains(&c.id.as_uuid()));
-    }
-
-    // ---- Sort ----
-    let ascending = sort_order == "asc";
-    match sort_by.as_str() {
-        "truth_value" => {
-            claims.sort_by(|a, b| {
-                let cmp = a
-                    .truth_value
-                    .value()
-                    .partial_cmp(&b.truth_value.value())
-                    .unwrap_or(std::cmp::Ordering::Equal);
-                if ascending {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            });
-        }
-        _ => {
-            claims.sort_by(|a, b| {
-                let cmp = a.created_at.cmp(&b.created_at);
-                if ascending {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            });
-        }
-    }
-
-    let total = claims.len();
-
-    let paginated: Vec<ClaimSummary> = claims
+    let claims: Vec<ClaimSummary> = rows
         .into_iter()
-        .skip(offset as usize)
-        .take(limit as usize)
         .map(|c| ClaimSummary {
             id: c.id.as_uuid(),
             statement: c.content.clone(),
-            content: c.content.clone(),
+            content: c.content,
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid(),
             is_current: c.is_current,
@@ -530,7 +402,7 @@ pub async fn list_claims_query(
         .collect();
 
     Ok(Json(ClaimListResponse {
-        claims: paginated,
+        claims,
         total,
         limit,
         offset,

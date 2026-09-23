@@ -1,6 +1,6 @@
 //! `routes/claims_query.rs::list_claims_query` serves every statement of
-//! `GET /api/v1/claims` on ONE viewer-stamped connection, and both of its paths
-//! suppress on the viewer.
+//! `GET /api/v1/claims` on ONE viewer-stamped connection, and every filter shape
+//! suppresses on the viewer.
 //!
 //! # What this file is, in the series
 //!
@@ -23,36 +23,38 @@
 //! So [`split_state`] gives `AppState.db_pool` its own pool whose every
 //! connection is `SET SESSION AUTHORIZATION epigraph_app` in `after_connect`,
 //! while `AppState.scoped` holds an ordinary `ScopedPool`. `db_pool !=
-//! scoped.inner()`, the raw arm is FILTERED and unstamped, and reverting any of
-//! the five converted sites is observable.
+//! scoped.inner()`, the raw arm is FILTERED and unstamped, and reverting either
+//! statement's site is observable.
 //!
-//! # The five sites, and which arm below drives each
+//! # The two statements, and which arm below drives each shape
 //!
-//! `needs_in_memory_filters` decides the path, and it includes
-//! `methodology.is_some() || evidence_type.is_some()` — so a fired prefetch
-//! FORCES the slow path and `count` can never run alongside a prefetch. The
-//! sites therefore partition:
+//! Since backlog `2265a67b` the handler runs the same two statements on every
+//! request: `ClaimRepository::count_filtered` for `total`, then
+//! `ClaimRepository::list_filtered` for the page, both over one
+//! `ClaimListFilter`. PR-28 converted five sites: a COUNT(*) fast path, an
+//! in-memory slow path over the newest 10,000 rows, and two id prefetches for
+//! `methodology` / `evidence_type`. Those are gone. The two filters that used
+//! prefetches are now `EXISTS` subqueries inside both statements.
 //!
-//! | site | driven by |
+//! What varies per request is the SQL TEXT. Each set filter adds a predicate,
+//! and each `EXISTS` subquery carries its own visibility marker (`rt`, `e`)
+//! beside the outer one (`c`). The arms cover the shapes whose markers or
+//! predicates differ:
+//!
+//! | shape | driven by |
 //! |---|---|
-//! | `count` (no-search shape) | [`the_fast_path_serves_the_viewers_own_group_private_claim`] |
-//! | `list` (no-search shape) | the same |
-//! | `count` + `list` (ILIKE shapes) | [`the_fast_paths_search_shape_still_suppresses`] |
-//! | `list` (slow path) | [`the_slow_path_serves_the_viewers_own_group_private_claim`] |
-//! | `claim_ids_by_methodology` | [`the_methodology_prefetch_narrows_without_dropping_the_viewers_own_claim`] |
-//! | `claim_ids_by_evidence_type` | [`the_evidence_type_prefetch_narrows_without_dropping_the_viewers_own_claim`] |
+//! | no filter (outer `c` marker only) | [`an_unfiltered_listing_serves_the_viewers_own_group_private_claim`] |
+//! | `content_contains` (ILIKE) | [`a_search_still_suppresses`] |
+//! | a column filter (`truth_min`) | [`a_filtered_listing_serves_the_viewers_own_group_private_claim`] |
+//! | `methodology` (adds the `rt` marker) | [`the_methodology_filter_narrows_without_dropping_the_viewers_own_claim`] |
+//! | `evidence_type` (adds the `e` marker) | [`the_evidence_type_filter_narrows_without_dropping_the_viewers_own_claim`] |
 //!
-//! Both `list` and `count` carry TWO SQL texts with their own marker, selected
-//! by `content_contains`, and `visibility_lint.rs` checks a marker's SPELLING
-//! rather than its presence per shape. Driving only one shape would leave the
-//! other unpinned, which is why the search arm exists.
-//!
-//! `total == claims.len()` is asserted on the FAST arms only. There it
-//! separates the two sites independently: reverting only `count` gives
-//! `total < len`, reverting only `list` gives `total > len`. On the slow path the
-//! same equality is a tautology — `total` is assigned `claims.len()` after
-//! filtering and before pagination — so asserting it there would look like
-//! evidence and be none.
+//! `total == claims.len()` is asserted on EVERY arm. `count_filtered` and
+//! `list_filtered` are separate statements, so the equality tells them apart:
+//! reverting only the count to the raw pool gives `total < len`, and reverting
+//! only the list gives `total > len`. On the old slow path `total` was assigned
+//! `claims.len()` after filtering, so there the equality was a tautology and
+//! was asserted on the fast-path arms only. It is not a tautology now.
 //!
 //! # What is still NOT proven here
 //!
@@ -174,7 +176,23 @@ fn ids(r: &ClaimListResponse) -> Vec<Uuid> {
     r.claims.iter().map(|c| c.id).collect()
 }
 
-/// THE FAST PATH, on the no-search shapes of BOTH `count` and `list`.
+/// `total` comes from `count_filtered` and the rows from `list_filtered`: two
+/// statements. Reverting only the count to the raw pool gives `total < len`,
+/// and reverting only the list gives `total > len`. Every arm seeds well under
+/// the default limit of 20, so pagination cannot explain a difference.
+fn assert_total_matches_rows(out: &ClaimListResponse) {
+    assert_eq!(
+        out.total,
+        out.claims.len(),
+        "`total` comes from ClaimRepository::count_filtered and the rows from \
+         ClaimRepository::list_filtered. Two statements that disagree about one viewer's \
+         corpus mean one of them ran on a connection the other did not; got total={} len={}",
+        out.total,
+        out.claims.len()
+    );
+}
+
+/// NO FILTER: the shape carrying only the outer `c` marker, on BOTH statements.
 ///
 /// The over-suppression direction is the one that catches a reversion to the raw
 /// pool: with the handler reading `&state.db_pool`, the filtered unstamped
@@ -182,12 +200,12 @@ fn ids(r: &ClaimListResponse) -> Vec<Uuid> {
 /// claim silently disappears. That direction is permanent and looks like data
 /// loss rather than like a leak, and it is the one PR-24's Mutation B broke.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_fast_path_serves_the_viewers_own_group_private_claim(pool: PgPool) {
+async fn an_unfiltered_listing_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-fast-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-fast-theirs").await;
 
-    let mine = seed_group_claim(&pool, agent, group, "fast path: my claim").await;
-    let theirs = seed_group_claim(&pool, stranger, stranger_group, "fast path: their claim").await;
+    let mine = seed_group_claim(&pool, agent, group, "unfiltered: my claim").await;
+    let theirs = seed_group_claim(&pool, stranger, stranger_group, "unfiltered: their claim").await;
 
     let state = split_state(&pool).await;
     let out = list(&pool, state, agent, base_params()).await;
@@ -208,30 +226,13 @@ async fn the_fast_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
          not present with its content blanked; got {got:?}"
     );
 
-    // `count` and `list` are SEPARATE statements. This equality is what
-    // distinguishes them: reverting only `count` gives total < len, reverting
-    // only `list` gives total > len. Both are seeded well under the default
-    // limit of 20, so pagination cannot explain a difference.
-    assert_eq!(
-        out.total,
-        out.claims.len(),
-        "the fast path reports `total` from ClaimRepository::count and the rows from \
-         ClaimRepository::list. Two statements that disagree about one viewer's corpus \
-         mean one of them ran on a connection the other did not; got total={} len={}",
-        out.total,
-        out.claims.len()
-    );
+    assert_total_matches_rows(&out);
 }
 
-/// THE OTHER SQL SHAPE. `list` and `count` each carry two query texts with their
-/// own marker, selected by `content_contains`; the arm above drives only the
-/// no-search pair.
-///
-/// `content_contains` does NOT select the path — it is absent from
-/// `needs_in_memory_filters` — so this stays on the fast path and the
-/// `total == len` discrimination still applies.
+/// THE SEARCH SHAPE: `content_contains` adds an `ILIKE` predicate ahead of the
+/// outer marker, on both statements.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_fast_paths_search_shape_still_suppresses(pool: PgPool) {
+async fn a_search_still_suppresses(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-ilike-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-ilike-theirs").await;
 
@@ -270,30 +271,22 @@ async fn the_fast_paths_search_shape_still_suppresses(pool: PgPool) {
     );
     assert!(
         !got.contains(&theirs),
-        "the ILIKE shape carries its own visibility marker at its own bind index. A \
-         stranger's matching claim must be ABSENT; got {got:?}"
+        "the ILIKE predicate takes a bind ahead of the visibility marker, which moves the \
+         group bind's index. A stranger's matching claim must be ABSENT; got {got:?}"
     );
-    assert_eq!(
-        out.total,
-        out.claims.len(),
-        "count's ILIKE shape and list's ILIKE shape must agree; got total={} len={}",
-        out.total,
-        out.claims.len()
-    );
+    assert_total_matches_rows(&out);
 }
 
-/// THE SLOW PATH, which is a different call site of `ClaimRepository::list`
-/// (10_000 / 0, then filtered in memory) and never calls `count` at all.
-///
-/// `truth_min` is the selector: it is a term of `needs_in_memory_filters` and
-/// nothing else about it touches tenancy.
+/// A COLUMN FILTER. `truth_min` adds a plain predicate on `claims` and nothing
+/// else about it touches tenancy. Before backlog `2265a67b` it was what
+/// selected the in-memory slow path.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_slow_path_serves_the_viewers_own_group_private_claim(pool: PgPool) {
+async fn a_filtered_listing_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-slow-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-slow-theirs").await;
 
-    let mine = seed_group_claim(&pool, agent, group, "slow path: my claim").await;
-    let theirs = seed_group_claim(&pool, stranger, stranger_group, "slow path: their claim").await;
+    let mine = seed_group_claim(&pool, agent, group, "filtered: my claim").await;
+    let theirs = seed_group_claim(&pool, stranger, stranger_group, "filtered: their claim").await;
 
     let state = split_state(&pool).await;
     let out = list(
@@ -302,7 +295,7 @@ async fn the_slow_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
         agent,
         ClaimQueryParams {
             // The fixture seeds truth_value 0.8, so this admits everything the
-            // viewer may read and selects the path without also being the
+            // viewer may read and adds a predicate without also being the
             // reason a row is missing.
             truth_min: Some(0.1),
             ..base_params()
@@ -313,28 +306,27 @@ async fn the_slow_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
     let got = ids(&out);
     assert!(
         got.contains(&mine),
-        "CALIBRATION: the slow path's working-set read is a SECOND call site of \
-         ClaimRepository::list and must serve the viewer's own group-private claim; \
-         got {got:?}"
+        "CALIBRATION: a filtered listing must serve the viewer's own group-private \
+         claim; got {got:?}"
     );
     assert!(
         !got.contains(&theirs),
-        "a stranger's group-private claim must be absent from the slow path's working \
-         set too — the in-memory filters below it only ever NARROW, so anything the \
-         read admits is served; got {got:?}"
+        "a stranger's group-private claim must be absent from a filtered listing too; \
+         got {got:?}"
     );
+    assert_total_matches_rows(&out);
 }
 
-/// THE METHODOLOGY PREFETCH — `ClaimRepository::claim_ids_by_methodology`, whose
-/// result is applied as `claims.retain(|c| ids.contains(..))`.
+/// THE METHODOLOGY FILTER: an `EXISTS` subquery over `reasoning_traces rt` that
+/// carries its own `/* {VISIBILITY:rt} */` marker, in both statements.
 ///
-/// Because that application is an INTERSECTION, a prefetch reverted to the raw
-/// pool returns an empty id set and the viewer's OWN claim vanishes. That is the
-/// direction this arm asserts. It is also why the prefetch predicates are
-/// defence in depth rather than the control: they can only narrow a set that
-/// already came from the viewer-predicated `list`.
+/// On the raw pool the filtered, unstamped session cannot read the viewer's own
+/// group-private trace, so the viewer's OWN claim vanishes. That is the
+/// direction this arm asserts. The opposite direction, a trace the viewer cannot
+/// read under a claim it can, is pinned in
+/// `epigraph-db/tests/claim_list_filtered.rs`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_methodology_prefetch_narrows_without_dropping_the_viewers_own_claim(pool: PgPool) {
+async fn the_methodology_filter_narrows_without_dropping_the_viewers_own_claim(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-meth-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-meth-theirs").await;
 
@@ -369,35 +361,34 @@ async fn the_methodology_prefetch_narrows_without_dropping_the_viewers_own_claim
     let got = ids(&out);
     assert!(
         got.contains(&mine),
-        "CALIBRATION: the viewer's own deductive claim must survive the prefetch. The \
-         prefetch result is INTERSECTED with the listing, so a prefetch that read an \
-         unstamped connection returns an empty set and empties the response; got {got:?}"
+        "CALIBRATION: the viewer's own deductive claim must survive the methodology \
+         filter. A filter that read an unstamped connection cannot see the viewer's own \
+         group-private trace and empties the response; got {got:?}"
     );
     assert!(
         !got.contains(&other_methodology),
         "CALIBRATION: the viewer's own INDUCTIVE claim must be filtered out, or the \
-         prefetch is not narrowing at all and the assertion above is about the listing \
+         filter is not narrowing at all and the assertion above is about the listing \
          alone; got {got:?}"
     );
     assert!(
         !got.contains(&theirs),
         "a stranger's deductive claim must be absent; got {got:?}"
     );
+    assert_total_matches_rows(&out);
 }
 
-/// THE EVIDENCE-TYPE PREFETCH — `ClaimRepository::claim_ids_by_evidence_type`,
-/// the second and structurally different one: the row it filters is not the row
-/// it returns.
+/// THE EVIDENCE-TYPE FILTER: an `EXISTS` subquery over `evidence e` that carries
+/// its own `/* {VISIBILITY:e} */` marker, in both statements. The row it filters
+/// is not the row it returns.
 ///
-/// That asymmetry is safe here only because the application is an intersection
-/// (see the handler's doc comment) — and, independently, because migration 070's
-/// `evidence_inherit_tenancy` arm is UNCONDITIONAL: a derived row's
-/// `(visibility, owner_group_id)` is overwritten from its parent claim's on
-/// every insert, with no no-widening gate. A fixture with a visible claim and an
-/// invisible evidence row is therefore not constructible, so this arm cannot
-/// separate the evidence marker from the claim marker, and does not claim to.
+/// Migration 070's `evidence_inherit_tenancy` arm copies the parent claim's
+/// `(visibility, owner_group_id)` onto evidence at INSERT, so this arm's evidence
+/// is as private as its claim and the arm cannot separate the `e` marker from
+/// the `c` marker. `epigraph-db/tests/claim_list_filtered.rs` separates them by
+/// narrowing an evidence row after insert, which the trigger does not undo.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_evidence_type_prefetch_narrows_without_dropping_the_viewers_own_claim(pool: PgPool) {
+async fn the_evidence_type_filter_narrows_without_dropping_the_viewers_own_claim(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-ev-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-ev-theirs").await;
 
@@ -432,17 +423,18 @@ async fn the_evidence_type_prefetch_narrows_without_dropping_the_viewers_own_cla
     assert!(
         got.contains(&mine),
         "CALIBRATION: the viewer's own claim with document evidence must survive the \
-         prefetch intersection; got {got:?}"
+         evidence-type filter; got {got:?}"
     );
     assert!(
         !got.contains(&other_type),
         "CALIBRATION: the viewer's own claim whose evidence is an OBSERVATION must be \
-         filtered out, or the prefetch is not narrowing; got {got:?}"
+         filtered out, or the filter is not narrowing; got {got:?}"
     );
     assert!(
         !got.contains(&theirs),
         "a stranger's claim with document evidence must be absent; got {got:?}"
     );
+    assert_total_matches_rows(&out);
 }
 
 // ── The 500 body, which is a different property from any of the above ───────
@@ -454,20 +446,26 @@ async fn the_evidence_type_prefetch_narrows_without_dropping_the_viewers_own_cla
 ///
 /// `list_claims_query`'s two PR-28 branches (`read_as`'s refusal and
 /// `finish_scoped_read`'s) log the internal error and answer with a fixed
-/// literal. Its five STATEMENT branches used to interpolate the `sqlx` error
-/// into the body instead, and log nothing. Nothing in this tree asserted a 500
-/// body from this handler, in either shape — so the inconsistency was invisible
-/// to the gate, and this file is explicitly the template the remaining
-/// conversion shards copy.
+/// literal. Its STATEMENT branches used to interpolate the `sqlx` error into the
+/// body instead, and log nothing. Nothing in this tree asserted a 500 body from
+/// this handler, in either shape — so the inconsistency was invisible to the
+/// gate, and this file is explicitly the template the remaining conversion
+/// shards copy.
 ///
 /// # The mutilation, and why it is this one
 ///
-/// `ClaimRepository::claim_ids_by_methodology` is the only one of the five that
-/// joins a table no other statement in the request touches, so renaming the
-/// column it filters on fails exactly one branch and leaves the handler
-/// otherwise intact. Renaming rather than dropping the table keeps the failure
-/// a plain "column does not exist" rather than a cascade of unrelated ones.
-/// The database is `#[sqlx::test]`'s throwaway, so nothing is restored.
+/// Only a request with `methodology` set reads `reasoning_traces.reasoning_type`,
+/// inside the `EXISTS` subquery both statements carry. Renaming that column
+/// therefore fails only the methodology shape and leaves every other request
+/// intact. `count_filtered` runs first, so its branch is the one that answers.
+/// Renaming rather than dropping the table keeps the failure a plain "column
+/// does not exist" rather than a cascade of unrelated ones. The database is
+/// `#[sqlx::test]`'s throwaway, so nothing is restored.
+///
+/// Before backlog `2265a67b` the column was read by a separate id prefetch, whose
+/// branch answered "Methodology filter query failed". The literal changed with
+/// the statement that fails; the property asserted (a fixed literal, and no
+/// driver text) did not.
 ///
 /// # What this asserts, and what it does NOT
 ///
@@ -490,14 +488,14 @@ async fn a_failed_statement_answers_with_an_opaque_body_not_the_driver_error(poo
     let ok = list(&pool, split_state(&pool).await, agent, methodology_params()).await;
     assert!(
         ids(&ok).contains(&claim),
-        "CALIBRATION: the methodology prefetch must serve the viewer's own claim \
+        "CALIBRATION: the methodology filter must serve the viewer's own claim \
          before the column is renamed"
     );
 
     sqlx::query("ALTER TABLE reasoning_traces RENAME COLUMN reasoning_type TO reasoning_type_gone")
         .execute(&pool)
         .await
-        .expect("rename the column the methodology prefetch filters on");
+        .expect("rename the column the methodology filter reads");
 
     let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
         .await
@@ -508,7 +506,7 @@ async fn a_failed_statement_answers_with_an_opaque_body_not_the_driver_error(poo
         Query(methodology_params()),
     )
     .await
-    .expect_err("the methodology prefetch must fail once its column is gone");
+    .expect_err("the methodology filter must fail once its column is gone");
 
     let message = match err {
         epigraph_api::errors::ApiError::InternalError { message } => message,
@@ -516,7 +514,7 @@ async fn a_failed_statement_answers_with_an_opaque_body_not_the_driver_error(poo
     };
 
     assert_eq!(
-        message, "Methodology filter query failed",
+        message, "Database count failed",
         "the 500 body must be the fixed literal the two PR-28 branches use. \
          `errors.rs` serialises `message` verbatim, so anything appended to it \
          is disclosed to the caller."
@@ -529,8 +527,8 @@ async fn a_failed_statement_answers_with_an_opaque_body_not_the_driver_error(poo
     );
 }
 
-/// `methodology = "deductive"` and nothing else — the shape that fires the
-/// prefetch and therefore forces the slow path.
+/// `methodology = "deductive"` and nothing else — the shape whose statements read
+/// `reasoning_traces`.
 fn methodology_params() -> ClaimQueryParams {
     ClaimQueryParams {
         methodology: Some("deductive".to_string()),
