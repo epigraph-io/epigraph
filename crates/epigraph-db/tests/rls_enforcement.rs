@@ -2700,14 +2700,16 @@ fn db_refusal(e: &sqlx::Error) -> Option<(String, String)> {
 /// **Migration 094, the 086 half.** When `epigraph_claim_tenancy_by_ids`' owner
 /// is not admitted by `epigraph_definer_bypass()`, both repo functions that read
 /// through it return an ERROR, for every caller. Before 094 they returned
-/// `Ok`, and the answer was wrong in the delivering direction.
+/// `Ok`. On the app role that answer was wrong in the delivering direction. On
+/// the superuser harness it was correct (see "Both connections" below).
 ///
 /// # The failure this closes, measured rather than argued
 ///
 /// Before 094 the body was a plain `LANGUAGE sql` read of `claims`. An owner
 /// that the bypass does not admit reads `claims` under `claims_tenancy` like any
-/// other reader, so the private row vanishes from BOTH arms of each set
-/// difference at once. `hidden_claim_ids` then answered `Ok({})`, which both of
+/// other reader. On an `epigraph_app` session no arm of that policy admits the
+/// private row, so it vanishes from BOTH arms of each set difference at once.
+/// `hidden_claim_ids` then answered `Ok({})`, which both of
 /// its callers read as "nothing is hidden", and `EventRepository::list`
 /// returned the event naming the private claim to a stranger. Nothing errored,
 /// and the only control that could see the ownership was the `verify`
@@ -2726,12 +2728,16 @@ fn db_refusal(e: &sqlx::Error) -> Option<(String, String)> {
 /// request. That is an OUTAGE of those surfaces while the owner is wrong, and
 /// 094's header records it as the price, not as free.
 ///
-/// # Both connections, because the frame ignores the caller
+/// # Both connections, and what each could show before 094
 ///
 /// A `SECURITY DEFINER` frame runs as its owner whatever the calling role is,
-/// so the superuser harness pool is refused too. That arm also shows the guard
-/// is not keyed on `session_user`: the harness is a superuser, and
-/// `epigraph_bypass()` (the `session_user` variant) is true there.
+/// but that fixes `current_user` only. `claims_tenancy` also admits through
+/// `(SELECT epigraph_bypass())`, which reads `session_user`. The harness is a
+/// superuser, and a superuser is a member of every role. So before 094 the
+/// superuser arm got a COMPLETE read and the CORRECT answer, and only the
+/// app-role arm could fail, and did. The guard in this revision of 094 does not
+/// consult `session_user`, so it refuses the superuser harness as well. That
+/// arm pins the guard's strictness. It is not evidence of a pre-094 leak.
 ///
 /// # The last arm is the calibration that the refusal is about the OWNER
 ///
@@ -2822,10 +2828,10 @@ async fn a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify(
             }
             other => panic!(
                 "{label}: hidden_claim_ids must REFUSE when its definer frame is not admitted. \
-                 Before migration 094 it returned Ok with the private id missing, because the \
-                 frame read claims under claims_tenancy and both arms of the set difference \
-                 lost the row together, and both callers read that as \"nothing is hidden\" \
-                 and deliver. Got: {other:?}"
+                 Before migration 094, on the app role, it returned Ok with the private id \
+                 missing, because the frame read claims under claims_tenancy and both arms of \
+                 the set difference lost the row together, and both callers read that as \
+                 \"nothing is hidden\" and deliver. Got: {other:?}"
             ),
         }
 
@@ -2844,8 +2850,8 @@ async fn a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify(
                 "{label}: EventRepository::list must REFUSE when its definer frame is not \
                  admitted. It is the sole tenancy filter for the persisted half of \
                  GET /api/v1/events, for graph_snapshot and for MCP list_events. Before \
-                 migration 094 it returned the event naming the private claim to a stranger \
-                 (returned it: {}). Rows: {:?}",
+                 migration 094, on the app role, it returned the event naming the private \
+                 claim to a stranger (returned it: {}). Rows: {:?}",
                 rows.iter().any(|r| r.id == ev_private),
                 rows.iter().map(|r| r.id).collect::<Vec<_>>()
             ),

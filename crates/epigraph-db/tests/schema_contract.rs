@@ -1257,11 +1257,13 @@ async fn migration_093_widening_guard_fires_on_visibility_and_owner(pool: PgPool
 ///
 /// `epigraph_claim_tenancy_by_ids` (086) and
 /// `epigraph_group_roster_admits_principal` (092) each read a FORCEd table, and
-/// the read is complete only while `epigraph_definer_bypass()` admits the frame,
-/// i.e. while the OWNER is a member of `epigraph_maintenance`. Before 094 an
-/// unadmitted frame answered from a policy-filtered read: 086's classifier
-/// reported nothing hidden, and 092's predicate relied on a recursion to keep its
-/// `NOT EXISTS` from admitting. 094 makes each body test the bypass first. 086's
+/// the read is complete only while the table's policy admits the frame: through
+/// `epigraph_definer_bypass()`, i.e. while the OWNER is a member of
+/// `epigraph_maintenance`, or through `epigraph_bypass()`, i.e. while the
+/// SESSION user is. Before 094 a frame neither admitted, which is an app-role
+/// session under a wrong owner, answered from a policy-filtered read: 086's
+/// classifier reported nothing hidden, and 092's predicate relied on a recursion
+/// to keep its `NOT EXISTS` from admitting. 094 makes each body test the bypass first. 086's
 /// RAISES `42501`, because a set-returning classifier has no deny value. 092's
 /// RETURNS FALSE, because false is a policy predicate's deny.
 ///

@@ -853,8 +853,9 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// `current_user` is a member of `epigraph_maintenance`. If the guarded
 /// `ALTER FUNCTION ... OWNER TO` in 086 silently no-ops — which is exactly what
 /// 060's `RAISE NOTICE`-only role creation makes possible — the 086 body
-/// returned FEWER rows with no error, and the suppression control it backs
-/// degraded to reporting nothing hidden. That is the same silent failure mode
+/// returned FEWER rows with no error to any session `claims_tenancy`'s
+/// `epigraph_bypass()` arm does not admit (the app role), and the suppression
+/// control it backs degraded to reporting nothing hidden. That is the same silent failure mode
 /// this check exists for, on a READ path rather than a write one, so it takes
 /// the same instrument rather than a second one.
 ///
@@ -1095,8 +1096,8 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
 ///   this bullet describes the pre-094 behaviour.
 ///   `epigraph_claim_tenancy_by_ids`
 ///   reaches `claims` only through `claims_tenancy`'s definer-bypass disjunct.
-///   An app-owned body is policy-filtered like any other reader, so it returns
-///   FEWER rows with no error, and `ClaimRepository::hidden_claim_ids` — which
+///   An app-owned body is policy-filtered like any other reader, so on an
+///   app-role session it returns FEWER rows with no error, and `ClaimRepository::hidden_claim_ids` — which
 ///   decides what `GET /api/v1/events` and the webhook fan-out suppress —
 ///   degrades back toward reporting nothing hidden. Same silent shape as 070's,
 ///   on a read path. **And the stake is wider than that one function**: as of

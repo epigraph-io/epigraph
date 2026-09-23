@@ -1094,13 +1094,17 @@ whose reads are complete only while their OWNER is a member of
 `IF EXISTS (pg_roles)` guard that silently no-ops on a cluster where the role
 was missing at the time (060 only `RAISE NOTICE`s), and a re-own or a restore
 reaches the same state. Before 094, such an owner made 086 report "nothing
-hidden", which leaked group-private claim events through the event surfaces,
-and made 092 fail erratically with `stack depth limit exceeded`. From 094 on:
+hidden" to an `epigraph_app` session, which leaked group-private claim events
+through the event surfaces, and made 092 fail erratically with `stack depth
+limit exceeded` on the same sessions. A superuser or maintenance-member session
+was not affected: `claims_tenancy`'s `epigraph_bypass()` arm reads
+`session_user` and admitted the frame's read, so 086 answered correctly there.
+From 094 on:
 
 | Body | Wrong owner, before 094 | Wrong owner, from 094 |
 |---|---|---|
-| `epigraph_claim_tenancy_by_ids` | returns fewer rows, no error: private claim events are DELIVERED | RAISES `42501`: `GET /api/v1/events`, `GET /api/v1/graph/snapshot/:version` and MCP `list_events` fail, webhook deliveries are suppressed |
-| `epigraph_group_roster_admits_principal` | `54001 stack depth limit exceeded` on some group reads | returns FALSE: group creation is refused (`42501` from `groups_tenancy`), and a creator is denied a group it can reach only through the creator arm |
+| `epigraph_claim_tenancy_by_ids` | app role: returns fewer rows, no error, so private claim events are DELIVERED. Superuser or maintenance member: correct | RAISES `42501`: `GET /api/v1/events`, `GET /api/v1/graph/snapshot/:version` and MCP `list_events` fail, webhook deliveries are suppressed |
+| `epigraph_group_roster_admits_principal` | app role: `54001 stack depth limit exceeded` on some group reads. Superuser or maintenance member: unaffected | returns FALSE: group creation is refused (`42501` from `groups_tenancy`), and a creator is denied a group it can reach only through the creator arm |
 
 On a correctly migrated database, where both owners are `epigraph_maintenance`,
 nothing changes. The trade-off is recorded in `docs/tenancy/progress.json` under

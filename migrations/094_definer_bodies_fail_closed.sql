@@ -41,16 +41,26 @@
 -- re-owned to `epigraph_app` (not a member of `epigraph_maintenance`) and its
 -- grants intact. The acceptance tests are in
 -- `crates/epigraph-db/tests/rls_enforcement.rs`, and both FAIL without this
--- file:
+-- file on their `epigraph_app` arms:
 --
---   * `epigraph_claim_tenancy_by_ids` (086) -- FAIL-OPEN, as 086 recorded. The
---     frame reads `claims` under `claims_tenancy`, so a group-private row
+--   * `epigraph_claim_tenancy_by_ids` (086) -- FAIL-OPEN ON THE APP ROLE, as
+--     086 recorded. On an `epigraph_app` session the frame reads `claims` under
+--     `claims_tenancy` with neither bypass arm true, so a group-private row
 --     vanishes from BOTH arms of each set difference at once.
 --     `ClaimRepository::hidden_claim_ids` returned `Ok({})`, and its callers read
 --     that as "nothing is hidden". `EventRepository::list` returned the event
---     naming the private claim to a stranger. No error was raised, and the
---     superuser connection got the same wrong answer, because the frame ignores
---     the caller.
+--     naming the private claim to a stranger. No error was raised.
+--     NOT on a superuser or maintenance-member session. The frame fixes
+--     `current_user` to the owner, but `claims_tenancy` also admits through
+--     `(SELECT epigraph_bypass())`, which reads `session_user`, and a superuser
+--     is a member of every role. There the frame's read was COMPLETE and the
+--     classification CORRECT. Re-measured on a template clone of the lane
+--     database with 086's own `LANGUAGE sql` body re-owned to `epigraph_app`:
+--     five group-private ids in, five rows out as the superuser and under
+--     `SET SESSION AUTHORIZATION epigraph_maintenance`, zero rows out under
+--     `SET SESSION AUTHORIZATION epigraph_app`. This agrees with PR-24's record
+--     that the superuser harness returned identical answers before and after
+--     086 (`docs/tenancy/progress.json`).
 --     (`a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`)
 --
 --   * `epigraph_group_roster_admits_principal` (092) -- NOT the silent revert
@@ -59,10 +69,13 @@
 --     `group_memberships_tenancy` -> `epigraph_is_group_creator` -> this
 --     predicate from recursing. With the frame unadmitted, every roster row
 --     other than the principal's own re-enters the predicate, until PostgreSQL
---     raises `54001 stack depth limit exceeded`. A creator removed from a group
---     that still has other members got that ERROR, not an admit. A LIVE creator
---     got it too whenever another member's row was scanned first. Group
---     creation (an empty roster) still succeeded. So the residual was
+--     raises `54001 stack depth limit exceeded`. On an `epigraph_app` session,
+--     a creator removed from a group that still has other members got that
+--     ERROR, not an admit. A LIVE creator got it too whenever another member's
+--     row was scanned first. Group creation (an empty roster) still succeeded.
+--     Only such a session reaches the creator arm at all: a superuser skips row
+--     security, and a maintenance member is admitted by the policies'
+--     `epigraph_bypass()` arm first. So the residual was
 --     FAIL-ERRATIC, and nothing designed was stopping the `NOT EXISTS` from
 --     admitting. An unplanned recursion was, and any edit to 077's policy
 --     shape could remove it.
