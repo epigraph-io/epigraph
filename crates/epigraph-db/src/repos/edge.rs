@@ -332,14 +332,18 @@ impl EdgeRepository {
     /// arbiter here is migration 042's `edges_alternative_of_symmetric_uniq`
     /// (narrowed by 091), not 090 — `alternative_of` is outside 090's predicate.
     ///
-    /// WHAT THE `DO NOTHING` IS AND IS NOT PROVED TO DO. When the conflicting
-    /// row is visible to this connection the dedup-hit branch below reads it and
-    /// the concurrent-duplicate case resolves to `(existing_id, false)` instead
-    /// of a 23505 the caller maps to an internal error. When it is NOT visible,
-    /// one error is traded for another, not for an answer. There is no test over
-    /// this function or over its one caller, so both halves are asserted by
-    /// inspection; the change is conservative because every pre-change path is
-    /// unchanged.
+    /// WHAT THE `DO NOTHING` DOES, AND THE TESTS THAT PIN IT. When the
+    /// conflicting row is visible to this connection the dedup-hit branch below
+    /// reads it, and the concurrent-duplicate case resolves to
+    /// `(existing_id, false)` instead of a 23505 the caller maps to an internal
+    /// error. When it is NOT visible, one error is traded for another, not for
+    /// an answer: `Err(QueryFailed(RowNotFound))` instead of `DuplicateKey`,
+    /// with no second row written and no id returned. Pinned by
+    /// `edge_repo_tests.rs::create_symmetric_if_absent_returning_resolves_a_concurrent_duplicate_through_on_conflict`
+    /// (visible) and
+    /// `rls_enforcement.rs::symmetric_dedup_returning_errors_when_the_existing_alternative_of_is_invisible`
+    /// (invisible), and through the one caller by
+    /// `epigraph-mcp/tests/link_alternative_smoke.rs`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails. On the

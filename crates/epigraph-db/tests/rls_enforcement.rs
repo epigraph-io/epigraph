@@ -1700,7 +1700,7 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 /// |---|---|---|---|
 /// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (`bin/server.rs` builds `job_pool` from `maintenance_url`; both `PostgresJobQueue::new` sites take it) | `epigraph_bypass()` is true, guard intact |
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
-/// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
+/// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | constraint-backed by `edges_alternative_of_symmetric_uniq` (042, narrowed to rows in force by 091), NOT by 090, whose predicate excludes `alternative_of`. An INVISIBLE conflicting row yields `Err(RowNotFound)`: no answer, no duplicate, no id (`symmetric_dedup_returning_errors_when_the_existing_alternative_of_is_invisible`) |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
 /// | `graph_neighborhood.rs` (2 sites) | `edges` | app, **viewer-stamped since conversion shard 5** | ditto |
 ///
@@ -2079,6 +2079,200 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
     assert_eq!(
         asymmetric, 2,
         "both directions of an asymmetric edge survive"
+    );
+}
+
+/// `EdgeRepository::create_symmetric_if_absent_returning`, the one writer
+/// behind MCP `link_alternative`, when the existing `alternative_of` edge is
+/// INVISIBLE to the writer.
+///
+/// The test above covers `create_symmetric_if_absent` over migration 090's
+/// index. This one covers the `_returning` variant over its own arbiter,
+/// migration 042's `edges_alternative_of_symmetric_uniq` (narrowed by 091), and
+/// it pins a DIFFERENT outcome. The plain variant only reports whether it
+/// inserted, so the constraint alone gives it a correct answer. This one must
+/// return an edge id, and when the writer cannot see the conflicting row there
+/// is no id it may return.
+///
+/// The hidden state is planted exactly as in the test above, and for the same
+/// reason: an edge stamped `('group', G)` keeps that stamp when 072 arm (d)'s
+/// no-widening rule meets a declassification of both endpoints. Read that
+/// test's doc for why the state is legitimate even though no production writer
+/// produces it today.
+///
+/// # The properties
+///
+/// 1. **PREMISE**: the app-role session sees both claims and no edge for the
+///    pair. Without it property 2 could pass because nothing is filtered.
+/// 2. **INVISIBLE CONFLICT**: the guard is blind, so the INSERT reaches the
+///    index, which refuses the row. `ON CONFLICT DO NOTHING` absorbs that, and
+///    the dedup probe is blind too, so the function returns
+///    `Err(DbError::QueryFailed { source: RowNotFound })`. The owner connection
+///    still sees exactly ONE row. This pins today's behaviour: an error, not an
+///    answer and not a duplicate. `link_alternative` maps it to an internal
+///    error. What it must never do is return the hidden edge's id to a session
+///    that cannot read the edge, or write a second row. Mutations:
+///    - without `ON CONFLICT` the call fails with `DuplicateKey` instead;
+///    - without the index it returns `Ok((new_id, true))` and the count is two.
+/// 3. **VISIBLE**: on the same app-role pool, a pair whose edge the writer CAN
+///    see still links and still dedups (`(id, true)`, then `(id, false)` in
+///    reverse). Over-suppression is the silent failure a refusal-only
+///    assertion would miss.
+///
+/// The VISIBLE `ON CONFLICT` exit (the conflicting row commits while the
+/// writer's INSERT is in flight) is covered deterministically in
+/// `edge_repo_tests.rs::create_symmetric_if_absent_returning_resolves_a_concurrent_duplicate_through_on_conflict`,
+/// and both conflict cases through the MCP tool in
+/// `epigraph-mcp/tests/link_alternative_smoke.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn symmetric_dedup_returning_errors_when_the_existing_alternative_of_is_invisible(
+    pool: PgPool,
+) {
+    use epigraph_db::{DbError, EdgeRepository};
+    use sqlx::Executor;
+
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "alt-invisible").await;
+    let c1 = fixture::seed_group_claim(&pool, agent, group, "alt claim one").await;
+    let c2 = fixture::seed_group_claim(&pool, agent, group, "alt claim two").await;
+
+    // Written the production way, so `epigraph_edges_tenancy` stamps ('group', G).
+    let (hidden, created) = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        c1,
+        c2,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("seed the alternative_of edge");
+    assert!(created, "the first link must insert");
+
+    // Declassify both endpoints on one connection (the GUC is session-scoped).
+    let mut admin = pool.acquire().await.expect("admin connection");
+    admin
+        .execute("SET epigraph.allow_declassify = 'yes'")
+        .await
+        .expect("arm the declassification GUC");
+    sqlx::query(
+        "UPDATE claims SET visibility = 'public', \
+         owner_group_id = '00000000-0000-0000-0000-000000000000'::uuid \
+         WHERE id = ANY($1)",
+    )
+    .bind(&[c1, c2][..])
+    .execute(&mut *admin)
+    .await
+    .expect("declassify both endpoints");
+    admin
+        .execute("SET epigraph.allow_declassify = 'no'")
+        .await
+        .expect("disarm the declassification GUC");
+    drop(admin);
+
+    let (edge_vis, edge_owner): (String, Uuid) =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM edges WHERE id = $1")
+            .bind(hidden)
+            .fetch_one(&pool)
+            .await
+            .expect("read the edge back");
+    assert_eq!(
+        (edge_vis.as_str(), edge_owner),
+        ("group", group),
+        "PREMISE: 072 arm (d) must leave the edge group-owned after both endpoints \
+         go public, or the hidden-conflict state is not reachable"
+    );
+
+    let app_pool = app_role_pool(&pool).await;
+    let pair_count = "SELECT count(*) FROM edges \
+         WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
+           AND relationship = 'alternative_of'";
+
+    // ---- (1) PREMISE: endpoints visible, edge not.
+    let claims_seen: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1)")
+        .bind(&[c1, c2][..])
+        .fetch_one(&app_pool)
+        .await
+        .expect("count claims under the app role");
+    assert_eq!(
+        claims_seen, 2,
+        "PREMISE: both endpoints must be visible to the app role, or \
+         edges_validate_refs refuses the insert and this test measures that instead"
+    );
+    let edges_seen: i64 = sqlx::query_scalar(pair_count)
+        .bind(c1)
+        .bind(c2)
+        .fetch_one(&app_pool)
+        .await
+        .expect("count edges under the app role");
+    assert_eq!(
+        edges_seen, 0,
+        "PREMISE: the group-owned alternative_of edge must be INVISIBLE to the app \
+         role; seeing it means the guard is not blind and property 2 is vacuous"
+    );
+
+    // ---- (2) INVISIBLE CONFLICT, reverse direction, through the production function.
+    let outcome = EdgeRepository::create_symmetric_if_absent_returning(
+        &app_pool,
+        c2,
+        c1,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await;
+    match &outcome {
+        Err(DbError::QueryFailed {
+            source: sqlx::Error::RowNotFound,
+        }) => {}
+        other => panic!(
+            "an invisible conflicting alternative_of edge must surface as \
+             QueryFailed(RowNotFound): the index refused the row and the probe cannot \
+             read the one it conflicts with. DuplicateKey means ON CONFLICT is gone; \
+             Ok((_, true)) means the index is gone; Ok((id, false)) means the probe \
+             returned an id this session cannot read. Got {other:?}"
+        ),
+    }
+    let total: i64 = sqlx::query_scalar(pair_count)
+        .bind(c1)
+        .bind(c2)
+        .fetch_one(&pool)
+        .await
+        .expect("count edges on the owner connection");
+    assert_eq!(
+        total, 1,
+        "ASSERT THE EFFECT: exactly one alternative_of row for the pair on the owner \
+         connection. Two means the duplicate landed."
+    );
+
+    // ---- (3) VISIBLE: the same app-role pool still links and dedups a pair it can see.
+    let c3 = fixture::seed_public_claim(&pool, agent, "alt claim three").await;
+    let c4 = fixture::seed_public_claim(&pool, agent, "alt claim four").await;
+    let (fresh, fresh_created) = EdgeRepository::create_symmetric_if_absent_returning(
+        &app_pool,
+        c3,
+        c4,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("a legitimate first link must not error");
+    assert!(
+        fresh_created,
+        "the app role must still be able to link a pair it can see"
+    );
+    let again = EdgeRepository::create_symmetric_if_absent_returning(
+        &app_pool,
+        c4,
+        c3,
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("a visible dedup hit must not error");
+    assert_eq!(
+        again,
+        (fresh, false),
+        "a VISIBLE existing edge must come back as (its id, created=false)"
     );
 }
 

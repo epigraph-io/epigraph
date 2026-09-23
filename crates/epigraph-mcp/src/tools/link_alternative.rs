@@ -105,6 +105,11 @@ pub async fn do_link_alternative(
         props.insert("rationale".to_string(), Value::String(r.clone()));
     }
 
+    // A concurrent duplicate resolves to (existing_id, false) through the
+    // writer's ON CONFLICT exit. A conflicting edge this connection cannot SEE
+    // (row-level security) has no id to return, so the writer errors and this
+    // maps it to internal_error, with no second row written and without the
+    // hidden edge's id. Both cases are pinned in tests/link_alternative_smoke.rs.
     let (edge_id, created) = EdgeRepository::create_symmetric_if_absent_returning(
         pool,
         a,

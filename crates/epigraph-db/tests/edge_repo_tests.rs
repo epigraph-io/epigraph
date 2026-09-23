@@ -235,3 +235,188 @@ async fn create_symmetric_if_absent_distinguishes_by_relationship(pool: PgPool) 
         "two distinct edges total (one per relationship)"
     );
 }
+
+// ── create_symmetric_if_absent_returning ────────────────────────────────────
+//
+// The one writer behind MCP `link_alternative`. Its statement has three exits:
+// a fresh insert, the guard's dedup hit (`NOT EXISTS` saw the pair), and
+// `ON CONFLICT DO NOTHING` (the guard saw nothing and
+// `edges_alternative_of_symmetric_uniq` refused the row). Until these tests
+// nothing in the tree called it, so every exit was asserted by inspection. The
+// fourth case, a conflicting row the WRITER cannot see, needs an app-role pool
+// and lives in `rls_enforcement.rs`.
+
+/// Two `ClaimRepository::create` claims (public by migration 062's default).
+async fn two_claims(pool: &PgPool, label: &str) -> (uuid::Uuid, uuid::Uuid) {
+    let agent = make_agent(Some(label));
+    let agent_row = AgentRepository::create(pool, &agent).await.unwrap();
+    let mut ids = Vec::with_capacity(2);
+    for side in ["a", "b"] {
+        let claim = make_claim(agent_row.id, &format!("{label} claim {side}"), 0.5);
+        let id: uuid::Uuid =
+            ClaimRepository::create(pool, &claim, epigraph_core::TenancyDecl::Inherited)
+                .await
+                .unwrap()
+                .id
+                .into();
+        ids.push(id);
+    }
+    (ids[0], ids[1])
+}
+
+/// The guard's dedup-hit exit: a reverse-direction second call returns the
+/// FIRST edge's id with `created = false`, writes nothing, and leaves the stored
+/// properties alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_symmetric_if_absent_returning_dedups_in_both_directions(pool: PgPool) {
+    let (a, b) = two_claims(&pool, "ret-dedup").await;
+
+    let (id, created) = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        a,
+        b,
+        "alternative_of",
+        serde_json::json!({"rationale": "first"}),
+    )
+    .await
+    .expect("first link");
+    assert!(created, "the first link must insert");
+
+    let (again, created_again) = EdgeRepository::create_symmetric_if_absent_returning(
+        &pool,
+        b,
+        a,
+        "alternative_of",
+        serde_json::json!({"rationale": "second"}),
+    )
+    .await
+    .expect("reverse-direction link");
+    assert_eq!(
+        (again, created_again),
+        (id, false),
+        "the REVERSE-direction call must answer with the existing edge's id and \
+         created=false: alternative_of is symmetric"
+    );
+    assert_eq!(
+        incident_edge_count(&pool, a, b, "alternative_of").await,
+        1,
+        "the dedup hit must not write a second row"
+    );
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT properties FROM edges WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored,
+        serde_json::json!({"rationale": "first"}),
+        "a dedup hit must not overwrite the stored properties"
+    );
+}
+
+/// Wait until some backend is blocked by `blocker_pid`, polling on a connection
+/// of its own so the pool under test is not starved. Panics after ~10s.
+async fn wait_until_blocked_by(pool: &PgPool, blocker_pid: i32) {
+    use sqlx::Connection;
+    let mut probe = sqlx::PgConnection::connect_with(&pool.connect_options())
+        .await
+        .expect("probe connection");
+    for _ in 0..200 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(blocker_pid)
+        .fetch_one(&mut probe)
+        .await
+        .expect("read pg_blocking_pids");
+        if blocked > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "no backend blocked on pid {blocker_pid} within 10s: the writer never reached \
+         the unique index, so this test cannot claim to exercise ON CONFLICT"
+    );
+}
+
+/// The `ON CONFLICT DO NOTHING` exit, with the conflicting row VISIBLE to the
+/// writer once it commits.
+///
+/// A sequential second call never reaches this exit, because the guard sees the
+/// first row and skips the insert. It is reached only when the guard's snapshot
+/// is older than the conflicting row, which is the concurrent-duplicate case.
+/// The test builds that case on purpose rather than racing for it:
+///
+/// 1. A second connection inserts the REVERSE-direction row and holds its
+///    transaction open.
+/// 2. The writer runs. Its `NOT EXISTS` snapshot cannot see an uncommitted row,
+///    so the guard passes and the INSERT blocks on
+///    `edges_alternative_of_symmetric_uniq`. The test waits until
+///    `pg_blocking_pids` shows it blocked, which proves the statement started
+///    before the commit.
+/// 3. The holder commits. `DO NOTHING` resolves the conflict and the dedup
+///    probe, a new statement, sees the committed row.
+///
+/// Without `ON CONFLICT DO NOTHING` step 3 is a 23505, which `DbError` turns
+/// into `DuplicateKey` and `link_alternative` into an internal error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_symmetric_if_absent_returning_resolves_a_concurrent_duplicate_through_on_conflict(
+    pool: PgPool,
+) {
+    use sqlx::Connection;
+    let (a, b) = two_claims(&pool, "ret-race").await;
+
+    let mut holder = sqlx::PgConnection::connect_with(&pool.connect_options())
+        .await
+        .expect("holder connection");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .unwrap();
+    let mut tx = holder.begin().await.expect("holder BEGIN");
+    let held: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                            relationship, properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'alternative_of', '{}'::jsonb) \
+         RETURNING id",
+    )
+    .bind(b)
+    .bind(a)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("holder inserts the reverse-direction row");
+
+    let writer = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            EdgeRepository::create_symmetric_if_absent_returning(
+                &pool,
+                a,
+                b,
+                "alternative_of",
+                serde_json::json!({}),
+            )
+            .await
+        }
+    });
+
+    wait_until_blocked_by(&pool, holder_pid).await;
+    tx.commit().await.expect("holder COMMIT");
+
+    let answer = writer
+        .await
+        .expect("writer task")
+        .expect("the ON CONFLICT exit must resolve to an answer, not a unique violation");
+    assert_eq!(
+        answer,
+        (held, false),
+        "a concurrent duplicate must resolve to the committed row's id with created=false"
+    );
+    assert_eq!(
+        incident_edge_count(&pool, a, b, "alternative_of").await,
+        1,
+        "exactly one alternative_of row for the pair"
+    );
+}
