@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 #[cfg(feature = "db")]
 use crate::errors::ApiError;
 #[cfg(feature = "db")]
+use crate::middleware::bearer::ViewerExtractor;
+#[cfg(feature = "db")]
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
@@ -43,8 +45,18 @@ pub struct NeighborhoodDensityResponse {
 }
 
 /// POST /api/v1/embeddings/neighborhood-density
+///
+/// Both statements are read through the caller's [`Viewer`](epigraph_db::Viewer).
+/// Until `F-inline-claim-content-reads` was discharged they ran inline on the
+/// raw pool with no viewer at all, so the count, the mean/median similarity and
+/// the level/source-type histogram were computed over every tenant's claims: a
+/// semantic membership oracle that answered "is there private material near this
+/// topic, and what kind" without returning a single id. They now call the same
+/// repo functions the MCP twin `embedding_neighborhood_density` has used since
+/// PR-09, so there is one copy of this SQL, filtered.
 #[cfg(feature = "db")]
 pub async fn neighborhood_density(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<NeighborhoodDensityRequest>,
 ) -> Result<Json<NeighborhoodDensityResponse>, ApiError> {
@@ -70,46 +82,48 @@ pub async fn neighborhood_density(
             .join(",")
     );
 
+    // Both statements on ONE viewer-stamped connection, so the in-query `$V`
+    // predicate and the session GUCs migration 077's policies read come from
+    // the same `Viewer`. The error shape is the template's: log the reason,
+    // answer with a fixed message.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "neighborhood_density",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Aggregate stats in one round trip. Uses the existing HNSW index on
     // claims.embedding via the `<=>` cosine-distance operator. Cosine
     // similarity = 1 - cosine_distance. Filter is `similarity >= 1 - radius`
     // in distance space because pgvector indexes operate on distance.
-    let row = sqlx::query_as::<_, (i64, Option<f64>, Option<f64>)>(
-        "SELECT COUNT(*)::bigint AS n, \
-                AVG(1 - (embedding <=> $1::vector))::float8 AS mean_sim, \
-                percentile_cont(0.5) WITHIN GROUP \
-                    (ORDER BY 1 - (embedding <=> $1::vector))::float8 AS median_sim \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND is_current = true \
-           AND (embedding <=> $1::vector) <= $2",
+    let (n_claims, mean_sim, median_sim) = epigraph_db::ClaimRepository::embedding_radius_density(
+        &mut *read,
+        &viewer,
+        &embedding_str,
+        radius,
     )
-    .bind(&embedding_str)
-    .bind(radius)
-    .fetch_one(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("density aggregate failed: {e}"),
     })?;
-    let n_claims = row.0;
-    let mean_similarity = row.1.unwrap_or(0.0);
-    let median_similarity = row.2.unwrap_or(0.0);
+    let mean_similarity = mean_sim.unwrap_or(0.0);
+    let median_similarity = median_sim.unwrap_or(0.0);
 
     // Sample for level + source_type breakdown. Use max_sample to bound
     // worst-case scan even when n_claims is huge.
-    let breakdown_rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT properties->>'level' AS lvl, properties->>'source_type' AS src \
-         FROM claims \
-         WHERE embedding IS NOT NULL \
-           AND is_current = true \
-           AND (embedding <=> $1::vector) <= $2 \
-         ORDER BY embedding <=> $1::vector \
-         LIMIT $3",
+    let breakdown_rows = epigraph_db::ClaimRepository::embedding_radius_breakdown(
+        &mut *read,
+        &viewer,
+        &embedding_str,
+        radius,
+        max_sample,
     )
-    .bind(&embedding_str)
-    .bind(radius)
-    .bind(max_sample)
-    .fetch_all(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("density breakdown failed: {e}"),

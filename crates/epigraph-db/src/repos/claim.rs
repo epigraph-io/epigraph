@@ -1150,9 +1150,10 @@ impl ClaimRepository {
     /// Count / mean / median cosine similarity inside a distance radius of a
     /// probe vector, viewer-filtered.
     ///
-    /// Backs MCP `embedding_neighborhood_density` (PR-09). That tool ran this
-    /// aggregate inline in `epigraph-mcp/src/tools/embeddings.rs` with no
-    /// `Viewer` parameter at all. It is the same cardinality-oracle shape as
+    /// Backs MCP `embedding_neighborhood_density` (PR-09) and its HTTP twin
+    /// `POST /api/v1/embeddings/neighborhood-density` (the
+    /// `F-inline-claim-content-reads` discharge). Both ran this aggregate
+    /// inline with no `Viewer` parameter at all. It is the same cardinality-oracle shape as
     /// [`Self::embedding_density_stats`] — which already exists for the HTTP
     /// twin `GET /api/v1/voids/density` — but not the same query: this one
     /// gates on cosine *distance* `<= radius` rather than similarity
@@ -1193,7 +1194,8 @@ impl ClaimRepository {
     /// `properties->>'level'` / `properties->>'source_type'` for the nearest
     /// claims inside a distance radius, viewer-filtered.
     ///
-    /// The MCP `embedding_neighborhood_density` breakdown. Unfiltered this was
+    /// The `embedding_neighborhood_density` breakdown, shared by the MCP tool
+    /// and `POST /api/v1/embeddings/neighborhood-density`. Unfiltered this was
     /// the sharper of that tool's two leaks: the level/source-type histogram of
     /// the nearest neighbours to a caller-chosen probe is a membership oracle
     /// over the whole corpus — it answers "is there private material near this

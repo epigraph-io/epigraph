@@ -226,7 +226,15 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `MatchCandidateRepo::corroborates_edges_for_claim`. Both were byte-for-byte
     // duplicates of SQL in `epigraph-mcp/src/tools/matching.rs`; there is now
     // one copy, in the repo layer, filtered.
-    ("embeddings.rs", 1),
+    // `embeddings.rs` was 1 until `F-inline-claim-content-reads` was
+    // discharged and is now 0, so it is gone from the register entirely. The
+    // counted site was `neighborhood_density`'s level/source-type breakdown. The
+    // handler had a SECOND unfiltered statement this register never counted —
+    // the count/mean/median aggregate, a `query_as::<_, (i64, Option<f64>,
+    // Option<f64>)>(` whose nested generic ended `sqlx_call_offsets`' turbofish
+    // scan early. Both now call the viewer-spliced repo functions the MCP twin
+    // has used since PR-09 (`ClaimRepository::embedding_radius_density` and
+    // `::embedding_radius_breakdown`), on `AppState::read_as`.
     // `hypothesis.rs` was 1 until `tenancy/fix-security-track` and is now 0, so
     // it is gone from the register entirely. The site was
     // `create_hypothesis`'s VOI neighborhood scan — `SELECT c.id, c.belief,
