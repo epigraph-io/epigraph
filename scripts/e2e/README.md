@@ -67,6 +67,7 @@ precisely why production admits writes a clean schema refuses.
 | `probe-tools.sh <binary> <label> <a\|b>` | `challenge_claim`, `update_with_evidence`, `submit_ds_evidence`, `update_labels`. Every arm hangs off a claim authored by the server's own agent. |
 | `probe-embed.sh <binary> <label> <a\|b>` | The `McpEmbedder::embed_and_store` callers that embed **executor-authored** claims (`store_workflow`, `add_step`) — the arms that distinguish *stamped* from *stamped from the right author*. |
 | `probe-workflow.sh <binary> <label> <a\|b\|b2a>` | `deprecate_workflow` and `report_workflow_outcome` on their own populations, hierarchical **and** legacy-flat, in both ownership shapes. |
+| `probe-unit-e.sh <binary> <label> <a\|b>` | The R3 gate's remaining tools: `ingest_workflow` (with level-3 atoms), `improve_workflow_hierarchy`, `delete_step`, `link_epistemic`'s belief wiring, `consolidate_claims` (own and foreign sources), `ingest_document_inline` (fresh, re-ingest, converged-foreign-atom) and `ingest_document_spine`, plus the authority arms: the synchronous ingest PREFLIGHT, and a REVOKED / READER ingest-system membership that must not be revived or promoted. Also the REGISTER arm the residual-register reasons cite. |
 | `embed-verdict.sh` | How many committed claims carry a vector. |
 | `drive.sh <binary> <label> <a\|b>` | `set-config` + `run-e2e` + the embedding verdict, in one call. |
 | `set-config.sh a\|b` | Switches the schema configuration. Reads `helper.sql` and `fn2.sql`. |
@@ -129,6 +130,21 @@ site that hit them; they are collected here because they generalise.
 4. **An absent `OPENAI_API_KEY` makes every embedding arm vacuous.** The embedder
    fails before it reaches the database, so `embedding IS NULL` says nothing about
    the write path. `probe-embed.sh` hard-refuses rather than reporting it.
+5. **Every probe TRUNCATEs first, which hides collisions that span runs.**
+   `store_workflow`'s constant `"Body"` phase is hashed with plain `content_hash`,
+   so the SECOND workflow ever written collides on `uq_claims_content_hash_agent`
+   ("Duplicate entity already exists") — on main and in production too. No probe
+   saw it, because each run starts from an empty `claims` table and writes one
+   workflow. A probe that asserts "tool X succeeds" on a truncated database says
+   nothing about the second call.
+6. **A baseline binary must come from its OWN target dir.** Building an extracted
+   copy of the same workspace (`git archive <ref> | tar -x`) with the same
+   `CARGO_TARGET_DIR` is unsafe: cargo hashes path packages relative to the
+   workspace root, the extracted files carry OLD mtimes, and cargo reports
+   `Finished` without compiling and hands back the OTHER tree's binary. MEASURED —
+   a "main" binary built that way embedded the worktree's paths. Build the
+   baseline with a separate `CARGO_TARGET_DIR`, and check
+   `strings <binary> | grep crates/epigraph-engine` names the tree you meant.
 
 ## What this harness does not cover
 

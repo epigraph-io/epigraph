@@ -68,10 +68,11 @@
 //! AUTHOR. That is invisible to a syntactic scan — the call reads `&mut *tx`
 //! either way — and it is the axis on which a conversion actually fails, because
 //! every tier-A `WITH CHECK` asks about the ROW's `owner_group_id` rather than the
-//! caller's identity. `scripts/e2e/probe-workflow.sh` is currently the only
-//! instrument for it: it reaches the real `epigraph_app` role (`rolbypassrls =
-//! false`), seeds the SAME claim in the server agent's own group and in a foreign
-//! one, and reports which writes land. A green run HERE means "no tool-layer write
+//! caller's identity. The harness is the instrument for it —
+//! `scripts/e2e/probe-workflow.sh` and `scripts/e2e/probe-unit-e.sh` reach the
+//! real `epigraph_app` role (`rolbypassrls = false`), seed the SAME shape of row
+//! in the server agent's own group and in a foreign one, and report which writes
+//! land. A green run HERE means "no tool-layer write
 //! takes the unstamped pool except the registered ones" — never "the converted
 //! tools stamp from the right viewer".
 
