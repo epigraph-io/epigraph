@@ -469,7 +469,11 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("belief.rs", 1),
     ("claims.rs", 4),
     ("computation.rs", 2),
-    ("conventions.rs", 2),
+    // `conventions.rs` was 2 -- `learn_convention`'s and `share_skill`'s inline
+    // `UPDATE claims SET labels`. Both moved to `ClaimRepository::update_labels`
+    // when the two handlers left the legacy content-hash-only
+    // `ClaimRepository::create` (deferred-commitment key
+    // legacy-claim-create-callers). Removed, not zeroed.
     ("hypothesis.rs", 2),
     ("policies.rs", 4),
     ("rag.rs", 2),

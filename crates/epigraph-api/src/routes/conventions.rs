@@ -29,9 +29,12 @@
 //! all WRITE. [`AppState::read_as`] is documented read-only and a write routed
 //! through a `ScopedRead` is rolled back on drop under
 //! `SessionGucMode::Transaction` while still type-checking. Their owner is
-//! `ScopedPool::begin_as` plus `Viewer::splice_write`, and
-//! `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
-//! `("conventions.rs", 2)` for two of them, unchanged by this shard.
+//! `ScopedPool::begin_as` plus `Viewer::splice_write`. The two inline
+//! `UPDATE claims SET labels` statements `viewer_route_table_lint.rs::
+//! ROUTE_LAYER_WRITES` carried as `("conventions.rs", 2)` moved into
+//! `ClaimRepository::update_labels` when `learn_convention` and `share_skill`
+//! left the legacy content-hash-only `ClaimRepository::create`
+//! (deferred-commitment key legacy-claim-create-callers); the row is gone.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -127,6 +130,10 @@ pub struct SkillResponse {
 /// Learn a convention — creates a claim with "convention" label and empirical evidence.
 ///
 /// `POST /api/v1/conventions`
+///
+/// Idempotent on the convention text: `201` the first time, `200` with the SAME
+/// `claim_id` when the system agent already holds that text (new evidence text
+/// is attached as further support; repeated evidence text is a no-op).
 pub async fn learn_convention(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -176,22 +183,39 @@ pub async fn learn_convention(
     // on this surface -- a convention is instance-wide by construction.
     let decl =
         epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
-    epigraph_db::ClaimRepository::create(pool, &claim, decl).await?;
 
-    // Set labels: convention + any user tags
-    let mut labels = vec!["convention".to_string(), "learned".to_string()];
-    labels.extend(request.tags);
-
-    sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
-        .bind(&labels)
-        .bind(claim.id.as_uuid())
-        .execute(pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
+    // Dedup on the noun-claim key `(content_hash, agent_id)` -- against the
+    // SYSTEM agent's own rows only -- and carry on with the id the repository
+    // RETURNS. The legacy `ClaimRepository::create` deduped on `content_hash`
+    // alone and this handler discarded its return value, so a convention whose
+    // text matched ANY existing claim (any agent, any tenant) inserted nothing,
+    // and the evidence write below then named `claim.id`, a row that did not
+    // exist, and failed `evidence_claim_id_fkey` (a 400 via the 23503 mapping).
+    //
+    // The viewer is the system agent's own: it is the author, and the lookup
+    // asks "does the author already hold this text". Resolved after `decl`,
+    // which mints that agent's personal group and membership on first use.
+    let author_viewer = epigraph_db::Viewer::resolve(pool, agent_id.into()).await?;
+    let (persisted, was_created) = {
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
             message: e.to_string(),
         })?;
+        epigraph_db::ClaimRepository::create_or_get(&mut conn, &author_viewer, &claim, decl).await?
+    };
+    let claim_id = persisted.id;
+    let claim_uuid = claim_id.as_uuid();
 
-    // Create evidence
+    // Labels: convention + any user tags, merged idempotently so re-learning a
+    // convention keeps whatever it already carried.
+    let mut labels = vec!["convention".to_string(), "learned".to_string()];
+    labels.extend(request.tags);
+    let labels =
+        epigraph_db::ClaimRepository::update_labels(pool, claim_uuid, &labels, &[]).await?;
+
+    // Create evidence. On a re-learn the same evidence text may already support
+    // this convention (`evidence_content_hash_claim_unique`): that is the
+    // idempotent case, not an error. New evidence text on a re-learn is
+    // attached as further support.
     let evidence_hash = epigraph_crypto::ContentHasher::hash(request.evidence.as_bytes());
     let evidence = epigraph_core::Evidence::new(
         agent_id,
@@ -203,9 +227,44 @@ pub async fn learn_convention(
             location: None,
         },
         Some(request.evidence),
-        claim.id,
+        claim_id,
     );
-    epigraph_db::EvidenceRepository::create(pool, &evidence).await?;
+    let evidence_written = match epigraph_db::EvidenceRepository::create(pool, &evidence).await {
+        Ok(_) => true,
+        Err(epigraph_db::DbError::DuplicateKey { .. }) if !was_created => false,
+        Err(e) => return Err(e.into()),
+    };
+    let evidence_uuid = evidence.id.as_uuid();
+    if evidence_written {
+        let _ = epigraph_db::EdgeRepository::create(
+            pool,
+            evidence_uuid,
+            "evidence",
+            claim_uuid,
+            "claim",
+            "SUPPORTS",
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    if !was_created {
+        // Re-learn of an existing convention. Its reasoning trace and
+        // authorship edges were written when it was first learned; a second
+        // trace here would re-point `trace_id` away from that provenance.
+        // Report the STORED truth value, not this request's confidence.
+        return Ok((
+            StatusCode::OK,
+            Json(ConventionResponse {
+                claim_id: claim_uuid,
+                content: request.content,
+                truth_value: persisted.truth_value.value(),
+                labels,
+            }),
+        ));
+    }
 
     // Create reasoning trace
     let trace = epigraph_core::ReasoningTrace::new(
@@ -216,29 +275,15 @@ pub async fn learn_convention(
         confidence,
         format!("Convention learned: {}", request.content),
     );
-    epigraph_db::ReasoningTraceRepository::create(pool, &trace, claim.id).await?;
-    epigraph_db::ClaimRepository::update_trace_id(pool, claim.id, trace.id).await?;
+    epigraph_db::ReasoningTraceRepository::create(pool, &trace, claim_id).await?;
+    epigraph_db::ClaimRepository::update_trace_id(pool, claim_id, trace.id).await?;
 
-    // Materialize graph edges
-    let claim_uuid = claim.id.as_uuid();
-    let evidence_uuid = evidence.id.as_uuid();
+    // Materialize graph edges (SUPPORTS was written with the evidence above)
     let trace_uuid = trace.id.as_uuid();
     let agent_uuid = system_agent.id.as_uuid();
 
     let _ = epigraph_db::EdgeRepository::create(
         pool, agent_uuid, "agent", claim_uuid, "claim", "AUTHORED", None, None, None,
-    )
-    .await;
-    let _ = epigraph_db::EdgeRepository::create(
-        pool,
-        evidence_uuid,
-        "evidence",
-        claim_uuid,
-        "claim",
-        "SUPPORTS",
-        None,
-        None,
-        None,
     )
     .await;
     let _ = epigraph_db::EdgeRepository::create(
@@ -261,7 +306,7 @@ pub async fn learn_convention(
     Ok((
         StatusCode::CREATED,
         Json(ConventionResponse {
-            claim_id: claim.id.as_uuid(),
+            claim_id: claim_uuid,
             content: request.content,
             truth_value: confidence,
             labels,
@@ -427,6 +472,10 @@ pub async fn list_skills(
 /// Share a workflow skill to global scope.
 ///
 /// `POST /api/v1/skills/share`
+///
+/// `201` when a new system-authored copy is made, `200` with the SAME
+/// `shared_claim_id` and `edge_id` on a re-share, `409` when the named claim is
+/// itself system-authored (already a shared copy).
 pub async fn share_skill(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -470,27 +519,53 @@ pub async fn share_skill(
     // group-private would defeat the sharing this endpoint exists to do.
     let decl =
         epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id.into()).await?;
-    epigraph_db::ClaimRepository::create(pool, &shared_claim, decl).await?;
 
-    // Set labels
+    // The copy has the ORIGINAL's content, so under the legacy content-hash-only
+    // dedup `ClaimRepository::create` returned the original row on essentially
+    // every call and inserted nothing; this handler then labelled (zero rows)
+    // and linked `shared_claim.id`, a row that never existed, and the edge
+    // write was refused by `trigger_validate_edge_refs` -- a 400 on every share
+    // of a claim whose content hash was already in the table.
+    // Dedup on `(content_hash, agent_id)` instead -- the system agent's own
+    // shared copy of this text, if it already made one -- and use the id the
+    // repository returns. The viewer is the system agent's: it is the author.
+    let author_viewer = epigraph_db::Viewer::resolve(pool, agent_id.into()).await?;
+    let (shared, was_created) = {
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })?;
+        epigraph_db::ClaimRepository::create_or_get(&mut conn, &author_viewer, &shared_claim, decl)
+            .await?
+    };
+    let shared_claim_id = shared.id.as_uuid();
+
+    // The one way `(content_hash, system agent)` resolves to the ORIGINAL: the
+    // original is itself system-authored (e.g. an already-shared copy). There
+    // is nothing to copy, and a SHARED_BY edge from a claim to itself is a
+    // self-loop the edges table refuses anyway.
+    if shared_claim_id == request.workflow_id {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "claim {} is already authored by the system agent (it is a shared copy); \
+                 there is nothing further to share",
+                request.workflow_id
+            ),
+        });
+    }
+
+    // Set labels (idempotent merge; a re-share leaves them as they are)
     let labels = vec![
         "workflow".to_string(),
         "global".to_string(),
         "shared".to_string(),
     ];
-    sqlx::query("UPDATE claims SET labels = $1 WHERE id = $2")
-        .bind(&labels)
-        .bind(shared_claim.id.as_uuid())
-        .execute(pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
+    epigraph_db::ClaimRepository::update_labels(pool, shared_claim_id, &labels, &[]).await?;
 
-    // Create SHARED_BY edge from shared → original
-    let edge_id = epigraph_db::EdgeRepository::create(
+    // SHARED_BY edge from shared -> original. Idempotent, so sharing the same
+    // workflow twice answers with the same copy AND the same edge.
+    let (edge, _edge_created) = epigraph_db::EdgeRepository::create_if_not_exists(
         pool,
-        shared_claim.id.as_uuid(),
+        shared_claim_id,
         "claim",
         request.workflow_id,
         "claim",
@@ -502,11 +577,15 @@ pub async fn share_skill(
     .await?;
 
     Ok((
-        StatusCode::CREATED,
+        if was_created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
         Json(ShareSkillResponse {
-            shared_claim_id: shared_claim.id.as_uuid(),
+            shared_claim_id,
             original_workflow_id: request.workflow_id,
-            edge_id,
+            edge_id: edge.id,
         }),
     ))
 }
