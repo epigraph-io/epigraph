@@ -351,3 +351,79 @@ async fn helper_authored_failure_does_not_propagate(pool: PgPool) {
         "tracing::warn! must fire on AUTHORED failure"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// helper_invisible_self_authored_collision — plan §8.5, acceptance item 21
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The MCP twin of `epigraph-api/tests/unique_constraint_oracle_n21.rs`.
+///
+/// MCP writers author as the CALLING principal, so a stranger cannot aim this
+/// path at a victim's `agent_id` the way the HTTP body's `agent_id` can. The
+/// reachable case is a claim the caller itself authored that has since become
+/// invisible to it — owned by a group the author is not a member of, which is
+/// the state a privatization into a foreign group, or a revoked membership,
+/// leaves behind. `uq_claims_content_hash_agent` still refuses the re-submit,
+/// and the Viewer-scoped re-find has nothing to return.
+///
+/// The helper must answer with `ClaimRepository::CONTENT_COLLISION_REASON` as
+/// invalid params. Before, it was an internal error quoting
+/// `InvalidData("… no row found on re-find")`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn helper_invisible_self_authored_collision_is_the_fixed_conflict(pool: PgPool) {
+    // Asserts the constraint is present after (re)adding it: without it nothing
+    // collides and this arm asserts nothing.
+    add_unique_constraint(&pool).await;
+
+    let (author, _own_group) = fixture::seed_agent_with_group(&pool, "n21-mcp-author").await;
+    let (_other, foreign_group) = fixture::seed_agent_with_group(&pool, "n21-mcp-other").await;
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, author)
+        .await
+        .expect("resolve the author's viewer");
+
+    let content = format!("n21 mcp self-authored {}", Uuid::new_v4());
+    let hidden: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, 0.5, $3, true, 'group', $4) RETURNING id",
+    )
+    .bind(&content)
+    .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+    .bind(author)
+    .bind(foreign_group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the author's claim into a foreign group");
+
+    // PREMISE: the author cannot read its own claim any more.
+    assert!(epigraph_db::ClaimRepository::get_by_id(
+        &pool,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(hidden)
+    )
+    .await
+    .expect("get_by_id")
+    .is_none());
+
+    let err = create_claim_idempotent(&pool, &viewer, &make_claim(&content, author), "test_tool")
+        .await
+        .expect_err("a collision with an unreadable row cannot succeed");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "the collision is the request's, not a server fault: {err:?}"
+    );
+    assert_eq!(
+        err.message,
+        epigraph_db::ClaimRepository::CONTENT_COLLISION_REASON,
+        "the refusal must be the one fixed literal every collision gets"
+    );
+    assert!(!err.message.contains(&hidden.to_string()));
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(&content)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 1, "the refused re-submit must not land a row");
+}

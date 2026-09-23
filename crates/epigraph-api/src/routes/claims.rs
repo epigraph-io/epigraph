@@ -638,23 +638,37 @@ pub async fn create_claim(
     };
 
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
+    //
+    // EVERY COLLISION ANSWERS WITH ONE BODY (plan §8.5, acceptance item 21).
+    // `uq_claims_content_hash_agent` is not Viewer-scoped and the body's
+    // `agent_id` is not a credential, so a stranger can aim a write at a
+    // victim's `(content, agent_id)` and collide with a row it cannot read. The
+    // strict arm below answers a VISIBLE collision with
+    // `ClaimRepository::CONTENT_COLLISION_REASON`, and `create_or_get` answers
+    // an INVISIBLE one on either arm with a `DbError::Conflict` carrying the
+    // same literal, which `?` maps onto the same `ApiError::Conflict`. The
+    // result is byte-identical; `tests/unique_constraint_oracle_n21.rs` pins
+    // it. It is NOT yet identical to the absent case (201): that needs the
+    // dedup key to carry `owner_group_id`, recorded as
+    // `D-N21-unique-keys-omit-owner-group`.
     let (created_claim, was_created) = if request.if_not_exists {
         ClaimRepository::create_or_get(&mut tx, &viewer, &claim, decl).await?
     } else {
-        // The (content_hash, agent_id) UNIQUE constraint that create_strict's
-        // 409-on-duplicate contract relied on was dropped (migration 107), so
-        // create_strict now silently INSERTs duplicates — 20+ identical claims
-        // accumulated this way (bug c11c1295). Re-assert the contract at the app
-        // layer: refuse a duplicate up front with the same 409 the constraint
-        // would have produced. (Restoring the DB constraint requires de-duping
-        // existing rows first and is a separate migration; adding it here would
-        // brick API boot on the existing duplicates.)
+        // `create_strict` is an unconditional INSERT, and its 409-on-duplicate
+        // contract rests on `uq_claims_content_hash_agent` (migration 013). The
+        // constraint is present on every schema built from `migrations/`, but
+        // it is ABSENT from the long-lived production database, dropped there
+        // by test fixtures run against it (`migrations/README.md`, "Known
+        // schema drift"), where 20+ identical claims accumulated (bug
+        // c11c1295). So the contract is re-asserted at the app layer: refuse a
+        // duplicate up front with the same 409 the constraint produces.
+        // (Restoring the constraint there requires de-duping existing rows
+        // first; a migration that re-adds it would brick API boot on the
+        // existing duplicates.)
         let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
         let agent_uuid: Uuid = claim.agent_id.into();
-        let dup_conflict = || {
-            ApiError::Conflict {
-            reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
-        }
+        let dup_conflict = || ApiError::Conflict {
+            reason: ClaimRepository::CONTENT_COLLISION_REASON.to_string(),
         };
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,
@@ -669,9 +683,10 @@ pub async fn create_claim(
         }
         match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
-            // Belt-and-suspenders: if the UNIQUE constraint is ever restored, or
-            // a concurrent writer wins the race between the check above and this
-            // INSERT, still surface 409 rather than a generic 500.
+            // Reached by a concurrent writer winning the race between the
+            // check above and this INSERT, AND — on every schema that carries
+            // the constraint — by a colliding row the Viewer-scoped check could
+            // not see. Both must answer exactly as the visible case above does.
             Err(epigraph_db::DbError::DuplicateKey { .. }) => return Err(dup_conflict()),
             Err(e) => return Err(e.into()),
         }

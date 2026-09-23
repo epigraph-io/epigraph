@@ -4676,9 +4676,42 @@ impl ClaimRepository {
     /// another unique constraint to `claims`, narrow this match to inspect
     /// the constraint name.
     ///
+    /// # The collision whose row the caller cannot read (plan §8.5, item 21)
+    ///
+    /// The find is Viewer-scoped and the constraint is not, so the catch path
+    /// is reached by TWO cases, not one: the race above, and a colliding row
+    /// that exists and is invisible to `viewer`. The second is the ordinary
+    /// case for a stranger over HTTP, because `claims.agent_id` comes from the
+    /// request body and is not a credential
+    /// (`D-PR16-claim-authorship-is-not-a-credential`): anyone can aim a write
+    /// at a victim's `(content, agent_id)`. It answers
+    /// `DbError::Conflict { reason: CONTENT_COLLISION_REASON }` — the same
+    /// fixed literal `routes/claims.rs` answers a VISIBLE collision with on the
+    /// strict path, so the two are byte-identical over HTTP. It used to answer
+    /// `InvalidData("… no row found on re-find")` on a bare connection and a
+    /// 500 inside a transaction, each distinct from every other outcome.
+    ///
+    /// What this does NOT make it: identical to the ABSENT case, which inserts.
+    /// That needs the dedup key to carry `owner_group_id` so a stranger's
+    /// write, which the route always declares into the stranger's own group,
+    /// cannot collide with a row in a group it cannot read — a migration,
+    /// recorded as `D-N21-unique-keys-omit-owner-group`.
+    ///
+    /// # Why the INSERT runs under a savepoint
+    ///
+    /// Inside a caller's transaction a unique violation aborts the whole
+    /// transaction, and the re-find below then fails with `25P02` rather than
+    /// running. So the race handling documented above never worked for the two
+    /// callers that pass a transaction (`routes/claims.rs`, `routes/submit.rs`);
+    /// both surfaced it as a 500. `Connection::begin` on a connection already in
+    /// a transaction issues `SAVEPOINT`, and on a bare one `BEGIN`, so the same
+    /// code is correct for `claim_helper.rs`'s pooled connection too.
+    ///
     /// Takes `&mut PgConnection` for transactional composition.
     ///
     /// # Errors
+    /// Returns `DbError::Conflict` with [`Self::CONTENT_COLLISION_REASON`] when
+    /// the constraint refuses the insert and no row is readable to `viewer`.
     /// Returns `DbError::QueryFailed` for non-unique-violation database errors.
     pub async fn create_or_get(
         conn: &mut sqlx::PgConnection,
@@ -4686,6 +4719,8 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<(Claim, bool), DbError> {
+        use sqlx::Connection;
+
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
@@ -4700,10 +4735,17 @@ impl ClaimRepository {
             return Ok((existing, false));
         }
 
-        match Self::create_strict(&mut *conn, claim, decl).await {
-            Ok(c) => Ok((c, true)),
+        let mut savepoint = conn.begin().await?;
+        match Self::create_strict(&mut savepoint, claim, decl).await {
+            Ok(c) => {
+                savepoint.commit().await?;
+                Ok((c, true))
+            }
             Err(DbError::DuplicateKey { .. }) => {
-                // Post-107 race: another writer won. Re-find and return.
+                savepoint.rollback().await?;
+                // Post-107 race (another writer won), or a colliding row this
+                // viewer cannot read. Re-find: the first returns the row, the
+                // second has nothing to return and must not say why.
                 let existing = Self::find_by_content_hash_and_agent(
                     &mut *conn,
                     viewer,
@@ -4711,15 +4753,26 @@ impl ClaimRepository {
                     agent_id,
                 )
                 .await?
-                .ok_or_else(|| DbError::InvalidData {
-                    reason: "DuplicateKey from create_strict but no row found on re-find"
-                        .to_string(),
+                .ok_or_else(|| DbError::Conflict {
+                    reason: Self::CONTENT_COLLISION_REASON.to_string(),
                 })?;
                 Ok((existing, false))
             }
             Err(e) => Err(e),
         }
     }
+
+    /// The one answer every `(content_hash, agent_id)` collision gets, whether
+    /// or not the caller can read the colliding row (plan §8.5, item 21).
+    ///
+    /// A FIXED LITERAL on purpose. It names no row, id, content or group, and it
+    /// is phrased to be true of both cases, because the whole property is that
+    /// it cannot differ between them: `routes/claims.rs` returns it for a
+    /// visible collision on the strict path, and [`Self::create_or_get`] for an
+    /// invisible one on either path.
+    pub const CONTENT_COLLISION_REASON: &'static str =
+        "a claim with this (content_hash, agent_id) already exists; \
+         if_not_exists=true returns it when you can read it";
 
     /// Insert a claim with a caller-supplied id. Returns `true` if the row
     /// was newly inserted, `false` if the id already existed (silently

@@ -7,7 +7,7 @@ use epigraph_db::{ClaimRepository, EdgeRepository};
 use serde_json::json;
 use sqlx::PgPool;
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, invalid_params, McpError};
 
 /// Idempotently create a claim by `(content_hash, agent_id)` and emit an
 /// AUTHORED verb-edge marking the submission lifecycle event.
@@ -23,7 +23,9 @@ use crate::errors::{internal_error, McpError};
 ///
 /// # Errors
 /// Returns the underlying `McpError::internal_error` if `pool.acquire()`
-/// or `ClaimRepository::create_or_get` fail. AUTHORED edge failure is
+/// or `ClaimRepository::create_or_get` fail, except that a collision with a
+/// row the caller cannot read is `invalid_params` carrying
+/// `ClaimRepository::CONTENT_COLLISION_REASON`. AUTHORED edge failure is
 /// not returned (logged + swallowed).
 pub async fn create_claim_idempotent(
     pool: &PgPool,
@@ -42,9 +44,19 @@ pub async fn create_claim_idempotent(
     let decl = ClaimRepository::default_decl_for_author(&mut conn, claim.agent_id.into())
         .await
         .map_err(internal_error)?;
+    // A `Conflict` is a `(content_hash, agent_id)` collision with a row the
+    // caller cannot read (plan §8.5, item 21). Here the author IS the caller,
+    // so it is reached only by a self-authored claim that has since become
+    // invisible to its author — moved into a group the author is not in, or a
+    // revoked membership. It carries a fixed literal naming nothing, and is
+    // answered as invalid params with that literal rather than as an internal
+    // error: the request is what collides, and nothing failed.
     let (claim, was_created) = ClaimRepository::create_or_get(&mut conn, viewer, claim, decl)
         .await
-        .map_err(internal_error)?;
+        .map_err(|e| match e {
+            epigraph_db::DbError::Conflict { reason } => invalid_params(reason),
+            e => internal_error(e),
+        })?;
     drop(conn);
 
     if let Err(e) = EdgeRepository::create(

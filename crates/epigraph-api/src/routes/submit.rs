@@ -1126,14 +1126,22 @@ async fn persist_packet(
             )
         })?;
 
+    // A `Conflict` here is a `(content_hash, agent_id)` collision with a row
+    // this viewer cannot read (plan §8.5, item 21). It carries a fixed literal
+    // and is answered as a 409 with that literal alone; before `create_or_get`
+    // ran its INSERT under a savepoint it surfaced as a 500 quoting the
+    // aborted-transaction driver error.
     let (persisted, was_created) =
         epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)
             .await
-            .map_err(|e| {
-                (
+            .map_err(|e| match e {
+                epigraph_db::DbError::Conflict { reason } => {
+                    (StatusCode::CONFLICT, ErrorResponse::new("Conflict", reason))
+                }
+                e => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ErrorResponse::new("DatabaseError", format!("Failed to insert claim: {}", e)),
-                )
+                ),
             })?;
     let canonical_id = persisted.id;
     // All dependent rows hang off the canonical claim id, not the
