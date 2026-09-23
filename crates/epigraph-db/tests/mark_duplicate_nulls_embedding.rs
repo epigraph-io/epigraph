@@ -18,8 +18,8 @@ async fn mark_duplicate_nulls_embedding(pool: PgPool) {
         .unwrap();
 
     // Seed two claim rows directly via SQL — bypasses any cross-crate helper
-    // churn. Both get a stub embedding sized to the column's declared dim
-    // (1536; the column has a fixed-dim constraint).
+    // churn. Both get a stub embedding in BOTH the 1536d and 3072d columns
+    // (each sized to its column's declared fixed-dim constraint).
     let canonical_id = Uuid::new_v4();
     let dup_id = Uuid::new_v4();
     let stub_vec = {
@@ -28,16 +28,23 @@ async fn mark_duplicate_nulls_embedding(pool: PgPool) {
         format!("[{}]", v.join(","))
     };
     let stub_vec = stub_vec.as_str();
+    let stub_vec_3072 = {
+        let mut v = vec!["0.0"; 3072];
+        v[0] = "0.1";
+        format!("[{}]", v.join(","))
+    };
+    let stub_vec_3072 = stub_vec_3072.as_str();
     for (id, content) in [(canonical_id, "canonical"), (dup_id, "duplicate")] {
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, embedding) \
-             VALUES ($1, $2, $3, $4, 0.5, $5::vector)",
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, embedding, embedding_3072) \
+             VALUES ($1, $2, $3, $4, 0.5, $5::vector, $6::vector)",
         )
         .bind(id)
         .bind(content)
         .bind(blake3::hash(content.as_bytes()).as_bytes().as_slice())
         .bind(agent_id)
         .bind(stub_vec)
+        .bind(stub_vec_3072)
         .execute(&pool)
         .await
         .unwrap();
@@ -57,8 +64,20 @@ async fn mark_duplicate_nulls_embedding(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
+    let dup_has_embedding_3072: bool =
+        sqlx::query_scalar("SELECT embedding_3072 IS NOT NULL FROM claims WHERE id = $1")
+            .bind(dup_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let canon_has_embedding: bool =
         sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+            .bind(canonical_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let canon_has_embedding_3072: bool =
+        sqlx::query_scalar("SELECT embedding_3072 IS NOT NULL FROM claims WHERE id = $1")
             .bind(canonical_id)
             .fetch_one(&pool)
             .await
@@ -69,7 +88,15 @@ async fn mark_duplicate_nulls_embedding(pool: PgPool) {
         "duplicate {dup_id} embedding should be NULL after mark_duplicate"
     );
     assert!(
+        !dup_has_embedding_3072,
+        "duplicate {dup_id} embedding_3072 should be NULL after mark_duplicate"
+    );
+    assert!(
         canon_has_embedding,
         "canonical {canonical_id} embedding must be preserved"
+    );
+    assert!(
+        canon_has_embedding_3072,
+        "canonical {canonical_id} embedding_3072 must be preserved"
     );
 }

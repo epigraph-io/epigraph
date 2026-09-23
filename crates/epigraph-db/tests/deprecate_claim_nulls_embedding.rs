@@ -21,8 +21,9 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
         .unwrap();
 
     // Seed two CURRENT, embedded claims directly via SQL. Both get a stub
-    // vector sized to the column's declared dim (1536). `target` will be
-    // deprecated; `control` must be left completely untouched.
+    // vector in BOTH the 1536d and 3072d columns (each sized to its column's
+    // declared dim). `target` will be deprecated; `control` must be left
+    // completely untouched.
     let target_id = Uuid::new_v4();
     let control_id = Uuid::new_v4();
     let stub_vec = {
@@ -31,16 +32,23 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
         format!("[{}]", v.join(","))
     };
     let stub_vec = stub_vec.as_str();
+    let stub_vec_3072 = {
+        let mut v = vec!["0.0"; 3072];
+        v[0] = "0.1";
+        format!("[{}]", v.join(","))
+    };
+    let stub_vec_3072 = stub_vec_3072.as_str();
     for (id, content) in [(target_id, "deprecate-me"), (control_id, "leave-me")] {
         sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current, embedding) \
-             VALUES ($1, $2, $3, $4, 0.9, true, $5::vector)",
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current, embedding, embedding_3072) \
+             VALUES ($1, $2, $3, $4, 0.9, true, $5::vector, $6::vector)",
         )
         .bind(id)
         .bind(content)
         .bind(blake3::hash(content.as_bytes()).as_bytes().as_slice())
         .bind(agent_id)
         .bind(stub_vec)
+        .bind(stub_vec_3072)
         .execute(&pool)
         .await
         .unwrap();
@@ -54,14 +62,18 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
         "deprecate_claim should touch exactly the target row"
     );
 
-    // Full post-condition on the target: truth 0.05, not current, embedding NULL.
-    let (truth, is_current, has_embedding): (f64, bool, bool) = sqlx::query_as(
-        "SELECT truth_value, is_current, embedding IS NOT NULL FROM claims WHERE id = $1",
-    )
-    .bind(target_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    // Full post-condition on the target: truth 0.05, not current, both
+    // embedding columns NULL.
+    let (truth, is_current, has_embedding, has_embedding_3072): (f64, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT truth_value, is_current, embedding IS NOT NULL, \
+                    embedding_3072 IS NOT NULL \
+             FROM claims WHERE id = $1",
+        )
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(
         (truth - 0.05).abs() < 1e-9,
         "target truth_value should be 0.05, got {truth}"
@@ -71,23 +83,34 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
         !has_embedding,
         "target embedding should be NULL after deprecate_claim"
     );
+    assert!(
+        !has_embedding_3072,
+        "target embedding_3072 should be NULL after deprecate_claim"
+    );
 
     // Control row must be entirely unaffected: still current, still embedded,
     // truth unchanged. Without this assertion the test would pass even if
     // deprecate_claim nulled every embedding in the table.
-    let (c_truth, c_current, c_has_embedding): (f64, bool, bool) = sqlx::query_as(
-        "SELECT truth_value, is_current, embedding IS NOT NULL FROM claims WHERE id = $1",
-    )
-    .bind(control_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (c_truth, c_current, c_has_embedding, c_has_embedding_3072): (f64, bool, bool, bool) =
+        sqlx::query_as(
+            "SELECT truth_value, is_current, embedding IS NOT NULL, \
+                    embedding_3072 IS NOT NULL \
+             FROM claims WHERE id = $1",
+        )
+        .bind(control_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(
         (c_truth - 0.9).abs() < 1e-9,
         "control truth_value must be unchanged"
     );
     assert!(c_current, "control is_current must stay true");
     assert!(c_has_embedding, "control embedding must be preserved");
+    assert!(
+        c_has_embedding_3072,
+        "control embedding_3072 must be preserved"
+    );
 
     // Idempotency: a second call (the post-deploy remediation path for claims
     // the pre-fix binary deprecated) must remain a safe no-op flip.
@@ -106,5 +129,15 @@ async fn deprecate_claim_nulls_embedding_and_preserves_control(pool: PgPool) {
     assert!(
         still_null,
         "embedding stays NULL after a second deprecate_claim"
+    );
+    let still_null_3072: bool =
+        sqlx::query_scalar("SELECT embedding_3072 IS NULL FROM claims WHERE id = $1")
+            .bind(target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        still_null_3072,
+        "embedding_3072 stays NULL after a second deprecate_claim"
     );
 }
