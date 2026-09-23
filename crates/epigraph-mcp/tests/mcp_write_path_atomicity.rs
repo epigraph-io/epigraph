@@ -552,12 +552,31 @@ async fn a_refused_event_insert_does_not_abort_the_submission(pool: PgPool) {
 /// than hand-rolling a `claims` INSERT — the point is that the row is
 /// byte-identical to one the write path produced, so the dedup path really does
 /// recognise it on the retry.
+///
+/// # The `embedding` is nulled too, and that is not cosmetic
+///
+/// In the pre-change code the return happened at the
+/// `ReasoningTraceRepository::create` error — strictly BEFORE the post-commit
+/// embed — so a production orphan carries `is_current = true` AND
+/// `embedding IS NULL`, which is CLAUDE.md's `live_missing` invariant violation.
+/// A fixture that stripped only the provenance produced a row that was not
+/// shaped like the thing under repair, and an arm over it could not see that the
+/// repair left the claim permanently invisible to `recall()`.
+///
+/// **What these arms therefore can and cannot assert.** They can assert that the
+/// repair runs and that the provenance comes back. They CANNOT assert that the
+/// vector comes back: `McpEmbedder::new(pool, None)` has no API key, and
+/// `embed.rs` posts to a hardcoded `https://api.openai.com/v1/embeddings`, so no
+/// offline arm can make a real embedding succeed. The decision the fix actually
+/// changes — *should this resubmit embed?* — is one SQL predicate, and it is
+/// asserted directly, including on a non-bypassing role, by
+/// `epigraph-db/tests/embedding_repair_population.rs`.
 async fn strip_provenance(pool: &PgPool, claim: Uuid) {
-    sqlx::query("UPDATE claims SET trace_id = NULL WHERE id = $1")
+    sqlx::query("UPDATE claims SET trace_id = NULL, embedding = NULL WHERE id = $1")
         .bind(claim)
         .execute(pool)
         .await
-        .expect("null the trace link");
+        .expect("null the trace link and the vector");
     sqlx::query("DELETE FROM reasoning_traces WHERE claim_id = $1")
         .bind(claim)
         .execute(pool)

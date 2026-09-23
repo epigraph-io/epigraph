@@ -419,8 +419,12 @@ pub async fn submit_claim(
     // COMMIT. Everything below this line is post-commit and best-effort.
     tx.commit().await.map_err(internal_error)?;
 
-    let (final_truth, ds, embedded) = if was_created {
-        // First-create: full lineage. DS auto-wire, embed.
+    // DS auto-wire: FIRST-CREATE ONLY, and that asymmetry with the embed below is
+    // deliberate. Re-running it on an existing claim would combine the same mass
+    // into the same frame twice, so a resubmit must not; re-embedding a claim that
+    // has no vector is idempotent and is the only way a repaired orphan becomes
+    // recallable again.
+    let ds = if was_created {
         let ds_result = ds_auto::auto_wire_ds_for_claim(
             &server.pool,
             viewer,
@@ -452,40 +456,79 @@ pub async fn submit_claim(
                 );
             }
         }
-        let ds = ds_result.ok();
-
-        // Reuse the novelty gate's already-generated vector when we have
-        // one (avoids a second OpenAI call for the same content). Only the
-        // gate's own embedder-failure path (`pending_embedding = None`)
-        // falls back to `embed_and_store`'s independent generate-and-store.
-        let embedded = if let Some(pgvec) = pending_embedding.take() {
-            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                    false
-                }
-            }
-        } else {
-            server
-                .embedder
-                .embed_and_store(claim_uuid, &params.content)
-                .await
-        };
-
-        let final_truth = ds
-            .as_ref()
-            .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
-            .unwrap_or(raw_truth);
-
-        (final_truth, ds, embedded)
+        ds_result.ok()
     } else {
-        // Resubmit (Option B): verb-edges already emitted above. The canonical
-        // trace stays as it is UNLESS the claim had none (the orphan-repair arm
-        // above); skip DS auto-wire (canonical truth set on first create), skip
-        // embed (canonical embedding already exists). Report canonical truth,
-        // not raw.
-        (claim.truth_value.value(), None, false)
+        // Resubmit (Option B): verb-edges already emitted above, and the canonical
+        // trace stays as it is unless the claim had none (the orphan-repair arm
+        // above). No DS: canonical truth was set on first create.
+        None
+    };
+
+    // EMBEDDING. Gated on `was_created` OR "the canonical row is missing its
+    // vector", never on `was_created` alone.
+    //
+    // `was_created` alone is what made the orphan repair half a repair. A
+    // production orphan committed its claim and lost its trace to the 42501
+    // BEFORE this post-commit embed ran, so it carries `is_current = true` AND
+    // `embedding IS NULL` — CLAUDE.md's `live_missing` violation. The retry that
+    // repairs its provenance took the `was_created == false` branch, which
+    // returned `{"embedded": false}` with HTTP success and a comment asserting
+    // "canonical embedding already exists". For that row the comment was false
+    // and the claim stayed invisible to `recall()` forever.
+    //
+    // `claim_text_if_embedding_missing` is the gate rather than a bare
+    // `embedding IS NULL` read because the embedded population excludes
+    // telemetry and sealed rows — see `EMBEDDABLE_POPULATION` in
+    // `epigraph-db/src/repos/claim.rs`. A read failure means we cannot tell, and
+    // the conservative answer is not to embed (the maintenance backfill
+    // enumerates the same population and will pick it up).
+    let embed_text: Option<String> = if was_created {
+        Some(params.content.clone())
+    } else {
+        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %claim_uuid,
+                    "could not read whether the canonical claim still needs an embedding; \
+                     skipping the repair embed: {e}"
+                );
+                None
+            }
+        }
+    };
+
+    // Reuse the novelty gate's already-generated vector when we have one
+    // (avoids a second OpenAI call for the same content). Only the gate's own
+    // embedder-failure path (`pending_embedding = None`) and the repair arm —
+    // where the exact-resubmit shortcut means the gate never ran — fall back to
+    // `embed_and_store`'s independent generate-and-store.
+    let embedded = match embed_text {
+        None => false,
+        Some(text) => {
+            if let Some(pgvec) = pending_embedding.take() {
+                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                server.embedder.embed_and_store(claim_uuid, &text).await
+            }
+        }
+    };
+
+    // A resubmit reports the CANONICAL truth, not this submission's raw value.
+    let final_truth = if was_created {
+        ds.as_ref()
+            .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
+            .unwrap_or(raw_truth)
+    } else {
+        claim.truth_value.value()
     };
 
     success_json(&SubmitClaimResponse {

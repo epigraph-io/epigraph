@@ -161,8 +161,11 @@ pub async fn memorize(
     // every retry return `{"embedded": false}` and HTTP success for a row with
     // no provenance at all, so the retry a caller performs to repair the row
     // could not repair it. The provenance half is now gated on
-    // `was_created || claim.trace_id.is_none()`; DS auto-wire and embedding stay
-    // gated on `was_created` alone, because re-running DS on an existing claim
+    // `was_created || claim.trace_id.is_none()`, and the embed below on
+    // `was_created || <the canonical row has no vector>` — an orphan lost its
+    // embedding to the same refusal, and repairing provenance while leaving
+    // `embedding IS NULL` leaves the claim unrecallable. Only DS auto-wire stays
+    // gated on `was_created` alone, because re-running it on an existing claim
     // would combine the same mass twice.
     let needs_provenance = was_created || claim.trace_id.is_none();
     if needs_provenance {
@@ -209,8 +212,12 @@ pub async fn memorize(
     // COMMIT. Everything below this line is post-commit and best-effort.
     tx.commit().await.map_err(internal_error)?;
 
-    let (final_truth, ds, embedded) = if was_created {
-        let ds = match ds_auto::auto_wire_ds_for_claim(
+    // DS auto-wire: FIRST-CREATE ONLY (re-running would combine the same mass
+    // twice). The embed below is deliberately NOT gated the same way — see the
+    // comment there and `tools::claims::submit_claim`, which carries the long
+    // form of both halves.
+    let ds = if was_created {
+        match ds_auto::auto_wire_ds_for_claim(
             &server.pool,
             viewer,
             claim_uuid,
@@ -229,33 +236,61 @@ pub async fn memorize(
                 tracing::warn!(claim_id = %claim_uuid, "ds auto-wire memorize failed: {e}");
                 None
             }
-        };
-
-        // Reuse the novelty gate's already-generated vector when available,
-        // matching submit_claim's pattern — avoids a second OpenAI call.
-        let embedded = if let Some(pgvec) = pending_embedding.take() {
-            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                    false
-                }
-            }
-        } else {
-            server
-                .embedder
-                .embed_and_store(claim_uuid, &params.content)
-                .await
-        };
-
-        (raw_truth, ds, embedded)
+        }
     } else {
-        // Option A: a dedup hit on a claim that already HAS its provenance —
-        // skip DS + embed (both would double-count / re-pay for a canonical row
-        // that already carries them). AUTHORED already fired in the helper, and
-        // Trace + Evidence + `update_trace_id` ran above IF and only if the
-        // canonical claim had no trace. Report canonical truth.
-        (claim.truth_value.value(), None, false)
+        // Option A: a dedup hit. AUTHORED already fired in the helper, and Trace
+        // + Evidence + `update_trace_id` ran above IF and only if the canonical
+        // claim had no trace. No DS: it would double-count.
+        None
+    };
+
+    // EMBEDDING. `was_created` OR "the canonical row is missing its vector" —
+    // the repaired orphan is exactly the row for which those differ, and
+    // `submit_claim` carries the full argument. Telemetry and sealed rows are
+    // excluded inside `claim_text_if_embedding_missing`; an unreadable answer is
+    // treated as "do not embed" and left to the maintenance backfill.
+    let embed_text: Option<String> = if was_created {
+        Some(params.content.clone())
+    } else {
+        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %claim_uuid,
+                    "could not read whether the canonical claim still needs an embedding; \
+                     skipping the repair embed: {e}"
+                );
+                None
+            }
+        }
+    };
+
+    // Reuse the novelty gate's already-generated vector when available, matching
+    // submit_claim's pattern — avoids a second OpenAI call.
+    let embedded = match embed_text {
+        None => false,
+        Some(text) => {
+            if let Some(pgvec) = pending_embedding.take() {
+                match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                server.embedder.embed_and_store(claim_uuid, &text).await
+            }
+        }
+    };
+
+    // A dedup hit reports the CANONICAL truth, not this call's raw value.
+    let final_truth = if was_created {
+        raw_truth
+    } else {
+        claim.truth_value.value()
     };
 
     success_json(&MemorizeResponse {
