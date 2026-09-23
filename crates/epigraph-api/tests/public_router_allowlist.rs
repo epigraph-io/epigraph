@@ -10,12 +10,13 @@
 //!   * **axum 0.7.9's `Router` exposes no route enumeration.** There is no API
 //!     that yields the set of registered paths, so even the variant that
 //!     compiles cannot be interrogated at runtime.
-//!   * **The `#[cfg(not(feature = "db"))]` variant is not built in any
-//!     buildable configuration.** `epigraph-api`'s default features are
-//!     `["db"]`, every CI job builds with defaults, and
-//!     `cargo check -p epigraph-api --no-default-features` fails with
-//!     pre-existing errors unrelated to tenancy. No compiler checks that
-//!     function.
+//!   * **The `#[cfg(not(feature = "db"))]` variant was not built in any
+//!     configuration** when this file was written: `epigraph-api`'s default
+//!     features are `["db"]`, and `cargo check -p epigraph-api
+//!     --no-default-features` failed. CORRECTED since. CI gates that check
+//!     (PR-07 repaired the library after PR-06 broke it with 17 errors), and
+//!     CI's no-db step now runs tests through the variant too. The first
+//!     reason still stands, so the route TABLE is still checked only here.
 //!
 //! So this is a **source-text lint**, which is the stronger choice anyway: it
 //! is the only mechanism that covers the second variant at all. Precedent for
@@ -40,16 +41,14 @@
 //!
 //! Nine `OK → UNAUTHORIZED` assertion flips made in PR-03 live in
 //! `#[cfg(not(feature = "db"))]` test modules inside `src/routes/` (`rag.rs`,
-//! `admin.rs`, `versioning.rs`, `challenge.rs`, `negative_tests.rs`). The
-//! `not(db)` LIBRARY does compile — `.github/workflows/ci.yml` gates it with
-//! `cargo check -p epigraph-api --no-default-features --locked`, and PR-07
-//! repaired it after PR-06 broke it with 17 errors — but these `cfg(all(test,
-//! not(feature = "db")))` MODULES are still built in no CI configuration
-//! (`epigraph-api`'s default features include `db`), so those edits remain
-//! documentation, not coverage, and
-//! `cargo test -p epigraph-api --lib -- --list` does not name them. The
-//! classes they claimed to cover (RAG, evidence search, history, challenges,
-//! admin stats) are covered here instead, and now exhaustively.
+//! `admin.rs`, `versioning.rs`, `challenge.rs`, `negative_tests.rs`). Those
+//! modules assert the `not(db)` build only. Until
+//! F-PR10-no-db-test-cfg-never-compiles was discharged they compiled in no
+//! configuration and were documentation, not coverage. They now run in CI's
+//! no-db step (`cargo test -p epigraph-api --no-default-features --lib`), but
+//! the default `cargo test -p epigraph-api --lib -- --list` still does not name
+//! them. For the `db` build, the classes they cover (RAG, evidence search,
+//! history, challenges, admin stats) are covered here, exhaustively.
 
 #![cfg(feature = "db")]
 

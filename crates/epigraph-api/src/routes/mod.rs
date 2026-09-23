@@ -1042,15 +1042,18 @@ pub fn create_router(state: AppState) -> Router {
 
 /// Create a router without database-dependent routes.
 ///
-/// # Status: not built in any supported configuration
+/// # Status: no deployment builds it; CI compiles and exercises it
 ///
-/// `epigraph-api`'s default feature set is `["db"]` and every CI job builds
-/// with defaults. `cargo check -p epigraph-api --no-default-features` has been
-/// failing for some time (28 pre-existing errors: missing `sqlx`, `db_pool`,
-/// `ClaimId`, …), so **no compiler checks this function**. It is kept in sync
-/// with the `db` variant by hand and by
-/// `crates/epigraph-api/tests/public_router_allowlist.rs`, which is a
-/// source-text lint precisely so that it covers the block nothing else does.
+/// `epigraph-api`'s default feature set is `["db"]`, so no shipped binary
+/// contains this function. This section used to say that no compiler checked
+/// it, because `cargo check -p epigraph-api --no-default-features` failed with
+/// 28 errors. That stopped being true when CI gated the no-db lib build. Since
+/// F-PR10-no-db-test-cfg-never-compiles was discharged, CI's no-db step also
+/// runs tests that go through it: `routes::tests` in this file, and every
+/// `*_via_full_router_is_401` / `auth_failure_tests` case in the not(db)
+/// modules. Its route TABLE is still kept in sync with the `db` variant by hand
+/// and by `crates/epigraph-api/tests/public_router_allowlist.rs`, a source-text
+/// lint, because axum exposes no route enumeration to test against.
 ///
 /// # Route structure
 ///

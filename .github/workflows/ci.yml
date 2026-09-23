@@ -249,11 +249,32 @@ jobs:
         # build) and fails the moment a db-only item lands without its
         # `#[cfg(not(feature = "db"))]` counterpart.
         #
-        # Scope is deliberately lib+bins, NOT --all-targets: the crate's
-        # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
-        # test targets link Postgres regardless of the feature flag and cannot
-        # pass under --no-default-features today.
-        run: cargo check -p epigraph-api --no-default-features --locked
+        # --all-targets, so the `cfg(all(test, not(feature = "db")))` modules and
+        # the integration tests are type-checked too. This step used to stop at
+        # lib+bins, and its comment said the test targets "cannot pass" because
+        # the [dev-dependencies] on epigraph-db and sqlx are non-optional. Both
+        # halves of that were wrong. Cargo does not allow optional
+        # dev-dependencies at all, and linking an unused epigraph-db never
+        # stopped a not(db) test from compiling. What failed was code rot: stale
+        # struct literals and a missing helper in the not(db) unit modules, and
+        # DB-dependent integration tests with no `#![cfg(feature = "db")]`.
+        # Those are fixed (F-PR10-no-db-test-cfg-never-compiles,
+        # F-PR28-nodb-lib-test-build).
+        run: cargo check -p epigraph-api --no-default-features --all-targets --locked
+      - name: Test (epigraph-api, no-db, serialized)
+        # `check` only type-checks. This step RUNS the not(db) half: the
+        # `cfg(all(test, not(feature = "db")))` unit modules in src/routes/
+        # (webhook, RAG, challenge, event, submit and claims-query handler tests,
+        # plus the malformed-input and concurrency negatives), and
+        # tests/webhook_dispatcher_nodb.rs, the only behavioural test of the
+        # no-db webhook dispatcher. Integration tests that need the `db` build
+        # are `#![cfg(feature = "db")]` and compile to empty binaries here. The
+        # rest run a second time, in the no-db configuration. `--tests` rather
+        # than a named list, so a new `#![cfg(not(feature = "db"))]` test file is
+        # picked up without editing this line. SQLX_OFFLINE (job env) still
+        # matters here: the epigraph-db dev-dependency compiles its query macros
+        # in this configuration too.
+        run: cargo test -p epigraph-api --no-default-features --lib --tests --locked -- --test-threads=1
 
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every
