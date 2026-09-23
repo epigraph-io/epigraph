@@ -524,6 +524,16 @@
 //!   publish_or_log, publish_or_log_conn}` are untouched and PR-16 still owns
 //!   the write-side predicate, including the `create_event` / `publish_event`
 //!   attribution surface. No `FAIL_OPEN_SCOPE_SITES` row moved.
+//!   **The attribution half is DISCHARGED (2026-09-22,
+//!   deferred-commitment `events-actor-id-binding`).** PR-16 did not take it:
+//!   it shipped as 16a only, and 16b's entry never names events. It was also
+//!   never a SQL write-side predicate, because `events` has no tenancy column
+//!   for one to constrain. `routes/events.rs::create_event` now takes
+//!   `RequirePrincipal`, and MCP `publish_event` resolves its caller through
+//!   `tools::viewer::request_principal`. Both refuse an `actor_id` that is not
+//!   the principal, and both persist the principal when it is omitted.
+//!   `EventRepository::insert` is still unchanged and still trusts its caller.
+//!   None of D1 to D4 moves: no policy, no route split, no tenancy column.
 //! * **The `no_unscoped_pool.rs` counters do not move.** PR-25 converts nothing
 //!   and is explicitly not a conversion shard: `UNCONVERTED` keeps
 //!   `routes/events.rs` at 6 and `routes/webhooks.rs` at 3, `HIGH_WATER` stays

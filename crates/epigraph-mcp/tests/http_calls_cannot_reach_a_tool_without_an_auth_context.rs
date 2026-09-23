@@ -162,9 +162,10 @@ fn an_authenticated_token_without_an_agent_is_refused_not_elevated() {
         .collect();
     let src = std::fs::read_to_string(&path).expect("read tools/viewer.rs");
 
-    let start = src
-        .find("let principal = match auth {")
-        .expect("`request_viewer` must still derive its principal by matching on `auth`");
+    let start = src.find("let principal = match auth {").expect(
+        "`request_principal` (which `request_viewer` is built on) must still derive \
+             its principal by matching on `auth`",
+    );
     let arm = &src[start..];
     let end = arm
         .find("None =>")

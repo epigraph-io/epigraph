@@ -136,11 +136,49 @@ pub async fn request_viewer(
     server: &EpiGraphMcpFull,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<Viewer, McpError> {
+    let principal = request_principal(server, auth).await?;
+    Viewer::resolve(&server.pool, principal)
+        .await
+        .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+}
+
+/// Resolve the `agents.id` that one tool call acts as. This is the identity
+/// half of [`request_viewer`], without the membership lookup.
+///
+/// A write path that has to ATTRIBUTE a row to its caller, and has no
+/// visibility predicate to spend a viewer on, calls this directly.
+/// `tools/events.rs::publish_event` is the first such caller
+/// (deferred-commitment `events-actor-id-binding`). An `events` row has no
+/// tenancy column, so acquiring a whole [`Viewer`] only to read its principal
+/// would leave an unspent viewer. `epigraph-api`'s `RequirePrincipal` doc
+/// rejects that shape for the same reason.
+///
+/// [`request_viewer`] is built on this function, not beside it, so the two
+/// cannot disagree about who the caller is. The arms are the ones the module
+/// doc describes:
+///
+/// * HTTP takes `auth.agent_id` and refuses a token without one. There is no
+///   fallback to `owner_id` or `client_id`.
+/// * stdio has no `AuthContext` and takes the server's own agent.
+///
+/// The two source locks on the HTTP arm now match here: `epigraph-db`'s
+/// `locked_decisions.rs::d3_mcp_viewer_acquisition_does_not_flatten_a_client_id`
+/// and this crate's
+/// `http_calls_cannot_reach_a_tool_without_an_auth_context.rs::an_authenticated_token_without_an_agent_is_refused_not_elevated`.
+///
+/// # Errors
+///
+/// An MCP invalid-request error when an HTTP `AuthContext` carries no
+/// `agent_id`. On stdio, whatever `EpiGraphMcpFull::agent_id` returns.
+pub async fn request_principal(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+) -> Result<uuid::Uuid, McpError> {
     let principal = match auth {
         Some(a) => a.agent_id.ok_or_else(|| {
             McpError::invalid_request(
                 concat!(
-                    "token carries no agent principal; no read authority (see plan D3). ",
+                    "token carries no agent principal; no read or write authority (see plan D3). ",
                     "Re-mint the token through /oauth/token, which has attached an ",
                     "agents.id to every principal since PR-02."
                 )
@@ -152,7 +190,5 @@ pub async fn request_viewer(
         // module doc's "why there is no HTTP-with-no-context arm".
         None => server.agent_id().await?,
     };
-    Viewer::resolve(&server.pool, principal)
-        .await
-        .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+    Ok(principal)
 }

@@ -22,6 +22,15 @@ pub struct EventRepository;
 
 impl EventRepository {
     /// Insert a new event, auto-incrementing graph_version.
+    ///
+    /// `actor_id` is written as given. It is TRUSTED input, and the only check
+    /// on it here is `events_actor_id_fkey` (it must name a real agent). A
+    /// caller-facing write path must pass an actor derived from the
+    /// authenticated principal, never a request field taken on trust.
+    /// `epigraph-api` `routes/events.rs::create_event` and `epigraph-mcp`
+    /// `tools/events.rs::publish_event` each apply a `bind_actor` rule for this
+    /// (deferred-commitment `events-actor-id-binding`). Server-internal
+    /// emitters pass the identity of the code path doing the write.
     pub async fn insert(
         pool: &PgPool,
         event_type: &str,

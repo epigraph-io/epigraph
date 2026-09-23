@@ -185,7 +185,9 @@ pub struct EventListResponse {
 pub struct CreateEventRequest {
     /// The kind of mutation (e.g. "claim.created")
     pub event_type: String,
-    /// The agent that triggered the event, if attributable
+    /// Optional, and never trusted. When present it must equal the
+    /// authenticated principal, or the request is refused 403. When absent the
+    /// event is attributed to the principal. See [`bind_actor`].
     pub actor_id: Option<Uuid>,
     /// Arbitrary structured payload
     pub payload: serde_json::Value,
@@ -466,14 +468,74 @@ async fn retain_visible_events(
     Ok(())
 }
 
+/// The attribution rule for a caller-facing event write.
+///
+/// Returns the `actor_id` to persist. An absent `actor_id` is filled from the
+/// principal, an `actor_id` equal to the principal is accepted, and any other
+/// value is refused with 403. There is no third outcome: a caller cannot record
+/// an event on another agent's behalf, and cannot record an unattributed one.
+///
+/// MCP `publish_event` applies the same rule (`epigraph-mcp`
+/// `tools/events.rs::bind_actor`). Keep the two identical, or the transports
+/// disagree about who may be named as an event's actor.
+pub(crate) fn bind_actor(requested: Option<Uuid>, principal: Uuid) -> Result<Uuid, ApiError> {
+    match requested {
+        None => Ok(principal),
+        Some(actor) if actor == principal => Ok(principal),
+        Some(actor) => Err(ApiError::Forbidden {
+            reason: format!(
+                "actor_id {actor} is not the authenticated principal ({principal}); \
+                 an event can only be attributed to its caller, so omit actor_id or \
+                 set it to your own agent id"
+            ),
+        }),
+    }
+}
+
 /// `POST /api/v1/events` - Record a new graph event.
 ///
 /// Auto-generates `id`, `graph_version` (monotonic), and `created_at`.
 /// Validates that `event_type` is non-empty and payload is within size limits.
+///
+/// # Attribution (deferred-commitment `events-actor-id-binding`)
+///
+/// The persisted `actor_id` is the **authenticated principal**, applied by
+/// [`bind_actor`] before anything is validated or written. Before this change
+/// the handler took no auth extractor and passed `request.actor_id` straight to
+/// `EventRepository::insert`, so any caller past `bearer_auth_middleware` could
+/// record an event attributed to any existing agent (`events_actor_id_fkey`
+/// bounds it to real `agents` rows and no further). That row is
+/// indistinguishable from a genuine one in `GET /api/v1/events`, in MCP
+/// `list_events`' `actor_id` filter and in snapshot replay. PR-25 recorded the
+/// gap and handed it to "PR-16's write-side predicate". PR-16 shipped only its
+/// 16a slice, and 16b never took the item.
+///
+/// `RequirePrincipal` rather than `Option<Extension<AuthContext>>`: an optional
+/// principal would let an agent-less token through with `actor = None`, which
+/// is the fall-through `middleware/bearer.rs` documents that extractor as
+/// existing to remove. Its two 401 branches are `ViewerExtractor`'s. This is
+/// **a behaviour change for a token with no `agent_id`** (a `ClientType::Service`
+/// credential, or an OAuth client registered before PR-02). Such a token was
+/// accepted here and is now 401.
+///
+/// No `Viewer`: an `events` row carries no tenancy column, so there is no
+/// predicate to spend one on. No delegation override either. No in-repo caller
+/// records an event on another agent's behalf, so nothing here plays the part
+/// `decompose_claims` plays for `claims.agent_id` in
+/// `D-PR16-claim-authorship-is-not-a-credential`, and no scope is honoured as a
+/// licence to attribute.
+///
+/// The signature is not `#[cfg]`-split. `RequirePrincipal` exists in both
+/// builds, and the resolved actor is bound in both arms of the body.
 pub async fn create_event(
     State(_state): State<AppState>,
+    crate::middleware::bearer::RequirePrincipal { principal, .. }: crate::middleware::bearer::RequirePrincipal,
     Json(request): Json<CreateEventRequest>,
 ) -> Result<Json<GraphEvent>, ApiError> {
+    // Attribution first: a forged actor is refused before validation, so the
+    // refusal cannot depend on whether the rest of the body happens to be valid.
+    let actor_id = bind_actor(request.actor_id, principal)?;
+
     // Validate event_type is non-empty and bounded
     let event_type = request.event_type.trim().to_string();
     if event_type.is_empty() {
@@ -510,7 +572,7 @@ pub async fn create_event(
         let id = epigraph_db::EventRepository::insert(
             &_state.db_pool,
             &event_type,
-            request.actor_id,
+            Some(actor_id),
             &request.payload,
         )
         .await
@@ -520,7 +582,7 @@ pub async fn create_event(
         let event = GraphEvent {
             id,
             event_type,
-            actor_id: request.actor_id,
+            actor_id: Some(actor_id),
             payload: request.payload,
             graph_version: epigraph_db::EventRepository::get_latest_version(&_state.db_pool)
                 .await
@@ -533,7 +595,7 @@ pub async fn create_event(
     {
         let store = global_event_store();
         let event = store
-            .push(event_type, request.actor_id, request.payload)
+            .push(event_type, Some(actor_id), request.payload)
             .await;
         Ok(Json(event))
     }
@@ -680,12 +742,31 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt as _;
 
+    /// The principal every request from [`test_router`] authenticates as.
+    const TEST_PRINCIPAL: Uuid = Uuid::from_u128(0x5eed_0000_0000_4000_8000_0000_0000_0001);
+
     /// Build a minimal router with just the event endpoints for testing.
+    ///
+    /// Every request carries an `AuthContext` naming [`TEST_PRINCIPAL`], which
+    /// is what `bearer_auth_middleware` leaves on a request in production.
+    /// `list_events`, `graph_snapshot` and `create_event` all refuse a request
+    /// without one (their extractors are defined in both builds with the same
+    /// two 401 branches), so a router without this layer would 401 every case
+    /// below.
     fn test_router() -> Router {
         let state = AppState::new(ApiConfig::default());
+        let auth = crate::middleware::bearer::AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(TEST_PRINCIPAL),
+            owner_id: None,
+            client_type: crate::middleware::bearer::ClientType::Agent,
+            scopes: vec!["claims:read".into(), "claims:write".into()],
+            jti: Uuid::new_v4(),
+        };
         Router::new()
             .route("/api/v1/events", get(list_events).post(create_event))
             .route("/api/v1/graph/snapshot/:version", get(graph_snapshot))
+            .layer(axum::Extension(auth))
             .with_state(state)
     }
 
@@ -922,6 +1003,47 @@ mod tests {
         assert_eq!(roundtripped.graph_version, 42);
     }
 
+    /// The `not(db)` arm binds the resolved actor too: the in-memory store is
+    /// what `GET /api/v1/events` serves in this build, so an unbound push
+    /// there would be the same forgery with a different backing store.
+    #[tokio::test]
+    async fn create_event_attributes_to_the_principal_in_the_in_memory_store() {
+        let router = test_router();
+        let (status, body) =
+            post_event(&router, "test.actor_binding_nodb", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let event: GraphEvent = serde_json::from_slice(&body).unwrap();
+        assert_eq!(event.actor_id, Some(TEST_PRINCIPAL));
+    }
+
+    #[tokio::test]
+    async fn create_event_refuses_a_forged_actor_in_the_in_memory_store() {
+        let router = test_router();
+        let event_type = "test.actor_binding_nodb_forged";
+        let body = serde_json::json!({
+            "event_type": event_type,
+            "actor_id": Uuid::new_v4(),
+            "payload": {},
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let filter = EventFilter {
+            since: None,
+            event_type: Some(event_type.to_string()),
+            limit: None,
+            offset: None,
+        };
+        let (_, total) = global_event_store().list(&filter).await;
+        assert_eq!(total, 0, "a refused event must not reach the store");
+    }
+
     #[tokio::test]
     async fn event_store_push_assigns_unique_ids() {
         let store = EventStore::new();
@@ -932,6 +1054,56 @@ mod tests {
             e1.graph_version, e2.graph_version,
             "Each event must have a unique version"
         );
+    }
+}
+
+// ── bind_actor unit tests ───────────────────────────────────────────────────
+//
+// Not feature-gated: the rule is the same in both builds, and these are the
+// only tests of it that the `db`-only workspace suite runs without a database.
+// The effect on the stored row is asserted by
+// `tests/event_actor_binding.rs`.
+
+#[cfg(test)]
+mod bind_actor_tests {
+    use super::{bind_actor, ApiError};
+    use uuid::Uuid;
+
+    #[test]
+    fn an_absent_actor_is_the_principal() {
+        let p = Uuid::new_v4();
+        assert_eq!(bind_actor(None, p).unwrap(), p);
+    }
+
+    #[test]
+    fn the_principal_naming_itself_is_accepted() {
+        let p = Uuid::new_v4();
+        assert_eq!(bind_actor(Some(p), p).unwrap(), p);
+    }
+
+    #[test]
+    fn any_other_actor_is_forbidden() {
+        let p = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        match bind_actor(Some(other), p) {
+            Err(ApiError::Forbidden { reason }) => assert!(
+                reason.contains(&other.to_string()),
+                "the refusal should name the rejected actor_id: {reason}"
+            ),
+            got => panic!("expected 403 Forbidden, got {got:?}"),
+        }
+    }
+
+    /// The nil UUID is not a wildcard. A client that sends
+    /// `00000000-0000-0000-0000-000000000000` as a placeholder is refused like
+    /// any other agent id that is not its own.
+    #[test]
+    fn the_nil_uuid_is_not_a_wildcard() {
+        let p = Uuid::new_v4();
+        assert!(matches!(
+            bind_actor(Some(Uuid::nil()), p),
+            Err(ApiError::Forbidden { .. })
+        ));
     }
 }
 

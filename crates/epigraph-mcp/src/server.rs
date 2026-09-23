@@ -1350,14 +1350,21 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Manually publish an event to the graph event log for audit and traceability."
+        description = "Manually publish an event to the graph event log for audit and traceability. The event is attributed to the calling principal: omit actor_id, or set it to your own agent id; any other actor_id is refused."
     )]
     async fn publish_event(
         &self,
         Parameters(params): Parameters<PublishEventParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        tools::events::publish_event(self, params).await
+        // The caller's identity, not a viewer: an `events` row has no tenancy
+        // column to filter on, only an actor to attribute. The tool function
+        // resolves the principal through `tools::viewer::request_principal`
+        // (the resolution `request_viewer` is built on) and refuses an
+        // `actor_id` that is not it. See `tools::events::publish_event`.
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        tools::events::publish_event(self, params, auth).await
     }
 
     // ── Batch / Staging / Stats (3 tools) ──

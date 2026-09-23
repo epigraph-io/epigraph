@@ -51,13 +51,15 @@ use std::path::{Path, PathBuf};
 /// Tools whose dispatch body acquires **no** viewer, as measured on
 /// **2026-09-03** after PR-09, minus the two PR-11 converted.
 ///
-/// Three groups:
+/// Four groups:
 ///
-/// * **Write / decide paths (15).** The count went **17 → 15**, not 18 → 15:
+/// * **Write / decide paths (14).** The count went **17 → 15**, not 18 → 15:
 ///   PR-11 removed two names, and the "(18)" this doc previously carried was a
 ///   pre-existing miscount — the base array held 17 write-group entries. The
 ///   array length is what the test asserts, so nothing was broken by it; it is
-///   corrected here rather than silently absorbed. Converting one needs write
+///   corrected here rather than silently absorbed. It went 15 → 14 on
+///   2026-09-22 when `publish_event` moved to its own group below; the array
+///   length did not change. Converting one needs write
 ///   authority —
 ///   member-with-write-role, not merely member-who-can-read. That mechanism
 ///   turned out to **already exist**: `Viewer::resolve` has split `writable`
@@ -69,6 +71,19 @@ use std::path::{Path, PathBuf};
 ///   sites there. PR-11 built the Rust half (`crates/epigraph-authz`) and spent
 ///   it on the two declassification tools, which is why `assign_ownership` and
 ///   `update_partition` are no longer in this list.
+/// * **Attribution-bound write, no tenancy column (1).** `publish_event` writes
+///   an `events` row, and `events` carries no `owner_group_id`: it is outside
+///   migration 062's `tier_a` array and 079's protected array. So the SQL
+///   write-side predicate PR-16 owns has nothing to constrain there, and a
+///   viewer would be a parameter with nothing to filter. The tool's one
+///   identity obligation was attribution. PR-25 handed that to PR-16, and 16b
+///   never took it. It is DISCHARGED by deferred-commitment
+///   `events-actor-id-binding` (2026-09-22). The dispatch body passes the
+///   request's `AuthContext` to the tool, which resolves the caller through
+///   `tools::viewer::request_principal` and refuses an `actor_id` that is not
+///   it. `tests/publish_event_actor_binding.rs` asserts the effect on the stored
+///   row and pins the dispatch body. It stays in this list because it still
+///   acquires no viewer, and it should not acquire one.
 /// * **Pure-CPU, no DB (2).** `stage_claims` validates strings and takes
 ///   `_server`; `list_mcp_tools` reads the compiled-in manifest. A viewer here
 ///   would be a parameter with nothing to filter.
@@ -115,12 +130,15 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     "ingest_document_spine",
     "patch_claim",
     "patch_edge",
-    "publish_event",
     "report_hierarchical_outcome",
     "retire_match_candidate",
     "set_source_reliability",
     "structure_source",
     "update_labels",
+    // attribution-bound write to a table with no tenancy column. Its caller
+    // binding was discharged by `events-actor-id-binding`, not by PR-16. See
+    // the const's doc.
+    "publish_event",
     // pure-CPU, no DB
     "list_mcp_tools",
     "stage_claims",

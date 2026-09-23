@@ -1862,7 +1862,9 @@ pub struct PublishEventParams {
     #[schemars(description = "Event type (e.g. 'claim.created', 'analysis.completed')")]
     pub event_type: String,
 
-    #[schemars(description = "UUID of the actor (agent) triggering this event")]
+    #[schemars(
+        description = "Optional. The event is attributed to the calling principal. If given, this must be your own agent UUID; any other value is refused."
+    )]
     pub actor_id: Option<String>,
 
     #[schemars(

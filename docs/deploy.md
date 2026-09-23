@@ -1133,3 +1133,43 @@ with no `epigraph_maintenance` role. While the DSN is the owning superuser, as
 it is on every deployment today, a wrong owner has NO runtime symptom. That is
 why the `verify` run above is required and not optional: it is the only thing
 that finds the wrong owner before step 11d turns it into an outage.
+
+## Event attribution: `POST /api/v1/events` and MCP `publish_event` bind `actor_id` to the caller
+
+Deferred-commitment batch `fix/deferred-2026-09-22-lane-b`, screen key
+`events-actor-id-binding`. This is a code-only change. It ships no migration and
+takes effect when the binaries roll. The two write surfaces of the event log now
+apply one rule: **an event's `actor_id` is the authenticated principal.** An
+omitted (or `null`) `actor_id` is filled from the principal. An `actor_id` equal
+to it is accepted. Any other value is refused before anything is written.
+Before this change both surfaces persisted whatever `actor_id` they were sent.
+`events_actor_id_fkey` only required that it name a real agent, so any caller
+could record an event as any existing agent.
+
+### 1a. BREAKING — `POST /api/v1/events` refuses a forged actor, and a token with no principal
+
+The handler took no auth extractor. It now takes `RequirePrincipal`.
+
+* **An `actor_id` that is not the caller's own agent** was a `200`. It is now a
+  `403`. **The affected caller** is any client that posts events on another
+  agent's behalf. No in-repo client does. **Remedy:** omit `actor_id`.
+* **A token whose `agent_id` is `None`** was a `200`, and the row was written
+  with the body's `actor_id` or `NULL`. It is now a `401` with
+  `token carries no agent_id`. **The affected credential** is the same one as
+  `fix-security-track` §1a above: an OAuth client registered before PR-02, or a
+  hand-minted `service` token. **Remedy:** re-mint through `/oauth/token`.
+  **Finding them before rolling:** the refusal emits
+  `visibility.viewer.rejected{reason="no_agent_id", route="/api/v1/events"}`.
+
+### 1b. MCP `publish_event` refuses a forged actor on every transport
+
+* **HTTP listener.** The actor is the token's `agent_id`. A token without one is
+  refused, which matches every viewer-taking tool on that listener. A mismatched
+  `actor_id` is refused with JSON-RPC `-32602` (invalid params).
+* **stdio.** The process is the principal, so the actor is the server's own
+  signer agent. A stdio caller that names any other agent is refused as well.
+  **The affected caller** is a stdio client that passed a different agent's id
+  as `actor_id`. **Remedy:** omit it.
+
+Rows written before this change are not rewritten. An event whose `actor_id` was
+forged, or left `NULL`, keeps it.
