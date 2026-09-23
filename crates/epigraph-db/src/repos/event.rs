@@ -27,10 +27,30 @@ impl EventRepository {
     /// on it here is `events_actor_id_fkey` (it must name a real agent). A
     /// caller-facing write path must pass an actor derived from the
     /// authenticated principal, never a request field taken on trust.
-    /// `epigraph-api` `routes/events.rs::create_event` and `epigraph-mcp`
-    /// `tools/events.rs::publish_event` each apply a `bind_actor` rule for this
-    /// (deferred-commitment `events-actor-id-binding`). Server-internal
-    /// emitters pass the identity of the code path doing the write.
+    /// [`Self::publish_or_log`] and [`Self::publish_or_log_conn`] trust their
+    /// caller in the same way.
+    ///
+    /// **Where that holds** (deferred-commitment `events-actor-id-binding`,
+    /// `D-PR25-event-actor-id-unbound`). `epigraph-api`
+    /// `routes/events.rs::create_event` and `epigraph-mcp`
+    /// `tools/events.rs::publish_event` each apply a `bind_actor` rule.
+    /// `epigraph-api` `routes/challenge.rs::submit_challenge` passes its
+    /// `RequirePrincipal`. The MCP emitters that pass `server.agent_id()` take
+    /// no caller-supplied actor. They are `challenge_claim` here, and
+    /// `emit_tool_invoked`, `link_epistemic` and `edge_mutation` through
+    /// `publish_or_log`. On the HTTP listener that agent is the listener's
+    /// shared identity rather than the per-request caller.
+    ///
+    /// **Where it does NOT hold.** `ClaimRepository`'s `claim.created` emits
+    /// (`create`, `create_with_tx`, `create_strict`, `create_with_id_if_absent`)
+    /// pass the new row's `claims.agent_id`. On `POST /api/v1/claims` that is
+    /// the request body's `agent_id`. On `POST /api/v1/submit/packet` it is the
+    /// packet's, checked against a signature only when
+    /// `EPIGRAPH_REQUIRE_SIGNATURES` is set. So a caller can still file a
+    /// `claim.created` event under another existing agent's name. That is the
+    /// event-log side of the open authorship half of
+    /// `D-PR16-claim-authorship-is-not-a-credential`, an operator decision, and
+    /// it is recorded on that entry.
     pub async fn insert(
         pool: &PgPool,
         event_type: &str,

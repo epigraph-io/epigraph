@@ -1148,6 +1148,18 @@ written. Before this change all three persisted whatever actor they were sent
 `events_actor_id_fkey` only required that it name a real agent, so any caller
 could record an event as any existing agent.
 
+**One writer of the event log is NOT covered, and operators reading
+`actor_id` should know it.** `claim.created` events are written by the claim
+repository whenever a claim is inserted, and they take their actor from the
+claim's `agent_id`. On `POST /api/v1/claims` that is a request field. On
+`POST /api/v1/submit/packet` it is too, unless `EPIGRAPH_REQUIRE_SIGNATURES` is
+set. So a caller can still file a `claim.created` event under another existing
+agent's name. Whether a caller may author as another agent is the open operator
+decision on delegated authorship (`D-PR16-claim-authorship-is-not-a-credential`
+in `docs/tenancy/progress.json`), and this change does not make it. Until it
+is made, treat a `claim.created` event's `actor_id` as the claim's stated
+author, not as the principal that made the request.
+
 ### 1a. BREAKING — `POST /api/v1/events` refuses a forged actor, and a token with no principal
 
 The handler took no auth extractor. It now takes `RequirePrincipal`.

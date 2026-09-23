@@ -472,8 +472,16 @@ async fn retain_visible_events(
 ///
 /// Returns the `actor_id` to persist. An absent `actor_id` is filled from the
 /// principal, an `actor_id` equal to the principal is accepted, and any other
-/// value is refused with 403. There is no third outcome: a caller cannot record
-/// an event on another agent's behalf, and cannot record an unattributed one.
+/// value is refused with 403. There is no third outcome: through THIS route a
+/// caller cannot record an event on another agent's behalf, and cannot record
+/// an unattributed one.
+///
+/// That is a statement about this route and MCP `publish_event`, not about the
+/// event log. `ClaimRepository`'s `claim.created` emits still take their actor
+/// from `claims.agent_id`, which `POST /api/v1/claims` reads from the request
+/// body. That half stays with the open
+/// `D-PR16-claim-authorship-is-not-a-credential`. See
+/// `EventRepository::insert`'s doc for every writer and what it passes.
 ///
 /// MCP `publish_event` applies the same rule (`epigraph-mcp`
 /// `tools/events.rs::bind_actor`). Keep the two identical, or the transports
