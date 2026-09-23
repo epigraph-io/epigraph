@@ -47,6 +47,37 @@ pub struct BuildFromBridgesResponse {
 #[cfg(feature = "db")]
 const ALGO_LOUVAIN_BRIDGE: &str = "louvain_bridge";
 
+/// `POST /api/v1/clusters/build-from-bridges` — build and persist one
+/// `louvain_bridge` cluster run over the whole corpus.
+///
+/// # A MAINTENANCE route, and it runs on the maintenance connection
+///
+/// Requires `claims:admin`. The run it writes is global: `graph_cluster_runs`
+/// and `graph_clusters` carry no tenancy, the run is GC'd against every other
+/// bridge run, and readers of the clusters are filtered at READ time
+/// (`GraphViewRepository` marks every `claim_cluster_membership` join). A
+/// viewer-scoped build would write a run whose paragraph set depended on who
+/// called it, and would then GC everyone else's. So the bridge reads spend a
+/// bypass viewer minted by [`AppState::maintenance_viewer`] under
+/// `SystemReason::ThemeClustering`, the same shape as
+/// `claims.rs::find_claims_needing_embeddings`.
+///
+/// Until the `F-inline-claim-content-reads` discharge both reads were inline
+/// here (`viewer_route_table_lint.rs` counted them: they read
+/// `properties->>'level'`), ran on the raw application pool, and carried no
+/// statement of whether they were meant to be global. They are now
+/// `GraphViewRepository::bridge_edges` / `::bridge_paragraphs`, which carry
+/// real markers that render to nothing for this bypass viewer.
+///
+/// EVERY statement, the writes included, runs on the session's maintenance
+/// connection, never on `state.db_pool`. A bypass viewer emits no predicate,
+/// so once RLS is live the connection decides what the build sees; reading on
+/// the maintenance connection and writing through the application pool would
+/// be the hybrid `epigraph-db/tests/no_hybrid_bypass_spend.rs` exists to
+/// refuse, and an unstamped application session could not insert
+/// `claim_cluster_membership` rows (a tenancy-bearing table) under FORCE.
+///
+/// [`AppState::maintenance_viewer`]: crate::AppState::maintenance_viewer
 #[cfg(feature = "db")]
 pub async fn build_from_bridges(
     State(state): State<AppState>,
@@ -62,53 +93,38 @@ pub async fn build_from_bridges(
     use epigraph_jobs::cluster_graph::louvain::{louvain, LouvainInput};
     use std::collections::HashMap;
 
-    let pool = &state.db_pool;
-
     let min_shared = req.min_shared_atoms.unwrap_or(1) as i64;
     let resolution = req.resolution.unwrap_or(1.0);
     let retain_runs = req.retain_runs.unwrap_or(5);
+
+    let mut session = state
+        .maintenance_viewer(epigraph_db::visibility::SystemReason::ThemeClustering)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.maintenance",
+                error = %e,
+                handler = "build_from_bridges",
+                "could not acquire a maintenance session"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a maintenance connection".to_string(),
+            }
+        })?;
+    let (conn, viewer) = session.split();
 
     // -- Step 1: pre-aggregate bridge edges via SQL.
     //
     // For each pair of paragraph-level claims (level=2), count the number of
     // atom-level children (level=3 — by convention; we don't strictly require
     // it on the child side because the parent gate is what matters for the
-    // bridge graph) they share via `decomposes_to`.
-    //
-    // The `paragraph_id < other.paragraph_id` join condition emits each
-    // unordered pair exactly once.
-    #[derive(sqlx::FromRow)]
-    struct BridgeEdgeRow {
-        para_a: Uuid,
-        para_b: Uuid,
-        weight: i64,
-    }
-    let edges: Vec<BridgeEdgeRow> = sqlx::query_as::<_, BridgeEdgeRow>(
-        r#"WITH atom_parents AS (
-            SELECT e.target_id AS atom_id, e.source_id AS paragraph_id
-            FROM edges e
-            JOIN claims p ON p.id = e.source_id
-            WHERE e.relationship = 'decomposes_to'
-              AND (p.properties->>'level')::int = 2
-        )
-        SELECT
-            a.paragraph_id  AS para_a,
-            b.paragraph_id  AS para_b,
-            COUNT(*)::bigint AS weight
-        FROM atom_parents a
-        JOIN atom_parents b
-            ON a.atom_id = b.atom_id
-           AND a.paragraph_id < b.paragraph_id
-        GROUP BY a.paragraph_id, b.paragraph_id
-        HAVING COUNT(*) >= $1
-        "#,
-    )
-    .bind(min_shared)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("bridge edge query: {e}"),
-    })?;
+    // bridge graph) they share via `decomposes_to`. Each unordered pair is
+    // emitted exactly once.
+    let edges = epigraph_db::GraphViewRepository::bridge_edges(&mut *conn, viewer, min_shared)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("bridge edge query: {e}"),
+        })?;
 
     // -- Step 2a: enumerate paragraph nodes.
     //
@@ -117,18 +133,11 @@ pub async fn build_from_bridges(
     // paragraphs in the result (they get their own cluster) — matching the
     // Phase 5.B spec contract that paragraph_count counts "paragraphs in the
     // bridge graph", not just paragraphs with at least one bridge.
-    let para_rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT DISTINCT e.source_id
-         FROM edges e
-         JOIN claims p ON p.id = e.source_id
-         WHERE e.relationship = 'decomposes_to'
-           AND (p.properties->>'level')::int = 2",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("paragraph node query: {e}"),
-    })?;
+    let para_rows = epigraph_db::GraphViewRepository::bridge_paragraphs(&mut *conn, viewer)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("paragraph node query: {e}"),
+        })?;
 
     // -- Step 2b: build a dense node index for Louvain.
     //
@@ -136,7 +145,7 @@ pub async fn build_from_bridges(
     // paragraph node (so isolates are nodes too), then ensure both endpoints
     // of each bridge edge are present.
     let mut node_idx: HashMap<Uuid, u32> = HashMap::new();
-    for (id,) in &para_rows {
+    for id in &para_rows {
         let next = node_idx.len() as u32;
         node_idx.entry(*id).or_insert(next);
     }
@@ -169,8 +178,8 @@ pub async fn build_from_bridges(
     };
 
     // -- Step 4: persist run row + clusters + memberships, then GC old runs.
-    let run_id = persist_bridge_run(pool, &node_idx, &assignments).await?;
-    gc_bridge_runs(pool, retain_runs).await?;
+    let run_id = persist_bridge_run(&mut *conn, &node_idx, &assignments).await?;
+    gc_bridge_runs(&mut *conn, retain_runs).await?;
 
     let cluster_count: usize = {
         use std::collections::BTreeSet;
@@ -201,10 +210,11 @@ pub async fn build_from_bridges(
 /// `algo='louvain_bridge'` on the run row.
 #[cfg(feature = "db")]
 async fn persist_bridge_run(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     node_idx: &std::collections::HashMap<Uuid, u32>,
     assignments: &[u32],
 ) -> Result<Uuid, ApiError> {
+    use sqlx::Connection;
     use std::collections::HashMap;
 
     let run_id = Uuid::new_v4();
@@ -221,7 +231,7 @@ async fn persist_bridge_run(
         groups.entry(*comm).or_default().push(idx as u32);
     }
 
-    let mut tx = pool.begin().await.map_err(|e| ApiError::InternalError {
+    let mut tx = conn.begin().await.map_err(|e| ApiError::InternalError {
         message: format!("begin tx: {e}"),
     })?;
 
@@ -323,7 +333,7 @@ async fn flush_membership(
 /// `retain` runs by `completed_at`. Scoped by `algo` so we don't touch the
 /// nightly epistemic Louvain runs.
 #[cfg(feature = "db")]
-async fn gc_bridge_runs(pool: &sqlx::PgPool, retain: u32) -> Result<(), ApiError> {
+async fn gc_bridge_runs(conn: &mut sqlx::PgConnection, retain: u32) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         WITH old AS (
@@ -337,7 +347,7 @@ async fn gc_bridge_runs(pool: &sqlx::PgPool, retain: u32) -> Result<(), ApiError
     )
     .bind(retain as i64)
     .bind(ALGO_LOUVAIN_BRIDGE)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("gc runs: {e}"),
@@ -351,7 +361,7 @@ async fn gc_bridge_runs(pool: &sqlx::PgPool, retain: u32) -> Result<(), ApiError
         "DELETE FROM claim_cluster_membership
          WHERE run_id NOT IN (SELECT run_id FROM graph_cluster_runs)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("gc memberships: {e}"),
@@ -360,7 +370,7 @@ async fn gc_bridge_runs(pool: &sqlx::PgPool, retain: u32) -> Result<(), ApiError
         "DELETE FROM graph_clusters
          WHERE run_id NOT IN (SELECT run_id FROM graph_cluster_runs)",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("gc clusters: {e}"),

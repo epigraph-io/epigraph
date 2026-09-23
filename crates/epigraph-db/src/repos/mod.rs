@@ -107,8 +107,9 @@ pub use factor::FactorRepository;
 pub use frame::FrameRepository;
 pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use graph_view::{
-    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
-    GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+    AtomicNodeRow, BridgeEdgeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow,
+    GraphNodeRow, GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow,
+    SubgraphTraceRow,
 };
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;

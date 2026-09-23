@@ -33,6 +33,29 @@
 //!
 //! Handlers are invoked as plain `async fn`s with a `ViewerExtractor` built from
 //! a resolved `Viewer`, the template the shard files established.
+//!
+//! # Two kinds of arm are not handler-level, and one arm is the other way round
+//!
+//! * `frame_conflict_densities` and `semantic_search_selected` are driven
+//!   through their repo functions on a `read_as` connection. A silence alarm
+//!   fires only for a frame with twenty claims, and the diverse search path
+//!   cannot be handed a stranger's id, so a handler-level arm would assert over
+//!   an empty list.
+//! * `build_from_bridges` is a corpus-wide MAINTENANCE build. Its arm pins the
+//!   GLOBAL direction (every tenant's paragraphs are in the run), because a
+//!   filtered build would silently omit other tenants. The repo functions'
+//!   markers are pinned separately, with a scoped viewer.
+//!
+//! # Mutations these arms were adjudicated against
+//!
+//! Each applied, run, restored by file copy and `cmp`-verified:
+//!
+//! 1. `Viewer::predicate_fragment`'s Scoped arm OR-ed to `true`, keeping marker,
+//!    alias and bind: every arm fails except the maintenance build's.
+//! 2. Each handler-level arm's repo call pointed at `&state.db_pool`: that arm
+//!    fails, because the viewer's own private row disappears on the raw pool.
+//! 3. Each individual marker dropped from the new repo functions: the arm that
+//!    plants a row only that marker can withhold fails.
 
 #![cfg(feature = "db")]
 
@@ -1016,4 +1039,158 @@ async fn report_hierarchical_outcome_resolves_steps_the_viewer_can_read(pool: Pg
          read — not to the stranger's step (predicate missing) and not to \
          nothing (read on the unstamped raw pool)"
     );
+}
+
+// ── routes/clusters.rs ──
+
+/// A `decomposes_to` edge `paragraph -> atom`, forced to `(visibility, group)`.
+async fn seed_decomposes(
+    pool: &PgPool,
+    paragraph: Uuid,
+    atom: Uuid,
+    visibility: &str,
+    group: Uuid,
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'decomposes_to') RETURNING id",
+    )
+    .bind(paragraph)
+    .bind(atom)
+    .fetch_one(pool)
+    .await
+    .expect("seed decomposes_to edge");
+    force_tenancy(pool, "edges", id, visibility, group).await;
+    id
+}
+
+/// Four level=2 paragraphs, each decomposing into ONE shared public atom, so
+/// every pair of paragraphs a reader can see is one bridge edge.
+///
+/// * `public` — public paragraph, public edge.
+/// * `mine` — the viewer's private paragraph, edge in the viewer's group.
+/// * `theirs` — the stranger's private paragraph, edge forced PUBLIC: only the
+///   `claims` predicate hides it.
+/// * `public_via_private_edge` — a public paragraph whose only edge is private
+///   to the stranger: only the edge predicate hides it.
+struct BridgePlant {
+    p: Plant,
+    public_via_private_edge: Uuid,
+}
+
+async fn plant_bridges(pool: &PgPool) -> BridgePlant {
+    let p = plant(pool, "bridge").await;
+    let world: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("world group");
+    let public_via_private_edge =
+        seed_public_claim(pool, p.stranger_agent, "bridge public/private-edge").await;
+    let atom = seed_public_claim(pool, p.viewer_agent, "bridge shared atom").await;
+    set_properties(pool, atom, serde_json::json!({ "level": 3 })).await;
+    for (paragraph, visibility, group) in [
+        (p.public, "public", world),
+        (p.mine, "group", p.viewer_group),
+        (p.theirs, "public", world),
+        (public_via_private_edge, "group", p.stranger_group),
+    ] {
+        set_properties(pool, paragraph, serde_json::json!({ "level": 2 })).await;
+        seed_decomposes(pool, paragraph, atom, visibility, group).await;
+    }
+    BridgePlant {
+        p,
+        public_via_private_edge,
+    }
+}
+
+/// The repo functions carry REAL markers: a scoped viewer gets the bridge
+/// graph over the paragraphs and edges it can read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bridge_reads_filter_a_scoped_viewer(pool: PgPool) {
+    let bp = plant_bridges(&pool).await;
+    let viewer = viewer_for(&pool, bp.p.viewer_agent).await;
+    let state = split_state(&pool).await;
+    let mut read = state.read_as(&viewer).await.expect("read_as");
+
+    let mut paragraphs = epigraph_db::GraphViewRepository::bridge_paragraphs(&mut *read, &viewer)
+        .await
+        .expect("bridge_paragraphs");
+    paragraphs.sort();
+    let mut want = vec![bp.p.public, bp.p.mine];
+    want.sort();
+    assert_eq!(
+        paragraphs, want,
+        "a scoped viewer sees the public and its own paragraph; the stranger's \
+         (claims predicate) and the one reached only by a private edge (edge \
+         predicate) are absent"
+    );
+
+    let edges = epigraph_db::GraphViewRepository::bridge_edges(&mut *read, &viewer, 1)
+        .await
+        .expect("bridge_edges");
+    assert_eq!(edges.len(), 1, "one readable pair: {edges:?}");
+    let pair = [edges[0].para_a, edges[0].para_b];
+    assert!(
+        pair.contains(&bp.p.public) && pair.contains(&bp.p.mine),
+        "the one bridge edge joins the two readable paragraphs: {edges:?}"
+    );
+    let _ = bp.public_via_private_edge;
+}
+
+/// `POST /clusters/build-from-bridges` is a corpus-wide MAINTENANCE build, and
+/// the global direction is the one to pin: a build filtered to the caller
+/// would write a run that silently omits every other tenant's paragraphs.
+///
+/// Through `split_state`, whose raw `db_pool` is an unstamped RLS subject, the
+/// build must still see all four paragraphs — possible only because every
+/// statement runs on the maintenance session. Reverting the reads to the raw
+/// pool drops the three private-reached ones. The memberships it writes are
+/// checked on the superuser pool, which pins that the writes happened.
+#[sqlx::test(migrations = "../../migrations")]
+async fn build_from_bridges_builds_over_the_whole_corpus_on_the_maintenance_connection(
+    pool: PgPool,
+) {
+    use epigraph_api::middleware::bearer::{AuthContext, ClientType};
+
+    let bp = plant_bridges(&pool).await;
+    let state = split_state(&pool).await;
+    let admin = bp.p.viewer_agent;
+    let auth = AuthContext {
+        client_id: admin,
+        agent_id: Some(admin),
+        owner_id: Some(admin),
+        client_type: ClientType::Service,
+        scopes: vec!["claims:admin".to_string()],
+        jti: Uuid::new_v4(),
+    };
+
+    let body = epigraph_api::routes::clusters::build_from_bridges(
+        State(state),
+        Some(axum::Extension(auth)),
+        Json(epigraph_api::routes::clusters::BuildFromBridgesRequest {
+            min_shared_atoms: Some(1),
+            resolution: Some(1.0),
+            retain_runs: Some(5),
+        }),
+    )
+    .await
+    .expect("build_from_bridges")
+    .0;
+
+    assert_eq!(
+        body.paragraph_count, 4,
+        "the maintenance build sees every paragraph, private ones included"
+    );
+    assert_eq!(
+        body.bridge_edge_count, 6,
+        "every pair of the four shares the atom"
+    );
+
+    let members: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM claim_cluster_membership WHERE run_id = $1")
+            .bind(body.run_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count memberships");
+    assert_eq!(members, 4, "one membership row per paragraph was written");
 }

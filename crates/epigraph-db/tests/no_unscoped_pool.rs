@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (283 today; the assertions below measure the tree and
+//! deletes in week two. (282 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 283 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 282 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,19 +120,20 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 283 is not 0 — and no shard in the series may be
+//!      discharged the gate — 282 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 133 of the 416 sites the series began with are gone — 113
+//!      decision: 134 of the 416 sites the series began with are gone — 113
 //!      converted by the shards, 3 REMOVED outright when `routes/claims.rs`'s
 //!      `group_id` membership gates stopped reading `group_memberships` through
 //!      the raw pool, and 4 moved onto `ScopedPool::begin_as` when
 //!      `routes/workflows.rs::deprecate_workflow` was gated
-//!      (F-write-authz-reads-unfiltered), and 13 went with the
+//!      (F-write-authz-reads-unfiltered), and 14 went with the
 //!      F-inline-claim-content-reads discharge — 12 moved onto
 //!      `AppState::read_as` (`routes/embeddings.rs` 2, `routes/conflicts.rs`
 //!      3, `routes/policies.rs` 2, `routes/political.rs` 1,
-//!      `routes/workflows.rs` 4) and 1 removed outright (`report_outcome`'s
-//!      redundant content re-read) — and 283 are not.
+//!      `routes/workflows.rs` 4), 1 moved onto a maintenance session
+//!      (`routes/clusters.rs::build_from_bridges`) and 1 removed outright
+//!      (`report_outcome`'s redundant content re-read) — and 282 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -563,7 +564,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 283;
+const HIGH_WATER: usize = 282;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -618,12 +619,13 @@ const HIGH_WATER: usize = 283;
 /// `routes/political.rs` 5 -> 4 (`inflation_leaderboard`): 289 -> 288.
 /// `routes/workflows.rs` 26 -> 22 (`get_workflow`, `report_outcome`):
 /// 288 -> 284; 22 -> 21 (`report_hierarchical_outcome`'s step lookup):
-/// 284 -> 283.
-const HIGH_WATER_FILES: usize = 43;
+/// 284 -> 283. `routes/clusters.rs` 1 -> NONE (`build_from_bridges` onto the
+/// maintenance session): `HIGH_WATER` 283 -> 282 and this constant 43 -> 42.
+const HIGH_WATER_FILES: usize = 42;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 283 sites across 43 files as of this commit. Lower an entry when a shard
+/// 282 sites across 42 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -669,7 +671,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
     // so a `0` row could never be satisfied.
-    ("routes/clusters.rs", 1),
+    // `routes/clusters.rs` was 1 and is GONE: `build_from_bridges` now runs
+    // every statement, reads and writes, on the maintenance session
+    // `AppState::maintenance_viewer` hands it (`SystemReason::ThemeClustering`),
+    // since the `F-inline-claim-content-reads` discharge. It is a corpus-wide
+    // maintenance build, the same shape as `claims.rs::find_claims_needing_embeddings`.
     ("routes/community.rs", 3),
     // 15 before this PR. Shard 4 converted the five sites belonging to its four
     // read-only handlers (`sheaf_consistency`, `sheaf_cohomology`,

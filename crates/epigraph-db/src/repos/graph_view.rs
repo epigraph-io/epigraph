@@ -176,6 +176,16 @@ pub struct CompoundNeighborRow {
     pub pignistic_prob: Option<f64>,
 }
 
+/// A bridge-graph edge from [`GraphViewRepository::bridge_edges`]: two
+/// paragraph-level claims (`level = 2`) and the number of atom children they
+/// share through `decomposes_to`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BridgeEdgeRow {
+    pub para_a: Uuid,
+    pub para_b: Uuid,
+    pub weight: i64,
+}
+
 /// Reads for the graph-visualisation endpoints.
 pub struct GraphViewRepository;
 
@@ -597,6 +607,85 @@ impl GraphViewRepository {
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphTraceRow>(&sql).bind(node_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The paragraph bridge graph's edges: each unordered pair of level=2
+    /// claims that share at least `min_shared_atoms` atom children through
+    /// `decomposes_to`, weighted by how many they share.
+    ///
+    /// Backs `POST /api/v1/clusters/build-from-bridges`, which ran this
+    /// statement inline (`F-inline-claim-content-reads`: it reads
+    /// `properties->>'level'`). That route is a corpus-wide MAINTENANCE build
+    /// and spends a bypass viewer here (`SystemReason::ThemeClustering`, on the
+    /// maintenance connection), so both markers render to nothing and the
+    /// statement is the one it always was. The markers are real, not
+    /// decorative: a scoped viewer gets the bridge graph over the paragraphs
+    /// and `decomposes_to` edges it can read. The atom side is covered by the
+    /// edge predicate, since migration 070 stamps a `decomposes_to` edge from
+    /// its endpoints.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn bridge_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        min_shared_atoms: i64,
+    ) -> Result<Vec<BridgeEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            r#"WITH atom_parents AS (
+                SELECT e.target_id AS atom_id, e.source_id AS paragraph_id
+                FROM edges e
+                JOIN claims p ON p.id = e.source_id
+                WHERE e.relationship = 'decomposes_to'
+                  AND (p.properties->>'level')::int = 2
+                  /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:p} */
+            )
+            SELECT
+                a.paragraph_id  AS para_a,
+                b.paragraph_id  AS para_b,
+                COUNT(*)::bigint AS weight
+            FROM atom_parents a
+            JOIN atom_parents b
+                ON a.atom_id = b.atom_id
+               AND a.paragraph_id < b.paragraph_id
+            GROUP BY a.paragraph_id, b.paragraph_id
+            HAVING COUNT(*) >= $1
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, BridgeEdgeRow>(&sql).bind(min_shared_atoms);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The paragraph bridge graph's nodes: every level=2 claim with at least
+    /// one `decomposes_to` atom child, isolates included. Same statement shape
+    /// and the same marker reasoning as [`Self::bridge_edges`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn bridge_paragraphs<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT DISTINCT e.source_id \
+             FROM edges e \
+             JOIN claims p ON p.id = e.source_id \
+             WHERE e.relationship = 'decomposes_to' \
+               AND (p.properties->>'level')::int = 2 \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:p} */",
+            1,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

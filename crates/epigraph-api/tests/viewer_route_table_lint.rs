@@ -179,41 +179,65 @@ use std::path::{Path, PathBuf};
 /// the number here is lowered. Do not raise it.
 const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3)];
 
-/// The register entries with **no filter and, since PR-14, no post-pass
-/// anywhere in the tree**.
+/// **CLOSED, and it must stay empty.** The route-layer `tier_a` reads that had
+/// no `Viewer` in the statement and, since PR-14, no post-pass anywhere.
 ///
-/// Twelve handler sites across seven files read `tier_a` claim content inline
-/// (thirteen across eight until `tenancy/fix-security-track` retired
-/// `hypothesis.rs`'s — see the comment on that removal below)
-/// in the route layer with no `Viewer` spliced into the statement. Before PR-14
-/// the register carried the sentence *"Deadline **PR-12**, not PR-14: these
-/// become live disclosure the moment ownership is transcribed into the tenancy
-/// columns, with nothing behind them."* That prediction is not stale — it has
-/// come true, and PR-14 is the commit that removes any ambiguity about it:
+/// # What it held
 ///
-/// * PR-12 landed the transcription, so the condition the sentence named is
-///   satisfied for every row the backfill has reached.
-/// * `docs/deploy.md` now makes running `epigraph-tenancy-backfill` to
-///   completion a **prerequisite** of shipping this release, so the condition is
-///   satisfied for the rest by the time it deploys.
-/// * PR-14 deleted `check_content_access`, the pass these sites were once
-///   (wrongly — see the note on [`TEST_ONLY_INLINE_READS`]) believed to sit
-///   behind. There is now nothing behind them at all.
+/// Twelve counted handler sites across seven files (thirteen across eight until
+/// `tenancy/fix-security-track` retired `hypothesis.rs`'s). The count was
+/// itself LOW by one: `embeddings.rs`'s aggregate was a nested-generic
+/// turbofish call that [`sqlx_call_offsets`] could not see (see
+/// [`call_open_paren`]). So the real population was thirteen statements. Two
+/// further uncounted statements were cardinalities over the same rows and went
+/// with them: the per-frame conflict densities in `conflicts.rs`, once in
+/// `scan_conflicts` and once in `silence_check`.
 ///
-/// So this is a live-disclosure register, not a latent one, and the deadline it
-/// carries is **overdue since PR-12** rather than pending. PR-14 does not
-/// discharge it: the plan's *Files* line scopes this PR to deleting redaction,
-/// and converting the remaining handlers in unrelated files is a different
-/// change with a different blast radius. The owner is recorded on
-/// `open_findings::F-inline-claim-content-reads` in
-/// `docs/tenancy/progress.json` (proposed: PR-16, which already owns the
-/// write-side predicate for the same files).
+/// Before PR-14 the register carried the sentence *"Deadline **PR-12**, not
+/// PR-14: these become live disclosure the moment ownership is transcribed into
+/// the tenancy columns, with nothing behind them."* That came true. PR-12
+/// transcribed ownership, and PR-14 deleted `check_content_access`, the pass
+/// these sites were once (wrongly, see the note on [`TEST_ONLY_INLINE_READS`])
+/// believed to sit behind. From then until this register closed, these were
+/// live disclosure, not latent. The owner PR-14 proposed (PR-16) was delivered
+/// without them.
 ///
-/// This list is a debt register, not a permission slip. Every entry is a
-/// handler. Do not add to it — move the statement into
-/// `crates/epigraph-db/src/repos/`, mark it, and splice a `Viewer`.
+/// # How it closed
+///
+/// `F-inline-claim-content-reads` was discharged on
+/// `fix/deferred-2026-09-22-lane-a` (deferred-commitment screen key
+/// `inline-claim-content-reads`). Every statement moved into
+/// `crates/epigraph-db/src/repos/` behind a `/* {VISIBILITY:…} */` or
+/// `/* {EDGE_VISIBILITY:…} */` marker. Each handler reads through
+/// `AppState::read_as` with a `ViewerExtractor`, except
+/// `clusters.rs::build_from_bridges`, a corpus-wide maintenance build that
+/// spends a `SystemReason::ThemeClustering` bypass on the maintenance
+/// connection. The comment for each file below names its repo function. The
+/// tests are `tests/inline_reads_viewer_filtered.rs`: one stranger-hidden /
+/// owner-visible arm per moved read, each mutation-checked. The closing
+/// record, with commits, is `closed_findings::F-inline-claim-content-reads`
+/// in `docs/tenancy/progress.json`.
+///
+/// # Why it is kept, empty
+///
+/// The constant stays as the ledger of what was here, and
+/// [`no_new_inline_claim_content_reads_in_the_route_layer`] asserts that it is
+/// EMPTY. A new inline `tier_a` read therefore cannot be registered here. It
+/// fails the exact-set assertion, and the only fix is the one every entry below
+/// took: move the statement into `crates/epigraph-db/src/repos/`, mark it, and
+/// splice a `Viewer`.
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
-    ("clusters.rs", 2),
+    // `clusters.rs` was 2 until `F-inline-claim-content-reads` was discharged
+    // and is now 0, the last file to leave. `build_from_bridges`' two bridge-
+    // graph reads (they read `properties->>'level'`) ran on the raw application
+    // pool with no statement of whether they were meant to be global. They are
+    // now `GraphViewRepository::bridge_edges` / `::bridge_paragraphs`, with
+    // real `{EDGE_VISIBILITY:e}` / `{VISIBILITY:p}` markers. The handler spends
+    // a `SystemReason::ThemeClustering` bypass from
+    // `AppState::maintenance_viewer` on the maintenance connection, and its
+    // writes run there too. The build is global by design: it writes one
+    // instance-wide run and GCs the others, and readers are filtered at read
+    // time.
     // `conflicts.rs` was 1 until `F-inline-claim-content-reads` was discharged
     // and is now 0. The site was `scan_conflicts`' high-conflict scan, which
     // returned `c.content` for every tenant's highest-conflict claims. It is
@@ -1274,9 +1298,15 @@ fn diff_report(actual: &BTreeMap<String, usize>, want: &BTreeMap<String, usize>)
 
 #[test]
 fn no_new_inline_claim_content_reads_in_the_route_layer() {
+    assert!(
+        UNCOMPENSATED_INLINE_READS.is_empty(),
+        "UNCOMPENSATED_INLINE_READS is CLOSED (F-inline-claim-content-reads) and \
+         must stay empty. An inline tier_a read in a route handler is not \
+         registered; it is moved into crates/epigraph-db/src/repos/ behind a \
+         spliced Viewer. See the constant's doc comment."
+    );
     let actual = measure_inline_claim_content_reads();
-    let mut want = expected(TEST_ONLY_INLINE_READS);
-    want.extend(expected(UNCOMPENSATED_INLINE_READS));
+    let want = expected(TEST_ONLY_INLINE_READS);
     assert_eq!(
         actual,
         want,
@@ -1290,9 +1320,9 @@ fn no_new_inline_claim_content_reads_in_the_route_layer() {
          anyway, which is why this lint checks WHERE the SQL lives rather than \
          whether the word `ViewerExtractor` appears.\n\n\
          Fix: move the statement into crates/epigraph-db/src/repos/, add the \
-         marker, and call `viewer.splice`. If you have genuinely removed a \
-         site, LOWER the number in TEST_ONLY_INLINE_READS or \
-         UNCOMPENSATED_INLINE_READS. Never raise it.\n",
+         marker, and call `viewer.splice`. UNCOMPENSATED_INLINE_READS is closed \
+         and cannot take the entry. If you have genuinely removed a test-only \
+         read-back, LOWER TEST_ONLY_INLINE_READS. Never raise it.\n",
         diff_report(&actual, &want)
     );
 }
