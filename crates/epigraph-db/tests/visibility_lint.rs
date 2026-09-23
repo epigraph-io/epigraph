@@ -936,6 +936,31 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "operator_links",
+        "READ through migration 102's `epigraph_operator_of` SECURITY DEFINER function, not of a \
+         table. It must answer on an UNSTAMPED epigraph_app session (brief constraint 4: a \
+         viewer-gated read there is blind and turns read-then-mint into re-mint), so a Viewer \
+         would be the wrong control. It returns only (operator agent id, operator personal group \
+         id) for the NAMED agent — the OPERATED_BY edge it reads is public (agent endpoints stamp \
+         ('public', world) in 070/072) and a personal group's id derives from the public \
+         `did:epigraph:personal:<agent>` key.",
+    ),
+    (
+        "agent.rs",
+        "operator_of",
+        "READ. The single-link projection of `operator_links` (ambiguity collapses to None); same \
+         definer function, same reason as that entry.",
+    ),
+    (
+        "agent.rs",
+        "link_operator",
+        "WRITE through migration 102's `epigraph_link_operator` SECURITY DEFINER function, which \
+         is EXECUTE-able by epigraph_maintenance only; the CONNECTION's privilege is the \
+         authorisation (an epigraph_app connection gets 42501), so there is nothing for a Viewer \
+         to filter. Returns only the outcome of the named (agent, operator) link.",
+    ),
+    (
+        "agent.rs",
         "public_key_if_signer",
         "READ of `agents`, projecting `public_key` for one id already held by the caller, and only \
          where `key_kind = 'ed25519'`. `agents` is deliberately not tenancy-partitioned — \
