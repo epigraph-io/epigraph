@@ -15,11 +15,36 @@
 //! `supports` and `SUPPORTS`, and `CORROBORATES` alongside `corroborates`
 //! (see `routes/graph.rs` `GRAPH_VIEW_RELATIONSHIPS`), so a case-sensitive
 //! filter would silently hide half the graph.
+//!
+//! # Tenancy
+//!
+//! Every statement is filtered in SQL against the caller's [`Viewer`]. The
+//! three `edges` reads carry `/* {EDGE_VISIBILITY:e} */` — the co-ownership
+//! spelling, because migration 072 stores an edge between two differently-owned
+//! endpoints as `(owner = G, co_owner = H)` and the single-owner predicate
+//! would show it to a principal in G alone. Each of them ALSO carries
+//! `/* {VISIBILITY:fc} */` on an `EXISTS` over the FAR endpoint's `claims` row,
+//! so an edge is counted and listed only when the claim at its other end is one
+//! the viewer may read. Both markers in one statement resolve to the same bind
+//! index, which `Viewer::splice` asserts.
+//!
+//! That second marker is what makes [`EgoEdges::total_edges`] safe to serialise
+//! as-is. An unfiltered degree beside a filtered edge list states exactly how
+//! many neighbours the viewer cannot see — the same metadata leak, dressed as a
+//! count. Computing the number inside the same predicate that produces the rows
+//! makes it a function only of visible rows by construction, rather than
+//! something every caller has to remember to correct afterwards.
+//!
+//! Non-claim endpoints (evidence, agents, papers, reasoning traces) are not
+//! constrained by the `claims` half of that predicate: `evidence` and
+//! `reasoning_traces` are filtered where they are hydrated, and `agents` /
+//! `papers` are not in migration 062's `tier_a` array and carry no
+//! `owner_group_id` to filter on.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::errors::DbError;
+use crate::visibility::Viewer;
 
 /// One depth-1 edge, reported exactly as stored.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -39,17 +64,18 @@ pub struct EgoEdges {
     pub outbound: Vec<EgoEdgeRow>,
     /// Edges whose target is the centre, newest first.
     pub inbound: Vec<EgoEdgeRow>,
-    /// Every matching depth-1 edge, before the degree cap. Counted in the
-    /// database, so it is unaffected by the cap and by any redaction the
-    /// caller applies afterwards.
+    /// Every depth-1 edge matching the relationship filter **that this viewer
+    /// may see**, before the degree cap.
     ///
-    /// That last part is why a caller that redacts must NOT serialise this
-    /// number as-is: it is the claim's true degree, and next to a redacted
-    /// edge list it states exactly how many neighbours the viewer may not see.
-    /// `routes/ego.rs` subtracts what it dropped before putting it on the
-    /// wire; a new caller has to do the same.
+    /// Counted in the database inside the same viewer predicate that produces
+    /// [`Self::outbound`] and [`Self::inbound`], so it is unaffected by the cap
+    /// and is already the visible count — a caller serialises it as-is. It is
+    /// deliberately NOT the claim's true degree: that number is a count of the
+    /// neighbours the viewer is not allowed to know about.
     pub total_edges: i64,
-    /// `true` when the degree cap cut the set — NOT when redaction did.
+    /// `true` when the degree cap cut the set — never when tenancy did. The
+    /// pair therefore distinguishes "the cap cut the list" from "there is more
+    /// you cannot see", and only the first of those is reported at all.
     pub truncated: bool,
 }
 
@@ -92,7 +118,8 @@ struct EvidenceHydrationRow {
 pub struct EgoRepository;
 
 impl EgoRepository {
-    /// Fetch the depth-1 edges around `center`, balanced across directions.
+    /// Fetch the depth-1 edges around `center` that `viewer` may see, balanced
+    /// across directions.
     ///
     /// Each direction gets up to `max_degree.div_ceil(2)` edges, newest first;
     /// budget one side cannot use goes to the other, so a claim with 40
@@ -101,10 +128,16 @@ impl EgoRepository {
     ///
     /// `relationships`, when supplied non-empty, filters case-insensitively.
     ///
+    /// Takes a `&mut PgConnection` rather than a generic executor because it
+    /// runs three statements and they must describe the same corpus on the
+    /// caller's one viewer-stamped connection (the `ClaimRepository::
+    /// get_by_id_conn` precedent).
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the count or either edge query fails.
     pub async fn edges(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
         center: Uuid,
         max_degree: usize,
         relationships: Option<&[String]>,
@@ -115,61 +148,102 @@ impl EgoRepository {
             .filter(|r| !r.is_empty())
             .map(|r| r.iter().map(|s| s.to_lowercase()).collect());
 
-        let total_edges: i64 = sqlx::query_scalar(
+        // The far endpoint has to be computed before it can be constrained,
+        // because this statement walks both directions at once: `far` is the
+        // target for an edge leaving the centre and the source for one arriving
+        // at it. `far.entity_type <> 'claim'` leaves evidence / agent / paper /
+        // trace endpoints alone — they have no `claims` row for the EXISTS to
+        // find, and dropping them would silently empty the non-claim half of
+        // every ego view.
+        let count_sql = viewer.splice(
             r#"
-            SELECT COUNT(*) FROM edges
-            WHERE (valid_to IS NULL OR valid_to > now())
-              AND ( (source_id = $1 AND source_type = 'claim')
-                 OR (target_id = $1 AND target_type = 'claim') )
-              AND ($2::text[] IS NULL OR lower(relationship) = ANY($2))
+            SELECT COUNT(*)
+            FROM edges e
+            CROSS JOIN LATERAL (
+                SELECT CASE WHEN e.source_id = $1 AND e.source_type = 'claim'
+                            THEN e.target_id ELSE e.source_id END AS id,
+                       CASE WHEN e.source_id = $1 AND e.source_type = 'claim'
+                            THEN e.target_type ELSE e.source_type END AS entity_type
+            ) far
+            WHERE (e.valid_to IS NULL OR e.valid_to > now())
+              AND ( (e.source_id = $1 AND e.source_type = 'claim')
+                 OR (e.target_id = $1 AND e.target_type = 'claim') )
+              AND ($2::text[] IS NULL OR lower(e.relationship) = ANY($2))
+              AND ( far.entity_type <> 'claim'
+                    OR EXISTS (SELECT 1 FROM claims fc
+                                WHERE fc.id = far.id /* {VISIBILITY:fc} */) )
+              /* {EDGE_VISIBILITY:e} */
             "#,
-        )
-        .bind(center)
-        .bind(&filter)
-        .fetch_one(pool)
-        .await?;
+            3,
+        );
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql)
+            .bind(center)
+            .bind(&filter);
+        // Guarded, not `unwrap_or(&[])`: a Bypass viewer renders no `$3` at
+        // all, so an unconditional bind sends one parameter more than the
+        // rendered statement references and Postgres rejects it on arity.
+        if let Some(g) = viewer.group_bind() {
+            count_q = count_q.bind(g);
+        }
+        let total_edges: i64 = count_q.fetch_one(&mut *conn).await?;
 
         // Fetch up to the whole budget on each side, then decide the split in
         // memory: the unused half of one side is only knowable after both
         // sides are counted.
         let limit = max_degree as i64;
 
-        let outbound: Vec<EgoEdgeRow> = sqlx::query_as(
+        let outbound_sql = viewer.splice(
             r#"
-            SELECT id, source_id, target_id, source_type, target_type, relationship
-            FROM edges
-            WHERE source_id = $1 AND source_type = 'claim'
-              AND (valid_to IS NULL OR valid_to > now())
-              AND ($2::text[] IS NULL OR lower(relationship) = ANY($2))
-            ORDER BY created_at DESC, id DESC
+            SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
+            FROM edges e
+            WHERE e.source_id = $1 AND e.source_type = 'claim'
+              AND (e.valid_to IS NULL OR e.valid_to > now())
+              AND ($2::text[] IS NULL OR lower(e.relationship) = ANY($2))
+              AND ( e.target_type <> 'claim'
+                    OR EXISTS (SELECT 1 FROM claims fc
+                                WHERE fc.id = e.target_id /* {VISIBILITY:fc} */) )
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at DESC, e.id DESC
             LIMIT $3
             "#,
-        )
-        .bind(center)
-        .bind(&filter)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut out_q = sqlx::query_as::<_, EgoEdgeRow>(&outbound_sql)
+            .bind(center)
+            .bind(&filter)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            out_q = out_q.bind(g);
+        }
+        let outbound: Vec<EgoEdgeRow> = out_q.fetch_all(&mut *conn).await?;
 
         // `NOT (source_id = $1 AND source_type = 'claim')` keeps a degenerate
         // self-edge out of both lists, so no edge is counted twice.
-        let inbound: Vec<EgoEdgeRow> = sqlx::query_as(
+        let inbound_sql = viewer.splice(
             r#"
-            SELECT id, source_id, target_id, source_type, target_type, relationship
-            FROM edges
-            WHERE target_id = $1 AND target_type = 'claim'
-              AND NOT (source_id = $1 AND source_type = 'claim')
-              AND (valid_to IS NULL OR valid_to > now())
-              AND ($2::text[] IS NULL OR lower(relationship) = ANY($2))
-            ORDER BY created_at DESC, id DESC
+            SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
+            FROM edges e
+            WHERE e.target_id = $1 AND e.target_type = 'claim'
+              AND NOT (e.source_id = $1 AND e.source_type = 'claim')
+              AND (e.valid_to IS NULL OR e.valid_to > now())
+              AND ($2::text[] IS NULL OR lower(e.relationship) = ANY($2))
+              AND ( e.source_type <> 'claim'
+                    OR EXISTS (SELECT 1 FROM claims fc
+                                WHERE fc.id = e.source_id /* {VISIBILITY:fc} */) )
+              /* {EDGE_VISIBILITY:e} */
+            ORDER BY e.created_at DESC, e.id DESC
             LIMIT $3
             "#,
-        )
-        .bind(center)
-        .bind(&filter)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            4,
+        );
+        let mut in_q = sqlx::query_as::<_, EgoEdgeRow>(&inbound_sql)
+            .bind(center)
+            .bind(&filter)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            in_q = in_q.bind(g);
+        }
+        let inbound: Vec<EgoEdgeRow> = in_q.fetch_all(&mut *conn).await?;
 
         let (out_take, in_take) = balanced_split(outbound.len(), inbound.len(), max_degree);
         let mut outbound = outbound;
@@ -186,33 +260,59 @@ impl EgoRepository {
         })
     }
 
+    /// Hydrate the centre claim, or `None` when it does not exist **or** the
+    /// viewer may not read it — the caller's 404, and the same 404 either way.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the hydration query fails.
+    pub async fn center(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        id: Uuid,
+    ) -> Result<Option<EgoEntity>, DbError> {
+        Ok(Self::hydrate(conn, viewer, &[id])
+            .await?
+            .into_iter()
+            .find(|e| e.entity_type == "claim"))
+    }
+
     /// Hydrate `ids` across the entity tables that carry display text:
-    /// claims, agents, evidence, reasoning traces and papers. Ids that match
-    /// nothing are simply absent from the result; the caller knows the
-    /// declared entity type from the edge row and renders those as bare typed
-    /// nodes.
+    /// claims, agents, evidence, reasoning traces and papers.
+    ///
+    /// Ids that match nothing — and ids naming a row this viewer may not read,
+    /// which is the same outcome — are simply absent from the result; the
+    /// caller knows the declared entity type from the edge row and decides
+    /// whether to render those as bare typed nodes or drop them.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any of the per-table queries fails.
-    pub async fn hydrate(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<EgoEntity>, DbError> {
+    pub async fn hydrate(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<EgoEntity>, DbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
         let mut out: Vec<EgoEntity> = Vec::new();
 
-        let claims: Vec<ClaimHydrationRow> = sqlx::query_as(
-            "SELECT id, content, truth_value, pignistic_prob, labels, is_current \
-             FROM claims WHERE id = ANY($1)",
-        )
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+        let claims_sql = viewer.splice(
+            "SELECT c.id, c.content, c.truth_value, c.pignistic_prob, c.labels, c.is_current \
+             FROM claims c WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut claims_q = sqlx::query_as::<_, ClaimHydrationRow>(&claims_sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            claims_q = claims_q.bind(g);
+        }
+        let claims: Vec<ClaimHydrationRow> = claims_q.fetch_all(&mut *conn).await?;
         for row in claims {
             out.push(EgoEntity {
                 id: row.id,
                 entity_type: "claim".to_string(),
-                // Provisional: a caller that redacts the content must rebuild
-                // the label from the redacted text.
+                // A claim's label IS its content; there is no second spelling
+                // of it to build, because a claim the viewer cannot read never
+                // reaches this loop.
                 label: row.content.clone(),
                 content: Some(row.content),
                 truth_value: Some(row.truth_value),
@@ -222,10 +322,18 @@ impl EgoRepository {
             });
         }
 
+        // `agents` is not in migration 062's `tier_a` array — 062 gives it
+        // `profile_visibility` and `default_group_id`, not `owner_group_id` —
+        // so there is no predicate a viewer could be spent on here. This
+        // function spends its viewer on the three tier_a tables it does read
+        // (claims, evidence, reasoning_traces), so it needs no exemption
+        // marker; writing one would enter it in `visibility_lint.rs`'s
+        // `EXPECTED_EXEMPTIONS`, which is an exact set reserved for functions
+        // that filter NOTHING.
         let agents: Vec<(Uuid, Option<String>)> =
             sqlx::query_as("SELECT id, display_name FROM agents WHERE id = ANY($1)")
                 .bind(ids)
-                .fetch_all(pool)
+                .fetch_all(&mut *conn)
                 .await?;
         for (id, display_name) in agents {
             let label = display_name.unwrap_or_else(|| short_id("Agent", id));
@@ -244,13 +352,17 @@ impl EgoRepository {
         // `properties->>'caption'` / `'doi'` mirror the label rules in
         // `routes/graph_query_utils.rs::load_subgraph`, so the two graph
         // surfaces name the same evidence the same way.
-        let evidence: Vec<EvidenceHydrationRow> = sqlx::query_as(
-            "SELECT id, properties->>'caption' AS caption, properties->>'doi' AS doi, source_url \
-             FROM evidence WHERE id = ANY($1)",
-        )
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+        let evidence_sql = viewer.splice(
+            "SELECT ev.id, ev.properties->>'caption' AS caption, \
+             ev.properties->>'doi' AS doi, ev.source_url \
+             FROM evidence ev WHERE ev.id = ANY($1) /* {VISIBILITY:ev} */",
+            2,
+        );
+        let mut evidence_q = sqlx::query_as::<_, EvidenceHydrationRow>(&evidence_sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            evidence_q = evidence_q.bind(g);
+        }
+        let evidence: Vec<EvidenceHydrationRow> = evidence_q.fetch_all(&mut *conn).await?;
         for row in evidence {
             let id = row.id;
             let label = match (
@@ -280,12 +392,16 @@ impl EgoRepository {
         // has no `frame` branch, so no edge can point at a frame, while
         // claim→trace edges are the ordinary provenance shape. Label rule
         // copied from `routes/graph_query_utils.rs::load_subgraph`.
-        let traces: Vec<(Uuid, String, f64)> = sqlx::query_as(
-            "SELECT id, reasoning_type, confidence FROM reasoning_traces WHERE id = ANY($1)",
-        )
-        .bind(ids)
-        .fetch_all(pool)
-        .await?;
+        let traces_sql = viewer.splice(
+            "SELECT rt.id, rt.reasoning_type, rt.confidence \
+             FROM reasoning_traces rt WHERE rt.id = ANY($1) /* {VISIBILITY:rt} */",
+            2,
+        );
+        let mut traces_q = sqlx::query_as::<_, (Uuid, String, f64)>(&traces_sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            traces_q = traces_q.bind(g);
+        }
+        let traces: Vec<(Uuid, String, f64)> = traces_q.fetch_all(&mut *conn).await?;
         for (id, reasoning_type, confidence) in traces {
             out.push(EgoEntity {
                 id,
@@ -299,10 +415,12 @@ impl EgoRepository {
             });
         }
 
+        // `papers` is not in migration 062's `tier_a` array either, for the
+        // same reason as `agents`: bibliographic metadata, no owner_group_id.
         let papers: Vec<(Uuid, Option<String>, String)> =
             sqlx::query_as("SELECT id, title, doi FROM papers WHERE id = ANY($1)")
                 .bind(ids)
-                .fetch_all(pool)
+                .fetch_all(&mut *conn)
                 .await?;
         for (id, title, doi) in papers {
             let label = title.filter(|t| !t.is_empty()).unwrap_or(doi);
