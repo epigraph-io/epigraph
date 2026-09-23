@@ -114,8 +114,13 @@ class _StubFinder(importlib.abc.MetaPathFinder):
         return None
 
 
-def run(script, argv):
+def install_stubs():
+    """Put the stub finder ahead of every real one, in this process."""
     sys.meta_path.insert(0, _StubFinder())
+
+
+def run(script, argv):
+    install_stubs()
     script = os.path.abspath(script)
     # Match `python3 scripts/foo.py`: the script's own directory is sys.path[0],
     # which is what lets `from maintenance_dsn import ...` resolve.

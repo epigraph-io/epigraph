@@ -22,6 +22,7 @@ imports it, on a machine where the real driver is installed as well.
 The static half of this rule, which CI runs, is
 `crates/epigraph-db/tests/scripts_have_no_default_dsn.rs`.
 """
+import json
 import os
 import subprocess
 import sys
@@ -234,6 +235,55 @@ class ScriptsRefuseWithoutADsnTests(unittest.TestCase):
         proc = run_script("migrate_mixed_bbas.py", ["--database-url", ""], clean_env())
         self.assertIn(REFUSAL, proc.stderr)
         self.assertNotIn(REACHED_CONNECT_MARKER, proc.stderr)
+
+
+class ThemePipelineLabelStepTests(unittest.TestCase):
+    """`theme_pipeline` hands its own database to the label child it spawns."""
+
+    # Imports theme_pipeline behind the stubs, replaces subprocess.run, and
+    # prints what the label child would have been given.
+    PROBE = """
+import json, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+import _offline_script_harness
+_offline_script_harness.install_stubs()
+import theme_pipeline
+seen = {}
+def fake_run(argv, **kwargs):
+    seen["argv"] = argv
+    env = kwargs.get("env") or {}
+    seen["env"] = {k: env.get(k) for k in ("MAINTENANCE_DATABASE_URL", "DATABASE_URL")}
+theme_pipeline.subprocess.run = fake_run
+theme_pipeline.run_label_step(sys.argv[3])
+print(json.dumps(seen))
+"""
+
+    @classmethod
+    def setUpClass(cls):
+        if sys.version_info < (3, 11):
+            raise AssertionError(
+                f"run these with Python >= 3.11; this is {sys.version.split()[0]}."
+            )
+
+    def test_the_label_child_runs_on_the_pipelines_database(self):
+        # A different DSN in the environment must not win over the pipeline's.
+        proc = subprocess.run(
+            [sys.executable, "-c", self.PROBE, str(HARNESS.parent), str(SCRIPTS), OTHER_DSN],
+            cwd=REPO,
+            env=clean_env(DATABASE_URL=SCRATCH_DSN),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        seen = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            seen["env"],
+            {"MAINTENANCE_DATABASE_URL": OTHER_DSN, "DATABASE_URL": OTHER_DSN},
+        )
+        self.assertTrue(seen["argv"][-2].endswith("label_themes_llm.py"), seen["argv"])
+        self.assertNotIn(OTHER_DSN, seen["argv"], "the DSN must not be on the command line")
 
 
 if __name__ == "__main__":

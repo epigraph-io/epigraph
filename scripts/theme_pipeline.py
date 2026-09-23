@@ -12,6 +12,7 @@ materialises Model A; label names it. --dry-run reports the plan without writing
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -119,6 +120,24 @@ def current_k(conn, run_id):
         return cur.fetchone()[0]
 
 
+def run_label_step(database_url):
+    """Relabel, as a child process, on the database this pipeline is using.
+
+    The child resolves its own DSN, and until now nothing gave it this one.
+    Run as `grow --database-url X`, the pipeline wrote clusters to X while the
+    child labelled whatever the environment named. With no DSN in the
+    environment, that was the hardcoded production default. The default is
+    gone, so the child would now refuse. This passes the pipeline's own
+    database to it. The DSN goes in the environment, not argv, so its password
+    is not visible in `ps`. Both variables are set so the child's
+    database-name guard sees one database.
+    """
+    env = dict(os.environ, MAINTENANCE_DATABASE_URL=database_url, DATABASE_URL=database_url)
+    subprocess.run(
+        [sys.executable, "scripts/label_themes_llm.py", "--relabel-all"], check=False, env=env
+    )
+
+
 def grow(conn, args):
     # --from-run-id resumes the split/project/label phases on an existing base
     # run (skips the ~40-min base assign); otherwise start a fresh consolidated run.
@@ -157,7 +176,7 @@ def grow(conn, args):
         return {"status": "dry-run", "run_id": run_id, "k": current_k(conn, run_id)}
 
     project_to_themes.project_run(conn, run_id)
-    subprocess.run([sys.executable, "scripts/label_themes_llm.py", "--relabel-all"], check=False)
+    run_label_step(args.database_url)
     return {"status": "grown", "run_id": run_id, "k": current_k(conn, run_id)}
 
 
@@ -182,6 +201,8 @@ def main():
                    help="grow: resume split/project/label on an existing base run (skip base)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+    # Resolved once, here, so the label child runs on the same database.
+    args.database_url = args.database_url or theme_lib.maintenance_dsn()
 
     conn = theme_lib.connect(args.database_url)
     theme_lib.set_statement_timeout(conn, ms=900000)
@@ -203,7 +224,7 @@ def main():
         print(json.dumps({"status": "projected", "run_id": run_id,
                           "themes": project_to_themes.project_run(conn, run_id)}))
     elif args.command == "label":
-        subprocess.run([sys.executable, "scripts/label_themes_llm.py", "--relabel-all"], check=False)
+        run_label_step(args.database_url)
     conn.close()
 
 
