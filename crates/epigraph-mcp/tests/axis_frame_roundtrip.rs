@@ -394,6 +394,10 @@ async fn recompute_beliefs_keeps_an_axis_only_claims_cache_on_its_declared_hypot
 /// on a label. At the wire layer this is refuse-and-skip: the colliding entry
 /// gets no assignment, no BBA and no cache, the stored frame is left as it was,
 /// and the rest of the batch still wires.
+///
+/// An ingest now refuses such a clash before writing anything (test 5). What
+/// is pinned here is the backstop for a clash that appears between that check
+/// and the wire, i.e. a concurrent ingest that creates the frame in between.
 #[sqlx::test(migrations = "../../migrations")]
 async fn axis_frame_name_collision_is_refused_not_rebound(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -559,5 +563,66 @@ async fn ingest_document_places_each_atom_on_its_declared_label(pool: PgPool) {
         assignments(&pool, tolerated).await,
         vec![(binary_frame_id, Some(0))],
         "an atom with no axis in effect stays on binary_truth at TRUE"
+    );
+}
+
+// ── 5. A stored-frame clash fails the ingest call ────────────────────────────
+
+/// The `ingest_document_inline` contract says an inconsistent axis "fails the
+/// call rather than silently falling back to binary". `validate_axes` can only
+/// see inconsistency inside one document. So when an axis clashed with a frame
+/// an EARLIER ingest had stored under the same name, the call used to succeed.
+/// The paper, the thesis and every atom were persisted, and the clashing atoms
+/// were skipped by the wire with only a log line, so they carried no mass
+/// function at all. The call must now fail with INVALID_PARAMS before anything
+/// is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_with_an_axis_that_clashes_with_a_stored_frame_fails_before_any_write(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_test_server(pool.clone());
+    let extraction: epigraph_ingest::schema::DocumentExtraction =
+        serde_json::from_str(AXIS_FIXTURE).expect("fixture parses");
+
+    let reordered: Vec<String> = POTENCY.iter().rev().map(|s| (*s).to_string()).collect();
+    let existing = FrameRepository::create(&pool, POTENCY_FRAME, None, &reordered)
+        .await
+        .expect("frame stored by an earlier ingest");
+
+    let err = epigraph_mcp::tools::ingestion::do_ingest_document(&server, &viewer, &extraction)
+        .await
+        .expect_err("an axis clashing with a stored frame must fail the call");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(
+        err.message.contains("axis declaration invalid") && err.message.contains("already exists"),
+        "the error must name the clash: {}",
+        err.message
+    );
+
+    let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = $1")
+        .bind("10.1234/axis-roundtrip")
+        .fetch_one(&pool)
+        .await
+        .expect("count papers");
+    assert_eq!(papers, 0, "no paper may be written by a refused ingest");
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = ANY($1)")
+        .bind(vec![
+            "Anxiolytic potency varies across compounds",
+            "Compound A shows mild anxiolytic potency",
+            "Compound B shows moderate anxiolytic potency",
+            "Compound C shows strong anxiolytic potency",
+            "All three compounds were well tolerated",
+        ])
+        .fetch_one(&pool)
+        .await
+        .expect("count claims");
+    assert_eq!(claims, 0, "no claim may be written by a refused ingest");
+
+    let still = FrameRepository::get_by_id(&pool, &viewer, existing.id)
+        .await
+        .expect("get_by_id")
+        .expect("stored frame");
+    assert_eq!(
+        still.hypotheses, reordered,
+        "the stored frame must not be rewritten"
     );
 }

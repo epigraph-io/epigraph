@@ -134,6 +134,52 @@ pub async fn ensure_axis_frame(
     }
 }
 
+/// Refuse any declared axis whose frame name already exists over a different
+/// ordered hypothesis list. This is the stored-frame half of the axis guard
+/// (issue #222), and it is read-only.
+///
+/// `validate_axes` checks a document against itself. It cannot see a frame
+/// that an earlier ingest created under the same name. [`ensure_axis_frame`]
+/// does catch that clash, but only at DS-wiring time. That is after every claim
+/// is persisted, and inside [`auto_wire_ds_batch`], which logs the error and
+/// skips the claim. So the ingest call used to succeed with those atoms carrying
+/// no mass function, although the tool contract says an inconsistent axis
+/// fails the call. Run this before any write, and the whole ingest is refused
+/// instead.
+///
+/// A frame that does not exist yet passes: `ensure_axis_frame` will create it.
+/// A clash created by a concurrent ingest between this check and the wire is
+/// still refused per claim by `ensure_axis_frame`. It is just no longer the
+/// normal path.
+pub async fn check_axes_against_stored_frames(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    axes: &[&epigraph_ingest::common::plan::PlannedAxis],
+) -> Result<(), String> {
+    let mut checked: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for axis in axes {
+        // `validate_axes` already guarantees one name means one list within
+        // the document, so each name needs one round trip.
+        if !checked.insert(axis.frame.as_str()) {
+            continue;
+        }
+        if let Some(row) = FrameRepository::get_by_name(pool, viewer, &axis.frame)
+            .await
+            .map_err(|e| format!("get_by_name: {e}"))?
+        {
+            if row.hypotheses != axis.hypotheses {
+                return Err(format!(
+                    "frame {:?} already exists over {:?}, but this document declares {:?}; \
+                     a frame name denotes one ordered axis, so reuse the stored list \
+                     exactly or pick another frame name",
+                    axis.frame, row.hypotheses, axis.hypotheses
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build a simple-support BBA for a binary frame: `m({primary}) =
 /// (confidence*weight).clamp(0.01, 0.99)`, with the remainder on Θ.
 ///

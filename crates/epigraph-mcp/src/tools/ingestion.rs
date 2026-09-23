@@ -418,6 +418,24 @@ pub async fn do_ingest_document(
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
+
+    // Declared-axis guard, stored-frame half (issue #222). `validate_axes`
+    // checks the document against itself. This check runs against frames that
+    // already exist, and it must also run before any write. Without it, a name
+    // clash surfaced only inside `auto_wire_ds_batch`, which logs and skips.
+    // The call then succeeded with the clashing atoms persisted but carrying no
+    // mass function. Scoped to atoms (level 3), the only claims that are
+    // DS-wired, so this refuses exactly what the wire would otherwise skip.
+    let declared_axes: Vec<&epigraph_ingest::common::plan::PlannedAxis> = plan
+        .claims
+        .iter()
+        .filter(|c| c.level == 3)
+        .filter_map(|c| c.axis.as_ref())
+        .collect();
+    ds_auto::check_axes_against_stored_frames(pool, viewer, &declared_axes)
+        .await
+        .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
