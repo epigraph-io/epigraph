@@ -4,6 +4,23 @@
 //! and checks neither side for cycles, so two calls in opposite directions
 //! make an X↔Y loop; the walk used to follow it forever, holding a pooled
 //! connection and growing the version list without bound.
+//!
+//! # What these arms assert now, and why it is weaker than it was
+//!
+//! The inline three-statement walk this branch guarded with two visited-sets is
+//! gone. `ClaimRepository::version_history` replaces it with ONE viewer-filtered
+//! recursive CTE that stops a loop with `depth < 100` on both recursive terms,
+//! so an X↔Y cycle terminates at roughly 101 entries with duplicated ids rather
+//! than at 2 distinct ones. The DoS is stopped either way — which is what these
+//! arms exist for — but the response shape is main's, so the cycle arms assert
+//! BOUNDED AND TERMINATING rather than an exact set. Reintroducing the exact
+//! shape would mean reintroducing three unfiltered inline reads, and this branch
+//! is not trading a tenancy filter for a cosmetic wart on data that is already
+//! malformed.
+//!
+//! `history_of_a_linear_chain_is_unchanged` is kept VERBATIM: it is a genuine
+//! non-regression over main's new CTE, which derives `superseded_by` from
+//! `claims.supersedes` rather than positionally.
 mod common;
 
 use epigraph_core::ClaimId;
@@ -24,6 +41,21 @@ async fn pool_and_app() -> (
         .connect(&url)
         .await
         .unwrap();
+    // This suite runs on the shared $DATABASE_URL database rather than on a
+    // per-test one, so it must state its precondition instead of self-healing.
+    // The tenancy series deleted `ensure_claim_encryption_table` precisely so
+    // an unmigrated database fails loudly here rather than silently passing a
+    // suite that tests nothing.
+    let migrated: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public.claim_encryption')::text")
+            .fetch_one(&pool)
+            .await
+            .expect("probe the schema");
+    assert!(
+        migrated.is_some(),
+        "$DATABASE_URL is not migrated. Run: \
+         cargo run -p epigraph-api --bin epigraph-migrate"
+    );
     let (addr, shutdown) = common::spawn_app(&url).await;
     // A looping handler never answers; the timeout turns that into a failure
     // instead of a hung test.
@@ -39,8 +71,16 @@ async fn history(
     addr: std::net::SocketAddr,
     claim_id: Uuid,
 ) -> serde_json::Value {
+    // A bearer is not optional any more: the tenancy series moved 105
+    // registrations from the public router to the protected one, and the
+    // anonymous allowlist is `/health` and `/api/v1/openapi.json`. Without
+    // this every arm below fails on a 401 that has nothing to do with cycles.
     let resp = client
         .get(format!("http://{addr}/api/v1/claims/{claim_id}/history"))
+        .bearer_auth(common::mint_token_with_agent(
+            &["claims:read"],
+            Uuid::new_v4(),
+        ))
         .send()
         .await
         .unwrap_or_else(|e| panic!("history for {claim_id} did not answer (cycle?): {e}"));
@@ -82,19 +122,22 @@ async fn history_terminates_on_a_mark_duplicate_cycle() {
         .unwrap();
 
     for start in [x, y] {
+        // Answering at all is half the assertion: the client carries a 20s
+        // timeout, so a walk that follows the loop fails here rather than
+        // hanging the suite.
         let body = history(&client, addr, start).await;
         let ids = version_ids(&body);
-        assert_eq!(
-            ids.len(),
-            2,
-            "start {start}: each version exactly once: {ids:?}"
+        let total = body["total_versions"].as_i64().expect("total_versions");
+        assert!(
+            total <= 101,
+            "start {start}: the CTE's depth<100 cap must bound the walk, got {total}"
         );
+        assert_eq!(ids.len() as i64, total, "start {start}: {ids:?}");
         assert_eq!(
             ids.iter().copied().collect::<HashSet<_>>(),
             HashSet::from([x, y]),
-            "start {start}"
+            "start {start}: the loop may repeat ids but must not invent any"
         );
-        assert_eq!(body["total_versions"], 2);
         assert_eq!(body["claim_id"], start.to_string());
     }
     unlink(&pool, &[x, y]).await;
@@ -111,7 +154,15 @@ async fn history_terminates_on_a_self_supersedes_loop() {
         .unwrap();
 
     let body = history(&client, addr, z).await;
-    assert_eq!(version_ids(&body), vec![z]);
+    let ids = version_ids(&body);
+    assert!(
+        !ids.is_empty() && ids.len() <= 101,
+        "a self-loop must terminate inside the depth cap, got {ids:?}"
+    );
+    assert!(
+        ids.iter().all(|id| *id == z),
+        "a self-loop must not reach any other claim, got {ids:?}"
+    );
     unlink(&pool, &[z]).await;
 }
 

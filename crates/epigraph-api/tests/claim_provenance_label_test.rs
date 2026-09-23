@@ -8,8 +8,12 @@ mod common;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
-/// Seed a public claim (no ownership row) with one claim→evidence edge, so the
-/// response carries a claim step whose label can be asserted.
+/// Seed a public claim with one claim→evidence edge, so the response carries a
+/// claim step whose label can be asserted.
+///
+/// "Public" is the migration-062 default for a claim whose insert declares no
+/// tenancy, so nothing extra is needed here. (This comment used to say "no
+/// ownership row"; that table is retired, and the behaviour is unchanged.)
 async fn seed_claim_with_evidence(pool: &sqlx::PgPool, content: &str) -> Uuid {
     let claim_id = common::seed_claim(pool, content).await;
     let evidence_id = Uuid::new_v4();
@@ -90,6 +94,13 @@ async fn provenance_label_cuts_multibyte_content_on_a_char_boundary() {
         let claim_id = seed_claim_with_evidence(&pool, &content).await;
         let resp = client
             .get(format!("http://{addr}/api/v1/claims/{claim_id}/provenance"))
+            // Not optional any more: this route moved to the protected router
+            // with the other 104. Without a bearer the arm fails on a 401 that
+            // has nothing to do with char boundaries.
+            .bearer_auth(common::mint_token_with_agent(
+                &["claims:read"],
+                Uuid::new_v4(),
+            ))
             .send()
             .await
             .unwrap_or_else(|e| panic!("request for {content:?} failed (handler panic?): {e}"));
