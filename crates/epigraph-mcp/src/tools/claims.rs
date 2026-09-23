@@ -999,7 +999,12 @@ pub async fn update_with_evidence(
     // permanently `true`. This change is confined to what happens WHEN it fails.
     //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    let ds = match ds_auto::auto_wire_ds_update(
+    //
+    // The STAGED form is used so the response can say whether this submission's
+    // BBA was persisted before the failure (`bba_stored`). The two outcomes need
+    // opposite recoveries and are otherwise indistinguishable to the caller —
+    // `truth_after == truth_before` and the measures are absent in both.
+    let (ds, ds_failure) = match ds_auto::auto_wire_ds_update_staged(
         &server.pool,
         viewer,
         claim_id,
@@ -1012,12 +1017,17 @@ pub async fn update_with_evidence(
     )
     .await
     {
-        Ok(ds) => Some(ds),
-        Err(e) => {
+        Ok(ds) => (Some(ds), None),
+        Err(f) => {
             // Same message shape and same fields as `submit_claim`'s warn, so one
             // log query finds every dropped wire regardless of which tool dropped it.
-            tracing::warn!(claim_id = %claim_id, "ds auto-wire failed: {e}");
-            None
+            tracing::warn!(
+                claim_id = %claim_id,
+                bba_stored = f.bba_stored,
+                "ds auto-wire failed: {}",
+                f.error
+            );
+            (None, Some(f))
         }
     };
 
@@ -1072,9 +1082,10 @@ pub async fn update_with_evidence(
     // ── AND WHEN THE WIRING DROPPED, THE LABEL MERGE STILL RUNS ─────────
     //
     // `after_truth` is `None` exactly when the wiring failed, because its value
-    // is DERIVED from `ds.pignistic_prob` — with no fresh BBA there is no new
-    // truth to write, and writing the old one back would be a lie dressed as an
-    // update.
+    // is DERIVED from `ds.pignistic_prob` — with no completed combination there
+    // is no new truth to write (even when this submission's BBA was stored before
+    // a late step failed), and writing the old one back would be a lie dressed as
+    // an update.
     //
     // The label merge is NOT gated on the same condition, and that separation is
     // deliberate. Gating the whole block on "the wiring succeeded" would drop
@@ -1139,7 +1150,8 @@ pub async fn update_with_evidence(
     // committed unconditionally — that half genuinely succeeded and the caller
     // needs the id to find it.
     //
-    // Everything DS-derived is reported only when there is a fresh BBA behind it:
+    // Everything DS-derived is reported only when the wire COMPLETED — a stored
+    // BBA with no completed combination (a late-step failure) yields no measures:
     //
     // * `truth_after` falls back to `before` — the claim's truth_value was not
     //   updated, so before and after really are equal. Reporting the persisted
@@ -1150,15 +1162,24 @@ pub async fn update_with_evidence(
     //   or stale. A consumer that reads them gets this submission's measures or
     //   nothing; it never gets someone else's.
     // * `belief_wired` is the flag that makes the above legible instead of
-    //   ambiguous: `false` says "no belief moved", so an unchanged `truth_after`
+    //   ambiguous: `false` says "`claims.truth_value` and the cached belief
+    //   columns were not updated by this call", so an unchanged `truth_after`
     //   cannot be misread as "the evidence had no effect on a claim that WAS
-    //   recomputed".
+    //   recomputed". It does NOT say no BBA landed — that is `bba_stored`.
+    // * `bba_stored` / `ds_wire_error` say WHICH failure it was. A late-step
+    //   failure has already persisted this submission's BBA (framed reads that
+    //   recompute live from stored BBAs reflect it, and the next successful wire
+    //   combines it); a first-step failure has not. The error text is the same
+    //   string the tool used to return as its -32603 message, so reporting it
+    //   discloses nothing the old contract did not.
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
         truth_after: after_truth.map_or(before, |t| t.value()),
         evidence_id: evidence.id.as_uuid().to_string(),
         belief_wired: ds.is_some(),
+        bba_stored: ds_failure.as_ref().map_or(true, |f| f.bba_stored),
+        ds_wire_error: ds_failure.map(|f| f.error),
         belief: ds.as_ref().map(|d| d.belief),
         plausibility: ds.as_ref().map(|d| d.plausibility),
         pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),

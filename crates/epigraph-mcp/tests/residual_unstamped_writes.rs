@@ -115,12 +115,15 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/claims.rs",
-        "ds_auto::auto_wire_ds_update",
+        "ds_auto::auto_wire_ds_update_staged",
         1,
-        "`update_with_evidence`'s DS wiring. Writes `claim_frames` + `mass_functions`, neither of \
+        "`update_with_evidence`'s DS wiring (the STAGED form, so the response can report whether \
+         the BBA was stored before a failure — same writes as `auto_wire_ds_update`, which is now \
+         a thin wrapper over it). Writes `claim_frames` + `mass_functions`, neither of \
          which has an orphan `*_privacy` policy, so it is refused in PRODUCTION as well as on a \
          clean migrate — this is why `mass_functions` stopped growing. D2. Its FAILURE is now \
-         best-effort and DISCLOSED (`tracing::warn!` + `belief_wired: false` in the response), \
+         best-effort and DISCLOSED (`tracing::warn!` + `belief_wired: false` / `bba_stored` / \
+         `ds_wire_error` in the response), \
          matching `submit_claim`; that changed how the refusal is reported, NOT that the site \
          takes the unstamped pool, so the entry stands until D2 converts it. Gated on \
          `was_created` asymmetrically ON PURPOSE: re-running it double-counts mass.",

@@ -1279,21 +1279,24 @@ pub struct UpdateResponse {
     /// `pignistic_prob` fields describe a NEW epistemic state.
     ///
     /// `false` means the evidence row was attached and committed — the claim
-    /// genuinely carries this submission — but the DS wiring failed, so **this
-    /// call moved no belief**: neither the claim's `truth_value` nor its cached
-    /// belief columns were recomputed. On that path `truth_after ==
-    /// truth_before`, the three measure fields are ABSENT rather than stale
-    /// (there are no fresh measures to report, and echoing the persisted
-    /// columns would dress a no-op as a delta), and the underlying error is in
-    /// the server log as a `ds auto-wire failed` WARN.
+    /// genuinely carries this submission — but the DS wiring did not complete,
+    /// so **`claims.truth_value` and the cached belief columns (`belief`,
+    /// `plausibility`, `pignistic_prob`, …) were not updated by this call**. On
+    /// that path `truth_after == truth_before`, the three measure fields are
+    /// ABSENT rather than stale (there are no fresh measures to report, and
+    /// echoing the persisted columns would dress a no-op as a delta), and the
+    /// error is in `ds_wire_error` and in the server log as a `ds auto-wire
+    /// failed` WARN.
     ///
-    /// What `false` does NOT promise is that no DS row at all was written.
-    /// `ds_auto::auto_wire_ds_update` is a sequence of separate pool writes
-    /// (`claim_frames` → evidence perspective → `mass_functions` → cached
-    /// belief), so a failure at a LATER step can leave the earlier rows behind.
-    /// The production failure is at the FIRST step (`assign_claim` refused on
-    /// `claim_frames`), where nothing lands — measured on the prod-faithful e2e
-    /// configuration as `claim_frames=0 mass_functions=0` after the call.
+    /// `false` does NOT mean no BBA landed. `ds_auto::auto_wire_ds_update_staged`
+    /// is a sequence of separate pool writes (`claim_frames` → evidence
+    /// perspective → `mass_functions` → cached belief), so a failure after the
+    /// BBA is stored leaves it persisted, and framed belief reads that recompute
+    /// live from stored BBAs may already reflect it. Which case applies is
+    /// [`Self::bba_stored`]. The production failure is at the FIRST step
+    /// (`assign_claim` refused on `claim_frames`), where no BBA lands — measured
+    /// on the prod-faithful e2e configuration as `claim_frames=0
+    /// mass_functions=0` after the call.
     ///
     /// Out-of-band repair of the cached belief is `epigraph-cli
     /// recompute_claim_belief` (which runs on `MaintenancePool::connect`, not on
@@ -1307,6 +1310,29 @@ pub struct UpdateResponse {
     /// Same disclosure contract as [`LinkEpistemicResponse::belief_wired`]: the
     /// call succeeded, and the caller is told exactly which half of it did.
     pub belief_wired: bool,
+    /// Whether THIS submission's BBA is persisted in `mass_functions`.
+    ///
+    /// Always `true` when `belief_wired` is `true`. When `belief_wired` is
+    /// `false` it separates the two failures, which need opposite recoveries:
+    ///
+    /// * `true` — the wire failed AFTER `store_with_perspective` (re-reading,
+    ///   parsing — e.g. a legacy malformed stored BBA — discounting, combining,
+    ///   or writing the cached columns). The BBA is persisted: framed reads that
+    ///   recompute live from stored BBAs already include it, and the next
+    ///   successful wire on this claim combines it. Do NOT submit the evidence
+    ///   again in any form — it would count twice. Only the cached columns and
+    ///   `truth_value` are stale.
+    /// * `false` — the wire failed at or before storing the BBA (the production
+    ///   case). The evidence row exists but contributes nothing to any belief.
+    ///
+    /// Set by which step returned the error, not by parsing its text.
+    pub bba_stored: bool,
+    /// The DS wiring's error, prefixed with the step that failed (`assign_claim:`,
+    /// `store BBA:`, `update_claim_belief:`, …). Present exactly when
+    /// `belief_wired` is `false`. It is the same text this tool used to return as
+    /// its -32603 error message before the wiring became best-effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_wire_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

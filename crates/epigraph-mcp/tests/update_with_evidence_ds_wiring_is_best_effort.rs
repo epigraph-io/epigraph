@@ -64,6 +64,26 @@
 //!   cannot be satisfied by a constant.
 //!
 //! Restoring the change returns the file to `2 passed`.
+//!
+//! # `bba_stored` — which failure it was
+//!
+//! `belief_wired: false` alone cannot tell a FIRST-step drop (no BBA stored —
+//! production's `claim_frames` refusal) from a LATE-step drop (BBA stored, then
+//! e.g. `update_claim_belief` refused), and the two need opposite recoveries.
+//! [`a_late_step_drop_reports_the_bba_it_already_stored`] injects the late
+//! failure with `CHECK (belief_frame_id IS NULL) NOT VALID` on `claims`, which
+//! refuses only the cached-belief write, and pins `bba_stored: true`, one
+//! `mass_functions` row keyed to the reported evidence, untouched
+//! `truth_value` / cached `pignistic_prob`, and a framed `get_belief` that
+//! already reads `source: "recomputed"`. MEASURED, one mutation each, on the
+//! response field in `update_with_evidence`:
+//!
+//! * `bba_stored: true` hardcoded — `2 passed; 1 failed`: the first-step arm
+//!   fails with `got {"bba_stored":true,…,"ds_wire_error":"assign_claim: Check
+//!   constraint ds_wiring_denied_for_test violated…`.
+//! * `bba_stored: false` hardcoded — `1 passed; 2 failed`: the late arm
+//!   (`"ds_wire_error":"update_claim_belief: Check constraint
+//!   cached_belief_denied_for_test…`) and the success arm both fail.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -102,7 +122,8 @@ async fn deny_all_writes_to_claim_frames(pool: &PgPool) {
 
 /// The arm the fix exists for: the wiring is refused, and the tool must still
 /// succeed, still attach the evidence, still merge the labels, and say plainly
-/// that no belief moved.
+/// that the claim's truth_value and cached belief were not updated and that no
+/// BBA was stored.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dropped_ds_wire_still_attaches_the_evidence_and_reports_belief_wired_false(
     pool: PgPool,
@@ -152,13 +173,26 @@ async fn a_dropped_ds_wire_still_attaches_the_evidence_and_reports_belief_wired_
         "the dropped wire must be DISCLOSED, not swallowed — bare success here is the \
          silent-failure mode this change exists to remove; got {body}"
     );
+    // And WHICH drop it was: the first step failed, so no BBA was stored. This is
+    // the production case, and the one whose recovery differs from a late drop.
+    assert_eq!(
+        body["bba_stored"],
+        serde_json::json!(false),
+        "the wire failed at `assign_claim`, before any BBA was stored; got {body}"
+    );
+    assert!(
+        body["ds_wire_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("assign_claim:")),
+        "`ds_wire_error` must name the failing step; got {body}"
+    );
 
     // The belief numbers must reflect that NOTHING changed, rather than echoing
     // the persisted columns (which would manufacture a delta out of a previous
     // call's state).
     assert_eq!(
         body["truth_before"], body["truth_after"],
-        "no BBA was materialized, so truth_after must equal truth_before; got {body}"
+        "the wire did not complete, so truth_after must equal truth_before; got {body}"
     );
     assert_eq!(
         body["truth_after"],
@@ -168,8 +202,8 @@ async fn a_dropped_ds_wire_still_attaches_the_evidence_and_reports_belief_wired_
     for absent in ["belief", "plausibility", "pignistic_prob"] {
         assert!(
             body.get(absent).is_none(),
-            "`{absent}` must be ABSENT (not null, not stale) when there is no fresh BBA behind \
-             it; got {body}"
+            "`{absent}` must be ABSENT (not null, not stale) when the wire did not complete; \
+             got {body}"
         );
     }
 
@@ -202,18 +236,20 @@ async fn a_dropped_ds_wire_still_attaches_the_evidence_and_reports_belief_wired_
         .expect("read truth_value after");
     assert!(
         (truth_after_db - truth_before).abs() < f64::EPSILON,
-        "no BBA landed, so the stored truth_value must be untouched: {truth_before} -> \
+        "the wire did not complete, so the stored truth_value must be untouched: {truth_before} -> \
          {truth_after_db}"
     );
 
-    // No BBA means no BBA: the response's honesty must match the tables.
+    // `bba_stored: false` must match the tables. (This is a property of a
+    // FIRST-step drop, not of `belief_wired: false` in general — the late-step arm
+    // below stores a BBA and still reports `belief_wired: false`.)
     let (masses,): (i64,) = sqlx::query_as("SELECT count(*) FROM mass_functions")
         .fetch_one(&pool)
         .await
         .expect("count mass_functions");
     assert_eq!(
         masses, 0,
-        "`belief_wired: false` must mean no mass function was written"
+        "`bba_stored: false` must mean no mass function was written"
     );
 
     // Labels are deliberately NOT gated on the wire's success. Gating them would
@@ -266,6 +302,15 @@ async fn a_successful_ds_wire_reports_belief_wired_true_with_its_measures(pool: 
         "the wiring landed here, so the flag must say so — a hardcoded `false` would pass the \
          dropped-wire arm and fail this one; got {body}"
     );
+    assert_eq!(
+        body["bba_stored"],
+        serde_json::json!(true),
+        "a completed wire stored its BBA; got {body}"
+    );
+    assert!(
+        body.get("ds_wire_error").is_none(),
+        "`ds_wire_error` must be absent when the wire completed; got {body}"
+    );
     for present in ["belief", "plausibility", "pignistic_prob"] {
         assert!(
             body[present].is_f64(),
@@ -279,5 +324,140 @@ async fn a_successful_ds_wire_reports_belief_wired_true_with_its_measures(pool: 
     assert_eq!(
         masses, 1,
         "`belief_wired: true` must mean a mass function was actually written"
+    );
+}
+
+/// Make ONLY the last step of the wire fail: `update_claim_belief` sets
+/// `claims.belief_frame_id`, so a `CHECK (belief_frame_id IS NULL)` refuses it
+/// after `store_with_perspective` has already committed the BBA. `NOT VALID` so
+/// existing rows do not block the DDL; a seeded claim's `belief_frame_id` is
+/// NULL, so the label-merge `UPDATE claims` later in the tool still passes it.
+async fn deny_the_cached_belief_write(pool: &PgPool) {
+    sqlx::query(
+        "ALTER TABLE claims \
+         ADD CONSTRAINT cached_belief_denied_for_test CHECK (belief_frame_id IS NULL) NOT VALID",
+    )
+    .execute(pool)
+    .await
+    .expect("install the late-step failure injector");
+}
+
+/// A LATE-step drop: the BBA is stored, then the cached-belief write fails.
+/// `belief_wired` is `false` exactly as in the first-step arm, and without
+/// `bba_stored` the two responses would be indistinguishable — while needing
+/// opposite recoveries (here, submitting the evidence again would count it
+/// twice).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_late_step_drop_reports_the_bba_it_already_stored(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let claim_id =
+        seed_claim_with_labels(&pool, "claim whose DS wire drops late", &["keeper"]).await;
+    let (truth_before, frame_before): (f64, Option<uuid::Uuid>) =
+        sqlx::query_as("SELECT truth_value, belief_frame_id FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read claim before");
+    assert!(
+        frame_before.is_none(),
+        "precondition: the seeded claim must have NULL belief_frame_id, or the injector would \
+         also refuse the label merge and this arm would test the wrong failure"
+    );
+
+    deny_the_cached_belief_write(&pool).await;
+
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let body = json_of(
+        epigraph_mcp::tools::claims::update_with_evidence(
+            &server,
+            &viewer,
+            UpdateWithEvidenceParams {
+                canonical_name: None,
+                step_index: None,
+                claim_id: claim_id.to_string(),
+                evidence_type: "empirical".into(),
+                evidence_data: "Corroboration whose cached-belief write is refused.".into(),
+                source_url: None,
+                supports: true,
+                strength: 0.7,
+                labels: vec!["run-tag-late".into()],
+            },
+        )
+        .await
+        .expect("a late-step drop is best-effort too"),
+    );
+
+    assert_eq!(body["belief_wired"], serde_json::json!(false), "got {body}");
+    assert_eq!(
+        body["bba_stored"],
+        serde_json::json!(true),
+        "the BBA was stored before `update_claim_belief` failed, and the response must say so; \
+         got {body}"
+    );
+    assert!(
+        body["ds_wire_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("update_claim_belief:")),
+        "`ds_wire_error` must name the failing step; got {body}"
+    );
+    assert_eq!(body["truth_before"], body["truth_after"], "got {body}");
+
+    // The tables agree with `bba_stored: true`: exactly one BBA, keyed to the
+    // evidence row the response names.
+    let evidence_id: uuid::Uuid = body["evidence_id"]
+        .as_str()
+        .expect("evidence_id is reported")
+        .parse()
+        .expect("evidence_id is a UUID");
+    let (masses_for_evidence,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM mass_functions WHERE evidence_id = $1")
+            .bind(evidence_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count this evidence's BBAs");
+    assert_eq!(
+        masses_for_evidence, 1,
+        "the stored BBA is keyed to the evidence row"
+    );
+
+    // `claims.truth_value` and the cached columns were not updated...
+    let (truth_after_db, cached_betp): (f64, Option<f64>) =
+        sqlx::query_as("SELECT truth_value, pignistic_prob FROM claims WHERE id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read claim after");
+    assert!((truth_after_db - truth_before).abs() < f64::EPSILON);
+    assert!(
+        cached_betp.is_none(),
+        "the cached pignistic_prob must not have been written; got {cached_betp:?}"
+    );
+
+    // ...but a framed read, which recomputes live from stored BBAs, already
+    // reflects the evidence. This is why the old "belief_wired=false moved NO
+    // belief" wording was false.
+    let (frame_id,): (uuid::Uuid,) =
+        sqlx::query_as("SELECT id FROM frames WHERE name = 'binary_truth'")
+            .fetch_one(&pool)
+            .await
+            .expect("binary_truth frame exists after the wire's first step");
+    let framed =
+        epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_id, Some(frame_id))
+            .await
+            .expect("framed get_belief");
+    assert_eq!(
+        framed.source, "recomputed",
+        "a framed read must see the stored BBA; got {framed:?}"
+    );
+
+    // Labels still merge on this path too.
+    let (labels,): (Vec<String>,) = sqlx::query_as("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read labels");
+    assert!(
+        labels.contains(&"run-tag-late".to_string()),
+        "got {labels:?}"
     );
 }
