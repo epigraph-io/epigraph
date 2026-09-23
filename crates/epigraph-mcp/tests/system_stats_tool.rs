@@ -1,9 +1,16 @@
 //! MCP `system_stats` after its SQL moved into
-//! `epigraph_db::StatsRepository` (shared with `GET /api/v1/stats`).
+//! `epigraph_db::CorpusStatsRepository` (shared with `GET /api/v1/stats`).
 //!
 //! Nothing pinned this tool's output before, so the move had no regression
 //! guard. These tests are that guard: the exact key set in each mode, and the
-//! counts tracking seeded rows.
+//! counts tracking seeded rows. Both key sets are asserted VERBATIM — the
+//! output contract did not change when the counts became viewer-scoped.
+//!
+//! The counts themselves did: they are "rows this viewer can read" now, so the
+//! tool takes a `&Viewer` and the delta assertions depend on the seeded claim
+//! being visible to it. `viewer_fixture::public_viewer` resolves a real viewer
+//! with an empty group set, and `seed_claim` below writes the migration-062
+//! default `visibility = 'public'`, so it is.
 
 use epigraph_mcp::tools::batch::system_stats;
 use epigraph_mcp::types::SystemStatsParams;
@@ -14,6 +21,9 @@ use uuid::Uuid;
 
 mod common;
 use common::{build_test_server, seed_agent};
+
+#[path = "viewer_fixture.rs"]
+mod viewer_fixture;
 
 fn parse(result: &CallToolResult) -> Value {
     let content = result.content.first().expect("one content block");
@@ -58,9 +68,10 @@ async fn seed_claim(pool: &PgPool, agent: Uuid, labels: &[&str]) -> Uuid {
 #[sqlx::test(migrations = "../../migrations")]
 async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    let viewer = viewer_fixture::public_viewer(&pool).await;
 
     let before = parse(
-        &system_stats(&server, SystemStatsParams { detailed: None })
+        &system_stats(&server, &viewer, SystemStatsParams { detailed: None })
             .await
             .expect("system_stats"),
     );
@@ -76,6 +87,7 @@ async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
     let after = parse(
         &system_stats(
             &server,
+            &viewer,
             SystemStatsParams {
                 detailed: Some(false),
             },
@@ -91,10 +103,12 @@ async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn detailed_mode_adds_the_six_extra_counts(pool: PgPool) {
     let server = build_test_server(pool.clone());
+    let viewer = viewer_fixture::public_viewer(&pool).await;
 
     let before = parse(
         &system_stats(
             &server,
+            &viewer,
             SystemStatsParams {
                 detailed: Some(true),
             },
@@ -129,6 +143,7 @@ async fn detailed_mode_adds_the_six_extra_counts(pool: PgPool) {
     let after = parse(
         &system_stats(
             &server,
+            &viewer,
             SystemStatsParams {
                 detailed: Some(true),
             },
