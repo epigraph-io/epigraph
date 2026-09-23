@@ -865,9 +865,40 @@ pub async fn update_with_evidence(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    EvidenceRepository::create(&server.pool, &evidence)
-        .await
-        .map_err(internal_error)?;
+    // ── THE EVIDENCE WRITE, ON AN AUTHOR-STAMPED CONNECTION ─────────────
+    //
+    // `evidence` is tier-A with migration 077's strict
+    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on the
+    // unstamped pool this INSERT was refused — MEASURED on a cleanly-migrated
+    // schema: `new row violates row-level security policy for table "evidence"`,
+    // which was this tool's FIRST write and therefore its whole outcome.
+    //
+    // IT COMMITS ON ITS OWN, and that is forced rather than chosen. Migration 046
+    // gives `mass_functions.evidence_id` a FK to `evidence(id)`, and the DS wiring
+    // below runs on a SIBLING pool connection which cannot see an uncommitted
+    // row — so the evidence must be committed before `auto_wire_ds_update` can
+    // reference it. Putting the whole tool in one transaction requires converting
+    // `ds_auto` itself (the DS-wiring change, D2); until then the shape is
+    // evidence -> DS -> {truth_value, labels}, three units rather than one.
+    //
+    // CONSEQUENCE, stated plainly: on a clean schema this tool still fails at the
+    // DS wiring, and it now fails with the evidence row COMMITTED instead of
+    // failing before writing anything. That is not a new failure mode — it is
+    // exactly what production does today, where `evidence_privacy` admits the
+    // INSERT and `claim_frames` then refuses the BBA (MEASURED: after the failed
+    // call, `evidence` had gained its row). A retry mints a fresh evidence UUID
+    // rather than upserting, so retries accumulate evidence rows; that is also
+    // pre-existing, and it is the reason this tool's conversion is the LAST of the
+    // three rather than the first.
+    {
+        let mut tx =
+            crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+                .await?;
+        EvidenceRepository::create(&mut *tx, &evidence)
+            .await
+            .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+    }
 
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
@@ -907,23 +938,47 @@ pub async fn update_with_evidence(
     .await
     .map_err(internal_error)?;
 
-    // Derive truth_value from CDST pignistic probability
+    // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // Both are `UPDATE claims`, so both are governed by `claims_tenancy`'s
+    // `WITH CHECK` and both were refused on the unstamped pool. They share a
+    // transaction because they are one decision about one row: the belief this
+    // submission produced, and the labels it was submitted under. Splitting them
+    // is how a successful truth update with dropped labels happens — the shape
+    // backlog f14592cb reported for the labels themselves.
+    //
+    // AFTER the DS wiring, necessarily: `after_truth` is derived from
+    // `ds.pignistic_prob`, so there is nothing to write until the recompute has
+    // run. The label merge stays in the same unit rather than moving earlier,
+    // because a label rejection must not leave the claim's belief moved on the
+    // strength of a submission the caller was told had failed — the placement rule
+    // the caller-label validation at the top of this function already follows.
     let after_truth = TruthValue::clamped(ds.pignistic_prob);
-    ClaimRepository::update_truth_value(&server.pool, ClaimId::from_uuid(claim_id), after_truth)
+    {
+        let mut tx =
+            crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+                .await?;
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            ClaimId::from_uuid(claim_id),
+            after_truth,
+        )
         .await
         .map_err(internal_error)?;
 
-    // Additive label merge on the dedup-match write, mirroring submit_claim's
-    // and memorize's dedup-hit behavior: labels union into the claim's
-    // existing array (ClaimRepository::update_labels dedupes via
-    // array_agg(DISTINCT ...)), never overwriting labels from the claim's
-    // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
-    // norcal-rfp-2026-07-05) were previously dropped on every call because
-    // UpdateWithEvidenceParams had no labels field at all.
-    if !params.labels.is_empty() {
-        ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
-            .await
-            .map_err(db_caller_error)?;
+        // Additive label merge on the dedup-match write, mirroring submit_claim's
+        // and memorize's dedup-hit behavior: labels union into the claim's
+        // existing array (ClaimRepository::update_labels dedupes via
+        // array_agg(DISTINCT ...)), never overwriting labels from the claim's
+        // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
+        // norcal-rfp-2026-07-05) were previously dropped on every call because
+        // UpdateWithEvidenceParams had no labels field at all.
+        if !params.labels.is_empty() {
+            ClaimRepository::update_labels_conn(&mut tx, claim_id, &params.labels, &[])
+                .await
+                .map_err(db_caller_error)?;
+        }
+        tx.commit().await.map_err(internal_error)?;
     }
 
     // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
