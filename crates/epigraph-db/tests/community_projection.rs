@@ -493,8 +493,8 @@ async fn a_live_member_can_add_another(pool: PgPool) {
     assert_eq!(live_membership(&pool, row.id, newcomer).await, 1);
 }
 
-/// A community whose projected group has no live members is OPEN — the
-/// bootstrap case.
+/// A community whose projected group has never had a membership row is OPEN —
+/// the bootstrap case.
 ///
 /// Migration 068 projected communities with `created_by_agent_id` NULL and no
 /// admin membership. Refusing the first `add_member` on those would leave every
@@ -517,8 +517,8 @@ async fn a_memberless_community_group_is_open_for_bootstrap(pool: PgPool) {
     assert_eq!(
         outcome,
         MembershipOutcome::Applied,
-        "a group with no live members has nobody who could ever authorize the \
-         first join; refusing would be a permanent dead end, not a control"
+        "a group that has never had a member has nobody who could ever authorize \
+         the first join; refusing would be a permanent dead end, not a control"
     );
 }
 
@@ -797,4 +797,52 @@ async fn a_member_revoked_concurrently_cannot_complete_an_eviction(pool: PgPool)
     );
     assert!(in_community(&pool, row.id, targets).await);
     assert_eq!(live_membership(&pool, row.id, target).await, 1);
+}
+
+/// Once a group has had members, losing the last one does not reopen it.
+///
+/// The bootstrap is for a group that has NEVER had a membership row. Keyed on
+/// "no live row" instead, it reopened the moment the last member left, and the
+/// next caller could add itself. The rule now has the roster-shaped spelling
+/// migration 092 uses for the same bootstrap at the RLS layer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn removing_the_last_member_does_not_reopen_bootstrap_to_a_stranger(pool: PgPool) {
+    let (founder, _) = fixture::seed_agent_with_group(&pool, "founder").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    // No creator: the zero-admin shape migration 068 projected.
+    let row = CommunityRepository::create(&pool, "emptied", None, None, None, None)
+        .await
+        .expect("create community");
+    let founders = seed_perspective(&pool, Some(founder), "founders").await;
+    assert_eq!(
+        CommunityRepository::add_member(&pool, Some(founder), row.id, founders)
+            .await
+            .expect("bootstrap join"),
+        MembershipOutcome::Applied,
+        "CALIBRATION: a never-joined group is open, so the first join is the bootstrap"
+    );
+    assert_eq!(
+        CommunityRepository::remove_member(&pool, Some(founder), row.id, founders)
+            .await
+            .expect("leave"),
+        MembershipOutcome::Applied
+    );
+    assert_eq!(
+        live_membership(&pool, row.id, founder).await,
+        0,
+        "CALIBRATION: the group now has no live member"
+    );
+
+    let strangers = seed_perspective(&pool, Some(stranger), "strangers").await;
+    let outcome = CommunityRepository::add_member(&pool, Some(stranger), row.id, strangers)
+        .await
+        .expect("add_member must DENY, not error");
+
+    assert_eq!(
+        outcome,
+        MembershipOutcome::DeniedNotAMember,
+        "a group that has had members is not a bootstrap case once they are gone"
+    );
+    assert_eq!(live_membership(&pool, row.id, stranger).await, 0);
+    assert!(!in_community(&pool, row.id, strangers).await);
 }

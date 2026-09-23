@@ -206,7 +206,7 @@ pub async fn create_community(
         // community group has ZERO administrators until PR-12 gives it one".
         // `Viewer::principal()` is `None` only for a bypass/system viewer,
         // which is not a principal that should own a community — that case
-        // still lands on the memberless-group bootstrap path, which
+        // still lands on the never-joined-group bootstrap path, which
         // `CommunityRepository::add_member` treats as open.
         //
         // This route is on the PROTECTED router, so `ViewerExtractor` already
@@ -319,9 +319,9 @@ pub async fn get_community(
 /// managing an existing group's membership. Membership is enforced in the repo
 /// layer (`CommunityRepository::add_member`: the acting agent must hold a live
 /// membership in the community's projected group, with a bootstrap exception for
-/// a group that has none). Scope was the missing half, and it is the half a
-/// scope-less route cannot supply: without it a token that may not manage a
-/// group through `POST /api/v1/groups/:id/members` could grant the same
+/// a group that has never had a membership row). Scope was the missing half, and
+/// it is the half a scope-less route cannot supply: without it a token that may
+/// not manage a group through `POST /api/v1/groups/:id/members` could grant the same
 /// `group_memberships` row through this route, because migration 068 projects a
 /// community onto a group ID-preservingly and this handler's write is projected
 /// onto that group. Read authority granted here is read authority, however it

@@ -83,9 +83,9 @@
 //! authorization therefore sits on the whole operation, in the repo layer where
 //! both writers reach it:
 //!
-//! * if the community's projected group has **any** live membership, the acting
-//!   agent must itself be a live member of it;
-//! * if it has none, the operation is allowed — that is the bootstrap case, and
+//! * if the community's projected group has **ever** had a membership row, live
+//!   or revoked, the acting agent must itself be a live member of it;
+//! * if it never has, the operation is allowed — that is the bootstrap case, and
 //!   refusing it would make every 068-projected group (which 068 left with
 //!   *zero administrators* by design) permanently unmanageable;
 //! * `remove_member` additionally always permits an agent to remove **its own**
@@ -94,6 +94,32 @@
 //! This is deliberately weaker than "only an admin may add members": community
 //! groups have no admins to require. It is strictly stronger than nothing, and it
 //! is fail-closed in the direction that matters (a stranger cannot let itself in).
+//!
+//! ## The bootstrap is keyed on the roster EXISTING, not on it being live
+//!
+//! An earlier revision opened the bootstrap whenever the group had no LIVE
+//! membership. That is a standing condition, not a moment: once the last member
+//! left or was removed, the group was open again, and the next caller to add
+//! itself received a live row over everything the group had accumulated while
+//! it was closed. The rule is now "no membership row at all", the same
+//! roster-shaped spelling migration 092 gives
+//! `epigraph_group_roster_admits_principal`. It is keyed on whether a roster
+//! exists at all, which a soft revocation -- the only kind of removal this
+//! workspace performs on `group_memberships` -- never undoes, and it agrees
+//! with the RLS arm it will eventually sit behind. Like 092's, it would reopen
+//! if every row of a group were hard-deleted; 092 section 3 records that as a
+//! named residual and this rule shares it.
+//!
+//! The cost is stated rather than hidden. A community whose last member has
+//! left is now closed to the community routes for good: nobody is a live
+//! member, so nobody passes the rule. There is no in-band recovery. A group
+//! created through `POST /api/v1/communities` never reaches that state, because
+//! its creator's `admin` row is never retracted by [`CommunityRepository::remove_member`]
+//! and the group route's last-admin guard keeps it live. The groups that can
+//! reach it are the ones 068 projected with no administrator; re-seeding one
+//! is an operator action on the maintenance connection, and giving those groups
+//! an administrator in band is the projected-groups half of
+//! `F-PR12-community-groups-still-have-no-admin` (owner PR-18).
 //!
 //! ## The route-level half is now in place too
 //!
@@ -153,8 +179,8 @@ pub enum MembershipOutcome {
     /// The row was not present (`remove_member` only).
     NotFound,
     /// The acting agent is not a live member of the community's projected
-    /// group, and that group has live members — so this is not the bootstrap
-    /// case. Map to 403.
+    /// group, and that group has a roster (live or revoked rows) — so this is
+    /// not the bootstrap case. Map to 403.
     DeniedNotAMember,
 }
 
@@ -165,10 +191,12 @@ pub struct CommunityRepository;
 /// allowed to change the membership of community `$1`?
 ///
 /// See the module docs for the rule and why it is this rule. True when the
-/// projected group has no live members at all (bootstrap), otherwise only if
-/// the acting agent holds a live membership in it. A `None` agent binds SQL
-/// NULL, `agent_id = NULL` is never true, and the second disjunct is false —
-/// the same refusal the two-query form gave a caller with no principal.
+/// projected group has never had a membership row (bootstrap), otherwise only
+/// if the acting agent holds a live membership in it. The first disjunct
+/// carries no `revoked_at` filter ON PURPOSE: with one, a group whose members
+/// had all left would reopen to anyone. A `None` agent binds SQL NULL,
+/// `agent_id = NULL` is never true, and the second disjunct is false — the same
+/// refusal the two-query form gave a caller with no principal.
 ///
 /// A `const` rather than a connection-taking helper, deliberately. It is run in
 /// two places: [`may_manage_membership`] runs it on the pool for `add_member`,
@@ -179,8 +207,7 @@ pub struct CommunityRepository;
 /// rule has no viewer to spend, because it must read the whole roster.
 /// Sharing the text means the rule is still written once.
 const MAY_MANAGE_MEMBERSHIP_SQL: &str = "
-    SELECT NOT EXISTS (SELECT 1 FROM group_memberships m
-                        WHERE m.group_id = $1 AND m.revoked_at IS NULL)
+    SELECT NOT EXISTS (SELECT 1 FROM group_memberships m WHERE m.group_id = $1)
         OR EXISTS (SELECT 1 FROM group_memberships m
                     WHERE m.group_id = $1 AND m.agent_id = $2
                       AND m.revoked_at IS NULL)";
@@ -391,7 +418,8 @@ impl CommunityRepository {
     ///
     /// Closed membership — see the module docs. `acting_agent` is the
     /// authenticated principal (`Viewer::principal()`); `None` is a caller with
-    /// no principal and is refused unless the community's group is empty.
+    /// no principal and is refused unless the community's group has never had
+    /// a membership row.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails.
