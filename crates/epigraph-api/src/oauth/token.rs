@@ -159,31 +159,89 @@ fn refresh_allowed(
 /// `oauth_clients`, the `agents` upsert, the write-once link and the
 /// personal-group bootstrap either all land or none do.
 ///
-/// The WARM path does no database work at all. `client_agent_id` is
+/// The WARM path does no transaction. `client_agent_id` is
 /// `oauth_clients.agent_id` from the row the caller already loaded to
 /// authenticate this request, which is exactly the value the transaction would
 /// re-read; taking it as an argument avoids `BEGIN; SELECT … FOR UPDATE;
 /// COMMIT;` — three round-trips plus a row-level lock that serialises
 /// concurrent mints for one client — on every refresh, forever, for a value the
-/// caller is holding.
+/// caller is holding. It does ONE read: the operated-agent refusal below.
+///
+/// # Operated agents are stdio-only (migration 102)
+///
+/// Both paths end in [`refuse_operated_agent`]: an agent with a live ACTING
+/// operator link (`epigraph_operator_actor`) gets no token, in every grant arm,
+/// because this function is the one choke point all four mint sites share. An
+/// operated agent's writer membership puts its operator's personal group in
+/// the `Viewer` of any token minted for it, so an OAuth token would carry the
+/// operator's write authority onto the HTTP surface. A link-time "has no OAuth
+/// client" check would not be enough — a client can be approved after the
+/// link — so the refusal is at issuance, re-read on every mint.
 ///
 /// This is on the write path of every token mint, so a failure here is an
 /// authentication failure — it is deliberately NOT best-effort.
 ///
 /// # Errors
-/// Returns `ApiError::InternalError` if the transaction cannot be opened,
-/// committed, or if the principal cannot be materialised.
+/// Returns `ApiError::Forbidden` for an operated agent, and
+/// `ApiError::InternalError` if the transaction cannot be opened, committed, if
+/// the principal cannot be materialised, or if the operated-agent check fails.
 #[cfg(feature = "db")]
 pub(crate) async fn principal_agent_id(
     state: &AppState,
     client_row_id: uuid::Uuid,
     client_agent_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, ApiError> {
+    let agent_id = match client_agent_id {
+        Some(agent_id) => agent_id,
+        None => materialise_principal_agent(state, client_row_id).await?,
+    };
+    refuse_operated_agent(state, agent_id).await?;
+    Ok(agent_id)
+}
+
+/// Refuse to mint a token for an agent with a live ACTING operator link. See
+/// [`principal_agent_id`]. A RETIRED link does not refuse: a retired agent
+/// holds no membership, so its token carries no operator authority.
+///
+/// # Errors
+/// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the
+/// check itself fails (fail closed — no token on an unanswered question).
+#[cfg(feature = "db")]
+async fn refuse_operated_agent(state: &AppState, agent_id: uuid::Uuid) -> Result<(), ApiError> {
     use epigraph_db::repos::agent::AgentRepository;
 
-    if let Some(agent_id) = client_agent_id {
-        return Ok(agent_id);
+    match AgentRepository::operator_actor_pool(&state.db_pool, agent_id).await {
+        Ok(None) => Ok(()),
+        Ok(Some(link)) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                operator_id = %link.operator_id,
+                "token refused: the agent is operated (migration 102) and operated agents are \
+                 stdio-only"
+            );
+            Err(ApiError::Forbidden {
+                reason: format!(
+                    "agent {agent_id} is operated by {} and operated agents are stdio-only: a \
+                     token for it would carry the operator's write authority onto the HTTP \
+                     surface",
+                    link.operator_id
+                ),
+            })
+        }
+        Err(e) => Err(ApiError::InternalError {
+            message: format!("Failed to check whether agent {agent_id} is operated: {e}"),
+        }),
     }
+}
+
+/// The COLD path of [`principal_agent_id`]: materialise the client's agent and
+/// link it, in one transaction.
+#[cfg(feature = "db")]
+async fn materialise_principal_agent(
+    state: &AppState,
+    client_row_id: uuid::Uuid,
+) -> Result<uuid::Uuid, ApiError> {
+    use epigraph_db::repos::agent::AgentRepository;
 
     let mut tx = state
         .db_pool

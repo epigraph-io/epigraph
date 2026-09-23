@@ -514,9 +514,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        13,
+        14,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
-         that MINTS the principal every later request is scoped to; a Viewer cannot precede it.",
+         that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
+         The fourteenth site is `refuse_operated_agent` (migration 102): it asks, before minting, \
+         whether the agent has an ACTING operator link, through the `epigraph_operator_actor` \
+         SECURITY DEFINER read, which answers without a stamp and returns only the named agent's \
+         operator — the same pre-authentication reason, re-read for it.",
     ),
     (
         "state.rs",
