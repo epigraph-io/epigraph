@@ -1296,3 +1296,67 @@ async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool
          about it; stderr:\n{stderr}"
     );
 }
+
+/// `verify` checks migration 102's EXECUTE grants to `epigraph_app`, in both
+/// directions (review finding F8).
+///
+/// * A missing grant on the actor read is an OUTAGE, not a feature quietly
+///   off: `default_decl_for_author` calls it on every claim write, so every
+///   app-DSN claim write fails 42501. 102 grants it only if the app role
+///   existed when 102 ran, and the ownership check passes green regardless.
+/// * A grant on a link function hands the request DSN the power to record
+///   operator links.
+///
+/// CALIBRATION: at head, after a clean run, `verify` passes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_checks_the_operator_function_grants_to_the_app_role(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    seed_undeclared_claim(&pool, agent, "ordinary").await;
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "baseline run must pass; stderr:\n{stderr}");
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "CALIBRATION: verify passes at head; stderr:\n{stderr}"
+    );
+
+    // The app role provisioned after 102 ran: no EXECUTE on the actor read.
+    sqlx::query(
+        "REVOKE EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) FROM epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke the read grant");
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must refuse a deploy where epigraph_app cannot call the per-write operator \
+         read; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("epigraph_operator_actor") && stderr.contains("cannot EXECUTE"),
+        "and it must NAME the function; stderr:\n{stderr}"
+    );
+    sqlx::query("GRANT EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) TO epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("restore the read grant");
+
+    // The opposite direction: the app role may call a link function.
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION public.epigraph_link_retired_agent(uuid, uuid) TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("grant the link function");
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must refuse a deploy where the request DSN can record operator links; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("epigraph_link_retired_agent") && stderr.contains("CAN EXECUTE"),
+        "and it must NAME the function; stderr:\n{stderr}"
+    );
+}

@@ -204,10 +204,20 @@
 -- can silently no-op, so it is pinned in CI by
 -- `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted`
 -- and at deploy by `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. The
--- failure directions are both CLOSED: an unbypassed read reads no link
--- (agents author into their own group and own nothing through an operator, as
--- before this file), and an unbypassed link function is refused by the tenancy
--- policies.
+-- failure directions of a wrong OWNER are both CLOSED: an unbypassed read reads
+-- no link (agents author into their own group and own nothing through an
+-- operator, as before this file), and an unbypassed link function is refused by
+-- the tenancy policies.
+--
+-- A missing EXECUTE GRANT is NOT closed in the same way, and is not a feature
+-- quietly off: `default_decl_for_author` calls `epigraph_operator_actor` on
+-- EVERY claim write, so an `epigraph_app` without EXECUTE on it gets 42501 on
+-- every app-DSN claim write -- an outage. The grant below sits inside
+-- `IF EXISTS (... 'epigraph_app')`, so a cluster where the app role is
+-- provisioned AFTER this file ran carries no grant. The ownership check above
+-- cannot see that; `tenancy_backfill.rs::verify_operator_function_grants`
+-- checks both directions (the reads granted, the link functions not) and
+-- fails the deploy pre-flight.
 --
 -- ===================================================================
 -- 7. RETIRED LINKS: `epigraph_link_retired_agent`

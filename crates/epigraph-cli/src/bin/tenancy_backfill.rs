@@ -1187,6 +1187,101 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     Ok(failures)
 }
 
+/// Migration 102's EXECUTE grants to `epigraph_app`, which the ownership check
+/// above does not see. Returns the number of failing checks.
+///
+/// # Why this is its own check
+///
+/// [`verify_definer_ownership`] proves each body is OWNED by a maintenance
+/// member. It says nothing about who may CALL it, and for 102 both directions
+/// matter:
+///
+/// * the two READS (`epigraph_operator_actor`, `epigraph_operator_of_author`)
+///   must be EXECUTE-able by `epigraph_app`. `default_decl_for_author` calls the
+///   actor read on EVERY claim write, so a missing grant is not a feature
+///   quietly off — it is `42501` on every app-DSN claim write, an outage. 102
+///   grants it inside `IF EXISTS (… 'epigraph_app')`, so a cluster where the app
+///   role is provisioned AFTER 102 ran carries no grant, and the ownership check
+///   still passes green (review finding F8).
+/// * the two LINK functions (`epigraph_link_operator`,
+///   `epigraph_link_retired_agent`) must NOT be. A grant there lets the request
+///   DSN record operator links, which is the whole of 102's trust basis.
+///
+/// Each function is checked only when it exists (the same deferral as
+/// [`DEFERRED_DEFINER_FUNCTIONS`]), and the whole check only when the app role
+/// exists — with no `epigraph_app` there is no grant to be wrong.
+async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize> {
+    const APP_ROLE: &str = "epigraph_app";
+    const GRANTS: &[(&str, &str, bool)] = &[
+        (
+            "epigraph_operator_actor",
+            "public.epigraph_operator_actor(uuid)",
+            true,
+        ),
+        (
+            "epigraph_operator_of_author",
+            "public.epigraph_operator_of_author(uuid)",
+            true,
+        ),
+        (
+            "epigraph_link_operator",
+            "public.epigraph_link_operator(uuid, uuid)",
+            false,
+        ),
+        (
+            "epigraph_link_retired_agent",
+            "public.epigraph_link_retired_agent(uuid, uuid)",
+            false,
+        ),
+    ];
+
+    let app_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(APP_ROLE)
+            .fetch_one(pool)
+            .await?;
+    if !app_exists {
+        return Ok(0);
+    }
+    let mut failures = 0usize;
+    for (name, signature, app_must_execute) in GRANTS {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p
+                              JOIN pg_namespace n ON n.oid = p.pronamespace
+                             WHERE n.nspname = 'public' AND p.proname = $1)",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await?;
+        if !present {
+            continue;
+        }
+        let app_can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(APP_ROLE)
+            .bind(signature)
+            .fetch_one(pool)
+            .await?;
+        if app_can != *app_must_execute {
+            failures += 1;
+            if *app_must_execute {
+                eprintln!(
+                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Migration 102 grants it only if \
+                     the role existed when 102 ran; without it every claim write on the app DSN \
+                     fails with 42501 (the authoring path calls it per write). Re-issue: GRANT \
+                     EXECUTE ON FUNCTION {signature} TO {APP_ROLE};"
+                );
+            } else {
+                eprintln!(
+                    "FAIL: {APP_ROLE} CAN EXECUTE {signature}. The request DSN could then record \
+                     operator links itself, which is the whole of migration 102's trust basis. \
+                     Re-issue: REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {APP_ROLE};"
+                );
+            }
+        }
+    }
+    Ok(failures)
+}
+
 /// Count rows still owned by the world group on `table`.
 ///
 /// **The world group ONLY, which is narrower than "carries no real owner".** 062
@@ -1222,6 +1317,7 @@ async fn verify(pool: &PgPool) -> anyhow::Result<usize> {
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
+    failures += verify_operator_function_grants(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL
