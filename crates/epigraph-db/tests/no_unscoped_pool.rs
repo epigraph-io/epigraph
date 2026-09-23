@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (278 today; the assertions below measure the tree and
+//! deletes in week two. (271 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 278 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 271 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,22 +120,24 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 278 is not 0 — and no shard in the series may be
+//!      discharged the gate — 271 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 138 of the 416 sites the series began with are gone — 113
+//!      decision: 145 of the 416 sites the series began with are gone — 113
 //!      converted by the shards, 3 REMOVED outright when `routes/claims.rs`'s
 //!      `group_id` membership gates stopped reading `group_memberships` through
 //!      the raw pool, 4 moved onto `ScopedPool::begin_as` when
 //!      `routes/workflows.rs::deprecate_workflow` was gated
 //!      (F-write-authz-reads-unfiltered), 4 more moved onto it when
-//!      `routes/hypothesis.rs::promote_hypothesis` was gated (F-SBC-A2), and
-//!      14 went with the
+//!      `routes/hypothesis.rs::promote_hypothesis` was gated (F-SBC-A2), 7
+//!      more moved onto `AppState::read_as` / `ScopedPool::begin_as` when
+//!      `routes/computation.rs::propagate_beliefs` was converted as a whole
+//!      handler (F-SHARD4-A2), and 14 went with the
 //!      F-inline-claim-content-reads discharge — 12 moved onto
 //!      `AppState::read_as` (`routes/embeddings.rs` 2, `routes/conflicts.rs`
 //!      3, `routes/policies.rs` 2, `routes/political.rs` 1,
 //!      `routes/workflows.rs` 4), 1 moved onto a maintenance session
 //!      (`routes/clusters.rs::build_from_bridges`) and 1 removed outright
-//!      (`report_outcome`'s redundant content re-read) — and 278 are not.
+//!      (`report_outcome`'s redundant content re-read) — and 271 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -566,7 +568,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 278;
+const HIGH_WATER: usize = 271;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -633,11 +635,21 @@ const HIGH_WATER: usize = 278;
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// ("routes/hypothesis.rs: recorded 11, measured 7") and off this test's own
 /// failure with both constants temporarily set to 1 ("278 unexempted sites").
+///
+/// The `propagate_beliefs` conversion (deferred-commitment screen key
+/// `f-shard4-a2-propagate-beliefs`, recorded on `F-SHARD4-A2`) did not move
+/// this constant: `routes/computation.rs` keeps `compose_subgraphs`'s 3 sites.
+/// The handler's seven sites moved onto ONE stamped connection per request,
+/// `AppState::read_as` without `apply_updates` and `ScopedPool::begin_as` with
+/// it. `HIGH_WATER` went 278 -> 271, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// ("routes/computation.rs: recorded 10, measured 3") and off this test's own
+/// failure with both constants temporarily set to 1 ("271 unexempted sites").
 const HIGH_WATER_FILES: usize = 42;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 278 sites across 42 files as of this commit. Lower an entry when a shard
+/// 271 sites across 42 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -696,7 +708,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the shard declined to produce one. Of the ten that remain, seven are
     // `propagate_beliefs`, which writes through two of them, and three are
     // `compose_subgraphs`. Both are named in that file's module doc.
-    ("routes/computation.rs", 10),
+    // 10 before the deferred-commitment fix recorded on `F-SHARD4-A2`
+    // (screen key `f-shard4-a2-propagate-beliefs`), which converted
+    // `propagate_beliefs` as a whole handler: its seven sites moved onto ONE
+    // stamped connection, `AppState::read_as` without `apply_updates` and
+    // `ScopedPool::begin_as` with it. The three that remain are
+    // `compose_subgraphs` (`F-SHARD4-A1`).
+    ("routes/computation.rs", 3),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     // 10 before the `F-inline-claim-content-reads` discharge moved

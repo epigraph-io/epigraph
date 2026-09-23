@@ -9,7 +9,7 @@
 //! - `POST /api/v1/graph/compose`         - Compose two subgraphs via decorated cospans
 //! - `GET  /api/v1/claims/:id/belief-at`  - Reconstruct belief at a past timestamp
 //!
-//! # Tenancy: 5 of this file's 15 raw-pool sites are converted, and 10 are not
+//! # Tenancy: 12 of this file's 15 raw-pool sites are converted, and 3 are not
 //!
 //! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
 //! (`epigraph-db/tests/no_unscoped_pool.rs`). Unlike `routes/belief.rs`, the
@@ -23,22 +23,22 @@
 //! statement on it. `sheaf_reconcile` is a POST and is still a read — it returns
 //! computed proposals and persists nothing.
 //!
+//! Converted later, as a whole handler (seven sites): `propagate_beliefs`, by
+//! deferred-commitment screen key `f-shard4-a2-propagate-beliefs`, recorded on
+//! `F-SHARD4-A2`'s `fix_2026_09_22` field. That entry stays open until the
+//! operator confirms the fix answers the question its private record holds.
+//! Shard 4 declined the handler because it writes
+//! through two of its seven sites, and converting only the reads would have
+//! changed its output silently and with a 200. It now runs every statement on
+//! ONE stamped connection: `read_as` when `apply_updates` is off, and
+//! `ScopedPool::begin_as` when it is on, never `read_as` for a write. Its four
+//! reads are viewer-filtered repo functions, and its two writes are one
+//! `{WRITABLE:c}` statement, `ClaimRepository::apply_propagated_belief`. See
+//! the handler's own doc for the read predicates, including the one on
+//! `factors`, which has no tenancy columns of its own.
+//!
 //! Not converted, and NOT merely deferred:
 //!
-//! * `propagate_beliefs` (7 sites) writes through two of them. Converting only
-//!   its reads is the shape no shard in this series has reviewed — every prior
-//!   shard converted whole handlers — and a half-converted handler here would
-//!   change its own output silently and with a 200, so it is whole-handler work
-//!   or none. Converting the writes too is worse — `read_as` is
-//!   documented read-only, `ScopedRead::commit` is not called by `Drop`, and
-//!   under `SessionGucMode::Transaction` a write routed through it is rolled
-//!   back while still type-checking, because `ScopedRead` is
-//!   `DerefMut<Target = PgConnection>`. Its write side belongs to
-//!   `ScopedPool::begin_as` plus 16b's `Viewer::splice_write`, as a whole-handler
-//!   change with its own evidence. A separate question raised while classifying
-//!   this handler is registered as `F-SHARD4-A2`; analysis held outside this
-//!   repository, and its owner is NOT the conversion-shard series — see the
-//!   entry's `assigned` field.
 //! * `compose_subgraphs` (3 sites) is registered as `F-SHARD4-A1`; analysis
 //!   held outside this repository. Owner: the conversion-shard series. Two of
 //!   its three sites reach the database through [`extract_neighborhood`], which
@@ -556,44 +556,246 @@ pub async fn sheaf_reconcile(
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
+///
+/// # Tenancy (`F-SHARD4-A2`)
+///
+/// Every statement runs on ONE viewer-stamped connection, and every read is
+/// filtered by the caller's `Viewer`:
+///
+/// * factors: `FactorRepository::list_readable`, which drops a factor unless
+///   EVERY variable is a claim the caller may read, so hidden evidence never
+///   reaches a visible claim through a message;
+/// * prior beliefs: `ClaimRepository::pignistic_probs_for`;
+/// * mass functions: `MassFunctionRepository::get_for_claims`, loaded once;
+/// * alternative sets: `AlternativeSetRepository::members_for_claims`, which
+///   filters the edge and both endpoints.
+///
+/// Without `apply_updates` nothing is written, and the reads run on
+/// [`AppState::read_as`]. With it, the caller must hold `claims:write` (401
+/// without an auth context, 403 without the scope), and the reads and the
+/// writes run on one `ScopedPool::begin_as(&viewer)` transaction. Each write is
+/// `ClaimRepository::apply_propagated_belief`, whose `UPDATE` carries
+/// `{WRITABLE:c}`. A claim the caller may read but not write is counted in
+/// `apply_failures` and left unchanged; so is a CDST result with no interval.
+/// A database error on any statement is a 500, and the transaction is not
+/// committed, so nothing is persisted.
+///
+/// Before this, all seven statements ran on the raw pool. Any bearer got BetPs
+/// for claims it could not read and could overwrite the cached belief of any
+/// claim a factor named. The scalar branch also discarded its write errors.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let apply = request.apply_updates.unwrap_or(false);
+
+    if !apply {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "propagate_beliefs",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let run = compute_propagation(&mut read, &viewer, &request).await?;
+        crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
+        return Ok(Json(run.response(false, 0)));
+    }
+
+    // An ABSENT auth context is a refusal, not a pass.
+    let Some(axum::Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            handler = "propagate_beliefs",
+            "apply_updates refused: this process was not built from a ScopedPool"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+    let mut tx = scoped.begin_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "propagate_beliefs",
+            "could not begin a viewer-stamped transaction"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+
+    let run = compute_propagation(&mut tx, &viewer, &request).await?;
+    let apply_failures = persist_propagation(&mut tx, &viewer, &run).await?;
+
+    tx.commit().await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "propagate_beliefs",
+            "commit failed"
+        );
+        ApiError::InternalError {
+            message: "Belief propagation transaction failed".to_string(),
+        }
+    })?;
+
+    Ok(Json(run.response(true, apply_failures)))
+}
+
+/// One result an `apply_updates` run writes: `(claim, betp, interval)`, where
+/// `interval` is `Some((belief, plausibility))` for CDST and `None` for scalar.
+#[cfg(feature = "db")]
+type PropagationWrite = (Uuid, f64, Option<(f64, f64)>);
+
+/// What one `propagate_beliefs` run computed, before anything is persisted.
+#[cfg(feature = "db")]
+enum Propagation {
+    /// No factor the viewer may read, so there was nothing to run.
+    NoFactors,
+    Cdst {
+        result: epigraph_engine::cdst_bp::CdstBpResult,
+        factors_count: usize,
+        variables_count: usize,
+    },
+    Scalar {
+        result: epigraph_engine::BpResult,
+        factors_count: usize,
+        variables_count: usize,
+    },
+}
+
+#[cfg(feature = "db")]
+impl Propagation {
+    /// The rows an `apply_updates` run writes, as `(claim, betp, interval)`,
+    /// and how many results could not be written at all.
+    ///
+    /// A CDST result with no interval for its claim is counted rather than
+    /// written as the vacuous `(0.0, 1.0)` the handler used to substitute.
+    /// `run_cdst_bp` builds both lists from one map, so the count is 0 today;
+    /// it is counted so that a change to the engine surfaces as a failure
+    /// instead of as vacuous belief written over a real one.
+    fn writes(&self) -> (Vec<PropagationWrite>, usize) {
+        match self {
+            Propagation::NoFactors => (Vec::new(), 0),
+            Propagation::Cdst { result, .. } => {
+                let intervals: HashMap<Uuid, (f64, f64)> = result
+                    .updated_intervals
+                    .iter()
+                    .map(|(id, iv)| (*id, (iv.bel, iv.pl)))
+                    .collect();
+                let mut writes = Vec::with_capacity(result.updated_betps.len());
+                let mut missing = 0;
+                for (claim_id, betp) in &result.updated_betps {
+                    match intervals.get(claim_id) {
+                        Some(iv) => writes.push((*claim_id, *betp, Some(*iv))),
+                        None => missing += 1,
+                    }
+                }
+                (writes, missing)
+            }
+            Propagation::Scalar { result, .. } => (
+                result
+                    .updated_beliefs
+                    .iter()
+                    .map(|(id, betp)| (*id, *betp, None))
+                    .collect(),
+                0,
+            ),
+        }
+    }
+
+    fn response(&self, applied: bool, apply_failures: usize) -> serde_json::Value {
+        match self {
+            Propagation::NoFactors => serde_json::json!({
+                "iterations": 0,
+                "converged": true,
+                "max_change": 0.0,
+                "messages_sent": 0,
+                "factors_count": 0,
+                "variables_count": 0,
+                "applied": false,
+                "updated_beliefs": [],
+            }),
+            Propagation::Cdst {
+                result,
+                factors_count,
+                variables_count,
+            } => serde_json::json!({
+                "mode": "cdst",
+                "iterations": result.iterations,
+                "converged": result.converged,
+                "max_change": result.max_change,
+                "max_conflict": result.max_conflict,
+                "messages_sent": result.messages_sent,
+                "factors_count": factors_count,
+                "variables_count": variables_count,
+                "applied": applied,
+                "apply_failures": apply_failures,
+                "updated_beliefs": result.updated_betps.iter()
+                    .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
+                    .collect::<Vec<_>>(),
+            }),
+            Propagation::Scalar {
+                result,
+                factors_count,
+                variables_count,
+            } => serde_json::json!({
+                "mode": "scalar",
+                "iterations": result.iterations,
+                "converged": result.converged,
+                "max_change": result.max_change,
+                "messages_sent": result.messages_sent,
+                "factors_count": factors_count,
+                "variables_count": variables_count,
+                "applied": applied,
+                "apply_failures": apply_failures,
+                "updated_beliefs": result.updated_beliefs.iter()
+                    .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
+                    .collect::<Vec<_>>(),
+            }),
+        }
+    }
+}
+
+/// Load what the viewer may read and run belief propagation over it. Reads
+/// only: the caller decides whether `conn` is a read or a write transaction.
+#[cfg(feature = "db")]
+async fn compute_propagation(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
+    request: &PropagateRequest,
+) -> Result<Propagation, ApiError> {
     let config = epigraph_engine::BpConfig {
         max_iterations: request.max_iterations.unwrap_or(20),
         convergence_threshold: request.convergence_threshold.unwrap_or(0.01),
         damping: request.damping.unwrap_or(0.5),
     };
-    let apply = request.apply_updates.unwrap_or(false);
 
-    // Load factors from DB
-    let factors: Vec<FactorRow> = sqlx::query_as(
-        "SELECT id, factor_type, variable_ids, potential, description \
-         FROM factors \
-         WHERE ($1::uuid IS NULL OR frame_id = $1) \
-         ORDER BY created_at",
-    )
-    .bind(request.frame_id)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to load factors: {e}"),
-    })?;
+    // Load the factors whose every variable the viewer may read.
+    let factors =
+        epigraph_db::FactorRepository::list_readable(&mut *conn, viewer, request.frame_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to load factors: {e}"),
+            })?;
 
     if factors.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "iterations": 0,
-            "converged": true,
-            "max_change": 0.0,
-            "messages_sent": 0,
-            "factors_count": 0,
-            "variables_count": 0,
-            "applied": false,
-            "updated_beliefs": [],
-        })));
+        return Ok(Propagation::NoFactors);
     }
 
     // Collect all variable IDs and load their current beliefs
@@ -604,10 +806,8 @@ pub async fn propagate_beliefs(
         .into_iter()
         .collect();
 
-    let belief_rows: Vec<(Uuid, Option<f64>)> =
-        sqlx::query_as("SELECT id, pignistic_prob FROM claims WHERE id = ANY($1)")
-            .bind(&all_var_ids)
-            .fetch_all(&state.db_pool)
+    let belief_rows =
+        epigraph_db::ClaimRepository::pignistic_probs_for(&mut *conn, viewer, &all_var_ids)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to load beliefs: {e}"),
@@ -631,19 +831,24 @@ pub async fn propagate_beliefs(
     // -- CDST branch: decide mode, load mass functions if needed ---------------
     let mode = request.mode.as_deref().unwrap_or("auto");
 
-    // Only load mass functions when CDST might be used (skip for explicit scalar/interval)
+    // Load mass functions once, and only when CDST might be used (skip for
+    // explicit scalar/interval). Auto mode used to load them twice and treat a
+    // failed first load as "no coverage"; inside a transaction a failed
+    // statement aborts every statement after it, so it is an error instead.
+    let mf_rows = match mode {
+        "scalar" | "interval" => Vec::new(),
+        _ => epigraph_db::MassFunctionRepository::get_for_claims(&mut *conn, viewer, &all_var_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to load mass functions: {e}"),
+            })?,
+    };
+
     let use_cdst = match mode {
         "cdst" => true,
         "scalar" | "interval" => false,
         _ => {
-            // Auto: load mass functions and check coverage
-            let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
-                &state.db_pool,
-                &viewer,
-                &all_var_ids,
-            )
-            .await
-            .unwrap_or_default();
+            // Auto: check coverage
             let claims_with_mf: std::collections::HashSet<Uuid> =
                 mf_rows.iter().map(|r| r.claim_id).collect();
             !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len()
@@ -651,16 +856,6 @@ pub async fn propagate_beliefs(
     };
 
     if use_cdst {
-        let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
-            &state.db_pool,
-            &viewer,
-            &all_var_ids,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to load mass functions: {e}"),
-        })?;
-
         // Combine multiple mass functions per claim via adaptive combination
         // (a claim may have evidence from multiple sources/agents)
         let mut evidence: HashMap<Uuid, epigraph_ds::MassFunction> = HashMap::new();
@@ -693,15 +888,19 @@ pub async fn propagate_beliefs(
             })
             .collect();
 
-        // Load the alternative-set equivalence class for every claim from the
-        // `alternative_set` view (migration 042). Empty on a fresh graph —
-        // BP must not fail in that case, so we tolerate query failures and
-        // proceed with an empty map (== legacy pure-Dempster behavior).
-        let alt_set_rows: Vec<(Uuid, Vec<Uuid>)> =
-            sqlx::query_as("SELECT claim_id, alt_members FROM alternative_set")
-                .fetch_all(&state.db_pool)
-                .await
-                .unwrap_or_default();
+        // The alternative-set equivalence class of every variable, over the
+        // edges and claims the viewer may read. Empty on a fresh graph, which
+        // is the legacy pure-Dempster behaviour. A failure is an error, no
+        // longer an empty map: it changed the result silently with a 200.
+        let alt_set_rows = epigraph_db::AlternativeSetRepository::members_for_claims(
+            &mut *conn,
+            viewer,
+            &all_var_ids,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to load alternative sets: {e}"),
+        })?;
 
         let mut alt_set_membership: epigraph_engine::cdst_bp::AltSetMembership = HashMap::new();
         for (claim_id, members) in alt_set_rows {
@@ -723,75 +922,60 @@ pub async fn propagate_beliefs(
             &cdst_config,
         );
 
-        // Apply updates: write pignistic_prob, belief, plausibility to claims
-        let mut apply_failures = 0_usize;
-        if apply {
-            for (claim_id, betp) in &result.updated_betps {
-                let iv = result
-                    .updated_intervals
-                    .iter()
-                    .find(|(id, _)| id == claim_id)
-                    .map(|(_, iv)| iv);
-                let (bel, pl) = iv.map(|i| (i.bel, i.pl)).unwrap_or((0.0, 1.0));
-                if sqlx::query(
-                    "UPDATE claims SET pignistic_prob = $1, belief = $2, plausibility = $3, updated_at = NOW() WHERE id = $4",
-                )
-                .bind(betp).bind(bel).bind(pl).bind(claim_id)
-                .execute(&state.db_pool)
-                .await
-                .is_err() {
-                    apply_failures += 1;
-                }
-            }
-        }
-
-        return Ok(Json(serde_json::json!({
-            "mode": "cdst",
-            "iterations": result.iterations,
-            "converged": result.converged,
-            "max_change": result.max_change,
-            "max_conflict": result.max_conflict,
-            "messages_sent": result.messages_sent,
-            "factors_count": engine_factors.len(),
-            "variables_count": all_var_ids.len(),
-            "applied": apply,
-            "apply_failures": apply_failures,
-            "updated_beliefs": result.updated_betps.iter()
-                .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
-                .collect::<Vec<_>>(),
-        })));
+        return Ok(Propagation::Cdst {
+            result,
+            factors_count: engine_factors.len(),
+            variables_count: all_var_ids.len(),
+        });
     }
 
     // -- Scalar BP fallback ---------------------------------------------------
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
-    if apply && !result.updated_beliefs.is_empty() {
-        for (claim_id, new_betp) in &result.updated_beliefs {
-            let _ = sqlx::query("UPDATE claims SET pignistic_prob = $1 WHERE id = $2")
-                .bind(new_betp)
-                .bind(claim_id)
-                .execute(&state.db_pool)
-                .await;
+    Ok(Propagation::Scalar {
+        result,
+        factors_count: engine_factors.len(),
+        variables_count: all_var_ids.len(),
+    })
+}
+
+/// Write a propagation run's results through the write predicate, returning
+/// `apply_failures`: the results that were not written.
+///
+/// Takes the `ScopedTx` itself, not a `&mut PgConnection`, so that a write
+/// cannot be routed through a `ScopedRead`. Under
+/// `SessionGucMode::Transaction` a `ScopedRead` is rolled back on drop, so a
+/// write through one would type-check and then vanish.
+#[cfg(feature = "db")]
+async fn persist_propagation(
+    tx: &mut epigraph_db::ScopedTx<'_>,
+    viewer: &epigraph_db::Viewer,
+    run: &Propagation,
+) -> Result<usize, ApiError> {
+    let (writes, mut apply_failures) = run.writes();
+    for (claim_id, betp, interval) in writes {
+        let written = epigraph_db::ClaimRepository::apply_propagated_belief(
+            &mut **tx, viewer, claim_id, betp, interval,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                error = %e,
+                handler = "propagate_beliefs",
+                "belief propagation write failed"
+            );
+            ApiError::InternalError {
+                message: "Failed to persist propagated beliefs".to_string(),
+            }
+        })?;
+        // A claim the caller may read but not write matches no row. Counted,
+        // never silent: under FORCE RLS a refused UPDATE raises nothing either.
+        if !written {
+            apply_failures += 1;
         }
     }
-
-    let updated: Vec<serde_json::Value> = result
-        .updated_beliefs
-        .iter()
-        .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
-        .collect();
-
-    Ok(Json(serde_json::json!({
-        "mode": "scalar",
-        "iterations": result.iterations,
-        "converged": result.converged,
-        "max_change": result.max_change,
-        "messages_sent": result.messages_sent,
-        "factors_count": engine_factors.len(),
-        "variables_count": all_var_ids.len(),
-        "applied": apply,
-        "updated_beliefs": updated,
-    })))
+    Ok(apply_failures)
 }
 
 /// POST /api/v1/graph/compose - Compose two subgraphs via decorated cospans.
@@ -976,17 +1160,9 @@ pub async fn belief_at_time(
 
 // ── Internal types ──
 
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct FactorRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    factor_type: String,
-    variable_ids: Vec<Uuid>,
-    potential: serde_json::Value,
-    #[allow(dead_code)]
-    description: Option<String>,
-}
+// `FactorRow` was deleted with the inline factor load in `propagate_beliefs`;
+// its replacement is `epigraph_db::FactorRow`, returned by
+// `FactorRepository::list_readable`, whose query carries `/* {VISIBILITY:c} */`.
 
 // `EvidenceAtRow` was deleted with the inline evidence read in
 // `belief_at_time`; its replacement is `epigraph_db::EvidenceAtTimeRow`, whose

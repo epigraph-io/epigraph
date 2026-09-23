@@ -520,7 +520,12 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("assess.rs", 1),
     ("belief.rs", 1),
     ("claims.rs", 4),
-    ("computation.rs", 2),
+    // `("computation.rs", 2)` REMOVED by the deferred-commitment fix recorded
+    // on `F-SHARD4-A2` (screen key `f-shard4-a2-propagate-beliefs`), on the
+    // PR-10 precedent in `FAIL_OPEN_SCOPE_SITES`. `propagate_beliefs`'s two
+    // `UPDATE claims` statements (CDST and scalar) moved to
+    // `ClaimRepository::apply_propagated_belief` behind `{WRITABLE:c}`, which
+    // `write_gate_lint.rs` covers on the repo side.
     ("conventions.rs", 2),
     // 2 before the `F-SBC-A2` fix. `promote_hypothesis`'s
     // `UPDATE claims SET properties = … 'promoted'` moved to

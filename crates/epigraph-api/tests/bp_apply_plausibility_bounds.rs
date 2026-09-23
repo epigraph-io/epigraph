@@ -32,6 +32,22 @@
 //! Task 4's helper migration of computation.rs:621/655 is therefore a
 //! defense-in-depth refactor (centralizing the contract), not a bug fix; the
 //! bug was already fixed at the engine layer in PR #149.
+//!
+//! ## Fixture, since the `F-SHARD4-A2` fix
+//!
+//! The apply path now writes through `ClaimRepository::apply_propagated_belief`,
+//! whose `UPDATE` carries `{WRITABLE:c}`, and counts every claim the caller may
+//! not write in `apply_failures`. So this fixture changed in two ways, and the
+//! `apply_failures == 0` assertion did not:
+//!
+//! * The claims are declared `('public', <the token principal's personal
+//!   group>)` and the token is minted for that principal. Undeclared, they
+//!   landed in the seed group through migration 074's escape hatch, which
+//!   nobody can write, so every result would have been counted.
+//! * The frame is new on every run. It used to be one fixed id, so every run's
+//!   factors joined every later run over the shared `DATABASE_URL` database.
+//!   Those earlier claims belong to earlier runs' principals, so a later run
+//!   would count them too.
 
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -43,46 +59,51 @@ mod common;
 
 /// Frame fixture: binary frame matching `epigraph_engine::cdst_bp::BINARY_FRAME`
 /// (`{"supported", "unsupported"}`). Stored in `frames` so `mass_functions.frame_id`
-/// FK is satisfied. Idempotent across test runs.
-async fn ensure_binary_frame(pool: &PgPool) -> Uuid {
-    // Deterministic UUID so repeated test runs reuse the same row.
-    let frame_id = Uuid::parse_str("00000000-0000-0000-0000-00000000bf01").expect("constant uuid");
+/// FK is satisfied. A new frame on every run, so no earlier run's factors join
+/// this one; see the module doc.
+async fn fresh_binary_frame(pool: &PgPool) -> Uuid {
+    let frame_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO frames (id, name, hypotheses) \
-         VALUES ($1, 'bp_apply_test_binary', ARRAY['supported','unsupported']::text[]) \
-         ON CONFLICT (id) DO NOTHING",
+         VALUES ($1, $2, ARRAY['supported','unsupported']::text[])",
     )
     .bind(frame_id)
+    .bind(format!("bp_apply_test_binary {frame_id}"))
     .execute(pool)
     .await
     .expect("seed binary frame");
     frame_id
 }
 
-/// Seed a claim with explicit belief/plausibility/BetP. Mirrors the helper in
+/// Seed a claim with explicit belief/plausibility/BetP, authored by `owner`
+/// and declared `('public', <owner's personal group>)` so `owner` may write
+/// it. Mirrors the helper in
 /// `crates/epigraph-mcp/tests/common/mod.rs::seed_claim_with_belief`.
 async fn seed_claim_with_belief(
     pool: &PgPool,
+    owner: Uuid,
     belief: f64,
     plausibility: f64,
     pignistic_prob: Option<f64>,
 ) -> Uuid {
-    let agent_id = common::seed_system_agent(pool).await;
+    let group = common::personal_group_of(pool, owner).await;
     let id = Uuid::new_v4();
     let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
     sqlx::query(
         "INSERT INTO claims \
             (id, content, content_hash, agent_id, truth_value, \
-             belief, plausibility, pignistic_prob, is_current, labels) \
-         VALUES ($1, $2, $3, $4, 0.5, $5, $6, $7, true, ARRAY[]::text[])",
+             belief, plausibility, pignistic_prob, is_current, labels, \
+             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, $4, 0.5, $5, $6, $7, true, ARRAY[]::text[], 'public', $8)",
     )
     .bind(id)
     .bind(format!("bp_apply drift seed {id}"))
     .bind(&hash)
-    .bind(agent_id)
+    .bind(owner)
     .bind(belief)
     .bind(plausibility)
     .bind(pignistic_prob)
+    .bind(group)
     .execute(pool)
     .await
     .expect("seed claim with belief");
@@ -183,15 +204,18 @@ async fn cdst_bp_apply_clamps_drifted_plausibility() {
         .await
         .expect("db pool");
 
-    let frame_id = ensure_binary_frame(&pool).await;
+    let frame_id = fresh_binary_frame(&pool).await;
+
+    // The principal the token is minted for, and the author of both claims.
+    let owner = common::seed_system_agent(&pool).await;
 
     // The "drifting" claim — seeded at Pl=1.0 so any post-recompute write above
     // 1.0 trips claims_plausibility_bounds CHECK.
-    let claim_drift = seed_claim_with_belief(&pool, 0.4, 1.0, Some(0.4)).await;
+    let claim_drift = seed_claim_with_belief(&pool, owner, 0.4, 1.0, Some(0.4)).await;
 
     // Companion claim so the factor has the 2 variables it requires
     // (factors_min_variables CHECK in migrations/001_initial_schema.sql:975).
-    let claim_companion = seed_claim_with_belief(&pool, 0.5, 0.6, Some(0.55)).await;
+    let claim_companion = seed_claim_with_belief(&pool, owner, 0.5, 0.6, Some(0.55)).await;
 
     // 20 BBA rows on the drifting claim — combine path produces 1.0+1ULP raw Pl.
     seed_drifting_bbas(&pool, claim_drift, frame_id, 20, 0.05).await;
@@ -202,7 +226,7 @@ async fn cdst_bp_apply_clamps_drifted_plausibility() {
     seed_evidential_support_factor(&pool, frame_id, claim_drift, claim_companion).await;
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let token = common::test_bearer_token_with_scopes(&["claims:write", "graph:read"]);
+    let token = common::test_bearer_token_for_principal(owner, &["claims:write", "graph:read"]);
 
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/bp/propagate"))
