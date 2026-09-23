@@ -25,8 +25,6 @@ use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
-#[cfg(feature = "db")]
-use sqlx;
 
 // ── Request / Response types ──
 
@@ -80,60 +78,61 @@ pub struct LearningEventsQuery {
 // ── Handlers ──
 
 /// GET /api/v1/conflicts/scan - Scan for high-conflict claim pairs.
+///
+/// Both statements are read through the caller's [`Viewer`](epigraph_db::Viewer)
+/// on one stamped connection. Until `F-inline-claim-content-reads` was
+/// discharged this handler took no `Viewer` and returned the raw `content` of
+/// every tenant's highest-conflict claims, plus per-frame counts over claims
+/// and contradictions the caller could not read.
 #[cfg(feature = "db")]
 pub async fn scan_conflicts(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ScanConflictsQuery>,
 ) -> Result<Json<ConflictScanResponse>, ApiError> {
     let min_k = params.min_k.unwrap_or(0.3);
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "scan_conflicts",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Scan for high-conflict claims via mass_functions
-    let high_conflict: Vec<serde_json::Value> = sqlx::query_as::<_, HighConflictRow>(
-        "SELECT mf.claim_id, mf.frame_id, MAX(mf.conflict_k) AS max_k, \
-                COUNT(*) AS bba_count, c.content \
-         FROM mass_functions mf \
-         JOIN claims c ON c.id = mf.claim_id \
-         WHERE mf.conflict_k >= $1 \
-         GROUP BY mf.claim_id, mf.frame_id, c.content \
-         ORDER BY max_k DESC \
-         LIMIT $2",
-    )
-    .bind(min_k)
-    .bind(limit)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to scan conflicts: {e}"),
-    })?
-    .into_iter()
-    .map(|r| {
-        serde_json::json!({
-            "claim_id": r.claim_id,
-            "frame_id": r.frame_id,
-            "max_k": r.max_k,
-            "bba_count": r.bba_count,
-            "content": r.content,
+    let high_conflict: Vec<serde_json::Value> =
+        epigraph_db::MassFunctionRepository::high_conflict_claims(
+            &mut *read, &viewer, min_k, limit,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to scan conflicts: {e}"),
+        })?
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "claim_id": r.claim_id,
+                "frame_id": r.frame_id,
+                "max_k": r.max_k,
+                "bba_count": r.bba_count,
+                "content": r.content,
+            })
         })
-    })
-    .collect();
+        .collect();
 
     // Scan for silence alarms
-    let frame_densities: Vec<FrameDensityRow> = sqlx::query_as(
-        "SELECT f.id AS frame_id, f.name AS frame_name, \
-                (SELECT COUNT(DISTINCT mf.claim_id) FROM mass_functions mf WHERE mf.frame_id = f.id) AS total_claims, \
-                (SELECT COUNT(*) FROM edges e \
-                 JOIN mass_functions mf1 ON mf1.claim_id = e.source_id AND mf1.frame_id = f.id \
-                 WHERE e.relationship = 'CONTRADICTS') AS contradicts_edges, \
-                (SELECT COUNT(DISTINCT mf2.source_agent_id) FROM mass_functions mf2 \
-                 WHERE mf2.frame_id = f.id AND mf2.source_agent_id IS NOT NULL) AS distinct_sources \
-         FROM frames f LIMIT 100",
-    )
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to scan frame densities: {e}"),
-    })?;
+    let frame_densities =
+        epigraph_db::MassFunctionRepository::frame_conflict_densities(&mut *read, &viewer)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to scan frame densities: {e}"),
+            })?;
 
     let silence_alarms: Vec<serde_json::Value> = frame_densities
         .iter()
@@ -355,25 +354,32 @@ pub async fn resolve_conflict(
 }
 
 /// GET /api/v1/conflicts/silence-check - Check for suspiciously silent frames.
+///
+/// Reads the same viewer-filtered densities as [`scan_conflicts`]. It carried
+/// its own unfiltered copy of that statement on the raw pool until
+/// `F-inline-claim-content-reads` was discharged.
 #[cfg(feature = "db")]
 pub async fn silence_check(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let frame_densities: Vec<FrameDensityRow> = sqlx::query_as(
-        "SELECT f.id AS frame_id, f.name AS frame_name, \
-                (SELECT COUNT(DISTINCT mf.claim_id) FROM mass_functions mf WHERE mf.frame_id = f.id) AS total_claims, \
-                (SELECT COUNT(*) FROM edges e \
-                 JOIN mass_functions mf1 ON mf1.claim_id = e.source_id AND mf1.frame_id = f.id \
-                 WHERE e.relationship = 'CONTRADICTS') AS contradicts_edges, \
-                (SELECT COUNT(DISTINCT mf2.source_agent_id) FROM mass_functions mf2 \
-                 WHERE mf2.frame_id = f.id AND mf2.source_agent_id IS NOT NULL) AS distinct_sources \
-         FROM frames f LIMIT 100",
-    )
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to scan frame densities: {e}"),
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "silence_check",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
     })?;
+    let frame_densities =
+        epigraph_db::MassFunctionRepository::frame_conflict_densities(&mut *read, &viewer)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to scan frame densities: {e}"),
+            })?;
 
     let alarms: Vec<serde_json::Value> = frame_densities
         .iter()
@@ -484,26 +490,4 @@ pub async fn list_learning_events(
         "learning_events": events,
         "total": events.len(),
     })))
-}
-
-// ── Internal row types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct HighConflictRow {
-    claim_id: Uuid,
-    frame_id: Uuid,
-    max_k: Option<f64>,
-    bba_count: i64,
-    content: String,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct FrameDensityRow {
-    frame_id: Uuid,
-    frame_name: String,
-    total_claims: i64,
-    contradicts_edges: i64,
-    distinct_sources: i64,
 }

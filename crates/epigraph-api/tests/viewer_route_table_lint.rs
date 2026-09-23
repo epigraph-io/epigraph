@@ -214,7 +214,14 @@ const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3)];
 /// `crates/epigraph-db/src/repos/`, mark it, and splice a `Viewer`.
 const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     ("clusters.rs", 2),
-    ("conflicts.rs", 1),
+    // `conflicts.rs` was 1 until `F-inline-claim-content-reads` was discharged
+    // and is now 0. The site was `scan_conflicts`' high-conflict scan, which
+    // returned `c.content` for every tenant's highest-conflict claims. It is
+    // now `MassFunctionRepository::high_conflict_claims`, marking BOTH
+    // `mass_functions` and `claims`. The handler's silence-alarm statement,
+    // and `silence_check`'s identical copy, were never counted (no content
+    // column) but were per-frame cardinalities over the same rows; both now
+    // call `MassFunctionRepository::frame_conflict_densities`.
     // `cross_source.rs` was 1 until PR-09 and is now 0, so it is gone from the
     // register entirely. The site was `SELECT id, content FROM claims WHERE id
     // = ANY($1)` in `list_candidates`, hydrating excerpts for the candidate

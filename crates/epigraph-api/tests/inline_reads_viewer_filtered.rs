@@ -99,10 +99,50 @@ async fn set_properties(pool: &PgPool, claim: Uuid, props: serde_json::Value) {
         .expect("set properties");
 }
 
+/// Force a row's tenancy columns after insert, and check they held.
+///
+/// Derived rows (`mass_functions`, `edges`) inherit their tenancy from the
+/// parent claim through migration 070's triggers. An arm that needs a derived
+/// row whose tenancy DIFFERS from its parent's — so that exactly one predicate
+/// can withhold it — has to force it afterwards. `co_owner_group_id` is
+/// cleared on `edges` so the single-owner arm of the edge predicate applies.
+async fn force_tenancy(pool: &PgPool, table: &str, id: Uuid, visibility: &str, group: Uuid) {
+    // `table` is a test-local literal at every call site, never caller data.
+    let extra = if table == "edges" {
+        ", co_owner_group_id = NULL"
+    } else {
+        ""
+    };
+    let sql =
+        format!("UPDATE {table} SET visibility = $2, owner_group_id = $3{extra} WHERE id = $1");
+    sqlx::query(&sql)
+        .bind(id)
+        .bind(visibility)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("force tenancy");
+    let (v, g): (String, Uuid) = sqlx::query_as(&format!(
+        "SELECT visibility::text, owner_group_id FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read back tenancy");
+    assert_eq!(
+        (v.as_str(), g),
+        (visibility, group),
+        "CALIBRATION: the {table} row did not keep the tenancy it was given"
+    );
+}
+
 /// A viewer, a stranger, and one claim of each tenancy: public, private to
 /// the viewer's group, private to the stranger's group.
 struct Plant {
     viewer_agent: Uuid,
+    viewer_group: Uuid,
+    stranger_agent: Uuid,
+    stranger_group: Uuid,
     public: Uuid,
     mine: Uuid,
     theirs: Uuid,
@@ -122,6 +162,9 @@ async fn plant(pool: &PgPool, label: &str) -> Plant {
     .await;
     Plant {
         viewer_agent,
+        viewer_group,
+        stranger_agent,
+        stranger_group,
         public,
         mine,
         theirs,
@@ -209,4 +252,252 @@ async fn neighborhood_density_counts_only_what_the_viewer_can_read(pool: PgPool)
         body.by_source_type
     );
     assert_eq!(body.by_level.get("2").copied(), Some(2));
+}
+
+// ── routes/conflicts.rs ──
+
+/// A public frame, owned by the world group.
+async fn seed_public_frame(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, visibility, owner_group_id) \
+         VALUES ($1, ARRAY['supported','contradicted'], 'public', \
+                 (SELECT id FROM groups WHERE kind = 'world' LIMIT 1)) \
+         RETURNING id",
+    )
+    .bind(format!("inline-reads-frame-{}", Uuid::new_v4()))
+    .fetch_one(pool)
+    .await
+    .expect("seed frame")
+}
+
+/// A BBA on `(claim, frame)` from `agent` with conflict coefficient `k`,
+/// forced to `(visibility, group)`.
+async fn seed_bba(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    agent: Uuid,
+    k: f64,
+    visibility: &str,
+    group: Uuid,
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, conflict_k) \
+         VALUES ($1, $2, $3, '{}'::jsonb, $4) RETURNING id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .bind(k)
+    .fetch_one(pool)
+    .await
+    .expect("seed mass function");
+    force_tenancy(pool, "mass_functions", id, visibility, group).await;
+    id
+}
+
+/// A `CONTRADICTS` edge `source -> target`, forced to `(visibility, group)`.
+async fn seed_contradicts(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    visibility: &str,
+    group: Uuid,
+) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'CONTRADICTS') RETURNING id",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(pool)
+    .await
+    .expect("seed CONTRADICTS edge");
+    force_tenancy(pool, "edges", id, visibility, group).await;
+    id
+}
+
+/// The conflict fixture: one public frame, and four claims with a
+/// high-conflict BBA each.
+///
+/// * `public` — public claim, public BBA. Visible.
+/// * `mine` — the viewer's private claim, BBA private to the viewer's group.
+///   Visible only on a viewer-stamped connection.
+/// * `theirs` — the stranger's private claim, whose BBA is forced PUBLIC, so
+///   only the `claims` predicate can withhold it.
+/// * `public_with_private_bba` — a public claim whose only BBA is private to
+///   the stranger's group, so only the `mass_functions` predicate can withhold
+///   it.
+struct ConflictPlant {
+    p: Plant,
+    frame: Uuid,
+    public_with_private_bba: Uuid,
+}
+
+async fn plant_conflicts(pool: &PgPool, label: &str) -> ConflictPlant {
+    let p = plant(pool, label).await;
+    let world: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("world group");
+    let frame = seed_public_frame(pool).await;
+    let public_with_private_bba = seed_public_claim(
+        pool,
+        p.stranger_agent,
+        &format!("{label} public/private-bba"),
+    )
+    .await;
+
+    seed_bba(pool, p.public, frame, p.viewer_agent, 0.9, "public", world).await;
+    seed_bba(
+        pool,
+        p.mine,
+        frame,
+        p.viewer_agent,
+        0.9,
+        "group",
+        p.viewer_group,
+    )
+    .await;
+    seed_bba(
+        pool,
+        p.theirs,
+        frame,
+        p.stranger_agent,
+        0.9,
+        "public",
+        world,
+    )
+    .await;
+    seed_bba(
+        pool,
+        public_with_private_bba,
+        frame,
+        p.stranger_agent,
+        0.9,
+        "group",
+        p.stranger_group,
+    )
+    .await;
+    ConflictPlant {
+        p,
+        frame,
+        public_with_private_bba,
+    }
+}
+
+/// `GET /conflicts/scan`'s high-conflict list returns claim CONTENT, so it is
+/// the sharpest of the register's sites.
+#[sqlx::test(migrations = "../../migrations")]
+async fn scan_conflicts_lists_only_claims_and_bbas_the_viewer_can_read(pool: PgPool) {
+    let cp = plant_conflicts(&pool, "scan").await;
+    let viewer = viewer_for(&pool, cp.p.viewer_agent).await;
+    let state = split_state(&pool).await;
+
+    let body = epigraph_api::routes::conflicts::scan_conflicts(
+        ViewerExtractor(viewer),
+        State(state),
+        axum::extract::Query(epigraph_api::routes::conflicts::ScanConflictsQuery {
+            min_k: Some(0.5),
+            frame_id: None,
+            limit: Some(100),
+        }),
+    )
+    .await
+    .expect("scan_conflicts")
+    .0;
+
+    let ids: Vec<Uuid> = body
+        .high_conflict
+        .iter()
+        .map(|r| {
+            r["claim_id"]
+                .as_str()
+                .expect("claim_id")
+                .parse()
+                .expect("uuid")
+        })
+        .collect();
+    assert!(
+        ids.contains(&cp.p.public) && ids.contains(&cp.p.mine),
+        "the public claim and the viewer's own private claim must both be listed; \
+         the second is absent when the read runs on the unstamped raw pool. Got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&cp.p.theirs),
+        "the stranger's private claim must not be listed. Its BBA is public, so \
+         only the `claims` predicate can withhold it. Got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&cp.public_with_private_bba),
+        "a public claim whose only high-conflict BBA is private to another group \
+         must not be listed: only the `mass_functions` predicate can withhold it. \
+         Got {ids:?}"
+    );
+    assert_eq!(ids.len(), 2, "exactly two rows: got {ids:?}");
+    let contents: Vec<&str> = body
+        .high_conflict
+        .iter()
+        .filter_map(|r| r["content"].as_str())
+        .collect();
+    assert!(
+        !contents.iter().any(|c| c.ends_with("theirs")),
+        "the stranger's content must not be served: {contents:?}"
+    );
+}
+
+/// The silence-alarm densities are counts, not content, and the register never
+/// counted them. Every one of the three numbers is asserted exactly, on the
+/// same plant plus one `CONTRADICTS` edge per case.
+///
+/// Driven through the repo function on a `read_as` connection, the one both
+/// `scan_conflicts` and `silence_check` call: an alarm fires only for a frame
+/// with twenty or more claims, so a handler-level arm would assert over a
+/// filtered-away list and prove nothing about the counts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn frame_conflict_densities_count_only_what_the_viewer_can_read(pool: PgPool) {
+    let cp = plant_conflicts(&pool, "density").await;
+    let world: Uuid = sqlx::query_scalar("SELECT id FROM groups WHERE kind = 'world' LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("world group");
+    let target = seed_public_claim(&pool, cp.p.viewer_agent, "density target").await;
+
+    // Counted: public edge from the public claim, and the viewer's own edge
+    // from the viewer's own claim.
+    seed_contradicts(&pool, cp.p.public, target, "public", world).await;
+    seed_contradicts(&pool, cp.p.mine, target, "group", cp.p.viewer_group).await;
+    // Not counted, each withheld by exactly one predicate: the source claim
+    // (`claims`), the source's only BBA (`mass_functions`), the edge itself
+    // (`edges`).
+    seed_contradicts(&pool, cp.p.theirs, target, "public", world).await;
+    seed_contradicts(&pool, cp.public_with_private_bba, target, "public", world).await;
+    seed_contradicts(&pool, cp.p.public, target, "group", cp.p.stranger_group).await;
+
+    let viewer = viewer_for(&pool, cp.p.viewer_agent).await;
+    let state = split_state(&pool).await;
+    let mut read = state.read_as(&viewer).await.expect("read_as");
+    let rows = epigraph_db::MassFunctionRepository::frame_conflict_densities(&mut *read, &viewer)
+        .await
+        .expect("frame_conflict_densities");
+    let row = rows
+        .iter()
+        .find(|r| r.frame_id == cp.frame)
+        .expect("the public frame must be listed");
+
+    assert_eq!(
+        row.total_claims, 2,
+        "claims with a BBA in the frame: the public one and the viewer's own. \
+         4 means neither the claim nor the BBA predicate is applied"
+    );
+    assert_eq!(
+        row.contradicts_edges, 2,
+        "CONTRADICTS edges leaving those claims: 5 are planted, 3 of them \
+         unreadable, each through a different relation"
+    );
+    assert_eq!(
+        row.distinct_sources, 1,
+        "only the viewer contributed a readable BBA; the stranger's two are \
+         withheld by the claim and the BBA predicate respectively"
+    );
 }

@@ -41,6 +41,29 @@ pub struct MassFunctionRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// One row of [`MassFunctionRepository::high_conflict_claims`]: a
+/// (claim, frame) pair whose BBAs carry a high conflict coefficient.
+#[derive(Debug, Clone, FromRow)]
+pub struct HighConflictClaimRow {
+    pub claim_id: Uuid,
+    pub frame_id: Uuid,
+    pub max_k: Option<f64>,
+    pub bba_count: i64,
+    pub content: String,
+}
+
+/// One row of [`MassFunctionRepository::frame_conflict_densities`]: how many
+/// claims a frame carries BBAs for, how many `CONTRADICTS` edges leave them,
+/// and how many distinct agents contributed.
+#[derive(Debug, Clone, FromRow)]
+pub struct FrameConflictDensityRow {
+    pub frame_id: Uuid,
+    pub frame_name: String,
+    pub total_claims: i64,
+    pub contradicts_edges: i64,
+    pub distinct_sources: i64,
+}
+
 /// Repository for mass function (BBA) operations
 pub struct MassFunctionRepository;
 
@@ -786,6 +809,106 @@ impl MassFunctionRepository {
         .await?;
 
         Ok(rows)
+    }
+
+    /// The (claim, frame) pairs whose BBAs reach conflict coefficient
+    /// `min_k`, highest first, with the claim's content. Viewer-filtered.
+    ///
+    /// Backs `GET /api/v1/conflicts/scan`. The route ran this statement inline
+    /// on the raw pool with no `Viewer`, so it returned the raw `content` of
+    /// every tenant's highest-conflict claims to any bearer
+    /// (`F-inline-claim-content-reads`).
+    ///
+    /// BOTH relations are marked. `claims` because `content` is projected from
+    /// it. `mass_functions` because `max_k` and `bba_count` are aggregates over
+    /// its rows, and a BBA carries its own tenancy: a perspective's BBA can be
+    /// private while the claim it scores is public, and a count over it would
+    /// then say how much private evidence exists against a public claim.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn high_conflict_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        min_k: f64,
+        limit: i64,
+    ) -> Result<Vec<HighConflictClaimRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT mf.claim_id, mf.frame_id, MAX(mf.conflict_k) AS max_k, \
+                    COUNT(*) AS bba_count, c.content \
+             FROM mass_functions mf \
+             JOIN claims c ON c.id = mf.claim_id \
+             WHERE mf.conflict_k >= $1 \
+               /* {VISIBILITY:mf} */ /* {VISIBILITY:c} */ \
+             GROUP BY mf.claim_id, mf.frame_id, c.content \
+             ORDER BY max_k DESC \
+             LIMIT $2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, HighConflictClaimRow>(&sql)
+            .bind(min_k)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Per-frame conflict density — claims with BBAs, `CONTRADICTS` edges
+    /// leaving them, distinct contributing agents — over the first 100 frames
+    /// the viewer can read. Viewer-filtered.
+    ///
+    /// Backs the silence alarm in `GET /api/v1/conflicts/scan` and
+    /// `GET /api/v1/conflicts/silence-check`, which each carried an inline,
+    /// unfiltered copy of this statement. It projects no content column, so
+    /// `viewer_route_table_lint.rs` never counted it, but every number in it is
+    /// a cardinality over tenancy-bearing rows: how many claims a frame holds,
+    /// and how many contradictions among them, including ones the caller cannot
+    /// read.
+    ///
+    /// Every counted relation is marked, and each subquery also requires the
+    /// BBA's CLAIM to be readable. A BBA carries its own tenancy, so filtering
+    /// `mass_functions` alone would still count a claim the viewer cannot read
+    /// whenever one of its BBAs is public. `edges` takes the edge predicate
+    /// (co-ownership intersection).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn frame_conflict_densities<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+    ) -> Result<Vec<FrameConflictDensityRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT f.id AS frame_id, f.name AS frame_name, \
+                    (SELECT COUNT(DISTINCT mf.claim_id) \
+                       FROM mass_functions mf \
+                       JOIN claims c ON c.id = mf.claim_id \
+                      WHERE mf.frame_id = f.id \
+                        /* {VISIBILITY:mf} */ /* {VISIBILITY:c} */) AS total_claims, \
+                    (SELECT COUNT(*) FROM edges e \
+                       JOIN mass_functions mf1 \
+                         ON mf1.claim_id = e.source_id AND mf1.frame_id = f.id \
+                       JOIN claims c1 ON c1.id = mf1.claim_id \
+                      WHERE e.relationship = 'CONTRADICTS' \
+                        /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:mf1} */ \
+                        /* {VISIBILITY:c1} */) AS contradicts_edges, \
+                    (SELECT COUNT(DISTINCT mf2.source_agent_id) \
+                       FROM mass_functions mf2 \
+                       JOIN claims c2 ON c2.id = mf2.claim_id \
+                      WHERE mf2.frame_id = f.id AND mf2.source_agent_id IS NOT NULL \
+                        /* {VISIBILITY:mf2} */ /* {VISIBILITY:c2} */) AS distinct_sources \
+             FROM frames f \
+             WHERE true /* {VISIBILITY:f} */ \
+             LIMIT 100",
+            1,
+        );
+        let mut q = sqlx::query_as::<_, FrameConflictDensityRow>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 }
 
