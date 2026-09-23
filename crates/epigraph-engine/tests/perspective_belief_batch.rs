@@ -24,6 +24,9 @@
 //!    change the per-claim results (a batch that re-fetched the perspective per
 //!    claim would flip later claims to the global value mid-page).
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
@@ -169,10 +172,12 @@ async fn seed_page(pool: &PgPool, n: usize) -> (Uuid, Uuid, Vec<Uuid>) {
 /// is a pure performance refactor.
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_equals_per_hit(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let (frame_id, perspective_id, claim_ids) = seed_page(&pool, 5).await;
 
     let batch = epigraph_engine::belief_query::get_perspective_belief_batch(
         &pool,
+        &viewer,
         &claim_ids,
         frame_id,
         perspective_id,
@@ -192,6 +197,7 @@ async fn batch_equals_per_hit(pool: PgPool) {
 
         let single = epigraph_engine::belief_query::get_perspective_belief(
             &pool,
+            &viewer,
             *claim_id,
             frame_id,
             perspective_id,
@@ -208,9 +214,10 @@ async fn batch_equals_per_hit(pool: PgPool) {
 
     // Sanity: the lens actually bites — batch value differs from the global
     // (unlensed) belief, so the equivalence above is over a non-trivial lens.
-    let global = epigraph_engine::belief_query::get_belief(&pool, claim_ids[0], Some(frame_id))
-        .await
-        .expect("global");
+    let global =
+        epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_ids[0], Some(frame_id))
+            .await
+            .expect("global");
     let lensed = batch[0].1.as_ref().unwrap();
     assert!(
         (lensed.belief - global.belief).abs() > 1e-6,
@@ -235,6 +242,7 @@ async fn batch_equals_per_hit(pool: PgPool) {
 /// mid-page delete could not, so uniformity is the discriminating signal.
 #[sqlx::test(migrations = "../../migrations")]
 async fn batch_resolves_perspective_once_via_snapshot(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     // Uniform page: every claim carries the identical corpus, so under a single
     // resolution every lensed belief is the same number.
     let agent = insert_agent(&pool).await;
@@ -301,6 +309,7 @@ async fn batch_resolves_perspective_once_via_snapshot(pool: PgPool) {
     // Baseline lensed value under the configured skeptic (resolved once).
     let baseline = epigraph_engine::belief_query::get_perspective_belief(
         &pool,
+        &viewer,
         claim_ids[0],
         frame_row.id,
         skeptic.id,
@@ -310,10 +319,11 @@ async fn batch_resolves_perspective_once_via_snapshot(pool: PgPool) {
     .belief;
     // And the global (what a fallen-back re-fetch would produce): must differ,
     // else the guard can't discriminate.
-    let global = epigraph_engine::belief_query::get_belief(&pool, claim_ids[0], Some(frame_row.id))
-        .await
-        .expect("global")
-        .belief;
+    let global =
+        epigraph_engine::belief_query::get_belief(&pool, &viewer, claim_ids[0], Some(frame_row.id))
+            .await
+            .expect("global")
+            .belief;
     assert!(
         (baseline - global).abs() > 1e-6,
         "skeptic lens must diverge from global for the guard to bite: {baseline} vs {global}"
@@ -321,6 +331,7 @@ async fn batch_resolves_perspective_once_via_snapshot(pool: PgPool) {
 
     let batch = epigraph_engine::belief_query::get_perspective_belief_batch(
         &pool,
+        &viewer,
         &claim_ids,
         frame_row.id,
         skeptic.id,

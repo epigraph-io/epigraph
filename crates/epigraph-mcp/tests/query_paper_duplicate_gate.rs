@@ -8,6 +8,9 @@
 //! reads as "not yet ingested" — causing it to re-run extraction on an
 //! already (partially) ingested paper.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_core::{Agent, AgentId, Claim, TruthValue};
 use epigraph_crypto::{AgentSigner, ContentHasher};
 use epigraph_db::{AgentRepository, ClaimRepository, PaperRepository};
@@ -36,6 +39,7 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let doi = "10.48550/arXiv.2504.18085";
 
@@ -61,7 +65,7 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
         TruthValue::new(0.7).unwrap(),
     );
     claim.content_hash = ContentHasher::hash(content.as_bytes());
-    let persisted = ClaimRepository::create(&pool, &claim)
+    let persisted = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("create claim");
     let persisted_id: uuid::Uuid = persisted.id.into();
@@ -74,10 +78,15 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
 
     let result = query_paper(
         &server,
+        &viewer,
         QueryPaperParams {
             doi: doi.to_string(),
+            // Paging defaults; this test is about `claim_count`, which is a
+            // COUNT over the whole paper and is deliberately independent of the
+            // page (backlog `0e6ec456`).
+            limit: None,
+            offset: None,
         },
-        None,
     )
     .await
     .expect("query_paper succeeds");
@@ -94,14 +103,17 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
 
     let result = query_paper(
         &server,
+        &viewer,
         QueryPaperParams {
             doi: "10.9999/never-ingested".to_string(),
+            limit: None,
+            offset: None,
         },
-        None,
     )
     .await
     .expect("query_paper succeeds");

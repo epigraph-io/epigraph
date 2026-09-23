@@ -9,6 +9,9 @@
 //! Outcome: PASSED — auto_wire_ds_update path already clamps post-#149.
 //! Task 3 covers the still-unclamped BP apply path.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod common;
 use common::*;
 
@@ -16,6 +19,7 @@ use epigraph_mcp::types::UpdateWithEvidenceParams;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn update_with_evidence_does_not_violate_plausibility_bounds_at_one(pool: sqlx::PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let claim_id = seed_claim_with_belief(
         &pool,
         /* belief */ 0.4,
@@ -28,6 +32,7 @@ async fn update_with_evidence_does_not_violate_plausibility_bounds_at_one(pool: 
 
     let result = epigraph_mcp::tools::claims::update_with_evidence(
         &server,
+        &viewer,
         UpdateWithEvidenceParams {
             canonical_name: None,
             step_index: None,

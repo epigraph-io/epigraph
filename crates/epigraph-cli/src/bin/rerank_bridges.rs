@@ -271,20 +271,18 @@ async fn main() {
     println!();
 
     // Connect to PostgreSQL
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        eprintln!("ERROR: DATABASE_URL must be set");
-        std::process::exit(1);
-    });
-
     println!("Connecting to PostgreSQL...");
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&database_url)
+    // Corpus-wide, and it WRITES edges. On an application connection under
+    // FORCE the candidate scan returns a subset and the edge writes land
+    // nowhere, with a success report either way.
+    // See `epigraph_cli::MaintenancePool`.
+    let maint = epigraph_cli::MaintenancePool::connect("rerank_bridges")
         .await
         .unwrap_or_else(|e| {
             eprintln!("ERROR: Failed to connect to PostgreSQL: {e}");
             std::process::exit(1);
         });
+    let pool = maint.pool().clone();
 
     let config = args.to_config();
 

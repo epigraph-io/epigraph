@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use epigraph_engine::matching::verifier::{Verdict, VerifierClient};
+use epigraph_engine::matching::verifier::{Verdict, VerifierClient, REJECTED_RELATIONSHIP};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -30,7 +30,8 @@ use crate::rerank::{rerank_candidates_table, PerPairVerdict, RerankConfig, Reran
 /// 4. Joins the per-pair verdicts back to the input order via
 ///    [`align_verdicts`]. Pairs the reranker returned no row for yield `None`
 ///    ("no answer"), which the pipeline skips; the LLM's own `valid: false`
-///    rejections are a real answer and still map to `derives_from`.
+///    rejections are a real answer and carry
+///    [`epigraph_engine::matching::verifier::REJECTED_RELATIONSHIP`].
 pub struct RerankBridgesClient {
     pool: PgPool,
     config: RerankConfig,
@@ -87,8 +88,20 @@ impl RerankBridgesClient {
 /// string asserts anything and none can be false.
 ///
 /// `valid: false` is the opposite case: the model *did* answer and said the
-/// pair is not a real bridge. That keeps the `derives_from` mapping (→
-/// `MatchVerdict::Distinct` → Reject) it has always had.
+/// pair is not a real bridge. It is stamped with
+/// [`REJECTED_RELATIONSHIP`], which `map_relationship` sends to
+/// `MatchVerdict::Distinct` → Reject — the same outcome it has always had, now
+/// carried by a string that means only that.
+///
+/// It used to be stamped with the literal `"derives_from"`, which reached
+/// `Distinct` only via the `_` fallback arm, i.e. only because `derives_from`
+/// was an unmapped member of the reranker's own vocabulary. That made a
+/// rejection and a `valid: true, relationship: "derives_from"` endorsement
+/// byte-identical by the time the policy layer saw them (issue #388), and it
+/// would have turned any future `derives_from` arm into a silent rewrite of
+/// every rejection — `MatchVerdict::Overlapping.promotion_disposition()` is
+/// `Corroborate`, so the rejections would have become human-promotable into
+/// `CORROBORATES` edges.
 pub fn align_verdicts(
     pairs: &[(Uuid, Uuid)],
     per_pair_verdicts: Vec<PerPairVerdict>,
@@ -114,7 +127,7 @@ pub fn align_verdicts(
                 return Some(Verdict {
                     source_id: *a,
                     target_id: *b,
-                    relationship: "derives_from".to_string(),
+                    relationship: REJECTED_RELATIONSHIP.to_string(),
                     strength: per_pair.strength.unwrap_or(0.0) as f32,
                     rationale: per_pair.rationale.clone(),
                 });
@@ -274,7 +287,7 @@ mod tests {
 
     /// THE regression guard for defect B: a pair the reranker produced no row
     /// for must come back as `None`, not as a synthetic verdict. Before this,
-    /// the miss returned `derives_from`/0.0, which `map_relationship` sends to
+    /// the miss returned `derives_from`/0.0, which `map_relationship` sent to
     /// `MatchVerdict::Distinct` → Reject → `patch_verdict('distinct')`.
     #[test]
     fn a_pair_the_reranker_did_not_answer_on_yields_no_verdict() {
@@ -291,6 +304,11 @@ mod tests {
 
     /// The complement: an explicit `valid: false` IS an answer — the model was
     /// asked and said no. Skipping those too would throw away real rejections.
+    ///
+    /// The relationship assertion is the issue-#388 half: a rejection must
+    /// carry `REJECTED_RELATIONSHIP` and NOT `derives_from`, which is a
+    /// member of the reranker's endorsement vocabulary. Sharing that string
+    /// made the two indistinguishable downstream.
     #[test]
     fn an_explicit_llm_rejection_is_still_a_verdict() {
         let a = Uuid::new_v4();
@@ -299,8 +317,34 @@ mod tests {
         let v = out[0]
             .as_ref()
             .expect("valid:false is an answer, not silence");
-        assert_eq!(v.relationship, "derives_from");
+        assert_eq!(v.relationship, REJECTED_RELATIONSHIP);
+        assert_ne!(
+            v.relationship, "derives_from",
+            "a rejection must not borrow an endorsement relationship"
+        );
         assert_eq!(v.rationale, "model spoke");
+    }
+
+    /// The sentinel must map to the same verdict the old overloaded literal
+    /// did, so this change moves no rejection. Pinned as a unit test rather
+    /// than an explicit `map_relationship` arm, which would duplicate `_`.
+    #[test]
+    fn the_rejection_sentinel_still_maps_to_distinct() {
+        use epigraph_engine::matching::verifier::{map_relationship, MatchVerdict};
+        assert_eq!(
+            map_relationship(REJECTED_RELATIONSHIP, 0.0),
+            MatchVerdict::Distinct
+        );
+    }
+
+    /// The sentinel must never become a vocabulary member, or the overload
+    /// this commit removes comes straight back.
+    #[test]
+    fn the_rejection_sentinel_is_not_in_the_reranker_vocabulary() {
+        assert!(
+            !crate::rerank::candidates::VALID_RELATIONSHIPS.contains(&REJECTED_RELATIONSHIP),
+            "REJECTED_RELATIONSHIP leaked into VALID_RELATIONSHIPS"
+        );
     }
 
     /// A total LLM failure must NOT be laundered into "the corpus stopped

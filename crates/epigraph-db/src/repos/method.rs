@@ -322,7 +322,22 @@ impl MethodRepository {
     }
 
     /// Get method by ID.
-    pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<MethodSearchResult>, sqlx::Error> {
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so a caller that has already acquired a
+    /// viewer-stamped connection can run this statement on it rather than
+    /// reaching for the raw pool. PR-29 widened it for
+    /// `routes/methods.rs::get_method`; `&PgPool` still satisfies the bound, so
+    /// every pre-existing caller compiles unchanged.
+    ///
+    /// It takes no `&Viewer` because `methods` carries no tenancy to filter on —
+    /// see the `EXECUTOR_WITHOUT_VIEWER` entry in
+    /// `epigraph-db/tests/visibility_lint.rs`, which records the measurement.
+    pub async fn get<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<MethodSearchResult>, sqlx::Error> {
         let row: Option<MethodDetailRow> = sqlx::query_as(
             "SELECT id, name, canonical_name, technique_type, measures, resolution, \
              sensitivity, limitations, required_equipment, typical_conditions, \
@@ -330,7 +345,7 @@ impl MethodRepository {
              FROM methods WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(|r| MethodSearchResult {
@@ -375,8 +390,19 @@ impl MethodRepository {
     }
 
     /// Find methods that enable a specific capability (pattern match).
-    pub async fn get_methods_for_capability(
-        pool: &PgPool,
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so `routes/experiments.rs::method_gap_analysis`
+    /// can run it on the same viewer-stamped connection as the two
+    /// tenancy-carrying reads it interleaves with. Conversion shard 6 widened the
+    /// executor ONLY; the SQL, its bind and the projected row shape are unchanged.
+    ///
+    /// It takes no `Viewer` because neither relation in its FROM has anything for
+    /// one to filter — see this function's row in
+    /// `epigraph-db/tests/visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
+    pub async fn get_methods_for_capability<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         capability_pattern: &str,
     ) -> Result<Vec<MethodForCapability>, sqlx::Error> {
         let like = format!("%{capability_pattern}%");
@@ -389,7 +415,7 @@ impl MethodRepository {
              ORDER BY mc.evidence_count DESC",
         )
         .bind(&like)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await?;
 
         Ok(rows
@@ -407,11 +433,16 @@ impl MethodRepository {
     }
 
     /// Get average DS belief strength for claims linked to a method.
-    pub async fn get_evidence_strength(
-        pool: &PgPool,
+    pub async fn get_evidence_strength<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         method_id: Uuid,
     ) -> Result<MethodEvidenceStrength, sqlx::Error> {
-        let row: Option<MethodEvidenceStrengthRow> = sqlx::query_as(
+        // The `edges` marker sits in the LEFT JOIN's ON clause, not the WHERE.
+        // In a WHERE it would null-filter the outer side and silently turn the
+        // LEFT JOIN into an inner join, dropping claims that simply have no
+        // visible asserting paper.
+        let sql = viewer.splice(
             "SELECT \
                  AVG(COALESCE(c.pignistic_prob, c.truth_value)) AS avg_belief, \
                  COUNT(*) AS claim_count, \
@@ -420,11 +451,15 @@ impl MethodRepository {
              CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
              JOIN claims c ON c.id = scid \
              LEFT JOIN edges e ON e.target_id = c.id AND e.source_type = 'paper' AND e.relationship = 'asserts' \
-             WHERE m.id = $1",
-        )
-        .bind(method_id)
-        .fetch_optional(pool)
-        .await?;
+                 /* {EDGE_VISIBILITY:e} */ \
+             WHERE m.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, MethodEvidenceStrengthRow>(&sql).bind(method_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<MethodEvidenceStrengthRow> = q.fetch_optional(executor).await?;
 
         Ok(row.map_or(
             MethodEvidenceStrength {
@@ -441,11 +476,12 @@ impl MethodRepository {
     }
 
     /// Get source papers for a method.
-    pub async fn get_source_papers(
-        pool: &PgPool,
+    pub async fn get_source_papers<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         method_id: Uuid,
     ) -> Result<Vec<MethodSourcePaper>, sqlx::Error> {
-        let rows: Vec<MethodSourcePaperRow> = sqlx::query_as(
+        let sql = viewer.splice(
             "SELECT DISTINCT p.id, p.doi, p.title, \
                     (p.properties->>'year')::int AS pub_year, \
                     p.properties->>'source_type' AS source_type \
@@ -453,12 +489,15 @@ impl MethodRepository {
              CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
              JOIN edges e ON e.target_id = scid AND e.source_type = 'paper' AND e.relationship = 'asserts' \
              JOIN papers p ON p.id = e.source_id \
-             WHERE m.id = $1 \
+             WHERE m.id = $1 /* {EDGE_VISIBILITY:e} */ \
              ORDER BY pub_year DESC NULLS LAST",
-        )
-        .bind(method_id)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, MethodSourcePaperRow>(&sql).bind(method_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<MethodSourcePaperRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()
@@ -473,27 +512,35 @@ impl MethodRepository {
     }
 
     /// Get usage examples for a method from analyses.
-    pub async fn get_usage_examples(
-        pool: &PgPool,
+    pub async fn get_usage_examples<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         method_id: Uuid,
         limit: i64,
     ) -> Result<Vec<MethodUsageExample>, sqlx::Error> {
-        let rows: Vec<MethodUsageRow> = sqlx::query_as(
+        // LEFT JOIN: the marker belongs in the ON clause. See
+        // `get_evidence_strength` for why.
+        let sql = viewer.splice(
             "SELECT am.analysis_id, am.role, am.conditions_used, \
                     a.analysis_type, a.method_description, \
                     p.doi AS paper_doi, p.title AS paper_title \
              FROM analysis_methods am \
              JOIN analyses a ON a.id = am.analysis_id \
              LEFT JOIN edges e ON e.target_id = am.analysis_id AND e.source_type = 'paper' \
+                 /* {EDGE_VISIBILITY:e} */ \
              LEFT JOIN papers p ON p.id = e.source_id \
              WHERE am.method_id = $1 \
              ORDER BY a.created_at DESC \
              LIMIT $2",
-        )
-        .bind(method_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+            3,
+        );
+        let mut q = sqlx::query_as::<_, MethodUsageRow>(&sql)
+            .bind(method_id)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<MethodUsageRow> = q.fetch_all(executor).await?;
 
         Ok(rows
             .into_iter()

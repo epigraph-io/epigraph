@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT 1 AS exists_marker\n            FROM edges\n            WHERE source_id = $1\n              AND source_type = 'paper'\n              AND relationship = 'processed_by'\n              AND properties ->> 'pipeline' = $2\n              AND ($3::bool OR visibility = 'public'\n                   OR (owner_group_id = ANY($4::uuid[])\n                       AND (co_owner_group_id IS NULL\n                            OR co_owner_group_id = ANY($4::uuid[]))))\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists_marker",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "11f24789f6d78e1e3397c3ba378a4cad893c6a57d39dc8174c292a50431a5f4d"
+}

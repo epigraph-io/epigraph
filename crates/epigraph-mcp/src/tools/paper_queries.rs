@@ -6,9 +6,8 @@ use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
-use epigraph_db::access_control::check_content_access;
+use epigraph_crypto::ContentHasher;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
-use uuid::Uuid;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(
@@ -16,8 +15,23 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-/// Look up a paper by DOI and return its title, authors, claim count, and up
-/// to 100 asserted-claim summaries.
+/// Default page size for asserted claims when the caller supplies no `limit`.
+///
+/// Was a hardcoded 100 with no caller override, which produced ~62K-character
+/// single-shot responses on densely-decomposed papers (arXiv:2607.05794's
+/// paragraph/atom claims) and blew the MCP tool output token limit, erroring
+/// the call out entirely rather than returning a first page (backlog
+/// `0e6ec456`). 25 claims is a quarter of that worst case; callers who want
+/// the old behaviour pass `limit: 100`, and `claim_count` still reports the
+/// full total so a pager knows where it is.
+const DEFAULT_PAPER_CLAIM_LIMIT: i64 = 25;
+
+/// Hard ceiling on `limit`, so a caller cannot re-create the unbounded case.
+const MAX_PAPER_CLAIM_LIMIT: i64 = 200;
+
+/// Look up a paper by DOI and return its title, authors, claim count, and one
+/// page of asserted-claim summaries (`limit`/`offset`, default
+/// [`DEFAULT_PAPER_CLAIM_LIMIT`]).
 ///
 /// The earlier implementation searched claim *content* for the DOI substring
 /// via `ClaimRepository::list(.., Some(doi))` — that almost never matched, so
@@ -51,9 +65,15 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// (which was already made whole by a subsequent full re-ingestion).
 pub async fn query_paper(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryPaperParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PAPER_CLAIM_LIMIT)
+        .clamp(1, MAX_PAPER_CLAIM_LIMIT);
+    let offset = params.offset.unwrap_or(0).max(0);
+
     let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
         .await
         .map_err(internal_error)?;
@@ -64,22 +84,27 @@ pub async fn query_paper(
             title: String::new(),
             authors: vec![],
             claim_count: 0,
+            returned: 0,
+            offset,
+            limit,
+            has_more: false,
             claims: vec![],
         });
     };
 
-    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, paper.id)
+    let asserted_count = PaperRepository::count_asserted_claims(&server.pool, viewer, paper.id)
         .await
         .map_err(internal_error)?;
     // Node-existence probe, independent of the `asserts` edge: catches claims
     // a partial/crashed ingestion already labelled `doi:<doi>` but never got
     // to link, which `asserted_count` alone would silently report as zero.
-    let labeled_count = PaperRepository::count_claims_by_doi_label(&server.pool, &paper.doi)
-        .await
-        .map_err(internal_error)?;
+    let labeled_count =
+        PaperRepository::count_claims_by_doi_label(&server.pool, viewer, &paper.doi)
+            .await
+            .map_err(internal_error)?;
     let claim_count = asserted_count.max(labeled_count);
 
-    let authors = PaperRepository::list_authors(&server.pool, paper.id)
+    let authors = PaperRepository::list_authors(&server.pool, viewer, paper.id)
         .await
         .map_err(internal_error)?
         .into_iter()
@@ -89,21 +114,19 @@ pub async fn query_paper(
         })
         .collect();
 
-    let claim_rows = PaperRepository::list_asserted_claims(&server.pool, paper.id, 100)
-        .await
-        .map_err(internal_error)?;
+    let claim_rows =
+        PaperRepository::list_asserted_claims(&server.pool, viewer, paper.id, limit, offset)
+            .await
+            .map_err(internal_error)?;
 
     let mut claims = Vec::with_capacity(claim_rows.len());
     for c in claim_rows {
-        let access = check_content_access(&server.pool, c.id, requester).await;
-        let (content, content_hash) =
-            crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
         claims.push(ClaimResponse {
             id: c.id.to_string(),
-            content,
+            content: c.content.clone(),
             truth_value: c.truth_value,
             agent_id: c.agent_id.to_string(),
-            content_hash,
+            content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
             labels: Vec::new(),
             is_current: true,
@@ -111,25 +134,47 @@ pub async fn query_paper(
         });
     }
 
+    // `has_more` must TERMINATE, which rules out comparing against
+    // `claim_count` alone.
+    //
+    // `claim_count` is `max(asserted_count, labeled_count)`, but this page can
+    // only ever contain `asserts`-edge rows. A partially-ingested paper — 60
+    // claims labelled `doi:<doi>`, zero edges linked yet, the exact state
+    // `query_paper_duplicate_gate.rs` fixtures — would give `returned = 0`
+    // against `claim_count = 60` and advertise another page forever, sending
+    // any pager into an infinite loop over empty results.
+    //
+    // A SHORT PAGE IS THE END OF THE SET: the repo query asked for `limit` rows
+    // and PostgreSQL returned fewer, so there are none left. The `claim_count`
+    // comparison is kept as a second conjunct only so a page that lands exactly
+    // on the boundary (`offset + returned == claim_count`) stops immediately
+    // instead of costing one extra empty round-trip.
+    let returned = claims.len();
+    let has_more = returned as i64 == limit && offset.saturating_add(returned as i64) < claim_count;
+
     success_json(&PaperResponse {
         doi: paper.doi,
         title: paper.title.unwrap_or_default(),
         authors,
         claim_count,
+        returned,
+        offset,
+        limit,
+        has_more,
         claims,
     })
 }
 
 pub async fn query_claims_by_evidence(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsByEvidenceParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
     // Search claims and filter by evidence type
-    let claims = ClaimRepository::list(&server.pool, limit * 2, 0, None)
+    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -141,7 +186,7 @@ pub async fn query_claims_by_evidence(
             continue;
         }
 
-        let evidence_list = EvidenceRepository::get_by_claim(&server.pool, claim.id)
+        let evidence_list = EvidenceRepository::get_by_claim(&server.pool, viewer, claim.id)
             .await
             .unwrap_or_default();
 
@@ -159,18 +204,12 @@ pub async fn query_claims_by_evidence(
         });
 
         if matches {
-            let access = check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-            let (content, content_hash) = crate::tools::redaction::redact_content(
-                access,
-                &claim.content,
-                &claim.content_hash,
-            );
             results.push(ClaimResponse {
                 id: claim.id.as_uuid().to_string(),
-                content,
+                content: claim.content.clone(),
                 truth_value: claim.truth_value.value(),
                 agent_id: claim.agent_id.as_uuid().to_string(),
-                content_hash,
+                content_hash: ContentHasher::to_hex(&claim.content_hash),
                 created_at: claim.created_at.to_rfc3339(),
                 labels: Vec::new(),
                 is_current: true,
@@ -188,13 +227,13 @@ pub async fn query_claims_by_evidence(
 
 pub async fn query_claims_by_methodology(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsByMethodologyParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
 
-    let claims = ClaimRepository::list(&server.pool, limit * 2, 0, None)
+    let claims = ClaimRepository::list(&server.pool, viewer, limit * 2, 0, None)
         .await
         .map_err(internal_error)?;
 
@@ -209,23 +248,16 @@ pub async fn query_claims_by_methodology(
         // Check reasoning traces for methodology
         if let Some(trace_id) = claim.trace_id {
             if let Ok(Some(trace)) =
-                ReasoningTraceRepository::get_by_id(&server.pool, trace_id).await
+                ReasoningTraceRepository::get_by_id(&server.pool, viewer, trace_id).await
             {
                 let method_name = trace.methodology.description().to_lowercase();
                 if method_name.contains(&methodology_lower) {
-                    let access =
-                        check_content_access(&server.pool, claim.id.as_uuid(), requester).await;
-                    let (content, content_hash) = crate::tools::redaction::redact_content(
-                        access,
-                        &claim.content,
-                        &claim.content_hash,
-                    );
                     results.push(ClaimResponse {
                         id: claim.id.as_uuid().to_string(),
-                        content,
+                        content: claim.content.clone(),
                         truth_value: claim.truth_value.value(),
                         agent_id: claim.agent_id.as_uuid().to_string(),
-                        content_hash,
+                        content_hash: ContentHasher::to_hex(&claim.content_hash),
                         created_at: claim.created_at.to_rfc3339(),
                         labels: Vec::new(),
                         is_current: true,
@@ -245,8 +277,8 @@ pub async fn query_claims_by_methodology(
 
 pub async fn query_claims_by_label(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: QueryClaimsByLabelParams,
-    requester: Option<Uuid>,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let min_truth = params.min_truth.unwrap_or(0.0);
@@ -262,27 +294,27 @@ pub async fn query_claims_by_label(
 
     let rows = ClaimRepository::list_by_labels(
         &server.pool,
-        &params.labels,
-        &params.exclude_labels,
-        params.current_only,
-        min_truth,
-        limit,
-        offset,
+        viewer,
+        epigraph_db::LabelQuery {
+            labels: &params.labels,
+            exclude_labels: &params.exclude_labels,
+            current_only: params.current_only,
+            min_truth,
+            limit,
+            offset,
+        },
     )
     .await
     .map_err(internal_error)?;
 
     let mut results: Vec<ClaimResponse> = Vec::with_capacity(rows.len());
     for (c, labels) in rows {
-        let access = check_content_access(&server.pool, c.id.as_uuid(), requester).await;
-        let (content, content_hash) =
-            crate::tools::redaction::redact_content(access, &c.content, &c.content_hash);
         results.push(ClaimResponse {
             id: c.id.as_uuid().to_string(),
-            content,
+            content: c.content.clone(),
             truth_value: c.truth_value.value(),
             agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash,
+            content_hash: ContentHasher::to_hex(&c.content_hash),
             created_at: c.created_at.to_rfc3339(),
             labels,
             is_current: c.is_current,

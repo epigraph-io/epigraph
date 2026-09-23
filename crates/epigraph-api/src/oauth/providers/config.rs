@@ -83,12 +83,17 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub default_scopes: Vec<String>,
     /// Allowlist of exact email addresses permitted to auto-provision.
-    /// Empty (the serde default) together with `allowed_domains` empty means
-    /// allow-all (backward compatible). See [`email_is_allowed`].
+    ///
+    /// Empty (the serde default) together with `allowed_domains` empty now
+    /// REFUSES all provisioning through this provider, unless the operator sets
+    /// `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`; under `EPIGRAPH_ENV=production`
+    /// that combination refuses to boot. It used to mean allow-all.
+    /// See [`email_is_allowed`] and `oauth::providers::build_registry`.
     #[serde(default)]
     pub allowed_emails: Vec<String>,
     /// Allowlist of email domains (the part after the last `@`) permitted to
-    /// auto-provision. Empty together with `allowed_emails` empty means allow-all.
+    /// auto-provision. Empty together with `allowed_emails` empty REFUSES all
+    /// provisioning (see `allowed_emails`).
     #[serde(default)]
     pub allowed_domains: Vec<String>,
 }
@@ -99,9 +104,18 @@ fn default_true() -> bool {
 
 /// Decide whether `email` is permitted by the configured allowlists.
 ///
+/// This is a **pure, total string predicate** and nothing more. It is NOT the
+/// provisioning gate — `provision_external_user_client` and
+/// `oauth::token::refresh_allowed` are, and as of PR-02 both check the
+/// both-lists-empty case THEMSELVES, before calling this, and deny unless
+/// `ApiConfig.allow_all_identities` is explicitly true.
+///
 /// Semantics (deliberately conservative — this gate is security-sensitive):
-/// * Both lists empty -> `true` (allow-all; the gate is opt-in and backward
-///   compatible with the serde-default-empty config).
+/// * Both lists empty -> `true`. **This arm is UNREACHABLE from production
+///   callers**; it exists only so the helper stays total, and
+///   `both_lists_empty_is_unreachable_from_production_callers` pins the
+///   contract. A future caller that reaches this arm has reintroduced the
+///   allow-all hole PR-02 closed — gate on emptiness at the call site instead.
 /// * Otherwise -> `true` iff the trimmed, lowercased email EXACTLY matches some
 ///   `allowed_emails` entry (compared case-insensitively after trimming the
 ///   entry too) OR its domain (the substring after the LAST `@`, lowercased)
@@ -119,7 +133,8 @@ pub fn email_is_allowed(
     allowed_emails: &[String],
     allowed_domains: &[String],
 ) -> bool {
-    // Both empty => allow-all (opt-in gate, backward compatible).
+    // Both empty => vacuously permitted. Callers MUST have already refused this
+    // case (see the doc comment); reaching it means the caller forgot to.
     if allowed_emails.is_empty() && allowed_domains.is_empty() {
         return true;
     }
@@ -339,9 +354,15 @@ default_scopes = ["claims:read"]
     }
 
     #[test]
-    fn both_lists_empty_allows_all() {
-        // Allow-all is the opt-in default; even an empty email is permitted when
-        // no allowlist is configured (matches pre-gate provisioning behavior).
+    fn both_lists_empty_is_unreachable_from_production_callers() {
+        // CONTRACT PIN (PR-02). This helper is total: with no allowlist there is
+        // nothing to compare against, so it answers `true`. That is NOT a
+        // permission decision, and no production caller may rely on it —
+        // `provision_external_user_client` and `oauth::token::refresh_allowed`
+        // both refuse the empty-allowlist case themselves (unless
+        // `ApiConfig.allow_all_identities` is explicitly true) BEFORE calling
+        // here. If a new call site reaches this arm, the allow-all hole is back;
+        // gate on emptiness at that call site, do not change this function.
         assert!(email_is_allowed("anyone@example.com", &[], &[]));
         assert!(email_is_allowed("", &[], &[]));
     }

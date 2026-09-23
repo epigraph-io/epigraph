@@ -36,9 +36,16 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 
-/// Shared slot the capture middleware writes the last-seen `Authorization`
-/// header into. Cloned into both the middleware and the assertion.
-type AuthSlot = Arc<Mutex<Option<String>>>;
+/// Shared slot the capture middleware writes the last-seen request HEADERS
+/// into. Cloned into both the middleware and the assertion.
+///
+/// **Widened by PR-10** from a single `Option<String>` holding `Authorization`.
+/// The federation clause PR-10 was handed — "`epigraph-mcp/src/federation/`
+/// forwards the `Viewer` group set as a header" — was REJECTED (see
+/// `no_group_or_identity_header_is_forwarded_to_the_downstream`), and the
+/// property that replaces it is a statement about what the gateway does NOT
+/// send. A capture that only ever looked at one header could not make it.
+type AuthSlot = Arc<Mutex<Option<axum::http::HeaderMap>>>;
 
 /// A minimal downstream MCP server exposing exactly one tool named `tool_name`.
 /// `call_tool` echoes a fixed payload so the gateway-side test can assert the
@@ -98,13 +105,7 @@ async fn capture_auth(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if let Some(value) = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-    {
-        *slot.lock().unwrap() = Some(value.to_string());
-    }
+    *slot.lock().unwrap() = Some(req.headers().clone());
     next.run(req).await
 }
 
@@ -206,8 +207,89 @@ async fn lists_and_invokes_stub_tool_forwarding_caller_bearer() {
         .lock()
         .unwrap()
         .clone()
-        .expect("stub saw an Authorization header");
-    assert_eq!(seen, format!("Bearer {caller_token}"));
+        .expect("stub saw request headers");
+    assert_eq!(
+        seen.get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("Bearer {caller_token}").as_str())
+    );
+}
+
+/// **PR-10's federation clause, rejected with evidence.**
+///
+/// The plan's *Files* line asks that `epigraph-mcp/src/federation/` "forward
+/// the `Viewer` group set as a header". That was not implemented, and this test
+/// is the record of why — an unimplemented clause with a reason and a guard is
+/// worth more than a clause implemented because it was written down.
+///
+/// 1. **It is redundant.** `client::invoke_once` already forwards the CALLER'S
+///    OWN bearer verbatim (`connect(addr, Some(caller_token))` →
+///    `.bearer_auth(token)`), and `server.rs::call_tool` refuses a federated
+///    call outright when there is no raw caller token to forward ("federated
+///    tools are unavailable over stdio"). The downstream therefore validates
+///    the real principal and derives its own `Viewer` from its own
+///    `group_memberships`. That is the model
+///    `docs/superpowers/specs/2026-07-23-mcp-federation-gateway-design.md`
+///    states: "single credential, single token across both hops".
+///
+/// 2. **It is a regression risk.** A gateway-asserted group set is an
+///    *assertion the downstream must trust*. The moment anything downstream
+///    reads it for authorization, read authority is being materialised from a
+///    request header — which is exactly the shape
+///    `epigraph-db/tests/no_anonymous_viewer.rs` exists to prevent, and a
+///    strictly weaker control than a token the downstream can validate.
+///    `ExtensionConfig` has no field in which such a contract could even be
+///    declared (`name` / `addr` / `scope` / `prefix`).
+///
+/// So the invariant asserted here is the inverse of the plan's clause: the
+/// gateway sends the caller's credential and **no identity or group assertion
+/// of its own**. If someone later adds one, this test is what tells them it was
+/// a decision and not an oversight.
+#[tokio::test]
+async fn no_group_or_identity_header_is_forwarded_to_the_downstream() {
+    let (addr, slot) = spawn_stub("ping").await;
+    let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+        .await
+        .expect("build should succeed against a reachable stub");
+
+    registry
+        .invoke("ping", "caller-bearer-xyz", None)
+        .await
+        .expect("invoke should proxy to the stub");
+
+    let seen = slot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("stub saw request headers");
+
+    // Nothing that names a principal, a group, or a tenancy decision.
+    for banned in [
+        "x-epigraph-groups",
+        "x-epigraph-group-ids",
+        "x-epigraph-viewer",
+        "x-epigraph-agent-id",
+        "x-epigraph-principal",
+        "x-epigraph-owner-group-id",
+        "x-epigraph-visibility",
+        "x-forwarded-user",
+    ] {
+        assert!(
+            seen.get(banned).is_none(),
+            "the gateway forwarded `{banned}`. A downstream that trusts a \
+             gateway-asserted identity or group set derives read authority from \
+             an untrusted header; forward the caller's own bearer instead, which \
+             the downstream can validate."
+        );
+    }
+
+    // …and the positive control: the caller's credential DID arrive, so the
+    // absence above is "we send only the token", not "we sent nothing".
+    assert_eq!(
+        seen.get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer caller-bearer-xyz")
+    );
 }
 
 #[tokio::test]
@@ -371,9 +453,15 @@ async fn reconnect_tick_revives_an_extension_that_was_down_at_boot() {
         result.content[0].as_text().unwrap().text,
         "stub handled `ping`"
     );
+    let seen = slot
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the revived stub saw request headers");
     assert_eq!(
-        slot.lock().unwrap().clone(),
-        Some("Bearer caller-after-revival".to_string()),
+        seen.get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer caller-after-revival"),
         "the caller's bearer must reach the revived downstream"
     );
 }
@@ -408,4 +496,108 @@ async fn absent_extensions_yield_empty_registry() {
         .unwrap();
     assert!(registry.is_empty());
     assert!(registry.list_federated_tools().is_empty());
+}
+
+// ── Unknown/unavailable tool attribution (backlog ee50d10d) ────────────────
+//
+// `attach_blob` is a FEDERATED episcience tool — `grep -rn attach_blob
+// crates/` finds nothing in this workspace. While episcience was unmounted,
+// every call for it fell through `call_tool`'s federation branch into
+// `enforce_tool_scope`'s deny-by-default arm and came back as
+// "Forbidden: tool 'attach_blob' is not authorized (no scope mapping)" —
+// an AUTHORIZATION verdict on a call whose credentials were never examined.
+// It was filed as an authorization regression for exactly that reason.
+
+/// An unhealthy extension whose configured `prefix=` matches the requested
+/// name is named as the likely owner.
+///
+/// End-to-end against a real registry (unreachable address => mounted
+/// unhealthy), not against the pure rule alone: the unit tests in
+/// `federation::candidate_tests` pin the narrowing logic, and this pins that
+/// `unhealthy_extension_candidates` actually reaches an unhealthy mount.
+#[tokio::test]
+async fn an_unhealthy_extension_owning_the_prefix_is_named_as_the_candidate() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dead_addr = format!("127.0.0.1:{port}");
+
+    let registry = FederationRegistry::build(
+        vec![cfg("episcience", &dead_addr, Some("es_"))],
+        "discovery-tok",
+    )
+    .await
+    .expect("an unreachable extension must not fail the build");
+    let shared = SharedFederation::new(registry);
+
+    assert_eq!(
+        shared.unhealthy_extension_candidates("es_attach_blob"),
+        vec!["episcience".to_string()],
+        "a down extension that owns the prefix is the diagnosis for an \
+         unroutable name"
+    );
+}
+
+/// A healthy registry names nobody: there is no unreachable extension to blame,
+/// and inventing one would be as misleading as the authz message this replaces.
+#[tokio::test]
+async fn a_healthy_registry_names_no_unhealthy_candidate() {
+    let (addr, _slot) = spawn_stub("ping").await;
+    let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+        .await
+        .expect("build");
+    let shared = SharedFederation::new(registry);
+
+    assert!(
+        shared
+            .unhealthy_extension_candidates("attach_blob")
+            .is_empty(),
+        "nothing is down, so nothing may be blamed"
+    );
+}
+
+/// The message is a ROUTING verdict, and must not read as an authorization one.
+#[test]
+fn unknown_tool_error_reports_routing_not_authorization() {
+    let err = epigraph_mcp::EpiGraphMcpFull::unknown_tool_error("attach_blob", &[]);
+    let msg = err.message.to_string();
+
+    assert!(
+        msg.contains("attach_blob"),
+        "must name the tool that did not route: {msg}"
+    );
+    assert!(
+        !msg.contains("no scope mapping"),
+        "the old authz-shaped wording is the bug (backlog ee50d10d): {msg}"
+    );
+    assert!(
+        !msg.contains("Forbidden") && !msg.contains("not authorized"),
+        "a name that routes nowhere is not an authorization verdict; the \
+         caller's scopes were never consulted: {msg}"
+    );
+    assert!(
+        msg.contains("ROUTING failure"),
+        "must say what kind of failure this is, or the reader re-derives the \
+         wrong one: {msg}"
+    );
+}
+
+/// With a down extension, the message says which one — the whole point of the
+/// candidate lookup. Without that clause the caller still has a dead end.
+#[test]
+fn unknown_tool_error_names_the_unreachable_extension() {
+    let err = epigraph_mcp::EpiGraphMcpFull::unknown_tool_error(
+        "attach_blob",
+        &["episcience".to_string()],
+    );
+    let msg = err.message.to_string();
+
+    assert!(
+        msg.contains("episcience"),
+        "must name the configured-but-unreachable extension: {msg}"
+    );
+    assert!(
+        msg.contains("unreachable"),
+        "must say WHY it is being named, not just drop a bare name: {msg}"
+    );
 }

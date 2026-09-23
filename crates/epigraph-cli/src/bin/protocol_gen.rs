@@ -32,15 +32,34 @@ async fn main() {
 
     let args = Args::parse();
 
-    if let Err(e) = run(args).await {
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("protocol_gen")
+        .await
+        .expect("maintenance pool");
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance viewer");
+    let viewer = session.viewer();
+
+    if let Err(e) = run(args, maint.pool().clone(), viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = epigraph_cli::db_connect().await?;
-
+async fn run(
+    args: Args,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load hypothesis claim
     let hypothesis: (String, serde_json::Value) =
         sqlx::query_as("SELECT content, properties FROM claims WHERE id = $1")
@@ -62,10 +81,11 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(method_ids) = &exp.method_ids {
             for mid in method_ids {
                 if let Some(method) = epigraph_db::MethodRepository::get(&pool, *mid).await? {
-                    let evidence =
-                        epigraph_db::MethodRepository::get_evidence_strength(&pool, method.id)
-                            .await
-                            .ok();
+                    let evidence = epigraph_db::MethodRepository::get_evidence_strength(
+                        &pool, viewer, method.id,
+                    )
+                    .await
+                    .ok();
                     let score = evidence.map(|e| e.avg_belief).unwrap_or(0.0);
                     method_context.push(serde_json::json!({
                         "name": method.name,

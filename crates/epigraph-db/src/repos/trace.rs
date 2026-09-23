@@ -26,6 +26,21 @@ struct TraceWithAgentRow {
     agent_id: Uuid,
 }
 
+/// One reasoning trace as a provenance step: the identity, the **raw**
+/// `reasoning_type` string as stored, and the confidence.
+///
+/// `reasoning_type` is deliberately NOT parsed into [`Methodology`]. See
+/// [`ReasoningTraceRepository::provenance_step_by_id`] for why.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TraceProvenanceStep {
+    /// `reasoning_traces.id`.
+    pub id: Uuid,
+    /// `reasoning_traces.reasoning_type`, exactly as stored.
+    pub reasoning_type: String,
+    /// `reasoning_traces.confidence`.
+    pub confidence: f64,
+}
+
 /// Build ReasoningTrace from database row data.
 ///
 /// This helper function handles the crypto fields that may not exist in
@@ -66,16 +81,34 @@ impl ReasoningTraceRepository {
     /// Note: This stores the trace metadata but does NOT store the inputs
     /// in trace_parents. Use `add_parent` to link traces together.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `reasoning_traces` is one of the tables migration 077 gives a STRICT
+    /// `WITH CHECK` (`owner_group_id = ANY(epigraph_writable_groups())`) and 079
+    /// FORCEs. An unstamped application connection has an empty writable set, so
+    /// the INSERT is refused with `42501` — pinned by
+    /// `epigraph-db/tests/rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`.
+    /// The only connection that CAN write it is one stamped by
+    /// `ScopedPool::begin_as`, and that hands back a transaction, not a pool. A
+    /// `&PgPool` parameter therefore made this function unreachable from the one
+    /// connection shape that works, which is why the executor is generic rather
+    /// than a pool: `&PgPool` and `&mut PgConnection` both satisfy
+    /// [`sqlx::PgExecutor`], so every existing pool-taking caller compiles
+    /// unchanged while a transaction can now join.
+    ///
+    /// Mirrors the read side of this repository, which has been
+    /// `<'e, E: PgExecutor<'e>>` since PR-09.
+    ///
     /// # Arguments
-    /// * `pool` - The database connection pool
+    /// * `executor` - A pool, connection, or transaction handle
     /// * `trace` - The reasoning trace to create
     /// * `claim_id` - The ID of the claim this trace is associated with
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, trace))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, trace))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         trace: &ReasoningTrace,
         claim_id: ClaimId,
     ) -> Result<ReasoningTrace, DbError> {
@@ -108,7 +141,7 @@ impl ReasoningTraceRepository {
             properties_json,
             created_at
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         let methodology = Self::db_string_to_methodology(&row.reasoning_type)?;
@@ -133,18 +166,72 @@ impl ReasoningTraceRepository {
         ))
     }
 
+    /// The three columns a provenance step renders — `id`, the **raw**
+    /// `reasoning_type` string and `confidence` — read through a `Viewer`.
+    ///
+    /// # Why this is not [`Self::get_by_id`]
+    ///
+    /// `get_by_id` parses `reasoning_type` into [`Methodology`] via
+    /// [`Self::db_string_to_methodology`], and that mapping is deliberately
+    /// lossy in the direction this caller cannot absorb: `"statistical"` and
+    /// `"analogical"` both resolve to a different spelling on the way back out.
+    /// The provenance step label is a response field, so reusing `get_by_id`
+    /// would change a public API response as a side effect of adding a filter.
+    /// It also `INNER JOIN`s `claims` for an `agent_id` this caller does not
+    /// project, and returns `explanation`, which it must not.
+    ///
+    /// So: the same visibility mechanism, over the projection the caller
+    /// actually needs. One marker, one bind — `reasoning_traces` is the only
+    /// relation here. The caller has already read the owning claim through the
+    /// same viewer, so there is no second alias to mark.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn provenance_step_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: TraceId,
+    ) -> Result<Option<TraceProvenanceStep>, DbError> {
+        let uuid: Uuid = id.into();
+        let sql = viewer.splice(
+            r#"
+            SELECT rt.id, rt.reasoning_type, rt.confidence
+            FROM reasoning_traces rt
+            WHERE rt.id = $1
+              /* {VISIBILITY:rt} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, TraceProvenanceStep>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
     /// Get a reasoning trace by ID
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, id: TraceId) -> Result<Option<ReasoningTrace>, DbError> {
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        id: TraceId,
+    ) -> Result<Option<ReasoningTrace>, DbError> {
         let uuid: Uuid = id.into();
 
         // JOIN with claims table to get the correct agent_id
         // This preserves provenance tracking - the agent who made the claim
         // is the agent associated with the reasoning trace
-        let row: Option<TraceWithAgentRow> = sqlx::query_as(
+        //
+        // BOTH aliases are marked. `reasoning_traces` carries its own tenancy
+        // columns (062) and `explanation` is free prose about the claim, so
+        // filtering only the joined `claims` row would still be wrong the other
+        // way round: a trace private to another group hanging off a public
+        // claim.
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -152,11 +239,15 @@ impl ReasoningTraceRepository {
             FROM reasoning_traces rt
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE rt.id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_optional(pool)
-        .await?;
+            2,
+        );
+        let mut q = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row: Option<TraceWithAgentRow> = q.fetch_optional(executor).await?;
 
         match row {
             Some(row) => {
@@ -192,15 +283,16 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_by_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: ClaimId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
         let uuid: Uuid = claim_id.into();
 
         // JOIN with claims table to get the correct agent_id
-        let rows: Vec<TraceWithAgentRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -208,12 +300,16 @@ impl ReasoningTraceRepository {
             FROM reasoning_traces rt
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE rt.claim_id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             ORDER BY rt.created_at DESC
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut qy = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            qy = qy.bind(g);
+        }
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(executor).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -277,15 +373,16 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_parents(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_parents<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         trace_id: TraceId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
         let uuid: Uuid = trace_id.into();
 
         // JOIN with claims table to get the correct agent_id for each parent trace
-        let rows: Vec<TraceWithAgentRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -294,11 +391,15 @@ impl ReasoningTraceRepository {
             INNER JOIN trace_parents tp ON rt.id = tp.parent_id
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE tp.trace_id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut qy = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            qy = qy.bind(g);
+        }
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(executor).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -334,15 +435,16 @@ impl ReasoningTraceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_children(
-        pool: &PgPool,
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_children<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         trace_id: TraceId,
     ) -> Result<Vec<ReasoningTrace>, DbError> {
         let uuid: Uuid = trace_id.into();
 
         // JOIN with claims table to get the correct agent_id for each child trace
-        let rows: Vec<TraceWithAgentRow> = sqlx::query_as(
+        let sql = viewer.splice(
             r#"
             SELECT rt.id, rt.claim_id, rt.reasoning_type, rt.confidence,
                    rt.explanation, rt.properties, rt.created_at,
@@ -351,11 +453,15 @@ impl ReasoningTraceRepository {
             INNER JOIN trace_parents tp ON rt.id = tp.trace_id
             INNER JOIN claims c ON rt.claim_id = c.id
             WHERE tp.parent_id = $1
+              /* {VISIBILITY:rt} */ /* {VISIBILITY:c} */
             "#,
-        )
-        .bind(uuid)
-        .fetch_all(pool)
-        .await?;
+            2,
+        );
+        let mut qy = sqlx::query_as::<_, TraceWithAgentRow>(&sql).bind(uuid);
+        if let Some(g) = viewer.group_bind() {
+            qy = qy.bind(g);
+        }
+        let rows: Vec<TraceWithAgentRow> = qy.fetch_all(executor).await?;
 
         let mut traces = Vec::with_capacity(rows.len());
 
@@ -493,10 +599,14 @@ mod tests {
         );
 
         // Now fetch the trace by ID and verify agent_id is correct
-        let fetched_trace = ReasoningTraceRepository::get_by_id(&pool, created_trace.id)
-            .await
-            .expect("Failed to fetch trace")
-            .expect("Trace should exist");
+        let fetched_trace = ReasoningTraceRepository::get_by_id(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            created_trace.id,
+        )
+        .await
+        .expect("Failed to fetch trace")
+        .expect("Trace should exist");
 
         let fetched_agent_uuid: Uuid = fetched_trace.agent_id.into();
         assert_eq!(
@@ -505,10 +615,13 @@ mod tests {
         );
 
         // Verify by fetching via get_by_claim
-        let traces_for_claim =
-            ReasoningTraceRepository::get_by_claim(&pool, ClaimId::from_uuid(claim_id))
-                .await
-                .expect("Failed to fetch traces by claim");
+        let traces_for_claim = ReasoningTraceRepository::get_by_claim(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            ClaimId::from_uuid(claim_id),
+        )
+        .await
+        .expect("Failed to fetch traces by claim");
 
         assert_eq!(traces_for_claim.len(), 1);
         let trace_from_claim: Uuid = traces_for_claim[0].agent_id.into();
@@ -608,9 +721,13 @@ mod tests {
             .expect("Failed to add parent");
 
         // Verify get_parents returns correct agent_id for parent
-        let parents = ReasoningTraceRepository::get_parents(&pool, child.id)
-            .await
-            .expect("Failed to get parents");
+        let parents = ReasoningTraceRepository::get_parents(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            child.id,
+        )
+        .await
+        .expect("Failed to get parents");
         assert_eq!(parents.len(), 1);
         let parent_agent: Uuid = parents[0].agent_id.into();
         assert_eq!(
@@ -619,9 +736,13 @@ mod tests {
         );
 
         // Verify get_children returns correct agent_id for child
-        let children = ReasoningTraceRepository::get_children(&pool, parent.id)
-            .await
-            .expect("Failed to get children");
+        let children = ReasoningTraceRepository::get_children(
+            &pool,
+            &crate::visibility::Viewer::test_scoped(uuid::Uuid::nil(), vec![]),
+            parent.id,
+        )
+        .await
+        .expect("Failed to get children");
         assert_eq!(children.len(), 1);
         let child_agent: Uuid = children[0].agent_id.into();
         assert_eq!(

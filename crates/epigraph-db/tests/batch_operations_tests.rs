@@ -12,6 +12,9 @@
 //! - UPDATE with CASE WHEN allows efficient mass updates
 //! - Transaction wrapper ensures atomicity (all succeed or all fail)
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 mod helpers;
 
 use epigraph_core::{Claim, ClaimId, Evidence, EvidenceType, TruthValue};
@@ -74,9 +77,10 @@ fn create_test_evidence_entity(
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_create_claims_empty_slice_returns_empty(pool: PgPool) {
     let claims: Vec<Claim> = vec![];
-    let result = ClaimRepository::batch_create(&pool, &claims)
-        .await
-        .expect("Batch create should succeed");
+    let result =
+        ClaimRepository::batch_create(&pool, &claims, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Batch create should succeed");
 
     assert!(result.is_empty(), "Empty input should produce empty output");
 }
@@ -93,9 +97,10 @@ async fn test_batch_create_claims_single_claim(pool: PgPool) {
     let claim = create_test_claim_entity(agent.id, "Single batch claim", 0.75);
     let claims = vec![claim.clone()];
 
-    let result = ClaimRepository::batch_create(&pool, &claims)
-        .await
-        .expect("Batch create should succeed");
+    let result =
+        ClaimRepository::batch_create(&pool, &claims, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Batch create should succeed");
 
     assert_eq!(result.len(), 1, "Should return one claim");
     assert_eq!(result[0].id, claim.id, "Claim ID should match");
@@ -122,9 +127,10 @@ async fn test_batch_create_claims_multiple(pool: PgPool) {
         })
         .collect();
 
-    let result = ClaimRepository::batch_create(&pool, &claims)
-        .await
-        .expect("Batch create should succeed");
+    let result =
+        ClaimRepository::batch_create(&pool, &claims, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Batch create should succeed");
 
     assert_eq!(result.len(), 5, "Should return all 5 claims");
 
@@ -158,9 +164,10 @@ async fn test_batch_create_claims_large_batch(pool: PgPool) {
         .map(|i| create_test_claim_entity(agent.id, &format!("Large batch claim {}", i), 0.5))
         .collect();
 
-    let result = ClaimRepository::batch_create(&pool, &claims)
-        .await
-        .expect("Batch create should succeed for large batches");
+    let result =
+        ClaimRepository::batch_create(&pool, &claims, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Batch create should succeed for large batches");
 
     assert_eq!(result.len(), 100, "Should return all 100 claims");
 }
@@ -171,14 +178,19 @@ async fn test_batch_create_claims_large_batch(pool: PgPool) {
 /// **Reasoning**: Maintains data integrity for bulk operations
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_create_claims_atomicity(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
     // Create a claim and insert it first
     let existing_claim = create_test_claim_entity(agent.id, "Existing claim", 0.7);
-    ClaimRepository::create(&pool, &existing_claim)
-        .await
-        .expect("Initial create should succeed");
+    ClaimRepository::create(
+        &pool,
+        &existing_claim,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("Initial create should succeed");
 
     // Now try to batch insert including the duplicate
     let mut claims: Vec<Claim> = (0..3)
@@ -200,12 +212,15 @@ async fn test_batch_create_claims_atomicity(pool: PgPool) {
     ));
 
     // The batch insert should fail
-    let result = ClaimRepository::batch_create(&pool, &claims).await;
+    let result =
+        ClaimRepository::batch_create(&pool, &claims, epigraph_core::TenancyDecl::Inherited).await;
     assert!(result.is_err(), "Batch with duplicate should fail");
 
     // Verify none of the new claims were inserted
     for (i, claim) in claims.iter().take(3).enumerate() {
-        let check = ClaimRepository::get_by_id(&pool, claim.id).await.unwrap();
+        let check = ClaimRepository::get_by_id(&pool, &viewer, claim.id)
+            .await
+            .unwrap();
         assert!(
             check.is_none(),
             "Claim {} should not exist due to atomic rollback",
@@ -238,12 +253,13 @@ async fn test_batch_update_truth_values_empty_returns_zero(pool: PgPool) {
 /// **Reasoning**: Batch degrades to single update gracefully
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_update_truth_values_single(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
     // Create a claim
     let claim = create_test_claim_entity(agent.id, "Claim to update", 0.5);
-    ClaimRepository::create(&pool, &claim)
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("Create should succeed");
 
@@ -258,7 +274,7 @@ async fn test_batch_update_truth_values_single(pool: PgPool) {
     assert_eq!(affected, 1, "Should affect 1 row");
 
     // Verify the update
-    let updated = ClaimRepository::get_by_id(&pool, claim.id)
+    let updated = ClaimRepository::get_by_id(&pool, &viewer, claim.id)
         .await
         .expect("Get should succeed")
         .expect("Claim should exist");
@@ -276,6 +292,7 @@ async fn test_batch_update_truth_values_single(pool: PgPool) {
 /// **Reasoning**: Primary use case for truth propagation updates
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_update_truth_values_multiple(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
@@ -285,7 +302,7 @@ async fn test_batch_update_truth_values_multiple(pool: PgPool) {
         .collect();
 
     for claim in &claims {
-        ClaimRepository::create(&pool, claim)
+        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
             .await
             .expect("Create should succeed");
     }
@@ -305,7 +322,7 @@ async fn test_batch_update_truth_values_multiple(pool: PgPool) {
 
     // Verify each update
     for (i, claim) in claims.iter().enumerate() {
-        let updated = ClaimRepository::get_by_id(&pool, claim.id)
+        let updated = ClaimRepository::get_by_id(&pool, &viewer, claim.id)
             .await
             .expect("Get should succeed")
             .expect("Claim should exist");
@@ -327,12 +344,13 @@ async fn test_batch_update_truth_values_multiple(pool: PgPool) {
 /// **Reasoning**: Graceful handling of stale update requests
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_update_truth_values_nonexistent_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
     // Create one real claim
     let claim = create_test_claim_entity(agent.id, "Real claim", 0.5);
-    ClaimRepository::create(&pool, &claim)
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("Create should succeed");
 
@@ -350,7 +368,7 @@ async fn test_batch_update_truth_values_nonexistent_claims(pool: PgPool) {
     assert_eq!(affected, 1, "Should only affect 1 existing row");
 
     // Verify the real claim was updated
-    let updated = ClaimRepository::get_by_id(&pool, claim.id)
+    let updated = ClaimRepository::get_by_id(&pool, &viewer, claim.id)
         .await
         .expect("Get should succeed")
         .expect("Claim should exist");
@@ -364,6 +382,7 @@ async fn test_batch_update_truth_values_nonexistent_claims(pool: PgPool) {
 /// **Reasoning**: Single round-trip to database for all updates
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
@@ -373,7 +392,7 @@ async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
         .collect();
 
     for claim in &claims {
-        ClaimRepository::create(&pool, claim)
+        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
             .await
             .expect("Create should succeed");
     }
@@ -393,7 +412,7 @@ async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
 
     // Verify each got its unique value
     for (id, expected_truth) in &updates {
-        let claim = ClaimRepository::get_by_id(&pool, *id)
+        let claim = ClaimRepository::get_by_id(&pool, &viewer, *id)
             .await
             .expect("Get should succeed")
             .expect("Claim should exist");
@@ -431,7 +450,7 @@ async fn test_batch_create_evidence_single(pool: PgPool) {
 
     // Create a claim first
     let claim = create_test_claim_entity(agent.id, "Claim for evidence", 0.7);
-    ClaimRepository::create(&pool, &claim)
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("Create claim should succeed");
 
@@ -457,7 +476,7 @@ async fn test_batch_create_evidence_multiple(pool: PgPool) {
 
     // Create a claim
     let claim = create_test_claim_entity(agent.id, "Claim for multiple evidence", 0.7);
-    ClaimRepository::create(&pool, &claim)
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("Create claim should succeed");
 
@@ -489,6 +508,7 @@ async fn test_batch_create_evidence_multiple(pool: PgPool) {
 /// **Reasoning**: Supports bulk import of heterogeneous data
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_create_evidence_multiple_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
@@ -498,7 +518,7 @@ async fn test_batch_create_evidence_multiple_claims(pool: PgPool) {
         .collect();
 
     for claim in &claims {
-        ClaimRepository::create(&pool, claim)
+        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
             .await
             .expect("Create claim should succeed");
     }
@@ -531,7 +551,7 @@ async fn test_batch_create_evidence_multiple_claims(pool: PgPool) {
 
     // Verify evidence is correctly linked to claims
     for (i, claim) in claims.iter().enumerate() {
-        let claim_evidence = EvidenceRepository::get_by_claim(&pool, claim.id)
+        let claim_evidence = EvidenceRepository::get_by_claim(&pool, &viewer, claim.id)
             .await
             .expect("Get evidence should succeed");
 
@@ -550,12 +570,13 @@ async fn test_batch_create_evidence_multiple_claims(pool: PgPool) {
 /// **Reasoning**: Maintains data integrity
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_create_evidence_atomicity(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
     // Create a claim
     let claim = create_test_claim_entity(agent.id, "Claim for atomicity test", 0.7);
-    ClaimRepository::create(&pool, &claim)
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
         .await
         .expect("Create claim should succeed");
 
@@ -591,7 +612,7 @@ async fn test_batch_create_evidence_atomicity(pool: PgPool) {
     assert!(result.is_err(), "Batch with duplicate should fail");
 
     // Verify none of the new evidence was inserted
-    let all_evidence = EvidenceRepository::get_by_claim(&pool, claim.id)
+    let all_evidence = EvidenceRepository::get_by_claim(&pool, &viewer, claim.id)
         .await
         .expect("Get evidence should succeed");
 
@@ -612,6 +633,7 @@ async fn test_batch_create_evidence_atomicity(pool: PgPool) {
 /// **Reasoning**: Complex imports may need cross-entity atomicity
 #[sqlx::test(migrations = "../../migrations")]
 async fn test_batch_operations_in_transaction(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
 
@@ -620,9 +642,10 @@ async fn test_batch_operations_in_transaction(pool: PgPool) {
         .map(|i| create_test_claim_entity(agent.id, &format!("Transaction claim {}", i), 0.5))
         .collect();
 
-    let created_claims = ClaimRepository::batch_create(&pool, &claims)
-        .await
-        .expect("Batch create claims should succeed");
+    let created_claims =
+        ClaimRepository::batch_create(&pool, &claims, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Batch create claims should succeed");
 
     assert_eq!(created_claims.len(), 3);
 
@@ -640,7 +663,7 @@ async fn test_batch_operations_in_transaction(pool: PgPool) {
 
     // Verify all data was created
     for claim in &created_claims {
-        let evidence = EvidenceRepository::get_by_claim(&pool, claim.id)
+        let evidence = EvidenceRepository::get_by_claim(&pool, &viewer, claim.id)
             .await
             .expect("Get evidence should succeed");
 
@@ -669,9 +692,10 @@ async fn test_batch_insert_performance(pool: PgPool) {
         .collect();
 
     let batch_start = Instant::now();
-    let _ = ClaimRepository::batch_create(&pool, &batch_claims)
-        .await
-        .expect("Batch create should succeed");
+    let _ =
+        ClaimRepository::batch_create(&pool, &batch_claims, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .expect("Batch create should succeed");
     let batch_duration = batch_start.elapsed();
 
     // Create another 50 claims for individual insert
@@ -681,7 +705,7 @@ async fn test_batch_insert_performance(pool: PgPool) {
 
     let individual_start = Instant::now();
     for claim in &individual_claims {
-        ClaimRepository::create(&pool, claim)
+        ClaimRepository::create(&pool, claim, epigraph_core::TenancyDecl::Inherited)
             .await
             .expect("Create should succeed");
     }

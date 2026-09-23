@@ -16,6 +16,66 @@ pub struct ClaimThemeRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Read-path projection of a theme: everything a caller needs to decide
+/// whether to open it, without writing anything.
+///
+/// Deliberately a SEPARATE struct from [`ClaimThemeRow`] rather than extra
+/// fields on it. `sqlx::FromRow` resolves columns by name at RUNTIME, so
+/// adding `member_count` / `centroid_dim` to `ClaimThemeRow` would make every
+/// existing `query_as::<_, ClaimThemeRow>` whose SELECT omits them fail when
+/// executed, not when compiled — the same hazard documented on `ClaimRow` in
+/// `claim.rs::list_by_truth_range`.
+///
+/// ## `member_count` vs `stored_claim_count`
+///
+/// `stored_claim_count` is the denormalised `claim_themes.claim_count` column.
+/// It is **not maintained** by the assignment writers: `assign_claim`,
+/// `bulk_assign` and `unassign_claim` all write `claims.theme_id` and never
+/// touch it; only [`ClaimThemeRepository::update_count`] does, and only the
+/// k-means path calls that. `member_count` is the live
+/// `COUNT(*) FROM claims WHERE theme_id = t.id AND is_current` and is the
+/// authoritative figure. The two are both reported so a caller (or an
+/// operator auditing drift) can see the divergence instead of silently
+/// trusting a stale number.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ThemeSummaryRow {
+    pub id: Uuid,
+    pub label: String,
+    pub description: String,
+    /// Denormalised `claim_themes.claim_count` — stale by construction.
+    pub stored_claim_count: i32,
+    /// Live count of `is_current` claims assigned to this theme.
+    pub member_count: i64,
+    /// Derived from which centroid column is populated: `3072`, `1536`, or
+    /// `None` when the theme has no centroid at all (created but never
+    /// fitted). `claim_themes` has no `centroid_dim` column.
+    pub centroid_dim: Option<i32>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One member of a theme, as returned by
+/// [`ClaimThemeRepository::member_claim_ids`]. Carries no `content` — see
+/// that method's docstring for why.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ThemeMemberRow {
+    pub claim_id: Uuid,
+    pub truth_value: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Treat a blank/whitespace-only `label_prefix` as "no filter".
+///
+/// `starts_with(label, '')` is true for every row, so an empty prefix is
+/// already a no-op — normalising it to `NULL` just keeps the planner on the
+/// unfiltered path and makes the intent explicit at the call site.
+fn normalize_prefix(label_prefix: Option<&str>) -> Option<String> {
+    label_prefix
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(ToString::to_string)
+}
+
 /// A claim flagged as potentially misplaced by cluster-level metrics.
 #[derive(Debug, Clone)]
 pub struct BoundaryClaimRow {
@@ -108,6 +168,54 @@ impl ClaimThemeRepository {
         Ok(())
     }
 
+    /// Set a theme's centroid to the mean of the given claims' 1536-d
+    /// embeddings, computed in the database.
+    ///
+    /// # Why this exists
+    ///
+    /// `scripts/maintain_themes.py` used to compute sub-theme centroids
+    /// client-side from the raw vectors `GET /themes/:id/embeddings` handed
+    /// back. PR-07 stops that endpoint disclosing raw vectors (plan §4.9 row
+    /// 4), so the averaging moves here — the server already holds the vectors,
+    /// and this is the only remaining reason a caller needed them.
+    ///
+    /// The read is viewer-filtered: a centroid is an aggregate *of claim
+    /// content*, so averaging rows the caller cannot see would leak their
+    /// position in embedding space. `Bypass` viewers average everything, which
+    /// is what a maintenance job wants.
+    ///
+    /// Returns the number of claims that contributed. Zero means no visible
+    /// claim in `claim_ids` had an embedding, and the centroid is left unset
+    /// rather than written as NULL.
+    pub async fn set_centroid_from_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+        claim_ids: &[Uuid],
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "UPDATE claim_themes t \
+             SET centroid = agg.centroid, updated_at = NOW() \
+             FROM ( \
+                 SELECT AVG(c.embedding)::vector AS centroid, COUNT(*) AS n \
+                 FROM claims c \
+                 WHERE c.id = ANY($2) AND c.embedding IS NOT NULL \
+                   /* {VISIBILITY:c} */ \
+             ) agg \
+             WHERE t.id = $1 AND agg.n > 0 \
+             RETURNING agg.n",
+            3,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql)
+            .bind(theme_id)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let n = q.fetch_optional(executor).await.map_err(DbError::from)?;
+        Ok(n.unwrap_or(0))
+    }
+
     /// Assign a single claim to a theme
     pub async fn assign_claim(
         pool: &PgPool,
@@ -162,6 +270,192 @@ impl ClaimThemeRepository {
         Ok(rows)
     }
 
+    /// Paged theme summaries for the READ path, newest-first by live member
+    /// count. `label_prefix` filters on `starts_with(label, prefix)`; `None`
+    /// (or an empty string) means no filter.
+    ///
+    /// See [`ThemeSummaryRow`] for why this does not reuse [`Self::list`]:
+    /// `list` reports the denormalised `claim_count`, which the assignment
+    /// writers do not maintain.
+    ///
+    /// Ordering is `member_count DESC, label ASC, id ASC`. The `id` tiebreaker
+    /// is load-bearing, not cosmetic: `label` carries no UNIQUE constraint, so
+    /// without it two same-label themes could swap places between two pages of
+    /// the same walk and a caller would see one twice and the other never.
+    /// `member_count` is an aggregate over `claims`, so it is viewer-filtered:
+    /// an unfiltered count is an exact cardinality oracle over rows the caller
+    /// may not read, and it also drives `ORDER BY`, which would leak the
+    /// relative sizes of invisible partitions. `claim_themes` itself is NOT a
+    /// tenancy table (migration 062's `tier_a` does not list it), so the theme
+    /// ROWS are corpus-wide by design and only the counts narrow — which is
+    /// what keeps this consistent with [`Self::count_summaries`].
+    pub async fn list_summaries(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        label_prefix: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ThemeSummaryRow>, DbError> {
+        let prefix = normalize_prefix(label_prefix);
+        let sql = viewer.splice(
+            "SELECT t.id, t.label, t.description, \
+                    t.claim_count AS stored_claim_count, \
+                    COALESCE(m.member_count, 0)::int8 AS member_count, \
+                    CASE WHEN t.centroid_3072 IS NOT NULL THEN 3072 \
+                         WHEN t.centroid IS NOT NULL THEN 1536 \
+                         ELSE NULL END::int4 AS centroid_dim, \
+                    t.created_at, t.updated_at \
+             FROM claim_themes t \
+             LEFT JOIN LATERAL ( \
+                 SELECT COUNT(*) AS member_count FROM claims c \
+                 WHERE c.theme_id = t.id AND COALESCE(c.is_current, true) \
+                   /* {VISIBILITY:c} */ \
+             ) m ON TRUE \
+             WHERE ($1::text IS NULL OR starts_with(t.label, $1::text)) \
+             ORDER BY member_count DESC, t.label ASC, t.id ASC \
+             LIMIT $2 OFFSET $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, ThemeSummaryRow>(&sql)
+            .bind(prefix.as_deref()) // $1
+            .bind(limit) // $2
+            .bind(offset); // $3
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g); // $4
+        }
+        let rows = q.fetch_all(pool).await.map_err(DbError::from)?;
+        Ok(rows)
+    }
+
+    /// Total themes matching the same `label_prefix` predicate
+    /// [`Self::list_summaries`] applies, so a caller can tell a short page
+    /// from the end of the list.
+    ///
+    /// Takes NO `&Viewer`, and that is what keeps it CONSISTENT with its
+    /// paging twin rather than inconsistent with it. This counts `claim_themes`
+    /// rows and touches `claims` not at all; `claim_themes` is absent from
+    /// migration 062's `tier_a`, so it carries neither `visibility` nor
+    /// `owner_group_id` and there is no predicate to write. `list_summaries`
+    /// filters only the member COUNT it projects, never which theme rows it
+    /// returns, so both halves still describe the same population of themes.
+    pub async fn count_summaries(
+        pool: &PgPool,
+        label_prefix: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let prefix = normalize_prefix(label_prefix);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::int8 FROM claim_themes t \
+             WHERE ($1::text IS NULL OR starts_with(t.label, $1::text))",
+        )
+        .bind(prefix.as_deref())
+        .fetch_one(pool)
+        .await
+        .map_err(DbError::from)?;
+        Ok(count)
+    }
+
+    /// Single theme summary by id. `None` when no such theme exists — the
+    /// caller decides whether that is a 404 or a silent skip.
+    /// `member_count` is viewer-filtered for the reason given on
+    /// [`Self::list_summaries`]; the theme row itself is not a tenancy row.
+    pub async fn get_summary(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+    ) -> Result<Option<ThemeSummaryRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT t.id, t.label, t.description, \
+                    t.claim_count AS stored_claim_count, \
+                    COALESCE(m.member_count, 0)::int8 AS member_count, \
+                    CASE WHEN t.centroid_3072 IS NOT NULL THEN 3072 \
+                         WHEN t.centroid IS NOT NULL THEN 1536 \
+                         ELSE NULL END::int4 AS centroid_dim, \
+                    t.created_at, t.updated_at \
+             FROM claim_themes t \
+             LEFT JOIN LATERAL ( \
+                 SELECT COUNT(*) AS member_count FROM claims c \
+                 WHERE c.theme_id = t.id AND COALESCE(c.is_current, true) \
+                   /* {VISIBILITY:c} */ \
+             ) m ON TRUE \
+             WHERE t.id = $1",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ThemeSummaryRow>(&sql).bind(theme_id); // $1
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g); // $2
+        }
+        let row = q.fetch_optional(pool).await.map_err(DbError::from)?;
+        Ok(row)
+    }
+
+    /// Every theme carrying EXACTLY this label, oldest first.
+    ///
+    /// Returns a `Vec`, not an `Option`, on purpose: `claim_themes` has no
+    /// `UNIQUE(label)` constraint and `theme_cluster(wipe_first=false)`
+    /// actively produces duplicate `auto-00` rows (see this module's
+    /// docstring). A resolver that returned "the first match" would silently
+    /// pick one of several distinct themes; callers must see the ambiguity and
+    /// refuse rather than guess.
+    pub async fn find_by_label(pool: &PgPool, label: &str) -> Result<Vec<Uuid>, DbError> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM claim_themes WHERE label = $1 ORDER BY created_at ASC, id ASC",
+        )
+        .bind(label)
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::from)?;
+        Ok(ids)
+    }
+
+    /// One page of a theme's member claims — **ids and metadata only, never
+    /// `content`**.
+    ///
+    /// Withholding content is a deliberate scope decision, not an oversight:
+    /// every content-returning read in this system runs the PRIVATE-visibility
+    /// redaction pass (`batch_check_content_access` in
+    /// `epigraph-mcp/src/tools/claims.rs`), and a membership listing that
+    /// returned previews would be a second, unredacted content surface.
+    /// Callers resolve ids through `get_claim`, which redacts.
+    ///
+    /// Restricted to `is_current` members so the count and the page agree with
+    /// each other and with what the retrieval path can actually return
+    /// (migration 052 forces `embedding IS NULL` on retired rows, so a retired
+    /// member is unreachable by semantic recall anyway).
+    ///
+    /// Ordered `created_at ASC, id ASC` — the `id` tiebreaker makes the walk
+    /// stable across pages for claims sharing a timestamp (bulk ingest writes
+    /// many rows within the same microsecond).
+    /// Viewer-filtered. Withholding `content` (see above) bounds the damage of
+    /// an unfiltered read but does not remove it: claim IDs, truth values and
+    /// timestamps for rows the caller cannot read are themselves a disclosure,
+    /// and every id returned here is directly resolvable via `get_claim`.
+    pub async fn member_claim_ids(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ThemeMemberRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id AS claim_id, c.truth_value, c.created_at \
+             FROM claims c \
+             WHERE c.theme_id = $1 AND COALESCE(c.is_current, true) \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.created_at ASC, c.id ASC \
+             LIMIT $2 OFFSET $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, ThemeMemberRow>(&sql)
+            .bind(theme_id) // $1
+            .bind(limit) // $2
+            .bind(offset); // $3
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g); // $4
+        }
+        let rows = q.fetch_all(pool).await.map_err(DbError::from)?;
+        Ok(rows)
+    }
+
     /// Find themes whose centroids are most similar to the query vector.
     ///
     /// Returns `(theme_id, label, similarity)` tuples ordered by descending similarity.
@@ -185,8 +479,20 @@ impl ClaimThemeRepository {
     /// `DbError::InvalidData` — the dim gate is the *only* path by which a
     /// column name is interpolated, which is what makes the `format!`-built
     /// SQL injection-safe.
-    pub async fn find_similar_themes_at_dim(
-        pool: &PgPool,
+    ///
+    /// # Executor, and why this one takes no `Viewer`
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so a caller holding a viewer-stamped
+    /// connection can run this statement on it instead of the raw pool. PR-29
+    /// widened it for `routes/search.rs::semantic_search`; `&PgPool` still
+    /// satisfies the bound, so [`Self::find_similar_themes`] and the
+    /// `epigraph-engine` wrapper compile unchanged.
+    ///
+    /// It takes no `&Viewer` because `claim_themes` carries no tenancy to filter
+    /// on — see the `EXECUTOR_WITHOUT_VIEWER` entry in
+    /// `epigraph-db/tests/visibility_lint.rs`, which records the measurement.
+    pub async fn find_similar_themes_at_dim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         query_vec: &str,
         limit: i32,
         centroid_dim: u32,
@@ -207,7 +513,7 @@ impl ClaimThemeRepository {
         let rows = sqlx::query(&sql)
             .bind(query_vec)
             .bind(limit)
-            .fetch_all(pool)
+            .fetch_all(executor)
             .await
             .map_err(DbError::from)?;
 
@@ -230,11 +536,12 @@ impl ClaimThemeRepository {
     /// Legacy 1536d-only convenience over [`Self::claims_in_themes_at_dim`].
     pub async fn claims_in_themes(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         theme_ids: &[Uuid],
         query_vec: &str,
         limit: i32,
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
-        Self::claims_in_themes_at_dim(pool, theme_ids, query_vec, limit, 1536, false).await
+        Self::claims_in_themes_at_dim(pool, viewer, theme_ids, query_vec, limit, 1536, false).await
     }
 
     /// Dim-aware variant of [`Self::claims_in_themes`].
@@ -253,12 +560,19 @@ impl ClaimThemeRepository {
     /// REST passes `false` to match its historical behaviour.
     ///
     /// Retained at its original arity as a delegating wrapper over
-    /// [`Self::claims_in_themes_at_dim_since`], so the REST
-    /// `/api/v1/search/semantic?diverse=true` route (which reaches this
-    /// through `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`)
-    /// keeps the call it already has.
+    /// [`Self::claims_in_themes_at_dim_since`].
+    ///
+    /// The rationale that arity was retained FOR no longer applies, and saying
+    /// so is cheaper than letting the next reader re-derive it: the REST
+    /// `/api/v1/search/semantic?diverse=true` route used to reach this through
+    /// `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`, and
+    /// PR-29 re-pointed it at [`Self::claims_in_themes_at_dim_since`] directly
+    /// on a viewer-stamped connection. This method is still called — by
+    /// [`Self::claims_in_themes`], the legacy 1536d convenience above — so it is
+    /// not orphaned; only the REST justification is spent.
     pub async fn claims_in_themes_at_dim(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         theme_ids: &[Uuid],
         query_vec: &str,
         limit: i32,
@@ -267,6 +581,7 @@ impl ClaimThemeRepository {
     ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
         Self::claims_in_themes_at_dim_since(
             pool,
+            viewer,
             theme_ids,
             query_vec,
             limit,
@@ -287,8 +602,9 @@ impl ClaimThemeRepository {
     /// `paper_doi_filter` `TODO(diverse-recall)` already exhibits on this
     /// path; the window must not become the second instance of it.
     #[allow(clippy::too_many_arguments)]
-    pub async fn claims_in_themes_at_dim_since(
-        pool: &PgPool,
+    pub async fn claims_in_themes_at_dim_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         theme_ids: &[Uuid],
         query_vec: &str,
         limit: i32,
@@ -314,18 +630,23 @@ impl ClaimThemeRepository {
                AND c.{claim_col} IS NOT NULL \
                AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz)\
                {level_clause} \
+               /* {{VISIBILITY:c}} */ \
              ORDER BY c.{claim_col} <=> $2::vector \
              LIMIT $3"
         );
+        // Doubled braces above: this is a `format!` template, so `{{` emits the
+        // single brace `Viewer::splice` looks for.
+        let sql = viewer.splice(&sql, 5);
 
-        let rows = sqlx::query(&sql)
+        let mut vq = sqlx::query(&sql)
             .bind(theme_ids)
             .bind(query_vec)
             .bind(limit)
-            .bind(since)
-            .fetch_all(pool)
-            .await
-            .map_err(DbError::from)?;
+            .bind(since);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -361,28 +682,33 @@ impl ClaimThemeRepository {
     ///
     /// These are candidates for theme reassignment — they sit on cluster boundaries
     /// and are far from their assigned centroid.
-    pub async fn find_boundary_claims(
-        pool: &PgPool,
+    pub async fn find_boundary_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         min_boundary_ratio: f64,
         min_centroid_distance: f64,
         limit: i64,
     ) -> Result<Vec<BoundaryClaimRow>, DbError> {
-        let rows = sqlx::query(
+        let sql = viewer.splice(
             "SELECT cc.claim_id, c.theme_id, cc.boundary_ratio, cc.centroid_distance, \
                     LEFT(c.content, 120) AS content_preview \
              FROM claim_clusters cc \
              JOIN claims c ON c.id = cc.claim_id \
              WHERE cc.boundary_ratio > $1 \
                AND cc.centroid_distance > $2 \
+               /* {VISIBILITY:c} */ /* {VISIBILITY:cc} */ \
              ORDER BY cc.boundary_ratio DESC \
              LIMIT $3",
-        )
-        .bind(min_boundary_ratio)
-        .bind(min_centroid_distance)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
+            4,
+        );
+        let mut vq = sqlx::query(&sql)
+            .bind(min_boundary_ratio)
+            .bind(min_centroid_distance)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -413,22 +739,26 @@ impl ClaimThemeRepository {
     /// Get the cosine distance from a claim's embedding to its current theme centroid.
     ///
     /// Returns `None` if the claim has no theme, no embedding, or the theme has no centroid.
-    pub async fn get_claim_theme_distance(
-        pool: &PgPool,
+    pub async fn get_claim_theme_distance<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<f64>, DbError> {
-        let row = sqlx::query(
+        let sql = viewer.splice(
             "SELECT (ct.centroid <=> c.embedding)::float8 AS distance \
              FROM claims c \
              JOIN claim_themes ct ON c.theme_id = ct.id \
              WHERE c.id = $1 \
                AND c.embedding IS NOT NULL \
-               AND ct.centroid IS NOT NULL",
-        )
-        .bind(claim_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(DbError::from)?;
+               AND ct.centroid IS NOT NULL \
+               /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut vq = sqlx::query(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let row = vq.fetch_optional(executor).await.map_err(DbError::from)?;
 
         Ok(row.map(|r| r.get::<f64, _>("distance")))
     }
@@ -436,17 +766,20 @@ impl ClaimThemeRepository {
     /// Get a claim's embedding as a pgvector string for use in find_similar_themes.
     ///
     /// Returns `None` if the claim has no embedding.
-    pub async fn get_claim_embedding_str(
-        pool: &PgPool,
+    pub async fn get_claim_embedding_str<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Option<String>, DbError> {
-        let row = sqlx::query(
-            "SELECT embedding::text AS emb_str FROM claims WHERE id = $1 AND embedding IS NOT NULL",
-        )
-        .bind(claim_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(DbError::from)?;
+        let sql = viewer.splice(
+            "SELECT embedding::text AS emb_str FROM claims WHERE id = $1 AND embedding IS NOT NULL /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut vq = sqlx::query(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let row = vq.fetch_optional(executor).await.map_err(DbError::from)?;
 
         Ok(row.map(|r| r.get::<String, _>("emb_str")))
     }
@@ -456,9 +789,13 @@ impl ClaimThemeRepository {
     /// Uses a CTE: find claims with embeddings but no theme_id, assign each
     /// to the nearest theme centroid via pgvector `<=>`. Returns count assigned.
     /// Call in a loop until it returns 0.
-    pub async fn assign_unthemed_batch(pool: &PgPool, batch_size: i64) -> Result<i64, DbError> {
+    pub async fn assign_unthemed_batch<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        _viewer: &crate::visibility::Viewer,
+        batch_size: i64,
+    ) -> Result<i64, DbError> {
         let row = sqlx::query(
-            "WITH unthemed AS ( \
+            "-- VISIBILITY-EXEMPT: corpus-wide theme clustering maintenance, SystemReason::ThemeClustering.\n             -- A theme centroid is an average over EVERY member claim; computing it\n             -- per-viewer would give each tenant a different, wrong centroid for the\n             -- same theme row and make assignment non-deterministic. Takes a viewer\n             -- so the exemption is visible at the call site.\n             WITH unthemed AS ( \
                 SELECT id, embedding \
                 FROM claims \
                 WHERE embedding IS NOT NULL AND theme_id IS NULL \
@@ -479,7 +816,7 @@ impl ClaimThemeRepository {
             RETURNING c.id",
         )
         .bind(batch_size)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
         .map_err(DbError::from)?;
 
@@ -492,10 +829,11 @@ impl ClaimThemeRepository {
     /// Returns None if the theme has no claims with embeddings.
     pub async fn recompute_centroid_for_theme(
         pool: &PgPool,
+        _viewer: &crate::visibility::Viewer,
         theme_id: Uuid,
     ) -> Result<Option<(String, i32)>, DbError> {
         let count_row = sqlx::query(
-            "SELECT ct.label, COUNT(c.id)::int4 AS n \
+            "-- VISIBILITY-EXEMPT: corpus-wide theme clustering maintenance, SystemReason::ThemeClustering.\n             -- A theme centroid is an average over EVERY member claim; computing it\n             -- per-viewer would give each tenant a different, wrong centroid for the\n             -- same theme row and make assignment non-deterministic. Takes a viewer\n             -- so the exemption is visible at the call site.\n             SELECT ct.label, COUNT(c.id)::int4 AS n \
              FROM claim_themes ct \
              LEFT JOIN claims c ON c.theme_id = ct.id AND c.embedding IS NOT NULL \
              WHERE ct.id = $1 \
@@ -516,7 +854,7 @@ impl ClaimThemeRepository {
         }
 
         sqlx::query(
-            "UPDATE claim_themes SET \
+            "-- VISIBILITY-EXEMPT: corpus-wide theme clustering maintenance, SystemReason::ThemeClustering.\n             -- A theme centroid is an average over EVERY member claim; computing it\n             -- per-viewer would give each tenant a different, wrong centroid for the\n             -- same theme row and make assignment non-deterministic. Takes a viewer\n             -- so the exemption is visible at the call site.\n             UPDATE claim_themes SET \
                 centroid = (SELECT avg(c.embedding)::vector(1536) \
                             FROM claims c \
                             WHERE c.theme_id = $1 AND c.embedding IS NOT NULL), \
@@ -536,9 +874,10 @@ impl ClaimThemeRepository {
     /// Recompute centroids for all themes. Returns list of (id, label, count).
     pub async fn recompute_all_centroids(
         pool: &PgPool,
+        _viewer: &crate::visibility::Viewer,
     ) -> Result<Vec<RecomputedThemeRow>, DbError> {
         let themes = sqlx::query(
-            "SELECT ct.id, ct.label, COUNT(c.id)::int4 AS n \
+            "-- VISIBILITY-EXEMPT: corpus-wide theme clustering maintenance, SystemReason::ThemeClustering.\n             -- A theme centroid is an average over EVERY member claim.\n             SELECT ct.id, ct.label, COUNT(c.id)::int4 AS n \
              FROM claim_themes ct \
              LEFT JOIN claims c ON c.theme_id = ct.id AND c.embedding IS NOT NULL \
              GROUP BY ct.id, ct.label \
@@ -556,7 +895,7 @@ impl ClaimThemeRepository {
 
             if count > 0 {
                 sqlx::query(
-                    "UPDATE claim_themes SET \
+                    "-- VISIBILITY-EXEMPT: corpus-wide theme clustering maintenance, SystemReason::ThemeClustering.\n             -- A theme centroid is an average over EVERY member claim; computing it\n             -- per-viewer would give each tenant a different, wrong centroid for the\n             -- same theme row and make assignment non-deterministic. Takes a viewer\n             -- so the exemption is visible at the call site.\n             UPDATE claim_themes SET \
                         centroid = (SELECT avg(c.embedding)::vector(1536) \
                                     FROM claims c \
                                     WHERE c.theme_id = $1 AND c.embedding IS NOT NULL), \
@@ -582,30 +921,35 @@ impl ClaimThemeRepository {
     }
 
     /// Find themes with high intra-cluster variance (candidates for splitting).
-    pub async fn find_split_candidates(
-        pool: &PgPool,
+    pub async fn find_split_candidates<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         variance_threshold: f64,
         min_claims: i64,
         limit: i64,
     ) -> Result<Vec<SplitCandidateRow>, DbError> {
-        let rows = sqlx::query(
+        let sql = viewer.splice(
             "SELECT ct.id, ct.label, ct.claim_count, \
                     avg(ct.centroid <=> c.embedding)::float8 AS avg_distance, \
                     max(ct.centroid <=> c.embedding)::float8 AS max_distance \
              FROM claim_themes ct \
              JOIN claims c ON c.theme_id = ct.id AND c.embedding IS NOT NULL \
              WHERE ct.claim_count >= $1 AND ct.centroid IS NOT NULL \
+               /* {VISIBILITY:c} */ \
              GROUP BY ct.id, ct.label, ct.claim_count \
              HAVING avg(ct.centroid <=> c.embedding) > $2 \
              ORDER BY avg(ct.centroid <=> c.embedding) DESC \
              LIMIT $3",
-        )
-        .bind(min_claims)
-        .bind(variance_threshold)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
+            4,
+        );
+        let mut vq = sqlx::query(&sql)
+            .bind(min_claims)
+            .bind(variance_threshold)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -621,13 +965,14 @@ impl ClaimThemeRepository {
     }
 
     /// Find themes with many claims far from their centroid (new theme candidates).
-    pub async fn find_distant_claims(
-        pool: &PgPool,
+    pub async fn find_distant_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         distance_threshold: f64,
         min_cluster_size: i64,
         limit: i64,
     ) -> Result<Vec<DistantClaimsRow>, DbError> {
-        let rows = sqlx::query(
+        let sql = viewer.splice(
             "SELECT ct.label, COUNT(*)::int8 AS n_distant, \
                     avg(ct.centroid <=> c.embedding)::float8 AS avg_dist \
              FROM claims c \
@@ -635,17 +980,21 @@ impl ClaimThemeRepository {
              WHERE c.embedding IS NOT NULL \
                AND ct.centroid IS NOT NULL \
                AND (ct.centroid <=> c.embedding) > $1 \
+               /* {VISIBILITY:c} */ \
              GROUP BY ct.id, ct.label \
              HAVING COUNT(*) >= $2 \
              ORDER BY COUNT(*) DESC \
              LIMIT $3",
-        )
-        .bind(distance_threshold)
-        .bind(min_cluster_size)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
+            4,
+        );
+        let mut vq = sqlx::query(&sql)
+            .bind(distance_threshold)
+            .bind(min_cluster_size)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()
@@ -662,22 +1011,25 @@ impl ClaimThemeRepository {
     ///
     /// Returns embeddings as pgvector text format. The API handler converts
     /// to JSON arrays for the response.
-    pub async fn get_theme_embeddings(
-        pool: &PgPool,
+    pub async fn get_theme_embeddings<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         theme_id: Uuid,
         limit: i64,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
-        let rows = sqlx::query(
+        let sql = viewer.splice(
             "SELECT id, embedding::text AS emb_str \
              FROM claims \
              WHERE theme_id = $1 AND embedding IS NOT NULL \
+               /* {VISIBILITY:claims} */ \
              LIMIT $2",
-        )
-        .bind(theme_id)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::from)?;
+            3,
+        );
+        let mut vq = sqlx::query(&sql).bind(theme_id).bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
         let results = rows
             .iter()

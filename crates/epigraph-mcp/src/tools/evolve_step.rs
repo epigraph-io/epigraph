@@ -52,6 +52,7 @@ pub struct EvolveStepResponse {
 
 pub async fn evolve_step(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: EvolveStepParams,
 ) -> Result<CallToolResult, McpError> {
     let level = params.level.unwrap_or(2);
@@ -75,7 +76,7 @@ pub async fn evolve_step(
         }
         parse_uuid(params.parent_id.trim())?
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
-        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, name, idx, true)
+        epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
             .map_err(internal_error)?
             .ok_or_else(|| {

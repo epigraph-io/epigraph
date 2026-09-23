@@ -34,6 +34,7 @@
 //! workers ≈ 2–3 minutes.
 
 use clap::Parser;
+use futures::StreamExt as _;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,13 +73,34 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    if let Err(e) = run(cli).await {
+
+    // CLI maintenance bin: the operator is the authority and the work is
+    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
+    // bypass and a request handler does not.
+    //
+    // Built AFTER clap has parsed: an argv error must be reported as an argv
+    // error, not as a connection failure. And `_maint_conn` is held for the
+    // whole run — the lease attests to THAT connection, and the pre-PR-15
+    // template dropped it while the viewer lived on.
+    let maint = epigraph_cli::MaintenancePool::connect("recompute_claim_belief")
+        .await
+        .expect("maintenance pool");
+    let session = maint
+        .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance viewer");
+    let viewer = session.viewer();
+    if let Err(e) = run(cli, maint.pool().clone(), viewer).await {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Cli,
+    pool: sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Read the claim list first — fail fast if the file is missing /
     // unparseable, before touching the DB.
     let claim_ids = read_claim_ids(&cli)?;
@@ -96,7 +118,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let pool = epigraph_cli::db_connect().await?;
     let total = claim_ids.len();
     let done = Arc::new(AtomicUsize::new(0));
     let claims_with_work = Arc::new(AtomicUsize::new(0));
@@ -104,52 +125,75 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let frame_writes = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
 
-    // Bounded concurrent fan-out via tokio Semaphore. Each task may issue
-    // multiple per-frame recomputes for one claim — bounding at the
-    // claim level keeps the pool ceiling predictable.
-    let sem = Arc::new(tokio::sync::Semaphore::new(cli.concurrency.max(1)));
-    let mut handles = Vec::with_capacity(claim_ids.len());
-    for claim_id in claim_ids {
-        let permit = sem.clone().acquire_owned().await?;
-        let pool = pool.clone();
-        let done = done.clone();
-        let claims_with_work = claims_with_work.clone();
-        let claims_empty = claims_empty.clone();
-        let frame_writes = frame_writes.clone();
-        let errors = errors.clone();
-        let progress_every = cli.progress_every;
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            match recompute_one_claim_all_frames(&pool, claim_id).await {
-                Ok(written) => {
-                    if written > 0 {
-                        claims_with_work.fetch_add(1, Ordering::Relaxed);
-                        frame_writes.fetch_add(written, Ordering::Relaxed);
-                    } else {
-                        claims_empty.fetch_add(1, Ordering::Relaxed);
+    // Bounded concurrent fan-out. Each claim may issue multiple per-frame
+    // recomputes — bounding at the claim level keeps the pool ceiling
+    // predictable, and `buffer_unordered(n)` holds exactly the ceiling the
+    // previous `tokio::spawn` + `Semaphore` shape did.
+    //
+    // What changed, and why: `tokio::spawn` requires `'static`, so every task
+    // needed its OWN `Viewer`, and the bypass viewer this binary spends is one
+    // half of a pair whose other half is the maintenance connection held in
+    // `main`. `epigraph_db::Viewer` is no longer `Clone`, precisely so that
+    // pair cannot come apart; these futures are not `'static` and simply BORROW
+    // the viewer out of the session for as long as the fan-out runs.
+    //
+    // The cost, stated rather than implied: `concurrency` concurrent futures on
+    // ONE task rather than `concurrency` tasks on the multi-threaded runtime.
+    // Database round trips interleave exactly as before; a CPU-bound stretch of
+    // the DS math now serialises against its peers. No test covers this —
+    // `run` lives inside this binary and Cargo integration tests cannot reach
+    // it. See the sibling `recompute_betp.rs`, whose shape this mirrors.
+    //
+    // Second cost, and the less obvious one: a PANIC in one claim now stops the
+    // run, where the old `let _ = h.await;` discarded the `JoinError` and left
+    // that claim silently missing from the totals. Ordinary per-claim failures
+    // are unaffected — still counted into `errors` and printed. Deliberate. AND
+    // IT STOPS MORE THAN THE ONE CLAIM: the panic unwinds through the
+    // combinator, so the up to `concurrency - 1` siblings still in the buffer
+    // are dropped at their await points and one mid-write simply stops, leaving
+    // a handful of claims beyond the panicking one partially recomputed, where
+    // the old independent tasks ran to completion. This binary is idempotent,
+    // so the remedy is a re-run. Written out for an operator in
+    // `docs/deploy.md`.
+    let progress_every = cli.progress_every;
+    futures::stream::iter(claim_ids)
+        .map(|claim_id| {
+            let pool = pool.clone();
+            let done = done.clone();
+            let claims_with_work = claims_with_work.clone();
+            let claims_empty = claims_empty.clone();
+            let frame_writes = frame_writes.clone();
+            let errors = errors.clone();
+            async move {
+                match recompute_one_claim_cached_belief(&pool, viewer, claim_id).await {
+                    Ok(written) => {
+                        if written > 0 {
+                            claims_with_work.fetch_add(1, Ordering::Relaxed);
+                            frame_writes.fetch_add(written, Ordering::Relaxed);
+                        } else {
+                            claims_empty.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("  {claim_id}: {e}");
                     }
                 }
-                Err(e) => {
-                    errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("  {claim_id}: {e}");
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if progress_every > 0 && n.is_multiple_of(progress_every) {
+                    println!(
+                        "  [{n}/{total}] claims_recomputed={} frame_writes={} empty={} errors={}",
+                        claims_with_work.load(Ordering::Relaxed),
+                        frame_writes.load(Ordering::Relaxed),
+                        claims_empty.load(Ordering::Relaxed),
+                        errors.load(Ordering::Relaxed),
+                    );
                 }
             }
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if progress_every > 0 && n.is_multiple_of(progress_every) {
-                println!(
-                    "  [{n}/{total}] claims_recomputed={} frame_writes={} empty={} errors={}",
-                    claims_with_work.load(Ordering::Relaxed),
-                    frame_writes.load(Ordering::Relaxed),
-                    claims_empty.load(Ordering::Relaxed),
-                    errors.load(Ordering::Relaxed),
-                );
-            }
-        }));
-    }
-
-    for h in handles {
-        let _ = h.await;
-    }
+        })
+        .buffer_unordered(cli.concurrency.max(1))
+        .for_each(|()| async {})
+        .await;
 
     println!(
         "done: {} claims recomputed across {} (claim, frame) writes, {} had no BBAs, {} errors (of {total})",
@@ -169,32 +213,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// deterministic last-writer for the cached `claims.{belief, pl, betp, ...}`
 /// scalars so that two runs against the same population converge.
 ///
-/// Returns the number of (claim, frame) pairs that produced a recompute.
-async fn recompute_one_claim_all_frames(
+/// Returns 1 if the claim's cached scalars were rewritten, 0 otherwise.
+async fn recompute_one_claim_cached_belief(
     pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<usize, String> {
-    let rows: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT DISTINCT mf.frame_id, f.name \
-           FROM mass_functions mf \
-           JOIN frames f ON f.id = mf.frame_id \
-          WHERE mf.claim_id = $1 \
-          ORDER BY f.name",
-    )
-    .bind(claim_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| format!("list frames for claim: {e}"))?;
-    let mut written = 0usize;
-    for (frame_id, _frame_name) in rows {
-        let did =
-            epigraph_engine::edge_factor::recompute_claim_belief_on_frame(pool, claim_id, frame_id)
-                .await?;
-        if did {
-            written += 1;
-        }
-    }
-    Ok(written)
+    // Backlog 696d3a1c: `claims.{belief, plausibility, mass_on_empty,
+    // pignistic_prob, mass_on_missing}` is ONE shared cache, not per-frame state.
+    // This used to enumerate every frame the claim had BBAs on and recompute each,
+    // which wrote that cache once per frame and let the alphabetically last one
+    // win — reliably clobbering the edge-derived `binary_truth` belief, since
+    // `binary_truth` sorts first. `recompute_claim_cached_belief` picks the single
+    // owning frame instead.
+    Ok(usize::from(
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id).await?,
+    ))
 }
 
 fn read_claim_ids(cli: &Cli) -> Result<Vec<Uuid>, Box<dyn std::error::Error>> {

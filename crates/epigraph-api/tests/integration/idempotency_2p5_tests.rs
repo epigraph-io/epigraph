@@ -12,6 +12,9 @@
 //!   cargo test -p epigraph-api --test idempotency_2p5_tests
 //! ```
 
+#[path = "../viewer_fixture.rs"]
+mod fixture;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -73,9 +76,10 @@ async fn agent_create_or_get_is_idempotent_on_public_key(pool: PgPool) {
 /// `submit_persistence_tests::create_test_router`.
 fn create_test_router(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let state = AppState::with_db_and_signature_state(pool, config, signature_state);
@@ -88,13 +92,18 @@ fn create_test_router(pool: PgPool) -> Router {
 fn agents_write_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    // PR-02 binds every authenticated principal to an `agents.id`, and PR-06's
+    // `ViewerExtractor` refuses an agentless token with 401 before the handler
+    // runs. Bind the token to a principal so this fixture reflects a shape a
+    // real client can actually hold.
+    let principal = uuid::Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            uuid::Uuid::new_v4(),
+            principal,
             vec!["agents:write".to_string(), "agents:read".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");
@@ -188,13 +197,18 @@ async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
 fn submit_bearer_token() -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
+    // PR-02 binds every authenticated principal to an `agents.id`, and PR-06's
+    // `ViewerExtractor` refuses an agentless token with 401 before the handler
+    // runs. Bind the token to a principal so this fixture reflects a shape a
+    // real client can actually hold.
+    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
-            Uuid::new_v4(),
+            principal,
             vec!["epigraph:write".to_string(), "epigraph:read".to_string()],
             "service",
-            None,
-            None,
+            Some(principal),
+            Some(principal),
             chrono::Duration::seconds(300),
         )
         .expect("issue_access_token must succeed for tests");
@@ -590,10 +604,16 @@ async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPo
         chrono::Utc::now(),
         chrono::Utc::now(),
     );
+    let viewer = fixture::public_viewer(&pool).await;
     let mut conn = pool.acquire().await.expect("acquire conn");
-    let (persisted, created) = ClaimRepository::create_or_get(&mut conn, &seeded)
-        .await
-        .expect("seeding the null-trace claim should succeed");
+    let (persisted, created) = ClaimRepository::create_or_get(
+        &mut conn,
+        &viewer,
+        &seeded,
+        epigraph_core::TenancyDecl::Inherited,
+    )
+    .await
+    .expect("seeding the null-trace claim should succeed");
     assert!(created, "seed must be a fresh create");
     assert!(
         persisted.trace_id.is_none(),
@@ -643,9 +663,10 @@ async fn submit_packet_dedup_onto_null_trace_claim_returns_null_trace(pool: PgPo
 /// vacuously — even unfixed.
 fn create_test_router_with_embedder(pool: PgPool) -> Router {
     let config = ApiConfig {
-        require_signatures: false,
+        require_packet_signatures: false,
         max_request_size: 1024 * 1024,
         public_base_url: "http://localhost:8080".to_string(),
+        ..ApiConfig::default()
     };
     let signature_state = SignatureVerificationState::with_bypass_routes(vec!["/".to_string()]);
     let service: Arc<dyn EmbeddingService> =

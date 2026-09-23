@@ -33,18 +33,43 @@ import psycopg2
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 
 from lib.tiered_enrichment import auto_tier, EnrichmentResult
+from maintenance_dsn import require_same_database
 
 log = logging.getLogger(__name__)
 
-# Read-only DB for all SELECT queries
+# Read-only DB for all SELECT queries.
+# Deliberately the `epigraph_ro` role, and deliberately NOT given
+# MAINTENANCE_DATABASE_URL: this worker's read/write split is its safety
+# property (see DATABASE_ADMIN_URL below), and pointing the read side at a
+# maintenance DSN would collapse it. This file carries no exemption marker on
+# purpose: that keyword is paired with an entry in
+# `no_unmaintained_dsn.rs::EXEMPT`, and this file is NOT exempt — its writing
+# connection is converted, which is what that lint checks.
 DATABASE_RO_URL = os.environ.get(
     "DATABASE_URL",
     "postgres://epigraph_ro:epigraph_ro@localhost:5432/epigraph",
 )
-# Admin DB for UPDATE assessment_queue (status transitions only)
-DATABASE_ADMIN_URL = os.environ.get(
-    "DATABASE_ADMIN_URL",
-    "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph",
+# Admin DB for UPDATE assessment_queue (status transitions only).
+# PR-15: MAINTENANCE_DATABASE_URL takes precedence, because this is the writing
+# connection and its UPDATEs are what silently match zero rows once RLS is
+# active. It is NOT resolved through `maintenance_dsn()`: that helper falls back
+# to DATABASE_URL, which here is the READ-ONLY role, so using it would point
+# this worker's UPDATEs at `epigraph_ro` whenever MAINTENANCE_DATABASE_URL is
+# unset. The precedence is spelled out; only the guard is shared.
+DATABASE_ADMIN_URL = (
+    os.environ.get("MAINTENANCE_DATABASE_URL")
+    or os.environ.get(
+        "DATABASE_ADMIN_URL",
+        "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph",
+    )
+)
+# The read/write split is only a safety property while both halves are the same
+# DATABASE. An exported MAINTENANCE_DATABASE_URL naming a different one would
+# have this worker SELECT its queue from one database and UPDATE the statuses in
+# another — every row read, no row transitioned, exit 0. Same rule and same
+# message as `epigraph_db::resolve_maintenance_url`.
+require_same_database(
+    DATABASE_ADMIN_URL, "the admin DSN", DATABASE_RO_URL, "the read-only DSN"
 )
 API_URL = os.environ.get("EPIGRAPH_API_URL", "http://127.0.0.1:8080")
 

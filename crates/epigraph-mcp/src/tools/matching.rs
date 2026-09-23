@@ -5,16 +5,21 @@
 //! review surface:
 //!
 //! - `find_cross_source_matches`: return existing match_candidates + CORROBORATES
-//!   edges for a claim. Read-only.
+//!   edges for a claim, plus the claim's sweep coverage
+//!   (`last_swept_at` / `never_swept`) so an empty result is interpretable.
+//!   Read-only.
 //! - `list_match_candidates`: list the queue, sorted by score desc, optionally
 //!   filtered by status.
-//! - `decide_match_candidate`: promote, reject, or retire a row. Promotion
+//! - `decide_match_candidate`: promote or reject a `pending` row. Promotion
 //!   writes the edge the row's `verifier_verdict` calls for — `CORROBORATES`
 //!   for same/paraphrase/overlapping, `contradicts` for contradicts — and
-//!   refuses outright for `distinct`. Retirement is the undo of a promotion:
-//!   it deletes the matcher edge together with the `factors` / `bp_messages`
-//!   the `edges_auto_factor` trigger derived from it and flips the row to
-//!   `stale`. Honours `reject_if_read_only` like other write tools.
+//!   refuses outright for `distinct`. Both arms refuse a row that is already
+//!   decided, matching the HTTP route's 409. Honours `reject_if_read_only`
+//!   like other write tools.
+//! - `retire_match_candidate`: the undo of a promotion, and a SEPARATE tool
+//!   because it carries `claims:admin`. It retracts the matcher edge together
+//!   with the `factors` / `bp_messages` the `edges_auto_factor` trigger
+//!   derived from it and flips the row to `stale`.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -64,27 +69,26 @@ fn row_to_out(r: epigraph_db::MatchCandidateRow) -> CandidateOut {
 
 pub async fn find_cross_source_matches(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: FindCrossSourceMatchesParams,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let repo = MatchCandidateRepo::new(server.pool.clone());
 
     let candidates = repo
-        .list_for_claim(claim_id)
+        .list_for_claim(viewer, claim_id)
         .await
         .map_err(internal_error)?;
     let candidates_out: Vec<CandidateOut> = candidates.into_iter().map(row_to_out).collect();
 
     // Pull CORROBORATES edges incident on the claim — already-promoted matches.
-    let edges: Vec<(uuid::Uuid, uuid::Uuid, uuid::Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, source_id, target_id, properties FROM edges
-         WHERE relationship = 'CORROBORATES'
-           AND (source_id = $1 OR target_id = $1)",
-    )
-    .bind(claim_id)
-    .fetch_all(&server.pool)
-    .await
-    .map_err(internal_error)?;
+    // The SQL moved to `MatchCandidateRepo::corroborates_edges_for_claim`
+    // (PR-09): it was inline here and byte-identical inline in
+    // `routes/cross_source.rs`, and neither copy filtered.
+    let edges = repo
+        .corroborates_edges_for_claim(viewer, claim_id)
+        .await
+        .map_err(internal_error)?;
 
     let corroborates: Vec<serde_json::Value> = edges
         .into_iter()
@@ -98,15 +102,44 @@ pub async fn find_cross_source_matches(
         })
         .collect();
 
-    success_json(&serde_json::json!({
+    // Sweep coverage (backlog 4194b4a7 ask 3 / 9a513d47). Without it, an empty
+    // `candidates` array is ambiguous between "the matcher scanned this claim
+    // and found nothing" and "the matcher has never looked at this claim" —
+    // and only the second is actionable (run the sweep). The per-claim marker
+    // already existed (`claims.last_match_scan_at`, migration 037, stamped by
+    // the `cross_source_sweep` CLI); nothing read it back out.
+    //
+    // The three-state return of `last_match_scan_at` is load-bearing: for a
+    // claim this viewer cannot read we emit NEITHER field, keeping the
+    // existing non-leaking shape (unreadable claim -> empty arrays, no 404).
+    // Emitting `never_swept: true` there would answer a question about a row
+    // the caller has no right to, and would answer it wrongly.
+    let mut out = serde_json::json!({
         "claim_id":     claim_id.to_string(),
         "candidates":   candidates_out,
         "corroborates": corroborates,
-    }))
+    });
+    match repo
+        .last_match_scan_at(viewer, claim_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(Some(ts)) => {
+            out["last_swept_at"] = serde_json::json!(ts.to_rfc3339());
+            out["never_swept"] = serde_json::json!(false);
+        }
+        Some(None) => {
+            out["last_swept_at"] = serde_json::Value::Null;
+            out["never_swept"] = serde_json::json!(true);
+        }
+        None => {}
+    }
+    success_json(&out)
 }
 
 pub async fn list_match_candidates(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: ListMatchCandidatesParams,
 ) -> Result<CallToolResult, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
@@ -123,13 +156,17 @@ pub async fn list_match_candidates(
     };
 
     let repo = MatchCandidateRepo::new(server.pool.clone());
-    let rows = repo.list(status_ref, limit).await.map_err(internal_error)?;
+    let rows = repo
+        .list(viewer, status_ref, limit)
+        .await
+        .map_err(internal_error)?;
     let out: Vec<CandidateOut> = rows.into_iter().map(row_to_out).collect();
     success_json(&out)
 }
 
 pub async fn decide_match_candidate(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: DecideMatchCandidateParams,
 ) -> Result<CallToolResult, McpError> {
     server.reject_if_read_only()?;
@@ -141,8 +178,31 @@ pub async fn decide_match_candidate(
 
     let acting_agent = server.agent_id().await?;
 
+    // Already-decided gate — transport parity with
+    // `routes/cross_source.rs::decide_candidate`'s `reject_if_decided`
+    // (409 Conflict, pinned by
+    // `cross_source_route_tests::promote_and_reject_still_refuse_an_already_decided_candidate`).
+    // Both decide arms are guarded because both corrupt the edge/row pairing
+    // when replayed on a decided row: `reject` on a `promoted` row flips the
+    // status while leaving the matcher edge live (an edge with no owning
+    // candidate), and `promote` on a `stale` row re-creates the very edge a
+    // `retire_match_candidate` just retracted. The undo is
+    // `retire_match_candidate`, which deliberately carries NO such gate —
+    // retirement is only ever applied to an already-`promoted` row.
+    let reject_if_decided = || -> Result<(), McpError> {
+        if row.status == "pending" {
+            return Ok(());
+        }
+        Err(invalid_params(format!(
+            "candidate {candidate_id} already decided (status={}); use \
+             retire_match_candidate to undo a promotion",
+            row.status
+        )))
+    };
+
     match decision.as_str() {
         "promote" => {
+            reject_if_decided()?;
             // Resolve the polarity FIRST — before the current-ness guard and
             // before `set_status`. "promote" is the operator saying "act on
             // this pair", not "these claims agree": the relationship comes from
@@ -170,7 +230,7 @@ pub async fn decide_match_candidate(
             // false) since the candidate was generated, promoting would create
             // a structural inconsistency — an edge incident on a retired claim
             // (backlog bug 5c7fc645). Refuse rather than write it.
-            if !ClaimRepository::are_all_current(&server.pool, &[row.claim_a, row.claim_b])
+            if !ClaimRepository::are_all_current(&server.pool, viewer, &[row.claim_a, row.claim_b])
                 .await
                 .map_err(internal_error)?
             {
@@ -186,12 +246,15 @@ pub async fn decide_match_candidate(
                 .await
                 .map_err(internal_error)?;
 
-            // Write the edge if it doesn't already exist (either
-            // direction). The unique-triple index was dropped in migrations
-            // 017/018, so this explicit existence check — now centralized in
-            // `EdgeRepository::create_symmetric_if_absent` — is the only guard
-            // against duplicates from repeated `decide` calls. The
-            // are_all_current guard above stays here at the call site.
+            // Write the edge if it doesn't already exist (either direction).
+            // The unique-triple index was dropped in migrations 017/018, and
+            // migration 090's `edges_symmetric_relationship_uniq` replaces it:
+            // the explicit existence check — now centralized in
+            // `EdgeRepository::create_symmetric_if_absent` — is the FAST PATH,
+            // and that index is what makes the answer true for a duplicate the
+            // check cannot see. The index is keyed on the
+            // `"source": "cross_source_matcher"` marker the props below stamp.
+            // The are_all_current guard above stays here at the call site.
             let props = serde_json::json!({
                 "candidate_id":     candidate_id,
                 "score":            row.score,
@@ -211,13 +274,19 @@ pub async fn decide_match_candidate(
             .map_err(internal_error)?;
         }
         "reject" => {
+            reject_if_decided()?;
             repo.set_status(candidate_id, "rejected", Some(acting_agent))
                 .await
                 .map_err(internal_error)?;
         }
         other => {
+            // `retire` is NOT handled here — it is its own tool because it
+            // carries `claims:admin` rather than `claims:write` (see
+            // `retire_match_candidate`'s doc comment). The old message listed
+            // it as a valid verdict while rejecting it, which read as a bug.
             return Err(invalid_params(format!(
-                "verdict must be 'promote', 'reject' or 'retire', got {other}"
+                "verdict must be 'promote' or 'reject', got {other}. To undo a \
+                 promotion, call the separate `retire_match_candidate` tool."
             )));
         }
     }

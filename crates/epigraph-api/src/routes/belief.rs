@@ -13,8 +13,35 @@
 //! Protected (POST):
 //! - `POST /api/v1/frames` — create a frame
 //! - `POST /api/v1/frames/:id/evidence` — submit mass function evidence
+//!
+//! # Tenancy: 14 of this file's 17 raw-pool sites are converted, and 3 are not
+//!
+//! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
+//! (`epigraph-db/tests/no_unscoped_pool.rs`). Every site in this file is a
+//! handler-level `let pool = &state.db_pool;` alias, so one site is one handler
+//! and the conversion unit is the whole body — not the line the ratchet's needle
+//! matched.
+//!
+//! The fourteen read-only handlers below now acquire ONE viewer-stamped
+//! connection through [`AppState::read_as`] and thread it into every statement,
+//! which is what makes each response internally consistent: it describes the
+//! corpus this reader can see, not several corpora sampled a connection apart.
+//!
+//! **Three handlers are deliberately NOT converted, and the reason is not
+//! caution.** `create_frame`, `submit_evidence` and `refine_frame` each write
+//! through their alias. `read_as` is documented read-only: `ScopedRead::commit`
+//! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
+//! routed through it is rolled back on drop — a 200 with nothing persisted.
+//! `DerefMut<Target = PgConnection>` means that mistake COMPILES, so the
+//! prohibition cannot be delegated to the type checker. Their target is
+//! `ScopedPool::begin_as` plus 16b's `Viewer::splice_write`, which is a
+//! repo-signature change rather than an executor swap; `FrameRepository::create`
+//! and `::create_refinement` take no `Viewer` at all. That is a separate batch
+//! with its own evidence. The three sites stay COUNTED by the ratchet, which is
+//! why `routes/belief.rs` keeps a row there rather than being deleted.
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use crate::state::AppState;
 #[cfg(feature = "db")]
@@ -43,6 +70,25 @@ pub struct BeliefResponse {
     /// Frame incompleteness: m((Omega, true)) — frame may be missing propositions
     pub mass_on_missing: Option<f64>,
     pub pignistic_prob: Option<f64>,
+    /// How many mass functions **this reader can see** contribute to the claim.
+    ///
+    /// # This is deliberately NOT the denominator of the interval above
+    ///
+    /// `belief`/`plausibility`/`pignistic_prob` are precomputed aggregate
+    /// columns on `claims`, recomputed from *every* BBA in the corpus. No
+    /// visibility predicate can narrow them — they are a single stored number,
+    /// not a query over `mass_functions`. This count, by contrast, is
+    /// viewer-filtered (PR-07). So whenever a contributing BBA is group-private,
+    /// `mass_function_count` is strictly less than the number of mass functions
+    /// the interval actually rests on.
+    ///
+    /// The asymmetry is the intended trade, not an oversight: the alternative —
+    /// counting mass functions the reader cannot see — turns this field into a
+    /// cardinality oracle over another tenant's evidence. Read it as "how much
+    /// of the supporting evidence is available to me", never as "how many
+    /// sources produced this interval". Do not recompute ignorance from it;
+    /// `ignorance` is returned directly and is derived from the same corpus-wide
+    /// columns as the interval.
     pub mass_function_count: i64,
 }
 
@@ -427,55 +473,70 @@ pub(crate) fn compute_hypothesis_belief(
 /// Get belief interval for a claim
 ///
 /// `GET /api/v1/claims/:id/belief`
+///
+/// Both reads are filtered by the caller's [`Viewer`](epigraph_db::Viewer).
+/// Before PR-07 this handler ran two bare statements against `claims` and
+/// `mass_functions` inline, keyed only on the path id, which made it a precise
+/// oracle over the whole corpus: a 200 proved a claim id existed and disclosed
+/// its belief interval, a 404 proved it did not. Neither fact is public.
+/// A claim the viewer cannot see is now indistinguishable from one that does
+/// not exist — both are 404 — which is the intended shape.
 #[cfg(feature = "db")]
 pub async fn get_claim_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<BeliefResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_claim_belief",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    // Read the stored belief/plausibility/pignistic from the claims table
-    #[allow(clippy::type_complexity)]
-    let row: Option<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> = sqlx::query_as(
-        "SELECT belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing FROM claims WHERE id = $1",
+    let cols = epigraph_db::ClaimRepository::get_belief_columns(
+        &mut *read,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(claim_id),
     )
-    .bind(claim_id)
-    .fetch_optional(pool)
     .await
     .map_err(|e| ApiError::DatabaseError {
         message: e.to_string(),
+    })?
+    .ok_or(ApiError::NotFound {
+        entity: "claim".to_string(),
+        id: claim_id.to_string(),
     })?;
 
-    let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing) =
-        row.ok_or(ApiError::NotFound {
-            entity: "claim".to_string(),
-            id: claim_id.to_string(),
-        })?;
-
-    // Count mass functions across all frames for this claim
-    let count_row: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1")
-            .bind(claim_id)
-            .fetch_one(pool)
+    // Count mass functions across all frames for this claim, as the viewer.
+    let mass_function_count =
+        epigraph_db::MassFunctionRepository::count_for_claim(&mut *read, &viewer, claim_id)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: e.to_string(),
             })?;
 
-    let ignorance = match (belief, plausibility) {
+    crate::routes::finish_scoped_read(read, "get_claim_belief").await?;
+
+    let ignorance = match (cols.belief, cols.plausibility) {
         (Some(b), Some(p)) => Some(p - b),
         _ => None,
     };
 
     Ok(Json(BeliefResponse {
         claim_id,
-        belief,
-        plausibility,
+        belief: cols.belief,
+        plausibility: cols.plausibility,
         ignorance,
-        mass_on_conflict: mass_on_empty,
-        mass_on_missing,
-        pignistic_prob,
-        mass_function_count: count_row.0,
+        mass_on_conflict: cols.mass_on_empty,
+        mass_on_missing: cols.mass_on_missing,
+        pignistic_prob: cols.pignistic_prob,
+        mass_function_count,
     }))
 }
 
@@ -484,11 +545,26 @@ pub async fn get_claim_belief(
 /// `GET /api/v1/frames`
 #[cfg(feature = "db")]
 pub async fn list_frames(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<ListFramesQuery>,
 ) -> Result<Json<Vec<FrameResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::FrameRepository::list(pool, params.limit, params.offset).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_frames",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let rows = epigraph_db::FrameRepository::list(&mut *read, &viewer, params.limit, params.offset)
+        .await?;
+
+    crate::routes::finish_scoped_read(read, "list_frames").await?;
 
     let frames = rows.into_iter().map(frame_to_response).collect();
 
@@ -500,19 +576,33 @@ pub async fn list_frames(
 /// `GET /api/v1/frames/:id`
 #[cfg(feature = "db")]
 pub async fn get_frame(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<FrameDetailResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_frame",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
-    let row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let row = epigraph_db::FrameRepository::get_by_id(&mut *read, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
             id: frame_id.to_string(),
         })?;
 
-    let claim_rows = epigraph_db::FrameRepository::get_claims_in_frame(pool, frame_id).await?;
+    let claim_rows =
+        epigraph_db::FrameRepository::get_claims_in_frame(&mut *read, &viewer, frame_id).await?;
+
+    crate::routes::finish_scoped_read(read, "get_frame").await?;
 
     let claims: Vec<FrameClaimEntry> = claim_rows
         .into_iter()
@@ -534,19 +624,54 @@ pub async fn get_frame(
 /// `GET /api/v1/frames/:id/conflict`
 #[cfg(feature = "db")]
 pub async fn frame_conflict(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<FrameConflictResponse>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "frame_conflict",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Verify frame exists
-    epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    epigraph_db::FrameRepository::get_by_id(&mut *read, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
             id: frame_id.to_string(),
         })?;
 
+    // The aggregate below stays inline and carries no `/* {VISIBILITY:…} */`
+    // marker, because a route handler cannot carry one. It binds only
+    // `frame_id` and calls no `Viewer::splice`, so it is the ONE site this
+    // shard converted that has a single control layer where the other eighteen
+    // have two. Registered as `F-SHARD4-A5`, because no existing register can
+    // see it: `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` scans
+    // `CONTENT_TABLES`, and `mass_functions` is not one.
+    //
+    // WHICH DIRECTION THE CONVERSION MOVED IT, stated because the obvious
+    // reading is backwards. UNSTAMPED, `epigraph_session_groups()` is empty, so
+    // once `mass_functions`' policies are live this statement already counted
+    // PUBLIC rows only. Stamping it WIDENS the aggregate to public plus the
+    // viewer's own groups. That is the correct direction — it removes
+    // over-suppression — but it is not a leak being closed, and a later reader
+    // must not cite it as one.
+    //
+    // And the narrowing half is CONDITIONAL, unlike the spliced sites: with no
+    // in-query predicate, whether this aggregate describes the caller's corpus
+    // at all depends on the reading session being subject to `mass_functions`'
+    // row-level policies. On a deployment whose connecting role bypasses them
+    // it is unchanged. That is precisely why the site stays owned by
+    // `F-aggregate-existence-oracles`, whose own disposition prescribes
+    // repo-layer relocation — a DIFFERENT mechanism from this executor swap,
+    // and the actual fix.
     let row: (i64, Option<f64>, Option<f64>) = sqlx::query_as(
         r#"
         SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k)
@@ -555,11 +680,13 @@ pub async fn frame_conflict(
         "#,
     )
     .bind(frame_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *read)
     .await
     .map_err(|e| ApiError::DatabaseError {
         message: e.to_string(),
     })?;
+
+    crate::routes::finish_scoped_read(read, "frame_conflict").await?;
 
     Ok(Json(FrameConflictResponse {
         frame_id,
@@ -603,6 +730,7 @@ pub(crate) fn reconstruct_mass_function(
 /// `POST /api/v1/frames/:id/conflict-batch`
 #[cfg(feature = "db")]
 pub async fn conflict_batch(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Json(request): Json<ConflictBatchRequest>,
@@ -621,10 +749,20 @@ pub async fn conflict_batch(
         return Ok(Json(ConflictBatchResponse { results: vec![] }));
     }
 
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "conflict_batch",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Verify frame exists and get its hypotheses for reconstruction
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(&mut *read, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -649,8 +787,10 @@ pub async fn conflict_batch(
     // Load mass functions for all unique claims (use latest by created_at)
     let mut mass_fns: HashMap<Uuid, MassFunction> = HashMap::new();
     for &cid in &claim_ids {
-        let rows =
-            epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, cid, frame_id).await?;
+        let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *read, &viewer, cid, frame_id,
+        )
+        .await?;
         // get_for_claim_frame returns ORDER BY created_at ASC, so last() is latest.
         // Use max_by_key as defense against ordering changes.
         if let Some(row) = rows.iter().max_by_key(|r| r.created_at) {
@@ -659,6 +799,8 @@ pub async fn conflict_batch(
             }
         }
     }
+
+    crate::routes::finish_scoped_read(read, "conflict_batch").await?;
 
     // Compute conflict for each pair
     let results: Vec<ConflictBatchResult> = request
@@ -772,6 +914,7 @@ pub async fn create_frame(
 /// `POST /api/v1/frames/:id/evidence`
 #[cfg(feature = "db")]
 pub async fn submit_evidence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Json(request): Json<SubmitEvidenceRequest>,
@@ -782,7 +925,7 @@ pub async fn submit_evidence(
     let pool = &state.db_pool;
 
     // 1. Load and validate frame
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -849,7 +992,7 @@ pub async fn submit_evidence(
 
     // 4b. Apply active context modifiers for this frame (between discount and store)
     let mut modified = discounted;
-    let active_contexts = epigraph_db::ContextRepository::list_for_frame(pool, frame_id)
+    let active_contexts = epigraph_db::ContextRepository::list_for_frame(pool, &viewer, frame_id)
         .await
         .unwrap_or_default();
     let now = chrono::Utc::now();
@@ -898,7 +1041,7 @@ pub async fn submit_evidence(
     // 4c. Apply perspective confidence_calibration as additional discount
     if let Some(perspective_id) = request.perspective_id {
         if let Ok(Some(perspective)) =
-            epigraph_db::PerspectiveRepository::get_by_id(pool, perspective_id).await
+            epigraph_db::PerspectiveRepository::get_by_id(pool, &viewer, perspective_id).await
         {
             if let Some(calibration) = perspective.confidence_calibration {
                 if (0.0..1.0).contains(&calibration) {
@@ -966,11 +1109,11 @@ pub async fn submit_evidence(
 
         // Load edges where this claim is source or target
         let source_edges =
-            epigraph_db::EdgeRepository::get_by_source(pool, request.claim_id, "claim")
+            epigraph_db::EdgeRepository::get_by_source(pool, &viewer, request.claim_id, "claim")
                 .await
                 .unwrap_or_default();
         let target_edges =
-            epigraph_db::EdgeRepository::get_by_target(pool, request.claim_id, "claim")
+            epigraph_db::EdgeRepository::get_by_target(pool, &viewer, request.claim_id, "claim")
                 .await
                 .unwrap_or_default();
 
@@ -1103,9 +1246,13 @@ pub async fn submit_evidence(
     // 7. Retrieve all BBAs for this (claim, frame), excluding system-combined results.
     //    Only include user-submitted BBAs (combination_method = "discount") to avoid
     //    double-counting derived artifacts (violates TBM independence assumption).
-    let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, request.claim_id, frame_id)
-            .await?;
+    let all_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+        pool,
+        &viewer,
+        request.claim_id,
+        frame_id,
+    )
+    .await?;
 
     // 8. Sort mass functions by row ID for canonical combination ordering.
     //    This ensures identical results regardless of evidence submission order.
@@ -1126,7 +1273,7 @@ pub async fn submit_evidence(
             indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
         )
     } else {
-        super::independence::analyze_independence(pool, &indexed_rows, 5).await?
+        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
     };
 
     // 10a. Cautious-combine within each dependent group
@@ -1169,9 +1316,13 @@ pub async fn submit_evidence(
     };
 
     // 11. Look up claim's hypothesis_index in claim_frames for correct Bel/Pl
-    let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, request.claim_id, frame_id)
-            .await?;
+    let claim_assignment = epigraph_db::FrameRepository::get_claim_assignment(
+        pool,
+        &viewer,
+        request.claim_id,
+        frame_id,
+    )
+    .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
 
     let (final_bel, final_pl, final_betp, m_missing) =
@@ -1193,11 +1344,14 @@ pub async fn submit_evidence(
     epigraph_db::MassFunctionRepository::update_claim_belief(
         pool,
         request.claim_id,
-        final_bel,
-        final_pl,
-        m_empty,
-        Some(final_betp),
-        m_missing,
+        epigraph_db::CachedBelief {
+            belief: final_bel,
+            plausibility: final_pl,
+            mass_on_empty: m_empty,
+            pignistic_prob: Some(final_betp),
+            mass_on_missing: m_missing,
+            belief_frame_id: None,
+        },
     )
     .await?;
 
@@ -1322,6 +1476,7 @@ pub async fn submit_evidence(
 
     let total_sources = epigraph_db::MassFunctionRepository::count_for_claim_frame(
         pool,
+        &viewer,
         request.claim_id,
         frame_id,
     )
@@ -1410,6 +1565,7 @@ pub async fn submit_evidence(
         let perspective_rows =
             epigraph_db::MassFunctionRepository::get_for_claim_frame_perspective(
                 pool,
+                &viewer,
                 request.claim_id,
                 frame_id,
                 perspective_id,
@@ -1485,7 +1641,7 @@ pub async fn submit_evidence(
             for community_id in community_ids {
                 // Check for community mass_override before combining member BBAs
                 let use_override = if let Ok(Some(comm)) =
-                    epigraph_db::CommunityRepository::get_by_id(pool, community_id).await
+                    epigraph_db::CommunityRepository::get_by_id(pool, &viewer, community_id).await
                 {
                     if let Some(ref overrides) = comm.mass_override {
                         // Look up override for this specific frame
@@ -1538,6 +1694,7 @@ pub async fn submit_evidence(
                     let community_rows =
                         epigraph_db::MassFunctionRepository::get_for_claim_frame_perspectives(
                             pool,
+                            &viewer,
                             request.claim_id,
                             frame_id,
                             &member_ids,
@@ -1835,69 +1992,56 @@ pub async fn submit_evidence(
 #[cfg(feature = "db")]
 #[allow(clippy::type_complexity)]
 pub async fn claims_by_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<BeliefFilterQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<BeliefClaimRow>>, ApiError> {
-    let pool = &state.db_pool;
     let min_bel = params.min_belief.unwrap_or(0.0);
     let max_pl = params.max_plausibility.unwrap_or(1.0);
 
-    let rows: Vec<(
-        Uuid,
-        String,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-    )> = sqlx::query_as(
-        r#"
-        SELECT c.id, c.content, c.belief, c.plausibility, c.mass_on_empty, c.mass_on_missing
-        FROM claims c
-        WHERE c.belief >= $1 AND c.plausibility <= $2
-          AND ($3::uuid IS NULL OR c.id IN (
-              SELECT claim_id FROM claim_frames WHERE frame_id = $3
-          ))
-        ORDER BY c.belief DESC
-        LIMIT $4 OFFSET $5
-        "#,
-    )
-    .bind(min_bel)
-    .bind(max_pl)
-    .bind(params.frame_id)
-    .bind(params.limit)
-    .bind(params.offset)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: e.to_string(),
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claims_by_belief",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
     })?;
 
-    let mut result: Vec<BeliefClaimRow> = rows
+    // PR-07: this was an unfiltered, caller-paginated corpus scan projecting
+    // `c.content` with no `ViewerExtractor` at all. The statement now lives in
+    // `ClaimRepository::list_by_belief_bounds` with the visibility predicate on
+    // both `claims` and the `claim_frames` subquery.
+    let rows = epigraph_db::ClaimRepository::list_by_belief_bounds(
+        &mut *read,
+        &viewer,
+        min_bel,
+        max_pl,
+        params.frame_id,
+        params.limit,
+        params.offset,
+    )
+    .await?;
+
+    crate::routes::finish_scoped_read(read, "claims_by_belief").await?;
+
+    let result: Vec<BeliefClaimRow> = rows
         .into_iter()
-        .map(
-            |(id, content, belief, plausibility, mass_on_empty, mass_on_missing)| BeliefClaimRow {
-                id,
-                content,
-                belief,
-                plausibility,
-                mass_on_conflict: mass_on_empty,
-                mass_on_missing,
-            },
-        )
+        .map(|hit| BeliefClaimRow {
+            id: hit.id,
+            content: hit.content,
+            belief: hit.belief,
+            plausibility: hit.plausibility,
+            mass_on_conflict: hit.mass_on_empty,
+            mass_on_missing: hit.mass_on_missing,
+        })
         .collect();
 
-    // SECURITY (A3): use the authenticated requester, not params.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for row in &mut result {
-        let access = crate::access_control::check_content_access(pool, row.id, requester).await;
-        if access == crate::access_control::ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut row.content);
-        }
-    }
-
+    // No redaction pass: `list_by_belief_bounds` above is spliced with
+    // `&viewer`, so an unreadable row never reaches `result`.
     Ok(Json(result))
 }
 
@@ -1907,107 +2051,86 @@ pub async fn claims_by_belief(
 #[cfg(feature = "db")]
 #[allow(clippy::type_complexity)]
 pub async fn frame_claims_sorted(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
     Query(params): Query<FrameClaimsQuery>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
 ) -> Result<Json<Vec<FrameClaimBeliefRow>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "frame_claims_sorted",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Verify frame exists
-    epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    epigraph_db::FrameRepository::get_by_id(&mut *read, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
             id: frame_id.to_string(),
         })?;
 
-    // Validate sort_by
-    let order_col = match params.sort_by.as_str() {
-        "belief" => "c.belief",
-        "plausibility" => "c.plausibility",
-        "ignorance" => "(c.plausibility - c.belief)",
-        _ => {
-            return Err(ApiError::ValidationError {
-                field: "sort_by".to_string(),
-                reason: "Must be one of: belief, plausibility, ignorance".to_string(),
-            });
-        }
-    };
+    // Validate sort_by / order. `from_wire` returning `None` is a 400; the
+    // repo takes enums, so no caller-supplied string reaches the `ORDER BY`.
+    let sort = epigraph_db::BeliefSort::from_wire(params.sort_by.as_str()).ok_or(
+        ApiError::ValidationError {
+            field: "sort_by".to_string(),
+            reason: "Must be one of: belief, plausibility, ignorance".to_string(),
+        },
+    )?;
 
-    let order_dir = match params.order.as_str() {
-        "asc" => "ASC",
-        "desc" => "DESC",
-        _ => {
-            return Err(ApiError::ValidationError {
-                field: "order".to_string(),
-                reason: "Must be 'asc' or 'desc'".to_string(),
-            });
-        }
-    };
+    let direction = epigraph_db::SortDirection::from_wire(params.order.as_str()).ok_or(
+        ApiError::ValidationError {
+            field: "order".to_string(),
+            reason: "Must be 'asc' or 'desc'".to_string(),
+        },
+    )?;
 
-    // Build query with validated sort column and direction.
-    // These values come from match arms above, not user input, so this is safe.
-    let query = format!(
-        r#"
-        SELECT cf.claim_id, c.content, cf.hypothesis_index, c.belief, c.plausibility, c.mass_on_missing
-        FROM claim_frames cf
-        JOIN claims c ON c.id = cf.claim_id
-        WHERE cf.frame_id = $1
-        ORDER BY {order_col} {order_dir} NULLS LAST
-        LIMIT $2 OFFSET $3
-        "#,
-    );
+    // PR-07: this statement used to be built here with `format!` +
+    // `sqlx::query_as` and NO visibility predicate, even though the handler was
+    // already holding a `Viewer` (spent above on the frame-existence check).
+    // Holding a viewer and not filtering on it is the plan's own definition of
+    // a fail-open, and it escaped `Viewer::splice`'s missing-marker panic only
+    // because `splice` was never called.
+    let rows = epigraph_db::ClaimRepository::frame_claims_sorted(
+        &mut *read,
+        &viewer,
+        frame_id,
+        sort,
+        direction,
+        params.limit,
+        params.offset,
+    )
+    .await?;
 
-    let rows: Vec<(
-        Uuid,
-        String,
-        Option<i32>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-    )> = sqlx::query_as(&query)
-        .bind(frame_id)
-        .bind(params.limit)
-        .bind(params.offset)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: e.to_string(),
-        })?;
+    crate::routes::finish_scoped_read(read, "frame_claims_sorted").await?;
 
-    let mut result: Vec<FrameClaimBeliefRow> = rows
+    let result: Vec<FrameClaimBeliefRow> = rows
         .into_iter()
-        .map(
-            |(claim_id, content, hypothesis_index, belief, plausibility, mass_on_missing)| {
-                FrameClaimBeliefRow {
-                    claim_id,
-                    content,
-                    hypothesis_index,
-                    belief,
-                    plausibility,
-                    ignorance: match (belief, plausibility) {
-                        (Some(b), Some(p)) => Some(p - b),
-                        _ => None,
-                    },
-                    mass_on_missing,
-                }
+        .map(|hit| FrameClaimBeliefRow {
+            claim_id: hit.claim_id,
+            content: hit.content,
+            hypothesis_index: hit.hypothesis_index,
+            belief: hit.belief,
+            plausibility: hit.plausibility,
+            ignorance: match (hit.belief, hit.plausibility) {
+                (Some(b), Some(p)) => Some(p - b),
+                _ => None,
             },
-        )
+            mass_on_missing: hit.mass_on_missing,
+        })
         .collect();
 
-    // SECURITY (A3): use the authenticated requester, not params.agent_id.
-    let requester = auth_ctx
-        .as_ref()
-        .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)));
-    for row in &mut result {
-        let access =
-            crate::access_control::check_content_access(pool, row.claim_id, requester).await;
-        if access == crate::access_control::ContentAccess::Redacted {
-            crate::access_control::redact_claim_content(&mut row.content);
-        }
-    }
-
+    // No redaction pass: the frame-claims repo read above is spliced with
+    // `&viewer`. `frame_claims_sorted` is the site PR-07 found holding a
+    // `ViewerExtractor` and never filtering on it; the filter is real now, and
+    // the post-pass that masked that defect is gone.
     Ok(Json(result))
 }
 
@@ -2016,11 +2139,25 @@ pub async fn frame_claims_sorted(
 /// `GET /api/v1/claims/:id/divergence`
 #[cfg(feature = "db")]
 pub async fn claim_divergence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<Option<DivergenceResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let row = epigraph_db::DivergenceRepository::get_latest(pool, claim_id).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "claim_divergence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let row = epigraph_db::DivergenceRepository::get_latest(&mut *read, &viewer, claim_id).await?;
+
+    crate::routes::finish_scoped_read(read, "claim_divergence").await?;
 
     Ok(Json(row.map(|r| DivergenceResponse {
         id: r.id,
@@ -2039,11 +2176,26 @@ pub async fn claim_divergence(
 /// `GET /api/v1/divergence/top`
 #[cfg(feature = "db")]
 pub async fn top_divergence(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(params): Query<TopDivergenceQuery>,
 ) -> Result<Json<Vec<DivergenceResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::DivergenceRepository::top_divergent(pool, params.limit).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "top_divergence",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let rows =
+        epigraph_db::DivergenceRepository::top_divergent(&mut *read, &viewer, params.limit).await?;
+
+    crate::routes::finish_scoped_read(read, "top_divergence").await?;
 
     let result = rows
         .into_iter()
@@ -2069,11 +2221,11 @@ pub async fn top_divergence(
 /// Query params: `scope` (global|perspective|community), `scope_id` (UUID)
 #[cfg(feature = "db")]
 pub async fn get_scoped_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<ScopedBeliefQuery>,
 ) -> Result<Json<Option<ScopedBeliefEntry>>, ApiError> {
-    let pool = &state.db_pool;
     let scope_type = params.scope.as_deref().unwrap_or("global");
 
     if scope_type != "global" && params.scope_id.is_none() {
@@ -2083,8 +2235,28 @@ pub async fn get_scoped_belief(
         });
     }
 
-    let row = epigraph_db::ScopedBeliefRepository::get(pool, claim_id, scope_type, params.scope_id)
-        .await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_scoped_belief",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let row = epigraph_db::ScopedBeliefRepository::get(
+        &mut *read,
+        &viewer,
+        claim_id,
+        scope_type,
+        params.scope_id,
+    )
+    .await?;
+
+    crate::routes::finish_scoped_read(read, "get_scoped_belief").await?;
 
     Ok(Json(row.map(scoped_belief_to_entry)))
 }
@@ -2094,11 +2266,26 @@ pub async fn get_scoped_belief(
 /// `GET /api/v1/claims/:id/belief/all-scopes`
 #[cfg(feature = "db")]
 pub async fn all_scopes_belief(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<AllScopesBeliefResponse>, ApiError> {
-    let pool = &state.db_pool;
-    let rows = epigraph_db::ScopedBeliefRepository::list_for_claim(pool, claim_id).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "all_scopes_belief",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let rows =
+        epigraph_db::ScopedBeliefRepository::list_for_claim(&mut *read, &viewer, claim_id).await?;
+
+    crate::routes::finish_scoped_read(read, "all_scopes_belief").await?;
 
     let scopes = rows.into_iter().map(scoped_belief_to_entry).collect();
 
@@ -2130,17 +2317,29 @@ fn scoped_belief_to_entry(row: epigraph_db::ScopedBeliefRow) -> ScopedBeliefEntr
 /// credal-level storage, pignistic-level computation at decision time).
 #[cfg(feature = "db")]
 pub async fn get_pignistic(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
     Query(params): Query<PignisticQuery>,
 ) -> Result<Json<PignisticResponse>, ApiError> {
     use epigraph_ds::{combination, measures, FrameOfDiscernment, MassFunction};
 
-    let pool = &state.db_pool;
     let frame_id = params.frame_id;
 
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_pignistic",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Load frame
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(&mut *read, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -2155,8 +2354,15 @@ pub async fn get_pignistic(
         })?;
 
     // Load all individual evidence BBAs (exclude system-combined)
-    let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id).await?;
+    let all_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+        &mut *read, &viewer, claim_id, frame_id,
+    )
+    .await?;
+
+    // Finished here rather than at the end of the handler: this is the last
+    // statement, and the `masses.is_empty()` branch below returns early. Every
+    // path after this point is pure computation over rows already held.
+    crate::routes::finish_scoped_read(read, "get_pignistic").await?;
 
     let mut indexed: Vec<(Uuid, MassFunction)> = all_rows
         .iter()
@@ -2242,6 +2448,7 @@ pub async fn get_pignistic(
 /// `POST /api/v1/frames/:id/refine`
 #[cfg(feature = "db")]
 pub async fn refine_frame(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(parent_id): Path<Uuid>,
     Json(request): Json<RefineFrameRequest>,
@@ -2249,7 +2456,7 @@ pub async fn refine_frame(
     let pool = &state.db_pool;
 
     // Validate parent frame exists and is refinable
-    let parent = epigraph_db::FrameRepository::get_by_id(pool, parent_id)
+    let parent = epigraph_db::FrameRepository::get_by_id(pool, &viewer, parent_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -2294,20 +2501,35 @@ pub async fn refine_frame(
 /// `GET /api/v1/frames/:id/refinements`
 #[cfg(feature = "db")]
 pub async fn frame_refinements(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<Vec<FrameResponse>>, ApiError> {
-    let pool = &state.db_pool;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "frame_refinements",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     // Verify frame exists
-    epigraph_db::FrameRepository::get_by_id(pool, frame_id)
+    epigraph_db::FrameRepository::get_by_id(&mut *read, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
             id: frame_id.to_string(),
         })?;
 
-    let children = epigraph_db::FrameRepository::get_children(pool, frame_id).await?;
+    let children =
+        epigraph_db::FrameRepository::get_children(&mut *read, &viewer, frame_id).await?;
+
+    crate::routes::finish_scoped_read(read, "frame_refinements").await?;
+
     Ok(Json(children.into_iter().map(frame_to_response).collect()))
 }
 
@@ -2316,11 +2538,26 @@ pub async fn frame_refinements(
 /// `GET /api/v1/frames/:id/ancestry`
 #[cfg(feature = "db")]
 pub async fn frame_ancestry(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(frame_id): Path<Uuid>,
 ) -> Result<Json<Vec<FrameResponse>>, ApiError> {
-    let pool = &state.db_pool;
-    let ancestry = epigraph_db::FrameRepository::get_ancestry(pool, frame_id).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "frame_ancestry",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let ancestry =
+        epigraph_db::FrameRepository::get_ancestry(&mut *read, &viewer, frame_id).await?;
+
+    crate::routes::finish_scoped_read(read, "frame_ancestry").await?;
 
     if ancestry.is_empty() {
         return Err(ApiError::NotFound {

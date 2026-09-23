@@ -46,6 +46,8 @@ import time
 import psycopg2
 import psycopg2.extras
 
+from maintenance_dsn import maintenance_dsn
+
 psycopg2.extras.register_uuid()
 
 DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph"
@@ -180,7 +182,7 @@ def main():
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
+        default=maintenance_dsn(DEFAULT_DATABASE_URL),
         help=f"Postgres URL (default: {DEFAULT_DATABASE_URL})",
     )
     parser.add_argument("--dry-run", action="store_true")

@@ -67,10 +67,14 @@ const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 /// Get-or-create the canonical `binary_truth` frame.
 ///
 /// Handles race conditions: get → create → fallback get.
-pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
+pub async fn ensure_binary_frame(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Uuid, String> {
     let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
     ensure_axis_frame(
         pool,
+        viewer,
         BINARY_FRAME_NAME,
         &hyps,
         Some("Canonical binary frame: {TRUE, FALSE}"),
@@ -90,12 +94,13 @@ pub async fn ensure_binary_frame(pool: &PgPool) -> Result<Uuid, String> {
 /// Handles the create race the same way as before: get → create → fallback get.
 pub async fn ensure_axis_frame(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     name: &str,
     hypotheses: &[String],
     description: Option<&str>,
 ) -> Result<Uuid, String> {
     // Fast path: frame already exists — verify the axis agrees before reuse.
-    if let Some(row) = FrameRepository::get_by_name(pool, name)
+    if let Some(row) = FrameRepository::get_by_name(pool, viewer, name)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
@@ -113,7 +118,7 @@ pub async fn ensure_axis_frame(
         Ok(row) => Ok(row.id),
         Err(_) => {
             // Race: another connection created it first — re-fetch and re-verify.
-            let row = FrameRepository::get_by_name(pool, name)
+            let row = FrameRepository::get_by_name(pool, viewer, name)
                 .await
                 .map_err(|e| format!("fallback get_by_name: {e}"))?
                 .ok_or_else(|| format!("frame {name:?} missing after create attempt"))?;
@@ -240,20 +245,44 @@ fn parse_stored_bba(
         .map_err(|e| format!("parse stored BBA: {e}"))
 }
 
+/// The evidential content of one auto-wire call.
+///
+/// Bundled rather than passed positionally because `confidence` and `weight`
+/// are adjacent bare `f64`s: `(.., confidence, 0.6, true, None)` compiles just
+/// as happily with the two transposed, and the result is a silently
+/// mis-weighted BBA rather than an error. Named fields make that a compile
+/// error. (Adding `viewer` for tenancy also pushed this to 8 arguments and
+/// tripped `clippy::too_many_arguments`, but the count is the symptom.)
+#[derive(Debug, Clone, Copy)]
+pub struct DsAutoInput<'a> {
+    /// Belief mass for the supported hypothesis, in `[0, 1]`.
+    pub confidence: f64,
+    /// Source-reliability discount applied to the BBA, in `[0, 1]`.
+    pub weight: f64,
+    /// Whether the evidence supports (`true`) or opposes (`false`) the claim.
+    pub supports: bool,
+    /// Evidence classification tag, when the caller has one.
+    pub evidence_type: Option<&'a str>,
+}
+
 /// Auto-wire DS for a **new** claim.
 ///
 /// Creates a BBA, assigns the claim to the binary frame, computes Bel/Pl/BetP,
 /// and updates the claim's DS columns.
 pub async fn auto_wire_ds_for_claim(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     agent_id: Uuid,
-    confidence: f64,
-    weight: f64,
-    supports: bool,
-    evidence_type: Option<&str>, // NEW: evidence classification tag
+    input: DsAutoInput<'_>,
 ) -> Result<DsAutoResult, String> {
-    let frame_id = ensure_binary_frame(pool).await?;
+    let DsAutoInput {
+        confidence,
+        weight,
+        supports,
+        evidence_type,
+    } = input;
+    let frame_id = ensure_binary_frame(pool, viewer).await?;
     let frame = binary_frame()?;
 
     // Build BBA
@@ -320,7 +349,7 @@ pub async fn auto_wire_ds_for_claim(
             .ok()
             .flatten();
 
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, claim_id, frame_id)
+    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     let row = all_rows
@@ -341,11 +370,14 @@ pub async fn auto_wire_ds_for_claim(
     MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
+        epigraph_db::CachedBelief {
+            belief: bel,
+            plausibility: pl,
+            mass_on_empty: conflict,
+            pignistic_prob: Some(betp),
+            mass_on_missing: missing,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
@@ -372,6 +404,7 @@ pub async fn auto_wire_ds_for_claim(
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_update(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     agent_id: Uuid,
     confidence: f64,
@@ -380,7 +413,7 @@ pub async fn auto_wire_ds_update(
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
 ) -> Result<DsAutoResult, String> {
-    let frame_id = ensure_binary_frame(pool).await?;
+    let frame_id = ensure_binary_frame(pool, viewer).await?;
     let frame = binary_frame()?;
 
     // Build BBA for this evidence
@@ -434,7 +467,7 @@ pub async fn auto_wire_ds_update(
     // the full evidence history rather than starting fresh from just the new
     // BBA — the root cause of the BetP drop in backlog 30bfbb19
     // (claims c98b6dec, adf396a8: 0.883→0.725, 0.834→0.733).
-    let all_rows = MassFunctionRepository::get_for_claim_binary_frames(pool, claim_id)
+    let all_rows = MassFunctionRepository::get_for_claim_binary_frames(pool, viewer, claim_id)
         .await
         .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
 
@@ -470,12 +503,22 @@ pub async fn auto_wire_ds_update(
     // (m({0})>0 AND m({1})>0) and a new pure-support BBA can push mass to
     // missing via Inagaki redistribution and reduce pignistic_prob even when
     // supports=true.  We bound the result from below by the pre-addition value.
-    let prior_betp: Option<f64> =
-        sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
-            .bind(claim_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(None);
+    let prior_betp: Option<f64> = {
+        // PR-09: a per-id belief oracle over a caller-supplied uuid, so it
+        // is filtered rather than exempted. `unwrap_or(None)` already
+        // treats "no row" as "no prior", so an invisible claim degrades to
+        // the same answer a nonexistent one gives — no new failure mode.
+        let sql = viewer.splice(
+            "SELECT c.pignistic_prob FROM claims c \
+                 WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(pool).await.ok().flatten().flatten()
+    };
 
     let combined = if all_rows.len() <= 1 {
         // Single BBA — still apply discount
@@ -513,10 +556,23 @@ pub async fn auto_wire_ds_update(
     let (bel, pl, mut betp, conflict, missing) = compute_measures(&combined);
 
     // Monotonicity clamp: supports=true evidence must not lower pignistic_prob.
+    //
+    // Bounded by plausibility (backlog 0183a294). The prior is read from
+    // `claims.pignistic_prob`, which may itself be an inflated value left by an
+    // earlier write, so raising `betp` to it unconditionally persisted
+    // `pignistic_prob > plausibility` — a triple no mass function can represent,
+    // and one Postgres accepts because `claims_plausibility_bounds` is a [0,1]
+    // range check with no Bel <= BetP <= Pl ordering constraint.
+    //
+    // Where monotonicity and the DS bound conflict, the bound wins: a BetP above
+    // plausibility is not a weaker guarantee, it is an impossible one. Clamping
+    // to `prior.min(pl)` keeps 30bfbb19's intent wherever the prior is
+    // representable, and yields to `pl` only when it is not.
     if supports {
         if let Some(prior) = prior_betp {
-            if betp < prior {
-                betp = prior;
+            let bounded_prior = prior.min(pl);
+            if betp < bounded_prior {
+                betp = bounded_prior;
             }
         }
     }
@@ -524,11 +580,14 @@ pub async fn auto_wire_ds_update(
     MassFunctionRepository::update_claim_belief(
         pool,
         claim_id,
-        bel,
-        pl,
-        conflict,
-        Some(betp),
-        missing,
+        epigraph_db::CachedBelief {
+            belief: bel,
+            plausibility: pl,
+            mass_on_empty: conflict,
+            pignistic_prob: Some(betp),
+            mass_on_missing: missing,
+            belief_frame_id: Some(frame_id),
+        },
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
@@ -555,6 +614,7 @@ pub async fn auto_wire_ds_update(
 /// per claim via `claim_frames` rather than from this single id.
 pub async fn auto_wire_ds_batch(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     entries: &[BatchDsEntry],
     agent_id: Uuid,
 ) -> Result<(Uuid, usize), String> {
@@ -562,7 +622,7 @@ pub async fn auto_wire_ds_batch(
         return Err("empty batch".to_string());
     }
 
-    let binary_frame_id = ensure_binary_frame(pool).await?;
+    let binary_frame_id = ensure_binary_frame(pool, viewer).await?;
     let binary = binary_frame()?;
     // Axis frames resolved on first use, keyed by frame name. Keeps a sweep of N
     // atoms on one axis to a single get-or-create round trip, as the binary path
@@ -576,7 +636,9 @@ pub async fn auto_wire_ds_batch(
             None => Ok((binary_frame_id, binary.clone(), 0_usize)),
             Some(axis) => match axis_frames.get(&axis.frame) {
                 Some((id, frame)) => Ok((*id, frame.clone(), axis.hypothesis_index)),
-                None => match ensure_axis_frame(pool, &axis.frame, &axis.hypotheses, None).await {
+                None => match ensure_axis_frame(pool, viewer, &axis.frame, &axis.hypotheses, None)
+                    .await
+                {
                     Err(e) => Err(e),
                     Ok(id) => match axis_frame(&axis.frame, &axis.hypotheses) {
                         Err(e) => Err(e),
@@ -599,7 +661,8 @@ pub async fn auto_wire_ds_batch(
             }
         };
 
-        if let Err(e) = wire_single_batch_entry(pool, &frame, frame_id, idx, entry, agent_id).await
+        if let Err(e) =
+            wire_single_batch_entry(pool, viewer, &frame, frame_id, idx, entry, agent_id).await
         {
             tracing::warn!(
                 claim_id = %entry.claim_id,
@@ -621,6 +684,7 @@ pub async fn auto_wire_ds_batch(
 /// belief readers target.
 async fn wire_single_batch_entry(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
     frame: &FrameOfDiscernment,
     frame_id: Uuid,
     hypothesis_index: usize,
@@ -665,9 +729,14 @@ async fn wire_single_batch_entry(
     // recompute_beliefs. `recompute_claim_belief_on_frame` re-reads the row we
     // just stored, applies `effective_source_strength`, and writes Bel/Pl/BetP
     // (and, on the binary frame, classification) via update_claim_belief.
-    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(pool, entry.claim_id, frame_id)
-        .await
-        .map_err(|e| format!("recompute initial cache: {e}"))?;
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+        pool,
+        viewer,
+        entry.claim_id,
+        frame_id,
+    )
+    .await
+    .map_err(|e| format!("recompute initial cache: {e}"))?;
 
     Ok(())
 }
