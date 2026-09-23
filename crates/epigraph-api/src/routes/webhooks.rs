@@ -1204,9 +1204,12 @@ pub async fn deliver_event(
 /// and still filters on ownership in this build, because that needs no
 /// database — only the fan-out is disabled.
 ///
-/// This configuration is not built by any CI job or deployment (`epigraph-api`'s
-/// default features are `["db"]`); it is kept compiling by
-/// `cargo check -p epigraph-api --no-default-features`.
+/// No deployment builds this configuration (`epigraph-api`'s default features
+/// are `["db"]`). CI's no-db step type-checks it across all targets and runs its
+/// tests, and `tests/webhook_dispatcher_nodb.rs` asserts this function's
+/// contract end to end through [`start_webhook_dispatcher_with_client`]: the
+/// suppression line fires with the matching count and this reason, and a
+/// reachable sink receives nothing.
 #[cfg(not(feature = "db"))]
 pub async fn deliver_event(
     _client: &reqwest::Client,
@@ -1707,7 +1710,28 @@ pub fn start_webhook_dispatcher(
     let client = dispatcher_client_builder(config.timeout)
         .build()
         .expect("webhook dispatcher HTTP client must build; a default client would drop the no-redirect SSRF policy");
+    start_webhook_dispatcher_with_client(event_bus, webhook_store, config, client)
+}
 
+/// [`start_webhook_dispatcher`] over a caller-supplied client, in the
+/// `not(feature = "db")` build.
+///
+/// The same seam as the `db` variant, for the same reason: a behavioural test
+/// can reach a local sink only through a client whose `.resolve()` override
+/// names it (see that variant's doc for why, and for why this weakens nothing).
+/// Here it matters for a specific assertion. `tests/webhook_dispatcher_nodb.rs`
+/// shows this build delivers NOTHING by pointing a subscription at a sink the
+/// injected client can reach and counting zero requests. Through the
+/// production client the sink is unreachable by design, so a count of zero
+/// would hold even for a fan-out that tried to deliver, and it would prove
+/// nothing.
+#[cfg(not(feature = "db"))]
+pub fn start_webhook_dispatcher_with_client(
+    event_bus: &crate::state::SharedEventBus,
+    webhook_store: crate::state::WebhookStore,
+    config: WebhookDeliveryConfig,
+    client: reqwest::Client,
+) -> epigraph_events::SubscriptionId {
     let store = webhook_store;
     let cfg = std::sync::Arc::new(config);
 
