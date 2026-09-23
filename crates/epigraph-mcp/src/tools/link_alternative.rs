@@ -105,15 +105,25 @@ pub async fn do_link_alternative(
         props.insert("rationale".to_string(), Value::String(r.clone()));
     }
 
+    // An existing `alternative_of` edge over this pair that the caller cannot
+    // read is never returned: the repository answers `DbError::Conflict` with a
+    // fixed literal naming nothing, surfaced here as invalid params (plan §8.5,
+    // acceptance item 21). It is still distinguishable from the absent case,
+    // because the symmetric index refuses a second row whoever owns the first;
+    // see `D-N21-unique-keys-omit-owner-group`.
     let (edge_id, created) = EdgeRepository::create_symmetric_if_absent_returning(
         pool,
+        viewer,
         a,
         b,
         "alternative_of",
         Value::Object(props),
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| match e {
+        epigraph_db::DbError::Conflict { reason } => invalid_params(reason),
+        e => internal_error(e),
+    })?;
 
     success_json(&LinkAlternativeResponse {
         edge_id: edge_id.to_string(),

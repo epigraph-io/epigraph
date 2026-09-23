@@ -648,9 +648,15 @@ pub async fn create_edge(
     // STORED row with a 200 OK so retried drainer batches don't double-fire
     // events or write redundant provenance entries. Mirrors the claims
     // pattern in `routes/claims.rs::create_claim`.
+    //
+    // The probe is Viewer-scoped (plan §8.5, acceptance item 21): an existing
+    // edge the caller cannot read is treated as absent, so the caller's own
+    // edge is inserted and the invisible row — id, properties, validity window —
+    // is never echoed back. `tests/unique_constraint_oracle_n21.rs` pins it.
     let (edge_row, was_created) = if request.if_not_exists {
-        EdgeRepository::create_if_not_exists(
+        EdgeRepository::create_if_not_exists_for_viewer(
             pool,
+            &viewer,
             request.source_id,
             &request.source_type,
             request.target_id,
@@ -696,8 +702,8 @@ pub async fn create_edge(
     // Build the response from the STORED row. On a dedup hit (was_created=false)
     // the request.properties / valid_from / valid_to may differ from what's in
     // the database; the response must reflect what's actually stored, not the
-    // request. The `create_if_not_exists` path now returns the existing row's
-    // fields verbatim.
+    // request. The `create_if_not_exists_for_viewer` path returns the existing
+    // row's fields verbatim — only ever a row the caller can read.
     let response = EdgeResponse {
         id: edge_row.id,
         source_id: edge_row.source_id,
@@ -1066,8 +1072,11 @@ pub async fn create_hierarchical_edge(
 
     // Idempotent on (source, target, relationship) so per-chapter wire-ups
     // can re-run safely. source_type / target_type are always "claim" here.
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
+    // Viewer-scoped probe: an existing edge the caller cannot read is treated
+    // as absent, never returned (plan §8.5, acceptance item 21).
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_for_viewer(
         pool,
+        &viewer,
         request.source_claim_id,
         "claim",
         request.target_claim_id,

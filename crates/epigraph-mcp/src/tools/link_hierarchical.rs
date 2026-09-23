@@ -1,7 +1,7 @@
 //! `link_hierarchical` — cross-tier structural edge creation between claims.
 //!
 //! Counterpart to the new `POST /api/v1/edges/hierarchical` HTTP endpoint.
-//! Bypasses HTTP and goes directly through `EdgeRepository::create_if_not_exists`
+//! Bypasses HTTP and goes directly through `EdgeRepository::create_if_not_exists_for_viewer`
 //! so per-chapter ingest wiring (e.g. chapter thesis → book thesis,
 //! chapter[N] → chapter[N+1]) can continue from a Claude Code session even
 //! when the API binary is unavailable.
@@ -102,8 +102,11 @@ pub async fn do_link_hierarchical(
         )));
     }
 
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
+    // Viewer-scoped probe: an existing edge the caller cannot read is treated
+    // as absent, and its id is never returned (plan §8.5, acceptance item 21).
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_for_viewer(
         pool,
+        viewer,
         source_id,
         "claim",
         target_id,

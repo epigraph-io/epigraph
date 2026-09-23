@@ -122,15 +122,23 @@ impl EdgeRepository {
     ///
     /// Returns `(EdgeRow, was_created)` where `was_created` is `true` when a
     /// new row was inserted and `false` when an existing row was returned.
-    /// Mirrors `ClaimRepository::create_or_get`. Callers in API handlers gate
-    /// side effects (provenance, events, DS recomputation) on `was_created`
-    /// so dedup hits don't double-fire — see `routes/edges.rs::create_edge`.
+    /// Mirrors `ClaimRepository::create_or_get`.
     ///
     /// Uses check-then-insert in a transaction. The `edges` table has no
     /// unique index on this triple (multiple parallel edges with different
     /// `properties` are valid in the general case), so we cannot rely on
     /// `ON CONFLICT`. Two round-trips are acceptable for the ingestion
     /// path; the race window is small and edges are idempotent in practice.
+    ///
+    /// # Not for a caller that hands the row to a requester
+    ///
+    /// The probe is unfiltered and the matched row is RETURNED — id,
+    /// properties, validity window. Handing that to a requester who cannot
+    /// read the edge discloses the edge itself: the plan §8.5 existence oracle
+    /// in its strongest form (acceptance item 21). A request-facing caller uses
+    /// [`Self::create_if_not_exists_for_viewer`]. The callers left here are
+    /// internal writers — ingestion, the workflow executor, the CLI decomposer,
+    /// the MCP auth-lineage edge — that use at most `was_created` as a counter.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database operation fails.
@@ -151,13 +159,13 @@ impl EdgeRepository {
 
         let existing = sqlx::query!(
             r#"
-            -- VISIBILITY-EXEMPT: dedup probe inside a WRITE path
-            -- (`create_or_get`). It must see an existing edge regardless of who
-            -- is asking, or the "get" half silently becomes "create" and the
-            -- table grows a duplicate every time a caller without read access
-            -- re-asserts a link that is already there. PR-16 owns the
-            -- write-side authorization that decides whether the caller may
-            -- create the edge at all.
+            -- VISIBILITY-EXEMPT: dedup probe inside an INTERNAL write path.
+            -- It must see an existing edge regardless of who is asking, or the
+            -- "get" half silently becomes "create" and the table grows a
+            -- duplicate every time a writer without read access re-asserts a
+            -- link that is already there. Its row must not reach a requester:
+            -- request-facing callers use `create_if_not_exists_for_viewer`,
+            -- whose probe is filtered (plan §8.5, acceptance item 21).
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE source_id = $1 AND target_id = $2 AND relationship = $3
@@ -188,6 +196,143 @@ impl EdgeRepository {
             ));
         }
 
+        let properties = properties.unwrap_or(serde_json::json!({}));
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
+            "#,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((
+            EdgeRow {
+                id: row.id,
+                source_id: row.source_id,
+                source_type: row.source_type,
+                target_id: row.target_id,
+                target_type: row.target_type,
+                relationship: row.relationship,
+                properties: row.properties,
+                valid_from: row.valid_from,
+                valid_to: row.valid_to,
+            },
+            true,
+        ))
+    }
+
+    /// [`Self::create_if_not_exists`] for a REQUEST-FACING caller: the dedup
+    /// probe matches only an edge `viewer` can read.
+    ///
+    /// Same `(EdgeRow, was_created)` contract. Callers in API handlers gate
+    /// side effects (provenance, events, factor inserts) on `was_created` so
+    /// dedup hits don't double-fire — see `routes/edges.rs::create_edge`.
+    ///
+    /// # Why (plan §8.5, acceptance item 21)
+    ///
+    /// §8.5: an operation on a resource the Viewer cannot read answers exactly
+    /// as it does for a nonexistent one. The unfiltered probe answered a
+    /// re-assertion of an edge the caller could not read with that edge's id,
+    /// properties and validity window — `POST /api/v1/edges {if_not_exists}`
+    /// echoed all four, `POST /api/v1/edges/hierarchical` and MCP
+    /// `link_epistemic` / `link_hierarchical` the id. Here an invisible match is
+    /// treated as absent: the probe misses and the caller's own edge is
+    /// inserted, which is exactly what the absent case does. There is no triple
+    /// constraint left to refuse it (migrations 017/018 dropped
+    /// `idx_edges_unique_triple`); the two partial symmetric indexes (042/091,
+    /// 090) still can, for `alternative_of` and matcher-stamped
+    /// `CORROBORATES`/`contradicts` — `D-N21-unique-keys-omit-owner-group`.
+    ///
+    /// # What that costs, stated
+    ///
+    /// A caller who cannot read an existing edge now writes a second one over
+    /// the same triple. That is the trade the `VISIBILITY-EXEMPT` note on the
+    /// unfiltered probe was avoiding, and it is the correct side of it: the
+    /// duplicate is the caller's own row, carrying the tenancy migration 070's
+    /// trigger derives from the endpoints, and its only alternative is handing
+    /// the caller a row it may not read.
+    ///
+    /// # Which connection, and why not a stamped one
+    ///
+    /// The probe runs on `pool` with no session GUCs stamped, like every other
+    /// write in the edge routes today (`routes/edges.rs`' module doc names
+    /// `ScopedPool::begin_as` plus `Viewer::splice_write` as their owner). The
+    /// Viewer splice is what filters under the role the application connects as
+    /// now; once plan §9.2 step 11d FORCEs RLS on `edges` for `epigraph_app`,
+    /// the unstamped session additionally sees only public edges, so the probe
+    /// can only match LESS, never more — a missed dedup, never a disclosure. A
+    /// maintenance connection or a bypass viewer would reintroduce the
+    /// unfiltered probe and must not be used here.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(pool, viewer, properties))]
+    pub async fn create_if_not_exists_for_viewer(
+        pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        use sqlx::Row;
+
+        let mut tx = pool.begin().await?;
+
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
+                    e.relationship, e.properties, e.valid_from, e.valid_to \
+             FROM edges e \
+             WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+               /* {EDGE_VISIBILITY:e} */ \
+             LIMIT 1",
+            4,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+
+        if let Some(row) = q.fetch_optional(&mut *tx).await? {
+            tx.commit().await?;
+            return Ok((
+                EdgeRow {
+                    id: row.try_get("id")?,
+                    source_id: row.try_get("source_id")?,
+                    source_type: row.try_get("source_type")?,
+                    target_id: row.try_get("target_id")?,
+                    target_type: row.try_get("target_type")?,
+                    relationship: row.try_get("relationship")?,
+                    properties: row.try_get("properties")?,
+                    valid_from: row.try_get("valid_from")?,
+                    valid_to: row.try_get("valid_to")?,
+                },
+                false,
+            ));
+        }
+
+        // Same INSERT text as `create_if_not_exists`, so both share one
+        // `.sqlx/` entry. Inlined rather than factored into a helper: a helper
+        // taking `&mut PgConnection` and no Viewer would have to join
+        // `visibility_lint.rs`'s CONN_WITHOUT_VIEWER register.
         let properties = properties.unwrap_or(serde_json::json!({}));
         let row = sqlx::query!(
             r#"
@@ -327,26 +472,36 @@ impl EdgeRepository {
     /// (narrowed by 091), not 090 — `alternative_of` is outside 090's predicate.
     ///
     /// WHAT THE `DO NOTHING` IS AND IS NOT PROVED TO DO. When the conflicting
-    /// row is visible to this connection the dedup-hit branch below reads it and
-    /// the concurrent-duplicate case resolves to `(existing_id, false)` instead
-    /// of a 23505 the caller maps to an internal error. When it is NOT visible,
-    /// one error is traded for another, not for an answer. There is no test over
-    /// this function or over its one caller, so both halves are asserted by
-    /// inspection; the change is conservative because every pre-change path is
-    /// unchanged.
+    /// row is readable by `viewer` the dedup-hit branch below reads it and the
+    /// concurrent-duplicate case resolves to `(existing_id, false)` instead of a
+    /// 23505 the caller maps to an internal error.
+    ///
+    /// # When the existing edge is one `viewer` cannot read (plan §8.5, item 21)
+    ///
+    /// The dedup-hit read is Viewer-scoped, so it never returns such an edge's
+    /// id; the function answers `DbError::Conflict` carrying the fixed literal
+    /// [`Self::SYMMETRIC_COLLISION_REASON`] instead. Before, the read was
+    /// unfiltered and handed the invisible edge's id back through
+    /// `link_alternative`. The answer still differs from both other cases —
+    /// a visible edge returns its id, an absent one is created — because
+    /// `edges_alternative_of_symmetric_uniq` refuses a second in-force row
+    /// whoever owns the first. Only a key carrying `owner_group_id` closes that,
+    /// which is a migration: `D-N21-unique-keys-omit-owner-group`.
+    ///
+    /// The INSERT's `NOT EXISTS` guard is left unfiltered on purpose. For
+    /// `alternative_of`, the only relationship any caller passes, the index
+    /// decides the outcome whichever way the guard reads, and the guard's
+    /// posture under FORCEd RLS is recorded on `D-PR17-read-guards-widen-under-rls`;
+    /// changing it here would move that analysis for no change in the answer.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails. On the
-    /// dedup-hit branch that includes the case where the conflicting edge is not
-    /// visible to this connection and there is no id to return. Note what does
-    /// the filtering and when: the probe below is annotated
-    /// `VISIBILITY-EXEMPT` and carries no `Viewer` splice, so it is unfiltered
-    /// on the role the application connects as TODAY and becomes filtered by the
-    /// database policy only from plan §9.2 step 11d, at which point that branch
-    /// yields `RowNotFound`. That is a loud failure rather than a wrong answer.
-    #[instrument(skip(pool, properties))]
+    /// Returns `DbError::Conflict` with [`Self::SYMMETRIC_COLLISION_REASON`]
+    /// when the insert is refused and no conflicting edge is readable by
+    /// `viewer`. Returns `DbError::QueryFailed` if a database query fails.
+    #[instrument(skip(pool, viewer, properties))]
     pub async fn create_symmetric_if_absent_returning(
         pool: &PgPool,
+        viewer: &crate::visibility::Viewer,
         a: Uuid,
         b: Uuid,
         relationship: &str,
@@ -376,24 +531,37 @@ impl EdgeRepository {
             return Ok((id, true));
         }
 
-        // Dedup hit — surface the id of the existing symmetric edge.
-        let existing: Uuid = sqlx::query_scalar(
-            "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
-             -- same reasoning as `create_or_get`'s.
-             SELECT id FROM edges
-             WHERE ((source_id = $1 AND target_id = $2)
-                 OR (source_id = $2 AND target_id = $1))
-               AND relationship = $3
+        // Dedup hit — surface the id of the existing symmetric edge, but only
+        // an edge this viewer can read.
+        let sql = viewer.splice(
+            "SELECT e.id FROM edges e
+             WHERE ((e.source_id = $1 AND e.target_id = $2)
+                 OR (e.source_id = $2 AND e.target_id = $1))
+               AND e.relationship = $3
+               /* {EDGE_VISIBILITY:e} */
              LIMIT 1",
-        )
-        .bind(a)
-        .bind(b)
-        .bind(relationship)
-        .fetch_one(pool)
-        .await?;
-
-        Ok((existing, false))
+            4,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(a)
+            .bind(b)
+            .bind(relationship);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        match q.fetch_optional(pool).await? {
+            Some(existing) => Ok((existing, false)),
+            None => Err(DbError::Conflict {
+                reason: Self::SYMMETRIC_COLLISION_REASON.to_string(),
+            }),
+        }
     }
+
+    /// The answer [`Self::create_symmetric_if_absent_returning`] gives when a
+    /// symmetric edge already joins the pair and the caller cannot read it.
+    /// A FIXED LITERAL naming no edge, id or group (plan §8.5, item 21).
+    pub const SYMMETRIC_COLLISION_REASON: &'static str =
+        "an edge with this relationship already joins these two claims";
 
     /// Get edges by source entity
     ///

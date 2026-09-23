@@ -15,8 +15,18 @@
 //!
 //! The plan named `idx_edges_unique_triple`. Migrations 017/018 dropped it (and
 //! 053 its drifted copy), so there is no edge triple constraint to collide
-//! with. The surface this file covers is:
+//! with. What replaced it is WORSE than an oracle: `EdgeRepository`'s
+//! `create_if_not_exists` dedup probe, which returned the matching row's id,
+//! properties and validity window whoever was asking. The surfaces are
+//! therefore:
 //!
+//! * **edges** — the `if_not_exists` dedup probe behind `POST /api/v1/edges`
+//!   and `POST /api/v1/edges/hierarchical`. Fixed to the FULL §8.5 rule: an
+//!   invisible match is treated exactly as an absent one (the probe is
+//!   Viewer-scoped, and with no triple constraint left the insert succeeds).
+//!   The partial symmetric indexes (042/091 `alternative_of`, 090 matcher
+//!   `CORROBORATES`/`contradicts`) are the edge-side residual, recorded on the
+//!   same obligation as the claims one below.
 //! * **claims** — `uq_claims_content_hash_agent UNIQUE (content_hash,
 //!   agent_id)` (migration 013), reachable by a stranger because the body's
 //!   `agent_id` is not a credential (`D-PR16-claim-authorship-is-not-a-credential`).
@@ -41,7 +51,7 @@
 
 use epigraph_core::ClaimId;
 use epigraph_db::visibility::Viewer;
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimRepository, EdgeRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -242,6 +252,302 @@ async fn a_claim_collision_on_an_invisible_row_answers_exactly_like_a_visible_on
         owner_json["id"].as_str(),
         Some(private.to_string().as_str())
     );
+
+    let _ = shutdown.send(());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// edges — the if_not_exists dedup probe
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Two public claims joined by a `relationship` edge that is private to
+/// `group`, carrying a marker property. Returns `(source, target, edge)`.
+///
+/// Public endpoints are the point: the stranger can see and name both, so the
+/// only thing standing between it and the edge is the edge's own tenancy —
+/// which is the case the dedup probe ignored. `seed_edge_owned_by` forces the
+/// stamp because migration 070's trigger would otherwise derive a PUBLIC edge
+/// from two public endpoints.
+async fn public_pair_with_private_edge(
+    pool: &PgPool,
+    author: Uuid,
+    group: Uuid,
+    relationship: &str,
+    marker: &str,
+) -> (Uuid, Uuid, Uuid) {
+    let source = fixture::seed_public_claim(pool, author, &format!("n21 src {marker}")).await;
+    let target = fixture::seed_public_claim(pool, author, &format!("n21 tgt {marker}")).await;
+    let edge = fixture::seed_edge_owned_by(pool, source, target, "group", group).await;
+    sqlx::query("UPDATE edges SET relationship = $2, properties = $3 WHERE id = $1")
+        .bind(edge)
+        .bind(relationship)
+        .bind(serde_json::json!({ "n21_marker": marker }))
+        .execute(pool)
+        .await
+        .expect("shape the private edge");
+    (source, target, edge)
+}
+
+/// Replace every id the response legitimately differs by with a placeholder,
+/// so two responses can be compared for everything else.
+fn normalise(body: &str, ids: &[Uuid]) -> String {
+    let mut out = body.to_string();
+    for (i, id) in ids.iter().enumerate() {
+        out = out.replace(&id.to_string(), &format!("<id{i}>"));
+    }
+    out
+}
+
+/// `POST /api/v1/edges {if_not_exists: true}` over an edge the caller cannot
+/// read must not hand that edge back — not its id, not its properties — and
+/// must answer exactly as it does when no such edge exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn edge_dedup_treats_an_invisible_edge_as_absent(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "n21-edge-owner").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "n21-edge-stranger").await;
+
+    let marker = format!("hidden-{}", Uuid::new_v4());
+    let (source, target, hidden) =
+        public_pair_with_private_edge(&pool, owner, group, "supports", &marker).await;
+    let absent_source = fixture::seed_public_claim(&pool, owner, "n21 absent src").await;
+    let absent_target = fixture::seed_public_claim(&pool, owner, "n21 absent tgt").await;
+
+    // PREMISE: the edge is invisible to the stranger and visible to the owner.
+    let stranger_viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
+    let owner_viewer = Viewer::resolve(&pool, owner).await.expect("resolve");
+    let seen = |rows: Vec<epigraph_db::EdgeRow>| rows.iter().any(|r| r.id == hidden);
+    assert!(!seen(
+        EdgeRepository::get_by_source(&pool, &stranger_viewer, source, "claim")
+            .await
+            .expect("get_by_source")
+    ));
+    assert!(seen(
+        EdgeRepository::get_by_source(&pool, &owner_viewer, source, "claim")
+            .await
+            .expect("get_by_source")
+    ));
+
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let (stranger_token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["edges:write"], stranger)
+            .await;
+    let (owner_token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["edges:write"], owner)
+            .await;
+
+    let body = |s: Uuid, t: Uuid| {
+        serde_json::json!({
+            "source_id": s, "target_id": t,
+            "source_type": "claim", "target_type": "claim",
+            "relationship": "supports",
+            "if_not_exists": true,
+        })
+    };
+
+    // CLASS P first — before the stranger writes a second row over the same
+    // triple and makes the probe's LIMIT 1 ambiguous. A reader still gets the
+    // existing edge back: the probe was narrowed, not disabled.
+    let (owner_status, owner_body) =
+        post_json(addr, "/api/v1/edges", &owner_token, &body(source, target)).await;
+    assert_eq!(owner_status, 200, "owner dedup hit: {owner_body}");
+    assert!(
+        owner_body.contains(&hidden.to_string()),
+        "a caller who can read the edge must get it back from the dedup probe: {owner_body}"
+    );
+
+    let (hit_status, hit_body) = post_json(
+        addr,
+        "/api/v1/edges",
+        &stranger_token,
+        &body(source, target),
+    )
+    .await;
+    let (absent_status, absent_body) = post_json(
+        addr,
+        "/api/v1/edges",
+        &stranger_token,
+        &body(absent_source, absent_target),
+    )
+    .await;
+
+    assert!(
+        !hit_body.contains(&hidden.to_string()) && !hit_body.contains(&marker),
+        "the dedup probe handed a stranger an edge it cannot read (id {hidden} / \
+         marker {marker}): {hit_body}"
+    );
+    let hit_json: serde_json::Value = serde_json::from_str(&hit_body).expect("json");
+    let absent_json: serde_json::Value = serde_json::from_str(&absent_body).expect("json");
+    let id_of =
+        |v: &serde_json::Value| -> Uuid { v["id"].as_str().expect("id").parse().expect("uuid") };
+    assert_eq!(
+        (
+            hit_status,
+            normalise(&hit_body, &[id_of(&hit_json), source, target])
+        ),
+        (
+            absent_status,
+            normalise(
+                &absent_body,
+                &[id_of(&absent_json), absent_source, absent_target]
+            )
+        ),
+        "an invisible matching edge must be indistinguishable from no edge at all \
+         (§8.5), once the ids that legitimately differ are normalised out"
+    );
+    assert_eq!(
+        hit_status, 201,
+        "the stranger's own edge is created: {hit_body}"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `POST /api/v1/edges/hierarchical` is idempotent on the same probe and had
+/// the same leak: `{edge_id: <invisible>, created: false}`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hierarchical_edge_dedup_treats_an_invisible_edge_as_absent(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "n21-hier-owner").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "n21-hier-stranger").await;
+
+    let marker = format!("hidden-{}", Uuid::new_v4());
+    let (source, target, hidden) =
+        public_pair_with_private_edge(&pool, owner, group, "decomposes_to", &marker).await;
+    let absent_source = fixture::seed_public_claim(&pool, owner, "n21 hier absent src").await;
+    let absent_target = fixture::seed_public_claim(&pool, owner, "n21 hier absent tgt").await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let (stranger_token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["edges:write"], stranger)
+            .await;
+    let (owner_token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["edges:write"], owner)
+            .await;
+
+    let body = |s: Uuid, t: Uuid| {
+        serde_json::json!({
+            "source_claim_id": s, "target_claim_id": t,
+            "relationship": "decomposes_to",
+        })
+    };
+
+    let (owner_status, owner_body) = post_json(
+        addr,
+        "/api/v1/edges/hierarchical",
+        &owner_token,
+        &body(source, target),
+    )
+    .await;
+    assert_eq!(owner_status, 200, "{owner_body}");
+    let owner_json: serde_json::Value = serde_json::from_str(&owner_body).expect("json");
+    assert_eq!(
+        (
+            owner_json["edge_id"].as_str(),
+            owner_json["created"].as_bool()
+        ),
+        (Some(hidden.to_string().as_str()), Some(false)),
+        "CLASS P: a reader's re-run is still a dedup hit on the existing edge"
+    );
+
+    let (hit_status, hit_body) = post_json(
+        addr,
+        "/api/v1/edges/hierarchical",
+        &stranger_token,
+        &body(source, target),
+    )
+    .await;
+    let (absent_status, absent_body) = post_json(
+        addr,
+        "/api/v1/edges/hierarchical",
+        &stranger_token,
+        &body(absent_source, absent_target),
+    )
+    .await;
+
+    assert!(
+        !hit_body.contains(&hidden.to_string()),
+        "the hierarchical dedup probe handed a stranger an edge it cannot read: {hit_body}"
+    );
+    let edge_id = |b: &str| -> Uuid {
+        let v: serde_json::Value = serde_json::from_str(b).expect("json");
+        v["edge_id"]
+            .as_str()
+            .expect("edge_id")
+            .parse()
+            .expect("uuid")
+    };
+    assert_eq!(
+        (hit_status, normalise(&hit_body, &[edge_id(&hit_body)])),
+        (
+            absent_status,
+            normalise(&absent_body, &[edge_id(&absent_body)])
+        ),
+        "an invisible matching edge must be indistinguishable from no edge at all"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// The unique-INDEX half on the edge side: `edges_alternative_of_symmetric_uniq`
+/// (042, narrowed by 091) refuses a second in-force `alternative_of` row over a
+/// claim pair whoever owns the first. Item 21's form holds — a collision with an
+/// edge the caller cannot read answers byte-for-byte as a collision with one it
+/// can, and names neither — while the ABSENT case still differs (201). That
+/// residual is `D-N21-unique-keys-omit-owner-group`, and nothing here asserts it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_symmetric_index_collision_on_an_invisible_edge_answers_like_a_visible_one(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "n21-sym-owner").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "n21-sym-stranger").await;
+
+    let marker = format!("hidden-{}", Uuid::new_v4());
+    let (a, b, hidden) =
+        public_pair_with_private_edge(&pool, owner, group, "alternative_of", &marker).await;
+    // A readable alternative_of edge over another public pair: the reference.
+    let c = fixture::seed_public_claim(&pool, owner, "n21 sym visible c").await;
+    let d = fixture::seed_public_claim(&pool, owner, "n21 sym visible d").await;
+    let visible = fixture::seed_edge(&pool, c, d).await;
+    sqlx::query("UPDATE edges SET relationship = 'alternative_of' WHERE id = $1")
+        .bind(visible)
+        .execute(&pool)
+        .await
+        .expect("make the visible edge an alternative_of");
+
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let (stranger_token, _) =
+        common::test_bearer_token_with_seeded_client_for_agent(&pool, &["edges:write"], stranger)
+            .await;
+    let body = |s: Uuid, t: Uuid| {
+        serde_json::json!({
+            "source_id": s, "target_id": t,
+            "source_type": "claim", "target_type": "claim",
+            "relationship": "alternative_of",
+        })
+    };
+
+    let (visible_status, visible_body) =
+        post_json(addr, "/api/v1/edges", &stranger_token, &body(c, d)).await;
+    assert!(
+        (400..500).contains(&visible_status),
+        "calibration: the index refuses a second alternative_of over a readable \
+         pair; got {visible_status}: {visible_body}"
+    );
+    let (hidden_status, hidden_body) =
+        post_json(addr, "/api/v1/edges", &stranger_token, &body(a, b)).await;
+
+    assert_eq!(
+        (hidden_status, hidden_body.as_str()),
+        (visible_status, visible_body.as_str()),
+        "a symmetric-index collision with an edge the caller cannot read must \
+         answer exactly as one with an edge it can"
+    );
+    for secret in [hidden.to_string(), marker.clone(), group.to_string()] {
+        assert!(
+            !hidden_body.contains(&secret),
+            "the refusal names the invisible edge ({secret}): {hidden_body}"
+        );
+    }
 
     let _ = shutdown.send(());
 }

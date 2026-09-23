@@ -165,8 +165,11 @@ pub async fn do_link_epistemic(
         )));
     }
 
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
+    // Viewer-scoped probe: an existing edge the caller cannot read is treated
+    // as absent, and its id is never returned (plan §8.5, acceptance item 21).
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_for_viewer(
         pool,
+        viewer,
         source_id,
         "claim",
         target_id,
