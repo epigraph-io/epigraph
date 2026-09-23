@@ -234,9 +234,32 @@ Current reservation:
   `100` was: it has never been applied to a deployed database — production is at
   59.
 
-- **102+**: public next
+- **102**: public `operator_link` — operator-scoped ownership. Two `SECURITY
+  DEFINER` functions and nothing else: `epigraph_link_operator(agent, operator)`
+  records `agent --OPERATED_BY--> operator` plus a `writer` membership for the
+  agent in the operator's personal group (EXECUTE: `epigraph_maintenance` only —
+  revoked from `PUBLIC` and from `epigraph_app`), and
+  `epigraph_operator_of(agent)` is the read the authoring and ownership paths
+  use (EXECUTE: `epigraph_app`), so neither depends on a stamped session. The
+  link is recorded once: the membership is inserted only when the roster holds
+  no row of any state for the pair, with `ON CONFLICT DO NOTHING`, so a revoked
+  link is never revived (the #493 shape `epigraph_ensure_personal_group` has is
+  deliberately not reused). Pinned by
+  `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted` and
+  `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`; behaviour in
+  `epigraph-db/tests/operator_link.rs`. **Deploy order:** a binary carrying
+  `default_decl_for_author`'s operator lookup fails closed on every claim write
+  against a database without 102, so apply 102 first. Allocated here, not in
+  `093–099`, because this is not one of the obligation batches that block is
+  reserved for. Like `100` and `101` it sits inside internal's `060–112`; see
+  "Version range coordination" above. **No undo runbook ships**: undo is two
+  `DROP FUNCTION IF EXISTS` statements named in the file, together with a binary
+  that no longer calls them. **Applied to a throwaway database only, NOT to any
+  deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `102` or
+- **103+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `103` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

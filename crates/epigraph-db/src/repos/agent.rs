@@ -8,6 +8,34 @@ use sqlx::PgPool;
 use tracing::instrument;
 use uuid::Uuid;
 
+/// One live operator link: the operator's agent id and the id of the
+/// operator's personal group, which owns the operated agent's new claims.
+///
+/// Produced only by [`AgentRepository::operator_links`] /
+/// [`AgentRepository::operator_of`] (migration 102's `epigraph_operator_of`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorLink {
+    pub operator_id: Uuid,
+    pub operator_group_id: Uuid,
+}
+
+/// What one [`AgentRepository::link_operator`] call did, for the startup log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorLinkOutcome {
+    /// The operator's personal group.
+    pub operator_group_id: Uuid,
+    /// This call created the operator's personal group (and seeded the
+    /// operator's own `admin` row in it).
+    pub group_created: bool,
+    /// This call inserted the agent's `writer` membership.
+    pub membership_created: bool,
+    /// The agent's membership is live after the call. `false` means an operator
+    /// revoked it and the call deliberately did not restore it.
+    pub membership_live: bool,
+    /// This call inserted the `OPERATED_BY` edge.
+    pub edge_created: bool,
+}
+
 /// A database row combining agent identity fields with capability flags.
 ///
 /// Uses primitive types (no `epigraph-api` imports) so callers can convert
@@ -1300,6 +1328,148 @@ impl AgentRepository {
                 .await?;
 
         Ok(group_id)
+    }
+
+    /// Every LIVE operator link of `agent_id`, through migration 102's
+    /// `epigraph_operator_of` definer read.
+    ///
+    /// A live link is an in-force `agent --OPERATED_BY--> operator` edge AND a
+    /// live `writer`/`admin` membership for the agent in the operator's
+    /// personal group. The membership half is what stops an HTTP server's
+    /// auth-lineage edges (`EpiGraphMcpFull::record_auth_lineage`, which write
+    /// no membership) from reading as links, and it is what makes a revoked
+    /// membership end the link everywhere at once.
+    ///
+    /// Returned as a list, not collapsed, because the two consumers need
+    /// OPPOSITE answers for the ambiguous case: [`Self::operator_of`] (the
+    /// authoring and ownership paths) treats more than one link as none, and the
+    /// HTTP startup gate treats ANY link as a refusal.
+    ///
+    /// # Why a definer function and not a read of `edges`
+    ///
+    /// On an unstamped `epigraph_app` session `groups_tenancy` and
+    /// `group_memberships_tenancy` hide every row, so an inline read here would
+    /// answer "no operator" on exactly the connections that most need the
+    /// answer, and the caller would fall through to minting. The definer read
+    /// does not depend on the session's stamp.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent (a database that has not
+    /// applied migration 102) or the read fails. Deliberately NOT mapped to
+    /// "no operator": a binary that cannot ask must not author as if the answer
+    /// were no.
+    pub async fn operator_links(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Vec<OperatorLink>, DbError> {
+        let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT operator_id, operator_group_id \
+               FROM public.epigraph_operator_of($1) \
+              ORDER BY operator_id",
+        )
+        .bind(agent_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(operator_id, operator_group_id)| OperatorLink {
+                operator_id,
+                operator_group_id,
+            })
+            .collect())
+    }
+
+    /// The ONE live operator of `agent_id`, or `None`.
+    ///
+    /// More than one live link is ambiguous and collapses to `None` with a
+    /// warning: every consumer of this function either widens authority
+    /// (ownership) or chooses whose group owns a new row (authoring), and in
+    /// both the safe answer to "which operator?" when the graph says two is
+    /// "neither" — i.e. exactly the behaviour an unlinked agent has.
+    /// `epigraph_link_operator` refuses to create a second live link, so this
+    /// is reachable only through out-of-band writes.
+    ///
+    /// # Errors
+    /// As [`Self::operator_links`].
+    pub async fn operator_of(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<OperatorLink>, DbError> {
+        let links = Self::operator_links(conn, agent_id).await?;
+        match links.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(*one)),
+            many => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    links = many.len(),
+                    "agent has more than one live operator link; treating it as unoperated \
+                     (authoring into its own personal group, no operator ownership arm)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// [`Self::operator_of`] for a caller holding a pool.
+    ///
+    /// # Errors
+    /// As [`Self::operator_of`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn operator_of_pool(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Option<OperatorLink>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::operator_of(&mut conn, agent_id).await
+    }
+
+    /// Record that `agent_id` is operated by `operator_id`, through migration
+    /// 102's `epigraph_link_operator`.
+    ///
+    /// **The caller's connection privilege is the authorization.** The function
+    /// is EXECUTE-able by `epigraph_maintenance` (and superusers) only; on an
+    /// `epigraph_app` connection this returns the database's `42501 permission
+    /// denied` as `DbError::QueryFailed`. It is never skipped or retried on a
+    /// different connection — a declared link the process cannot record must be
+    /// visible, not absent.
+    ///
+    /// Recorded once: an existing membership row of any state for the pair is
+    /// left untouched, so a link an operator revoked stays revoked
+    /// ([`OperatorLinkOutcome::membership_live`] reports `false`). See the
+    /// migration's section 3.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
+    /// self-link, an operator that is itself operated, or an agent already
+    /// linked to a DIFFERENT live operator; the database message names which.
+    pub async fn link_operator(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        operator_id: Uuid,
+    ) -> Result<OperatorLinkOutcome, DbError> {
+        let (operator_group_id, group_created, membership_created, membership_live, edge_created): (
+            Uuid,
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT operator_group_id, group_created, membership_created, membership_live, \
+                    edge_created \
+               FROM public.epigraph_link_operator($1, $2)",
+        )
+        .bind(agent_id)
+        .bind(operator_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(OperatorLinkOutcome {
+            operator_group_id,
+            group_created,
+            membership_created,
+            membership_live,
+            edge_created,
+        })
     }
 
     /// Tier-B projection of one agent, filtered by what `viewer` may see.
