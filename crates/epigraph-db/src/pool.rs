@@ -1116,7 +1116,11 @@ impl ScopedPool {
     ) -> Result<MaintenanceSession<'_>, DbError> {
         let (conn, lease) = self.unscoped_for_maintenance(r).await?;
         let viewer = Viewer::system(&lease, r);
-        Ok(MaintenanceSession::new(conn, viewer))
+        Ok(MaintenanceSession::new(
+            conn,
+            viewer,
+            self.maintenance_inner(),
+        ))
     }
 
     /// The plan §0.5 boot probe: prove session GUCs survive between statements
@@ -1555,6 +1559,9 @@ impl std::ops::DerefMut for MaintenanceConn<'_> {
 pub struct MaintenanceSession<'a> {
     conn: MaintenanceConn<'a>,
     viewer: Viewer,
+    /// The pool `conn` was drawn from: [`ScopedPool::maintenance_inner`] at
+    /// mint time. See [`Self::pool`].
+    pool: &'a PgPool,
 }
 
 impl std::fmt::Debug for MaintenanceSession<'_> {
@@ -1569,8 +1576,8 @@ impl<'a> MaintenanceSession<'a> {
     /// Crate-private, like [`MaintenanceLease::new`]: the only mint is
     /// [`ScopedPool::maintenance_session`], so there is no way to pair an
     /// arbitrary connection with a bypass viewer from outside this crate.
-    pub(crate) fn new(conn: MaintenanceConn<'a>, viewer: Viewer) -> Self {
-        Self { conn, viewer }
+    pub(crate) fn new(conn: MaintenanceConn<'a>, viewer: Viewer, pool: &'a PgPool) -> Self {
+        Self { conn, viewer, pool }
     }
 
     /// The bypass viewer, BY REFERENCE. It cannot outlive this session.
@@ -1588,6 +1595,42 @@ impl<'a> MaintenanceSession<'a> {
     /// call needs. See the type doc for why this is not a `DerefMut`.
     pub fn split(&mut self) -> (&mut PgConnection, &Viewer) {
         (&mut self.conn.0, &self.viewer)
+    }
+
+    /// The pool this session's connection was drawn from — the attached
+    /// maintenance pool, or the application pool when none was attached, i.e.
+    /// exactly [`ScopedPool::maintenance_inner`] at mint time.
+    ///
+    /// # Why this exists
+    ///
+    /// For a callee that still takes `&PgPool` rather than a connection. The
+    /// retraction cascade and the cached-belief recompute in `epigraph-engine`
+    /// are such callees, and each fans out to a dozen repo functions that
+    /// borrow their own pooled connection per statement; converting that whole
+    /// tree to `&mut PgConnection` is a separate refactor. Before this accessor
+    /// the only pool a holder of a session could hand them was one it got from
+    /// somewhere else — which, in `epigraph-mcp`, was the application pool: the
+    /// privileged-viewer/ordinary-pool hybrid `no_hybrid_bypass_spend.rs`
+    /// exists to catch, and a silent zero-row no-op under row security.
+    ///
+    /// Returning the pool the session was drawn from makes "the viewer is spent
+    /// on a connection as privileged as its own" a property of where the
+    /// handle came from rather than a call-site convention. It is privileged
+    /// exactly when this session's own connection is, which is what
+    /// [`assert_maintenance_privilege`] vets at process start.
+    ///
+    /// # The cost, stated
+    ///
+    /// A statement run here is a SECOND checkout from the pool that already
+    /// holds this session's pinned connection. A caller that uses it while
+    /// holding the session needs two connections from that pool at once; a
+    /// process running N such callers concurrently needs the pool sized for
+    /// it, or N pinned sessions can exhaust the pool and every transient
+    /// checkout waits out the acquire timeout. `epigraph_mcp::maintenance`
+    /// bounds its callers for exactly this reason.
+    #[must_use]
+    pub const fn pool(&self) -> &'a PgPool {
+        self.pool
     }
 }
 
