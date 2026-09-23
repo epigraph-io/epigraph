@@ -109,8 +109,10 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "`update_with_evidence`'s evidence INSERT. Stamped in an earlier revision of this branch \
          and DELIBERATELY REVERTED: migration 046's FK from `mass_functions.evidence_id` forces \
          it to commit before the (unconverted) DS wiring can reference it, so stamping it traded \
-         a clean CONFIG-A refusal for a committed orphan, and `Evidence::new` + a no-`ON CONFLICT` \
-         INSERT makes agent retries accumulate rows. Converts with D2, in the commit that can put \
+         a clean CONFIG-A refusal for a committed BBA-less row, and \
+         `evidence_content_hash_claim_unique` then refuses the identical re-submission that could \
+         land it later (identical retries are refused, not accumulated; only re-worded ones add \
+         rows). Converts with D2, in the commit that can put \
          evidence -> BBA -> truth -> labels in one unit.",
     ),
     (
@@ -302,9 +304,10 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          MEASURED as `epigraph_app` (`rolbypassrls = false`) via `scripts/e2e/probe-workflow.sh`, \
          on a flat workflow claim in the server agent's OWN group: stamped leaves \
          `evidence_rows=1` and then fails at `claim_frames`; unstamped leaves `evidence_rows=0` \
-         and fails at `evidence`; CONFIG B is `evidence_rows=1` either way. `Evidence::new` mints \
-         a fresh id and `create` has no `ON CONFLICT`, so the committed orphan also accumulates \
-         per retry. Converts with D2.",
+         and fails at `evidence`; CONFIG B is `evidence_rows=1` either way. An IDENTICAL retry \
+         does not add a row (`evidence_content_hash_claim_unique` refuses it, the hash being over \
+         a deterministic serialization of the arguments); only a retry with different arguments \
+         does. Converts with D2.",
     ),
     (
         "tools/workflows.rs",

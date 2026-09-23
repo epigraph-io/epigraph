@@ -894,22 +894,31 @@ pub async fn update_with_evidence(
     //   nothing; stamped commits the evidence row and then drops the wire at
     //   `claim_frames`.
     //
-    // So the stamp buys nothing on either configuration today, and on CONFIG A it
-    // converts a clean refusal into a committed row whose BBA never lands.
+    // So on CONFIG B the stamp changes nothing, and on CONFIG A it converts a
+    // clean refusal into a committed evidence row whose BBA never lands.
     //
-    // ONE PREMISE OF THIS ARGUMENT WEAKENED WHEN THE DS WIRING BELOW BECAME
-    // BEST-EFFORT, and it is recorded here rather than quietly acted on. The
-    // earlier form of the argument leant on RETRY AMPLIFICATION: `Evidence::new`
-    // mints a fresh `EvidenceId` (a v4 UUID) and `EvidenceRepository::create` has
-    // NO `ON CONFLICT`, so every agent retry of a call *certain to fail* appended
-    // another evidence row for the same assertion. With the wire best-effort, a
-    // stamped INSERT on CONFIG A would no longer report failure, so there would be
-    // no retry to amplify — the residue would be one evidence row per submission
-    // with `belief_wired: false`, which is exactly CONFIG B's behaviour today.
-    // What survives untouched is the ATOMICITY half: a stamp here would still
-    // commit evidence on its own connection, ahead of the truth/label unit below,
-    // for no gain on either configuration. Re-deciding the stamp is D2's call and
-    // needs its own measurement; this change does not pre-empt it. Its sibling in
+    // THE RETRY-AMPLIFICATION PREMISE THIS ARGUMENT ONCE LEANT ON WAS WRONG, and
+    // it is corrected here rather than left standing. An earlier form said
+    // `Evidence::new` mints a fresh v4 `EvidenceId` and `EvidenceRepository::
+    // create` has no `ON CONFLICT`, "so every agent retry … appended another
+    // evidence row for the same assertion". An IDENTICAL retry never appends:
+    // `content_hash` is `blake3(evidence_data)` and migration 001's
+    // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+    // refuses it ("Duplicate entity already exists"). Only a RE-WORDED retry
+    // adds a row. Both are measured in
+    // `tests/update_with_evidence_ds_wiring_is_best_effort.rs`.
+    //
+    // THE CONCLUSION STILL HOLDS WITHOUT THAT PREMISE, and that same constraint
+    // makes it stronger. With the wire best-effort, a stamped INSERT on CONFIG A
+    // would let the call succeed: evidence attached, `belief_wired: false`,
+    // `bba_stored: false`, labels merged. That is CONFIG B's behaviour today. But
+    // the row it leaves is not just untidy. It is BBA-less, no tool mints a BBA
+    // from an existing evidence row, and the unique constraint refuses the
+    // identical re-submission that would otherwise land the contribution once D2
+    // converts the wire. Left unstamped, CONFIG A writes nothing, so that
+    // re-submission stays open. The atomicity half is unchanged: a stamp here
+    // would still commit evidence on its own connection, ahead of the truth/label
+    // unit below. Re-deciding the stamp is D2's call. Its sibling in
     // `submit_ds_evidence` was KEPT for a different reason — `assign_claim` is
     // `ON CONFLICT … DO UPDATE` and `store_with_perspective` upserts, so a retry
     // there re-states rather than accumulates.
@@ -1063,8 +1072,9 @@ pub async fn update_with_evidence(
     // window — there is nothing after it that can fail with them half-landed. The
     // evidence INSERT is the FIRST write and is followed by an unconverted step
     // that is certain to fail on a clean schema, so stamping it would have
-    // committed a row the call then reports as failed, and retries would
-    // accumulate.
+    // committed a row whose BBA never lands — and which, by
+    // `evidence_content_hash_claim_unique`, then refuses the identical
+    // re-submission that could land it later (see the note above the INSERT).
     //
     // REACHABILITY, RE-MEASURED AFTER THE DS WIRING ABOVE BECAME BEST-EFFORT.
     // It used to be true that "neither reaches execution on either
