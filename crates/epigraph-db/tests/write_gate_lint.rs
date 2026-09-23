@@ -21,9 +21,13 @@
 //!
 //! **Not claimed:** that a write cannot happen without a `Viewer` at all. A repo
 //! function that takes no `&Viewer` and issues an `UPDATE` is caught by this
-//! lint (the scan is keyed on the SQL, not on the signature). Two populations
+//! lint (the scan is keyed on the SQL, not on the signature). Three populations
 //! are not:
 //!
+//! * **Production code after a repo file's first `#[cfg(test)]`.** The scan
+//!   stops there ([`strip_test_modules`]), and `claim.rs` has production code
+//!   past that point today. This is the open finding
+//!   `F-write-gate-lint-stops-at-first-cfg-test`.
 //! * **`INSERT`.** `INSERT ... VALUES` has no `WHERE` clause for a marker to be
 //!   spliced into; insert-side authority can only come from a `WITH CHECK`-shaped
 //!   control on the new row, which is a different mechanism and a different
@@ -314,9 +318,15 @@ fn repo_files() -> Vec<(String, String)> {
 ///
 /// Blunt on purpose. A repo file's test module is conventionally last, and the
 /// alternative — tracking module nesting — would be a second parser to get
-/// wrong. If a file ever puts production code after its tests, this lint
-/// under-measures it, which is why [`the_write_scanner_is_not_vacuous`] pins the
-/// behaviour rather than leaving it implied.
+/// wrong. A file that puts production code after its tests is under-measured.
+///
+/// **That is not hypothetical: `claim.rs` does it today.** Its first
+/// `#[cfg(test)]` (`mod tests`) is followed by four more `impl` blocks, and
+/// four functions with scoped writes in them are measured by no register here.
+/// This is the open finding `F-write-gate-lint-stops-at-first-cfg-test` in
+/// `docs/tenancy/progress.json`, which lists them. Case 8 of
+/// [`the_write_scanner_is_not_vacuous`] pins only the exclusion half (a test
+/// module's cleanup stays out). Nothing pins the under-measurement half.
 fn strip_test_modules(src: &str) -> String {
     match src.find("#[cfg(test)]") {
         Some(at) => src[..at].to_string(),
