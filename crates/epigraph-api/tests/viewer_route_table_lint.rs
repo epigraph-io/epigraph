@@ -534,7 +534,14 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("hypothesis.rs", 1),
     ("policies.rs", 4),
     ("rag.rs", 2),
-    ("reasoning.rs", 2),
+    // `("reasoning.rs", 2)` REMOVED by the deferred-commitment fix recorded on
+    // `F-FAH-A1` (screen key `f-fah-a1-reasoning-analyze`), on the PR-10
+    // precedent in `FAIL_OPEN_SCOPE_SITES`. The two were never handler writes.
+    // They were the `DELETE FROM edges` / `DELETE FROM claims` cleanup of the
+    // file's in-module `#[cfg(all(test, feature = "db"))]` tests. Those tests
+    // moved to `tests/reasoning_scoped_read.rs` when `analyze`'s edge load was
+    // converted onto the caller's `Viewer`, because the converted handler
+    // refuses the `ScopedPool`-less state they built.
     ("revoke_signature.rs", 1),
     // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
     ("submit.rs", 4),

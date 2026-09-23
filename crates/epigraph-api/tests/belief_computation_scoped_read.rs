@@ -1,8 +1,9 @@
 //! `routes/belief.rs`'s fourteen read-only handlers and `routes/computation.rs`'s
 //! four each serve every statement of their request on ONE viewer-stamped
 //! connection, and every read that has a viewer to spend suppresses on it.
-//! So does `computation.rs::compose_subgraphs`, converted later (see the last
-//! section of this file).
+//! So does `computation.rs::compose_subgraphs`, converted later, and so does
+//! `reasoning.rs::analyze`'s edge load (see the last two sections of this
+//! file).
 //!
 //! # What this file is, in the series
 //!
@@ -55,6 +56,7 @@
 //! | `belief.rs::get_frame` | `FrameRepository::get_by_id`, `::get_claims_in_frame` | [`get_frame_serves_a_group_private_frame_to_its_own_group`] |
 //! | `computation.rs::belief_at_time` | `ClaimRepository::get_by_id`, `EvidenceRepository::provided_for_claim_as_of` | [`belief_at_time_replays_only_the_evidence_the_viewer_can_see`] |
 //! | `computation.rs::compose_subgraphs` (not shard 4's; `F-SHARD4-A1`) | `SheafRepository::epistemic_neighborhood_ids` (x2), `ClaimRepository::pignistic_probs_for` | [`compose_subgraphs_composes_over_the_viewers_own_private_claim`], [`compose_subgraphs_is_404_for_a_center_the_viewer_cannot_read`] |
+//! | `reasoning.rs::analyze` (not shard 4's; `F-FAH-A1`) | `EdgeRepository::claim_edges_for_reasoning` | [`reasoning_analyze_loads_the_viewers_own_private_edge`] |
 //!
 //! # What IS and is NOT proven here
 //!
@@ -654,5 +656,80 @@ async fn compose_subgraphs_refuses_without_a_scoped_pool(pool: PgPool) {
         matches!(&got, Err(ApiError::InternalError { .. })),
         "with no ScopedPool the handler must refuse, not read the raw pool; got {:?}",
         got.map(|j| j.0)
+    );
+}
+
+// ── reasoning.rs::analyze (F-FAH-A1) ──
+//
+// Not shard 4's route either: deferred-commitment screen key
+// `f-fah-a1-reasoning-analyze` converted its edge auto-load. It lives here for
+// the reason the compose arms do: this file's `split_state` is the instrument
+// it needs, and another hand-copy of that body would worsen
+// `F-PR28-viewer-fixture-duplication`. The handler's predicate arms and its
+// HTTP arm are in `reasoning_scoped_read.rs`, whose fixture cannot see a
+// reversion to the raw pool.
+
+/// `POST /api/v1/reasoning/analyze` with no edges sent: the owner's own
+/// group-private edge is loaded on the stamped connection.
+///
+/// The over-suppression direction is the one that catches a reversion to the
+/// raw pool. `split_state`'s raw pool is `epigraph_app` and unstamped, so the
+/// edge load there loses the owner's private edge and the analysis is a 200
+/// with no edges. That was the handler's behavior under an RLS-forced
+/// application role before the fix.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reasoning_analyze_loads_the_viewers_own_private_edge(pool: PgPool) {
+    use epigraph_api::routes::reasoning::{analyze, AnalyzeRequest};
+
+    let (owner, group) = seed_agent_with_group(&pool, "fah-a1-reasoning").await;
+    let x = seed_group_claim(&pool, owner, group, "fah-a1 reasoning: private x").await;
+    let y = seed_group_claim(&pool, owner, group, "fah-a1 reasoning: private y").await;
+    seed_edge(&pool, x, y).await;
+    let state = split_state(&pool).await;
+
+    let request = || {
+        Json(AnalyzeRequest {
+            claim_ids: Some(vec![x, y]),
+            edges: vec![],
+            min_similarity: None,
+            link_threshold: None,
+            decay_factor: None,
+            propagation_depth: None,
+            transitive_support_threshold: None,
+            contradiction_threshold: None,
+        })
+    };
+
+    let mine = analyze(
+        ViewerExtractor(viewer_for(&pool, owner).await),
+        State(state.clone()),
+        request(),
+    )
+    .await
+    .expect("the owner must be served on the stamped connection")
+    .0;
+    assert_eq!(
+        mine.stats.edges_loaded, 1,
+        "the owner's own private edge must be loaded. 0 here is the unstamped-session \
+         signature: the load ran on a connection the policies filter"
+    );
+    assert!(
+        mine.transitive_supports
+            .iter()
+            .any(|ts| ts.source_id == x.to_string() && ts.target_id == y.to_string()),
+        "the loaded edge must reach the engine as a transitive support x -> y"
+    );
+
+    let theirs = analyze(
+        ViewerExtractor(public_viewer(&pool).await),
+        State(state),
+        request(),
+    )
+    .await
+    .expect("a stranger is served, with nothing it cannot read")
+    .0;
+    assert_eq!(
+        theirs.stats.edges_loaded, 0,
+        "a stranger naming the owner's private claims must load no edge"
     );
 }

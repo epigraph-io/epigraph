@@ -120,9 +120,9 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 268 is not 0 — and no shard in the series may be
+//!      discharged the gate — 267 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 148 of the 416 sites the series began with are gone — 113
+//!      decision: 149 of the 416 sites the series began with are gone — 113
 //!      converted by the shards, 3 REMOVED outright when `routes/claims.rs`'s
 //!      `group_id` membership gates stopped reading `group_memberships` through
 //!      the raw pool, 4 moved onto `ScopedPool::begin_as` when
@@ -133,13 +133,15 @@
 //!      `routes/computation.rs::propagate_beliefs` was converted as a whole
 //!      handler (F-SHARD4-A2), 3 more moved onto `AppState::read_as` when
 //!      `routes/computation.rs::compose_subgraphs` was converted as a whole
-//!      handler (F-SHARD4-A1), and 14 went with the
+//!      handler (F-SHARD4-A1), 1 more moved onto `AppState::read_as` when
+//!      `routes/reasoning.rs::analyze`'s edge load was converted (F-FAH-A1),
+//!      and 14 went with the
 //!      F-inline-claim-content-reads discharge — 12 moved onto
 //!      `AppState::read_as` (`routes/embeddings.rs` 2, `routes/conflicts.rs`
 //!      3, `routes/policies.rs` 2, `routes/political.rs` 1,
 //!      `routes/workflows.rs` 4), 1 moved onto a maintenance session
 //!      (`routes/clusters.rs::build_from_bridges`) and 1 removed outright
-//!      (`report_outcome`'s redundant content re-read) — and 268 are not.
+//!      (`report_outcome`'s redundant content re-read) — and 267 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -579,7 +581,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 268;
+const HIGH_WATER: usize = 267;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -667,11 +669,23 @@ const HIGH_WATER: usize = 268;
 /// ("routes/computation.rs: recorded 3 site(s), measured NONE") and off this
 /// test's own failures with both constants temporarily set to 1
 /// ("268 unexempted sites", "41 unexempted files").
-const HIGH_WATER_FILES: usize = 41;
+///
+/// The `reasoning::analyze` conversion (deferred-commitment screen key
+/// `f-fah-a1-reasoning-analyze`, recorded on `F-FAH-A1`) moves BOTH integers:
+/// `routes/reasoning.rs` 1 -> NONE, so its key is deleted. The one site was
+/// `load_edges_from_db`'s `let pool = &state.db_pool;`, which fed two inline
+/// edge reads. They are now `EdgeRepository::claim_edges_for_reasoning` on ONE
+/// `AppState::read_as` connection. `HIGH_WATER` went 268 -> 267 and this
+/// constant 41 -> 40, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// ("routes/reasoning.rs: recorded 1 site(s), measured NONE") and off this
+/// test's own failures with both constants temporarily set to 1
+/// ("267 unexempted sites", "40 unexempted files").
+const HIGH_WATER_FILES: usize = 40;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 268 sites across 41 files as of this commit. Lower an entry when a shard
+/// 267 sites across 40 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -882,7 +896,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/political.rs", 4),
     ("routes/provenance.rs", 1),
     ("routes/rag.rs", 2),
-    ("routes/reasoning.rs", 1),
+    // `routes/reasoning.rs` was 1 and is GONE, not zeroed: the
+    // deferred-commitment fix recorded on `F-FAH-A1` (screen key
+    // `f-fah-a1-reasoning-analyze`) moved `analyze`'s edge auto-load onto ONE
+    // `AppState::read_as` connection. Its two inline statements are now
+    // `EdgeRepository::claim_edges_for_reasoning`, which is viewer-filtered on
+    // the edge and both endpoints and drops retracted edges.
     ("routes/revoke_signature.rs", 1),
     // `routes/search.rs` was 6 and is GONE, not zeroed: PR-29, conversion shard
     // 3. Two of the six were inline `sqlx::query*` statements in the handler
