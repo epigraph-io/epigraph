@@ -63,7 +63,7 @@
 //!   fails at its `belief_wired == true` assertion. That arm exists so the flag
 //!   cannot be satisfied by a constant.
 //!
-//! Restoring the change returns the file to `2 passed`.
+//! Restoring the change returns both of those arms to passing.
 //!
 //! # `bba_stored` — which failure it was
 //!
@@ -459,5 +459,116 @@ async fn a_late_step_drop_reports_the_bba_it_already_stored(pool: PgPool) {
     assert!(
         labels.contains(&"run-tag-late".to_string()),
         "got {labels:?}"
+    );
+}
+
+/// The recovery a first-step drop does NOT have, pinned so the documented
+/// guidance cannot drift back to prescribing it.
+///
+/// After a first-step drop the evidence row is committed with no BBA. Once the
+/// wire works again, re-submitting the SAME `evidence_data` is refused —
+/// `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+/// (migration 001), with `content_hash = blake3(evidence_data)` — so the
+/// orphaned row blocks the obvious retry. A RE-WORDED submission is admitted,
+/// but it is a second evidence row for the same assertion, and the original row
+/// still has no BBA.
+#[sqlx::test(migrations = "../../migrations")]
+async fn after_a_first_step_drop_an_identical_resubmit_is_refused_and_a_reworded_one_adds_a_row(
+    pool: PgPool,
+) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let claim_id = seed_claim_with_labels(&pool, "claim whose first wire drops", &[]).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let params = |data: &str| UpdateWithEvidenceParams {
+        canonical_name: None,
+        step_index: None,
+        claim_id: claim_id.to_string(),
+        evidence_type: "empirical".into(),
+        evidence_data: data.into(),
+        source_url: None,
+        supports: true,
+        strength: 0.7,
+        labels: vec![],
+    };
+    let evidence_on_claim = || async {
+        let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM evidence WHERE claim_id = $1")
+            .bind(claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count evidence");
+        n
+    };
+
+    deny_all_writes_to_claim_frames(&pool).await;
+    let first = json_of(
+        epigraph_mcp::tools::claims::update_with_evidence(
+            &server,
+            &viewer,
+            params("The assertion, first wording."),
+        )
+        .await
+        .expect("first-step drop is best-effort"),
+    );
+    assert_eq!(first["bba_stored"], serde_json::json!(false), "got {first}");
+    let original: uuid::Uuid = first["evidence_id"]
+        .as_str()
+        .expect("evidence_id")
+        .parse()
+        .expect("uuid");
+
+    // "The wiring is converted": the injector goes away.
+    sqlx::query("ALTER TABLE claim_frames DROP CONSTRAINT ds_wiring_denied_for_test")
+        .execute(&pool)
+        .await
+        .expect("drop the injector");
+
+    let identical = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        params("The assertion, first wording."),
+    )
+    .await;
+    let refusal = identical.expect_err(
+        "an identical re-submit must be refused by evidence_content_hash_claim_unique — if this \
+         now succeeds, the recovery guidance in UpdateResponse::bba_stored is stale",
+    );
+    assert!(
+        refusal.message.contains("Duplicate"),
+        "refused as a duplicate, not for some other reason; got {refusal:?}"
+    );
+    assert_eq!(
+        evidence_on_claim().await,
+        1,
+        "the refused re-submit wrote no row"
+    );
+
+    let reworded = json_of(
+        epigraph_mcp::tools::claims::update_with_evidence(
+            &server,
+            &viewer,
+            params("The assertion, second wording."),
+        )
+        .await
+        .expect("a re-worded submission is admitted"),
+    );
+    assert_eq!(
+        reworded["belief_wired"],
+        serde_json::json!(true),
+        "got {reworded}"
+    );
+    assert_eq!(
+        evidence_on_claim().await,
+        2,
+        "a re-worded re-submit is a SECOND evidence row for the same assertion"
+    );
+    let (original_bbas,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM mass_functions WHERE evidence_id = $1")
+            .bind(original)
+            .fetch_one(&pool)
+            .await
+            .expect("count the original row's BBAs");
+    assert_eq!(
+        original_bbas, 0,
+        "the original evidence row stays BBA-less: nothing mints one from an existing row"
     );
 }

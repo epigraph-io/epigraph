@@ -970,22 +970,32 @@ pub async fn update_with_evidence(
     // evidence is already committed either way, and the only difference is
     // whether the agent can proceed.
     //
-    // RECOVERY PATH, AND ITS LIMIT. The out-of-band repair for a claim's cached
-    // belief is `epigraph-cli recompute_claim_belief` (claim ids on a file or
-    // `--stdin`), which draws its connection from `MaintenancePool::connect` and
-    // so is not bound by this tool's pool; it is idempotent. It is specifically
-    // NOT the `recompute_beliefs` MCP tool — that one is hard-disabled by
-    // `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection()
-    // -> false` and refuses by construction, so naming it as the remedy would
-    // send an operator at a door that is welded shut. BUT `recompute_claim_belief`
-    // recomputes FROM THE CLAIM'S STORED `mass_functions`; it does not mint a BBA
-    // from an `evidence` row. So it repairs a wire that dropped at a LATE step
-    // (BBA stored, cached belief not updated). A wire that dropped at the FIRST
-    // step — production's `claim_frames` refusal — stored no BBA for this
-    // evidence, and no existing tool re-derives one from the evidence row; that
-    // contribution lands only once the wiring is converted and the evidence is
-    // re-submitted. The `evidence_id` in the response is what makes those rows
-    // findable for that.
+    // RECOVERY PATH, AND ITS LIMIT — which of the two applies is `bba_stored`.
+    //
+    // * BBA stored, late step failed: the operator binary
+    //   `recompute_claim_belief` (a `[[bin]]` in the `epigraph-cli` package —
+    //   `cargo run -p epigraph-cli --bin recompute_claim_belief -- --stdin` — not
+    //   an `epigraph-cli` subcommand) draws its connection from
+    //   `MaintenancePool::connect`, so it is not bound by this tool's pool, and
+    //   recomputes the cached DS columns per frame from the claim's STORED
+    //   `mass_functions`. It writes no `truth_value`
+    //   (`MassFunctionRepository::update_claim_belief` sets only the DS
+    //   columns), so `claims.truth_value` stays stale until the next successful
+    //   wire on the claim. It is specifically NOT the `recompute_beliefs` MCP
+    //   tool — that one is hard-disabled by
+    //   `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection()
+    //   -> false` and refuses by construction, so naming it as the remedy would
+    //   send an operator at a door that is welded shut.
+    // * No BBA stored, first step failed — production's `claim_frames` refusal:
+    //   there is nothing for that binary to recompute from, and no existing tool
+    //   mints a BBA from an `evidence` row. Re-submitting is NOT a recovery: an
+    //   identical re-submit is refused by `evidence_content_hash_claim_unique
+    //   UNIQUE (content_hash, claim_id)` (the hash is over `evidence_data`), so
+    //   the BBA-less row blocks it; a re-worded one is admitted as a SECOND
+    //   evidence row for the same assertion, leaving the original BBA-less. Both
+    //   measured in `update_with_evidence_ds_wiring_is_best_effort.rs`. The
+    //   `evidence_id` in the response is the handle for a future
+    //   BBA-from-evidence repair, and for de-duplicating the original row.
     //
     // AND IT IS DISCLOSED, NOT SWALLOWED. Returning bare success here would be
     // the silent-failure mode this codebase has been bitten by repeatedly, so the

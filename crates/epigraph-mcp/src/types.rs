@@ -1298,14 +1298,31 @@ pub struct UpdateResponse {
     /// on the prod-faithful e2e configuration as `claim_frames=0
     /// mass_functions=0` after the call.
     ///
-    /// Out-of-band repair of the cached belief is `epigraph-cli
-    /// recompute_claim_belief` (which runs on `MaintenancePool::connect`, not on
-    /// this tool's pool) — **not** the `recompute_beliefs` MCP tool, which
-    /// `maintenance_tools_run_on_the_maintenance_connection() -> false` refuses
-    /// by construction. `recompute_claim_belief` recomputes from the claim's
-    /// STORED mass functions, so it cannot restore a BBA that was never stored
-    /// (the first-step failure above); that contribution needs the evidence
-    /// re-submitted once the DS wiring is converted.
+    /// Recovery depends on [`Self::bba_stored`]:
+    ///
+    /// * **`bba_stored: true`** (late-step drop). The operator binary
+    ///   `recompute_claim_belief` — a separate `[[bin]]` in the `epigraph-cli`
+    ///   package, not a subcommand: `cargo run -p epigraph-cli --bin
+    ///   recompute_claim_belief -- --stdin` with claim ids on stdin — draws its
+    ///   connection from `MaintenancePool::connect` rather than this tool's pool,
+    ///   and recomputes the cached DS columns (`belief`, `plausibility`,
+    ///   `pignistic_prob`, conflict / missing mass) from the claim's stored mass
+    ///   functions, frame by frame. It does **not** write `claims.truth_value`,
+    ///   which stays stale until the next successful `update_with_evidence` on
+    ///   the claim. It is **not** the `recompute_beliefs` MCP tool, which
+    ///   `maintenance_tools_run_on_the_maintenance_connection() -> false` refuses
+    ///   by construction.
+    /// * **`bba_stored: false`** (first-step drop — the current production
+    ///   case). No BBA exists, so `recompute_claim_belief` repairs nothing, and no
+    ///   existing tool mints a BBA from an existing evidence row. Re-submitting is
+    ///   NOT a recovery. An identical re-submit (same `evidence_data` on the same
+    ///   claim) is refused as a duplicate by `evidence_content_hash_claim_unique
+    ///   UNIQUE (content_hash, claim_id)`, where `content_hash =
+    ///   blake3(evidence_data)`. A re-worded one is admitted, but it adds a SECOND
+    ///   evidence row for the same assertion, and the original row still has no
+    ///   BBA. The reported `evidence_id` identifies the BBA-less row, both for a
+    ///   future BBA-from-evidence repair and for de-duplicating it if the
+    ///   assertion is later re-submitted in other words.
     ///
     /// Same disclosure contract as [`LinkEpistemicResponse::belief_wired`]: the
     /// call succeeded, and the caller is told exactly which half of it did.
