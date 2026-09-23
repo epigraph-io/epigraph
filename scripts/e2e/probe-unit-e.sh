@@ -138,6 +138,31 @@ if [ -n "$C1" ] && [ -n "$C2" ]; then
 fi
 
 echo
+echo "=== REGISTER: alias-bound edge writes still on the unstamped pool (own PUBLIC claims) ==="
+# residual_unstamped_writes.rs now follows `let pool = &server.pool;` bindings,
+# which surfaced these. They are registered, not converted; this arm is the
+# measurement their register reasons cite.
+S4=$(tool submit_claim '{"content":"Unit E register probe parent","methodology":"extraction","evidence_data":"probe","evidence_type":"empirical","confidence":0.7,"novelty_threshold":0.0}')
+S5=$(tool submit_claim '{"content":"Unit E register probe child","methodology":"extraction","evidence_data":"probe","evidence_type":"empirical","confidence":0.7,"novelty_threshold":0.0}')
+C4=$(uuid_of "$S4" claim_id); C5=$(uuid_of "$S5" claim_id)
+if [ -n "$C4" ] && [ -n "$C5" ]; then
+  R=$(tool link_hierarchical "{\"source_claim_id\":\"$C4\",\"target_claim_id\":\"$C5\",\"relationship\":\"decomposes_to\"}")
+  echo "   link_hierarchical: $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,160}' | head -1)"
+  R=$(tool link_alternative "{\"claim_a\":\"$C4\",\"claim_b\":\"$C5\"}")
+  echo "   link_alternative:  $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,160}' | head -1)"
+  EID=$(q "SELECT id FROM edges WHERE source_id='$C4' AND target_id='$C5' AND relationship='decomposes_to' LIMIT 1")
+  R=$(tool patch_edge "{\"edge_id\":\"$EID\",\"properties\":{\"probe\":true}}")
+  echo "   patch_edge:        $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,160}' | head -1)"
+  R=$(tool delete_edge "{\"edge_id\":\"$EID\"}")
+  echo "   delete_edge:       $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,160}' | head -1)"
+  q "SELECT '   edges: decomposes_to='||(SELECT count(*) FROM edges WHERE source_id='$C4' AND relationship='decomposes_to')
+          ||' in_force='||(SELECT count(*) FROM edges WHERE source_id='$C4' AND relationship='decomposes_to' AND valid_to IS NULL)
+          ||' patched='||(SELECT count(*) FROM edges WHERE id='$EID' AND properties ? 'probe')
+          ||' alternative_of='||(SELECT count(*) FROM edges WHERE relationship='alternative_of' AND (source_id IN ('$C4','$C5')))
+          ||' owners='||COALESCE((SELECT string_agg(DISTINCT owner_group_id::text||'/'||visibility, ',') FROM edges WHERE source_id IN ('$C4','$C5') AND relationship IN ('decomposes_to','alternative_of')),'-')"
+fi
+
+echo
 echo "=== E1: consolidate_claims (the two claims above, both the server agent's own) ==="
 if [ -n "${C1:-}" ] && [ -n "${C2:-}" ]; then
   R=$(tool consolidate_claims "{\"source_claim_ids\":[\"$C1\",\"$C2\"],\"merged_content\":\"Unit E probe merged claim\",\"mode\":\"merge\",\"reason\":\"probe\"}")
@@ -180,7 +205,71 @@ sleep 2
 q "SELECT '   papers='||(SELECT count(*) FROM papers WHERE doi='$DOI')
         ||' doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI' = ANY(labels))
         ||' asserts_edges='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI' AND e.relationship='asserts')
-        ||' atom_bbas='||(SELECT count(*) FROM mass_functions m JOIN claims c ON c.id=m.claim_id WHERE c.content LIKE 'The % unit E probe atom')"
+        ||' atom_bbas='||(SELECT count(*) FROM mass_functions m JOIN claims c ON c.id=m.claim_id WHERE c.content LIKE 'The % unit E probe atom')
+        ||' traces='||(SELECT count(*) FROM reasoning_traces t JOIN claims c ON c.trace_id=t.id WHERE 'doi:$DOI' = ANY(c.labels))
+        ||' processed_by='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI' AND e.relationship='processed_by')"
+
+pb() { q "SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$1' AND e.relationship='processed_by'"; }
+settle() {  # $1 = doi: wait for the detached task to write processed_by, or give up
+  for _ in $(seq 1 20); do [ "$(pb "$1")" -ge 1 ] && break; sleep 1; done; sleep 1
+}
+
+echo "--- re-ingest of the SAME document: must converge, not accumulate ---"
+R=$(tool ingest_document_inline "{\"extraction\":$DOC}")
+sleep 4
+q "SELECT '   doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI' = ANY(labels))
+        ||' traces='||(SELECT count(*) FROM reasoning_traces t JOIN claims c ON c.trace_id=t.id WHERE 'doi:$DOI' = ANY(c.labels))
+        ||' evidence='||(SELECT count(*) FROM evidence ev JOIN claims c ON c.id=ev.claim_id WHERE 'doi:$DOI' = ANY(c.labels))
+        ||' processed_by='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI' AND e.relationship='processed_by')"
+
+echo "--- CONVERGED ATOM owned by ANOTHER group (the workflow ingest's operation atom) ---"
+# Atoms are content-addressed: this document's first atom has the same text as
+# an operation atom the ingest_workflow arm above wrote, owned by the
+# workflow-ingest-system agent's group. The ingest resolves to that row and must
+# still land the rest of the document.
+DOI3="10.9999/unit-e-conv-$LABEL"
+DOC3='{"source":{"title":"Unit E convergence paper","doi":"'"$DOI3"'","source_type":"Paper","authors":[]},"thesis":"Unit E convergence thesis","thesis_derivation":"TopDown","sections":[{"title":"Convergence section","paragraphs":[{"text":"The convergence paragraph","atoms":["Write the operation atom claims","A fresh unit E atom beside a converged one"],"generality":[3,3],"confidence":0.8}]}],"relationships":[]}'
+q "SELECT '   converged atom before: owner='||COALESCE((SELECT owner_group_id::text FROM claims WHERE content='Write the operation atom claims'),'absent')"
+R=$(tool ingest_document_inline "{\"extraction\":$DOC3}")
+echo "$R" | tail -c 200; echo
+settle "$DOI3"
+q "SELECT '   processed_by='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI3' AND e.relationship='processed_by')
+        ||' doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI3' = ANY(labels))
+        ||' fresh_atom='||(SELECT count(*) FROM claims WHERE content='A fresh unit E atom beside a converged one')
+        ||' asserts_to_converged='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id JOIN claims c ON c.id=e.target_id
+                                      WHERE p.doi='$DOI3' AND e.relationship='asserts' AND c.content='Write the operation atom claims')"
+
+echo
+echo "=== E1: ingest_document_spine (synchronous phase 1 of the two-phase flow) ==="
+DOI4="10.9999/unit-e-spine-$LABEL"
+DOC4='{"source":{"title":"Unit E spine paper","doi":"'"$DOI4"'","source_type":"Paper","authors":[{"name":"Spine Author","affiliations":[],"roles":["author"]}]},"thesis":"Unit E spine thesis","thesis_derivation":"TopDown","sections":[{"title":"Spine section","paragraphs":[{"text":"The unit E spine paragraph","atoms":[],"generality":[],"confidence":0.8}]}],"relationships":[]}'
+R=$(tool ingest_document_spine "{\"extraction\":$DOC4}")
+echo "$R" | tail -c 300; echo
+q "SELECT '   spine_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI4' = ANY(labels))
+        ||' processed_by='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.source_id WHERE p.doi='$DOI4' AND e.relationship='processed_by')
+        ||' authored='||(SELECT count(*) FROM edges e JOIN papers p ON p.id=e.target_id WHERE p.doi='$DOI4' AND e.relationship='authored')"
+
+echo
+echo "=== E1 PREFLIGHT: a detached ingest the author cannot write must be refused SYNCHRONOUSLY ==="
+# ingest_document runs detached, so a refusal inside the task reaches no caller.
+# With the server agent's memberships revoked, the synchronous preflight must
+# return an error and write NOTHING — not even the papers row — instead of
+# answering "queued" over a task that cannot write.
+MA=$(q "SELECT agent_id FROM claims WHERE content='Unit E register probe parent' LIMIT 1")
+if [ -n "$MA" ]; then
+  DOI5="10.9999/unit-e-preflight-$LABEL"
+  DOC5='{"source":{"title":"Unit E preflight paper","doi":"'"$DOI5"'","source_type":"Paper","authors":[]},"thesis":"Unit E preflight thesis","thesis_derivation":"TopDown","sections":[{"title":"Preflight section","paragraphs":[{"text":"The preflight paragraph","atoms":["The unit E preflight atom"],"generality":[3],"confidence":0.8}]}],"relationships":[]}'
+  q "UPDATE group_memberships SET revoked_at = now() WHERE agent_id = '$MA' AND revoked_at IS NULL" >/dev/null
+  R=$(tool ingest_document_inline "{\"extraction\":$DOC5}")
+  echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,200}' | head -1 | sed 's/^/   /'
+  sleep 3
+  q "SELECT '   papers='||(SELECT count(*) FROM papers WHERE doi='$DOI5')
+          ||' doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI5' = ANY(labels))
+          ||' membership='||(SELECT 'live='||count(*) FILTER (WHERE revoked_at IS NULL)||' revoked='||count(*) FILTER (WHERE revoked_at IS NOT NULL) FROM group_memberships WHERE agent_id='$MA')"
+  q "UPDATE group_memberships SET revoked_at = NULL WHERE agent_id = '$MA'" >/dev/null
+else
+  echo "   SKIP: could not identify the server's own agent"
+fi
 
 echo
 echo "=== E1 REVOKED: hard constraint #3 — a revoked ingest-system membership must NOT be revived ==="

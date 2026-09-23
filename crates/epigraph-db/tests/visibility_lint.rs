@@ -1046,6 +1046,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_conn",
+        "WRITE. `ClaimRepository::create`'s body on a caller's connection, so `ingest_document`'s \
+         content-addressed atoms ride the document walk's stamped transaction. Its \
+         `content_hash` dedup probe is the existing VISIBILITY-EXEMPT write-path read; the \
+         INSERT is authorised by claims_tenancy's WITH CHECK, and the `claim.created` event rides \
+         `publish_or_log_conn`'s SAVEPOINT.",
+    ),
+    (
+        "claim.rs",
+        "set_properties_conn",
+        "WRITE. `UPDATE claims SET properties` by primary key on a claim the same transaction \
+         just created — the ingest walk's hierarchy metadata. Authorised by claims_tenancy's \
+         WITH CHECK; `rows_affected() == 0` stays an error, which on a stamped connection is \
+         what keeps a USING-hidden target from reading as success.",
+    ),
+    (
+        "claim.rs",
         "create_with_id_if_absent_conn",
         "WRITE. `INSERT INTO claims ... ON CONFLICT (id) DO NOTHING` for the ingest paths' \
          deterministic ids, plus the SAVEPOINT-wrapped `claim.created` event. Same argument as \

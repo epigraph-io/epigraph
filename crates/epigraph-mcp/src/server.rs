@@ -41,6 +41,14 @@ pub struct EpiGraphMcpFull {
     /// `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection`
     /// for why that gate deliberately does not key on this field.
     pub(crate) scoped: Option<epigraph_db::ScopedPool>,
+    /// `Some(reason)` when the caller DECLARED that `pool` is a privileged
+    /// (BYPASSRLS) maintenance pool — set only through
+    /// [`Self::on_a_privileged_pool`]. The operator `ingest-document` CLI runs
+    /// its whole ingest on `MaintenancePool`, where there is no tenancy context
+    /// to stamp and a plain transaction is the correct shape. Declared rather
+    /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
+    /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
+    pub(crate) privileged_pool: Option<&'static str>,
     pub(crate) signer: Arc<AgentSigner>,
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) embedder: Arc<McpEmbedder>,
@@ -536,6 +544,7 @@ impl EpiGraphMcpFull {
             tool_router: Self::tool_router(),
             pool,
             scoped: None,
+            privileged_pool: None,
             signer: Arc::new(signer),
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder: Arc::new(embedder),
@@ -571,6 +580,21 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
+        self
+    }
+
+    /// Declare that this server's `pool` is a PRIVILEGED (BYPASSRLS)
+    /// maintenance pool, so a write path that would otherwise stamp a
+    /// connection may run a plain transaction on it instead. `reason` is
+    /// required and is logged by the paths that honour it.
+    ///
+    /// Honoured today ONLY by the document ingest walk
+    /// (`tools::ingestion::do_ingest_document` / `_spine`), which the operator
+    /// `ingest-document` CLI drives on `MaintenancePool`. Every other write path
+    /// still requires [`Self::with_scoped_pool`] and fails closed without it.
+    #[must_use]
+    pub fn on_a_privileged_pool(mut self, reason: &'static str) -> Self {
+        self.privileged_pool = Some(reason);
         self
     }
 
@@ -613,6 +637,7 @@ impl EpiGraphMcpFull {
             tool_router: Self::tool_router(),
             pool,
             scoped: None,
+            privileged_pool: None,
             signer,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder,

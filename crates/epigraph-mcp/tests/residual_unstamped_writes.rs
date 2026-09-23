@@ -170,9 +170,20 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/ingestion.rs",
         "PaperRepository::get_or_create",
         1,
-        "`ingest_document`'s paper upsert. The whole ingest path is pool-bound and its writes run \
-         in a DETACHED background task where a refusal reaches no caller — the brief's D4, whose \
-         first obligation is to make that task's outcome observable at all.",
+        "`ensure_paper_node`'s `papers` upsert, run synchronously before the detached ingest task \
+         is spawned. `papers` has NO row-level security (`relrowsecurity = false`, measured at \
+         head 101), so it is admitted unstamped by construction. The walk itself (claims, traces, \
+         evidence, edges) now runs on ONE transaction stamped from the ingesting agent (Unit E).",
+    ),
+    (
+        "tools/ingestion.rs",
+        "server.pool.begin",
+        1,
+        "`begin_ingest_tx`'s PRIVILEGED arm: a plain transaction, taken ONLY when the server has \
+         no `ScopedPool` AND was built with `EpiGraphMcpFull::on_a_privileged_pool(reason)`. Its \
+         one caller is the operator `ingest-document` CLI, which runs on `MaintenancePool` \
+         (BYPASSRLS) where there is no tenancy context to stamp. A server on an ordinary pool \
+         with neither never reaches it — it gets `begin_author_stamped_tx`'s refusal.",
     ),
     (
         "tools/matching.rs",

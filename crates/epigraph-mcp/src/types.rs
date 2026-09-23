@@ -1626,6 +1626,10 @@ pub struct IngestDocumentSpineResponse {
     /// as new in this ingest. Atomize exactly these paragraphs, then call
     /// `ingest_document_inline` with atoms filled for those paths only.
     pub new_paragraph_paths: Vec<String>,
+    /// Spine nodes this ingest resolved to that belong to a group the ingesting
+    /// agent cannot write, so the document's `doi:` label was not added to them.
+    /// See `IngestDocumentResponse::converged_claims_unlabelled`.
+    pub converged_claims_unlabelled: usize,
     /// `true` when every paragraph in the extraction already existed; nothing new was written.
     pub already_ingested: bool,
 }
@@ -1894,6 +1898,13 @@ pub struct IngestDocumentResponse {
     pub claims_ds_wired: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_frame_id: Option<String>,
+    /// Claims this ingest RESOLVED TO (content-addressed convergence onto a row
+    /// that already existed) but could not tag with the document's `doi:` label,
+    /// because they belong to a group the ingesting agent cannot write. The paper
+    /// still `asserts` each of them; only the label is missing. Disclosed rather
+    /// than swallowed, so a caller counting a paper's claim set by label can
+    /// see the gap.
+    pub converged_claims_unlabelled: usize,
     pub already_ingested: bool,
 }
 

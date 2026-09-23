@@ -97,7 +97,14 @@ async fn run(
     let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key).on_a_privileged_pool(
         "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
     );
-    let server = EpiGraphMcpFull::new(pool, signer, embedder, false);
+    // Declared on the SERVER too, for the same reason: `do_ingest_document` now
+    // runs its walk in one transaction stamped from the ingesting agent, and a
+    // server with neither a `ScopedPool` nor this declaration refuses rather
+    // than write on an unstamped connection. On `MaintenancePool` there is
+    // nothing to stamp, and the declaration selects a plain transaction.
+    let server = EpiGraphMcpFull::new(pool, signer, embedder, false).on_a_privileged_pool(
+        "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
+    );
 
     let result = do_ingest_document(&server, viewer, &extraction)
         .await

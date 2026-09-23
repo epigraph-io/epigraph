@@ -848,6 +848,34 @@ impl ClaimRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, claim))]
     pub async fn create(pool: &PgPool, claim: &Claim, decl: TenancyDecl) -> Result<Claim, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_conn(&mut conn, claim, decl).await
+    }
+
+    /// [`Self::create`] on a connection the caller owns — the form a
+    /// tenancy-stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so the dedup probe, the
+    /// INSERT and the event are one implementation. `ingest_document`'s atoms
+    /// (level 3, content-addressed) are written through it, and on an unstamped
+    /// checkout migration 077's `claims_tenancy` `WITH CHECK` refuses the INSERT
+    /// on a cleanly-migrated schema; handed `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` the atom rides the same transaction
+    /// as the document's other rows.
+    ///
+    /// The `claim.created` event moved to `publish_or_log_conn`: it is a
+    /// SWALLOWED failure, and inside a caller's transaction a swallowed failure is
+    /// a deferred silent ROLLBACK at COMMIT unless it is SAVEPOINT-wrapped (hard
+    /// constraint #6). On a bare pooled connection that SAVEPOINT is a real
+    /// `BEGIN`/`COMMIT` around the one INSERT, which is what the pool path did.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+    ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -867,7 +895,7 @@ impl ClaimRepository {
                FROM claims WHERE content_hash = $1 LIMIT 1"#,
             content_hash.as_slice()
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(existing_row) = existing {
@@ -903,7 +931,7 @@ impl ClaimRepository {
             decl.visibility_bind(),
             decl.owner_group_bind()
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         // Fire-and-forget claim.created event (closes #61). This is the
@@ -911,8 +939,8 @@ impl ClaimRepository {
         // (MCP ingestion paths, API conventions, paper repo, tests). The
         // dedup early-return above does NOT emit, so resubmissions of an
         // existing content_hash do not pollute the audit log.
-        let _ = crate::repos::EventRepository::publish_or_log(
-            pool,
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
             "claim.created",
             Some(row.agent_id),
             &serde_json::json!({
@@ -948,13 +976,31 @@ impl ClaimRepository {
         claim_id: ClaimId,
         properties: serde_json::Value,
     ) -> Result<(), DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::set_properties_conn(&mut conn, claim_id, properties).await
+    }
+
+    /// [`Self::set_properties`] on a connection the caller owns, so an ingest's
+    /// hierarchy metadata lands in the same stamped transaction as the claim it
+    /// describes. `rows_affected() == 0` stays an ERROR here, and that matters
+    /// more on a stamped connection than it did on the pool: an `UPDATE` that
+    /// `claims_tenancy`'s USING hides matches zero rows WITHOUT raising, so this
+    /// check is what keeps an invisible target from reading as success.
+    ///
+    /// # Errors
+    /// As [`Self::set_properties`].
+    pub async fn set_properties_conn(
+        conn: &mut sqlx::PgConnection,
+        claim_id: ClaimId,
+        properties: serde_json::Value,
+    ) -> Result<(), DbError> {
         let id: Uuid = claim_id.into();
         let result = sqlx::query!(
             "UPDATE claims SET properties = $2, updated_at = NOW() WHERE id = $1",
             id,
             properties
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
