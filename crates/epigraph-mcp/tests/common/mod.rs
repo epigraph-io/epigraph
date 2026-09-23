@@ -70,7 +70,22 @@ pub async fn try_test_pool() -> Option<PgPool> {
         .await
         .ok()?;
     assert_disposable_db(&pool).await;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
+    // Migrate on a connection of its own, then CLOSE it rather than return it
+    // to the pool. Migration 001 is `pg_dump` output and runs a session-level
+    // `SET row_security = off`, which outlives its transaction on whichever
+    // connection applied it. Back in the pool, that connection runs the
+    // `SECURITY DEFINER` tenancy probes (owned by a role without BYPASSRLS)
+    // with row security off, so any statement reaching them — `list_events`'
+    // suppression predicate, for one — fails "query would be affected by
+    // row-level security policy" for whichever test draws it. Only on a FRESH
+    // database: on one already at head, `migrate!` applies nothing and sets
+    // nothing, which is why this stayed latent.
+    let mut conn = pool.acquire().await.ok()?.detach();
+    sqlx::migrate!("../../migrations")
+        .run(&mut conn)
+        .await
+        .ok()?;
+    sqlx::Connection::close(conn).await.ok()?;
     Some(pool)
 }
 
