@@ -1375,6 +1375,85 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          are unchanged. REACH IS WIDER THAN MOTIVATION: three other production call sites, all \
          in `epigraph-mcp/src/tools/rdf.rs`, still pass `&PgPool` and were not edited.",
     ),
+    // ── FIVE MORE WRITES, from the conversion of the MCP tools PR #494 left
+    // unconverted. Same argument as the three writes at the top of this
+    // register — the control on a write is migration 077's `WITH CHECK`
+    // evaluated against the CONNECTION's session GUCs, not an in-query viewer
+    // predicate — so each entry below states only what is specific to it.
+    (
+        "challenge.rs",
+        "create",
+        "INSERT INTO `challenges`. A WRITE, so its control is migration 077's \
+         `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` evaluated against the \
+         connection's session GUCs, and a `&Viewer` here would be spent on nothing: the \
+         statement is an INSERT with no FROM, so `Viewer::splice` has no marker to fill. WHY THE \
+         EXECUTOR MOVED: `challenges` carries NO orphan `*_privacy` policy, so unlike `claims` / \
+         `evidence` / `edges` it is refused with `42501` on an unstamped session in PRODUCTION as \
+         well as on a clean migrate — MEASURED with the real binary as `epigraph_app` on both \
+         schema configurations, `challenge_claim` returning `new row violates row-level security \
+         policy for table \"challenges\"` and writing nothing. The only connection that can \
+         satisfy that check comes from `ScopedPool::begin_as`, which hands back a transaction. \
+         WHOSE group: the row is claim-derived, so 074's `epigraph_derived_require_tenancy` fills \
+         its tenancy from the CHALLENGED CLAIM and 070 arm (c) re-stamps it unconditionally — the \
+         check is about the claim's owning group, not the challenger's, and \
+         `tool_write_tables_require_a_stamp.rs` pins all three directions of that. SCOPE: the \
+         executor widened, the SQL is byte-identical and was not re-derived.",
+    ),
+    (
+        "frame.rs",
+        "assign_claim",
+        "INSERT INTO `claim_frames` (ON CONFLICT DO UPDATE). A write with the same control as the \
+         entries above, and the same absence of an orphan `*_privacy` policy to fall back on: \
+         `submit_ds_evidence` was MEASURED returning `new row violates row-level security policy \
+         for table \"claim_frames\"` on BOTH schema configurations, which is why `claim_frames` \
+         stayed empty in production. The executor moved so this assignment and the BBA that gives \
+         it meaning can share ONE stamped transaction — a frame membership with no mass function \
+         moves no belief, and a BBA whose claim is not assigned to the frame is unreachable from \
+         `recompute_claim_belief_on_frame`'s enumeration. Tenancy is inherited from the parent \
+         claim by 074/070, exactly as for `challenge.rs::create`. SCOPE: executor only; the SQL \
+         is unchanged.",
+    ),
+    (
+        "mass_function.rs",
+        "store_with_perspective",
+        "INSERT INTO `mass_functions` (ON CONFLICT on `(claim_id, frame_id, source_agent_id, \
+         perspective_id)` DO UPDATE). Same write-side control as the entries above. This is the \
+         table whose EMPTINESS was the original symptom: its last successful production write was \
+         2026-09-22 and it stayed 0 through every e2e run, so every `supports` / `refutes` edge \
+         created since the deployed DSN moved to `epigraph_app` moved NO belief mass. The \
+         executor moved so it can join `frame.rs::assign_claim` in one author-stamped \
+         transaction. The ON CONFLICT is also what makes a caller's RETRY safe after a failure \
+         further down its own pipeline — the same BBA is re-stored rather than combined twice — \
+         which is why this half was convertible ahead of the pool-bound DS recompute it feeds. \
+         SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "claim.rs",
+        "deprecate_claim",
+        "UPDATE `claims` SET `is_current = false`, `truth_value = 0.05`, `embedding = NULL`. A \
+         write, so the control is `claims_tenancy`'s `WITH CHECK` against the connection's GUCs; \
+         a `&Viewer` would be spendable only through `splice_write`, which is PR-16's marker and \
+         not this change's, and the UPDATE is by primary key. WHY THE EXECUTOR MOVED: \
+         `deprecate_workflow` calls this once per node while CASCADING over a variant tree, so a \
+         refusal partway through left a HALF-DEPRECATED hierarchy — some variants flipped, some \
+         still current, and `find_workflow_hierarchical` returning the ones that were missed. One \
+         transaction for the whole cascade is what removes that state, and a `&PgPool` parameter \
+         cannot express it. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "workflow.rs",
+        "set_truth_value",
+        "UPDATE `workflows` SET `truth_value`. THE ONE ENTRY HERE THAT IS NOT ABOUT A REFUSAL, \
+         and the distinction is measured rather than assumed: at migration head 101 `workflows` \
+         has `relrowsecurity` and `relforcerowsecurity` both FALSE, no policy, and no entry in \
+         migration 062's `tier_a` array — so unlike the `claims` UPDATE it cascades from, this \
+         statement is NOT refused on an unstamped session and a `&Viewer` would have nothing to \
+         filter on either. The executor moved for COHESION: `deprecate_workflow` flips the flat \
+         claim and this hierarchical row as two halves of ONE deprecation, and a `claims` row \
+         marked `is_current = false` whose `workflows` row keeps its truth value is exactly the \
+         split the cascade exists to prevent — `find_workflow_hierarchical` reads the half that \
+         was missed. SCOPE: executor only; the SQL is unchanged.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has
