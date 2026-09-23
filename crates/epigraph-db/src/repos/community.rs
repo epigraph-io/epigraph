@@ -451,6 +451,15 @@ impl CommunityRepository {
         // The join to `groups` guarantees `group_memberships_group_id_fkey`
         // holds and that a same-id group of another KIND can never be targeted
         // — 068 makes the same point about the same join.
+        //
+        // THE CONFLICT ARM GRANTS WHAT THIS PATH GRANTS, AND NO MORE. A LIVE
+        // row keeps its role: the creator adding its own perspective must stay
+        // admin, and `remove_member` leaves such a row alone for the same
+        // reason. A REVOKED row comes back as `reader`, whatever it was.
+        // Clearing `revoked_at` alone reactivated a revoked admin row as
+        // admin, so re-adding a perspective undid a revocation the group
+        // route's last-admin guard had decided. Both SET expressions read the
+        // pre-update row, so the CASE sees the old `revoked_at`.
         sqlx::query(
             r#"
             INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
@@ -459,7 +468,10 @@ impl CommunityRepository {
               JOIN groups g ON g.id = $1 AND g.kind = 'community'
              WHERE p.id = $2 AND p.owner_agent_id IS NOT NULL
             ON CONFLICT (group_id, agent_id, epoch)
-            DO UPDATE SET revoked_at = NULL
+            DO UPDATE SET revoked_at = NULL,
+                          role = CASE WHEN group_memberships.revoked_at IS NULL
+                                      THEN group_memberships.role
+                                      ELSE 'reader' END
             "#,
         )
         .bind(community_id)

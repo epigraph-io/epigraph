@@ -992,3 +992,63 @@ async fn two_removals_of_one_agents_perspectives_cannot_both_skip_the_revocation
         "no perspective of the member is left, so the membership must be revoked"
     );
 }
+
+/// Re-adding a perspective restores READER standing, never a revoked role.
+///
+/// `add_member`'s `ON CONFLICT` reactivates an existing `(group, agent, epoch)`
+/// row. When that row was an admin row revoked through the group route's
+/// last-admin guard, clearing `revoked_at` alone gave the admin row back. A
+/// community member could then undo an administrator's revocation of another
+/// administrator by re-adding that agent's perspective. This path grants only
+/// `reader`, so a reactivated row comes back as `reader`. A row that is still
+/// live keeps its role. That half is the calibration in
+/// `a_reader_cannot_revoke_the_creators_admin_membership_via_remove_member`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn re_adding_a_revoked_admins_perspective_restores_reader_not_admin(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (second_admin, _) = fixture::seed_agent_with_group(&pool, "second-admin").await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "reader").await;
+    let row = CommunityRepository::create(&pool, "demoted", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(row.id)
+    .bind(second_admin)
+    .execute(&pool)
+    .await
+    .expect("a second admin, as POST /groups/:id/members grants one");
+    let readers = seed_perspective(&pool, Some(reader), "readers").await;
+    CommunityRepository::add_member(&pool, Some(creator), row.id, readers)
+        .await
+        .expect("add reader");
+
+    assert_eq!(
+        epigraph_db::GroupMembershipRepository::revoke_member_unless_last_admin(
+            &pool,
+            row.id,
+            second_admin
+        )
+        .await
+        .expect("revoke the second admin"),
+        epigraph_db::RevokeOutcome::Revoked,
+        "CALIBRATION: the creator is still an admin, so the guard permits it"
+    );
+
+    let theirs = seed_perspective(&pool, Some(second_admin), "theirs").await;
+    assert_eq!(
+        CommunityRepository::add_member(&pool, Some(reader), row.id, theirs)
+            .await
+            .expect("add member"),
+        MembershipOutcome::Applied
+    );
+
+    assert_eq!(
+        live_role(&pool, row.id, second_admin).await.as_deref(),
+        Some("reader"),
+        "the community path grants reader standing; it must not restore a revoked admin"
+    );
+    assert_eq!(live_admins(&pool, row.id).await, 1);
+}
