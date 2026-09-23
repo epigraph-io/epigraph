@@ -1344,6 +1344,118 @@ async fn a_sealed_plan_becomes_revertible_once_its_items_are_unsealed(pool: PgPo
     );
 }
 
+/// **A claim another group SEALED does not wedge this plan's unseal or
+/// revert** (D-PR16-ownership-transfer-is-unguarded).
+///
+/// # Why this is a separate property from the seal half
+///
+/// A seal plan's frozen set can reach a claim that group A has already sealed
+/// under A's own key. The apply leaves it in A as a `skipped` item, and the
+/// seal manifest no longer serves it. The UNSEAL side and the revert gate
+/// still ranged over the whole frozen set:
+/// - `unseal_manifest_page_conn` served every frozen claim with a
+///   `claim_encryption` row, so A's ciphertext (under a key the target never
+///   held) went into the target's unseal walk. A client cannot open it, and a
+///   commit that covered it could not restore it.
+/// - `sealed_item_count_conn` counted it, so the revert was refused with
+///   "items still sealed" for a row this plan never sealed and can never
+///   unseal.
+///
+/// Together, one foreign sealed row made a seal plan permanently
+/// irreversible. §6.5.5 puts the most weight on full reversibility.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_another_group_sealed_does_not_wedge_the_plans_unseal_or_revert(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let plaintext = "a result sealed, unsealed and reverted beside a foreign sealed row";
+    let seed = seed_subject(&pool, &world, plaintext).await;
+
+    // Authored by the actor for the reason
+    // `a_seal_never_serves_or_seals_a_claim_private_to_another_group` gives:
+    // it keeps the route-created plan free of a second-approver requirement.
+    let (_, group_a) = viewer_fixture::seed_agent_with_group(&pool, "group-a-admin").await;
+    let foreign =
+        viewer_fixture::seed_group_claim(&pool, world.actor, group_a, "sealed by group A").await;
+    fx::encrypt_claim(&pool, foreign, group_a).await;
+    fx::derived_from(&pool, foreign, seed).await;
+
+    let plan = applied_seal_plan(&pool, &world, &[seed]).await;
+    let states: std::collections::HashMap<Uuid, String> = fx::items(&pool, plan)
+        .await
+        .into_iter()
+        .map(|(id, _, s)| (id, s))
+        .collect();
+    assert_eq!(
+        states.get(&foreign).map(String::as_str),
+        Some("skipped"),
+        "CALIBRATION: A's sealed claim must be a frozen, skipped item, or this test never offers \
+         the unseal and the revert a foreign ciphertext row"
+    );
+
+    seal_through_routes(&pool, &world, plan, 1).await;
+
+    let unseal = fetch_unseal_manifest(&pool, &world, plan).await;
+    let served: Vec<Uuid> = unseal.items.iter().map(|i| i.claim_id).collect();
+    assert_eq!(
+        served,
+        vec![seed],
+        "the unseal manifest carries only ciphertext bound to the plan's own target group"
+    );
+    unseal_through_routes(&pool, &world, plan, 1).await;
+
+    let status = post_revert(&pool, &world, plan)
+        .await
+        .expect("a seal plan whose own rows are all unsealed must be revertible");
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+
+    let scoped = fx::scoped(&pool).await;
+    let correlation = sqlx::query_scalar::<_, String>(
+        "SELECT correlation_id FROM security_events \
+          WHERE event_type = $1 AND details->>'plan_id' = $2::text \
+            AND correlation_id IS NOT NULL \
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(epigraph_jobs::privatization::DISPATCH_EVENT_TYPE)
+    .bind(plan)
+    .fetch_one(&pool)
+    .await
+    .expect("the revert dispatch wrote a correlated security event");
+    fx::run_revert(
+        &scoped,
+        &fx::revert_job(plan, world.actor, &correlation),
+        50,
+    )
+    .await
+    .expect("run the revert");
+    assert_eq!(fx::plan_state(&pool, plan).await, "reverted");
+
+    let (visibility, content): (String, String) =
+        sqlx::query_as("SELECT visibility, content FROM claims WHERE id = $1")
+            .bind(seed)
+            .fetch_one(&pool)
+            .await
+            .expect("read the reverted seed");
+    assert_eq!(
+        (visibility.as_str(), content.as_str()),
+        ("public", plaintext)
+    );
+    let key_group: Uuid =
+        sqlx::query_scalar("SELECT group_id FROM claim_encryption WHERE claim_id = $1")
+            .bind(foreign)
+            .fetch_one(&pool)
+            .await
+            .expect("A's claim keeps its ciphertext row");
+    assert_eq!(
+        key_group, group_a,
+        "and A's claim stays sealed under A's key"
+    );
+    assert_eq!(
+        fx::tenancy(&pool, foreign).await,
+        ("group".to_string(), group_a),
+        "in A"
+    );
+}
+
 /// Give `claim` a harvester source fragment, and return the fragment id.
 ///
 /// The fragment inherits the claim's own tenancy, so the rows are consistent

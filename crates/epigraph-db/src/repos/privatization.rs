@@ -2812,13 +2812,22 @@ impl PrivatizationRepository {
     /// id, and the closure and the content-lineage hull both run under the
     /// bypass viewer.
     ///
-    /// So the count is scoped to seal-mode plans. What is still NOT shipped is
-    /// the seal path that could make it non-zero through the product — `seal`
-    /// is PR-21's and `routes/privatization.rs::create_plan` returns `501` for
-    /// it; `crates/epigraph-privacy` now supplies the encryptor, but nothing
-    /// carries its output into these tables yet — so this
-    /// returns 0 for every plan the ROUTE can create today. It is here so that
-    /// the refusal arrives with the seal mode rather than after it.
+    /// So the count is scoped to seal-mode plans. (An earlier revision of this
+    /// comment said the seal path was not shipped and the count was always 0.
+    /// PR-21 shipped it, and the count is live.)
+    ///
+    /// # AND TO CIPHERTEXT BOUND TO THE PLAN'S OWN TARGET GROUP
+    ///
+    /// `ce.group_id = p.target_group_id` is the second half of the same
+    /// argument. A seal plan's frozen set can also reach a claim that an
+    /// unrelated group A has sealed under A's own key. The apply leaves it in
+    /// A as a `skipped` item (D-PR16-ownership-transfer-is-unguarded). This
+    /// plan did not seal it, and its unseal cannot remove it:
+    /// [`Self::unseal_claims_conn`] restores only rows bound to the target, and
+    /// [`Self::unseal_manifest_page_conn`] serves only those. So counting it
+    /// would refuse the revert for as long as A keeps its row sealed, and a
+    /// single foreign sealed claim would make the plan irreversible. The count
+    /// is exactly the set this plan's unseal can remove.
     ///
     /// # Errors
     ///
@@ -2836,6 +2845,7 @@ impl PrivatizationRepository {
               JOIN public.privatization_plans p
                 ON p.id = i.plan_id AND p.mode = 'seal'
              WHERE i.plan_id = $1
+               AND ce.group_id = p.target_group_id
             "#,
         )
         .bind(plan_id)
@@ -3449,6 +3459,20 @@ impl PrivatizationRepository {
     /// the route, because knowing WHICH claims are sealed is itself
     /// information; but there is no plaintext predicate to spend a viewer on.
     ///
+    /// # Only ciphertext bound to the plan's OWN target group
+    ///
+    /// `ce.group_id = p.target_group_id`, with the target joined from the plan
+    /// rather than passed in. The frozen set can reach a claim an unrelated
+    /// group A sealed under A's own key, which the apply left in A as a
+    /// `skipped` item (D-PR16-ownership-transfer-is-unguarded). Serving it
+    /// would tell the target's authority which of A's claims are sealed. It
+    /// would also put into the target's unseal walk a row the target holds no
+    /// key for. A client cannot open that row, and
+    /// [`Self::unseal_claims_conn`] would not restore it anyway, because it
+    /// matches only the target's binding. [`Self::unseal_tcb_shape_conn`] and
+    /// [`Self::sealed_item_count_conn`] carry the same binding, so the
+    /// manifest, the commit's cover and the revert gate agree on one set.
+    ///
     /// # Errors
     ///
     /// [`DbError`] for a query fault.
@@ -3466,7 +3490,10 @@ impl PrivatizationRepository {
               FROM public.claim_encryption ce
               JOIN public.privatization_plan_items i
                 ON i.entity_id = ce.claim_id AND i.kind = 'claim'
+              JOIN public.privatization_plans p
+                ON p.id = i.plan_id
              WHERE i.plan_id = $1
+               AND ce.group_id = p.target_group_id
                AND ($2::uuid IS NULL OR ce.claim_id > $2)
              ORDER BY ce.claim_id
              LIMIT $3

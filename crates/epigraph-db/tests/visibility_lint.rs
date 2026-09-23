@@ -693,7 +693,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          ids. It answers ops-F13's question — may this plan be reverted — and the count is the \
          number the 409 carries. Maintenance connection, because a filtered count would report \
          zero sealed items to a caller who cannot read them and permit a revert that then fails \
-         `42501` mid-batch.",
+         `42501` mid-batch. Its `ce.group_id = p.target_group_id` predicate is not a viewer \
+         filter. It limits the count to ciphertext this plan's unseal can remove, so another \
+         group's sealed claim in the frozen set does not make the plan irreversible.",
     ),
     (
         "privatization.rs",
@@ -851,7 +853,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          carry `group_id` but no `visibility`, and whose projection is CIPHERTEXT bound to a key \
          the server does not hold. There is no plaintext for a predicate to protect. Their tenancy \
          backstop is migration 077's `enc` policy loop, which selects on the CONNECTION; the \
-         authority for knowing WHICH claims are sealed is §6.6's, checked in the route.",
+         authority for knowing WHICH claims are sealed is §6.6's, checked in the route. It serves \
+         only rows bound to the plan's OWN target group (`ce.group_id = p.target_group_id`), so \
+         the target's authority does not learn which of another group's frozen claims that group \
+         has sealed.",
     ),
     (
         "privatization.rs",
