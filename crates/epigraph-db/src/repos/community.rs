@@ -414,6 +414,28 @@ impl CommunityRepository {
     /// there is no agent to grant it to. That is 068's behaviour too, and it is
     /// a silent no-op by necessity, not by choice.
     ///
+    /// # The membership is written at the group's CURRENT epoch
+    ///
+    /// It used to be written at epoch 0, always. A community's projected group
+    /// is a real group with its own `group_key_epochs`, and
+    /// `POST /api/v1/groups/:id/rotate` can advance it. After a rotation, every
+    /// community member added later was stamped at the retired epoch 0. Re-adding
+    /// a live member's perspective failed outright: the live row had moved to
+    /// epoch 1 with the rotation, so `ON CONFLICT (group_id, agent_id, epoch)`
+    /// matched nothing at epoch 0, and the insert hit `group_memberships_one_live`
+    /// (23505). The epoch is now read in the INSERT, under the group membership
+    /// lock this transaction takes first, with the same predicate as
+    /// `GroupKeyEpochRepository::get_current_epoch`. The share is still empty.
+    /// This path grants group membership, not key material, and every
+    /// membership it has written since migration 068 carries an empty share.
+    ///
+    /// A group with NO current epoch is broken. The subquery then yields NULL,
+    /// the `epoch NOT NULL` constraint refuses the row, and the whole
+    /// transaction rolls back, `community_members` row included. That is an
+    /// error on purpose: the old statement wrote epoch 0 for such a group,
+    /// which the group route refuses to do (409), and a silent no-op would
+    /// leave the perspective in the community with no membership behind it.
+    ///
     /// # Authorization
     ///
     /// Closed membership — see the module docs. `acting_agent` is the
@@ -422,7 +444,8 @@ impl CommunityRepository {
     /// a membership row.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any statement fails.
+    /// Returns `DbError::QueryFailed` if any statement fails, including when
+    /// the community's group has no current key epoch (see above).
     #[instrument(skip(pool))]
     pub async fn add_member(
         pool: &PgPool,
@@ -469,10 +492,19 @@ impl CommunityRepository {
         // admin, so re-adding a perspective undid a revocation the group
         // route's last-admin guard had decided. Both SET expressions read the
         // pre-update row, so the CASE sees the old `revoked_at`.
+        //
+        // The epoch is the group's CURRENT one, read under the lock taken
+        // above; see the doc comment for why it is no longer 0.
         sqlx::query(
             r#"
             INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
-            SELECT g.id, p.owner_agent_id, ''::bytea, 0, 'reader'
+            SELECT g.id, p.owner_agent_id, ''::bytea,
+                   (SELECT e.epoch
+                      FROM group_key_epochs e
+                     WHERE e.group_id = g.id AND e.status IN ('active', 'rotating')
+                     ORDER BY (e.status = 'active') DESC, e.epoch DESC
+                     LIMIT 1),
+                   'reader'
               FROM perspectives p
               JOIN groups g ON g.id = $1 AND g.kind = 'community'
              WHERE p.id = $2 AND p.owner_agent_id IS NOT NULL

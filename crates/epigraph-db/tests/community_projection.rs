@@ -14,7 +14,7 @@
 
 mod viewer_fixture;
 
-use epigraph_db::{CommunityRepository, MembershipOutcome};
+use epigraph_db::{CommunityRepository, GroupKeyEpochRepository, MembershipOutcome, RotateOutcome};
 use sqlx::PgPool;
 use uuid::Uuid;
 use viewer_fixture as fixture;
@@ -151,6 +151,87 @@ async fn add_member_projects_a_reader_membership(pool: PgPool) {
     .await
     .expect("the projected membership must exist");
     assert_eq!(role, "reader");
+}
+
+/// After the projected group rotates, a community member is written at the
+/// CURRENT epoch, not at epoch 0.
+///
+/// A community's projected group is a real group with its own key epochs, and
+/// `POST /groups/:id/rotate` can advance it. `add_member` hard-coded epoch 0,
+/// so every member added after a rotation sat on the retired epoch. Re-adding
+/// a live member's perspective failed with 23505: the live row had moved to
+/// epoch 1, the `ON CONFLICT (group_id, agent_id, epoch)` arbiter found nothing
+/// at epoch 0, and `group_memberships_one_live` refused the insert.
+#[sqlx::test(migrations = "../../migrations")]
+async fn add_member_after_a_rotation_writes_the_current_epoch(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (joiner, _) = fixture::seed_agent_with_group(&pool, "joiner").await;
+    let row = CommunityRepository::create(&pool, "rotated", None, None, None, Some(creator))
+        .await
+        .expect("create community");
+    let creators = seed_perspective(&pool, Some(creator), "creators").await;
+    let joiners = seed_perspective(&pool, Some(joiner), "joiners").await;
+
+    // Rotate the projected group 0 -> 1, re-wrapping its one live member.
+    sqlx::query(
+        "UPDATE groups SET properties = properties || jsonb_build_object('kms_key_ref', 'arn:test') \
+          WHERE id = $1",
+    )
+    .bind(row.id)
+    .execute(&pool)
+    .await
+    .expect("make the retiring epoch recoverable");
+    let mut tx = pool.begin().await.expect("rotation tx");
+    let rotated =
+        GroupKeyEpochRepository::rotate_conn(&mut tx, row.id, &[(creator, vec![7u8; 60])])
+            .await
+            .expect("rotate");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { new_epoch: 1, .. }),
+        "{rotated:?}"
+    );
+    tx.commit().await.expect("commit rotation");
+
+    let live_epoch = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT epoch FROM group_memberships \
+                  WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+            )
+            .bind(row.id)
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("read live epoch")
+        }
+    };
+
+    assert_eq!(
+        CommunityRepository::add_member(&pool, Some(creator), row.id, joiners)
+            .await
+            .expect("add the joiner"),
+        MembershipOutcome::Applied
+    );
+    assert_eq!(
+        live_epoch(joiner).await,
+        1,
+        "a member added after the rotation must be on the current epoch"
+    );
+
+    // Re-adding the creator's own perspective keeps its live admin row, which
+    // the rotation moved to epoch 1.
+    assert_eq!(
+        CommunityRepository::add_member(&pool, Some(creator), row.id, creators)
+            .await
+            .expect("re-adding a live member's perspective must not collide with its live row"),
+        MembershipOutcome::Applied
+    );
+    assert_eq!(
+        live_role(&pool, row.id, creator).await.as_deref(),
+        Some("admin")
+    );
+    assert_eq!(live_epoch(creator).await, 1);
 }
 
 /// A perspective with no owning agent projects nothing — there is no agent to
