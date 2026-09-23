@@ -11,6 +11,7 @@
 //! DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
 //!   cargo test -p epigraph-api --test idempotency_2p5_tests
 //! ```
+#![cfg(feature = "db")]
 
 #[path = "../viewer_fixture.rs"]
 mod fixture;

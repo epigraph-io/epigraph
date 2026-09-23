@@ -15,6 +15,7 @@
 //!
 //! So the assertions below are exactly the rescan arm, and the file says so
 //! rather than implying both arms are covered.
+#![cfg(feature = "db")]
 
 #[path = "privatization_fixture.rs"]
 mod fx;

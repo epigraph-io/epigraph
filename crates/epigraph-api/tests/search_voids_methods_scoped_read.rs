@@ -93,6 +93,7 @@
 //! session is filtered — is pinned on the repo primitives in
 //! `epigraph-db/tests/search_voids_methods_scoped_read_policy.rs`, on both
 //! `SessionGucMode` arms. Neither file is sufficient alone.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

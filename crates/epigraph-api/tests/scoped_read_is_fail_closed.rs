@@ -23,6 +23,7 @@
 //! the `None` constructor must ERROR, and the `with_scoped_pool` constructor
 //! must SERVE and actually stamp the GUC the RLS policy reads. Without the
 //! second half, an accessor that was simply broken would pass the first.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

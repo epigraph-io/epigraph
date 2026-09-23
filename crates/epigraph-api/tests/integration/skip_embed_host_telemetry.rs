@@ -7,6 +7,7 @@
 //!
 //! Regression guard: removing the skip-check in `submit.rs` would resume
 //! ~thousands of wasted embedding calls per day from the epiclaw orchestrator.
+#![cfg(feature = "db")]
 
 use std::sync::Arc;
 

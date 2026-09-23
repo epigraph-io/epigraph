@@ -34,6 +34,7 @@
 //! downgraded connections in
 //! `crates/epigraph-db/tests/privatization_plan_policies.rs`. Neither file is
 //! sufficient alone.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

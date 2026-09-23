@@ -179,6 +179,7 @@
 //! viewer's own group — while the viewer's group is still bound into `$V` on
 //! that same statement, so the in-query predicate would have returned the row.
 //! Only a row-level policy can have removed it.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

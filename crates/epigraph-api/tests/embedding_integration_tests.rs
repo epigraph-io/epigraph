@@ -2,6 +2,7 @@
 //!
 //! These tests verify that the embedding service is properly integrated
 //! into the API state and handlers.
+#![cfg(feature = "db")]
 
 use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 

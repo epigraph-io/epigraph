@@ -4,6 +4,11 @@
 //! touching the database. They run against `AppState::new(config)` which uses
 //! `connect_lazy` for the DB pool — DB queries are never issued because the
 //! 4xx response is returned before any handler reaches a repository call.
+//!
+//! Gated on `db` even so: the dispatch under test is `token_endpoint`'s `db`
+//! arm. Its `not(db)` arm answers 503 to every request, so under
+//! `--no-default-features` this file compiled and every test failed.
+#![cfg(feature = "db")]
 
 use axum::{
     body::Body,

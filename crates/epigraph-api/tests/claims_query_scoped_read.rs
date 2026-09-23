@@ -68,6 +68,7 @@
 //! through a non-scoped constructor, so the handler is called directly. That gap
 //! is recorded in `docs/tenancy/progress.json`'s `prs.next` with an owner, and
 //! this shard does not close it.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

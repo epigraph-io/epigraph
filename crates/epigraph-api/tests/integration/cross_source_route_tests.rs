@@ -1,4 +1,5 @@
 //! T20: GET /api/v1/claims/:id/cross_source_matches integration tests.
+#![cfg(feature = "db")]
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};

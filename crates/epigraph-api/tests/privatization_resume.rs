@@ -21,6 +21,7 @@
 //! The comparison against "the uninterrupted result" is a SECOND, structurally
 //! identical world in the same test, applied in one go. Comparing two runs of
 //! the same plan would compare a plan against itself.
+#![cfg(feature = "db")]
 
 #[path = "privatization_fixture.rs"]
 mod fx;

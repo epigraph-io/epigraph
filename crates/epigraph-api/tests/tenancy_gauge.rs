@@ -17,6 +17,7 @@
 //! `get_or_create` → `.set()` → registry encode — against real rows. What it
 //! does NOT cover is the `tokio::spawn` + `interval` wrapper in
 //! `bin/server.rs`, which has no logic beyond the loop.
+#![cfg(feature = "db")]
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

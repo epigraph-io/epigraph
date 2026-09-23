@@ -31,6 +31,7 @@
 //! ```bash
 //! cargo test --package epigraph-api --test submit_persistence_tests
 //! ```
+#![cfg(feature = "db")]
 
 #[path = "../viewer_fixture.rs"]
 mod fixture;

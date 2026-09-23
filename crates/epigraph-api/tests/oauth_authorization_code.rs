@@ -1,3 +1,5 @@
+#![cfg(feature = "db")]
+
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},

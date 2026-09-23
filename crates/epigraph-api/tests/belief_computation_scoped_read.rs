@@ -90,6 +90,7 @@
 //! non-bypass-role, principal-set, groups-deliberately-empty condition the
 //! acceptance asks for, observed directly rather than deferred to a sibling
 //! file: it is the FORCE differential itself, not a proxy for it.
+#![cfg(feature = "db")]
 
 mod common;
 mod viewer_fixture;

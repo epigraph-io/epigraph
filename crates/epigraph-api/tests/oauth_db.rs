@@ -3,6 +3,7 @@
 //! These use `#[sqlx::test(migrations = "../../migrations")]` which spins up
 //! a fresh per-test database — they require a live Postgres reachable via
 //! `DATABASE_URL` and are skipped otherwise.
+#![cfg(feature = "db")]
 
 mod oauth_providers;
 

@@ -24,6 +24,7 @@
 //! refusal's CONDITION — the same request accepted once the encryption row is
 //! gone — against a stub ciphertext, which keeps the revert assertions
 //! independent of the key ceremony's own correctness.
+#![cfg(feature = "db")]
 
 #[path = "privatization_fixture.rs"]
 mod fx;

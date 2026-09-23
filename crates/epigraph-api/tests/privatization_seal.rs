@@ -13,6 +13,7 @@
 //! hand-rolled bytes for the reason the CLI's own tests give: hand-rolled bytes
 //! would assert this file's idea of the wire format instead of the one the tool
 //! writes.
+#![cfg(feature = "db")]
 
 #[path = "privatization_fixture.rs"]
 mod fx;

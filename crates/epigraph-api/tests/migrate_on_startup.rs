@@ -10,6 +10,7 @@
 //! Uses non-macro `sqlx::query`/`query_scalar` forms to avoid extending the
 //! offline (`.sqlx/`) prepare cache for a single test (CI runs with
 //! `SQLX_OFFLINE=true`).
+#![cfg(feature = "db")]
 
 use sqlx::PgPool;
 

@@ -35,6 +35,7 @@
 //! the point of the whole exercise is that NO ROW MOVED. All three are asserted
 //! every time, because a handler that returned `Err` after privatizing the
 //! corpus would satisfy the first alone.
+#![cfg(feature = "db")]
 
 #[path = "privatization_fixture.rs"]
 mod fx;

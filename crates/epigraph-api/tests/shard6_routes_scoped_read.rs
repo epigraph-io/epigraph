@@ -157,6 +157,7 @@
 //! row-level policy can have removed it. That is the non-bypass-role,
 //! principal-set, groups-deliberately-empty condition the acceptance asks for,
 //! observed rather than deferred.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

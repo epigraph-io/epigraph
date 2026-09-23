@@ -1,5 +1,6 @@
 //! POST /api/v1/claims must embed the claim inline post-commit, best-effort.
 //! Regression guard for backlog item 92eedc8b (embedding gap).
+#![cfg(feature = "db")]
 
 use std::sync::Arc;
 

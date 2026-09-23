@@ -109,6 +109,7 @@
 //! Shard 5 ships no `epigraph-db/tests/*_policy.rs` sibling, for the same
 //! fixture reason the coverage fraction gives; `F-SHARD4-A4` already owns that
 //! gap and this shard neither closes nor widens it.
+#![cfg(feature = "db")]
 
 mod common;
 mod viewer_fixture;

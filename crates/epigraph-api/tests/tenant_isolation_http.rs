@@ -58,6 +58,7 @@
 //! module's recorded residual — see `epigraph_db::repos::graph_view`'s module
 //! docs and the `F-edges-unfiltered` entry in `docs/tenancy/progress.json`
 //! (assigned to PR-13).
+#![cfg(feature = "db")]
 
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{

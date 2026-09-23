@@ -66,6 +66,7 @@
 //! and routes `/lineage/:claim_id` to a `mock_lineage_handler`, importing
 //! nothing from `epigraph_api`. A green run there is not evidence about this
 //! shard.
+#![cfg(feature = "db")]
 
 mod viewer_fixture;
 

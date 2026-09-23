@@ -34,6 +34,7 @@
 //! exact counts at `epsilon=0`). The stranger is an admin and still sees only
 //! the public part — which is the assertion that `claims:admin` is a noise gate
 //! and not a tenancy bypass.
+#![cfg(feature = "db")]
 
 use serde_json::Value;
 use sqlx::PgPool;

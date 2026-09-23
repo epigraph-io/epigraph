@@ -29,6 +29,7 @@
 //! `epigraph-db/tests/privatization_authz.rs` and
 //! `privatization_plan_policies.rs`, which downgrade the role deliberately.
 
+#![cfg(feature = "db")]
 #![allow(dead_code)]
 
 #[path = "viewer_fixture.rs"]

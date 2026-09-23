@@ -16,6 +16,7 @@
 //! # Prerequisites
 //!
 //! Requires PostgreSQL with pgvector extension.
+#![cfg(feature = "db")]
 
 use axum::{
     body::Body,
