@@ -524,6 +524,124 @@ impl EdgeRepository {
         Ok(rows)
     }
 
+    /// The claim-to-claim edges the reasoning engine analyses: edges in force
+    /// that `viewer` may read, between claims `viewer` may read.
+    ///
+    /// Returns `(source_id, target_id, relationship, properties)` per edge,
+    /// ordered by edge id. The caller reads the edge strength out of
+    /// `properties`.
+    ///
+    /// This is the edge read of `POST /api/v1/reasoning/analyze`
+    /// (`routes/reasoning.rs::analyze`, `F-FAH-A1`). It used to run as two
+    /// inline statements in the route layer, on the raw pool, with no viewer
+    /// predicate. With no claim set given, it scanned every tenant's
+    /// claim-to-claim edges up to its cap.
+    ///
+    /// `among`: when `Some`, only edges whose source AND target are both in
+    /// the set, which is what the route always did. When `None`, every such
+    /// edge. Either way at most `limit` rows are returned. The `ORDER BY` makes
+    /// the cap cut the same rows on every call.
+    ///
+    /// # Four predicates, and why each is needed
+    ///
+    /// * `{EDGE_VISIBILITY:e}`. Under migration 070's no-widening rule, a
+    ///   group-private edge between two public claims stays private.
+    /// * `{VISIBILITY:cs}` and `{VISIBILITY:ct}`. A public edge can still touch
+    ///   a private claim. Without these joins, that claim's id and the edge's
+    ///   relationship and strength would reach the engine and come back in
+    ///   the response. The joins also drop an endpoint that names no claim.
+    ///   That is forced: under migration 077's policies, a missing claim and
+    ///   an unreadable one are the same empty join.
+    /// * [`EDGE_IN_FORCE`]. A retracted edge (`valid_to` in the past) is no
+    ///   longer evidence. [`EDGE_IN_FORCE`]'s own doc records that every
+    ///   belief-bearing read saw retracted edges as live, and this is one of
+    ///   those reads.
+    ///
+    /// All three markers resolve to one bind: `$3` when `among` is given
+    /// (`$1` is the set, `$2` the cap), and `$2` when it is not (`$1` is the
+    /// cap). A `Bypass` viewer renders no predicate and binds nothing.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, among))]
+    pub async fn claim_edges_for_reasoning<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        among: Option<&[Uuid]>,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, Uuid, String, serde_json::Value)>, DbError> {
+        type Row = (Uuid, Uuid, String, Json<serde_json::Value>);
+        // Two statement texts rather than one with `$1 IS NULL OR ...`: under a
+        // generic plan the planner cannot fold the NULL test away, and the
+        // restricted branch must keep using the source/target indexes.
+        //
+        // The markers are escaped `{{...}}` because each text goes through
+        // `format!` first to interpolate `EDGE_IN_FORCE`. `splice` then asserts
+        // they are present, so an edit that drops one fails loudly.
+        let rows: Vec<Row> = match among {
+            Some(ids) => {
+                let sql = viewer.splice(
+                    &format!(
+                        r#"
+                    SELECT e.source_id, e.target_id, e.relationship, e.properties
+                      FROM edges e
+                      JOIN claims cs ON cs.id = e.source_id
+                      JOIN claims ct ON ct.id = e.target_id
+                     WHERE e.source_type = 'claim'
+                       AND e.target_type = 'claim'
+                       AND e.source_id = ANY($1)
+                       AND e.target_id = ANY($1)
+                       AND {EDGE_IN_FORCE}
+                       /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:cs}} */ /* {{VISIBILITY:ct}} */
+                     ORDER BY e.id
+                     LIMIT $2
+                    "#
+                    ),
+                    3,
+                );
+                let mut q = sqlx::query_as::<_, Row>(&sql).bind(ids).bind(limit);
+                // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders no
+                // predicate, so the statement has no `$3` to fill.
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q.fetch_all(executor).await?
+            }
+            None => {
+                let sql = viewer.splice(
+                    &format!(
+                        r#"
+                    SELECT e.source_id, e.target_id, e.relationship, e.properties
+                      FROM edges e
+                      JOIN claims cs ON cs.id = e.source_id
+                      JOIN claims ct ON ct.id = e.target_id
+                     WHERE e.source_type = 'claim'
+                       AND e.target_type = 'claim'
+                       AND {EDGE_IN_FORCE}
+                       /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:cs}} */ /* {{VISIBILITY:ct}} */
+                     ORDER BY e.id
+                     LIMIT $1
+                    "#
+                    ),
+                    2,
+                );
+                let mut q = sqlx::query_as::<_, Row>(&sql).bind(limit);
+                // Guarded, as above: no `$2` for a `Bypass` viewer.
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q.fetch_all(executor).await?
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(source, target, relationship, Json(properties))| {
+                (source, target, relationship, properties)
+            })
+            .collect())
+    }
+
     /// Retract edges by closing their validity interval instead of deleting them.
     ///
     /// This is the non-destructive counterpart to `DELETE FROM edges`. The row —
