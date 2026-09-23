@@ -466,8 +466,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(public_key = %hex::encode(signer.public_key()), "Agent identity ready");
 
-    // Create embedder
-    let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
+    // Create embedder.
+    //
+    // `with_scoped_pool` is NOT optional decoration: the embedder's own store is
+    // an `UPDATE claims SET embedding`, which migration 077's `claims_tenancy`
+    // `WITH CHECK` refuses on an unstamped session, and the refusal is swallowed
+    // because embedding is best-effort. Without this the seven tools that embed
+    // through `McpEmbedder` (`store_workflow`, `ingest_workflow`,
+    // `improve_workflow_hierarchy`, `add_step`, `consolidate_claims`, and both
+    // `ingest_document` paths) would land `embedding = NULL` with no error
+    // anywhere on a cleanly-migrated schema. It is the SAME `ScopedPool` the write
+    // path gets below, so the embedder and the claim write stamp through one pool.
+    let embedder =
+        McpEmbedder::new(pool.clone(), cli.openai_api_key).with_scoped_pool(scoped.clone());
 
     // ── Federation gateway ──────────────────────────────────────────────
     // Parse EPIGRAPH_MCP_EXTENSIONS and mount each downstream extension MCP.

@@ -23,17 +23,28 @@ use crate::server::EpiGraphMcpFull;
 /// ran first, which is precisely the diagnosis-free failure this module exists
 /// to remove.
 ///
+/// # Why it takes the pool and the `ScopedPool` rather than the server
+///
+/// Because [`crate::embed::McpEmbedder`] is the third caller and is not the
+/// server: it holds its own `ScopedPool` (declared via
+/// `McpEmbedder::with_scoped_pool`) and is cloned into detached background tasks
+/// where no `&EpiGraphMcpFull` survives — `tools/ingestion.rs`'s embed queue is
+/// `tokio::spawn`ed with `Arc::clone(&server.embedder)` alone. Parameterising
+/// here is what lets all three write paths share ONE refusal triple instead of a
+/// second copy that resolved a viewer and skipped the empty-writable check.
+///
 /// # Errors
 /// * `McpError::internal_error` if this process was not built from a
 ///   [`epigraph_db::ScopedPool`] — never a fallback to the unstamped pool.
 /// * `McpError::internal_error` if the author's viewer cannot be resolved.
 /// * `McpError::internal_error` if that viewer has no writable group.
 async fn author_write_authority<'p>(
-    server: &'p EpiGraphMcpFull,
+    scoped: Option<&'p epigraph_db::ScopedPool>,
+    pool: &sqlx::PgPool,
     author_agent_id: uuid::Uuid,
     tool_name: &'static str,
 ) -> Result<(&'p epigraph_db::ScopedPool, epigraph_db::visibility::Viewer), McpError> {
-    let scoped = server.scoped.as_ref().ok_or_else(|| {
+    let scoped = scoped.ok_or_else(|| {
         tracing::error!(
             target: "tenancy.scoped_write",
             tool = tool_name,
@@ -50,7 +61,7 @@ async fn author_write_authority<'p>(
         ))
     })?;
 
-    let author_viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, author_agent_id)
+    let author_viewer = epigraph_db::visibility::Viewer::resolve(pool, author_agent_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -173,8 +184,13 @@ pub async fn begin_author_stamped_tx<'p>(
     author_agent_id: uuid::Uuid,
     tool_name: &'static str,
 ) -> Result<epigraph_db::ScopedTx<'p>, McpError> {
-    let (scoped, author_viewer) =
-        author_write_authority(server, author_agent_id, tool_name).await?;
+    let (scoped, author_viewer) = author_write_authority(
+        server.scoped.as_ref(),
+        &server.pool,
+        author_agent_id,
+        tool_name,
+    )
+    .await?;
 
     scoped.begin_as(&author_viewer).await.map_err(|e| {
         tracing::error!(
@@ -282,74 +298,118 @@ pub async fn embed_claim_author_stamped(
         },
     };
 
-    let (scoped, author_viewer) =
-        match author_write_authority(server, author_agent_id, tool_name).await {
-            Ok(pair) => pair,
-            Err(_) => {
-                // `author_write_authority` has already logged the specific cause
-                // at ERROR on `tenancy.scoped_write`. The claim is committed, so
-                // this cannot be returned as a tool error.
-                tracing::warn!(
-                    claim_id = %claim_id,
-                    tool = tool_name,
-                    "no author-stamped connection is available for the post-commit embed; the \
-                     claim is stored but carries no vector and is invisible to semantic recall \
-                     until the maintenance backfill reaches it"
-                );
-                return false;
-            }
-        };
-
-    let mut tx = match scoped.begin_as(&author_viewer).await {
-        Ok(tx) => tx,
+    match store_embedding_author_stamped(
+        server.scoped.as_ref(),
+        &server.pool,
+        author_agent_id,
+        claim_id,
+        &pgvec,
+        tool_name,
+    )
+    .await
+    {
+        Ok(stored) => stored,
         Err(e) => {
             tracing::warn!(
                 claim_id = %claim_id,
                 tool = tool_name,
-                "could not begin an author-stamped transaction for the post-commit embed: {e}"
+                "the post-commit embed could not store a vector: {e}. The claim is stored but \
+                 carries no vector and is invisible to semantic recall until the maintenance \
+                 backfill reaches it"
             );
-            return false;
+            false
         }
-    };
+    }
+}
 
-    let stored =
-        ClaimRepository::store_embedding_if_unsealed(&mut tx, &author_viewer, claim_id, &pgvec)
-            .await;
+/// Run ONE `UPDATE claims SET embedding` on a connection stamped from
+/// `author_agent_id`'s viewer. **The single stamped-store mechanism in this
+/// crate.**
+///
+/// Extracted from [`embed_claim_author_stamped`] when the reviewer of the first
+/// revision of this branch pointed out the real shape of the defect: that
+/// revision converted `submit_claim` and `memorize`'s embed and left
+/// `McpEmbedder::embed_and_store` — used by `store_workflow`, `ingest_workflow`,
+/// `improve_workflow_hierarchy`, `add_step`, `consolidate_claims` and both
+/// `ingest_document` paths — storing through the embedder's own unstamped pool.
+/// Seven callers of a broken store, fixed at two call sites. Both entry points
+/// now land here, so there is one place the tenancy argument has to be right.
+///
+/// # `begin_as`, not `acquire_as`
+///
+/// A stamped *connection* is what this needs, and `acquire_as` is the
+/// one-round-trip way to get one — but it hard-refuses
+/// `SessionGucMode::Transaction`, the transaction-pooler fallback `bin/server.rs`
+/// advertises to operators (`EPIGRAPH_SESSION_GUC_MODE=transaction`). A site
+/// written that way is unservable in a supported configuration and CI has no
+/// pgbouncer fixture to catch it, which is exactly the rule
+/// `epigraph-db/tests/no_unscoped_pool.rs` states for shard authors: reads
+/// convert onto the mode-dispatching helper, **writes target
+/// `ScopedPool::begin_as`**. So the single `UPDATE` runs in its own
+/// one-statement transaction.
+///
+/// # Why `store_embedding_if_unsealed` and not `store_embedding`
+///
+/// The pair exists because the read that decided this claim needs a vector and
+/// the write that stores one are separated by a provider round trip, and a claim
+/// can be SEALED inside the window. `store_embedding_if_unsealed` takes the row
+/// lock first and re-checks `claim_encryption` and `is_current` against a
+/// snapshot that includes anything committed during the wait, and it splices the
+/// viewer's `{WRITABLE:c}` predicate so the statement's own qual agrees with the
+/// session GUCs this connection was stamped with. Both halves must be the
+/// AUTHOR's viewer: the row is owned by the author's personal group, so a
+/// caller-viewer splice here would render a predicate no row satisfies while the
+/// GUCs said otherwise — a mismatch `#[sqlx::test]` cannot see, because that
+/// harness connects as a BYPASSRLS superuser.
+///
+/// # Errors
+///
+/// `Err(String)` when no vector could be stored for a reason the caller may want
+/// to name in its own log line: no `ScopedPool`, an author with no writable
+/// group, a failed stamp, a failed statement, or a failed commit. `Ok(false)`
+/// means the statement ran and matched no row — claim missing, sealed,
+/// superseded, or not writable by its author's viewer. Callers treat both as
+/// "not embedded"; CLAUDE.md's embedding policy forbids either from unwinding an
+/// already-committed claim.
+pub(crate) async fn store_embedding_author_stamped(
+    scoped: Option<&epigraph_db::ScopedPool>,
+    pool: &sqlx::PgPool,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    pgvec: &str,
+    tool_name: &'static str,
+) -> Result<bool, String> {
+    // `author_write_authority` has already logged the specific cause at ERROR on
+    // `tenancy.scoped_write`; its message is re-surfaced here so the caller's own
+    // warn line carries it too.
+    let (scoped, author_viewer) = author_write_authority(scoped, pool, author_agent_id, tool_name)
+        .await
+        .map_err(|e| e.message.to_string())?;
 
-    match stored {
-        Ok(true) => match tx.commit().await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(
-                    claim_id = %claim_id,
-                    tool = tool_name,
-                    "the embedding UPDATE succeeded but its transaction could not commit: {e}"
-                );
-                false
-            }
-        },
+    let mut tx = scoped
+        .begin_as(&author_viewer)
+        .await
+        .map_err(|e| format!("could not begin an author-stamped transaction: {e}"))?;
+
+    match ClaimRepository::store_embedding_if_unsealed(&mut tx, &author_viewer, claim_id, pgvec)
+        .await
+    {
+        Ok(true) => tx
+            .commit()
+            .await
+            .map(|()| true)
+            .map_err(|e| format!("the embedding UPDATE succeeded but could not commit: {e}")),
         Ok(false) => {
             // Four indistinguishable causes by construction: no such claim, a
             // claim sealed or superseded since the text was read, or a row this
             // viewer may not write. None of them is an error the caller can act
             // on, and all of them mean "no vector was stored".
-            tracing::warn!(
-                claim_id = %claim_id,
-                tool = tool_name,
-                "embedding store affected 0 rows (claim missing, sealed, superseded, or not \
-                 writable by its author's viewer)"
-            );
             let _ = tx.commit().await;
-            false
+            Ok(false)
         }
-        Err(e) => {
-            tracing::warn!(
-                claim_id = %claim_id,
-                tool = tool_name,
-                "embedding store failed on the author-stamped connection: {e}"
-            );
-            false
-        }
+        Err(e) => Err(format!(
+            "embedding store failed on the author-stamped connection: {e}"
+        )),
     }
 }
 

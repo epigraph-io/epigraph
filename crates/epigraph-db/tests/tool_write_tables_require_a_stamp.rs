@@ -502,7 +502,9 @@ async fn relabelling_a_foreign_groups_claim_is_refused_on_a_stamped_app_session(
         "the refusal must be the row-level security one, not an unrelated failure: {msg}"
     );
     assert!(
-        !labels_of(&pool, claim).await.contains(&"resolved".to_string()),
+        !labels_of(&pool, claim)
+            .await
+            .contains(&"resolved".to_string()),
         "nothing may be written on the refused path"
     );
 }

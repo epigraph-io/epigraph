@@ -271,3 +271,108 @@ async fn store_embedding_if_unsealed_is_refused_when_the_session_is_not_stamped(
         "nothing may be written on the refused path"
     );
 }
+
+// ===========================================================================
+// THE AUTHOR LOOKUP THE EMBEDDER'S STORE PATH DEPENDS ON.
+//
+// `McpEmbedder::store_vector` cannot take the author from its caller: seven of
+// its nine callers embed claims the INGEST EXECUTOR authored, and that executor
+// authors as `get_or_create_system_agent(pool)` rather than as the MCP server's
+// agent, so a caller-supplied author would stamp the wrong writable group and be
+// refused — silently, because the embed is best-effort. It therefore reads the
+// author off the row, on the SAME unstamped application pool.
+//
+// That read is load-bearing and it is not obviously safe: hard constraint #3 of
+// the write-path brief records that `SELECT id FROM groups WHERE did_key = …`
+// returns ZERO rows on this connection, because `groups_tenancy`'s USING has no
+// true arm for an unstamped session. The two arms below measure whether `claims`
+// differs, and WHY: migration 077's tier-A USING is
+// `bypass OR definer_bypass OR visibility = 'public' OR owner_group_id = ANY(session_groups)`,
+// so the public arm admits it — for a PUBLIC row and only for a public row.
+// ===========================================================================
+
+/// A group-private claim, to show the lookup's boundary.
+async fn seed_group_private_claim(pool: &PgPool, author: Uuid, group: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, 'author lookup: group-private', $2, 0.8, $3, true, 'group', $4)",
+    )
+    .bind(id)
+    .bind(&hash)
+    .bind(author)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed a group-private claim on the superuser harness connection");
+    id
+}
+
+/// **The mechanism's precondition.** On an UNSTAMPED `epigraph_app` session, a
+/// public claim's `agent_id` is readable through a viewer resolved over the NIL
+/// principal. Without this the embedder could not find the one viewer whose
+/// writable set satisfies `claims_tenancy`'s `WITH CHECK`, and every embed on the
+/// converted path would degrade to a warn.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_claims_author_is_readable_on_an_unstamped_app_session(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author-lookup").await;
+    let claim =
+        seed_author_owned_public_claim(&pool, author, author_group, "author lookup: public").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let public = Viewer::resolve(&pool, Uuid::nil())
+        .await
+        .expect("resolve the NIL principal");
+
+    let got = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", "").await;
+        let out = ClaimRepository::get_agent_id(&mut *conn, &public, claim).await;
+        (conn, out)
+    })
+    .await;
+
+    assert_eq!(
+        got.expect("the author lookup must not error"),
+        Some(author),
+        "a public claim's author must be readable on an unstamped app session. If this returns \
+         None, `claims_tenancy`'s USING lost its `visibility = 'public'` arm and \
+         `McpEmbedder::store_vector` can no longer resolve an author for ANY claim — every \
+         converted embed would degrade to a warn with no vector stored."
+    );
+}
+
+/// **The boundary, stated so it is not mistaken for a regression.** A
+/// group-private claim's author is NOT readable this way, so the embedder refuses
+/// with a named cause instead of stamping a viewer that cannot satisfy the check.
+///
+/// No MCP write path produces such a row today —
+/// `ClaimRepository::default_decl_for_author` declares
+/// `('public', personal_group_of(author))` — so this is a boundary rather than a
+/// live gap. If a write path ever starts declaring group visibility, this arm is
+/// where the embedder's author lookup has to be revisited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_private_claims_author_is_not_readable_that_way(pool: PgPool) {
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "author-lookup-priv").await;
+    let claim = seed_group_private_claim(&pool, author, author_group).await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let public = Viewer::resolve(&pool, Uuid::nil())
+        .await
+        .expect("resolve the NIL principal");
+
+    let got = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", "").await;
+        let out = ClaimRepository::get_agent_id(&mut *conn, &public, claim).await;
+        (conn, out)
+    })
+    .await;
+
+    assert_eq!(
+        got.expect("the author lookup must not error"),
+        None,
+        "a group-private claim must not be readable through a public viewer on an unstamped \
+         session; if it is, the tenancy predicate leaks and far more than the embedder is wrong"
+    );
+}
