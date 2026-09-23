@@ -1306,3 +1306,85 @@ async fn an_operated_writer_cannot_rewrite_its_operator_groups_identity(pool: Pg
     assert_eq!((creator_after, kind_after.as_str()), (operator, "personal"));
     assert!(membership_rows(&pool, op_group, z).await.is_empty());
 }
+
+/// Review finding (consolidate ignored the operator link): an operated agent
+/// that merges public claims owned by its operator's group gets a merged claim
+/// owned by the OPERATOR's group — the same authoring default every other
+/// write path uses — not by its own personal group.
+///
+/// CALIBRATION in the same test: an unlinked agent's all-public merge still
+/// lands in its own personal group, so the arm is the operator link and not a
+/// change to the default.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agents_merge_is_owned_by_the_operator_group(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (agent, own_group) = fixture::seed_agent_with_group(&pool, "operated").await;
+    let (unlinked, unlinked_group) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    link(&pool, agent, operator).await;
+
+    async fn public_claim(pool: &PgPool, author: Uuid, owner: Uuid, content: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                                 visibility, owner_group_id) \
+             VALUES ($1, $2, $3, 0.6, $4, true, 'public', $5)",
+        )
+        .bind(id)
+        .bind(content)
+        .bind(hash32(id))
+        .bind(author)
+        .bind(owner)
+        .execute(pool)
+        .await
+        .expect("seed public claim");
+        id
+    }
+
+    let s1 = public_claim(&pool, agent, op_group, "operated source alpha").await;
+    let s2 = public_claim(&pool, agent, op_group, "operated source beta").await;
+    let merged = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "operated merge of alpha and beta",
+        0.7,
+        epigraph_db::ConsolidateMode::Merge,
+        "operator-link consolidate test",
+        agent,
+    )
+    .await
+    .expect("consolidate by the operated agent")
+    .merged_id;
+
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(merged)
+        .fetch_one(&pool)
+        .await
+        .expect("merged owner");
+    assert_eq!(
+        owner, op_group,
+        "an operated agent's merged claim must be owned by its operator's group, not by its \
+         own ({own_group}); otherwise a model bump splits the job's work across groups again"
+    );
+
+    // CALIBRATION: unlinked actor, all-public sources -> its own group, as before.
+    let u1 = public_claim(&pool, unlinked, unlinked_group, "unlinked source alpha").await;
+    let u2 = public_claim(&pool, unlinked, unlinked_group, "unlinked source beta").await;
+    let merged = ClaimRepository::consolidate(
+        &pool,
+        &[u1, u2],
+        "unlinked merge of alpha and beta",
+        0.7,
+        epigraph_db::ConsolidateMode::Merge,
+        "operator-link consolidate calibration",
+        unlinked,
+    )
+    .await
+    .expect("consolidate by an unlinked agent")
+    .merged_id;
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(merged)
+        .fetch_one(&pool)
+        .await
+        .expect("merged owner");
+    assert_eq!(owner, unlinked_group);
+}

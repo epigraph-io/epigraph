@@ -8378,19 +8378,26 @@ impl ClaimRepository {
             });
         }
 
-        // ── The actor's own group, for the all-public case ──
+        // ── The actor's authoring default, for the all-public case ──
         //
         // AFTER the idempotent-return branch above, deliberately: that branch
         // ends in `tx.rollback()`, and resolving the group before it would make
         // a no-op retry perform a `groups` upsert and a `group_memberships`
         // upsert only to discard them.
         //
-        // `personal_group_of` reads first and mints only if absent -- see its
-        // doc for why calling `ensure_personal_group` unconditionally here
-        // would revive a revoked membership as a side effect of a merge.
+        // `default_decl_for_author`, not `personal_group_of`: an actor with an
+        // ACTING operator link (migration 102) authors into its OPERATOR's
+        // personal group, exactly as every other authoring path does, so a
+        // merge by a model-bumped job does not split its work across groups
+        // again (review finding: the merged claim landed in the agent's own
+        // group while every source sat in the operator's). An unlinked,
+        // revoked or retired actor falls through to `personal_group_of`, which
+        // reads first and mints only if absent -- see its doc for why calling
+        // `ensure_personal_group` unconditionally here would revive a revoked
+        // membership as a side effect of a merge.
         let decl = match merged_owner {
             Some(g) => TenancyDecl::group(g),
-            None => TenancyDecl::public(Self::personal_group_of(&mut tx, acting_agent_id).await?),
+            None => Self::default_decl_for_author(&mut tx, acting_agent_id).await?,
         };
 
         let merged_id = sqlx::query_scalar!(
