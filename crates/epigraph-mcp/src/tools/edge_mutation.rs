@@ -202,8 +202,10 @@ pub async fn do_delete_edge(
     let edge_id = parse_uuid(&params.edge_id)?;
     let pool = &server.pool;
 
-    // `EdgeRepository::delete` reports absence as `Ok(false)`, not
-    // `DbError::NotFound`, so the 404-equivalent is raised here.
+    // A retraction, not a delete (a6adf739): the row keeps `valid_to` and
+    // drops out of every display and belief read. `retract_by_id` reports
+    // "absent or already retracted" as `Ok(false)`, not `DbError::NotFound`, so
+    // the 404-equivalent is raised here.
     let deleted = EdgeRepository::retract_by_id(pool, edge_id)
         .await
         .map_err(map_edge_err)?;

@@ -33,10 +33,16 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
 /// workspace filtered on it (`get_current_edges`), and 6 of 987,857 production
 /// rows carried a value. Every belief-bearing read saw retracted edges as live.
 ///
-/// That absence is why `MatchCandidateRepo::retire` hard-DELETEs edges rather
-/// than retracting them — a soft retraction that nothing honours retracts
-/// nothing. Enforcing the predicate on the derivation path is the precondition
-/// for making retirement non-destructive.
+/// That absence is why `MatchCandidateRepo::retire` used to hard-DELETE edges
+/// rather than retract them — a soft retraction that nothing honours retracts
+/// nothing. Enforcing the predicate made retraction meaningful, and since
+/// a6adf739 every edge removal is a retraction.
+///
+/// Which reads must apply it is written down in
+/// `docs/architecture/edge-retraction-tiers.md`: the belief-bearing and display
+/// tiers do (display reads spell it statically where `sqlx::query!` needs a
+/// literal, pinned by `tests/edge_in_force_lint.rs`), the structural tier does
+/// not.
 ///
 /// `valid_to IS NULL` means "ongoing or atemporal" and is the overwhelmingly
 /// common case, so the predicate is written NULL-first to short-circuit.
@@ -1134,14 +1140,6 @@ impl EdgeRepository {
         })
     }
 
-    /// Delete an edge by ID
-    ///
-    /// # Returns
-    /// Returns `true` if the edge was deleted, `false` if it didn't exist.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
     /// Take a single edge out of force.
     ///
     /// Named `retract_by_id` rather than `delete` because it no longer deletes:
@@ -1153,6 +1151,14 @@ impl EdgeRepository {
     /// not exist OR was already retracted. Callers that raise a 404 on `false`
     /// therefore also 404 a double-retract, which matches the previous
     /// delete-twice behaviour.
+    ///
+    /// The retracted row is hidden from every display and belief-bearing read
+    /// (`docs/architecture/edge-retraction-tiers.md`); the structural endpoint
+    /// reads [`Self::get_by_source`] / [`Self::get_by_target`] still return it.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
     pub async fn retract_by_id(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
         let result = sqlx::query!(
             r#"
@@ -1169,19 +1175,15 @@ impl EdgeRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete all edges between two entities
-    ///
-    /// # Returns
-    /// Returns the number of edges deleted.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
     /// Take every edge between two entities out of force.
     ///
     /// Retraction, not deletion — see [`Self::retract_by_id`]. Currently has no
     /// callers in the workspace; converted anyway so a future caller cannot reach
     /// for a hard-delete primitive that should not exist.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
     pub async fn retract_between(
         pool: &PgPool,
         source_id: Uuid,

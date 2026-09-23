@@ -861,7 +861,15 @@ pub async fn create_edge(
 ///
 /// DELETE /api/v1/edges/:id
 ///
-/// Hard-deletes the edge. Returns 204 No Content on success, 404 if not found.
+/// RETRACTS the edge (`EdgeRepository::retract_by_id` sets `valid_to = now()`)
+/// rather than deleting the row, which survives for audit. Since the display
+/// tier honours `valid_to`, a retracted edge disappears from the neighbourhood
+/// and graph views and from every belief-bearing read; the claim neighbourhood
+/// can still show it with `?include_retracted=true`. See
+/// `docs/architecture/edge-retraction-tiers.md`.
+///
+/// Returns 204 No Content on success, 404 if the edge does not exist OR is
+/// already retracted.
 #[cfg(feature = "db")]
 pub async fn delete_edge(
     State(state): State<AppState>,

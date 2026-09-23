@@ -1360,16 +1360,20 @@ pub struct PatchEdgeResponse {
 }
 
 /// Parameters for the `delete_edge` MCP tool — mirrors
-/// `DELETE /api/v1/edges/:id`, which hard-deletes the row.
+/// `DELETE /api/v1/edges/:id`, which RETRACTS the edge (sets `valid_to`; the
+/// row is kept for audit).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
-    #[schemars(description = "UUID of the edge to hard-delete")]
+    #[schemars(description = "UUID of the edge to remove (retract)")]
     pub edge_id: String,
 }
 
 /// Response for the `delete_edge` MCP tool. `deleted` is always `true` on
-/// success — a missing edge is an error, not `deleted=false`, mirroring the
-/// route's 404.
+/// success and means "retracted": the row survives with `valid_to` set and is
+/// hidden from every display and belief read (see
+/// `docs/architecture/edge-retraction-tiers.md`). A missing or already
+/// retracted edge is an error, not `deleted=false`, mirroring the route's 404.
+/// The field name is kept for wire compatibility.
 #[derive(Debug, Serialize)]
 pub struct DeleteEdgeResponse {
     pub edge_id: String,

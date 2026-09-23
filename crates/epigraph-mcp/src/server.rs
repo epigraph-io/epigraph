@@ -1030,7 +1030,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Hard-delete an edge by id. MCP-native wrapper for DELETE /api/v1/edges/:id. IRREVERSIBLE and audit-destroying — use patch_edge with valid_to to retire an edge that merely stopped holding; delete is for edges that should never have existed (e.g. a mislabeled contradicts edge). Errors if the edge id does not exist. Emits edge.deleted. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the deleted edge."
+        description = "Remove an edge by id. MCP-native wrapper for DELETE /api/v1/edges/:id. Removal is a RETRACTION: valid_to is set to now and the row is kept for audit, so `deleted: true` means retracted. A retracted edge no longer appears in get_neighborhood / traverse (unless include_retracted=true, which flags it) or in any graph or belief read. Use patch_edge with a future valid_to to schedule an end instead. Errors if the edge id does not exist or is already retracted. Emits edge.deleted. NOTE: this does not invalidate the Dempster-Shafer mass function that edge creation wired onto the target claim — the target's cached belief still reflects the removed edge until it is recomputed."
     )]
     async fn delete_edge(
         &self,
