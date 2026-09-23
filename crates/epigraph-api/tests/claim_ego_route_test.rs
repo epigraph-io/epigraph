@@ -4,8 +4,23 @@
 //! Hermetic `#[sqlx::test]`: the degree-cap, balance and `total_edges`
 //! assertions count rows, so they only mean anything on a database that holds
 //! nothing but this test's fixtures.
+//!
+//! # Two fixture rules this file depends on
+//!
+//! `AppState` is built with `with_scoped_pool`, not `with_db`. Every other
+//! constructor leaves `scoped: None`, and `read_as` REFUSES in that case rather
+//! than falling back to the raw pool, so a converted handler 500s and every
+//! assertion below reads the error body.
+//!
+//! Every request carries a bearer. `ViewerExtractor` has no anonymous shape:
+//! the tenancy series moved 105 registrations from the public router to the
+//! protected one and the anonymous allowlist is two routes, neither of them
+//! this one. The arms that used to send no credential now assert 401.
 
 mod common;
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -17,11 +32,20 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn router(pool: PgPool) -> Router {
-    create_router(AppState::with_db(pool, ApiConfig::default()))
+async fn router(pool: &PgPool) -> Router {
+    create_router(AppState::with_scoped_pool(
+        fixture::scoped_pool(pool).await,
+        ApiConfig::default(),
+    ))
 }
 
-async fn get(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+/// A token for a principal with no group memberships: it reads exactly the
+/// public corpus, which is the default position of any signed-in stranger.
+fn reader() -> String {
+    common::mint_token_with_agent(&["claims:read"], Uuid::new_v4())
+}
+
+async fn raw(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, String, String) {
     let mut req = Request::builder().method(Method::GET).uri(path);
     if let Some(token) = bearer {
         req = req.header("authorization", format!("Bearer {token}"));
@@ -32,9 +56,18 @@ async fn get(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, 
         .await
         .unwrap();
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .unwrap_or_default();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, body)
+    (status, content_type, String::from_utf8_lossy(&bytes).into())
+}
+
+async fn get(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+    let (status, _, text) = raw(router, path, bearer).await;
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
 fn node_ids(body: &Value) -> Vec<String> {
@@ -125,9 +158,14 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
         common::insert_edge(&pool, center, out_neighbour, "claim", "claim", "supports").await;
     let in_edge =
         common::insert_edge(&pool, in_neighbour, center, "claim", "claim", "supports").await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{center}/ego"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
     assert_eq!(body["total_edges"], 2);
@@ -162,7 +200,6 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
             "is_current",
             "label",
             "labels",
-            "redacted",
             "truth_value",
         ],
         "pignistic_prob is omitted, not null, when the claim has none"
@@ -173,7 +210,6 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
     assert_eq!(body["center"]["content"], "the centre claim");
     assert_eq!(body["center"]["truth_value"], 0.5);
     assert_eq!(body["center"]["is_current"], Value::Bool(true));
-    assert_eq!(body["center"]["redacted"], Value::Bool(false));
 
     let ids = node_ids(&body);
     assert_eq!(ids.len(), 2, "both neighbours hydrated, got {body}");
@@ -211,9 +247,14 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_claim_is_404(pool: PgPool) {
-    let app = router(pool);
+    let app = router(&pool).await;
     let missing = Uuid::new_v4();
-    let (status, body) = get(&app, &format!("/api/v1/claims/{missing}/ego"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{missing}/ego"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["error"], "NotFound");
 }
@@ -227,12 +268,12 @@ async fn both_directions_get_half_the_budget(pool: PgPool) {
         let inb = common::seed_claim(&pool, &format!("in {i}")).await;
         common::insert_edge(&pool, inb, center, "claim", "claim", "supports").await;
     }
-    let app = router(pool);
+    let app = router(&pool).await;
 
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?max_degree=4"),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -256,12 +297,12 @@ async fn an_unused_half_goes_to_the_other_direction(pool: PgPool) {
     }
     let inb = common::seed_claim(&pool, "the only backlink").await;
     common::insert_edge(&pool, inb, center, "claim", "claim", "supports").await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?max_degree=6"),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -282,13 +323,13 @@ async fn max_degree_is_clamped_and_below_the_cap_nothing_is_truncated(pool: PgPo
     let b = common::seed_claim(&pool, "b").await;
     common::insert_edge(&pool, center, a, "claim", "claim", "supports").await;
     common::insert_edge(&pool, b, center, "claim", "claim", "supports").await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
     // 0 clamps up to 1: one edge, and `truncated` says so.
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?max_degree=0"),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -300,7 +341,7 @@ async fn max_degree_is_clamped_and_below_the_cap_nothing_is_truncated(pool: PgPo
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?max_degree=99999"),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -320,9 +361,14 @@ async fn retracted_edges_are_excluded(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("retract edge");
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{center}/ego"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
     assert_eq!(
@@ -350,9 +396,14 @@ async fn non_claim_neighbours_are_hydrated_and_unknown_types_fall_back(pool: PgP
     let activity = seed_activity(&pool).await;
     common::insert_edge(&pool, center, activity, "claim", "activity", "produced").await;
 
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{center}/ego"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(node_ids(&body).len(), 4, "body: {body}");
 
@@ -387,12 +438,12 @@ async fn relationship_filter_is_case_insensitive(pool: PgPool) {
     // The corpus holds both spellings of the same relationship.
     common::insert_edge(&pool, center, supported, "claim", "claim", "SUPPORTS").await;
     common::insert_edge(&pool, center, refuted, "claim", "claim", "refutes").await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?relationships=supports"),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -406,7 +457,7 @@ async fn relationship_filter_is_case_insensitive(pool: PgPool) {
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?relationships="),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -428,32 +479,48 @@ async fn a_private_neighbour_and_its_edges_are_dropped_for_everyone_but_its_owne
         "supports",
     )
     .await;
-    common::insert_edge(&pool, secret, center, "claim", "claim", "supports").await;
+    let secret_edge =
+        common::insert_edge(&pool, secret, center, "claim", "claim", "supports").await;
     common::seed_private_ownership(&pool, secret, owner).await;
-    let app = router(pool);
 
+    // THE TRAP THIS LINE EXISTS TO DISARM. Migration 070 makes an edge inherit
+    // its endpoints' tenancy, so an edge stamped by the trigger AFTER the
+    // neighbour went private would be excluded by the EDGE predicate alone and
+    // this test would stay green with the far-endpoint `claims` predicate
+    // deleted. Forcing the edge public leaves that predicate as the only thing
+    // that can withhold the node.
+    sqlx::query("UPDATE edges SET visibility = 'public', co_owner_group_id = NULL WHERE id = $1")
+        .bind(secret_edge)
+        .execute(&pool)
+        .await
+        .expect("force the connecting edge public");
+
+    let app = router(&pool).await;
     let path = format!("/api/v1/claims/{center}/ego");
 
-    // Anonymous: the neighbour and the edge to it are gone, not redacted —
-    // a bare claim id plus a relationship already says too much.
-    let (status, body) = get(&app, &path, None).await;
+    // No credential at all: 401, because there is no anonymous read of claim
+    // content left anywhere on this router.
+    let (status, _, _) = raw(&app, &path, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A signed-in stranger: the neighbour and the edge to it are GONE, not
+    // blanked — a bare claim id plus a relationship already says too much.
+    let stranger = reader();
+    let (status, body) = get(&app, &path, Some(&stranger)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
     assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
     assert_eq!(body["center"]["content"], "public centre");
 
-    // A spoofed query parameter buys nothing.
-    let (status, body) = get(&app, &format!("{path}?agent_id={owner}"), None).await;
+    // A spoofed query parameter buys nothing: visibility comes from the token's
+    // principal and never from the wire.
+    let (status, body) = get(&app, &format!("{path}?agent_id={owner}"), Some(&stranger)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
 
-    // A stranger's token.
-    let stranger = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
-    let (status, body) = get(&app, &path, Some(&stranger)).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(node_ids(&body), vec![public_neighbour.to_string()]);
-
-    // The owner sees both, with content.
+    // The owner sees both, with content. CALIBRATION: without this arm the
+    // stranger assertions would pass just as well against a handler that
+    // returned nothing at all.
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
     let (status, body) = get(&app, &path, Some(&owner_token)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -463,39 +530,53 @@ async fn a_private_neighbour_and_its_edges_are_dropped_for_everyone_but_its_owne
     want.sort();
     assert_eq!(ids, want);
     assert_eq!(node(&body, secret)["content"], "classified neighbour");
-    assert_eq!(node(&body, secret)["redacted"], Value::Bool(false));
     assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_private_centre_returns_itself_redacted_and_nothing_else(pool: PgPool) {
+async fn a_private_centre_is_the_same_404_as_a_claim_that_does_not_exist(pool: PgPool) {
     let owner = Uuid::new_v4();
     let center = common::seed_claim_with_agent(&pool, "classified centre", owner).await;
     let neighbour = common::seed_claim(&pool, "public neighbour").await;
     common::insert_edge(&pool, center, neighbour, "claim", "claim", "supports").await;
     common::seed_private_ownership(&pool, center, owner).await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
     let path = format!("/api/v1/claims/{center}/ego");
+    let stranger = reader();
 
-    let (status, body) = get(&app, &path, None).await;
-    assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body["center"]["id"], center.to_string());
-    assert_eq!(body["center"]["content"], "[REDACTED]");
-    assert_eq!(body["center"]["label"], "[REDACTED]");
-    assert_eq!(body["center"]["redacted"], Value::Bool(true));
-    assert_eq!(body["nodes"], serde_json::json!([]));
-    assert_eq!(body["edges"], serde_json::json!([]));
+    // Byte-identical to the answer for a uuid that names nothing, modulo the
+    // echoed id. A status-code-only assertion would pass while the oracle
+    // stood: the old shape here was a 200 carrying the centre with a zeroed
+    // degree, which confirmed the claim existed.
+    let (private_status, private_ct, private_body) = raw(&app, &path, Some(&stranger)).await;
+    assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
+
+    let absent = Uuid::new_v4();
+    let (absent_status, absent_ct, absent_body) = raw(
+        &app,
+        &format!("/api/v1/claims/{absent}/ego"),
+        Some(&stranger),
+    )
+    .await;
     assert_eq!(
-        body["total_edges"], 0,
-        "the degree of an unreadable claim is itself withheld, got {body}"
+        private_status, absent_status,
+        "status must not discriminate"
+    );
+    assert_eq!(private_ct, absent_ct, "content-type must not discriminate");
+    assert_eq!(
+        private_body.replace(&center.to_string(), "<ID>"),
+        absent_body.replace(&absent.to_string(), "<ID>"),
+        "the body must not discriminate either: a private claim and a \
+         nonexistent one are one answer"
     );
 
+    // CALIBRATION: the owner still gets the whole ego view, so the assertions
+    // above are about tenancy and not about a route that 404s unconditionally.
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
     let (status, body) = get(&app, &path, Some(&owner_token)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["center"]["content"], "classified centre");
-    assert_eq!(body["center"]["redacted"], Value::Bool(false));
     assert_eq!(node_ids(&body), vec![neighbour.to_string()]);
     assert_eq!(body["total_edges"], 1);
 }
@@ -506,9 +587,14 @@ async fn long_labels_are_cut_on_a_char_boundary(pool: PgPool) {
     // land inside a character and panic the handler.
     let content = "é".repeat(200);
     let center = common::seed_claim(&pool, &content).await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{center}/ego"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{center}/ego"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     let label = body["center"]["label"].as_str().expect("label");
     assert_eq!(label.chars().count(), 160);
@@ -520,11 +606,10 @@ async fn long_labels_are_cut_on_a_char_boundary(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn total_edges_excludes_the_edges_redaction_dropped(pool: PgPool) {
+async fn total_edges_excludes_edges_the_viewer_cannot_see(pool: PgPool) {
     // Two private neighbours and one public one. Serialising the database
-    // degree would tell an anonymous caller that exactly two neighbours are
-    // being withheld — the metadata this route already refuses to publish for
-    // a redacted centre.
+    // degree would tell a stranger that exactly two neighbours are being
+    // withheld — the same metadata leak as returning them, dressed as a count.
     let owner = Uuid::new_v4();
     let center = common::seed_claim(&pool, "public centre").await;
     let public_neighbour = common::seed_claim(&pool, "public neighbour").await;
@@ -539,26 +624,37 @@ async fn total_edges_excludes_the_edges_redaction_dropped(pool: PgPool) {
         "supports",
     )
     .await;
-    common::insert_edge(&pool, center, secret_a, "claim", "claim", "supports").await;
-    common::insert_edge(&pool, secret_b, center, "claim", "claim", "supports").await;
+    let edge_a = common::insert_edge(&pool, center, secret_a, "claim", "claim", "supports").await;
+    let edge_b = common::insert_edge(&pool, secret_b, center, "claim", "claim", "supports").await;
     common::seed_private_ownership(&pool, secret_a, owner).await;
     common::seed_private_ownership(&pool, secret_b, owner).await;
-    let app = router(pool);
+    // Force both connecting edges PUBLIC. Migration 070's edge-inherits-
+    // endpoint-tenancy would otherwise satisfy this assertion through the EDGE
+    // predicate alone, and the test would stay green with the far-endpoint
+    // `claims` predicate — the thing it exists to test — deleted.
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', co_owner_group_id = NULL WHERE id = ANY($1)",
+    )
+    .bind(vec![edge_a, edge_b])
+    .execute(&pool)
+    .await
+    .expect("force the connecting edges public");
+    let app = router(&pool).await;
 
     let path = format!("/api/v1/claims/{center}/ego");
 
-    // Anonymous: one visible edge, and `total_edges` says one — not three.
-    let (status, body) = get(&app, &path, None).await;
+    // A stranger: one visible edge, and `total_edges` says one — not three.
+    let (status, body) = get(&app, &path, Some(&reader())).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
     assert_eq!(
         body["total_edges"], 1,
-        "`total_edges` must not count the edges redaction dropped, got {body}"
+        "`total_edges` must not count edges whose far endpoint is invisible, got {body}"
     );
     assert_eq!(
         body["truncated"],
         Value::Bool(false),
-        "redaction is not cap-truncation, got {body}"
+        "invisibility is not cap-truncation, got {body}"
     );
 
     // The owner sees the whole degree, so this cannot pass by always reporting
@@ -572,7 +668,7 @@ async fn total_edges_excludes_the_edges_redaction_dropped(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_degree_cap_and_redaction_subtract_independently(pool: PgPool) {
+async fn the_degree_cap_and_invisibility_subtract_independently(pool: PgPool) {
     // Four public neighbours and one private one, capped at 2. `truncated`
     // must stay true (the cap really did cut the list) while `total_edges`
     // drops to the four edges this caller is allowed to know about.
@@ -583,24 +679,30 @@ async fn the_degree_cap_and_redaction_subtract_independently(pool: PgPool) {
         common::insert_edge(&pool, center, n, "claim", "claim", "supports").await;
     }
     let secret = common::seed_claim_with_agent(&pool, "classified", owner).await;
-    common::insert_edge(&pool, secret, center, "claim", "claim", "supports").await;
+    let secret_edge =
+        common::insert_edge(&pool, secret, center, "claim", "claim", "supports").await;
     common::seed_private_ownership(&pool, secret, owner).await;
-    let app = router(pool);
+    sqlx::query("UPDATE edges SET visibility = 'public', co_owner_group_id = NULL WHERE id = $1")
+        .bind(secret_edge)
+        .execute(&pool)
+        .await
+        .expect("force the connecting edge public");
+    let app = router(&pool).await;
 
-    // max_degree=2 with 4 outbound and 1 inbound: the balanced split takes one
-    // from each side, so the single inbound edge taken IS the private one and
-    // redaction then drops it.
+    // max_degree=2 with 4 outbound and 1 inbound: the inbound side of the
+    // balanced split now has nothing visible to offer, so both slots go to
+    // outbound rather than one of them being spent on a node that is dropped.
     let (status, body) = get(
         &app,
         &format!("/api/v1/claims/{center}/ego?max_degree=2"),
-        None,
+        Some(&reader()),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(
         body["edges"].as_array().expect("edges").len(),
-        1,
-        "one of the two capped edges was the private one, got {body}"
+        2,
+        "the cap is spent entirely on edges this caller can see, got {body}"
     );
     assert_eq!(
         body["truncated"],
@@ -612,7 +714,7 @@ async fn the_degree_cap_and_redaction_subtract_independently(pool: PgPool) {
         "five edges exist but only four are this caller's to count, got {body}"
     );
 
-    // The owner: same cap, nothing redacted, full degree reported.
+    // The owner: same cap, nothing hidden, full degree reported.
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
     let (status, body) = get(
         &app,

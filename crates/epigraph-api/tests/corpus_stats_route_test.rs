@@ -4,8 +4,20 @@
 //! Counts are asserted as deltas around a baseline read: a migrated database
 //! may already contain rows, and the point of the route is that the numbers
 //! track the corpus, not that they start at zero.
+//!
+//! Post-tenancy they track the corpus **this viewer can read**, which is what
+//! the fourth arm asserts: the owner's claim count is exactly one higher than
+//! a stranger's when one group-private claim exists.
+//!
+//! `AppState` is built with `with_scoped_pool`: every other constructor leaves
+//! `scoped: None` and `read_as` refuses rather than falling back to the raw
+//! pool. Every request carries a bearer, because `ViewerExtractor` has no
+//! anonymous shape.
 
 mod common;
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -17,17 +29,27 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn router(pool: PgPool) -> Router {
-    create_router(AppState::with_db(pool, ApiConfig::default()))
+async fn router(pool: &PgPool) -> Router {
+    create_router(AppState::with_scoped_pool(
+        fixture::scoped_pool(pool).await,
+        ApiConfig::default(),
+    ))
 }
 
-async fn stats(router: &Router) -> Value {
+/// A token for a principal with no group memberships: it reads exactly the
+/// public corpus.
+fn reader() -> String {
+    common::mint_token_with_agent(&["claims:read"], Uuid::new_v4())
+}
+
+async fn stats_as(router: &Router, bearer: &str) -> Value {
     let resp = router
         .clone()
         .oneshot(
             Request::builder()
                 .method(Method::GET)
                 .uri("/api/v1/stats")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -73,8 +95,9 @@ async fn seed_frame(pool: &PgPool) -> Uuid {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn counts_track_the_rows_that_were_seeded(pool: PgPool) {
-    let app = router(pool.clone());
-    let before = stats(&app).await;
+    let app = router(&pool).await;
+    let token = reader();
+    let before = stats_as(&app, &token).await;
 
     // 3 claims (one of them a labelled workflow, one of them embedded),
     // 1 agent, 1 edge, 1 evidence row, 1 frame.
@@ -95,7 +118,7 @@ async fn counts_track_the_rows_that_were_seeded(pool: PgPool) {
     .await
     .expect("set an embedding");
 
-    let after = stats(&app).await;
+    let after = stats_as(&app, &token).await;
 
     // `seed_claim` also inserts a system agent per call, so claims and agents
     // move together; assert the deltas rather than absolute numbers.
@@ -115,8 +138,8 @@ async fn counts_track_the_rows_that_were_seeded(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_response_has_exactly_the_documented_keys(pool: PgPool) {
-    let app = router(pool);
-    let body = stats(&app).await;
+    let app = router(&pool).await;
+    let body = stats_as(&app, &reader()).await;
 
     let mut keys: Vec<&str> = body
         .as_object()
@@ -160,14 +183,53 @@ async fn the_response_has_exactly_the_documented_keys(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_workflow_is_a_labelled_claim_not_a_workflows_row(pool: PgPool) {
-    let app = router(pool.clone());
-    let before = count(&stats(&app).await, "workflows");
+    let app = router(&pool).await;
+    let token = reader();
+    let before = count(&stats_as(&app, &token).await, "workflows");
 
     // The definition MCP `system_stats` has always used. A claim with some
     // other label must not move the number.
     common::seed_claim_with_labels(&pool, "not a workflow", &["method"]).await;
-    assert_eq!(count(&stats(&app).await, "workflows"), before);
+    assert_eq!(count(&stats_as(&app, &token).await, "workflows"), before);
 
     common::seed_claim_with_labels(&pool, "a workflow", &["workflow", "method"]).await;
-    assert_eq!(count(&stats(&app).await, "workflows"), before + 1);
+    assert_eq!(
+        count(&stats_as(&app, &token).await, "workflows"),
+        before + 1
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_private_claim_counts_for_its_owner_and_not_for_a_stranger(pool: PgPool) {
+    // The counts are per-viewer now, and this is the arm that says so. Both
+    // directions are asserted: a route that counted nothing would satisfy the
+    // stranger half alone.
+    let (owner, _group) = fixture::seed_agent_with_group(&pool, "stats-owner").await;
+    let app = router(&pool).await;
+
+    let stranger = reader();
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+
+    let stranger_before = count(&stats_as(&app, &stranger).await, "claims");
+    let owner_before = count(&stats_as(&app, &owner_token).await, "claims");
+
+    let public = common::seed_claim(&pool, "a public claim").await;
+    let secret = common::seed_claim_with_agent(&pool, "a group-private claim", owner).await;
+    common::seed_private_ownership(&pool, secret, owner).await;
+    let _ = public;
+
+    let stranger_after = count(&stats_as(&app, &stranger).await, "claims");
+    let owner_after = count(&stats_as(&app, &owner_token).await, "claims");
+
+    assert_eq!(
+        stranger_after - stranger_before,
+        1,
+        "a stranger counts the public claim and not the private one"
+    );
+    assert_eq!(
+        owner_after - owner_before,
+        2,
+        "the owner counts both, so the stranger's number is a filter and not a \
+         route that undercounts for everyone"
+    );
 }

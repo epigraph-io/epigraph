@@ -6,8 +6,16 @@
 //! clustered case feeds the returned ids straight back into
 //! `/graph/communities/:id/expand` and `/graph/neighborhoods/:id/expand` and
 //! asserts they resolve.
+//!
+//! `AppState` is built with `with_scoped_pool`: every other constructor leaves
+//! `scoped: None` and `read_as` refuses rather than falling back to the raw
+//! pool. Every request carries a bearer, because `ViewerExtractor` has no
+//! anonymous shape.
 
 mod common;
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -19,11 +27,20 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn router(pool: PgPool) -> Router {
-    create_router(AppState::with_db(pool, ApiConfig::default()))
+async fn router(pool: &PgPool) -> Router {
+    create_router(AppState::with_scoped_pool(
+        fixture::scoped_pool(pool).await,
+        ApiConfig::default(),
+    ))
 }
 
-async fn raw(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, axum::body::Bytes) {
+/// A token for a principal with no group memberships: it reads exactly the
+/// public corpus.
+fn reader() -> String {
+    common::mint_token_with_agent(&["claims:read"], Uuid::new_v4())
+}
+
+async fn raw(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, String, String) {
     let mut req = Request::builder().method(Method::GET).uri(path);
     if let Some(token) = bearer {
         req = req.header("authorization", format!("Bearer {token}"));
@@ -34,16 +51,18 @@ async fn raw(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, 
         .await
         .unwrap();
     let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or_default().to_string())
+        .unwrap_or_default();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, bytes)
+    (status, content_type, String::from_utf8_lossy(&bytes).into())
 }
 
 async fn get(router: &Router, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
-    let (status, bytes) = raw(router, path, bearer).await;
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-    )
+    let (status, _, text) = raw(router, path, bearer).await;
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
 /// A complete clustering run around one claim: theme, cluster and
@@ -134,9 +153,14 @@ async fn seed_clustered(pool: &PgPool, content: &str) -> Clustered {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unclustered_claim_is_all_null(pool: PgPool) {
     let claim_id = common::seed_claim(&pool, "never clustered").await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{claim_id}/placement"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{claim_id}/placement"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     // All-null is a normal answer, not an error: clustering is
     // operator-triggered and only leaf claims get neighbourhoods.
@@ -155,9 +179,14 @@ async fn an_unclustered_claim_is_all_null(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_claim_is_404(pool: PgPool) {
-    let app = router(pool);
+    let app = router(&pool).await;
     let missing = Uuid::new_v4();
-    let (status, body) = get(&app, &format!("/api/v1/claims/{missing}/placement"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{missing}/placement"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
     assert_eq!(body["error"], "NotFound");
 }
@@ -166,9 +195,14 @@ async fn missing_claim_is_404(pool: PgPool) {
 async fn a_clustered_claim_returns_ids_that_expand_accepts(pool: PgPool) {
     let seeded = seed_clustered(&pool, "a clustered claim").await;
     let claim_id = seeded.claim_id;
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{claim_id}/placement"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{claim_id}/placement"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
     let mut keys: Vec<&str> = body
@@ -203,7 +237,7 @@ async fn a_clustered_claim_returns_ids_that_expand_accepts(pool: PgPool) {
     // Both expand routes are on the protected router, so they need a bearer.
     let token = common::test_bearer_token_with_scopes(&["graph:read"]);
     let cluster_id = body["cluster_id"].as_str().expect("cluster_id");
-    let (status, bytes) = raw(
+    let (status, _, text) = raw(
         &app,
         &format!("/api/v1/graph/communities/{cluster_id}/expand"),
         Some(&token),
@@ -212,12 +246,11 @@ async fn a_clustered_claim_returns_ids_that_expand_accepts(pool: PgPool) {
     assert_eq!(
         status,
         StatusCode::OK,
-        "community expand rejected an id placement handed out: {}",
-        String::from_utf8_lossy(&bytes)
+        "community expand rejected an id placement handed out: {text}"
     );
 
     let neighborhood_id = body["neighborhood_id"].as_str().expect("neighborhood_id");
-    let (status, bytes) = raw(
+    let (status, _, text) = raw(
         &app,
         &format!("/api/v1/graph/neighborhoods/{neighborhood_id}/expand"),
         Some(&token),
@@ -226,8 +259,7 @@ async fn a_clustered_claim_returns_ids_that_expand_accepts(pool: PgPool) {
     assert_eq!(
         status,
         StatusCode::OK,
-        "neighborhood expand rejected an id placement handed out: {}",
-        String::from_utf8_lossy(&bytes)
+        "neighborhood expand rejected an id placement handed out: {text}"
     );
 }
 
@@ -243,9 +275,14 @@ async fn a_newer_run_hides_the_previous_runs_ids(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("seed newer run");
-    let app = router(pool);
+    let app = router(&pool).await;
 
-    let (status, body) = get(&app, &format!("/api/v1/claims/{claim_id}/placement"), None).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/v1/claims/{claim_id}/placement"),
+        Some(&reader()),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["cluster_id"], Value::Null);
     assert_eq!(body["neighborhood_id"], Value::Null);
@@ -259,18 +296,14 @@ async fn a_newer_run_hides_the_previous_runs_ids(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_private_claims_placement_is_withheld_from_everyone_but_its_owner(pool: PgPool) {
-    let owner = Uuid::new_v4();
+async fn a_private_claims_placement_is_the_same_404_as_a_missing_claim(pool: PgPool) {
+    let (owner, _owner_group) = fixture::seed_agent_with_group(&pool, "placement-owner").await;
     let seeded = seed_clustered(&pool, "classified but clustered").await;
     let claim_id = seeded.claim_id;
-    // Re-point the claim at the owner so `private` ownership is coherent.
-    let pk: Vec<u8> = owner.as_bytes().iter().copied().cycle().take(32).collect();
-    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
-        .bind(owner)
-        .bind(&pk)
-        .execute(&pool)
-        .await
-        .expect("seed owner agent");
+    // Re-point the claim at the owner so the private stamp is coherent with
+    // its authorship, then stamp it group-private to that owner's personal
+    // group. `seed_private_ownership` asserts the read-back, so a fixture that
+    // silently failed to stamp cannot leave this test green.
     sqlx::query("UPDATE claims SET agent_id = $1 WHERE id = $2")
         .bind(owner)
         .bind(claim_id)
@@ -278,32 +311,41 @@ async fn a_private_claims_placement_is_withheld_from_everyone_but_its_owner(pool
         .await
         .expect("reassign claim");
     common::seed_private_ownership(&pool, claim_id, owner).await;
-    let app = router(pool);
+    let app = router(&pool).await;
 
     let path = format!("/api/v1/claims/{claim_id}/placement");
 
-    // A theme or cluster id is a pointer into a view that renders the claim's
-    // text, so a caller who may not read the claim gets the all-null answer.
-    for (who, token) in [
-        ("anonymous", None),
-        (
-            "stranger",
-            Some(common::mint_token_with_agent(
-                &["claims:read"],
-                Uuid::new_v4(),
-            )),
-        ),
-    ] {
-        let (status, body) = get(&app, &path, token.as_deref()).await;
-        assert_eq!(status, StatusCode::OK, "{who}: {body}");
-        assert_eq!(body["claim_id"], claim_id.to_string(), "{who}");
-        assert_eq!(body["theme_id"], Value::Null, "{who}: {body}");
-        assert_eq!(body["cluster_id"], Value::Null, "{who}: {body}");
-        assert_eq!(body["neighborhood_id"], Value::Null, "{who}: {body}");
-        assert_eq!(body["cluster_run_id"], Value::Null, "{who}: {body}");
-        assert_eq!(body["run_completed_at"], Value::Null, "{who}: {body}");
-    }
+    // No credential: 401.
+    let (status, _, _) = raw(&app, &path, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+    // A signed-in stranger gets the 404 a nonexistent uuid gets, byte for byte
+    // modulo the echoed id. The old shape was a 200 with every field null —
+    // not a "[REDACTED]" string, but the same disclosure: it echoed the id
+    // back, which confirms the claim exists.
+    let stranger = reader();
+    let (private_status, private_ct, private_body) = raw(&app, &path, Some(&stranger)).await;
+    assert_eq!(private_status, StatusCode::NOT_FOUND, "{private_body}");
+
+    let absent = Uuid::new_v4();
+    let (absent_status, absent_ct, absent_body) = raw(
+        &app,
+        &format!("/api/v1/claims/{absent}/placement"),
+        Some(&stranger),
+    )
+    .await;
+    assert_eq!(
+        private_status, absent_status,
+        "status must not discriminate"
+    );
+    assert_eq!(private_ct, absent_ct, "content-type must not discriminate");
+    assert_eq!(
+        private_body.replace(&claim_id.to_string(), "<ID>"),
+        absent_body.replace(&absent.to_string(), "<ID>"),
+        "the body must not discriminate either"
+    );
+
+    // CALIBRATION: the owner still gets the full placement.
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
     let (status, body) = get(&app, &path, Some(&owner_token)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
