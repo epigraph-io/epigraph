@@ -241,14 +241,40 @@ async fn an_http_listener_refuses_a_signer_that_already_has_an_operator_link(poo
         Outcome::Exited { code, stderr } => {
             assert_ne!(code, Some(0), "the refusal must be a failing exit");
             assert!(
-                stderr.contains("has a live operator link")
-                    && stderr.contains(&operator.to_string()),
+                stderr.contains("has an operator link") && stderr.contains(&operator.to_string()),
                 "stderr must name the link that refused the listener; got:\n{stderr}"
             );
         }
         Outcome::Serving { stderr } => panic!(
             "an HTTP listener whose signer is OPERATED started serving: every caller would write \
              into the operator's group.\n{stderr}"
+        ),
+    }
+
+    // A RETIRED link on the signer refuses too: the gate reads the AUTHOR
+    // record, retired included, because the operator would otherwise own every
+    // HTTP caller's claims (the signer authors them all).
+    let (retired, retired_key) = register_signer(&pool, 0x65).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, operator)
+        .await
+        .expect("record a retired link on the signer");
+    drop(conn);
+    let url = db_url.clone();
+    match tokio::task::spawn_blocking(move || spawn_listener(&url, &retired_key))
+        .await
+        .expect("join")
+    {
+        Outcome::Exited { code, stderr } => {
+            assert_ne!(code, Some(0), "the refusal must be a failing exit");
+            assert!(
+                stderr.contains("has an operator link") && stderr.contains("a retired link"),
+                "stderr must name the retired link that refused the listener; got:\n{stderr}"
+            );
+        }
+        Outcome::Serving { stderr } => panic!(
+            "an HTTP listener whose signer has a RETIRED link started serving: the operator would \
+             own every caller's claims.\n{stderr}"
         ),
     }
 }

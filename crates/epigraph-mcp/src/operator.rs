@@ -25,12 +25,23 @@
 //! signer agent. If that signer were operated, every OAuth caller would write
 //! into the operator's group and inherit the operator's ownership. So
 //! [`check_operator_transport`] refuses `--operator-id` with `--listen` before
-//! any database work, and [`refuse_operated_http_signer`] refuses to start an
-//! HTTP listener whose signer ALREADY has a live operator link (recorded by some
-//! earlier stdio process under the same key).
+//! any database work, [`refuse_operated_http_signer`] refuses to start an HTTP
+//! listener whose signer ALREADY has an operator link (recorded by some earlier
+//! stdio process under the same key, or as a retired link), and
+//! [`refuse_linked_http_signer`] re-checks the same predicate on EVERY HTTP tool
+//! call, so a link recorded after the listener started takes effect as a
+//! refusal at once rather than at the next restart.
+//!
+//! Both HTTP checks read the AUTHOR record (`AgentRepository::operator_of_author`,
+//! retired links included), not the actor read. That is a REFUSAL-only use of
+//! "whose are this agent's claims?": an HTTP signer with any link record would
+//! either author into the operator's group (an acting link) or hand the operator
+//! ownership of every HTTP caller's claims (either kind), and both are the
+//! failure the listener must not serve through.
 
+use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
-use epigraph_db::{AgentRepository, OperatorLinkOutcome};
+use epigraph_db::{AgentRepository, AuthorOperator, OperatorLinkOutcome};
 use uuid::Uuid;
 
 /// Refuse `--operator-id` / `EPIGRAPH_OPERATOR_ID` on an HTTP listener, and on a
@@ -77,8 +88,9 @@ pub fn check_operator_transport(
     Ok(())
 }
 
-/// Refuse to serve HTTP when this process's signer agent already has a live
-/// operator link.
+/// Refuse to serve HTTP when this process's signer agent already has an
+/// operator link of either kind (see the module doc for why the author record,
+/// retired links included, is the predicate).
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
@@ -106,7 +118,7 @@ pub async fn refuse_operated_http_signer(
         .acquire()
         .await
         .map_err(|e| format!("could not acquire a connection for the operator-link check: {e}"))?;
-    let link = AgentRepository::operator_actor(&mut conn, agent_id)
+    let link = AgentRepository::operator_of_author(&mut conn, agent_id)
         .await
         .map_err(|e| {
             format!(
@@ -114,17 +126,70 @@ pub async fn refuse_operated_http_signer(
                  link (is migration 102 applied?): {e}"
             )
         })?;
-    let Some(link) = link else {
-        return Ok(());
+    match link {
+        None => Ok(()),
+        Some(link) => Err(linked_http_signer_reason(agent_id, &link)),
+    }
+}
+
+/// The refusal text shared by the startup gate and the per-call guard.
+fn linked_http_signer_reason(agent_id: Uuid, link: &AuthorOperator) -> String {
+    let kind = if link.retired {
+        "a retired link"
+    } else {
+        "an acting link"
     };
-    Err(format!(
-        "this HTTP listener's signer agent {agent_id} has a live operator link to {}. An HTTP \
-         listener authors every caller's claims as that one agent, so every caller would write \
-         into the operator's personal group with the operator's ownership. Run the listener \
-         under a different --agent-key, or revoke the agent's membership in the operator's \
-         personal group.",
+    format!(
+        "this HTTP listener's signer agent {agent_id} has an operator link to {} ({kind}). An \
+         HTTP listener authors every caller's claims as that one agent, so every caller would \
+         write with the operator's ownership. Run the listener under a different --agent-key; \
+         the link record is permanent.",
         link.operator_id
-    ))
+    )
+}
+
+/// Per-call twin of [`refuse_operated_http_signer`]: refuse an HTTP tool call
+/// while this server's signer agent has an operator link of either kind.
+///
+/// The startup gate runs once. Every write re-reads the operator records
+/// (`default_decl_for_author`, `require_owner_or_admin`), so a link recorded
+/// AFTER the listener started — a stdio process under the same `--agent-key` or
+/// `--agent-model` identity with `EPIGRAPH_OPERATOR_ID` set, or a retired link
+/// recorded by an operator — would otherwise take effect immediately and stay
+/// live until the next restart. `server::call_tool` calls this on every HTTP
+/// call, before dispatch, so the listener refuses instead.
+///
+/// Logged at ERROR: it is a deployment fault, not a caller error. A failed
+/// lookup also refuses — the guard does not serve on an answer it did not get.
+///
+/// # Errors
+/// An `McpError` naming the link, or the lookup failure.
+pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), McpError> {
+    let agent_id = server.agent_id().await?;
+    match AgentRepository::operator_of_author_pool(&server.pool, agent_id).await {
+        Ok(None) => Ok(()),
+        Ok(Some(link)) => {
+            let reason = linked_http_signer_reason(agent_id, &link);
+            tracing::error!(
+                agent = %agent_id,
+                operator = %link.operator_id,
+                retired = link.retired,
+                "refusing an HTTP tool call: {reason}"
+            );
+            Err(internal_error(format!("refused: {reason}")))
+        }
+        Err(e) => {
+            tracing::error!(
+                agent = %agent_id,
+                error = %e,
+                "refusing an HTTP tool call: could not check the signer's operator link"
+            );
+            Err(internal_error(format!(
+                "refused: could not verify that this HTTP listener's signer agent {agent_id} \
+                 has no operator link: {e}"
+            )))
+        }
+    }
 }
 
 /// Record `operator` as the operator of this server's own signer agent and log

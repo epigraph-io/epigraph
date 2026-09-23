@@ -2023,6 +2023,20 @@ impl ServerHandler for EpiGraphMcpFull {
                     .await;
                 return Err(err);
             }
+            // An HTTP listener must never serve as an operator-linked signer
+            // (migration 102): it authors every caller's claims as this one
+            // agent. The startup gate (`operator::refuse_operated_http_signer`)
+            // runs once; this re-checks on EVERY call, so a link recorded after
+            // startup refuses at once instead of taking effect until the next
+            // restart. After the scope gate, so an unauthenticated caller learns
+            // nothing about the signer. Federated calls returned above: they are
+            // proxied under the caller's own token and never author as this
+            // signer.
+            if let Err(err) = crate::operator::refuse_linked_http_signer(self).await {
+                self.emit_tool_invoked(&format!("denied:{}", request.name))
+                    .await;
+                return Err(err);
+            }
         }
 
         // Single chokepoint for every MCP tool invocation: emit a durable
