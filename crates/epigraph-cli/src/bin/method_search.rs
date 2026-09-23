@@ -225,14 +225,21 @@ Return 3-8 claims."#,
             // Compute content_hash via BLAKE3 (matches all other claims in the DB)
             let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
-            // Check for duplicates
-            let exists: Option<(i64,)> =
-                sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
-                    .bind(content_hash.as_slice())
-                    .fetch_optional(&pool)
-                    .await?;
+            // Check for duplicates on the noun-claim key `(content_hash,
+            // agent_id)`: only THIS agent's own earlier claim of the same text
+            // is a duplicate. Keyed on `content_hash` alone, any agent's claim
+            // (in any tenant) suppressed this agent's insert. `EXISTS` returns
+            // a `bool`; the previous `SELECT 1` decoded an int4 into `i64`,
+            // which sqlx's type check refuses, so the first hit aborted the run.
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM claims WHERE content_hash = $1 AND agent_id = $2)",
+            )
+            .bind(content_hash.as_slice())
+            .bind(args.agent_id)
+            .fetch_one(&pool)
+            .await?;
 
-            if exists.is_some() {
+            if exists {
                 tracing::info!(
                     "Duplicate claim skipped: {}",
                     &content[..content.len().min(60)]
