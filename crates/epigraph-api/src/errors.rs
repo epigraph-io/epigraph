@@ -390,6 +390,18 @@ impl From<DbError> for ApiError {
                 message: format!("{} already exists", entity),
             },
             DbError::Conflict { reason } => ApiError::Conflict { reason },
+            // A caller programming error, never a client one: a maintenance
+            // enumerator was handed a `Scoped` viewer. 500, and logged. The
+            // body stays generic because nothing a client sends would fix it.
+            DbError::BypassViewerRequired { operation } => {
+                tracing::error!(
+                    operation,
+                    "maintenance enumerator called with a Scoped viewer"
+                );
+                ApiError::InternalError {
+                    message: "maintenance operation called with the wrong viewer".to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,
@@ -526,6 +538,25 @@ mod tests {
             other => panic!("23514 must not be a DatabaseError: {other:?}"),
         }
         assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A maintenance enumerator refusing a `Scoped` viewer is the server's own
+    /// bug, so it must reach the client as 500. It must not be a 4xx, which
+    /// would tell the client to change its request.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_scoped_viewer_at_a_maintenance_enumerator_is_a_server_error() {
+        let api = ApiError::from(DbError::BypassViewerRequired {
+            operation: "MassFunctionRepository::list_claim_ids",
+        });
+        assert!(
+            matches!(api, ApiError::InternalError { .. }),
+            "must map to InternalError: {api:?}"
+        );
+        assert_eq!(
+            api.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]

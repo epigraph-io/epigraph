@@ -934,10 +934,15 @@ impl Viewer {
     /// Test-only `Bypass` viewer.
     ///
     /// Maintenance enumerators (`find_claims_needing_embeddings`,
-    /// `MassFunctionRepository::list_claim_ids`, …) `debug_assert!(viewer.is_bypass())`
-    /// precisely because a `Scoped` viewer there would silently skip every other
-    /// tenant's rows — leaving them unembedded, or their beliefs stale, forever.
-    /// Their tests therefore need a real `Bypass`, not a permissive `Scoped`.
+    /// `MassFunctionRepository::list_claim_ids`, …) require a `Bypass` viewer,
+    /// because a `Scoped` viewer there would silently skip every other tenant's
+    /// rows — leaving them unembedded, or their beliefs stale, forever.
+    /// `list_claim_ids` refuses a `Scoped` one with
+    /// [`crate::DbError::BypassViewerRequired`] in every build profile.
+    /// `find_claims_needing_embeddings` still only
+    /// `debug_assert!(viewer.is_bypass())`s it, which a release build compiles
+    /// out. Their tests therefore need a real `Bypass`, not a permissive
+    /// `Scoped`.
     ///
     /// Production builds one only via `ScopedPool::unscoped_for_maintenance`,
     /// which hands back a [`MaintenanceLease`] proving the connection is a

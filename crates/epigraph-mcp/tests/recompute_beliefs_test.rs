@@ -99,7 +99,7 @@ async fn pignistic(pool: &PgPool, claim_id: Uuid) -> f64 {
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
-    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // which refuses a Scoped viewer with an error: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
@@ -151,7 +151,7 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_skips_claim_without_bbas(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
-    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // which refuses a Scoped viewer with an error: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
@@ -184,7 +184,7 @@ async fn recompute_skips_claim_without_bbas(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
-    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // which refuses a Scoped viewer with an error: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
@@ -242,7 +242,7 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
-    // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
+    // which refuses a Scoped viewer with an error: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());
@@ -321,7 +321,7 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool: PgPool) {
     // Same reason as the sibling tests: recompute_beliefs enumerates via
-    // `list_claim_ids`, whose debug_assert requires a Bypass viewer. Hold the
+    // `list_claim_ids`, which refuses a Scoped viewer with an error. Hold the
     // ScopedPool for the duration.
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let server = make_server(pool.clone());

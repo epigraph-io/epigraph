@@ -261,7 +261,7 @@ the only item here that touches existing data.
 delivered — so the residual has no compensating control), `D-PR16-mcp-http-parity-suite`,
 `D-PR16-per-id-claim-oracles-write-half`, `D-PR19-A`/`D-PR19-B`,
 `D-PR25-deferred-definer-doc-understates-its-stake`,
-`D-PR27-proven-equivalent-sibling-pairs`, `D-PR27-A`, `D-PR27-B`,
+`D-PR27-proven-equivalent-sibling-pairs`, `D-PR27-A`, `D-PR27-B` (DISCHARGED, see §5),
 `D-PR27-shared-db-test-isolation` (partly discharged by `tenancy/fix-test-integrity`).
 
 **4.6 The 20 `CONVERSION-TAIL` findings.** Filed as EpiGraph backlog claims and recorded in
@@ -299,6 +299,22 @@ session where RLS filters `group_memberships`. The membership bootstrap opens on
 group that has never had a membership row. The re-derivation is in
 `closed_findings::F-PR20-B`. Copying it to the private record is still an operator step.
 Four remain.
+
+**The list of six above was incomplete.** Two `deferred_obligations` carry the same
+`EMPTY-NEEDS-RE-DERIVATION` disposition and were filed under §4.5 instead: `D-PR27-A` and
+`D-PR27-B`.
+
+`D-PR27-B` is DISCHARGED (2026-09-23, fix/deferred-2026-09-22-lane-b, screen key
+`d-pr27-b-rederive-list-claim-ids`). It was re-derived as the pre-redaction
+`D-PR27-list-claim-ids-contract-is-debug-only`, and it turned out to be real but latent.
+`MassFunctionRepository::list_claim_ids` guarded its Bypass-only contract with a
+`debug_assert!`, which a release build compiles out. It now refuses a `Scoped` viewer with
+`DbError::BypassViewerRequired` in every build profile. The re-derivation is in
+`deferred_obligations::D-PR27-B`, and so is the half it does not close: the MCP recompute
+tool still queries the application pool rather than its maintenance connection. Copying
+the re-derivation to the private record is still an operator step.
+
+`D-PR27-A` is still content-free and belongs on this list. Counting it, five remain.
 
 ---
 

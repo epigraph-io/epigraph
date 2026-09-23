@@ -751,6 +751,28 @@ impl MassFunctionRepository {
     /// labels-target path (`list_by_labels(.., current_only = true, ..)`).
     /// `recompute_beliefs`' explicit `claim_ids` target bypasses this method,
     /// so a caller can still deliberately recompute a non-current claim by id.
+    ///
+    /// # The viewer must be `Bypass`, and that is checked in release builds
+    ///
+    /// The statement is `VISIBILITY-EXEMPT`, so the viewer never reaches the
+    /// SQL. A `Scoped` viewer is refused before any statement runs. This used
+    /// to be a `debug_assert!`, which a release build compiles out (the
+    /// workspace sets no `[profile.release]`). Since PR-27 widened `executor`
+    /// to any `PgExecutor`, the caller picks the connection. So a `Scoped`
+    /// viewer in release returned every tenant's ids on an unfiltered session,
+    /// or only its own tenant's ids on a stamped one. In the second case
+    /// every other tenant's cached beliefs stayed stale and the recompute
+    /// reported success.
+    ///
+    /// The check is on the VIEWER only. It cannot tell which connection
+    /// `executor` is. A `Bypass` viewer emits no predicate, so under row-level
+    /// security the connection decides what this returns. The caller must pass
+    /// the maintenance connection its viewer came with.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError::BypassViewerRequired`] for a `Scoped` viewer;
+    /// [`DbError::QueryFailed`] if the query fails.
     #[instrument(skip(executor, viewer))]
     pub async fn list_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -758,11 +780,11 @@ impl MassFunctionRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Uuid>, DbError> {
-        debug_assert!(
-            viewer.is_bypass(),
-            "list_claim_ids is the belief-recompute enumerator; a Scoped viewer \
-             here would leave every other tenant's cached beliefs stale forever"
-        );
+        if !viewer.is_bypass() {
+            return Err(DbError::BypassViewerRequired {
+                operation: "MassFunctionRepository::list_claim_ids",
+            });
+        }
         // No splice: this query is EXEMPT, and `Viewer::splice` panics on a
         // marker-free literal by design.
         let rows: Vec<Uuid> = sqlx::query_scalar(
@@ -770,8 +792,9 @@ impl MassFunctionRepository {
             -- VISIBILITY-EXEMPT: belief-recompute enumerator. Runs under
             -- SystemReason::BeliefRecomputation on a maintenance connection; a
             -- per-tenant view of the work queue would leave every other tenant's
-            -- cached beliefs permanently stale. The `_viewer` parameter exists
-            -- so the exemption is visible at every call site, not only here.
+            -- cached beliefs permanently stale. The `viewer` parameter exists
+            -- so the exemption is visible at every call site, not only here,
+            -- and the function refuses a Scoped one before this runs.
             SELECT DISTINCT mf.claim_id
             FROM mass_functions mf
             JOIN claims c ON c.id = mf.claim_id
@@ -1100,6 +1123,69 @@ mod tests {
         assert!(
             !ids.contains(&c_retired),
             "retired (is_current=false) claim must be excluded from bulk recompute"
+        );
+    }
+
+    /// `list_claim_ids` refuses a `Scoped` viewer with a returned error, in
+    /// every build profile.
+    ///
+    /// The test asserts on the `Err` and not on a panic. So it fails against
+    /// the old `debug_assert!` guard both ways: in a debug build the assert
+    /// panics, and in a release build it is compiled out and the call returns
+    /// `Ok` with the seeded claim.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_claim_ids_refuses_a_scoped_viewer(pool: sqlx::PgPool) {
+        let agent = insert_agent(&pool, "lci-scoped-a").await;
+        let suffix = Uuid::new_v4();
+        let frame_id = insert_frame(&pool, &format!("lci-scoped-frame-{suffix}")).await;
+        let claim = insert_claim(&pool, agent, &format!("lci-scoped-1-{suffix}")).await;
+        MassFunctionRepository::store(
+            &pool,
+            claim,
+            frame_id,
+            Some(agent),
+            &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+            None,
+            Some("test"),
+            "unknown",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Calibration. On this pool and data a Bypass viewer enumerates the
+        // claim, so the refusal below is not an empty-table artefact.
+        let bypass = MassFunctionRepository::list_claim_ids(
+            &pool,
+            &crate::visibility::Viewer::test_bypass(
+                crate::visibility::SystemReason::BeliefRecomputation,
+            ),
+            100,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bypass,
+            vec![claim],
+            "calibration: Bypass sees the seeded claim"
+        );
+
+        // The test pool is not filtered by row-level security. Without the
+        // check, a Scoped viewer in no group would get the seeded claim's id
+        // back like the Bypass viewer did.
+        let scoped = crate::visibility::Viewer::test_scoped(Uuid::new_v4(), vec![]);
+        let err = MassFunctionRepository::list_claim_ids(&pool, &scoped, 100, 0)
+            .await
+            .expect_err("a Scoped viewer must be refused, not answered");
+        assert!(
+            matches!(
+                err,
+                DbError::BypassViewerRequired {
+                    operation: "MassFunctionRepository::list_claim_ids"
+                }
+            ),
+            "expected BypassViewerRequired naming list_claim_ids, got {err:?}"
         );
     }
 

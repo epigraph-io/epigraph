@@ -108,6 +108,31 @@ pub enum DbError {
     #[error("Conflict: {reason}")]
     Conflict { reason: String },
 
+    /// A corpus-wide maintenance enumerator was handed a `Scoped` viewer.
+    ///
+    /// These functions run a `VISIBILITY-EXEMPT` statement. The viewer never
+    /// reaches the SQL, so it cannot narrow what they return. They are correct
+    /// only for a `Bypass` viewer minted for a maintenance job. With a `Scoped`
+    /// viewer they fail silently, in a direction set by the connection. On a
+    /// session that row-level security does not filter, they return every
+    /// tenant's rows to a caller scoped to fewer. On a session stamped for that
+    /// viewer, they return only that viewer's rows, and the maintenance job
+    /// reports success while every other tenant's rows go unprocessed.
+    ///
+    /// This is a caller programming error, not bad input, so it is neither
+    /// [`Self::InvalidData`] (422) nor [`Self::Conflict`] (409). The HTTP layer
+    /// maps it to a logged 500.
+    ///
+    /// It is a returned error rather than a `debug_assert!` because the
+    /// workspace sets no `[profile.release]`: `debug-assertions` is off in a
+    /// release build, and an assert there is compiled out. `operation` names
+    /// the refusing function.
+    #[error(
+        "{operation} is a corpus-wide maintenance enumerator and requires a Bypass \
+         viewer; it was called with a Scoped viewer"
+    )]
+    BypassViewerRequired { operation: &'static str },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {
