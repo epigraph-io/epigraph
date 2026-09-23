@@ -56,7 +56,7 @@
 //! | `belief.rs::get_frame` | `FrameRepository::get_by_id`, `::get_claims_in_frame` | [`get_frame_serves_a_group_private_frame_to_its_own_group`] |
 //! | `computation.rs::belief_at_time` | `ClaimRepository::get_by_id`, `EvidenceRepository::provided_for_claim_as_of` | [`belief_at_time_replays_only_the_evidence_the_viewer_can_see`] |
 //! | `computation.rs::compose_subgraphs` (not shard 4's; `F-SHARD4-A1`) | `SheafRepository::epistemic_neighborhood_ids` (x2), `ClaimRepository::pignistic_probs_for` | [`compose_subgraphs_composes_over_the_viewers_own_private_claim`], [`compose_subgraphs_is_404_for_a_center_the_viewer_cannot_read`] |
-//! | `reasoning.rs::analyze` (not shard 4's; `F-FAH-A1`) | `EdgeRepository::claim_edges_for_reasoning` | [`reasoning_analyze_loads_the_viewers_own_private_edge`] |
+//! | `reasoning.rs::analyze` (not shard 4's; `F-FAH-A1`) | `EdgeRepository::claim_edges_for_reasoning`, `ClaimRepository::truth_values_for` | [`reasoning_analyze_loads_the_viewers_own_private_edge`] |
 //!
 //! # What IS and is NOT proven here
 //!
@@ -670,12 +670,12 @@ async fn compose_subgraphs_refuses_without_a_scoped_pool(pool: PgPool) {
 // reversion to the raw pool.
 
 /// `POST /api/v1/reasoning/analyze` with no edges sent: the owner's own
-/// group-private edge is loaded on the stamped connection.
+/// group-private edge and claims are loaded on the stamped connection.
 ///
 /// The over-suppression direction is the one that catches a reversion to the
-/// raw pool. `split_state`'s raw pool is `epigraph_app` and unstamped, so the
-/// edge load there loses the owner's private edge and the analysis is a 200
-/// with no edges. That was the handler's behavior under an RLS-forced
+/// raw pool. `split_state`'s raw pool is `epigraph_app` and unstamped, so a
+/// read there loses the owner's private rows and the analysis is a 200 with
+/// nothing in it. That was the edge load's behavior under an RLS-forced
 /// application role before the fix.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reasoning_analyze_loads_the_viewers_own_private_edge(pool: PgPool) {
@@ -719,6 +719,11 @@ async fn reasoning_analyze_loads_the_viewers_own_private_edge(pool: PgPool) {
             .any(|ts| ts.source_id == x.to_string() && ts.target_id == y.to_string()),
         "the loaded edge must reach the engine as a transitive support x -> y"
     );
+    assert_eq!(
+        mine.stats.claims_loaded, 2,
+        "the owner's own private claims must be loaded too. 0 here means the claim \
+         read ran on a connection the policies filter"
+    );
 
     let theirs = analyze(
         ViewerExtractor(public_viewer(&pool).await),
@@ -729,7 +734,8 @@ async fn reasoning_analyze_loads_the_viewers_own_private_edge(pool: PgPool) {
     .expect("a stranger is served, with nothing it cannot read")
     .0;
     assert_eq!(
-        theirs.stats.edges_loaded, 0,
-        "a stranger naming the owner's private claims must load no edge"
+        (theirs.stats.edges_loaded, theirs.stats.claims_loaded),
+        (0, 0),
+        "a stranger naming the owner's private claims must load no edge and no claim"
     );
 }

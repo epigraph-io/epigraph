@@ -25,6 +25,10 @@
 //! * with no `ScopedPool`, the handler must refuse rather than read the raw
 //!   pool.
 //!
+//! The claim-side arms, in the last section, were run against the handler as
+//! it stood after the edge conversion and before the claim conversion. They
+//! FAILED there, because the claims still came from the in-memory store.
+//!
 //! The EXECUTOR half is pinned elsewhere. On this fixture `db_pool` and the
 //! scoped pool are the same superuser pool, so reverting the read to
 //! `state.db_pool` changes no row here. That reversion is caught by
@@ -418,5 +422,169 @@ async fn over_http_the_analysis_follows_the_bearer(pool: PgPool) {
     assert_eq!(
         theirs["stats"]["edges_loaded"], 1,
         "a stranger loads only the public control; got {theirs}"
+    );
+}
+
+// ── The claim side ──
+//
+// The claims used to come from `AppState::claim_store`, a process-wide
+// in-memory map with no tenancy. In the `db` build they now come from
+// `ClaimRepository::truth_values_for` on the same stamped connection as the
+// edges.
+
+/// Every claim id in the response's claim-derived fields:
+/// `unsupported_claims` and `connected_components`.
+fn claim_ids_in(resp: &AnalyzeResponse) -> Vec<String> {
+    let mut out: Vec<String> = resp.unsupported_claims.clone();
+    for c in &resp.connected_components {
+        out.extend(c.claim_ids.iter().cloned());
+    }
+    out
+}
+
+/// A stranger's analysis names none of the owner's private claims, with or
+/// without `claim_ids`. The owner's analysis over the same rows does, which is
+/// what makes the stranger's result a filter and not an empty fixture.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_analysis_names_none_of_the_owners_private_claims(pool: PgPool) {
+    let (owner, stranger, ids) = seed_hazard_graph(&pool).await;
+    let [p0, h, p2, p3] = ids;
+    let state = scoped_state(&pool).await;
+
+    let mine = run(
+        &state,
+        viewer_for(&pool, owner).await,
+        request(Some(ids.to_vec()), vec![]),
+    )
+    .await;
+    assert_eq!(
+        mine.stats.claims_loaded, 4,
+        "CALIBRATION: the owner loads all four of its claims"
+    );
+    assert!(
+        claim_ids_in(&mine).contains(&h.to_string()),
+        "CALIBRATION: the owner's analysis names its own private claim h"
+    );
+
+    let theirs = run(
+        &state,
+        viewer_for(&pool, stranger).await,
+        request(Some(ids.to_vec()), vec![]),
+    )
+    .await;
+    assert_eq!(
+        theirs.stats.claims_loaded, 3,
+        "a stranger naming the owner's claims must load only the three public ones"
+    );
+    assert!(
+        !claim_ids_in(&theirs).contains(&h.to_string()),
+        "a stranger's analysis must not name the owner's private claim h; got {:?}",
+        claim_ids_in(&theirs)
+    );
+
+    // No `claim_ids`: the claims are the readable endpoints of the readable
+    // edges, which for the stranger is the public control alone.
+    let theirs_all = run(
+        &state,
+        viewer_for(&pool, stranger).await,
+        request(None, vec![]),
+    )
+    .await;
+    let named = claim_ids_in(&theirs_all);
+    assert!(
+        named.contains(&p0.to_string()) && named.contains(&p3.to_string()),
+        "CALIBRATION: with no claim_ids the stranger analyses the public control's \
+         endpoints; got {named:?}"
+    );
+    assert!(
+        !named.contains(&h.to_string()) && !named.contains(&p2.to_string()),
+        "with no claim_ids, a stranger must analyse neither the owner's private claim \
+         nor the far end of its private edge; got {named:?}"
+    );
+}
+
+/// The process-wide in-memory store is not analysed in the `db` build. Before
+/// the fix, with no `claim_ids`, every claim in it reached every caller's
+/// analysis, whoever had batch-imported it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_in_memory_claim_store_is_not_analysed(pool: PgPool) {
+    let (caller, _) = seed_agent_with_group(&pool, "reasoning-api-store").await;
+    let state = scoped_state(&pool).await;
+
+    // What `POST /api/v1/claims/batch` leaves behind: a claim in the map and
+    // in no table.
+    let now = chrono::Utc::now();
+    let in_memory = epigraph_core::Claim::with_id(
+        epigraph_core::ClaimId::from_uuid(Uuid::new_v4()),
+        "another caller's batch-imported claim".to_string(),
+        epigraph_core::AgentId::new(),
+        [0u8; 32],
+        [0u8; 32],
+        None,
+        None,
+        epigraph_core::TruthValue::new(0.42).unwrap(),
+        now,
+        now,
+    );
+    let in_memory_id = in_memory.id.as_uuid();
+    state
+        .claim_store
+        .write()
+        .await
+        .insert(in_memory_id, in_memory);
+
+    let all = run(
+        &state,
+        viewer_for(&pool, caller).await,
+        request(None, vec![]),
+    )
+    .await;
+    assert!(
+        !claim_ids_in(&all).contains(&in_memory_id.to_string()),
+        "with no claim_ids, a claim that exists only in the in-memory store must not \
+         be analysed; got {:?}",
+        claim_ids_in(&all)
+    );
+
+    let named = run(
+        &state,
+        viewer_for(&pool, caller).await,
+        request(Some(vec![in_memory_id]), vec![]),
+    )
+    .await;
+    assert_eq!(
+        named.stats.claims_loaded, 0,
+        "naming an id that exists only in the in-memory store loads nothing"
+    );
+}
+
+/// With caller-supplied edges and no `claim_ids`, only the endpoints the
+/// caller may read are loaded as claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn explicit_edges_load_only_the_endpoints_the_caller_may_read(pool: PgPool) {
+    let (_owner, stranger, [p0, h, _p2, p3]) = seed_hazard_graph(&pool).await;
+    let state = scoped_state(&pool).await;
+    let edge = |s: Uuid, t: Uuid| EdgeInput {
+        source_id: s,
+        target_id: t,
+        relationship: "supports".to_string(),
+        strength: 0.5,
+    };
+
+    let theirs = run(
+        &state,
+        viewer_for(&pool, stranger).await,
+        request(None, vec![edge(p0, h), edge(p0, p3)]),
+    )
+    .await;
+    assert_eq!(
+        theirs.stats.claims_loaded, 2,
+        "only p0 and p3 are readable endpoints of the stranger's own edges"
+    );
+    assert!(
+        !claim_ids_in(&theirs).contains(&h.to_string()),
+        "the owner's private claim h must not be loaded as a claim, even when the \
+         caller names it in an edge; got {:?}",
+        claim_ids_in(&theirs)
     );
 }

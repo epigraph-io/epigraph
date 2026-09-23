@@ -1,10 +1,11 @@
 //! Reasoning analysis endpoint for the epistemic knowledge graph.
 //!
 //! Exposes the Ascent-based reasoning engine via `POST /api/v1/reasoning/analyze`.
-//! The endpoint is **read-only** — it consumes graph data (claims from the in-memory
-//! store plus caller-supplied edges) and returns analytical insights: transitive
-//! support chains, contradictions, support clusters, connected components, and
-//! unsupported claims.
+//! The endpoint is **read-only**. It consumes graph data (claims, plus edges the
+//! caller sends or the database supplies) and returns analytical insights:
+//! transitive support chains, contradictions, support clusters, connected
+//! components, and unsupported claims. In the `db` build the claims come from
+//! the database. In the no-db build they come from the in-memory claim store.
 //!
 //! The endpoint needs no request signature, because it performs no mutations.
 //! It does need a bearer token: it sits on the authenticated router and takes a
@@ -12,16 +13,26 @@
 //!
 //! # Tenancy (`F-FAH-A1`)
 //!
-//! When the caller sends no edges, the handler loads them from the database
-//! through [`EdgeRepository::claim_edges_for_reasoning`], on ONE
-//! [`AppState::read_as`] connection stamped with the caller's `Viewer`. That
-//! read returns only edges in force that the caller may read, between claims
-//! the caller may read. Before deferred-commitment screen key
-//! `f-fah-a1-reasoning-analyze`, the load ran two inline statements here, on the
-//! raw pool, with no viewer predicate. With no `claim_ids` it scanned every
-//! tenant's claim-to-claim edges. See [`load_edges_from_db`].
+//! Every database read runs on ONE [`AppState::read_as`] connection stamped with
+//! the caller's `Viewer`:
+//!
+//! * When the caller sends no edges, the handler loads them through
+//!   [`EdgeRepository::claim_edges_for_reasoning`]. That read returns only edges
+//!   in force that the caller may read, between claims the caller may read.
+//!   Before deferred-commitment screen key `f-fah-a1-reasoning-analyze`, the
+//!   load ran two inline statements here, on the raw pool, with no viewer
+//!   predicate. With no `claim_ids` it scanned every tenant's claim-to-claim
+//!   edges. See [`load_edges_from_db`].
+//! * The claims and their truth values come from
+//!   [`ClaimRepository::truth_values_for`], so only claims the caller may read
+//!   are analysed. Before, the handler took them from `AppState::claim_store`.
+//!   That is a process-wide in-memory map with no tenancy, filled by
+//!   `POST /api/v1/claims/batch` and never drained into `claims`. With no
+//!   `claim_ids`, the handler put every caller's batch-imported claims into
+//!   every caller's analysis. See [`load_claims_from_db`].
 //!
 //! [`EdgeRepository::claim_edges_for_reasoning`]: epigraph_db::EdgeRepository::claim_edges_for_reasoning
+//! [`ClaimRepository::truth_values_for`]: epigraph_db::ClaimRepository::truth_values_for
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -37,13 +48,15 @@ use uuid::Uuid;
 
 /// Request body for `POST /api/v1/reasoning/analyze`.
 ///
-/// Callers may supply edges explicitly (since the in-memory store does not
-/// persist typed edges) and optionally restrict analysis to a subset of
-/// claims via `claim_ids`. Parameter overrides tune engine thresholds.
+/// Callers may supply edges explicitly and may restrict the analysis to a
+/// subset of claims via `claim_ids`. Parameter overrides tune engine
+/// thresholds.
 #[derive(Debug, Deserialize)]
 pub struct AnalyzeRequest {
-    /// Optional subset of claim IDs to include. When absent, all claims
-    /// from the in-memory store are loaded.
+    /// Optional subset of claim IDs to include. An id the caller cannot read,
+    /// or one that names no claim, is skipped. When absent, the `db` build
+    /// analyses the readable endpoints of the edges being analysed, and the
+    /// no-db build analyses every claim in the in-memory store.
     pub claim_ids: Option<Vec<Uuid>>,
     /// Edges to analyze. When empty (the default), edges are auto-loaded
     /// from the database: the claim-to-claim edges in force that the caller
@@ -135,20 +148,21 @@ pub struct StatsDto {
 
 /// `POST /api/v1/reasoning/analyze`
 ///
-/// Loads claims from the in-memory claim store (optionally filtered by
-/// `claim_ids`), combines them with caller-supplied edges, and delegates
-/// to `ReasoningEngine::analyze()` for Datalog-based graph analysis.
+/// Loads the claims (optionally restricted to `claim_ids`) and the edges
+/// (the caller's, or the database's when none are sent), and delegates to
+/// `ReasoningEngine::analyze()` for Datalog-based graph analysis.
 ///
 /// Returns transitive supports, contradictions, support clusters, connected
 /// components, indirect challenges, and unsupported claims.
 ///
 /// # Tenancy (`F-FAH-A1`)
 ///
-/// When `edges` is empty, they are read on ONE [`AppState::read_as`]
-/// connection, filtered by the caller's `Viewer`; see [`load_edges_from_db`].
+/// The claims, and the edges when `edges` is empty, are read on ONE
+/// [`AppState::read_as`] connection, filtered by the caller's `Viewer`; see
+/// [`load_claims_from_db`] and [`load_edges_from_db`].
 ///
-/// Before this, that read ran on the raw pool with no viewer. There were two
-/// failure postures:
+/// Before this, the edge read ran on the raw pool with no viewer. There were
+/// two failure postures:
 ///
 /// * On an RLS-forced application role, the unstamped read saw only public
 ///   edges. The caller's own group-private edges were silently left out, and
@@ -157,10 +171,13 @@ pub struct StatsDto {
 ///   private edges reached the engine and came back in the response: claim
 ///   ids, relationships and strengths.
 ///
-/// In both postures, retracted edges were analysed as live.
+/// In both postures, retracted edges were analysed as live. And the claims
+/// came from the process-wide in-memory store, which has no tenancy, so with
+/// no `claim_ids` every caller's batch-imported claim ids and truth values
+/// appeared in every caller's analysis.
 ///
-/// A state built without a `ScopedPool` gets a fixed 500 when it sends no
-/// edges, because `read_as` refuses it. So does a `Bypass` viewer, which
+/// A state built without a `ScopedPool` gets a fixed 500, because `read_as`
+/// refuses it. So does a `Bypass` viewer, which
 /// `read_as` also refuses; `ViewerExtractor` only ever resolves a scoped
 /// viewer, so no HTTP caller reaches that arm. Both refusals are deliberate:
 /// there is no fallback to the raw pool.
@@ -207,40 +224,13 @@ pub async fn analyze(
         }
     }
 
-    // Load claims from the in-memory store
-    let store = state.claim_store.read().await;
-    let reasoning_claims: Vec<ReasoningClaim> = match &request.claim_ids {
-        Some(ids) => {
-            let mut claims = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(claim) = store.get(id) {
-                    claims.push(ReasoningClaim {
-                        id: claim.id.as_uuid(),
-                        truth_value: claim.truth_value.value(),
-                    });
-                }
-                // Silently skip missing IDs — partial analysis is acceptable
-            }
-            claims
-        }
-        None => store
-            .values()
-            .map(|claim| ReasoningClaim {
-                id: claim.id.as_uuid(),
-                truth_value: claim.truth_value.value(),
-            })
-            .collect(),
-    };
-    // Release the read lock before doing computation
-    drop(store);
-
-    // If no edges were supplied, auto-load claim-to-claim edges from the DB.
+    // `db` build: claims and edges come from the caller's view of the
+    // database, on ONE stamped connection, finished before the engine runs.
     //
-    // Rationale: callers should not have to pre-fetch edges to get useful
-    // results from the reasoning engine.  The fallback is behind `#[cfg(feature = "db")]`
-    // so the non-DB build path is unaffected.
+    // Callers should not have to pre-fetch edges to get useful results, so
+    // when none are sent the database supplies them.
     #[cfg(feature = "db")]
-    let request_edges: Vec<EdgeInput> = if request.edges.is_empty() {
+    let (reasoning_claims, request_edges): (Vec<ReasoningClaim>, Vec<EdgeInput>) = {
         let mut read = state.read_as(&viewer).await.map_err(|e| {
             tracing::error!(
                 target: "tenancy.scoped_read",
@@ -252,19 +242,27 @@ pub async fn analyze(
                 message: "Failed to acquire a scoped connection".to_string(),
             }
         })?;
-        let edges = load_edges_from_db(&mut read, &viewer, request.claim_ids.as_deref()).await?;
+        let edges = if request.edges.is_empty() {
+            load_edges_from_db(&mut read, &viewer, request.claim_ids.as_deref()).await?
+        } else {
+            request.edges
+        };
+        let claims =
+            load_claims_from_db(&mut read, &viewer, request.claim_ids.as_deref(), &edges).await?;
         crate::routes::finish_scoped_read(read, "reasoning_analyze").await?;
-        edges
-    } else {
-        request.edges
+        (claims, edges)
     };
 
-    // The no-db `ViewerExtractor` carries no authority; it is taken only so
-    // both builds refuse an unauthenticated request identically.
+    // No-db build: the in-memory store and the caller's edges. The no-db
+    // `ViewerExtractor` carries no authority; it is taken only so both builds
+    // refuse an unauthenticated request identically.
     #[cfg(not(feature = "db"))]
-    let request_edges: Vec<EdgeInput> = {
+    let (reasoning_claims, request_edges): (Vec<ReasoningClaim>, Vec<EdgeInput>) = {
         let _ = viewer;
-        request.edges
+        (
+            claims_from_store(&state, request.claim_ids.as_deref()).await,
+            request.edges,
+        )
     };
 
     // Convert input edges to engine types
@@ -389,6 +387,96 @@ pub async fn analyze(
         unsupported_claims,
         stats,
     }))
+}
+
+// =============================================================================
+// CLAIM LOADERS
+// =============================================================================
+
+/// The no-db build's claims: the in-memory store, optionally restricted to
+/// `claim_ids`. An id missing from the store is skipped, because a partial
+/// analysis is acceptable.
+///
+/// The `db` build does NOT read this store. It is process-wide, carries no
+/// tenancy, and nothing drains it into `claims`; see [`load_claims_from_db`].
+#[cfg(not(feature = "db"))]
+async fn claims_from_store(state: &AppState, claim_ids: Option<&[Uuid]>) -> Vec<ReasoningClaim> {
+    let store = state.claim_store.read().await;
+    let to_reasoning = |claim: &epigraph_core::Claim| ReasoningClaim {
+        id: claim.id.as_uuid(),
+        truth_value: claim.truth_value.value(),
+    };
+    match claim_ids {
+        Some(ids) => ids
+            .iter()
+            .filter_map(|id| store.get(id))
+            .map(to_reasoning)
+            .collect(),
+        None => store.values().map(to_reasoning).collect(),
+    }
+}
+
+/// The `db` build's claims: those `viewer` may read, with their stored truth
+/// values, on the handler's stamped connection.
+///
+/// Which ids are asked for:
+///
+/// * `claim_ids`, when given. An id the caller cannot read, or one that names
+///   no claim, is skipped, as a missing id always was. A given but empty set
+///   analyses no claims, as it always did.
+/// * Otherwise, the endpoints of `edges`, which are the edges being analysed.
+///   An auto-loaded edge already has two readable endpoints. For a
+///   caller-supplied edge, only the endpoints the caller may read are loaded.
+///
+/// This replaces a read of `AppState::claim_store`. That is a process-wide
+/// in-memory map with no tenancy. `POST /api/v1/claims/batch` fills it and
+/// nothing drains it into `claims`. With no `claim_ids`, the handler put the
+/// whole map into the analysis, so every caller's batch-imported claim ids and
+/// truth values reached every other caller's `unsupported_claims` and
+/// `connected_components`. It also meant the claims and the database edges
+/// came from two different sources, which never met. Now both come from the
+/// caller's view of the database. A batch-imported claim, which exists only in
+/// that map, is no longer analysed. No other `db`-build read serves one either.
+///
+/// A failed read is a 500 with a fixed message. The database error goes to the
+/// operator's log.
+#[cfg(feature = "db")]
+async fn load_claims_from_db(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
+    claim_ids: Option<&[Uuid]>,
+    edges: &[EdgeInput],
+) -> Result<Vec<ReasoningClaim>, ApiError> {
+    let ids: Vec<Uuid> = match claim_ids {
+        Some(ids) => ids.to_vec(),
+        None => edges
+            .iter()
+            .flat_map(|e| [e.source_id, e.target_id])
+            .collect::<std::collections::BTreeSet<Uuid>>()
+            .into_iter()
+            .collect(),
+    };
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = epigraph_db::ClaimRepository::truth_values_for(conn, viewer, &ids)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "reasoning_analyze",
+                statement = "truth_values_for",
+                "could not load claims for reasoning"
+            );
+            ApiError::InternalError {
+                message: "Failed to load claims for reasoning".to_string(),
+            }
+        })?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, truth_value)| ReasoningClaim { id, truth_value })
+        .collect())
 }
 
 // =============================================================================

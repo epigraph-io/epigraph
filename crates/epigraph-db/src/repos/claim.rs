@@ -1363,6 +1363,45 @@ impl ClaimRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
+    /// `(id, truth_value)` for each claim in `ids` the viewer may read, ordered
+    /// by id.
+    ///
+    /// This is the claim read of `POST /api/v1/reasoning/analyze`
+    /// (`routes/reasoning.rs::analyze`, `F-FAH-A1`). That handler used to take
+    /// its claims from `AppState::claim_store`, a process-wide in-memory map
+    /// with no tenancy. A claim the viewer cannot read, or an id that names no
+    /// claim, is simply absent. The handler already treated an id missing from
+    /// that map the same way.
+    ///
+    /// There is no `is_current` filter. The edge read beside it,
+    /// `EdgeRepository::claim_edges_for_reasoning`, has none either, so both
+    /// halves of the analysis see the same claims.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn truth_values_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, f64)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.truth_value \
+               FROM claims c \
+              WHERE c.id = ANY($1) \
+                /* {VISIBILITY:c} */ \
+              ORDER BY c.id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql).bind(ids);
+        // Guarded, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "`, so the
+        // statement has no `$2` to fill.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
     /// Persist one belief-propagation result on claim `id`, but only if the
     /// viewer may WRITE it.
     ///
