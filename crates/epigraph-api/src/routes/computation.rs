@@ -9,13 +9,14 @@
 //! - `POST /api/v1/graph/compose`         - Compose two subgraphs via decorated cospans
 //! - `GET  /api/v1/claims/:id/belief-at`  - Reconstruct belief at a past timestamp
 //!
-//! # Tenancy: 12 of this file's 15 raw-pool sites are converted, and 3 are not
+//! # Tenancy: all 15 of this file's raw-pool sites are converted
 //!
 //! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
 //! (`epigraph-db/tests/no_unscoped_pool.rs`). Unlike `routes/belief.rs`, the
 //! sites here are PER-STATEMENT rather than one alias per handler, so the file
-//! can end in a state `belief.rs` cannot: a partially-converted handler. It does
-//! not, and the reasons are recorded rather than left to inference.
+//! could have ended in a state `belief.rs` cannot: a partially-converted
+//! handler. It never did. Shard 4 converted four handlers whole and declined
+//! the other two whole, and those two were later converted whole as well.
 //!
 //! Converted (four read-only handlers, five sites): `sheaf_consistency`,
 //! `sheaf_cohomology`, `sheaf_reconcile` and `belief_at_time` each acquire ONE
@@ -37,14 +38,18 @@
 //! the handler's own doc for the read predicates, including the one on
 //! `factors`, which has no tenancy columns of its own.
 //!
-//! Not converted, and NOT merely deferred:
-//!
-//! * `compose_subgraphs` (3 sites) is registered as `F-SHARD4-A1`; analysis
-//!   held outside this repository. Owner: the conversion-shard series. Two of
-//!   its three sites reach the database through [`extract_neighborhood`], which
-//!   takes a `&PgPool` PARAMETER — a shape `no_unscoped_pool.rs` already
-//!   enumerates as invisible to its `.db_pool` needle — so a change that moved
-//!   this file's counter would not by itself settle the entry.
+//! Converted last, as a whole handler (three sites): `compose_subgraphs`, by
+//! deferred-commitment screen key `f-shard4-a1-compose-subgraphs`, recorded on
+//! `F-SHARD4-A1`'s `fix_2026_09_23` field. It is read-only, so it takes
+//! `read_as` and nothing else. Two of its three sites reached the database
+//! through a route-layer `extract_neighborhood(&PgPool, ..)` helper. That
+//! `&PgPool` PARAMETER shape is invisible to `no_unscoped_pool.rs`'s
+//! `.db_pool` needle, so lowering this file's counter would not by itself have
+//! settled the entry. The helper is DELETED, not re-pointed: its recursive CTE
+//! is now `SheafRepository::epistemic_neighborhood_ids`, which filters the
+//! seed, every edge and every far endpoint by the caller's `Viewer`. The third
+//! site is `ClaimRepository::pignistic_probs_for`, the same read
+//! `propagate_beliefs` uses. See the handler's own doc.
 
 #[cfg(feature = "db")]
 use axum::{
@@ -984,17 +989,59 @@ async fn persist_propagation(
 }
 
 /// POST /api/v1/graph/compose - Compose two subgraphs via decorated cospans.
+///
+/// # Tenancy (`F-SHARD4-A1`)
+///
+/// A read-only handler, converted as a whole: its three statements (the two
+/// neighborhood walks and the belief read) run on ONE
+/// [`AppState::read_as`] connection, and each is filtered by the caller's
+/// `Viewer`:
+///
+/// * neighborhoods: `SheafRepository::epistemic_neighborhood_ids`, which
+///   walks only edges the caller may read (`{EDGE_VISIBILITY:e}`) into claims
+///   the caller may read (`{VISIBILITY:far}`), so the walk never passes
+///   through a hidden claim;
+/// * beliefs: `ClaimRepository::pignistic_probs_for` (`{VISIBILITY:c}`).
+///
+/// A center the caller cannot read is a 404, the same answer as for an id
+/// that names no claim. Before this, the center was seeded as a bare literal,
+/// so either kind of id was counted as a node and the response was a 200.
+///
+/// Before this, all three statements ran on the raw pool with no viewer. On
+/// the RLS-forced application role the unstamped reads saw only public rows,
+/// so the caller's own private claims and edges were silently left out and
+/// the counts and the `consistent` verdict were wrong, with a 200. On a pool
+/// that bypasses RLS nothing filtered them, and the counts and
+/// `boundary_inconsistency` were computed from other tenants' private claims
+/// and their pignistic probabilities.
+///
+/// `read_as` refuses a `Bypass` viewer, so an admin or service caller gets a
+/// 500 here, as it does from `sheaf_reconcile`. That is deliberate: there is
+/// no fallback to the raw pool.
 #[cfg(feature = "db")]
 pub async fn compose_subgraphs(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ComposeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let max_depth = request.max_depth.unwrap_or(2).clamp(1, 4);
     let threshold = request.consistency_threshold.unwrap_or(0.2);
 
-    // Extract neighborhoods via recursive CTE
-    let left_nodes = extract_neighborhood(&state.db_pool, request.center_a, max_depth).await?;
-    let right_nodes = extract_neighborhood(&state.db_pool, request.center_b, max_depth).await?;
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "compose_subgraphs",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
+    let left_nodes = readable_neighborhood(&mut read, &viewer, request.center_a, max_depth).await?;
+    let right_nodes =
+        readable_neighborhood(&mut read, &viewer, request.center_b, max_depth).await?;
 
     // Determine boundary (shared nodes)
     let left_set: std::collections::HashSet<Uuid> = left_nodes.iter().copied().collect();
@@ -1013,14 +1060,14 @@ pub async fn compose_subgraphs(
         .into_iter()
         .collect();
 
-    let belief_rows: Vec<(Uuid, Option<f64>)> =
-        sqlx::query_as("SELECT id, pignistic_prob FROM claims WHERE id = ANY($1)")
-            .bind(&all_ids)
-            .fetch_all(&state.db_pool)
+    let belief_rows =
+        epigraph_db::ClaimRepository::pignistic_probs_for(&mut *read, &viewer, &all_ids)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to load beliefs: {e}"),
             })?;
+
+    crate::routes::finish_scoped_read(read, "compose_subgraphs").await?;
 
     let beliefs: HashMap<Uuid, f64> = belief_rows
         .into_iter()
@@ -1177,36 +1224,36 @@ pub async fn belief_at_time(
 
 // ── Internal helpers ──
 
-/// Extract the neighborhood of a node via recursive CTE.
+/// The neighborhood of `center` over what `viewer` may read, or a 404 when
+/// `center` is not a claim `viewer` may read.
+///
+/// Replaces `extract_neighborhood`, which ran its recursive CTE here, in the
+/// route layer, on a `&PgPool` PARAMETER, so `no_unscoped_pool.rs`'s
+/// `.db_pool` needle could not see it. The SQL now lives in
+/// `SheafRepository::epistemic_neighborhood_ids`, and this takes the caller's
+/// stamped connection. It runs no SQL of its own.
+///
+/// An empty result can only mean the center is unreadable or absent, because a
+/// readable center is always in its own neighborhood. The two cases get the
+/// same answer, so the response does not say which.
 #[cfg(feature = "db")]
-async fn extract_neighborhood(
-    pool: &sqlx::PgPool,
+async fn readable_neighborhood(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
     center: Uuid,
     max_depth: i32,
 ) -> Result<Vec<Uuid>, ApiError> {
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "WITH RECURSIVE neighborhood AS ( \
-            SELECT $1::uuid AS node_id, 0 AS depth \
-            UNION \
-            SELECT CASE WHEN e.source_id = n.node_id THEN e.target_id ELSE e.source_id END, \
-                   n.depth + 1 \
-            FROM neighborhood n \
-            JOIN edges e ON ( \
-                (e.source_id = n.node_id AND e.source_type = 'claim' AND e.target_type = 'claim') \
-                OR (e.target_id = n.node_id AND e.source_type = 'claim' AND e.target_type = 'claim') \
-            ) \
-            WHERE n.depth < $2 \
-              AND e.relationship IN ('supports', 'refutes', 'contradicts', 'corroborates', 'elaborates', 'specializes', 'generalizes') \
-        ) \
-        SELECT DISTINCT node_id FROM neighborhood",
-    )
-    .bind(center)
-    .bind(max_depth)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to extract neighborhood: {e}"),
-    })?;
-
-    Ok(rows.into_iter().map(|(id,)| id).collect())
+    let nodes =
+        epigraph_db::SheafRepository::epistemic_neighborhood_ids(conn, viewer, center, max_depth)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to extract neighborhood: {e}"),
+            })?;
+    if nodes.is_empty() {
+        return Err(ApiError::NotFound {
+            entity: "claim".into(),
+            id: center.to_string(),
+        });
+    }
+    Ok(nodes)
 }

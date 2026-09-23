@@ -120,9 +120,9 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 271 is not 0 — and no shard in the series may be
+//!      discharged the gate — 268 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
-//!      decision: 145 of the 416 sites the series began with are gone — 113
+//!      decision: 148 of the 416 sites the series began with are gone — 113
 //!      converted by the shards, 3 REMOVED outright when `routes/claims.rs`'s
 //!      `group_id` membership gates stopped reading `group_memberships` through
 //!      the raw pool, 4 moved onto `ScopedPool::begin_as` when
@@ -131,13 +131,15 @@
 //!      `routes/hypothesis.rs::promote_hypothesis` was gated (F-SBC-A2), 7
 //!      more moved onto `AppState::read_as` / `ScopedPool::begin_as` when
 //!      `routes/computation.rs::propagate_beliefs` was converted as a whole
-//!      handler (F-SHARD4-A2), and 14 went with the
+//!      handler (F-SHARD4-A2), 3 more moved onto `AppState::read_as` when
+//!      `routes/computation.rs::compose_subgraphs` was converted as a whole
+//!      handler (F-SHARD4-A1), and 14 went with the
 //!      F-inline-claim-content-reads discharge — 12 moved onto
 //!      `AppState::read_as` (`routes/embeddings.rs` 2, `routes/conflicts.rs`
 //!      3, `routes/policies.rs` 2, `routes/political.rs` 1,
 //!      `routes/workflows.rs` 4), 1 moved onto a maintenance session
 //!      (`routes/clusters.rs::build_from_bridges`) and 1 removed outright
-//!      (`report_outcome`'s redundant content re-read) — and 271 are not.
+//!      (`report_outcome`'s redundant content re-read) — and 268 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -346,12 +348,21 @@
 //!   call sites, and the `_conn` shape would have added a route-layer
 //!   connection primitive that `visibility_lint.rs`'s two connection rules
 //!   cannot see, because their scan root is `crates/epigraph-db/src/repos`.
+//!
+//!   **The `F-SHARD4-A1` fix struck a third name, by DELETION, and no integer
+//!   moves here either.** `routes/computation.rs::extract_neighborhood` took a
+//!   `&PgPool` PARAMETER, and its only caller, `compose_subgraphs`, passed it
+//!   `&state.db_pool` twice. Its recursive CTE is now
+//!   `SheafRepository::epistemic_neighborhood_ids`, inside `visibility_lint.rs`'s
+//!   reach, and the helper that replaced it in the route,
+//!   `readable_neighborhood`, takes the handler's stamped `&mut PgConnection`
+//!   and runs no SQL of its own.
+//!
 //!   Enumerated so no shard author mistakes this table for complete —
 //!   `middleware/group_authz.rs::require_group_admin`,
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
 //!   `routes/clusters.rs::{persist_bridge_run, gc_bridge_runs}`,
-//!   `routes/computation.rs::extract_neighborhood`,
 //!   `routes/edges.rs::{trigger_edge_ds_recomputation, propagate_to_dependents,
 //!   recompute_claim_belief}`, `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
@@ -568,7 +579,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 271;
+const HIGH_WATER: usize = 268;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -645,11 +656,22 @@ const HIGH_WATER: usize = 271;
 /// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
 /// ("routes/computation.rs: recorded 10, measured 3") and off this test's own
 /// failure with both constants temporarily set to 1 ("271 unexempted sites").
-const HIGH_WATER_FILES: usize = 42;
+///
+/// The `compose_subgraphs` conversion (deferred-commitment screen key
+/// `f-shard4-a1-compose-subgraphs`, recorded on `F-SHARD4-A1`) moves BOTH
+/// integers: `routes/computation.rs` 3 -> NONE, so its key is deleted. The
+/// handler's three sites moved onto ONE `AppState::read_as` connection, and
+/// the `&PgPool` helper two of them went through was deleted with them.
+/// `HIGH_WATER` went 271 -> 268 and this constant 42 -> 41, read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// ("routes/computation.rs: recorded 3 site(s), measured NONE") and off this
+/// test's own failures with both constants temporarily set to 1
+/// ("268 unexempted sites", "41 unexempted files").
+const HIGH_WATER_FILES: usize = 41;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 271 sites across 42 files as of this commit. Lower an entry when a shard
+/// 268 sites across 41 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -712,9 +734,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // (screen key `f-shard4-a2-propagate-beliefs`), which converted
     // `propagate_beliefs` as a whole handler: its seven sites moved onto ONE
     // stamped connection, `AppState::read_as` without `apply_updates` and
-    // `ScopedPool::begin_as` with it. The three that remain are
+    // `ScopedPool::begin_as` with it. The three that remained were
     // `compose_subgraphs` (`F-SHARD4-A1`).
-    ("routes/computation.rs", 3),
+    // `routes/computation.rs` was 3 and is GONE: the deferred-commitment fix
+    // recorded on `F-SHARD4-A1` (screen key `f-shard4-a1-compose-subgraphs`)
+    // moved `compose_subgraphs`'s two neighborhood walks and its belief read
+    // onto ONE `AppState::read_as` connection and deleted the `&PgPool`
+    // helper the walks went through.
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     // 10 before the `F-inline-claim-content-reads` discharge moved

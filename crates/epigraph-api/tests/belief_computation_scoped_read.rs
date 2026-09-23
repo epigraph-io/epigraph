@@ -1,6 +1,8 @@
 //! `routes/belief.rs`'s fourteen read-only handlers and `routes/computation.rs`'s
 //! four each serve every statement of their request on ONE viewer-stamped
 //! connection, and every read that has a viewer to spend suppresses on it.
+//! So does `computation.rs::compose_subgraphs`, converted later (see the last
+//! section of this file).
 //!
 //! # What this file is, in the series
 //!
@@ -52,6 +54,7 @@
 //! | `belief.rs::claims_by_belief` | `ClaimRepository::list_by_belief_bounds` | [`claims_by_belief_serves_the_viewers_own_group_private_claim`] |
 //! | `belief.rs::get_frame` | `FrameRepository::get_by_id`, `::get_claims_in_frame` | [`get_frame_serves_a_group_private_frame_to_its_own_group`] |
 //! | `computation.rs::belief_at_time` | `ClaimRepository::get_by_id`, `EvidenceRepository::provided_for_claim_as_of` | [`belief_at_time_replays_only_the_evidence_the_viewer_can_see`] |
+//! | `computation.rs::compose_subgraphs` (not shard 4's; `F-SHARD4-A1`) | `SheafRepository::epistemic_neighborhood_ids` (x2), `ClaimRepository::pignistic_probs_for` | [`compose_subgraphs_composes_over_the_viewers_own_private_claim`], [`compose_subgraphs_is_404_for_a_center_the_viewer_cannot_read`] |
 //!
 //! # What IS and is NOT proven here
 //!
@@ -95,17 +98,21 @@ mod common;
 mod viewer_fixture;
 
 use axum::extract::{Path, Query, State};
+use axum::Json;
+use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::belief::{
     claims_by_belief, frame_claims_sorted, get_frame, BeliefFilterQuery, FrameClaimsQuery,
 };
-use epigraph_api::routes::computation::{belief_at_time, BeliefAtQuery};
+use epigraph_api::routes::computation::{
+    belief_at_time, compose_subgraphs, BeliefAtQuery, ComposeRequest,
+};
 use epigraph_api::state::{ApiConfig, AppState};
 use sqlx::PgPool;
 use uuid::Uuid;
 use viewer_fixture::{
-    downgraded_pool, public_viewer, scoped_pool, seed_agent_with_group, seed_group_claim,
-    seed_public_claim,
+    downgraded_pool, public_viewer, scoped_pool, seed_agent_with_group, seed_edge,
+    seed_group_claim, seed_public_claim,
 };
 
 // ── The instrument ──
@@ -473,5 +480,179 @@ async fn belief_at_time_replays_only_the_evidence_the_viewer_can_see(pool: PgPoo
         stranger["evidence_count"], 1,
         "a stranger replays only the public control row; the group-private evidence must \
          not contribute to the reconstructed belief"
+    );
+}
+
+// ── computation.rs::compose_subgraphs (F-SHARD4-A1) ──
+//
+// Not one of shard 4's sites: shard 4 declined this handler, and it was
+// converted as a whole by deferred-commitment screen key
+// `f-shard4-a1-compose-subgraphs`. It lives here because this file's
+// `split_state` is the instrument it needs, and a tenth hand-copy of that body
+// would worsen `F-PR28-viewer-fixture-duplication`.
+
+/// `a -- h -- b`: two public centers joined only through `h`, a claim private
+/// to `owner`'s group. `seed_edge` leaves both edges to migration 070's
+/// trigger, which stamps them private to the same group because `h` is.
+///
+/// Every claim carries a `pignistic_prob`. `compose_cospans` counts a shared
+/// node in `shared_boundary_size` only when BOTH sides hold a belief for it,
+/// so that number depends on the belief read as well as on the two walks: a
+/// boundary of 1 needs `h` from the neighborhood walks AND `h`'s belief from
+/// `ClaimRepository::pignistic_probs_for`.
+///
+/// Returns `(owner, [a, h, b])`.
+async fn seed_compose_graph(pool: &PgPool) -> (Uuid, [Uuid; 3]) {
+    let (owner, group) = seed_agent_with_group(pool, "a1-compose").await;
+    let a = seed_public_claim(pool, owner, "a1 compose: public center a").await;
+    let h = seed_group_claim(pool, owner, group, "a1 compose: private bridge h").await;
+    let b = seed_public_claim(pool, owner, "a1 compose: public center b").await;
+    seed_edge(pool, a, h).await;
+    seed_edge(pool, h, b).await;
+    sqlx::query("UPDATE claims SET pignistic_prob = 0.7 WHERE id = ANY($1)")
+        .bind(vec![a, h, b])
+        .execute(pool)
+        .await
+        .expect("give every claim a belief");
+    (owner, [a, h, b])
+}
+
+fn compose_request(center_a: Uuid, center_b: Uuid) -> Json<ComposeRequest> {
+    Json(ComposeRequest {
+        center_a,
+        center_b,
+        max_depth: Some(1),
+        consistency_threshold: None,
+    })
+}
+
+/// `POST /api/v1/graph/compose` — all three reads on one stamped handle.
+///
+/// The owner's two public centers share exactly one neighbor, `h`, which is
+/// private to the owner's group. So `shared_boundary_size` is 1 for the owner
+/// and 0 for anyone else, and that is the number this arm asserts.
+///
+/// The over-suppression direction is the one that catches a reversion to the
+/// raw pool: `split_state`'s raw pool is `epigraph_app` and unstamped, so a
+/// neighborhood walk on it loses `h`, and the owner's own boundary drops to 0
+/// with a 200. That was the handler's production behavior before the fix.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compose_subgraphs_composes_over_the_viewers_own_private_claim(pool: PgPool) {
+    let (owner, [a, _h, b]) = seed_compose_graph(&pool).await;
+    let state = split_state(&pool).await;
+
+    let mine = compose_subgraphs(
+        ViewerExtractor(viewer_for(&pool, owner).await),
+        State(state.clone()),
+        compose_request(a, b),
+    )
+    .await
+    .expect("the owner must be served on the stamped connection")
+    .0;
+    assert_eq!(
+        (
+            mine["left_boundary"].as_u64(),
+            mine["shared_boundary_size"].as_u64(),
+            mine["total_nodes"].as_u64(),
+            mine["left_interior"].as_u64(),
+            mine["right_interior"].as_u64(),
+        ),
+        (Some(1), Some(1), Some(3), Some(1), Some(1)),
+        "the owner's two neighborhoods meet at its own private claim h, and h's belief \
+         is read. A left_boundary of 0 means a walk lost h to the reader who owns it, \
+         the unstamped-session signature; a shared_boundary_size of 0 beside a \
+         left_boundary of 1 means the belief read lost it; body={mine}"
+    );
+
+    let theirs = compose_subgraphs(
+        ViewerExtractor(public_viewer(&pool).await),
+        State(state),
+        compose_request(a, b),
+    )
+    .await
+    .expect("both centers are PUBLIC, so a stranger must still be served")
+    .0;
+    assert_eq!(
+        (
+            theirs["left_boundary"].as_u64(),
+            theirs["shared_boundary_size"].as_u64(),
+            theirs["total_nodes"].as_u64(),
+        ),
+        (Some(0), Some(0), Some(2)),
+        "a stranger's neighborhoods must not meet at, or count, a claim it cannot read; \
+         body={theirs}"
+    );
+}
+
+/// A center the caller cannot read is a 404, the same answer as an id that
+/// names no claim. The old handler seeded the center as a bare literal, so
+/// both kinds of id counted as a node and the response was a 200.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compose_subgraphs_is_404_for_a_center_the_viewer_cannot_read(pool: PgPool) {
+    let (owner, [a, h, _b]) = seed_compose_graph(&pool).await;
+    let state = split_state(&pool).await;
+
+    let theirs = compose_subgraphs(
+        ViewerExtractor(public_viewer(&pool).await),
+        State(state.clone()),
+        compose_request(h, a),
+    )
+    .await;
+    assert!(
+        matches!(&theirs, Err(ApiError::NotFound { id, .. }) if *id == h.to_string()),
+        "a stranger composing around the owner's private claim must get a 404 naming \
+         that center, not a 200 that counts it; got {:?}",
+        theirs.map(|j| j.0)
+    );
+
+    let mine = compose_subgraphs(
+        ViewerExtractor(viewer_for(&pool, owner).await),
+        State(state.clone()),
+        compose_request(h, a),
+    )
+    .await
+    .expect("CALIBRATION: the owner composing around its own private claim is served")
+    .0;
+    assert_eq!(
+        mine["total_nodes"].as_u64(),
+        Some(3),
+        "CALIBRATION: body={mine}"
+    );
+
+    let missing = Uuid::new_v4();
+    let absent = compose_subgraphs(
+        ViewerExtractor(viewer_for(&pool, owner).await),
+        State(state),
+        compose_request(a, missing),
+    )
+    .await;
+    assert!(
+        matches!(&absent, Err(ApiError::NotFound { id, .. }) if *id == missing.to_string()),
+        "an id that names no claim must be the same 404; got {:?}",
+        absent.map(|j| j.0)
+    );
+}
+
+/// No `ScopedPool`, no answer: the handler must refuse rather than fall back to
+/// the raw pool it used to read.
+#[sqlx::test(migrations = "../../migrations")]
+async fn compose_subgraphs_refuses_without_a_scoped_pool(pool: PgPool) {
+    let (owner, [a, _h, b]) = seed_compose_graph(&pool).await;
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    assert!(
+        state.scoped.is_none(),
+        "CALIBRATION: with_db must leave `scoped` unset"
+    );
+
+    let got = compose_subgraphs(
+        ViewerExtractor(viewer_for(&pool, owner).await),
+        State(state),
+        compose_request(a, b),
+    )
+    .await;
+    assert!(
+        matches!(&got, Err(ApiError::InternalError { .. })),
+        "with no ScopedPool the handler must refuse, not read the raw pool; got {:?}",
+        got.map(|j| j.0)
     );
 }
