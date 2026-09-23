@@ -41,13 +41,16 @@
 //!
 //! # What this lint does NOT see, stated so its green is not over-read
 //!
-//! It matches the literal `server.pool`, so it cannot see a write that reaches
-//! the pool through a `pool` BINDING — `tools/ingestion.rs`'s
-//! `ReasoningTraceRepository::create(pool, …)` / `EvidenceRepository::create(pool, …)`
-//! inside the detached background task are exactly that shape, and they are why
-//! the branch's inherited inventory undercounted. Those live in the brief's D4,
-//! not here. It is also purely syntactic: it says which call sites take the
-//! unstamped pool, never whether the statement they run would be refused.
+//! It matches the literal `server.pool` AND, since Unit E, any
+//! `let alias = &server.pool;` binding within the function that makes it (see
+//! `alias_regions`). Before that it could not see a write reached through a
+//! binding — `tools/ingestion.rs`'s whole document walk was that shape — and the
+//! broadening surfaced nine more alias-bound sites, now registered below. It
+//! still cannot see a pool passed through a FUNCTION PARAMETER or a struct
+//! field other than `server.pool`, and it only counts callees whose name
+//! carries a WRITE_TOKEN. It is also purely syntactic: it says which call sites
+//! take the unstamped pool, never whether the statement they run would be
+//! refused.
 //!
 //! # The axis it pins, and the axis it does not
 //!
@@ -87,13 +90,13 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/claims.rs",
         "ClaimRepository::update_labels",
         1,
-        "`update_labels`, THE TOOL — not `update_with_evidence`'s label merge, which D2 converted \
-         onto the shared transaction (`update_labels_conn`). RE-MEASURED rather than inherited: \
-         the previous reason on this entry named the wrong call site, and the count did not move \
-         when the merge was converted because the two are different lines. A tier-A `UPDATE \
-         claims`, so it is refused on a clean migrate and admitted in production by the orphan \
-         `claims_privacy` policy. Not in E1/E2; it converts with the same `server.agent_id()` \
-         stamp its sibling merge now uses.",
+        "`resolve_backlog_item`'s step 3, the `resolved` label PATCH on the ORIGINAL backlog \
+         claim. RE-MEASURED a second time, and the previous correction was itself wrong: it said \
+         this was the `update_labels` TOOL, but the only `ClaimRepository::update_labels(&server.pool` \
+         in this file is inside `resolve_backlog_item`, and the `update_labels` tool SUCCEEDS on a \
+         cleanly-migrated schema as `epigraph_app` (`scripts/e2e/probe-tools.sh` CONFIG A: \
+         `labelled=1`). A tier-A `UPDATE claims` on a claim that is frequently ANOTHER agent's, \
+         so its stamp is an ownership question, not a mechanical conversion. Not in E1/E2.",
     ),
     (
         "tools/claims.rs",
@@ -169,11 +172,15 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "tools/ingestion.rs",
         "PaperRepository::get_or_create",
-        1,
-        "`ensure_paper_node`'s `papers` upsert, run synchronously before the detached ingest task \
-         is spawned. `papers` has NO row-level security (`relrowsecurity = false`, measured at \
-         head 101), so it is admitted unstamped by construction. The walk itself (claims, traces, \
-         evidence, edges) now runs on ONE transaction stamped from the ingesting agent (Unit E).",
+        3,
+        "The `papers` upsert, three times: `ensure_paper_node` (synchronous, before the detached \
+         task is spawned), and the walk-opening call in `do_ingest_document` and \
+         `do_ingest_document_spine` (the last two reached through `let pool = &server.pool`, which \
+         this scan now follows). `papers` has NO row-level security \
+         (`relrowsecurity = false`, measured at head 101), so these are admitted unstamped by \
+         construction, and `ensure_paper_node` has already created the row before the walk's \
+         call runs. The rest of both walks runs on ONE transaction stamped from the ingesting \
+         agent (Unit E); reverting any of those statements to `pool` adds an entry here.",
     ),
     (
         "tools/ingestion.rs",
@@ -184,6 +191,82 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          one caller is the operator `ingest-document` CLI, which runs on `MaintenancePool` \
          (BYPASSRLS) where there is no tenancy context to stamp. A server on an ordinary pool \
          with neither never reaches it — it gets `begin_author_stamped_tx`'s refusal.",
+    ),
+    (
+        "tools/cdst_maintenance.rs",
+        "server.pool.acquire",
+        1,
+        "`recompute_beliefs`, one of the three MAINTENANCE tools, reached through `let pool = \
+         &server.pool` — invisible to this scan until it followed bindings. Hard-gated off like \
+         `dedup_sweep.rs` above, and its target is the maintenance connection, not a stamped one: \
+         a bulk recompute is authored by nobody. PR-17.",
+    ),
+    (
+        "tools/edge_mutation.rs",
+        "EdgeRepository::update_valid_to_and_properties",
+        1,
+        "`patch_edge`, through `let pool = &server.pool`. An `UPDATE edges`; for an edge between \
+         two PUBLIC claims the `edges_tenancy` trigger makes it world-owned public, which \
+         `edges_tenancy`'s WITH CHECK admits unstamped — MEASURED, `scripts/e2e/probe-unit-e.sh` \
+         CONFIG A REGISTER arm: `patch_edge isError:false`, `patched=1`. A group-owned edge is \
+         refused loudly (one statement). Not in E1/E2; converts with an owner-of-the-edge stamp.",
+    ),
+    (
+        "tools/edge_mutation.rs",
+        "EdgeRepository::retract_by_id",
+        1,
+        "`delete_edge`'s retraction (`valid_to = now()`), through `let pool = &server.pool`. \
+         Invisible until `retract` joined WRITE_TOKENS. Same world-owned-public argument as \
+         `patch_edge`; MEASURED on CONFIG A: `delete_edge isError:false`, `in_force=0`.",
+    ),
+    (
+        "tools/edge_mutation.rs",
+        "EventRepository::publish_or_log",
+        3,
+        "`patch_edge` / `delete_edge`'s best-effort audit events. `events` has no row-level \
+         security, and each is a single auto-committing statement outside any transaction, so \
+         the swallowed failure is genuinely fire-and-forget here.",
+    ),
+    (
+        "tools/link_alternative.rs",
+        "EdgeRepository::create_symmetric_if_absent_returning",
+        1,
+        "`link_alternative`'s `alternative_of` edge, through `let pool = &server.pool`. Between \
+         two PUBLIC claims the edge is world-owned public and admitted unstamped — MEASURED, \
+         CONFIG A REGISTER arm: `isError:false`, `alternative_of=1`, owner \
+         `00000000-…/public`. Between group-private claims it is refused loudly. Not in E1/E2.",
+    ),
+    (
+        "tools/link_epistemic.rs",
+        "EdgeRepository::create_if_not_exists",
+        1,
+        "`link_epistemic`'s edge INSERT, through `let pool = &server.pool`. Its BELIEF WIRING is \
+         stamped (E2: `belief_wired: true` on CONFIG A); the edge itself is world-owned public \
+         between public claims and admitted unstamped — MEASURED, `probe-unit-e.sh` \
+         `supports_edges=1`. A private endpoint makes it a group-owned edge and a loud refusal \
+         BEFORE any belief is wired.",
+    ),
+    (
+        "tools/link_epistemic.rs",
+        "EdgeRepository::create_symmetric_if_absent_oriented",
+        1,
+        "`link_epistemic`'s symmetric-relationship arm (`contradicts` and kin). Same edge-INSERT \
+         argument as its `create_if_not_exists` entry.",
+    ),
+    (
+        "tools/link_epistemic.rs",
+        "EventRepository::publish_or_log",
+        1,
+        "`link_epistemic`'s best-effort `edge.added` event: `events` has no row-level security, \
+         and it is emitted outside the stamped DS transaction.",
+    ),
+    (
+        "tools/link_hierarchical.rs",
+        "EdgeRepository::create_if_not_exists",
+        1,
+        "`link_hierarchical`'s structural edge, through `let pool = &server.pool`. World-owned \
+         public between public claims, admitted unstamped — MEASURED, CONFIG A REGISTER arm: \
+         `isError:false`, `decomposes_to=1`. Not in E1/E2.",
     ),
     (
         "tools/matching.rs",
@@ -325,6 +408,7 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
 /// a failure here rather than a silent return to the blind spot.
 const WRITE_TOKENS: &[&str] = &[
     "consolidate",
+    "retract",
     "acquire",
     "create",
     "insert",
@@ -446,6 +530,66 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Byte ranges of `stripped` in which `alias` names `server.pool`: from each
+/// `let alias = &server.pool;` (or `= server.pool.clone();`) binding to the end
+/// of the enclosing function — approximated as the next line that opens an item
+/// at column 0 or 4 (`fn`, `pub fn`, `async fn`, `pub async fn`, `pub(crate)`),
+/// which is how every function in this crate is laid out.
+///
+/// # Why aliases are followed at all
+///
+/// The scan below keys on the literal `server.pool`. A write reached through a
+/// binding — `let pool = &server.pool;` … `EdgeRepository::create(pool, …)` —
+/// was therefore INVISIBLE to this register, and `do_ingest_document` /
+/// `do_ingest_document_spine` wrote their whole walk that way. Unit E converted
+/// both onto a stamped transaction; following the binding is what makes a
+/// revert of either (`&mut tx` back to `pool`) fail here instead of vanishing.
+/// The broadening surfaced the other alias-bound writes in the crate, which are
+/// registered with their reasons rather than filtered out.
+fn alias_regions(stripped: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    for (pos, _) in stripped.match_indices("let ") {
+        let rest = &stripped[pos + 4..];
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let after = rest[name.len()..].trim_start();
+        let bound = after
+            .strip_prefix('=')
+            .map(str::trim_start)
+            .is_some_and(|rhs| {
+                rhs.starts_with("&server.pool;") || rhs.starts_with("server.pool.clone();")
+            });
+        if !bound {
+            continue;
+        }
+        let start = pos;
+        let mut end = stripped.len();
+        for marker in [
+            "\nfn ",
+            "\npub fn ",
+            "\nasync fn ",
+            "\npub async fn ",
+            "\npub(crate) async fn ",
+            "\n    fn ",
+            "\n    pub fn ",
+            "\n    async fn ",
+            "\n    pub async fn ",
+        ] {
+            if let Some(off) = stripped[start..].find(marker) {
+                end = end.min(start + off);
+            }
+        }
+        out.push((name, start, end));
+    }
+    out
+}
+
 /// `(relative file, normalized callee) -> occurrences`, over comment-stripped
 /// source under `crates/epigraph-mcp/src`.
 fn scan() -> BTreeMap<(String, String), usize> {
@@ -488,6 +632,45 @@ fn scan() -> BTreeMap<(String, String), usize> {
                 i += needle.len();
             } else {
                 i += 1;
+            }
+        }
+
+        // Writes reached through a `let alias = &server.pool;` binding. See
+        // `alias_regions`.
+        for (alias, bstart, bend) in alias_regions(&stripped) {
+            let cstart = stripped[..bstart].chars().count();
+            let cend = stripped[..bend].chars().count();
+            let a: Vec<char> = alias.chars().collect();
+            let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+            // Skip the binding's own `let alias` token.
+            let mut i = cstart + 4 + a.len();
+            while i + a.len() <= cend {
+                let hit = chars[i..i + a.len()] == a[..]
+                    && (i == 0 || !(is_ident(chars[i - 1]) || chars[i - 1] == '.'))
+                    && !chars.get(i + a.len()).is_some_and(|c| is_ident(*c));
+                if !hit {
+                    i += 1;
+                    continue;
+                }
+                let after: String = chars[i + a.len()..].iter().take(48).collect();
+                let name = if after.starts_with('.') {
+                    after
+                        .trim_start_matches('.')
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .map(|m| format!("server.pool.{m}"))
+                } else {
+                    callee_before(&chars, i)
+                };
+                if let Some(name) = name {
+                    let norm = normalize(&name);
+                    let short = norm.rsplit("::").next().unwrap_or(&norm).to_string();
+                    if WRITE_TOKENS.iter().any(|t| short.contains(t)) {
+                        *found.entry((rel.clone(), norm)).or_insert(0) += 1;
+                    }
+                }
+                i += a.len();
             }
         }
     }
