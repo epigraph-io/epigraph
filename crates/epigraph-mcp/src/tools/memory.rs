@@ -216,27 +216,28 @@ pub async fn memorize(
     // twice). The embed below is deliberately NOT gated the same way — see the
     // comment there and `tools::claims::submit_claim`, which carries the long
     // form of both halves.
+    //
+    // One transaction, stamped from the AUTHOR's viewer: `claim_frames`,
+    // `mass_functions` and the cached-belief `UPDATE claims` land together or not
+    // at all. `memorize` passes `persist_truth_from_pignistic = false` — unlike
+    // `submit_claim` it does not derive a `truth_value` from the BBA, so there is
+    // no second write to keep consistent with it.
     let ds = if was_created {
-        match ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            viewer,
-            claim_uuid,
+        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
+            server,
             agent_id,
+            claim_uuid,
+            viewer,
             ds_auto::DsAutoInput {
                 confidence,
                 weight: 0.6,
                 supports: true,
                 evidence_type: None,
             },
+            /* persist_truth_from_pignistic */ false,
+            "memorize",
         )
         .await
-        {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(claim_id = %claim_uuid, "ds auto-wire memorize failed: {e}");
-                None
-            }
-        }
     } else {
         // Option A: a dedup hit. AUTHORED already fired in the helper, and Trace
         // + Evidence + `update_trace_id` ran above IF and only if the canonical

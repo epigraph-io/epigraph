@@ -1022,7 +1022,23 @@ pub async fn report_workflow_outcome(
     // that is CERTAIN to fail appends another row: a retry amplifier, not just a
     // one-off orphan. Re-adding the stamp belongs in D2, which has to put
     // evidence → BBA → truth_value into one unit anyway.
-    EvidenceRepository::create(&server.pool, &evidence)
+    // ── D2 lands here too: evidence -> BBA -> truth_value, ONE STAMPED UNIT ──
+    //
+    // "the DS wiring that follows is itself unconverted" and "a SIBLING pool
+    // connection that cannot see an uncommitted row" were both true and are both
+    // now false. `ds_auto::auto_wire_ds_update` takes a connection, so it runs on
+    // THIS transaction, and migration 046's FK from `mass_functions.evidence_id`
+    // is checked against this transaction's own snapshot — an uncommitted evidence
+    // row in the same transaction satisfies it. The stamped INSERT is therefore no
+    // longer forced to commit alone, which removes both objections at once: the
+    // committed orphan (nothing commits unless everything does) and the retry
+    // amplifier (a rolled-back `Evidence::new` id leaves no row to accumulate
+    // against).
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "report_workflow_outcome")
+            .await?;
+
+    EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
 
@@ -1033,7 +1049,7 @@ pub async fn report_workflow_outcome(
     // quality is the confidence signal; success determines supports/refutes direction.
     let weight = load_evidence_type_weight("observation");
     let ds = ds_auto::auto_wire_ds_update(
-        &server.pool,
+        &mut tx,
         viewer,
         workflow_id,
         agent_id,
@@ -1059,12 +1075,6 @@ pub async fn report_workflow_outcome(
     // After the DS wiring necessarily, because the value comes from it.
     let after = TruthValue::clamped(ds.pignistic_prob);
     {
-        let mut tx = crate::claim_helper::begin_author_stamped_tx(
-            server,
-            agent_id,
-            "report_workflow_outcome",
-        )
-        .await?;
         ClaimRepository::update_truth_value_conn(
             &mut tx,
             epigraph_core::ClaimId::from_uuid(workflow_id),

@@ -44,7 +44,7 @@ async fn adding_supporting_evidence_does_not_drop_cached_betp(pool: sqlx::PgPool
     // 1. Write initial DS cache via the REAL ingestion batch writer, tagged with
     //    a hard-discounting evidence_type so raw-vs-discounted diverge starkly.
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         &[BatchDsEntry {
             claim_id,

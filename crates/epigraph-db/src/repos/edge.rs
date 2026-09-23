@@ -764,13 +764,16 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn is_in_force(pool: &PgPool, edge_id: Uuid) -> Result<bool, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn is_in_force<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        edge_id: Uuid,
+    ) -> Result<bool, DbError> {
         let found: Option<bool> = sqlx::query_scalar(&format!(
             "SELECT true FROM edges e WHERE e.id = $1 AND {EDGE_IN_FORCE}"
         ))
         .bind(edge_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(found.unwrap_or(false))
     }

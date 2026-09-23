@@ -50,7 +50,15 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 async fn wire(pool: &PgPool, claim: Uuid, agent: Uuid, confidence: f64, supports: bool) {
     let viewer = fixture::public_viewer(pool).await;
     tools::ds_auto::auto_wire_ds_update(
-        pool, &viewer, claim, agent, confidence, 1.0, supports, None, None,
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim,
+        agent,
+        confidence,
+        1.0,
+        supports,
+        None,
+        None,
     )
     .await
     .expect("auto_wire_ds_update");

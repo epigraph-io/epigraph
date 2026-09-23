@@ -6187,6 +6187,28 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<DedupRepair, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::mark_duplicate_with_repair_conn(&mut conn, dup, canonical).await
+    }
+
+    /// [`Self::mark_duplicate_with_repair`] on a connection the caller owns.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one
+    /// implementation. `begin()` below opens a real transaction when this
+    /// connection is not already in one and a **SAVEPOINT** when it is, so the
+    /// repair stays atomic in both shapes.
+    ///
+    /// A concrete `&mut PgConnection` rather than a generic `Acquire` for the
+    /// reason recorded on [`Self::create_with_id_if_absent_conn`].
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_with_repair`].
+    pub async fn mark_duplicate_with_repair_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<DedupRepair, DbError> {
+        use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         if dup_uuid == canon_uuid {
@@ -6194,7 +6216,7 @@ impl ClaimRepository {
                 source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
             });
         }
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
         let canon_exists: bool =
             sqlx::query_scalar(
                 r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.

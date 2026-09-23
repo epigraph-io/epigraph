@@ -279,11 +279,11 @@ pub async fn submit_ds_evidence(
     .await
     .map_err(internal_error)?;
 
-    tx.commit().await.map_err(internal_error)?;
-
     // Count stored BBAs for the response (bba_count is informational only).
+    // Read INSIDE the transaction so it counts the row just stored rather than
+    // whatever a sibling connection can see.
     let bba_count =
-        MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
+        MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
             .await
             .map_err(internal_error)?
             .len();
@@ -303,14 +303,23 @@ pub async fn submit_ds_evidence(
     // path always resolves method adaptively (via `combine_multiple`) and
     // targets hypothesis index 0 (the canonical binary_truth convention).
     // This is the accepted consequence of unification, not a follow-up bug.
+    //
+    // IT RUNS INSIDE THE SAME TRANSACTION, and the commit moved below it. Its
+    // `UPDATE claims SET belief/plausibility/pignistic_prob` is where
+    // `submit_ds_evidence` STOPPED on a cleanly-migrated schema: the statement
+    // ran on the unstamped pool, where `claims_tenancy`'s `WITH CHECK` refuses
+    // it. Errors here are propagated (DS is the primary belief authority on this
+    // path), so on the old shape a refusal returned an error with the BBA already
+    // committed and the claim's cached belief still describing the evidence
+    // before it — success-shaped state behind a failure-shaped response. Now the
+    // BBA and the belief it implies are one unit.
     epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-        &server.pool,
-        viewer,
-        claim_id,
-        frame_id,
+        &mut tx, viewer, claim_id, frame_id,
     )
     .await
     .map_err(internal_error)?;
+
+    tx.commit().await.map_err(internal_error)?;
 
     // Read back exactly what the shared recompute path just wrote, so the
     // response can never drift from what a later `recompute_beliefs` call

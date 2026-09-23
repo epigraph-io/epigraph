@@ -738,6 +738,11 @@ pub async fn do_ingest_document(
         let _ = &source_url;
     }
 
+    // ONE connection for every DS-wiring statement below, acquired here rather
+    // than per call. See the D4 note at the first use: this is not a stamp, it is
+    // the difference between N tenancy contexts and one.
+    let mut ds_conn = pool.acquire().await.map_err(internal_error)?;
+
     // ── 5. Plan edges (decomposes_to / section_follows / supports / authored placeholders) ──
     let mut relationships_created = 0_usize;
     for edge in &plan.edges {
@@ -787,8 +792,19 @@ pub async fn do_ingest_document(
 
         // Epistemic-edge factor auto-wire (best-effort; non-epistemic and
         // non-claim edges are filtered inside the helper).
+        //
+        // STILL UNSTAMPED, and named rather than quietly converted. This is the
+        // brief's D4: the whole `ingest_document` path is pool-bound and its
+        // writes run in a DETACHED `tokio::spawn`ed task, so a refusal here
+        // reaches no caller at all. Converting it onto a stamped transaction
+        // FIRST would make the path fail atomically into a void — the same
+        // outcome, still unobservable — so D4's first obligation is to make that
+        // task's outcome observable, and this site converts with it. The
+        // `&mut *ds_conn` below is a mechanical consequence of the engine
+        // signature change: it moves N pool checkouts onto ONE connection, which
+        // is a coherence improvement and NOT a tenancy stamp.
         ds_auto::auto_wire_edge_if_epistemic(
-            pool,
+            &mut ds_conn,
             viewer,
             was_created,
             row.id,
@@ -806,7 +822,7 @@ pub async fn do_ingest_document(
     let (claims_ds_wired, ds_frame_id) = if ds_entries.is_empty() {
         (None, None)
     } else {
-        match ds_auto::auto_wire_ds_batch(pool, viewer, &ds_entries, agent_id).await {
+        match ds_auto::auto_wire_ds_batch(&mut ds_conn, viewer, &ds_entries, agent_id).await {
             Ok((fid, count)) => (Some(count), Some(fid.to_string())),
             Err(e) => {
                 tracing::warn!("ds auto-wire batch failed: {e}");

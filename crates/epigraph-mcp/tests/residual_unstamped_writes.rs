@@ -87,45 +87,27 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/claims.rs",
         "ClaimRepository::update_labels",
         1,
-        "`update_with_evidence`'s label merge. Reached only AFTER the DS wiring below, which is \
-         itself unconverted and refuses first on a clean schema, so this line does not execute \
-         on either configuration today. Converts with D2.",
-    ),
-    (
-        "tools/claims.rs",
-        "ClaimRepository::update_truth_value",
-        1,
-        "`submit_claim`'s post-DS truth write, on the `was_created` branch. Same D2 ordering \
-         constraint as the label merge: `ds_auto` is pool-bound and post-commit, and the value \
-         written is derived from its result.",
-    ),
-    (
-        "tools/claims.rs",
-        "EvidenceRepository::create",
-        1,
-        "`update_with_evidence`'s evidence INSERT. Stamped in an earlier revision of this branch \
-         and DELIBERATELY REVERTED: migration 046's FK from `mass_functions.evidence_id` forces \
-         it to commit before the (unconverted) DS wiring can reference it, so stamping it traded \
-         a clean CONFIG-A refusal for a committed orphan, and `Evidence::new` + a no-`ON CONFLICT` \
-         INSERT makes agent retries accumulate rows. Converts with D2, in the commit that can put \
-         evidence -> BBA -> truth -> labels in one unit.",
-    ),
-    (
-        "tools/claims.rs",
-        "ds_auto::auto_wire_ds_update",
-        1,
-        "`update_with_evidence`'s DS wiring. Writes `claim_frames` + `mass_functions`, neither of \
-         which has an orphan `*_privacy` policy, so it is refused in PRODUCTION as well as on a \
-         clean migrate — this is why `mass_functions` stopped growing. D2. Gated on `was_created` \
-         asymmetrically ON PURPOSE: re-running it double-counts mass.",
+        "`update_labels`, THE TOOL — not `update_with_evidence`'s label merge, which D2 converted \
+         onto the shared transaction (`update_labels_conn`). RE-MEASURED rather than inherited: \
+         the previous reason on this entry named the wrong call site, and the count did not move \
+         when the merge was converted because the two are different lines. A tier-A `UPDATE \
+         claims`, so it is refused on a clean migrate and admitted in production by the orphan \
+         `claims_privacy` policy. Not in E1/E2; it converts with the same `server.agent_id()` \
+         stamp its sibling merge now uses.",
     ),
     (
         "tools/claims.rs",
         "EdgeRepository::create_if_not_exists",
         1,
-        "`update_with_evidence`'s CHALLENGED/SUPPORTED verb-edge. `edges` carries an orphan \
-         `edges_privacy` policy, so it lands in production and is refused on a clean migrate. \
-         Belongs with the rest of this tool's conversion rather than alone.",
+        "`resolve_backlog_item`'s `basis -justifies-> resolution` edge. RE-MEASURED: this entry \
+         previously read \"`update_with_evidence`'s CHALLENGED/SUPPORTED verb-edge\", and there \
+         is no such call site — `update_with_evidence` emits no verb-edge, and neither \
+         `CHALLENGED` nor `SUPPORTED` appears anywhere in this file. An inherited description \
+         that names the wrong tool sends the next reader to convert the wrong line, so it is \
+         corrected here rather than carried. `edges` carries an orphan `edges_privacy` policy, so \
+         it lands in production and is refused on a clean migrate. Not in E1/E2: \
+         `resolve_backlog_item` is its own tool with its own population and its own ownership \
+         question (the basis claims are frequently another agent's).",
     ),
     (
         "tools/claims.rs",
@@ -139,12 +121,16 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/dedup_sweep.rs",
-        "retraction_cascade::mark_duplicate_with_cascade",
+        "server.pool.acquire",
         1,
         "`sweep_semantic_duplicates`, one of the three MAINTENANCE tools. Hard-gated off by \
          `maintenance.rs::maintenance_tools_run_on_the_maintenance_connection() == false`, which \
          is checked before the pool is even consulted, so this line is unreachable. Converting \
-         the three tools' query plumbing is PR-17.",
+         the three tools' query plumbing is PR-17. \
+         REGISTERED UNDER `server.pool.acquire` RATHER THAN THE CASCADE CALLEE, and that rename \
+         is the point: the engine signature moved to `&mut PgConnection`, so the call no longer \
+         NAMES a pool and an argument-shaped scan stops seeing it. Keeping the site measured \
+         needed `acquire` in WRITE_TOKENS — see the note there.",
     ),
     (
         "tools/ds.rs",
@@ -227,16 +213,18 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/supersede.rs",
-        "retraction_cascade::cascade_after_supersede",
-        1,
-        "`supersede_claim`'s cascade, in `epigraph-engine` and pool-bound. Converting it is the \
-         same executor-generic widening D2 needs for `edge_factor`, so the two travel together.",
-    ),
-    (
-        "tools/supersede.rs",
-        "retraction_cascade::mark_duplicate_with_cascade",
-        1,
-        "`mark_duplicate`'s cascade. Same pool-bound engine machinery as `cascade_after_supersede`.",
+        "server.pool.acquire",
+        2,
+        "`supersede_claim`'s and `mark_duplicate`'s retraction cascades, one acquire each. STILL \
+         UNSTAMPED, and it is a design decision rather than a missing conversion: the cascade \
+         walks DOWNSTREAM claims, whose owner groups are arbitrary, so no single viewer's \
+         writable set covers its target population and stamping it from `server.agent_id()` \
+         would refuse some rows while looking converted. Which authority a retraction cascade \
+         carries across group boundaries is a tenancy-model question, not a mechanical \
+         conversion. \
+         REGISTERED UNDER `server.pool.acquire` for the same reason as `dedup_sweep.rs` above: \
+         the engine now takes `&mut PgConnection`, so the cascade call names no pool and only \
+         the acquire is visible to this scan.",
     ),
     (
         "tools/workflow_ingest.rs",
@@ -257,35 +245,10 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/workflows.rs",
-        "EvidenceRepository::create",
-        1,
-        "`report_workflow_outcome`'s evidence INSERT, on the LEGACY FLAT path. Stamped in an \
-         earlier revision of this branch and DELIBERATELY REVERTED, for the reason and on the \
-         measurement that reverted its sibling INSERT in `tools/claims.rs` (`update_with_evidence`, \
-         registered under that file's own entry for this same callee): \
-         migration 046's FK from `mass_functions.evidence_id` forces it to commit alone, and \
-         `ds_auto` — which runs next on a sibling pool connection — writes `claim_frames`, a \
-         table with no orphan `*_privacy` policy and therefore refused on BOTH configurations. \
-         MEASURED as `epigraph_app` (`rolbypassrls = false`) via `scripts/e2e/probe-workflow.sh`, \
-         on a flat workflow claim in the server agent's OWN group: stamped leaves \
-         `evidence_rows=1` and then fails at `claim_frames`; unstamped leaves `evidence_rows=0` \
-         and fails at `evidence`; CONFIG B is `evidence_rows=1` either way. `Evidence::new` mints \
-         a fresh id and `create` has no `ON CONFLICT`, so the committed orphan also accumulates \
-         per retry. Converts with D2.",
-    ),
-    (
-        "tools/workflows.rs",
         "WorkflowRepository::set_goal_embedding",
         1,
         "`store_workflow`'s goal embedding. Same `relrowsecurity = false` argument as the two in \
          `workflow_ingest.rs`.",
-    ),
-    (
-        "tools/workflows.rs",
-        "ds_auto::auto_wire_ds_update",
-        1,
-        "`report_workflow_outcome`'s DS wiring. Writes `claim_frames` + `mass_functions`, so it \
-         is refused on BOTH configurations exactly as `update_with_evidence`'s is. D2.",
     ),
 ];
 
@@ -295,7 +258,24 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
 /// One entry today. Kept as a register rather than a smarter heuristic because a
 /// heuristic that excluded it by shape would also start excluding real writes,
 /// and this lint's value is that its false-positive set is written down.
-const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[(
+const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
+    (
+        "tools/claims.rs",
+        "server.pool.acquire",
+        "`submit_claim`'s novelty-gate preamble: a READ-ONLY content-hash existence probe \
+         (`ClaimRepository::find_by_content_hash_and_agent`) that runs before any write, so that \
+         an exact resubmit takes the unchanged dedup path. Matched only because `acquire` had to \
+         join WRITE_TOKENS to keep the three cascade sites visible; nothing is written on this \
+         connection.",
+    ),
+    (
+        "tools/memory.rs",
+        "server.pool.acquire",
+        "`memorize`'s novelty-gate preamble. The same read-only content-hash probe as \
+         `tools/claims.rs` above, matched for the same WRITE_TOKENS reason. The write half of \
+         `memorize` runs on `begin_author_stamped_tx`.",
+    ),
+    (
     "claim_helper.rs",
     "store_embedding_author_stamped",
     "The `&server.pool` here is the helper's READ pool: it resolves the author's viewer through \
@@ -307,7 +287,24 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[(
 /// misses is a site this lint cannot see, and the inherited inventory's own
 /// Counting note records that a NARROW pattern "silently misses `set_*`,
 /// `deprecate_*`, `insert` and `delete_step`".
+///
+/// # `acquire` is here, and it is a DELIBERATE BROADENING — this register may grow
+///
+/// The monotone-decreasing rule is about the SITES, not about what the scanner can
+/// see. When `epigraph-engine`'s belief chain moved from `&PgPool` to
+/// `&mut PgConnection`, three unconverted sites stopped naming a pool
+/// (`supersede.rs` twice, `dedup_sweep.rs` once) and would have LEFT this
+/// register while still reaching an unstamped connection — the register going
+/// blind on exactly what it exists to track. `acquire` keeps them visible, at the
+/// cost of naming the acquire rather than the write it feeds; each affected entry
+/// says so.
+///
+/// It also matches read-only dedup probes, which is why
+/// `NOT_ACTUALLY_A_POOL_WRITE` gained two entries rather than the heuristic being
+/// narrowed: the false-positive set of this lint is WRITTEN DOWN, and that is the
+/// property that makes broadening it safe rather than noisy.
 const WRITE_TOKENS: &[&str] = &[
+    "acquire",
     "create",
     "insert",
     "update",
@@ -558,10 +555,14 @@ fn the_scanner_strips_comments_and_would_otherwise_report_the_docs() {
 fn the_scanner_is_not_vacuous() {
     let measured = scan();
     assert!(
-        measured.len() >= 20,
-        "the residual scan found only {} sites; the tool layer had 27 at the time this lint was \
-         written, so a collapse this large means the matcher broke rather than that the surface \
-         was converted",
+        measured.len() >= 16,
+        "the residual scan found only {} sites; the tool layer had 27 when this lint was written \
+         and 18 after the ingest-executor and DS-substrate conversions, so a collapse below 16 \
+         means the matcher broke rather than that the surface was converted. LOWERED FROM 20 \
+         DELIBERATELY: the register fell 24 -> 18 in one change (five D2 sites converted, three \
+         cascade sites re-keyed onto `server.pool.acquire`), so a floor of 20 would have failed \
+         on a correct shrink. A floor is a matcher-broke tripwire, not a second ratchet — the \
+         exact-equality assertion above is the ratchet.",
         measured.len()
     );
     assert!(

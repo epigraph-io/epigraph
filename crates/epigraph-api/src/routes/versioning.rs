@@ -353,12 +353,26 @@ pub async fn supersede_claim(
     // inside the transaction. Best-effort: the transaction has already
     // committed, so a cascade failure must not turn a successful write into a
     // reported error (the retry would hit "already been superseded").
-    let belief_cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
-        &state.db_pool,
-        &viewer,
-        new_uuid,
-    )
-    .await;
+    //
+    // STILL UNSTAMPED, and named. The cascade walks DOWNSTREAM claims whose owner
+    // groups are arbitrary, so no single viewer's writable set covers its target
+    // population; which authority a retraction cascade carries across group
+    // boundaries is a tenancy-model decision rather than a mechanical conversion.
+    // `no_unscoped_pool.rs` keeps `routes/versioning.rs` at 8 sites for this and
+    // the sibling `mark_duplicate` cascade. The acquire is mechanical: one
+    // connection instead of a checkout per statement.
+    let belief_cascade = match state.db_pool.acquire().await {
+        Ok(mut conn) => {
+            epigraph_engine::retraction_cascade::cascade_after_supersede(
+                &mut conn, &viewer, new_uuid,
+            )
+            .await
+        }
+        Err(e) => {
+            tracing::warn!("belief cascade skipped: could not acquire: {e}");
+            Default::default()
+        }
+    };
 
     // 10. Trigger belief propagation for downstream factors (fire-and-forget).
     //
@@ -489,8 +503,16 @@ pub async fn mark_duplicate(
     // Dedup repairs the orphaned/stranded edge-factor BBAs inside its own
     // transaction and then rebuilds the affected beliefs (backlog 20e9ed83).
     // Only the dedup's own failure is an error; the cascade's is reported.
+    // Unstamped for the reason recorded on `cascade_after_supersede` above.
+    let mut cascade_conn = state
+        .db_pool
+        .acquire()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("belief cascade: could not acquire: {e}"),
+        })?;
     let belief_cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &state.db_pool,
+        &mut cascade_conn,
         &viewer,
         dup_id,
         req.canonical_id,

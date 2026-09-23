@@ -219,9 +219,9 @@ impl PerspectiveRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn ensure_evidence_perspective(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn ensure_evidence_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         owner_agent_id: Option<Uuid>,
     ) -> Result<(), DbError> {
@@ -238,7 +238,7 @@ impl PerspectiveRepository {
         // Tenancy declaration (PR-16), as `create` above.
         .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
         .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -252,9 +252,9 @@ impl PerspectiveRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn ensure_edge_perspective(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn ensure_edge_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         owner_agent_id: Option<Uuid>,
     ) -> Result<(), DbError> {
@@ -271,7 +271,7 @@ impl PerspectiveRepository {
         // Tenancy declaration (PR-16), as `create` above.
         .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
         .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }

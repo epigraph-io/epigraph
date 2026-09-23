@@ -287,6 +287,125 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
     Ok((authority.agent_id, tx))
 }
 
+/// Run `ds_auto::auto_wire_ds_for_claim` in its OWN transaction, stamped from
+/// the **author's** viewer. Post-commit, best-effort, and deliberately NOT
+/// inside the submission's write transaction.
+///
+/// # Why the DS wiring gets its own transaction rather than joining the write
+///
+/// For `submit_claim` and `memorize` the DS wiring is best-effort by contract —
+/// the module doc on `tools::ds_auto` states it: "`update_with_evidence`
+/// propagates errors. `submit_claim` treats DS as best-effort (claim is already
+/// persisted)." Folding it into the submission transaction would make a DS
+/// failure roll the claim back, which converts a WARN into a total
+/// `submit_claim` outage. That is the fail-closed-regression-as-data-loss shape
+/// [`emit_verb_edge_best_effort`]'s doc argues against, and it is why the embed
+/// is post-commit too.
+///
+/// What a separate transaction DOES buy is atomicity WITHIN the wiring.
+/// `auto_wire_ds_for_claim` writes `claim_frames`, `mass_functions` and then
+/// `UPDATE claims SET belief/…`; on the pool each of those was a separate
+/// checkout with its own tenancy context, so a refusal at the belief UPDATE left
+/// a BBA behind with no cached belief derived from it. Here they land together or
+/// not at all.
+///
+/// # THE `was_created` GATE IS THE CALLER'S AND MUST NOT MOVE
+///
+/// Both callers gate this on `was_created` alone, and the asymmetry with the
+/// embed gate (which was deliberately widened) is not an oversight — the two
+/// have OPPOSITE safety properties. Re-running the embed overwrites one vector
+/// with an equivalent one; re-running this COMBINES the same mass a second time
+/// and inflates the claim's belief. This helper therefore takes no view on when
+/// it should run: it is called inside the caller's `if was_created` and that is
+/// where the decision stays.
+///
+/// # Errors
+/// None returned. Every failure is warned and reported as `None`, because the
+/// claim is already committed and CLAUDE.md's write-path invariant forbids a
+/// best-effort step from unwinding it.
+/// `persist_truth_from_pignistic` folds the caller's follow-up
+/// `UPDATE claims SET truth_value` into the SAME transaction. `submit_claim`
+/// needs it and `memorize` does not, and the difference is not cosmetic: that
+/// UPDATE writes a value DERIVED from the BBA this wiring just stored, so on a
+/// separate checkout it could land while the BBA was refused, or be refused
+/// while the BBA landed — a claim whose `truth_value` and whose `mass_functions`
+/// rows disagree about what the evidence says. Inside the transaction the two are
+/// one fact.
+pub async fn wire_ds_for_new_claim_author_stamped(
+    server: &EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    viewer: &epigraph_db::visibility::Viewer,
+    input: crate::tools::ds_auto::DsAutoInput<'_>,
+    persist_truth_from_pignistic: bool,
+    tool_name: &'static str,
+) -> Option<crate::tools::ds_auto::DsAutoResult> {
+    let mut tx = match begin_author_stamped_tx(server, author_agent_id, tool_name).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "ds auto-wire skipped: {}. The claim is stored but carries no BBA and no cached \
+                 belief until a recompute reaches it",
+                e.message
+            );
+            return None;
+        }
+    };
+    let wired = crate::tools::ds_auto::auto_wire_ds_for_claim(
+        &mut tx,
+        viewer,
+        claim_id,
+        author_agent_id,
+        input,
+    )
+    .await;
+    let result = match wired {
+        Ok(r) => r,
+        Err(e) => {
+            // Dropping `tx` rolls back, so a partial wiring is never left behind.
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "ds auto-wire failed: {e}. Rolled back; the claim is stored with no BBA"
+            );
+            return None;
+        }
+    };
+
+    if persist_truth_from_pignistic {
+        let ds_truth = epigraph_core::TruthValue::clamped(result.pignistic_prob);
+        if let Err(e) = ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            epigraph_core::ClaimId::from_uuid(claim_id),
+            ds_truth,
+        )
+        .await
+        {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "failed to update truth from DS pignistic: {e}. Rolled back the whole wiring \
+                 rather than leaving truth_value and mass_functions disagreeing"
+            );
+            return None;
+        }
+    }
+
+    match tx.commit().await {
+        Ok(()) => Some(result),
+        Err(e) => {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "ds auto-wire computed but could not commit: {e}. Nothing was written"
+            );
+            None
+        }
+    }
+}
+
 /// Generate (or reuse) a claim's embedding vector and store it on a connection
 /// stamped from the **author's** viewer. Post-commit, best-effort, and
 /// deliberately NOT inside the submission's write transaction.

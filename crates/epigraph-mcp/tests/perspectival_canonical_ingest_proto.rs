@@ -138,7 +138,7 @@ async fn canonical_ingest_preserves_per_lens_discount(pool: sqlx::PgPool) {
         persp.push(((*name).to_string(), row.id));
     }
 
-    let frame = ensure_binary_frame(&pool, &viewer)
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
         .await
         .expect("binary frame");
 

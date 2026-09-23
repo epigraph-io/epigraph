@@ -424,39 +424,31 @@ pub async fn submit_claim(
     // into the same frame twice, so a resubmit must not; re-embedding a claim that
     // has no vector is idempotent and is the only way a repaired orphan becomes
     // recallable again.
+    //
+    // Both halves now run in ONE transaction stamped from the AUTHOR's viewer —
+    // `claim_frames`, `mass_functions`, the cached-belief `UPDATE claims`, and the
+    // `truth_value` derived from the pignistic. On the unstamped pool the first
+    // of those was refused outright on a cleanly-migrated schema (`claim_frames`
+    // carries no orphan `*_privacy` policy, which is why `mass_functions` stopped
+    // growing in production), and the `truth_value` write could land while the
+    // BBA it is derived from did not. See
+    // `claim_helper::wire_ds_for_new_claim_author_stamped`.
     let ds = if was_created {
-        let ds_result = ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            viewer,
-            claim_uuid,
+        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
+            server,
             agent_id,
+            claim_uuid,
+            viewer,
             ds_auto::DsAutoInput {
                 confidence,
                 weight,
                 supports: true,
                 evidence_type: Some(&params.evidence_type),
             },
+            /* persist_truth_from_pignistic */ true,
+            "submit_claim",
         )
-        .await;
-        if let Err(ref e) = ds_result {
-            tracing::warn!(claim_id = %claim_uuid, "ds auto-wire failed: {e}");
-        }
-        if let Ok(ref ds) = ds_result {
-            let ds_truth = TruthValue::clamped(ds.pignistic_prob);
-            if let Err(e) = ClaimRepository::update_truth_value(
-                &server.pool,
-                ClaimId::from_uuid(claim_uuid),
-                ds_truth,
-            )
-            .await
-            {
-                tracing::warn!(
-                    claim_id = %claim_uuid,
-                    "failed to update truth from DS pignistic: {e}"
-                );
-            }
-        }
-        ds_result.ok()
+        .await
     } else {
         // Resubmit (Option B): verb-edges already emitted above, and the canonical
         // trace stays as it is unless the claim had none (the orphan-repair arm
@@ -906,7 +898,30 @@ pub async fn update_with_evidence(
     // can put evidence → BBA → truth_value → labels in a single stamped unit, and
     // not before. `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` carries
     // it in the residual register so it cannot be forgotten.
-    EvidenceRepository::create(&server.pool, &evidence)
+    // ── D2: evidence -> BBA -> truth_value -> labels, ONE STAMPED UNIT ──
+    //
+    // THE OBJECTION ABOVE IS ANSWERED BY THE TRANSACTION, NOT WAIVED. It said
+    // stamping this INSERT alone "converts a clean refusal into a committed
+    // orphan", unbounded because `Evidence::new` mints a fresh v4 UUID and
+    // `EvidenceRepository::create` has no `ON CONFLICT`, so each retry of a call
+    // certain to fail appends another row. That is true of a SELF-COMMITTING
+    // stamped INSERT. Here the INSERT joins the transaction that also carries the
+    // DS wiring, the truth write and the label merge: if any of them fails,
+    // nothing is committed, so there is no orphan for a retry to accumulate
+    // against.
+    //
+    // AND THE FK ORDERING THAT FORCED THE SPLIT DISSOLVES. Migration 046 gives
+    // `mass_functions.evidence_id` a foreign key to `evidence(id)`, which is why
+    // the evidence row had to exist before `auto_wire_ds_update` could reference
+    // it. A foreign key is checked at statement time against the CURRENT
+    // transaction's snapshot, not at commit, so an uncommitted evidence row in
+    // this same transaction satisfies it. The two writes no longer need separate
+    // commits to be orderable.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+            .await?;
+
+    EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
 
@@ -923,7 +938,7 @@ pub async fn update_with_evidence(
     // by the prior column value for supports=true, so the warning is only ever
     // reachable on the NULL-column (no-prior-DS-state) path.
     let pre_pignistic =
-        ClaimRepository::get_belief_columns(&server.pool, viewer, ClaimId::from_uuid(claim_id))
+        ClaimRepository::get_belief_columns(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
             .await
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
@@ -935,7 +950,7 @@ pub async fn update_with_evidence(
     // CDST update (primary — errors propagated, not swallowed)
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
     let ds = ds_auto::auto_wire_ds_update(
-        &server.pool,
+        &mut tx,
         viewer,
         claim_id,
         agent_id,
@@ -988,9 +1003,6 @@ pub async fn update_with_evidence(
     // states it at its own site. It is a tenancy-model decision, not a defect here.
     let after_truth = TruthValue::clamped(ds.pignistic_prob);
     {
-        let mut tx =
-            crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
-                .await?;
         ClaimRepository::update_truth_value_conn(
             &mut tx,
             ClaimId::from_uuid(claim_id),

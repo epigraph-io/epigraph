@@ -85,7 +85,34 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         .await
         .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
 
-    wire_ds_after_ingest(&server.pool, viewer, &plan, &result).await;
+    // The DS wiring runs in its OWN system-agent-stamped transaction, after the
+    // ingest commit. `claim_frames` / `mass_functions` / the cached-belief
+    // `UPDATE claims` are all owned by the same group as the claims they hang off
+    // — the `workflow-ingest-system` agent's — so this needs the same stamp the
+    // plan walk needed, and on the unstamped pool it was refused on BOTH
+    // configurations (`claim_frames` carries no orphan `*_privacy` policy).
+    //
+    // A SECOND transaction rather than the ingest's own, because this half is
+    // best-effort: a DS failure must not roll back a workflow that landed. Inside
+    // it the per-entry work is SAVEPOINT-wrapped by `auto_wire_ds_batch` and
+    // `auto_wire_edge_if_epistemic`, so one bad entry does not abort the rest.
+    match crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest_ds").await {
+        Ok((_agent, mut ds_tx)) => {
+            wire_ds_after_ingest(&mut ds_tx, viewer, &plan, &result).await;
+            if let Err(e) = ds_tx.commit().await {
+                tracing::warn!(
+                    workflow_id = %result.workflow_id,
+                    "workflow ds wiring could not commit: {e}. The ingest is stored; its claims \
+                     carry no BBA until a recompute reaches them"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            workflow_id = %result.workflow_id,
+            "workflow ds wiring skipped: {}. The ingest is stored and intact",
+            e.message
+        ),
+    }
 
     let inserted = result.inserted.clone();
     let response = IngestWorkflowResponse {
@@ -122,7 +149,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
 /// `ingest_workflow_tags_atom_bbas_with_normalized_evidence_type` failed with
 /// "expected exactly 2 operation-atom BBAs tagged 'empirical', found 0".
 async fn wire_ds_after_ingest(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     plan: &epigraph_ingest::common::plan::IngestPlan,
     result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
@@ -136,7 +163,7 @@ async fn wire_ds_after_ingest(
     };
     for e in &result.inserted_edges {
         ds_auto::auto_wire_edge_if_epistemic(
-            pool,
+            &mut *conn,
             viewer,
             true, // executor only emits an InsertedPlanEdge when was_created=true
             e.edge_id,
@@ -178,7 +205,8 @@ async fn wire_ds_after_ingest(
         })
         .collect();
     if !ds_entries.is_empty() {
-        if let Err(e) = ds_auto::auto_wire_ds_batch(pool, viewer, &ds_entries, agent_id).await {
+        if let Err(e) = ds_auto::auto_wire_ds_batch(&mut *conn, viewer, &ds_entries, agent_id).await
+        {
             tracing::warn!("workflow ds auto-wire batch failed: {e}");
         }
     }
@@ -215,7 +243,13 @@ pub async fn do_ingest_workflow_via_pool(
             .await
             .map_err(|e| internal_error(format!("workflow ingest: {e}")))?
     };
-    wire_ds_after_ingest(pool, viewer, &plan, &result).await;
+    {
+        let mut ds_conn = pool
+            .acquire()
+            .await
+            .map_err(|e| internal_error(format!("workflow ingest: could not acquire: {e}")))?;
+        wire_ds_after_ingest(&mut ds_conn, viewer, &plan, &result).await;
+    }
     Ok(IngestWorkflowResponse {
         workflow_id: result.workflow_id.to_string(),
         canonical_name: result.canonical_name.clone(),

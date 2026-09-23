@@ -340,7 +340,7 @@ pub async fn store_workflow(
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
 
-    auto_wire_inserted_edges(&state.db_pool, &viewer, &result).await;
+    auto_wire_inserted_edges(&state, &viewer, &result).await;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
@@ -1567,7 +1567,7 @@ pub async fn ingest_workflow(
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
 
-    auto_wire_inserted_edges(&state.db_pool, &viewer, &result).await;
+    auto_wire_inserted_edges(&state, &viewer, &result).await;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
@@ -1727,17 +1727,38 @@ fn format_embedding(embedding: &[f32]) -> String {
 /// inserted. Best-effort (the helper logs and swallows individual failures).
 /// Source-claim agent attribution is handled by the engine helper via
 /// `system_agent_id` from the executor result.
+/// Stamped from the `workflow-ingest-system` agent's viewer, like the plan walk
+/// it follows: the `claim_frames` / `mass_functions` / cached-belief rows it
+/// writes are claim-derived, so migrations 074/070 fill their tenancy from the
+/// ingest's own claims and the `WITH CHECK` asks about the SYSTEM agent's group.
+/// On the unstamped pool these were refused on BOTH schema configurations —
+/// `claim_frames` carries no orphan `*_privacy` policy.
+///
+/// Its own transaction rather than the ingest's, because this half is
+/// best-effort: a DS failure must not roll back a workflow that landed. Inside
+/// it, `auto_wire_edge_if_epistemic` SAVEPOINT-wraps each edge, so one failure
+/// does not abort the rest.
 async fn auto_wire_inserted_edges(
-    pool: &sqlx::PgPool,
+    state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
 ) {
     let Some(agent_id) = result.system_agent_id else {
         return;
     };
+    let mut tx = match begin_system_ingest_stamped_tx(state, "workflows/ingest:ds").await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                workflow_id = %result.workflow_id,
+                "workflow ds wiring skipped: {e}. The ingest is stored and intact"
+            );
+            return;
+        }
+    };
     for e in &result.inserted_edges {
         epigraph_engine::edge_factor::auto_wire_edge_if_epistemic(
-            pool,
+            &mut tx,
             viewer,
             true, // executor only emits InsertedPlanEdge when was_created=true
             e.edge_id,
@@ -1749,6 +1770,13 @@ async fn auto_wire_inserted_edges(
             agent_id,
         )
         .await;
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(
+            workflow_id = %result.workflow_id,
+            "workflow ds wiring could not commit: {e}. The ingest is stored; its claims carry \
+             no edge-factor BBA until a recompute reaches them"
+        );
     }
 }
 

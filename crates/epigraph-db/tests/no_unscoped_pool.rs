@@ -17,7 +17,7 @@
 //! PR-17 deliberately declined to ship this file, for a stated reason: *"the
 //! lint would fail on day one"*. It would — there were 391 unconverted sites
 //! when this file landed, and a lint that fails on day one is a lint someone
-//! deletes in week two. (300 today; the assertions below measure the tree and
+//! deletes in week two. (298 today; the assertions below measure the tree and
 //! are what a reader should trust over any integer in this prose.)
 //!
 //! Seeding fixes that without weakening it. The table below is the measured
@@ -103,7 +103,7 @@
 //!      counter protects that file, so this sentence is still the only control
 //!      on it.
 //!   2. `D-PR17-request-path-never-stamps-session-gucs`, which still blocks
-//!      §9.2 step 11d with 300 unconverted sites. **This alone is sufficient for
+//!      §9.2 step 11d with 298 unconverted sites. **This alone is sufficient for
 //!      the prohibition above.** PR-24 discharged one precondition and PR-25 a
 //!      second; PR-26 converted the first shard's seven sites, PR-28 the
 //!      second shard's five, PR-29 — the first MULTI-FILE shard — the third
@@ -120,10 +120,10 @@
 //!      `routes/claims.rs` (4), `routes/crud.rs` (4), and one each in
 //!      `routes/versioning.rs`, `routes/conventions.rs`, `routes/graph.rs` and
 //!      `routes/challenge.rs`. None
-//!      discharged the gate — 300 is not 0 — and no shard in the series may be
+//!      discharged the gate — 298 is not 0 — and no shard in the series may be
 //!      read as unblocking step 11d. A SMALLER number is not a discharged
 //!      decision: 113 of the 416 sites the series began with are converted, and
-//!      300 are not.
+//!      298 are not.
 //!
 //!      **What remains is NOT read-shard work, and that is the closing
 //!      measurement of the read programme rather than a to-do list.** Shard 7
@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 300;
+const HIGH_WATER: usize = 298;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -583,12 +583,15 @@ const HIGH_WATER: usize = 300;
 /// The workflow-ingest executor conversion did not move it either:
 /// `routes/workflows.rs` falls 30 -> 27 and keeps 27 sites, so no key is
 /// deleted. Its three sites came off `HIGH_WATER` alone, 303 -> 300, read off
-/// `the_scanner_is_not_vacuous`'s own failure on the converted tree.
+/// `the_scanner_is_not_vacuous`'s own failure on the converted tree. The
+/// DS-substrate conversion in the same branch took it 27 -> 25 and `HIGH_WATER`
+/// 300 -> 298, by the same method and for the same reason: the file keeps 25
+/// sites, so no key is deleted.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 300 sites across 44 files as of this commit. Lower an entry when a shard
+/// 298 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -818,7 +821,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // to resolve that agent's write authority — a read the SECURITY DEFINER
     // `epigraph_live_memberships` makes non-blind on an unstamped session, which
     // is exactly why it is the bootstrap and cannot be stamped.
-    ("routes/workflows.rs", 27),
+    //
+    // 27 -> 25: the DS-substrate conversion then moved `auto_wire_inserted_edges`
+    // — the post-ingest edge-factor wiring for BOTH ingest handlers — onto its own
+    // system-agent-stamped transaction, so its two `&state.db_pool` sites went
+    // with it. Both counts were read off this test's own failure output rather than
+    // derived by subtraction, which is the method every shard since 5 has used.
+    ("routes/workflows.rs", 25),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

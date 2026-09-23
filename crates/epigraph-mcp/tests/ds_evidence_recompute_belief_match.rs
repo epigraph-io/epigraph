@@ -94,7 +94,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_immediate_result(pool: PgP
         &format!("ds-recompute-match-{}", Uuid::new_v4()),
     )
     .await;
-    let frame_id = ensure_binary_frame(&pool, &viewer)
+    let frame_id = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
         .await
         .expect("binary frame");
 
@@ -185,7 +185,7 @@ async fn recompute_beliefs_matches_submit_ds_evidence_after_two_submissions(pool
         &format!("ds-recompute-match-2-{}", Uuid::new_v4()),
     )
     .await;
-    let frame_id = ensure_binary_frame(&pool, &viewer)
+    let frame_id = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
         .await
         .expect("binary frame");
 
