@@ -175,3 +175,91 @@ async fn supersede_nonexistent_claim_returns_404() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+/// POST /api/v1/claims/:id/supersede with an authorised token and an invalid
+/// body → 400, one case per validation early-return in `supersede_claim`.
+///
+/// These cases used to exist only as `#[cfg(not(feature = "db"))]` unit tests in
+/// `routes/versioning.rs`, written against an in-memory supersession path the
+/// `not(db)` arm no longer has (it answers 503). This is where they assert the
+/// shipping arm. The claim id does not exist: validation runs before the
+/// lookup, so a 400 here is the body's doing. The valid-body row at the end is
+/// the control for that. With the same token and the same missing id it must
+/// get past validation and answer 404, which rules out the token or the route
+/// as the cause of the 400s above it.
+#[tokio::test(flavor = "multi_thread")]
+async fn supersede_invalid_body_returns_400() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client(&pool, &["claims:write"]).await;
+    let missing = uuid::Uuid::new_v4();
+
+    let cases: [(&str, serde_json::Value, u16); 8] = [
+        (
+            "empty content",
+            serde_json::json!({"content": "", "truth_value": 0.8, "reason": "r"}),
+            400,
+        ),
+        (
+            "whitespace-only content",
+            serde_json::json!({"content": "   \n\t ", "truth_value": 0.8, "reason": "r"}),
+            400,
+        ),
+        (
+            "content over 65536 bytes",
+            serde_json::json!({"content": "x".repeat(65_537), "truth_value": 0.8, "reason": "r"}),
+            400,
+        ),
+        (
+            "empty reason",
+            serde_json::json!({"content": "c", "truth_value": 0.8, "reason": ""}),
+            400,
+        ),
+        (
+            "reason over 32768 bytes",
+            serde_json::json!({"content": "c", "truth_value": 0.8, "reason": "r".repeat(32_769)}),
+            400,
+        ),
+        (
+            "negative truth value",
+            serde_json::json!({"content": "c", "truth_value": -0.1, "reason": "r"}),
+            400,
+        ),
+        (
+            "truth value above one",
+            serde_json::json!({"content": "c", "truth_value": 1.5, "reason": "r"}),
+            400,
+        ),
+        (
+            "CONTROL: valid body, missing claim",
+            serde_json::json!({"content": "c", "truth_value": 0.8, "reason": "r"}),
+            404,
+        ),
+    ];
+
+    let client = reqwest::Client::new();
+    let mut wrong = Vec::new();
+    for (label, body, want) in &cases {
+        let resp = client
+            .post(format!("http://{addr}/api/v1/claims/{missing}/supersede"))
+            .bearer_auth(&token)
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        let got = resp.status().as_u16();
+        if got != *want {
+            wrong.push(format!(
+                "{label}: want {want}, got {got} — body={}",
+                resp.text().await.unwrap_or_default()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

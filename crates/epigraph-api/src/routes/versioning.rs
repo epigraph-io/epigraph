@@ -649,817 +649,125 @@ pub async fn claim_history(
 // for helper functions (count_version_chain, find_chain_root, etc.) were
 // removed along with the helper functions themselves.
 //
-// Integration tests for supersession should use a test database fixture.
+// The `db` arm is covered by integration binaries against a database:
+// `tests/supersede_scope_check_test.rs` (401, 403, owner match and mismatch,
+// 404, and the request-body 400s), `tests/versioning_belief_cascade_test.rs`,
+// and `claim_history` in `tests/shard7_routes_scoped_read.rs` and
+// `tests/tenant_isolation_http.rs`.
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "db")))]
 mod tests {
-    // No `use super::*` here: the only remaining child module brings its own
-    // (`use super::super::*`), and the unused re-export trips
-    // `clippy -D warnings` in a file this change already touches.
-
-    // ---- Handler integration tests (require DB) ----
-    // Formerly in-memory tests gated behind #[cfg(not(feature = "db"))].
-    // These need to be rewritten as proper DB integration tests.
-
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
-    #[cfg(not(feature = "db"))]
-    mod handler_tests_placeholder {
-        use super::super::*;
-        use crate::state::{ApiConfig, AppState};
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use axum::routing::{get, post};
-        use axum::Router;
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-
-        /// Helper to parse JSON response body
-        async fn parse_body<T: serde::de::DeserializeOwned>(
-            response: axum::http::Response<Body>,
-        ) -> T {
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            serde_json::from_slice(&body).unwrap()
-        }
-
-        /// Helper to create a state with a claim pre-populated in the store
-        async fn state_with_claim(claim_id: Uuid) -> (AppState, Uuid) {
-            let state = AppState::new(ApiConfig {
-                require_packet_signatures: false,
-                ..ApiConfig::default()
-            });
-
-            let claim = Claim::new(
-                "Original claim content".to_string(),
-                epigraph_core::AgentId::new(),
-                [0u8; 32],
-                TruthValue::new(0.7).unwrap(),
-            );
-
-            // Override the claim's ID to match the requested one
-            let claim = Claim {
-                id: ClaimId::from_uuid(claim_id),
-                ..claim
-            };
-
-            let mut store = state.claim_store.write().await;
-            store.insert(claim_id, claim);
-            drop(store);
-
-            (state, claim_id)
-        }
-
-        /// Create a test router with versioning endpoints (no auth middleware)
-        fn test_router(state: AppState) -> Router {
-            Router::new()
-                .route("/api/v1/claims/:id/supersede", post(supersede_claim))
-                .route("/api/v1/claims/:id/history", get(claim_history))
-                .with_state(state)
-        }
-
-        // ==================================================================
-        // SUPERSESSION TESTS
-        // ==================================================================
-
-        #[tokio::test]
-        async fn test_supersede_creates_new_claim() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state.clone());
-
-            let body = serde_json::json!({
-                "content": "Updated claim content",
-                "truth_value": 0.85,
-                "reason": "New evidence discovered"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::CREATED);
-
-            let resp: SupersessionResponse = parse_body(response).await;
-            assert_eq!(resp.superseded_claim_id, claim_id);
-            assert_ne!(resp.new_claim_id, claim_id);
-            assert!((resp.new_truth_value - 0.85).abs() < f64::EPSILON);
-            assert_eq!(resp.version, 2);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_marks_old_claim_non_current() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state.clone());
-
-            let body = serde_json::json!({
-                "content": "Updated content",
-                "truth_value": 0.9,
-                "reason": "Better evidence"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::CREATED);
-
-            // Verify old claim is now non-current
-            let store = state.claim_store.read().await;
-            let old_claim = store.get(&claim_id).unwrap();
-            assert!(!old_claim.is_current);
-            assert!(old_claim.is_superseded());
-        }
-
-        #[tokio::test]
-        async fn test_supersede_nonexistent_claim_returns_404() {
-            let state = AppState::new(ApiConfig {
-                require_packet_signatures: false,
-                ..ApiConfig::default()
-            });
-            let router = test_router(state);
-
-            let fake_id = Uuid::new_v4();
-            let body = serde_json::json!({
-                "content": "New content",
-                "truth_value": 0.5,
-                "reason": "Some reason"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{fake_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_already_superseded_claim_returns_400() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-
-            // First supersession
-            let router = test_router(state.clone());
-            let body = serde_json::json!({
-                "content": "Version 2",
-                "truth_value": 0.8,
-                "reason": "First update"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::CREATED);
-
-            // Second supersession of same (now non-current) claim should fail
-            let router = test_router(state.clone());
-            let body2 = serde_json::json!({
-                "content": "Version 3 attempt",
-                "truth_value": 0.9,
-                "reason": "Second update"
-            });
-
-            let request2 = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body2).unwrap()))
-                .unwrap();
-
-            let response2 = router.oneshot(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_invalid_truth_value_too_high() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state);
-
-            let body = serde_json::json!({
-                "content": "Updated content",
-                "truth_value": 1.5,
-                "reason": "Some reason"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_invalid_truth_value_negative() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state);
-
-            let body = serde_json::json!({
-                "content": "Updated content",
-                "truth_value": -0.1,
-                "reason": "Some reason"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_empty_content_rejected() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state);
-
-            let body = serde_json::json!({
-                "content": "",
-                "truth_value": 0.5,
-                "reason": "Some reason"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_empty_reason_rejected() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state);
-
-            let body = serde_json::json!({
-                "content": "Valid content",
-                "truth_value": 0.5,
-                "reason": ""
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        #[tokio::test]
-        async fn test_supersede_whitespace_only_content_rejected() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state);
-
-            let body = serde_json::json!({
-                "content": "   \n\t  ",
-                "truth_value": 0.5,
-                "reason": "Some reason"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        }
-
-        // ==================================================================
-        // VERSION HISTORY TESTS
-        // ==================================================================
-
-        #[tokio::test]
-        async fn test_history_single_version() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-            let router = test_router(state);
-
-            let request = Request::builder()
-                .method("GET")
-                .uri(format!("/api/v1/claims/{claim_id}/history"))
-                .body(Body::empty())
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let history: VersionHistoryResponse = parse_body(response).await;
-            assert_eq!(history.claim_id, claim_id);
-            assert_eq!(history.total_versions, 1);
-            assert_eq!(history.current_version, 1);
-            assert_eq!(history.versions.len(), 1);
-            assert!(history.versions[0].is_current);
-            assert_eq!(history.versions[0].version, 1);
-            assert!(history.versions[0].superseded_by.is_none());
-        }
-
-        #[tokio::test]
-        async fn test_history_after_supersession() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-
-            // Supersede the claim
-            let router = test_router(state.clone());
-            let body = serde_json::json!({
-                "content": "Version 2 content",
-                "truth_value": 0.85,
-                "reason": "Updated evidence"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let resp = router.oneshot(request).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED);
-            let supersession: SupersessionResponse = parse_body(resp).await;
-
-            // Query history for the original claim
-            let router = test_router(state.clone());
-            let request = Request::builder()
-                .method("GET")
-                .uri(format!("/api/v1/claims/{claim_id}/history"))
-                .body(Body::empty())
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let history: VersionHistoryResponse = parse_body(response).await;
-            assert_eq!(history.total_versions, 2);
-            assert_eq!(history.current_version, 2);
-
-            // First version: original claim (non-current)
-            assert_eq!(history.versions[0].claim_id, claim_id);
-            assert!(!history.versions[0].is_current);
-            assert_eq!(history.versions[0].version, 1);
-            assert_eq!(
-                history.versions[0].superseded_by,
-                Some(supersession.new_claim_id)
-            );
-
-            // Second version: new claim (current)
-            assert_eq!(history.versions[1].claim_id, supersession.new_claim_id);
-            assert!(history.versions[1].is_current);
-            assert_eq!(history.versions[1].version, 2);
-            assert!(history.versions[1].superseded_by.is_none());
-        }
-
-        #[tokio::test]
-        async fn test_history_nonexistent_claim_returns_404() {
-            let state = AppState::new(ApiConfig {
-                require_packet_signatures: false,
-                ..ApiConfig::default()
-            });
-            let router = test_router(state);
-
-            let fake_id = Uuid::new_v4();
-            let request = Request::builder()
-                .method("GET")
-                .uri(format!("/api/v1/claims/{fake_id}/history"))
-                .body(Body::empty())
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        }
-
-        #[tokio::test]
-        async fn test_version_numbering_is_correct() {
-            let claim_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(claim_id).await;
-
-            // First supersession: v1 -> v2
-            let router = test_router(state.clone());
-            let body = serde_json::json!({
-                "content": "Version 2",
-                "truth_value": 0.8,
-                "reason": "Update 1"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let resp = router.oneshot(request).await.unwrap();
-            let sup1: SupersessionResponse = parse_body(resp).await;
-            assert_eq!(sup1.version, 2);
-
-            // Second supersession: v2 -> v3
-            let router = test_router(state.clone());
-            let body = serde_json::json!({
-                "content": "Version 3",
-                "truth_value": 0.9,
-                "reason": "Update 2"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{}/supersede", sup1.new_claim_id))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let resp = router.oneshot(request).await.unwrap();
-            let sup2: SupersessionResponse = parse_body(resp).await;
-            assert_eq!(sup2.version, 3);
-
-            // Verify full history from the root claim
-            let router = test_router(state.clone());
-            let request = Request::builder()
-                .method("GET")
-                .uri(format!("/api/v1/claims/{claim_id}/history"))
-                .body(Body::empty())
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            let history: VersionHistoryResponse = parse_body(response).await;
-            assert_eq!(history.total_versions, 3);
-            assert_eq!(history.current_version, 3);
-
-            // Verify version numbers are sequential
-            for (i, version) in history.versions.iter().enumerate() {
-                assert_eq!(version.version, (i + 1) as u32);
-            }
-        }
-        // ==================================================================
-        // AUTH / MIDDLEWARE INTEGRATION TESTS
-        // ==================================================================
-
-        /// Test that superseding a claim without signature headers returns 401
-        /// when the request goes through the full create_router middleware stack.
-        ///
-        /// This is a true integration test: it uses the production router
-        /// (including the bearer_auth_middleware layer) rather than a
-        /// bare handler router, proving that unauthenticated writes are rejected.
-        #[tokio::test]
-        async fn test_supersede_without_signature_returns_401() {
-            let claim_id = Uuid::new_v4();
-            let state = AppState::new(ApiConfig {
-                require_packet_signatures: false, // irrelevant; middleware always checks headers
-                ..ApiConfig::default()
-            });
-
-            // Pre-populate a claim so we know the 401 comes from auth, not 404
-            {
-                let claim = epigraph_core::Claim::new(
-                    "Original claim".to_string(),
-                    epigraph_core::AgentId::new(),
-                    [0u8; 32],
-                    TruthValue::new(0.7).unwrap(),
-                );
-                let claim = epigraph_core::Claim {
-                    id: epigraph_core::ClaimId::from_uuid(claim_id),
-                    ..claim
-                };
-                let mut store = state.claim_store.write().await;
-                store.insert(claim_id, claim);
-            }
-
-            // Use the full production router with middleware
-            let router = crate::routes::create_router(state);
-
-            let body = serde_json::json!({
-                "content": "Updated claim content",
-                "truth_value": 0.85,
-                "reason": "New evidence discovered"
-            });
-
-            // POST without any signature headers -> middleware rejects with 401
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "Supersede without signature headers must return 401"
-            );
-        }
-
-        // ==================================================================
-        // HISTORY CHAIN TRAVERSAL TESTS
-        // ==================================================================
-
-        /// Test that querying history from a mid-chain claim still returns
-        /// the complete version chain from root to current.
-        ///
-        /// Chain: root (v1) -> v2 -> v3 (current)
-        /// Query history from v2 => should return all three versions.
-        #[tokio::test]
-        async fn test_history_queried_from_middle_of_chain() {
-            let root_id = Uuid::new_v4();
-            let (state, _) = state_with_claim(root_id).await;
-
-            // Supersede root -> v2
-            let router = test_router(state.clone());
-            let body = serde_json::json!({
-                "content": "Version 2",
-                "truth_value": 0.8,
-                "reason": "First update"
-            });
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{root_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-            let resp = router.oneshot(request).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED);
-            let sup1: SupersessionResponse = parse_body(resp).await;
-
-            // Supersede v2 -> v3
-            let router = test_router(state.clone());
-            let body = serde_json::json!({
-                "content": "Version 3",
-                "truth_value": 0.9,
-                "reason": "Second update"
-            });
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{}/supersede", sup1.new_claim_id))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-            let resp = router.oneshot(request).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED);
-
-            // Query history from the MIDDLE claim (v2), not root or current
-            let router = test_router(state.clone());
-            let request = Request::builder()
-                .method("GET")
-                .uri(format!("/api/v1/claims/{}/history", sup1.new_claim_id))
-                .body(Body::empty())
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-
-            let history: VersionHistoryResponse = parse_body(response).await;
-            assert_eq!(
-                history.total_versions, 3,
-                "History from mid-chain claim should include all versions"
-            );
-            assert_eq!(history.current_version, 3);
-
-            // Versions must be in chronological order (oldest first)
-            assert_eq!(history.versions[0].version, 1);
-            assert_eq!(history.versions[0].claim_id, root_id);
-            assert!(!history.versions[0].is_current);
-
-            assert_eq!(history.versions[1].version, 2);
-            assert_eq!(history.versions[1].claim_id, sup1.new_claim_id);
-            assert!(!history.versions[1].is_current);
-
-            assert_eq!(history.versions[2].version, 3);
-            assert!(history.versions[2].is_current);
-        }
-
-        /// PR-03 INVERSION. This asserted that `GET /api/v1/claims/:id/history`
-        /// answered 200 with no credential, "because the history endpoint is on
-        /// the public router". It is not on the public router any more: version
-        /// history is claim content over time, which is strictly more than
-        /// `GET /api/v1/claims/:id` exposes.
-        #[tokio::test]
-        async fn test_history_is_401_without_a_token() {
-            let claim_id = Uuid::new_v4();
-            let state = AppState::new(ApiConfig::default());
-
-            // Pre-populate a claim
-            {
-                let claim = epigraph_core::Claim::new(
-                    "A claim".to_string(),
-                    epigraph_core::AgentId::new(),
-                    [0u8; 32],
-                    TruthValue::new(0.5).unwrap(),
-                );
-                let claim = epigraph_core::Claim {
-                    id: epigraph_core::ClaimId::from_uuid(claim_id),
-                    ..claim
-                };
-                let mut store = state.claim_store.write().await;
-                store.insert(claim_id, claim);
-            }
-
-            // Use the full production router (with middleware)
-            let router = crate::routes::create_router(state);
-
-            // GET with no Authorization header -> 401 with the RFC 6750
-            // challenge. The handler's own behaviour (that it returns one
-            // version for a freshly-inserted claim) is covered by the
-            // handler-level tests above, which call it directly.
-            let request = Request::builder()
-                .method("GET")
-                .uri(format!("/api/v1/claims/{claim_id}/history"))
-                .body(Body::empty())
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNAUTHORIZED,
-                "claim version history is no longer anonymously readable"
-            );
-            let challenge = response
-                .headers()
-                .get(axum::http::header::WWW_AUTHENTICATE)
-                .expect("401 carries an RFC 6750 challenge")
-                .to_str()
-                .unwrap();
-            assert!(
-                challenge.contains(r#"error="invalid_token""#),
-                "got: {challenge}"
-            );
-        }
-    } // end mod handler_tests
-
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
-    #[cfg(not(feature = "db"))]
-    mod event_tests {
-        use super::super::*;
-        use crate::state::{ApiConfig, AppState};
-        use axum::body::Body;
-        use axum::http::{Request, StatusCode};
-        use axum::routing::post;
-        use axum::Router;
-        use http_body_util::BodyExt;
-        use tower::ServiceExt;
-
-        /// Helper to parse JSON response body
-        async fn parse_body<T: serde::de::DeserializeOwned>(
-            response: axum::http::Response<Body>,
-        ) -> T {
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            serde_json::from_slice(&body).unwrap()
-        }
-
-        /// Helper to create a state with a claim pre-populated in the store
-        async fn state_with_claim(claim_id: Uuid) -> AppState {
-            let state = AppState::new(ApiConfig {
-                require_packet_signatures: false,
-                ..ApiConfig::default()
-            });
-
-            let claim = Claim::new(
-                "Original claim content".to_string(),
-                epigraph_core::AgentId::new(),
-                [0u8; 32],
-                TruthValue::new(0.7).unwrap(),
-            );
-
-            let claim = Claim {
-                id: ClaimId::from_uuid(claim_id),
-                ..claim
-            };
-
-            let mut store = state.claim_store.write().await;
-            store.insert(claim_id, claim);
-            drop(store);
-
-            state
-        }
-
-        #[tokio::test]
-        async fn test_supersede_publishes_claim_submitted_event() {
-            let claim_id = Uuid::new_v4();
-            let state = state_with_claim(claim_id).await;
-
-            let router = Router::new()
-                .route("/api/v1/claims/:id/supersede", post(supersede_claim))
-                .with_state(state.clone());
-
-            let body = serde_json::json!({
-                "content": "Updated claim via supersession",
-                "truth_value": 0.85,
-                "reason": "New evidence discovered"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::CREATED);
-
-            // Verify that a ClaimSubmitted event was published for the new claim
-            assert_eq!(
-                state.event_bus.history_size(),
-                1,
-                "Event bus should contain exactly one event after successful supersession"
-            );
-
-            let history = state.event_bus.get_history().unwrap();
-            assert_eq!(history[0].event.event_type(), "ClaimSubmitted");
-
-            // Verify the event references the NEW claim, not the old one
-            let resp: SupersessionResponse = parse_body(response).await;
-            match &history[0].event {
-                epigraph_events::EpiGraphEvent::ClaimSubmitted {
-                    claim_id: event_claim_id,
-                    ..
-                } => {
-                    let event_uuid: Uuid = (*event_claim_id).into();
-                    assert_eq!(
-                        event_uuid, resp.new_claim_id,
-                        "Event claim_id should match the newly created claim"
-                    );
-                }
-                _ => panic!("Expected ClaimSubmitted event"),
-            }
-        }
-
-        #[tokio::test]
-        async fn test_supersede_no_event_on_validation_failure() {
-            let claim_id = Uuid::new_v4();
-            let state = state_with_claim(claim_id).await;
-
-            let router = Router::new()
-                .route("/api/v1/claims/:id/supersede", post(supersede_claim))
-                .with_state(state.clone());
-
-            // Invalid: empty content
-            let body = serde_json::json!({
-                "content": "",
-                "truth_value": 0.5,
-                "reason": "Some reason"
-            });
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(format!("/api/v1/claims/{claim_id}/supersede"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&body).unwrap()))
-                .unwrap();
-
-            let response = router.oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-            // No event should be published on validation failure
-            assert_eq!(
-                state.event_bus.history_size(),
-                0,
-                "Event bus should be empty after failed supersession"
-            );
-        }
-    } // end mod event_tests
+    //! The `not(db)` arm of this file is two 503 stubs, and these are its tests.
+    //!
+    //! This module used to hold sixteen handler tests and two event tests
+    //! written against an in-memory supersession path (`AppState::claim_store`
+    //! plus a version-chain walk) that was removed when supersession moved to
+    //! `ClaimRepository::supersede`. They never compiled after that. When the
+    //! configuration compiled again, 16 of the 18 failed, each on
+    //! `503 != 201/200/400/404`, because there is no in-memory behaviour left
+    //! to assert. They were deleted rather than rewritten. Their request-body
+    //! 400 cases were the one part that still described shipping behaviour, and
+    //! those moved to the `db` arm in `tests/supersede_scope_check_test.rs`.
+    //! The two tests that went through `create_router` still hold and are kept.
+    use super::*;
+    use crate::state::ApiConfig;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::{get, post};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    /// The bare handlers, with no middleware. The stubs take no authentication
+    /// extractor, because they answer before touching anything.
+    fn stub_router() -> Router {
+        Router::new()
+            .route("/api/v1/claims/:id/supersede", post(supersede_claim))
+            .route("/api/v1/claims/:id/history", get(claim_history))
+            .with_state(AppState::new(ApiConfig::default()))
+    }
+
+    fn supersede_body() -> String {
+        serde_json::json!({
+            "content": "Updated claim content",
+            "truth_value": 0.85,
+            "reason": "New evidence discovered"
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn supersede_without_a_database_is_503() {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/claims/{}/supersede", Uuid::new_v4()))
+            .header("content-type", "application/json")
+            .body(Body::from(supersede_body()))
+            .unwrap();
+
+        let response = stub_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn history_without_a_database_is_503() {
+        let request = Request::builder()
+            .uri(format!("/api/v1/claims/{}/history", Uuid::new_v4()))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = stub_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// PR-03 INVERSION. Supersession is a write: through the production
+    /// router, a request with no credential is refused by the bearer
+    /// middleware before the stub is reached.
+    #[tokio::test]
+    async fn supersede_via_full_router_without_a_token_is_401() {
+        let router = crate::routes::create_router(AppState::new(ApiConfig::default()));
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/claims/{}/supersede", Uuid::new_v4()))
+            .header("content-type", "application/json")
+            .body(Body::from(supersede_body()))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Supersede without a token must return 401"
+        );
+    }
+
+    /// PR-03 INVERSION. This asserted that `GET /api/v1/claims/:id/history`
+    /// answered 200 with no credential, "because the history endpoint is on
+    /// the public router". It is not on the public router any more: version
+    /// history is claim content over time, which is strictly more than
+    /// `GET /api/v1/claims/:id` exposes.
+    #[tokio::test]
+    async fn history_via_full_router_without_a_token_is_401() {
+        let router = crate::routes::create_router(AppState::new(ApiConfig::default()));
+        let request = Request::builder()
+            .uri(format!("/api/v1/claims/{}/history", Uuid::new_v4()))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "claim version history is no longer anonymously readable"
+        );
+        let challenge = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("401 carries an RFC 6750 challenge")
+            .to_str()
+            .unwrap();
+        assert!(
+            challenge.contains(r#"error="invalid_token""#),
+            "got: {challenge}"
+        );
+    }
 }
