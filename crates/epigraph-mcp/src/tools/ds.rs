@@ -204,8 +204,35 @@ pub async fn submit_ds_evidence(
     // converting on its own: `assign_claim` is `ON CONFLICT … DO UPDATE` and
     // `store_with_perspective` upserts on
     // `(claim_id, frame_id, source_agent_id, perspective_id)`, so a repeat call
-    // re-stores the same BBA instead of combining its mass twice, and
-    // `recompute_beliefs` can finish the job for a row already stored.
+    // re-stores the same BBA instead of combining its mass twice. Retry-safety is
+    // what makes the committed rows recoverable rather than corrupting, and it is
+    // the property the sibling conversion in `update_with_evidence` does NOT have
+    // (a fresh `EvidenceId::new()` per call, no `ON CONFLICT`) — which is why that
+    // one is deliberately left unstamped until D2 and this one is not.
+    //
+    // THE REPAIR PATH IS NOT THE `recompute_beliefs` TOOL. An earlier revision of
+    // this comment said it was, and that was wrong: `maintenance.rs`'s
+    // `maintenance_tools_run_on_the_maintenance_connection()` is
+    // `const fn … { false }` and is checked FIRST in `maintenance_viewer`, so all
+    // three maintenance tools — `recompute_beliefs` included — refuse by
+    // construction, and attaching a `ScopedPool` cannot un-gate them
+    // (`attaching_a_scoped_pool_does_not_enable_the_maintenance_tools` is the pin).
+    // Pointing a safety argument at a hard-disabled tool is worse than admitting
+    // there is no in-band repair. The repair that DOES exist is out-of-band:
+    // `epigraph-cli recompute_claim_belief`, which draws from
+    // `MaintenancePool::connect` and therefore writes `claims.{belief,
+    // plausibility, pignistic_prob}` on a privileged connection that the tier-A
+    // `WITH CHECK` does not refuse. In-band repair arrives with D2, when this
+    // recompute moves onto the stamped connection and the whole tool becomes one
+    // unit.
+    //
+    // CONSEQUENCE ON CONFIG A, STATED PLAINLY: on a cleanly-migrated schema this
+    // tool now commits `claim_frames` + `mass_functions` and THEN fails at the
+    // recompute's `UPDATE claims`, where before it failed at `claim_frames` having
+    // written nothing. The stored BBA is real and retry-stable; the claim's CACHED
+    // belief is stale until D2 or the CLI above runs. That window is a known
+    // release-gate residual, registered in
+    // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs`.
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_ds_evidence")
             .await?;
