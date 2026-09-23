@@ -1272,6 +1272,84 @@ pub struct UpdateResponse {
     pub truth_before: f64,
     pub truth_after: f64,
     pub evidence_id: String,
+    /// Whether the Dempster-Shafer wiring for this submission actually landed.
+    ///
+    /// `true` means a fresh BBA was materialized and the claim's belief was
+    /// recomputed, so `truth_after` and the three `belief` / `plausibility` /
+    /// `pignistic_prob` fields describe a NEW epistemic state.
+    ///
+    /// `false` means the evidence row was attached and committed — the claim
+    /// genuinely carries this submission — but the DS wiring did not complete,
+    /// so **`claims.truth_value` and the cached belief columns (`belief`,
+    /// `plausibility`, `pignistic_prob`, …) were not updated by this call**. On
+    /// that path `truth_after == truth_before`, the three measure fields are
+    /// ABSENT rather than stale (there are no fresh measures to report, and
+    /// echoing the persisted columns would dress a no-op as a delta), and the
+    /// error is in `ds_wire_error` and in the server log as a `ds auto-wire
+    /// failed` WARN.
+    ///
+    /// `false` does NOT mean no BBA landed. `ds_auto::auto_wire_ds_update_staged`
+    /// is a sequence of separate pool writes (`claim_frames` → evidence
+    /// perspective → `mass_functions` → cached belief), so a failure after the
+    /// BBA is stored leaves it persisted, and framed belief reads that recompute
+    /// live from stored BBAs may already reflect it. Which case applies is
+    /// [`Self::bba_stored`]. The production failure is at the FIRST step
+    /// (`assign_claim` refused on `claim_frames`), where no BBA lands — measured
+    /// on the prod-faithful e2e configuration as `claim_frames=0
+    /// mass_functions=0` after the call.
+    ///
+    /// Recovery depends on [`Self::bba_stored`]:
+    ///
+    /// * **`bba_stored: true`** (late-step drop). The operator binary
+    ///   `recompute_claim_belief` — a separate `[[bin]]` in the `epigraph-cli`
+    ///   package, not a subcommand: `cargo run -p epigraph-cli --bin
+    ///   recompute_claim_belief -- --stdin` with claim ids on stdin — draws its
+    ///   connection from `MaintenancePool::connect` rather than this tool's pool,
+    ///   and recomputes the cached DS columns (`belief`, `plausibility`,
+    ///   `pignistic_prob`, conflict / missing mass) from the claim's stored mass
+    ///   functions, frame by frame. It does **not** write `claims.truth_value`,
+    ///   which stays stale until the next successful `update_with_evidence` on
+    ///   the claim. It is **not** the `recompute_beliefs` MCP tool, which
+    ///   `maintenance_tools_run_on_the_maintenance_connection() -> false` refuses
+    ///   by construction.
+    /// * **`bba_stored: false`** (first-step drop — the current production
+    ///   case). No BBA exists, so `recompute_claim_belief` repairs nothing, and no
+    ///   existing tool mints a BBA from an existing evidence row. Re-submitting is
+    ///   NOT a recovery. An identical re-submit (same `evidence_data` on the same
+    ///   claim) is refused as a duplicate by `evidence_content_hash_claim_unique
+    ///   UNIQUE (content_hash, claim_id)`, where `content_hash =
+    ///   blake3(evidence_data)`. A re-worded one is admitted, but it adds a SECOND
+    ///   evidence row for the same assertion, and the original row still has no
+    ///   BBA. The reported `evidence_id` identifies the BBA-less row, both for a
+    ///   future BBA-from-evidence repair and for de-duplicating it if the
+    ///   assertion is later re-submitted in other words.
+    ///
+    /// Same disclosure contract as [`LinkEpistemicResponse::belief_wired`]: the
+    /// call succeeded, and the caller is told exactly which half of it did.
+    pub belief_wired: bool,
+    /// Whether THIS submission's BBA is persisted in `mass_functions`.
+    ///
+    /// Always `true` when `belief_wired` is `true`. When `belief_wired` is
+    /// `false` it separates the two failures, which need opposite recoveries:
+    ///
+    /// * `true` — the wire failed AFTER `store_with_perspective` (re-reading,
+    ///   parsing — e.g. a legacy malformed stored BBA — discounting, combining,
+    ///   or writing the cached columns). The BBA is persisted: framed reads that
+    ///   recompute live from stored BBAs already include it, and the next
+    ///   successful wire on this claim combines it. Do NOT submit the evidence
+    ///   again in any form — it would count twice. Only the cached columns and
+    ///   `truth_value` are stale.
+    /// * `false` — the wire failed at or before storing the BBA (the production
+    ///   case). The evidence row exists but contributes nothing to any belief.
+    ///
+    /// Set by which step returned the error, not by parsing its text.
+    pub bba_stored: bool,
+    /// The DS wiring's error, prefixed with the step that failed (`assign_claim:`,
+    /// `store BBA:`, `update_claim_belief:`, …). Present exactly when
+    /// `belief_wired` is `false`. It is the same text this tool used to return as
+    /// its -32603 error message before the wiring became best-effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_wire_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

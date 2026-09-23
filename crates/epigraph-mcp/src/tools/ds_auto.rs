@@ -1,8 +1,10 @@
 //! Auto-wiring of CDST (Calibrated Dempster-Shafer) evidence for claims.
 //!
 //! Every claim-creating or claim-updating tool calls into this module after
-//! persisting the claim. DS is the primary belief authority — `update_with_evidence`
-//! propagates errors. `submit_claim` treats DS as best-effort (claim is already persisted).
+//! persisting the claim. DS is the primary belief authority. `submit_claim` and
+//! `update_with_evidence` both treat a DS-wiring failure as best-effort (the claim /
+//! evidence row is already persisted); `update_with_evidence` additionally reports
+//! the stage of the failure via [`auto_wire_ds_update_staged`].
 //!
 //! Each BBA is Shafer-discounted by its `source_strength` before combination to
 //! prevent runaway confirmation (C2) and dilution attacks (C3).
@@ -401,6 +403,10 @@ pub async fn auto_wire_ds_for_claim(
 /// `evidence_id` is passed as `perspective_id` so that each evidence submission
 /// gets its own BBA row rather than upsert-overwriting the previous one on the
 /// unique constraint (claim_id, frame_id, agent_id, perspective_id=NULL).
+///
+/// Thin wrapper over [`auto_wire_ds_update_staged`] for callers that only need
+/// the error text. A caller that has to tell its own caller WHETHER THE BBA
+/// LANDED before the failure (so it can pick a recovery) uses the staged form.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_update(
     pool: &PgPool,
@@ -413,17 +419,81 @@ pub async fn auto_wire_ds_update(
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
 ) -> Result<DsAutoResult, String> {
-    let frame_id = ensure_binary_frame(pool, viewer).await?;
-    let frame = binary_frame()?;
+    auto_wire_ds_update_staged(
+        pool,
+        viewer,
+        claim_id,
+        agent_id,
+        confidence,
+        weight,
+        supports,
+        evidence_type_str,
+        evidence_id,
+    )
+    .await
+    .map_err(|f| f.error)
+}
+
+/// Why [`auto_wire_ds_update_staged`] failed, and — the part a bare `String`
+/// cannot carry — whether this call's BBA was already persisted when it did.
+///
+/// The wire is a sequence of SEPARATE pool writes, each auto-committed:
+/// `claim_frames` → evidence perspective → `mass_functions` → cached belief
+/// columns on `claims`. So a failure is not all-or-nothing, and the two halves
+/// need OPPOSITE recoveries:
+///
+/// * `bba_stored == false` — the failure happened at or before
+///   `store_with_perspective`. No `mass_functions` row exists for this
+///   submission (rows from the earlier steps — a `claim_frames` assignment, the
+///   synthetic evidence perspective — may). The evidence contributes nothing to
+///   any belief read until a BBA is minted for it.
+/// * `bba_stored == true` — `store_with_perspective` returned `Ok`, and a LATER
+///   step (re-reading the stored BBAs, parsing one — including a legacy
+///   malformed row — discounting, combining, or `update_claim_belief`) failed.
+///   The BBA is persisted: live framed recomputation from stored BBAs already
+///   includes it, and the next successful wire on this claim combines it. Only
+///   the cached belief columns were left stale.
+///
+/// The flag is set by WHICH STEP returned the error, structurally, not by
+/// parsing the error text.
+#[derive(Debug)]
+pub struct DsUpdateFailure {
+    pub bba_stored: bool,
+    pub error: String,
+}
+
+/// [`auto_wire_ds_update`], with the failure classified by stage. See
+/// [`DsUpdateFailure`].
+#[allow(clippy::too_many_arguments)]
+pub async fn auto_wire_ds_update_staged(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    agent_id: Uuid,
+    confidence: f64,
+    weight: f64,
+    supports: bool,
+    evidence_type_str: Option<&str>,
+    evidence_id: Option<Uuid>,
+) -> Result<DsAutoResult, DsUpdateFailure> {
+    // Every step up to and including `store_with_perspective` fails with no
+    // BBA stored for this submission.
+    let unstored = |error: String| DsUpdateFailure {
+        bba_stored: false,
+        error,
+    };
+
+    let frame_id = ensure_binary_frame(pool, viewer).await.map_err(unstored)?;
+    let frame = binary_frame().map_err(unstored)?;
 
     // Build BBA for this evidence
-    let bba = build_binary_bba(&frame, confidence, weight, supports)?;
-    let masses_json = mass_to_json(&bba)?;
+    let bba = build_binary_bba(&frame, confidence, weight, supports).map_err(unstored)?;
+    let masses_json = mass_to_json(&bba).map_err(unstored)?;
 
     // Ensure assignment exists
     FrameRepository::assign_claim(pool, claim_id, frame_id, Some(0))
         .await
-        .map_err(|e| format!("assign_claim: {e}"))?;
+        .map_err(|e| unstored(format!("assign_claim: {e}")))?;
 
     // Materialize a synthetic perspective with id=evidence_id so the
     // mass_functions.perspective_id FK is satisfied. Without this, every
@@ -432,7 +502,7 @@ pub async fn auto_wire_ds_update(
     if let Some(persp_id) = evidence_id {
         PerspectiveRepository::ensure_evidence_perspective(pool, persp_id, Some(agent_id))
             .await
-            .map_err(|e| format!("ensure_evidence_perspective: {e}"))?;
+            .map_err(|e| unstored(format!("ensure_evidence_perspective: {e}")))?;
     }
 
     // Store BBA — use evidence_id as perspective_id so each evidence submission
@@ -455,8 +525,30 @@ pub async fn auto_wire_ds_update(
         evidence_id, // Phase 3: the FK to the evidence row that produced this BBA (issue #197)
     )
     .await
-    .map_err(|e| format!("store BBA: {e}"))?;
+    .map_err(|e| unstored(format!("store BBA: {e}")))?;
 
+    // ── THE BBA IS NOW PERSISTED ─────────────────────────────────────────
+    // Every failure from here on leaves it behind, so it is reported as
+    // `bba_stored: true`.
+    combine_stored_bbas_and_cache(pool, viewer, claim_id, frame_id, &frame, supports)
+        .await
+        .map_err(|error| DsUpdateFailure {
+            bba_stored: true,
+            error,
+        })
+}
+
+/// The post-store half of [`auto_wire_ds_update_staged`]: re-read every stored
+/// binary-frame BBA for the claim, discount, combine, clamp, and write the
+/// cached belief columns.
+async fn combine_stored_bbas_and_cache(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    supports: bool,
+) -> Result<DsAutoResult, String> {
     // Retrieve BBAs from ALL 2-hypothesis frames for this claim. The DB JOIN
     // on frames ensures we only include frames with exactly 2 hypotheses —
     // a BBA from a 3+-hypothesis frame whose focal elements happen to use only
@@ -531,13 +623,13 @@ pub async fn auto_wire_ds_update(
             per_frame_evidence_weights.as_ref(),
             &calibration,
         );
-        let mf = parse_stored_bba(&frame, &r.masses)?;
+        let mf = parse_stored_bba(frame, &r.masses)?;
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
     } else {
         // Multiple BBAs — discount each via the helper, then combine.
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
-            let mf = parse_stored_bba(&frame, &row.masses)?;
+            let mf = parse_stored_bba(frame, &row.masses)?;
             let reliability = effective_source_strength(
                 row,
                 per_frame_intra,

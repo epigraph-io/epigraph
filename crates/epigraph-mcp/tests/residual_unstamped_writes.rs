@@ -87,9 +87,12 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "tools/claims.rs",
         "ClaimRepository::update_labels",
         1,
-        "`update_with_evidence`'s label merge. Reached only AFTER the DS wiring below, which is \
-         itself unconverted and refuses first on a clean schema, so this line does not execute \
-         on either configuration today. Converts with D2.",
+        "`update_with_evidence`'s label merge. Sequenced AFTER the DS wiring below, which is \
+         itself unconverted. RE-MEASURED once that wiring became best-effort: on CONFIG B \
+         (prod-faithful) this line now DOES execute — the wire is dropped with a warn and the \
+         merge commits, deliberately ungated on the wire's success so submitted labels are not \
+         silently lost (backlog f14592cb). On CONFIG A the evidence INSERT above still refuses \
+         first, so it stays unreached there. Converts with D2.",
     ),
     (
         "tools/claims.rs",
@@ -106,18 +109,26 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
         "`update_with_evidence`'s evidence INSERT. Stamped in an earlier revision of this branch \
          and DELIBERATELY REVERTED: migration 046's FK from `mass_functions.evidence_id` forces \
          it to commit before the (unconverted) DS wiring can reference it, so stamping it traded \
-         a clean CONFIG-A refusal for a committed orphan, and `Evidence::new` + a no-`ON CONFLICT` \
-         INSERT makes agent retries accumulate rows. Converts with D2, in the commit that can put \
+         a clean CONFIG-A refusal for a committed BBA-less row, and \
+         `evidence_content_hash_claim_unique` then refuses the identical re-submission that could \
+         land it later (identical retries are refused, not accumulated; only re-worded ones add \
+         rows). Converts with D2, in the commit that can put \
          evidence -> BBA -> truth -> labels in one unit.",
     ),
     (
         "tools/claims.rs",
-        "ds_auto::auto_wire_ds_update",
+        "ds_auto::auto_wire_ds_update_staged",
         1,
-        "`update_with_evidence`'s DS wiring. Writes `claim_frames` + `mass_functions`, neither of \
+        "`update_with_evidence`'s DS wiring (the STAGED form, so the response can report whether \
+         the BBA was stored before a failure — same writes as `auto_wire_ds_update`, which is now \
+         a thin wrapper over it). Writes `claim_frames` + `mass_functions`, neither of \
          which has an orphan `*_privacy` policy, so it is refused in PRODUCTION as well as on a \
-         clean migrate — this is why `mass_functions` stopped growing. D2. Gated on `was_created` \
-         asymmetrically ON PURPOSE: re-running it double-counts mass.",
+         clean migrate — this is why `mass_functions` stopped growing. D2. Its FAILURE is now \
+         best-effort and DISCLOSED (`tracing::warn!` + `belief_wired: false` / `bba_stored` / \
+         `ds_wire_error` in the response), \
+         matching `submit_claim`; that changed how the refusal is reported, NOT that the site \
+         takes the unstamped pool, so the entry stands until D2 converts it. Gated on \
+         `was_created` asymmetrically ON PURPOSE: re-running it double-counts mass.",
     ),
     (
         "tools/claims.rs",
@@ -293,9 +304,10 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          MEASURED as `epigraph_app` (`rolbypassrls = false`) via `scripts/e2e/probe-workflow.sh`, \
          on a flat workflow claim in the server agent's OWN group: stamped leaves \
          `evidence_rows=1` and then fails at `claim_frames`; unstamped leaves `evidence_rows=0` \
-         and fails at `evidence`; CONFIG B is `evidence_rows=1` either way. `Evidence::new` mints \
-         a fresh id and `create` has no `ON CONFLICT`, so the committed orphan also accumulates \
-         per retry. Converts with D2.",
+         and fails at `evidence`; CONFIG B is `evidence_rows=1` either way. An IDENTICAL retry \
+         does not add a row (`evidence_content_hash_claim_unique` refuses it, the hash being over \
+         a deterministic serialization of the arguments); only a retry with different arguments \
+         does. Converts with D2.",
     ),
     (
         "tools/workflows.rs",

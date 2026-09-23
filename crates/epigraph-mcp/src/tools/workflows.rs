@@ -1017,11 +1017,15 @@ pub async fn report_workflow_outcome(
     //
     // So the stamp buys nothing on either configuration and, on the one this
     // programme exists to make reachable, trades a clean refusal for a committed
-    // orphan. `Evidence::new` mints a fresh `EvidenceId` per call and
-    // `EvidenceRepository::create` has no `ON CONFLICT`, so each retry of a call
-    // that is CERTAIN to fail appends another row: a retry amplifier, not just a
-    // one-off orphan. Re-adding the stamp belongs in D2, which has to put
-    // evidence → BBA → truth_value into one unit anyway.
+    // orphan. (An earlier form of this note also called it a retry amplifier,
+    // on the premise that a fresh `EvidenceId` plus no `ON CONFLICT` appends a
+    // row per retry. That is wrong for an IDENTICAL retry: `content_hash` is
+    // `blake3(evidence_text)`, a deterministic serialization of the call's
+    // arguments, and migration 001's `evidence_content_hash_claim_unique UNIQUE
+    // (content_hash, claim_id)` refuses it. Only a retry with different
+    // arguments adds a row. See `tools::claims::update_with_evidence`, where the
+    // same correction is measured.) Re-adding the stamp belongs in D2, which has
+    // to put evidence → BBA → truth_value into one unit anyway.
     EvidenceRepository::create(&server.pool, &evidence)
         .await
         .map_err(internal_error)?;

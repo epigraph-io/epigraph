@@ -98,8 +98,25 @@ echo "--- challenge_claim ---"
 call "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"challenge_claim\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"challenge_type\":\"insufficient_evidence\",\"explanation\":\"probe challenge\"}}}" | tail -c 400
 echo
 echo "--- update_with_evidence ---"
-call "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"update_with_evidence\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"evidence_data\":\"probe corroboration\",\"evidence_type\":\"empirical\",\"strength\":0.7,\"supports\":true}}}" | tail -c 500
+# `labels` is passed so the arm has a DISCRIMINATING row count. The evidence
+# INSERT commits before the DS wiring on every binary, so `evidence` alone reads
+# the same whether the tool then errors or succeeds; the label merge runs only
+# AFTER the wiring, so `uwe_labelled` separates "errored after the evidence row"
+# from "completed". The snapshot is taken HERE, before submit_ds_evidence below
+# can add frames/masses of its own.
+TRUTH_PRE=$(q "SELECT truth_value FROM claims WHERE id = '$CLAIM'")
+UWE=$(call "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"update_with_evidence\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"evidence_data\":\"probe corroboration\",\"evidence_type\":\"empirical\",\"strength\":0.7,\"supports\":true,\"labels\":[\"uwe-probe\"]}}}")
+echo "$UWE" | tail -c 500
 echo
+UWE_EV=$(echo "$UWE" | grep -oE '"evidence_id\\": \\"[0-9a-f-]{36}' | head -1 | grep -oE '[0-9a-f-]{36}')
+echo "=== update_with_evidence snapshot ==="
+q "SELECT 'evidence_on_claim='||(SELECT count(*) FROM evidence WHERE claim_id = '$CLAIM')
+        ||' reported_evidence_attached='||(SELECT count(*) FROM evidence
+             WHERE id::text = '${UWE_EV:-none}' AND claim_id = '$CLAIM')
+        ||' claim_frames='||(SELECT count(*) FROM claim_frames)
+        ||' mass_functions='||(SELECT count(*) FROM mass_functions)
+        ||' uwe_labelled='||(SELECT count(*) FROM claims WHERE 'uwe-probe' = ANY(labels))
+        ||' truth_value='||'$TRUTH_PRE'||'->'||(SELECT truth_value FROM claims WHERE id = '$CLAIM')"
 echo "--- submit_ds_evidence (on the auto-wired binary_truth frame) ---"
 FRAME=$(q "SELECT id FROM frames WHERE name = 'binary_truth' LIMIT 1")
 if [ -n "$FRAME" ]; then
