@@ -264,18 +264,16 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // discharged and is now 0: `inflation_leaderboard` averaged
     // `c.properties->>'inflation_factor'` over every tenant's claims. It is now
     // `PoliticalRepository::inflation_leaderboard`, marking `claims`.
-    // `search.rs`'s remaining site is the `format!`-built `full_sql` the old
-    // forward-only scan could not see. Its in-code comment argues it is not a
-    // live leak — the ids come from the viewer-filtered
-    // `ClaimThemeRepository::claims_in_themes_at_dim_since`, which splices
-    // `{VISIBILITY:c}` onto the joined `claims` (PR-29 re-pointed the route at
-    // that repo method directly; it previously named the engine wrapper
-    // `candidates_in_themes_at_dim`, whose body was the same call) — and that
-    // derivation looks sound. It is
-    // registered anyway: the argument is a caller-side invariant with nothing
-    // enforcing it, which is precisely the kind of reasoning this register
-    // exists to keep visible rather than to accept silently.
-    ("search.rs", 1),
+    // `search.rs` was 1 until `F-inline-claim-content-reads` was discharged
+    // and is now 0. The site was the diverse path's `format!`-built `full_sql`,
+    // which the old forward-only scan could not see. Its in-code comment argued
+    // it was not a live leak: the ids came from the viewer-filtered
+    // `ClaimThemeRepository::claims_in_themes_at_dim_since`. That derivation
+    // was sound, but nothing enforced it, which is why it stayed registered.
+    // The statement is now `ClaimRepository::semantic_search_selected`, marking
+    // `claims`, so the invariant is enforced in the statement, and by RLS as
+    // well once the request path runs as `epigraph_app` (it already runs on a
+    // stamped `ScopedRead`).
     ("workflows.rs", 4),
 ];
 

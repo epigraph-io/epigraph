@@ -681,3 +681,59 @@ async fn inflation_leaderboard_aggregates_only_claims_the_viewer_can_read(pool: 
         "the mean must be over the two readable claims (3.0), not all three (6.0): {row}"
     );
 }
+
+// ── routes/search.rs ──
+
+/// The diverse search path's full-claim fetch, `semantic_search_selected`.
+///
+/// The handler cannot hand this statement a stranger's id today: its id set
+/// comes out of the viewer-filtered `claims_in_themes_at_dim_since`. That
+/// derivation was the only thing standing between it and a leak, which is why
+/// the register kept it. So the arm drives the repo function directly with an
+/// id set that DOES include a stranger's claim, which is the case the predicate
+/// now covers if the derivation ever changes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_search_selected_drops_ids_the_viewer_cannot_read(pool: PgPool) {
+    let p = plant(&pool, "selected").await;
+    let pgvec = format!(
+        "[{}]",
+        (0..1536)
+            .map(|i| if i == 0 { "1" } else { "0" })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for claim in [p.public, p.mine, p.theirs] {
+        set_claim_embedding(&pool, claim, &pgvec).await;
+    }
+
+    let viewer = viewer_for(&pool, p.viewer_agent).await;
+    let state = split_state(&pool).await;
+    let mut read = state.read_as(&viewer).await.expect("read_as");
+    let rows = epigraph_db::ClaimRepository::semantic_search_selected(
+        &mut *read,
+        &viewer,
+        "embedding",
+        &pgvec,
+        &[p.public, p.mine, p.theirs],
+    )
+    .await
+    .expect("semantic_search_selected");
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.claim_id).collect();
+
+    assert!(
+        ids.contains(&p.public) && ids.contains(&p.mine),
+        "the public and the viewer's own private claim must be returned: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&p.theirs),
+        "a stranger's private claim must be dropped even when the caller names \
+         its id: {ids:?}"
+    );
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    let mine = rows.iter().find(|r| r.claim_id == p.mine).expect("mine");
+    assert!(
+        (mine.similarity - 1.0).abs() < 1e-6,
+        "CALIBRATION: an identical vector has similarity 1.0, got {}",
+        mine.similarity
+    );
+}

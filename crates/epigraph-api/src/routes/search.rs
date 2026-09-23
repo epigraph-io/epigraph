@@ -27,9 +27,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-#[cfg(feature = "db")]
-use sqlx::Row;
-
 // PR-29: the two theme statements now go STRAIGHT to
 // `epigraph_db::ClaimThemeRepository` rather than through the
 // `epigraph_engine::diverse_retrieval` wrappers this file used to call.
@@ -773,54 +770,30 @@ pub async fn semantic_search(
                 let selected_claim_ids: Vec<Uuid> =
                     selected_rows.iter().map(|(id, _, _)| *id).collect();
 
-                // NOTE (PR-07): this statement is deliberately NOT viewer-
-                // spliced, and that is safe by derivation rather than by
-                // oversight. It is bounded by `WHERE c.id = ANY($2)` over
-                // `selected_claim_ids`, every element of which came out of
-                // `ClaimThemeRepository::claims_in_themes_at_dim_since` —
-                // which IS viewer-filtered, splicing `{VISIBILITY:c}` onto the
-                // joined `claims`. (PR-29 re-pointed this call off the
-                // `epigraph_engine::diverse_retrieval::candidates_in_themes_at_dim`
-                // wrapper it used to name here; the wrapper's whole body was
-                // that same call with `since = None`, so the derivation is
-                // unchanged — only the callee's name is.) A
-                // second predicate here would be redundant. Do not "harden" it
-                // by adding a marker without also re-checking that derivation:
-                // if the source of `selected_claim_ids` ever changes, this
-                // needs a real predicate, not a marker.
-                //
                 // Fetch full claim data for the selected IDs (including CDST
                 // columns + theme_id and the latest cluster_id from
                 // claim_cluster_membership). #49: surface the partition
                 // labels so callers can render or filter by them.
-                let full_sql = format!(
-                    r#"
-                    SELECT c.id, c.content, c.truth_value, c.belief, c.plausibility,
-                           c.agent_id, c.trace_id,
-                           c.labels[1] as claim_type, c.created_at,
-                           c.theme_id,
-                           (
-                               SELECT m.cluster_id
-                               FROM claim_cluster_membership m
-                               JOIN graph_cluster_runs r ON r.run_id = m.run_id
-                               WHERE m.claim_id = c.id
-                               ORDER BY r.completed_at DESC
-                               LIMIT 1
-                           ) AS cluster_id,
-                           1 - (c.{claim_embedding_col} <=> $1::vector) as similarity
-                    FROM claims c
-                    WHERE c.id = ANY($2)
-                    ORDER BY c.{claim_embedding_col} <=> $1::vector
-                    "#
-                );
-                let full_rows = sqlx::query(&full_sql)
-                    .bind(&embedding_str)
-                    .bind(&selected_claim_ids)
-                    .fetch_all(&mut *read)
-                    .await
-                    .map_err(|e| ApiError::InternalError {
-                        message: format!("Claim fetch failed: {e}"),
-                    })?;
+                //
+                // Every id here came out of the viewer-filtered
+                // `claims_in_themes_at_dim_since`, so a predicate on this read
+                // is redundant TODAY. It carries one anyway: until the
+                // `F-inline-claim-content-reads` discharge this was an inline,
+                // unfiltered `format!` statement whose safety rested on that
+                // derivation alone, with nothing enforcing it. If the source of
+                // `selected_claim_ids` ever changes, the repo function still
+                // filters.
+                let full_rows = epigraph_db::ClaimRepository::semantic_search_selected(
+                    &mut *read,
+                    &viewer,
+                    claim_embedding_col,
+                    &embedding_str,
+                    &selected_claim_ids,
+                )
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Claim fetch failed: {e}"),
+                })?;
 
                 // Fetch graph neighbors for all selected claims.
                 //
@@ -868,26 +841,26 @@ pub async fn semantic_search(
 
                 // Build response DTOs with full claim data and neighbors
                 let mut results: Vec<SemanticSearchResult> = full_rows
-                    .iter()
+                    .into_iter()
                     .map(|row| {
-                        let claim_id: Uuid = row.get("id");
-                        let neighbors = neighbor_map.remove(&claim_id).filter(|n| !n.is_empty());
+                        let neighbors =
+                            neighbor_map.remove(&row.claim_id).filter(|n| !n.is_empty());
                         SemanticSearchResult {
-                            claim_id,
-                            statement: row.get("content"),
-                            similarity: row.get("similarity"),
+                            claim_id: row.claim_id,
+                            statement: row.statement,
+                            similarity: row.similarity,
                             epistemic: EpistemicState::from_row(
-                                row.get("truth_value"),
-                                row.get("belief"),
-                                row.get("plausibility"),
+                                row.truth_value,
+                                row.belief,
+                                row.plausibility,
                             ),
-                            agent_id: row.get("agent_id"),
-                            trace_id: row.get("trace_id"),
-                            claim_type: row.get("claim_type"),
-                            created_at: row.get("created_at"),
+                            agent_id: row.agent_id,
+                            trace_id: row.trace_id,
+                            claim_type: row.claim_type,
+                            created_at: row.created_at,
                             graph_neighbors: neighbors,
-                            theme_id: row.try_get::<Option<Uuid>, _>("theme_id").ok().flatten(),
-                            cluster_id: row.try_get::<Option<Uuid>, _>("cluster_id").ok().flatten(),
+                            theme_id: row.theme_id,
+                            cluster_id: row.cluster_id,
                         }
                     })
                     .collect();

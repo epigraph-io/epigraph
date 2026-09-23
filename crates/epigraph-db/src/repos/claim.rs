@@ -120,6 +120,25 @@ pub struct SemanticFlatHit {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Result row for [`ClaimRepository::semantic_search_selected`]: the diverse
+/// search path's full claim data for an already-selected id set.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticSelectedHit {
+    pub claim_id: Uuid,
+    pub statement: String,
+    pub similarity: f64,
+    pub truth_value: f64,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub agent_id: Uuid,
+    pub trace_id: Option<Uuid>,
+    pub claim_type: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub theme_id: Option<Uuid>,
+    /// The claim's cluster in the most recently completed cluster run.
+    pub cluster_id: Option<Uuid>,
+}
+
 /// One `(properties->>'level', properties->>'source_type')` pair from
 /// [`ClaimRepository::embedding_radius_breakdown`].
 ///
@@ -1308,6 +1327,77 @@ impl ClaimRepository {
             3,
         );
         let mut q = sqlx::query_as::<_, SemanticNeighborHit>(&sql)
+            .bind(embedding)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Full claim data, with similarity to `embedding`, for the claim ids the
+    /// diverse search path has already selected. Viewer-filtered.
+    ///
+    /// Backs the `diverse=true` branch of `POST /api/v1/search/semantic`. The
+    /// route built this statement with `format!` and ran it with no predicate.
+    /// Its comment argued that none was needed: every id in `claim_ids` came
+    /// out of `ClaimThemeRepository::claims_in_themes_at_dim_since`, which IS
+    /// viewer-filtered. That derivation holds today, but nothing enforced it,
+    /// so `viewer_route_table_lint.rs` kept the site in
+    /// `UNCOMPENSATED_INLINE_READS` (`F-inline-claim-content-reads`). The
+    /// predicate is redundant for the current caller and turns the caller-side
+    /// invariant into one this statement enforces. Once RLS is live on the
+    /// request path the stamped connection enforces it a third time.
+    ///
+    /// `claim_cluster_membership` and `graph_cluster_runs` carry no tenancy
+    /// columns, so the cluster subquery is not marked. It only looks up a
+    /// cluster id for a claim that already passed the `claims` predicate.
+    ///
+    /// `embedding_col` must be `"embedding"` or `"embedding_3072"`; anything
+    /// else is rejected rather than interpolated.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for an unsupported `embedding_col`;
+    /// `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, embedding, claim_ids))]
+    pub async fn semantic_search_selected<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding_col: &str,
+        embedding: &str,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SemanticSelectedHit>, DbError> {
+        if embedding_col != "embedding" && embedding_col != "embedding_3072" {
+            return Err(DbError::InvalidData {
+                reason: format!("unsupported embedding column {embedding_col:?}"),
+            });
+        }
+        let sql = viewer.splice(
+            &format!(
+                r#"
+                SELECT c.id AS claim_id, c.content AS statement,
+                       c.truth_value, c.belief, c.plausibility,
+                       c.agent_id, c.trace_id,
+                       c.labels[1] AS claim_type, c.created_at,
+                       c.theme_id,
+                       (
+                           SELECT m.cluster_id
+                           FROM claim_cluster_membership m
+                           JOIN graph_cluster_runs r ON r.run_id = m.run_id
+                           WHERE m.claim_id = c.id
+                           ORDER BY r.completed_at DESC
+                           LIMIT 1
+                       ) AS cluster_id,
+                       (1 - (c.{embedding_col} <=> $1::vector))::float8 AS similarity
+                FROM claims c
+                WHERE c.id = ANY($2)
+                  /* {{VISIBILITY:c}} */
+                ORDER BY c.{embedding_col} <=> $1::vector
+                "#
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, SemanticSelectedHit>(&sql)
             .bind(embedding)
             .bind(claim_ids);
         if let Some(g) = viewer.group_bind() {
