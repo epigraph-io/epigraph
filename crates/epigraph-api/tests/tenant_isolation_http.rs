@@ -1750,15 +1750,17 @@ async fn list_candidates_http_renders_the_excerpt_of_a_superseded_claim() {
 /// `GET /api/v1/graph/snapshot/:version` must not replay another group's claim
 /// ids to a stranger.
 ///
-/// `graph_snapshot` replays the same `EventRepository::list` that
+/// `graph_snapshot` applies the same suppression predicate that
 /// `list_events_http_hides_a_private_claim_from_both_the_table_and_the_ring_buffer`
 /// covers, which is why this was recorded rather than asserted. The reason that
 /// argument is not sufficient is the one this whole file's header records
 /// against an earlier revision of itself: what a repo-level or sibling-handler
-/// test pins is the FUNCTION, and what leaks is the CALL SITE. `graph_snapshot`
-/// re-filters the rows it gets back (`graph_version <= version`) and rebuilds
-/// every event into its own response struct, so it is a second, independent
-/// rendering of the same rows.
+/// test pins is the FUNCTION, and what leaks is the CALL SITE. Since
+/// 2026-09-23 (`F-graph-snapshot-scan-cost`) `graph_snapshot` does not even
+/// call the same function: it calls `EventRepository::list_up_to_version`,
+/// which splices the predicate text `EventRepository::list` does but binds the
+/// viewer at a different index, and it rebuilds every event into its own
+/// response struct. So it is a second, independent rendering of the same rows.
 ///
 /// The payload shape is deliberately `claim_a_id` / `claim_b_id` and not
 /// `claim_id`: a suppression rule keyed on the `claim_id` key alone passes this
@@ -1817,14 +1819,220 @@ async fn graph_snapshot_http_does_not_replay_a_private_claim_id_to_a_stranger(po
     );
 
     // Class P. A snapshot that returns nothing to anybody would pass the
-    // assertion above and be a fail-closed regression, and `graph_snapshot`
-    // has a second filter of its own (`graph_version <= version`) that could
-    // produce exactly that.
+    // assertion above and be a fail-closed regression. Until 2026-09-23
+    // `graph_snapshot` had a second filter of its own (`graph_version <=
+    // version`, applied in Rust after a newest-first limit) that produced
+    // exactly that for any old version; see the test below.
     let owner_body = snapshot(owner_token).await;
     assert!(
         owner_body.contains(&private.to_string()) && owner_body.contains(&public.to_string()),
         "the owner must receive its own event with both claim ids; a snapshot \
          empty for everyone is not isolation. Body: {owner_body}"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// `GET /api/v1/graph/snapshot/:version` must replay an OLD version completely,
+/// however many events were recorded after it.
+///
+/// Deferred-commitment screen key `graph-snapshot-scan-cost`
+/// (`docs/tenancy/progress.json::F-graph-snapshot-scan-cost`). The handler used
+/// to call `EventRepository::list(.., version + 1)`, which orders by
+/// `created_at DESC`, and then keep `graph_version <= version` in Rust. The
+/// limit took the NEWEST `version + 1` rows, so once more than about `version`
+/// newer events existed the filter discarded every one of them and the
+/// endpoint answered 200 with `event_count: 0`. The test above only asks for
+/// the version it has just written, in a fresh database, which is the one
+/// shape the old code answered correctly.
+///
+/// This one writes the target events first and then more than twice as many
+/// newer ones. It asserts by id and by the response's own arithmetic, for an
+/// owner and a stranger, because both go through the spliced viewer predicate
+/// (bound at index 3 on the new path) and an off-by-one there fails only for a
+/// `Scoped` viewer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_snapshot_http_replays_an_old_version_completely(pool: PgPool) {
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "snapshot-old").await;
+    let (stranger_agent, _) = fixture::seed_agent_with_group(&pool, "snapshot-old-stranger").await;
+    let private =
+        fixture::seed_group_claim(&pool, owner_agent, group, "snapshot-old private content").await;
+    let public =
+        fixture::seed_public_claim(&pool, owner_agent, "snapshot-old public control").await;
+
+    async fn seed(pool: &PgPool, event_type: &str, payload: serde_json::Value) -> (Uuid, i64) {
+        sqlx::query_as(
+            "INSERT INTO events (event_type, actor_id, payload, graph_version) \
+             VALUES ($1, NULL, $2, nextval('events_graph_version_seq')) \
+             RETURNING id, graph_version",
+        )
+        .bind(event_type)
+        .bind(payload)
+        .fetch_one(pool)
+        .await
+        .expect("seed a snapshot event")
+    }
+
+    let (ev_pair, _) = seed(
+        &pool,
+        "snapshot-old.pair",
+        serde_json::json!({ "claim_a_id": private, "claim_b_id": public }),
+    )
+    .await;
+    let (ev_public, version) = seed(
+        &pool,
+        "snapshot-old.public",
+        serde_json::json!({ "claim_id": public }),
+    )
+    .await;
+
+    for i in 0..(2 * version + 5) {
+        seed(&pool, "snapshot-old.newer", serde_json::json!({ "i": i })).await;
+    }
+    let current: i64 = sqlx::query_scalar("SELECT max(graph_version) FROM events")
+        .fetch_one(&pool)
+        .await
+        .expect("current graph_version");
+    assert!(
+        current - version > 2 * version,
+        "PREMISE: more than twice as many events must follow the snapshot \
+         version as precede it, or this does not reproduce the shape the old \
+         code answered with nothing (version {version}, current {current})"
+    );
+
+    let url = fixture::database_url_for(&pool).await;
+    let owner_token = common::mint_token_with_agent(&["claims:read", "graph:read"], owner_agent);
+    let stranger_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    let snapshot = |token: String| async move {
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/api/v1/graph/snapshot/{version}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("GET /api/v1/graph/snapshot/:version");
+        let status = resp.status();
+        let body = resp.text().await.expect("snapshot body");
+        assert!(
+            status.is_success(),
+            "GET /api/v1/graph/snapshot/{version} must succeed; got {status}: {body}"
+        );
+        serde_json::from_str::<serde_json::Value>(&body).expect("snapshot JSON")
+    };
+    let event_ids = |body: &serde_json::Value| -> Vec<(Uuid, i64)> {
+        body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|e| {
+                (
+                    e["id"].as_str().expect("id").parse().expect("uuid id"),
+                    e["graph_version"].as_i64().expect("graph_version"),
+                )
+            })
+            .collect()
+    };
+
+    for (who, token, must_see_pair) in [
+        ("owner", owner_token, true),
+        ("stranger", stranger_token, false),
+    ] {
+        let body = snapshot(token).await;
+        let events = event_ids(&body);
+        let seen: std::collections::HashSet<Uuid> = events.iter().map(|(id, _)| *id).collect();
+
+        assert_eq!(body["version"].as_i64(), Some(version), "{who}: version");
+        assert_eq!(
+            body["current_version"].as_i64(),
+            Some(current),
+            "{who}: current_version"
+        );
+        assert!(
+            seen.contains(&ev_public),
+            "{who}: the snapshot at version {version} must contain the event \
+             recorded at that version, with {} newer events in the log. The old \
+             handler returned an empty replay here. Body: {body}",
+            current - version
+        );
+        assert_eq!(
+            seen.contains(&ev_pair),
+            must_see_pair,
+            "{who}: the older event naming the group-private claim is replayed \
+             to its owner and suppressed for a stranger. Body: {body}"
+        );
+        assert!(
+            events.iter().all(|(_, v)| *v <= version),
+            "{who}: nothing newer than the requested version. Body: {body}"
+        );
+        assert!(
+            events.windows(2).all(|w| w[0].1 < w[1].1),
+            "{who}: the replay comes back oldest first. Body: {body}"
+        );
+        assert_eq!(
+            body["event_count"].as_u64(),
+            Some(events.len() as u64),
+            "{who}: event_count counts the events returned"
+        );
+    }
+
+    let _ = shutdown.send(());
+}
+
+/// `GET /api/v1/graph/snapshot/:version` must REFUSE, not truncate, when its
+/// row limit binds.
+///
+/// The handler passes `version + 1` as the limit. That can only bind when more
+/// than `version` rows sit at or below `version`, which the sequence never
+/// produces but a literal `graph_version` (a test fixture, a restore) can. The
+/// read keeps the oldest rows when the limit binds, so answering would return
+/// a replay with its newest events silently missing. Three events are written
+/// at the literal version 1 here, and the snapshot at version 1 must fail
+/// loudly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_snapshot_http_refuses_rather_than_truncates_when_its_limit_binds(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "snapshot-repeat").await;
+    for i in 0..3 {
+        sqlx::query(
+            "INSERT INTO events (event_type, actor_id, payload, graph_version) \
+             VALUES ('snapshot-repeat', NULL, jsonb_build_object('i', $1::int), 1)",
+        )
+        .bind(i)
+        .execute(&pool)
+        .await
+        .expect("seed an event at the literal graph_version 1");
+    }
+    let at_one: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE graph_version <= 1")
+        .fetch_one(&pool)
+        .await
+        .expect("count events at or below version 1");
+    assert!(
+        at_one > 1,
+        "PREMISE: more than one event at or below version 1, or the limit cannot bind"
+    );
+
+    let url = fixture::database_url_for(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:read", "graph:read"], agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/graph/snapshot/1"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("GET /api/v1/graph/snapshot/1");
+    let status = resp.status();
+    let body = resp.text().await.expect("snapshot body");
+    assert_eq!(
+        status.as_u16(),
+        500,
+        "a snapshot whose limit bound must be refused, not returned with its \
+         newest events silently dropped. Body: {body}"
+    );
+    assert!(
+        body.contains("refusing to return it short"),
+        "the refusal names its reason. Body: {body}"
     );
 
     let _ = shutdown.send(());

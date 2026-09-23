@@ -18,6 +18,49 @@ pub struct EventRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// The [`EventRow`] projection over `events e`, shared by every viewer-filtered
+/// read in this file.
+const EVENT_COLUMNS: &str =
+    "e.id, e.event_type, e.actor_id, e.payload, e.graph_version, e.created_at";
+
+/// The tenancy suppression predicate over `events e`, written ONCE, in two
+/// halves around its viewer marker.
+///
+/// [`EventRepository::list`] and [`EventRepository::list_up_to_version`] both
+/// interpolate this text rather than each carrying a copy, so the two reads
+/// cannot drift apart. `list`'s doc is where the rule, its authority and its
+/// cost are stated; nothing about the rule differs between the two callers.
+///
+/// ## Why two halves and not one constant
+///
+/// The viewer marker, `/* {VISIBILITY:c} */`, goes BETWEEN the halves and is
+/// written at each call site, inside the `format!` string that call site hands
+/// to `viewer.splice`. `crates/epigraph-db/tests/visibility_lint.rs`
+/// (`every_spliced_statement_carries_the_canonical_marker_spelling`) requires
+/// the marker text in the body of every function that splices, so that a
+/// reader of the function can see what it filters. A marker hidden inside a
+/// shared constant fails that lint, and should. The assembled statement is
+/// `{EVENT_SUPPRESSION_BEFORE_MARKER} /* {VISIBILITY:c} */ {EVENT_SUPPRESSION_AFTER_MARKER}`.
+///
+/// Both halves must be interpolated ARGUMENTS and never part of a `format!`
+/// string: the regex quantifiers (`{8}`, `{4}`, `{12}`) are brace-delimited.
+const EVENT_SUPPRESSION_BEFORE_MARKER: &str = "NOT EXISTS ( \
+       SELECT 1 \
+       FROM regexp_matches(e.payload::text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-\
+[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'g') AS m \
+       WHERE EXISTS ( \
+               SELECT 1 \
+               FROM public.epigraph_claim_tenancy_by_ids(ARRAY[m[1]::uuid]) cx \
+             ) \
+         AND NOT EXISTS ( \
+               SELECT 1 \
+               FROM public.epigraph_claim_tenancy_by_ids(ARRAY[m[1]::uuid]) c \
+               WHERE true";
+
+/// Closes the two subqueries [`EVENT_SUPPRESSION_BEFORE_MARKER`] opens. See
+/// that constant's doc.
+const EVENT_SUPPRESSION_AFTER_MARKER: &str = ") )";
+
 pub struct EventRepository;
 
 impl EventRepository {
@@ -171,7 +214,10 @@ impl EventRepository {
     /// to `visibility = 'public'` whatever `$V` binds, because nothing on the
     /// request path stamps the session GUCs
     /// (`D-PR17-request-path-never-stamps-session-gucs`) — this function takes
-    /// a raw `&PgPool` and all three callers hand it an unstamped one. A
+    /// a raw `&PgPool` and all three callers hand it an unstamped one
+    /// (`graph_snapshot` reaches the same predicate through
+    /// [`Self::list_up_to_version`], so "three callers" here and below counts
+    /// it). A
     /// group-private claim a MEMBER viewer is entitled to read then looks
     /// invisible and the event carrying it is dropped: over-suppression, the
     /// opposite failure, silent and 200-shaped. PR-24 measured that as its
@@ -266,11 +312,12 @@ impl EventRepository {
     /// SQL-function inlining, so the planner cannot see through either call and
     /// falls back to its default row estimate for both. That is a real hot-path
     /// change and is accepted as the price of the arms having different
-    /// authority; it is not made better here. Scan cost on this surface is
-    /// tracked separately as `F-graph-snapshot-scan-cost`, which owns
-    /// `graph_snapshot` passing `version + 1` as the limit and filtering
-    /// client-side. The overwhelming majority of rows still pass, so `LIMIT n`
-    /// stops after roughly `n` rows.
+    /// authority; it is not made better here. The overwhelming majority of
+    /// rows still pass, so `LIMIT n` stops after roughly `n` rows.
+    /// `graph_snapshot` no longer comes through here. It passed `version + 1`
+    /// as the limit and filtered client-side, which returned wrong answers,
+    /// not merely slow ones. It now calls [`Self::list_up_to_version`], whose
+    /// doc records why (`F-graph-snapshot-scan-cost`, closed).
     ///
     /// # Errors
     ///
@@ -283,25 +330,15 @@ impl EventRepository {
         limit: i64,
     ) -> Result<Vec<EventRow>, sqlx::Error> {
         let sql = viewer.splice(
-            "SELECT e.id, e.event_type, e.actor_id, e.payload, e.graph_version, e.created_at \
-             FROM events e \
-             WHERE ($1::text IS NULL OR e.event_type = $1) \
-               AND ($2::uuid IS NULL OR e.actor_id = $2) \
-               AND NOT EXISTS ( \
-                     SELECT 1 \
-                     FROM regexp_matches(e.payload::text, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-\
-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', 'g') AS m \
-                     WHERE EXISTS ( \
-                             SELECT 1 \
-                             FROM public.epigraph_claim_tenancy_by_ids(ARRAY[m[1]::uuid]) cx \
-                           ) \
-                       AND NOT EXISTS ( \
-                             SELECT 1 \
-                             FROM public.epigraph_claim_tenancy_by_ids(ARRAY[m[1]::uuid]) c \
-                             WHERE true /* {VISIBILITY:c} */ \
-                           ) \
-                   ) \
-             ORDER BY e.created_at DESC LIMIT $3",
+            &format!(
+                "SELECT {EVENT_COLUMNS} \
+                 FROM events e \
+                 WHERE ($1::text IS NULL OR e.event_type = $1) \
+                   AND ($2::uuid IS NULL OR e.actor_id = $2) \
+                   AND {EVENT_SUPPRESSION_BEFORE_MARKER} /* {{VISIBILITY:c}} */ \
+                       {EVENT_SUPPRESSION_AFTER_MARKER} \
+                 ORDER BY e.created_at DESC LIMIT $3"
+            ),
             4,
         );
         let mut q = sqlx::query_as::<_, EventRow>(&sql)
@@ -311,6 +348,91 @@ impl EventRepository {
         // Guarded, not `unwrap_or(&[])`: `render_predicate` emits nothing for a
         // `Bypass` viewer, so an unconditional bind would send one more
         // parameter than the rendered statement references.
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
+    }
+
+    /// Every event with `graph_version <= max_version` that `viewer` may see,
+    /// OLDEST first (`graph_version` ascending), at most `limit` rows.
+    ///
+    /// The read behind `GET /api/v1/graph/snapshot/:version`. The suppression
+    /// rule is [`Self::list`]'s, spliced from the same
+    /// `EVENT_SUPPRESSION_BEFORE_MARKER` text, so everything `list`'s doc says
+    /// about tenancy holds here unchanged. That includes the definer authority,
+    /// the `42501` refusal on an unadmitted definer frame, the requirement that
+    /// migration 086 is applied before a binary carrying this serves traffic,
+    /// and the scope limit (the control is keyed to `claims` only).
+    ///
+    /// ## Why this is not `list` with a larger limit
+    ///
+    /// Deferred-commitment screen key `graph-snapshot-scan-cost`
+    /// (`F-graph-snapshot-scan-cost`). `graph_snapshot` used to call
+    /// `list(.., version + 1)` and drop rows newer than `version` in Rust.
+    /// `list` orders by `created_at DESC`, and every writer stamps `NOW()`
+    /// beside `nextval`, so that limit took the NEWEST `version + 1` rows. The
+    /// Rust filter then discarded exactly the rows newer than `version`. In an
+    /// N-event log a snapshot at version v therefore kept only versions in
+    /// about `[N - v, v]`: nothing at all for any v below about N/2, with
+    /// 200 OK and an `event_count` of 0. The register had filed this as a
+    /// speed question. It was a wrong answer. The version bound has to apply
+    /// BEFORE the limit, in SQL, and here it does.
+    ///
+    /// ## The limit
+    ///
+    /// `ORDER BY graph_version ASC, id ASC LIMIT $2`, so when the limit binds
+    /// it keeps a PREFIX of the replay, never a sample from the wrong end. `id`
+    /// only breaks ties. Every production writer assigns
+    /// `nextval('events_graph_version_seq')`, so versions do not repeat, but
+    /// the column carries no unique constraint and test fixtures do write
+    /// literals. A caller that must not truncate silently passes a limit it can
+    /// check. `graph_snapshot` passes `max_version + 1` and refuses when that
+    /// many rows come back.
+    ///
+    /// ## Cost
+    ///
+    /// Per classified row, the same as `list`: one regex pass plus two definer
+    /// invocations per uuid found. The difference is WHICH rows are classified.
+    /// The `graph_version <= $1` bound is applied to the scan
+    /// (`idx_events_version` can serve it as a range), so only rows the answer
+    /// can contain are classified. The old shape classified up to
+    /// `version + 1` rows from the newest end, and for an old version it then
+    /// threw every one of them away.
+    ///
+    /// Measured 2026-09-23 on 100,000 synthetic events (a Scoped viewer, about
+    /// two uuids per payload, local Postgres 16): a read at 10% of the log fell
+    /// from 2.4 s to 1.6 s, and at 50% from 12.1 s to 8.0 s. At the head of the
+    /// log both shapes cost about 16 s, because a snapshot there has to
+    /// classify every event. This change does not touch that per-row cost. It
+    /// is recorded as `F-graph-snapshot-head-classification-cost` in
+    /// `docs/tenancy/progress.json`, with the numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`sqlx::Error`] if the query fails.
+    pub async fn list_up_to_version<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        max_version: i64,
+        limit: i64,
+    ) -> Result<Vec<EventRow>, sqlx::Error> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT {EVENT_COLUMNS} \
+                 FROM events e \
+                 WHERE e.graph_version <= $1 \
+                   AND {EVENT_SUPPRESSION_BEFORE_MARKER} /* {{VISIBILITY:c}} */ \
+                       {EVENT_SUPPRESSION_AFTER_MARKER} \
+                 ORDER BY e.graph_version ASC, e.id ASC LIMIT $2"
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, EventRow>(&sql)
+            .bind(max_version)
+            .bind(limit);
+        // Guarded for the same reason as in `list`: a `Bypass` viewer renders
+        // no `$3`, so an unconditional bind would over-supply parameters.
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

@@ -628,13 +628,32 @@ pub async fn create_event(
 ///
 /// Returns all events with `graph_version <= version`, providing the
 /// information needed to reconstruct the graph as it existed at that point.
+/// The `db` build returns them oldest first (`graph_version` ascending, the
+/// order a replay consumes them in; it was `created_at` descending before
+/// 2026-09-23). The non-`db` build returns its ring buffer in insertion order.
 /// A future enhancement will replay events from periodic checkpoints for
 /// efficiency.
+///
+/// # The version bound is applied in SQL (`F-graph-snapshot-scan-cost`, closed)
+///
+/// Until 2026-09-23 the `db` build called `EventRepository::list(.., version + 1)`,
+/// which orders by `created_at DESC`, and then dropped rows newer than
+/// `version` in Rust. The limit therefore took the NEWEST `version + 1` rows,
+/// and for any `version` below about half the log the filter discarded every
+/// one of them: an empty or truncated replay with 200 OK. It now calls
+/// `EventRepository::list_up_to_version`, which bounds the scan before the
+/// limit. That function's doc has the full account.
+///
+/// The response is still unpaginated, and every returned event pays the
+/// suppression predicate's per-row cost. At the head of a large log that is
+/// the whole log. It was measured at about 16 s for 100,000 events and is
+/// recorded as `F-graph-snapshot-head-classification-cost`, not fixed here.
 ///
 /// # Tenancy (PR-09)
 ///
 /// Viewer-scoped for the same reason `list_events` is — it replays the same
-/// rows through the same repo function, so leaving it unfiltered would have
+/// rows under the same suppression predicate (`list_up_to_version` splices the
+/// text `EventRepository::list` does), so leaving it unfiltered would have
 /// made it the trivial bypass for the filter added one function up.
 ///
 /// Two consequences worth stating, because neither is a tenancy property:
@@ -649,10 +668,12 @@ pub async fn create_event(
 ///
 /// Unlike `list_events`, this handler does not merge the in-process ring buffer
 /// and therefore never reaches `retain_visible_events` /
-/// `ClaimRepository::hidden_claim_ids`. The suppression predicate inside
-/// `EventRepository::list` is the *entire* tenancy control over the event ROWS
-/// this handler returns, and `events` itself carries no RLS. That makes this a
-/// third caller of that function — the PR-25 scope recon named only two — and it
+/// `ClaimRepository::hidden_claim_ids`. The suppression predicate
+/// `EventRepository::list` applies (and `list_up_to_version`, the function this
+/// handler calls, splices from the same text) is the *entire* tenancy control
+/// over the event ROWS this handler returns, and `events` itself carries no
+/// RLS. That makes this a third caller of that predicate — the PR-25 scope
+/// recon named only two — and it
 /// inherits both halves of the consequence: the repair reaches this route
 /// without a code change here, and a binary carrying that repair on a
 /// **pre-086** database raises `42883` on every call to this route. Run
@@ -665,10 +686,6 @@ pub async fn create_event(
 /// the predicate itself classifies payload uuids against `claims` only, so a
 /// payload naming a row in another tenanted table is not classified — recorded
 /// as `F-PR25-event-suppression-is-claims-keyed-only`.
-///
-/// The `version + 1` limit below fetches a superset and filters client-side.
-/// That is pre-existing and is tracked as `F-graph-snapshot-scan-cost`, not
-/// something PR-25 introduced or fixed.
 ///
 /// The signature is **not** `#[cfg]`-split; see `list_events`'s doc for why.
 pub async fn graph_snapshot(
@@ -699,17 +716,35 @@ pub async fn graph_snapshot(
             });
         }
 
-        // Fetch all events up to version via the event list (filter by version not yet in repo,
-        // so we fetch all and filter client-side for now)
-        let rows =
-            epigraph_db::EventRepository::list(&_state.db_pool, &viewer, None, None, version + 1)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to fetch events for snapshot: {e}"),
-                })?;
+        // The version bound is applied in SQL, BEFORE the limit. Every writer
+        // assigns `nextval('events_graph_version_seq')` (it starts at 1 and
+        // does not repeat), so at most `version` rows can satisfy
+        // `graph_version <= version`. The limit is one more than that. While
+        // that holds, the limit never binds. If it does bind, the replay may be
+        // truncated, and that is refused rather than returned short.
+        let bound = version.saturating_add(1);
+        let rows = epigraph_db::EventRepository::list_up_to_version(
+            &_state.db_pool,
+            &viewer,
+            version,
+            bound,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch events for snapshot: {e}"),
+        })?;
+        if i64::try_from(rows.len()).unwrap_or(i64::MAX) >= bound {
+            return Err(ApiError::InternalError {
+                message: format!(
+                    "more than {version} events are recorded at or below graph_version \
+                     {version}, so some event carries a graph_version the sequence did \
+                     not assign (repeated, or below 1) and the snapshot may be truncated; \
+                     refusing to return it short"
+                ),
+            });
+        }
         let events: Vec<GraphEvent> = rows
             .into_iter()
-            .filter(|r| r.graph_version <= version)
             .map(|r| GraphEvent {
                 id: r.id,
                 event_type: r.event_type,
@@ -940,7 +975,9 @@ mod tests {
             post_event(&router, "test.snapshot_a", serde_json::json!({"v": "a"})).await;
         let event1: GraphEvent = serde_json::from_slice(&body1).unwrap();
 
-        post_event(&router, "test.snapshot_b", serde_json::json!({"v": "b"})).await;
+        let (_, body2) =
+            post_event(&router, "test.snapshot_b", serde_json::json!({"v": "b"})).await;
+        let event2: GraphEvent = serde_json::from_slice(&body2).unwrap();
 
         // Request snapshot at the first event's version
         let request = Request::builder()
@@ -963,6 +1000,23 @@ mod tests {
                 event.graph_version,
             );
         }
+        // Completeness, not only the upper bound. The `db` build's old shape
+        // passed the loop above while returning NOTHING for an old version
+        // (`F-graph-snapshot-scan-cost`), so the bound alone is not a test of
+        // a snapshot. Asserted by id: the global store is shared with other
+        // tests, so a count would race them.
+        assert!(
+            snapshot.events.iter().any(|e| e.id == event1.id),
+            "the snapshot at version {} must contain the event recorded at that version",
+            event1.graph_version,
+        );
+        assert!(
+            !snapshot.events.iter().any(|e| e.id == event2.id),
+            "the snapshot at version {} must not contain the later event at version {}",
+            event1.graph_version,
+            event2.graph_version,
+        );
+        assert_eq!(snapshot.event_count, snapshot.events.len());
     }
 
     #[tokio::test]
