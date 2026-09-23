@@ -366,3 +366,103 @@ async fn a_member_added_during_a_rotation_never_lands_on_the_retired_epoch(pool:
         "every live member must be on the new epoch after the rotation: {roster:?}"
     );
 }
+
+/// THE BACKSTOP. A rotation refuses to commit while a live member is still on
+/// the retired epoch, even when that member was written by something that
+/// skipped the lock.
+///
+/// Every in-tree writer takes the lock, so this simulates one that does not: a
+/// raw `INSERT`, as a backfill or a hand-run statement would do. It is made
+/// deterministic by holding one roster row, so the rotation blocks INSIDE its
+/// roster read with that statement's snapshot already taken. The raw insert
+/// commits while it waits. When the row is released, the rotation's roster is
+/// the two members it has shares for. The roster check passes, and the
+/// re-wraps land. Without the backstop it returned `Rotated` and committed,
+/// leaving the inserted member live on epoch 0 while epoch 1 was active. It
+/// must refuse, and the rollback must leave epoch 0 current.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rotation_refuses_to_strand_a_member_written_behind_its_roster_snapshot(pool: PgPool) {
+    let (creator, _) = fixture::seed_agent_with_group(&pool, "creator").await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "member").await;
+    let (bypasser, _) = fixture::seed_agent_with_group(&pool, "bypasser").await;
+    let group_id = rotatable_team_group(&pool, creator, "backstop").await;
+    GroupMembershipRepository::add_member(&pool, group_id, member, &share("m"), 0, "writer")
+        .await
+        .expect("add member");
+    let shares = shares_for_roster(&pool, group_id, "backstop").await;
+    assert_eq!(shares.len(), 2);
+
+    // Hold one roster row so the rotation stops inside its roster read.
+    let mut own = own_connection(&pool).await;
+    let mut holder = sqlx::Connection::begin(&mut own).await.expect("holder tx");
+    sqlx::query(
+        "SELECT 1 FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(group_id)
+    .bind(member)
+    .fetch_one(&mut *holder)
+    .await
+    .expect("hold the member's row");
+
+    let rotation = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.expect("rotation tx");
+            let outcome = GroupKeyEpochRepository::rotate_conn(&mut tx, group_id, &shares).await;
+            if matches!(outcome, Ok(RotateOutcome::Rotated { .. })) {
+                tx.commit().await.expect("commit rotation");
+            }
+            outcome
+        }
+    });
+    if !a_backend_is_blocked_on_a_lock(&pool, &rotation).await {
+        let early = rotation.await.expect("rotation task panicked");
+        panic!("the rotation did not block on the held roster row; it returned {early:?}");
+    }
+
+    // A writer that skips the lock commits a live member while the rotation's
+    // roster read is waiting.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, $3, 0, 'reader')",
+    )
+    .bind(group_id)
+    .bind(bypasser)
+    .bind(share("bypass"))
+    .execute(&pool)
+    .await
+    .expect("insert behind the snapshot");
+
+    holder.rollback().await.expect("release the roster row");
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), rotation)
+        .await
+        .expect("the rotation never unblocked")
+        .expect("rotation task panicked");
+    match outcome {
+        Err(epigraph_db::DbError::InvalidData { reason }) => assert!(
+            reason.contains("would leave 1 live membership"),
+            "unexpected refusal: {reason}"
+        ),
+        other => panic!(
+            "the rotation must refuse while a live member is on the retired epoch; got {other:?}"
+        ),
+    }
+
+    let current: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT epoch, status FROM group_key_epochs WHERE group_id = $1 ORDER BY epoch",
+    )
+    .bind(group_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read epochs");
+    assert_eq!(
+        current,
+        vec![(0, "active".to_string())],
+        "the refused rotation must roll back whole"
+    );
+    let roster = live_roster(&pool, group_id).await;
+    assert_eq!(roster.len(), 3, "{roster:?}");
+    assert!(roster.iter().all(|(_, epoch)| *epoch == 0), "{roster:?}");
+}

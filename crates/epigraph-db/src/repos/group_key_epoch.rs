@@ -260,7 +260,9 @@ impl GroupKeyEpochRepository {
     /// takes `GroupMembershipRepository::lock_group_membership_conn` before the
     /// roster. `add_member` takes the same lock and reads the current epoch
     /// under it, so an add either committed before this roster was read, and is
-    /// in it, or waits for this rotation and reads epoch N+1.
+    /// in it, or waits for this rotation and reads epoch N+1. As a backstop for
+    /// a writer that skips the lock, the rotation also refuses to return
+    /// `Rotated` while any live member is on an epoch other than N+1.
     ///
     /// The group creator's row is included, and that is deliberate:
     /// `GroupRepository::create_with_admin` writes their `wrapped_key_share`
@@ -278,7 +280,9 @@ impl GroupKeyEpochRepository {
     /// discharged that has not been.
     ///
     /// # Errors
-    /// * `DbError::InvalidData` if the epoch counter would overflow `i32`.
+    /// * `DbError::InvalidData` if the epoch counter would overflow `i32`, if
+    ///   the re-wraps did not all land, or if a live member is still on another
+    ///   epoch after them (a write that bypassed the group membership lock).
     /// * `DbError::QueryFailed` if any statement fails. The caller owns the
     ///   transaction and must roll back — a partial rotation is exactly the
     ///   state that leaves zero or two active epochs.
@@ -441,6 +445,38 @@ impl GroupKeyEpochRepository {
                     "rotation re-wrapped {members_rewrapped} of {} live memberships; refusing to \
                      commit an epoch advance that leaves a member on the retired epoch",
                     shares.len()
+                ),
+            });
+        }
+
+        // AND AGAINST THE COMMITTED ROSTER, NOT ONLY THE LOCKED ONE. Every
+        // in-tree writer of the roster takes the group membership lock this
+        // transaction took first, so none can land inside this window. A
+        // writer that skips it can: a raw INSERT, a backfill, or a future path
+        // that forgets. Row locks do not stop an INSERT, so such a writer can
+        // commit a live member after the roster snapshot above, and nothing
+        // above would notice. Under READ COMMITTED this later statement sees
+        // any such row that committed before it started. Refuse rather than
+        // commit an epoch advance that leaves that member on the retired
+        // epoch. It cannot see a row committed after it runs; only the lock
+        // closes that.
+        let stranded: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)
+            FROM group_memberships
+            WHERE group_id = $1 AND revoked_at IS NULL AND epoch <> $2
+            "#,
+        )
+        .bind(group_id)
+        .bind(new_epoch)
+        .fetch_one(&mut *conn)
+        .await?;
+        if stranded > 0 {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "rotation to epoch {new_epoch} would leave {stranded} live membership(s) on \
+                     another epoch: a member was written behind the roster snapshot without the \
+                     group membership lock; refusing to commit"
                 ),
             });
         }
