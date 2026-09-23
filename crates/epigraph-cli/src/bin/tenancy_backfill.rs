@@ -852,11 +852,20 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// `OR (SELECT public.epigraph_definer_bypass())` disjunct admits a frame whose
 /// `current_user` is a member of `epigraph_maintenance`. If the guarded
 /// `ALTER FUNCTION ... OWNER TO` in 086 silently no-ops — which is exactly what
-/// 060's `RAISE NOTICE`-only role creation makes possible — the function returns
-/// FEWER rows with no error, and the suppression control it backs degrades to
-/// reporting nothing hidden. That is the same silent failure mode this check
-/// exists for, on a READ path rather than a write one, so it takes the same
-/// instrument rather than a second one.
+/// 060's `RAISE NOTICE`-only role creation makes possible — the 086 body
+/// returned FEWER rows with no error, and the suppression control it backs
+/// degraded to reporting nothing hidden. That is the same silent failure mode
+/// this check exists for, on a READ path rather than a write one, so it takes
+/// the same instrument rather than a second one.
+///
+/// **Since migration 094 that failure is no longer silent.** The body tests
+/// `epigraph_definer_bypass()` before it reads and RAISES `42501` when its frame
+/// is not admitted, so a wrong owner is an OUTAGE of the five surfaces above,
+/// not a leak through them. This entry is still worth running. It turns that
+/// outage into a pre-flight finding. It is no longer the only thing between a
+/// degraded owner and a leak, which matters, because no documented step ran
+/// it after 086 existed (the NOTE in [`applicable_definer_functions`] asks for
+/// a re-run that no runbook scheduled; `docs/deploy.md` now does).
 ///
 /// The predicate is unchanged and is inherited deliberately:
 /// `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')`, not string equality —
@@ -969,15 +978,23 @@ const DEFINER_FUNCTIONS: &[&str] = &[
 /// every migration step 11c applies, so an unconditional entry would report
 /// `does not exist` and fail a correctly sequenced deploy.
 ///
-/// **Its failure direction is the one none of the other entries has, and it is
-/// why this entry is not optional.** 070's five lose a WRITE, 071's lost a LEAK,
-/// 086's degrades a READ CONTROL, 089's loses COVERAGE — all of them fail
-/// closed-ish, because their bodies ask `EXISTS` and an RLS-filtered read
-/// answers "no". This body's first disjunct asks `NOT EXISTS (any roster row for
-/// this group)`, so an RLS-filtered read answers **yes** and the predicate
-/// ADMITS. An app-owned or runner-owned body therefore does not degrade the
-/// narrowing migration 092 installs — it SILENTLY REVERTS it to migration 077's
-/// unbounded arm, with no error, no catalog symptom and a green test suite.
+/// **Its failure direction was the one none of the other entries had.** 070's
+/// five lose a WRITE, 071's lost a LEAK, 086's degraded a READ CONTROL, 089's
+/// loses COVERAGE — all of them fail closed-ish, because their bodies ask
+/// `EXISTS` and an RLS-filtered read answers "no". This body's first disjunct
+/// asks `NOT EXISTS (any roster row for this group)`, so an RLS-filtered read
+/// would answer **yes** and the predicate would ADMIT.
+///
+/// **Corrected by migration 094.** This paragraph said an app-owned or
+/// runner-owned body SILENTLY REVERTS 092 to 077's unbounded arm. MEASURED before
+/// 094, it did not. The unadmitted frame's read of `group_memberships`
+/// re-entered this predicate through `group_memberships_tenancy`'s creator
+/// disjunct and failed with `54001 stack depth limit exceeded`. So it was
+/// fail-erratic, and only an unplanned recursion kept the `NOT EXISTS` from
+/// admitting. Since 094 the body tests `epigraph_definer_bypass()` first and
+/// returns FALSE without reading. A wrong owner now refuses the creator arm,
+/// group creation included. This entry reports that state before it shows up as
+/// refused group creations.
 ///
 /// The predicate this gate applies —
 /// `pg_has_role(owner, 'epigraph_maintenance', 'MEMBER')` — is exactly the
@@ -1073,7 +1090,10 @@ async fn applicable_definer_functions(pool: &PgPool) -> anyhow::Result<Vec<Strin
 ///   Historical since PR-22: migration 084 drops both the table and 071's shim,
 ///   so this arm has no subject left and its entry is gone from
 ///   [`DEFINER_FUNCTIONS`]. The other three arms are unaffected.
-/// * **086 — a DEGRADED READ CONTROL (PR-24).** `epigraph_claim_tenancy_by_ids`
+/// * **086 — a DEGRADED READ CONTROL (PR-24), an OUTAGE since migration 094.**
+///   094's body RAISES `42501` when its frame is not admitted, so the rest of
+///   this bullet describes the pre-094 behaviour.
+///   `epigraph_claim_tenancy_by_ids`
 ///   reaches `claims` only through `claims_tenancy`'s definer-bypass disjunct.
 ///   An app-owned body is policy-filtered like any other reader, so it returns
 ///   FEWER rows with no error, and `ClaimRepository::hidden_claim_ids` — which
@@ -1166,9 +1186,11 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                      '{MAINTENANCE_ROLE}'. Migrations 070/086 skip their ALTER FUNCTION \
                      when the role is absent (060 only NOTICEs on insufficient_privilege), so \
                      this is a SILENT no-op: 070's bodies become RLS-filtered at PR-17 -- arm \
-                     (b) then stamps a private endpoint PUBLIC -- and 086's read helper returns \
-                     fewer rows with no error, which degrades the read-side suppression control \
-                     it backs. Re-apply 070 and 086 with the role provisioned."
+                     (b) then stamps a private endpoint PUBLIC. Since migration 094, 086's read \
+                     helper RAISES 42501 on every call (GET /api/v1/events, graph snapshots, \
+                     MCP list_events and webhook delivery all fail), and 092's roster predicate \
+                     answers false (group creation is refused). With the role provisioned, fix \
+                     with: ALTER FUNCTION public.{f} OWNER TO {MAINTENANCE_ROLE}."
                 );
             }
         }

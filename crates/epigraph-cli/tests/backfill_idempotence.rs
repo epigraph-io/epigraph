@@ -971,9 +971,10 @@ async fn verify_covers_the_086_read_definer_once_its_migration_is_applied(pool: 
     let (code, stderr) = run_backfill(&pool, &["verify"]).await;
     assert_eq!(
         code, 1,
-        "verify must refuse a deploy whose 086 read definer is app-owned — an app-owned body \
-         is RLS-filtered, so it returns fewer rows with NO error and hidden_claim_ids degrades \
-         to reporting nothing hidden; stderr:\n{stderr}"
+        "verify must refuse a deploy whose 086 read definer is app-owned. Since migration 094 \
+         such a body RAISES 42501 on every call, so the event surfaces and webhook delivery \
+         fail; before 094 it returned fewer rows with NO error and hidden_claim_ids reported \
+         nothing hidden. This gate turns either into a pre-flight finding; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("epigraph_claim_tenancy_by_ids") && stderr.contains("epigraph_maintenance"),
@@ -1222,11 +1223,14 @@ async fn verify_covers_the_089_stamping_definer_once_its_migration_is_applied(po
 /// The other three entries guard bodies that ask `EXISTS`. An RLS-filtered read
 /// answers "no", so they fail toward refusing — a lost write, a degraded read
 /// control, a coverage gap. This body's first disjunct asks `NOT EXISTS`, so a
-/// filtered read answers **yes** and the predicate ADMITS. A body owned by a
-/// role that is not a member of `epigraph_maintenance` therefore does not
-/// degrade migration 092's narrowing; it reverts it to migration 077's unbounded
-/// arm with no error and no catalog symptom. This gate is the only instrument
-/// that reports that on a real cluster, which is why the entry needs a test
+/// filtered read would answer **yes** and the predicate would ADMIT. This
+/// paragraph said a non-member owner therefore reverts migration 092's
+/// narrowing to migration 077's unbounded arm with no error. **Corrected by
+/// migration 094.** MEASURED before 094, the unadmitted frame's read recursed
+/// through `group_memberships_tenancy` and failed with `stack depth limit
+/// exceeded`. Since 094 the body returns FALSE without reading, which refuses
+/// group creation for everyone. This gate is what reports that state before
+/// it surfaces as refused group creations, which is why the entry needs a test
 /// rather than a list edit.
 ///
 /// A presence-gated entry is exactly the shape that can be right in the runbook
@@ -1277,10 +1281,10 @@ async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool
     assert_eq!(
         code, 1,
         "verify must refuse a deploy whose 092 roster predicate is owned by a role that is not \
-         a member of epigraph_maintenance. Such a body reads group_memberships under row \
-         security, and because its first disjunct is a NOT EXISTS an incomplete read makes it \
-         ADMIT rather than refuse — migration 092's narrowing silently becomes migration 077's \
-         unbounded arm again, with no runtime signal; stderr:\n{stderr}"
+         a member of epigraph_maintenance. Since migration 094 such a body answers FALSE \
+         without reading, so group creation is refused for everyone; before 094 its \
+         NOT EXISTS read recursed until the stack limit. This gate turns either into a \
+         pre-flight finding; stderr:\n{stderr}"
     );
     assert!(
         stderr.contains("epigraph_group_roster_admits_principal")

@@ -3124,7 +3124,12 @@ impl ClaimRepository {
     /// distinguish a working probe from a broken one.
     ///
     /// # Errors
-    /// Returns [`DbError::QueryFailed`] on database errors.
+    /// Returns [`DbError::QueryFailed`] on database errors. That includes
+    /// `42501` from the definer itself since migration 094, when its owner is
+    /// not admitted by `epigraph_definer_bypass()`. Before 094 that state
+    /// returned `Ok` with every private id missing, which both callers read as
+    /// "nothing is hidden". Both callers map this error to a refusal. Pinned by
+    /// `rls_enforcement.rs::a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`.
     pub async fn hidden_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,

@@ -385,6 +385,17 @@
 //!     is the only thing standing behind the frame's authority. It gates on the
 //!     function's presence in `pg_proc`, not on `_sqlx_migrations`, so a
 //!     database that lost its bookkeeping row cannot silently skip it.
+//!     **DISCHARGED by migration 094 (2026-09-22). This bullet is kept as the
+//!     PR-24 record and no longer describes the tree.** The body now RAISES
+//!     `42501` when `epigraph_definer_bypass()` does not admit its frame, so
+//!     degraded authority fails CLOSED at the function rather than resting on
+//!     `verify`. The acceptance statement is
+//!     `rls_enforcement.rs::a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`,
+//!     which re-owns the body and fails without 094. See
+//!     `## Status at migration 094` below. One correction to the bullet itself:
+//!     `epigraph_maintenance` LOSING `SELECT` on `claims` never shrank the CTE.
+//!     A missing table privilege raises `42501`, it does not filter, so that
+//!     sub-case was always fail-closed.
 //!   - **A missing `EXECUTE` grant IS fail-closed.** It raises `42501`, the call
 //!     returns `Err`, and the PR-10 trio pinned above (`agent_id == None`,
 //!     `Viewer::resolve` errors, `hidden_claim_ids` errors → all DROP) turns
@@ -463,6 +474,11 @@
 //!   only thing standing behind three read surfaces instead of two. PR-25 adds
 //!   no new entry there — the function is already registered, and the *same*
 //!   function is what backs both probes — but the stake it carries is larger.
+//!   **DISCHARGED by migration 094 (2026-09-22)**, as the PR-24 bullet above
+//!   records. A degraded frame now makes `EventRepository::list` return `Err`,
+//!   i.e. an OUTAGE of those three surfaces rather than a leak through them, and
+//!   `verify` is no longer the only thing standing behind them. See
+//!   `## Status at migration 094`.
 //!   **AMENDED by `tenancy/fix-coverage-hygiene` (2026-09-17); the three
 //!   sentences that stood here are now false and are corrected rather than left
 //!   to be read as current.** They said that the constant's own doc still named
@@ -654,6 +670,54 @@
 //! * **No `ROW_ONLY_BY_DESIGN` entry goes stale.** None of the four needles
 //!   (`true`, `key_kind`, `privatization_apply`, `agent_id IS NULL`) matches an
 //!   arm 092 rewrites, and that register is exact in both directions.
+//!
+//! ## Status at migration 094
+//!
+//! **094 CHANGES THE BODY OF A FUNCTION THREE RLS POLICIES CALL, so this file is
+//! touched deliberately.** It issues no `CREATE`/`ALTER`/`DROP POLICY`, and that
+//! is asserted from the migration source by [`d4_migration_094_installs_no_policy`]
+//! on 086's template. What each policy ADMITS is unchanged whenever the
+//! function's owner is admitted by `epigraph_definer_bypass()`, which is every
+//! correctly migrated database.
+//!
+//! 094 replaces `epigraph_claim_tenancy_by_ids` (086) and
+//! `epigraph_group_roster_admits_principal` (092) with plpgsql bodies that test
+//! `epigraph_definer_bypass()` BEFORE they read. Deferred-commitment screen key
+//! `definer-authority-degrade-fail-open`.
+//!
+//! * **D1 — the PR-24/PR-25 residual is DISCHARGED, in the direction the
+//!   bullets above said it could not be.** An unadmitted frame no longer
+//!   answers from a policy-filtered read. 086's classifier RAISES `42501`
+//!   (a set-returning function has no deny value, and "nothing hidden" is the
+//!   leak), so `hidden_claim_ids` and `EventRepository::list` return `Err` and
+//!   every caller turns that into a refusal. The PR-10 trio pinned above is
+//!   what makes that true for `hidden_claim_ids`. 092's predicate RETURNS
+//!   FALSE, which is the deny every sibling body already fails toward. The
+//!   instrument (`verify`'s `DEFERRED_DEFINER_FUNCTIONS`) stays and still
+//!   matters, because it turns a runtime OUTAGE into a pre-flight finding. It
+//!   is no longer what stands between a degraded owner and a leak. That matters
+//!   because no documented step ever ran it after 086, 089 or 092 existed.
+//! * **D1 — a correction to 092's recorded failure mode.** 092 section 5 and
+//!   the D4 doc below said an unadmitted roster frame "admits every group".
+//!   MEASURED before 094, it did not. The frame's read re-entered the predicate
+//!   through `group_memberships_tenancy`'s creator disjunct and failed with
+//!   `54001 stack depth limit exceeded`, for removed creators and for some live
+//!   ones. It was fail-ERRATIC, and what kept the `NOT EXISTS` from admitting
+//!   was a recursion nobody designed as a control.
+//! * **The price is recorded, not hidden.** While an owner is wrong, 094 makes
+//!   the event surfaces fail and makes group creation fail (`groups_tenancy`
+//!   refuses `INSERT … RETURNING`, 42501). Commit db2ac67b declined the second
+//!   half. 094 takes it as an explicit decision:
+//!   `docs/tenancy/progress.json::decisions_taken.definer_bodies_fail_closed_2026_09_22`.
+//!   `rls_enforcement.rs::a_roster_predicate_whose_owner_is_not_admitted_answers_false`
+//!   asserts the refusal, so a later edit cannot quietly re-admit it.
+//! * **D3 — no `Viewer` shape, constructor or `SystemReason`**, and no route is
+//!   added, moved or removed. 094 is SQL only. Neither function's signature
+//!   changes, so `hidden_claim_ids`' `Viewer::splice` marker and
+//!   `EventRepository::list`'s bind index 4 are untouched.
+//! * **D4 — the FORCEd set and command coverage are untouched.** No table is
+//!   added to or removed from any register, and `pg_policy` is not written.
+//! * **No tenancy column**, no `tenancy_exempt` row.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -2329,6 +2393,72 @@ fn d4_migration_086_installs_no_policy() {
     );
 }
 
+/// **094 installs no policy either**, on [`d4_migration_086_installs_no_policy`]'s
+/// template and for the same reason: the `## Status at migration 094` block in
+/// this file's module doc asserts that 094 replaces two function bodies and
+/// writes zero `pg_policy` rows. That is a claim about what the migration
+/// CONTAINS, so it is read from the source with `--` comments stripped (094's
+/// header discusses `groups_tenancy`, `claims_tenancy` and `INSERT … RETURNING`
+/// at length).
+///
+/// The positive half pins the parts that make 094 what the block says it is.
+/// Both bodies are replaced, the guard is present, 086's and 092's REVOKE, guarded
+/// OWNER TO and GRANT are re-issued, and the pinned `search_path` is kept.
+#[test]
+fn d4_migration_094_installs_no_policy() {
+    let raw = include_str!("../../../migrations/094_definer_bodies_fail_closed.sql");
+    let sql = raw
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_uppercase();
+
+    for banned in [
+        "CREATE POLICY",
+        "DROP POLICY",
+        "ALTER POLICY",
+        "ROW LEVEL SECURITY",
+        "ALTER TABLE",
+        "ADD COLUMN",
+        "DROP FUNCTION",
+    ] {
+        assert!(
+            !sql.contains(banned),
+            "migration 094 contains `{banned}`. The `Status at migration 094` block in this \
+             file's module doc asserts that it only replaces two function bodies in place. \
+             Either revert the statement or rewrite the block — do not delete this assertion. \
+             (`DROP FUNCTION` is banned too: DROP + CREATE resets proacl to NULL, which IS \
+             the implicit EXECUTE-to-PUBLIC grant.)"
+        );
+    }
+
+    assert!(
+        sql.contains("CREATE OR REPLACE FUNCTION PUBLIC.EPIGRAPH_CLAIM_TENANCY_BY_IDS")
+            && sql.contains(
+                "CREATE OR REPLACE FUNCTION PUBLIC.EPIGRAPH_GROUP_ROSTER_ADMITS_PRINCIPAL"
+            )
+            && sql
+                .matches("IF NOT PUBLIC.EPIGRAPH_DEFINER_BYPASS()")
+                .count()
+                == 2,
+        "094 must still replace both bodies and guard both on epigraph_definer_bypass(), or \
+         the negative assertions above are vacuous"
+    );
+    assert!(
+        sql.matches("STABLE SECURITY DEFINER").count() == 2
+            && sql.matches("SET SEARCH_PATH = PUBLIC, PG_TEMP").count() == 2
+            && sql.matches("REVOKE EXECUTE ON FUNCTION").count() == 2
+            && sql.contains("OWNER TO EPIGRAPH_MAINTENANCE")
+            && sql.contains("GRANT EXECUTE ON FUNCTION"),
+        "094 must keep both bodies SECURITY DEFINER with the pinned search_path, and re-issue \
+         the REVOKE, the guarded OWNER TO and the GRANT EXECUTE that 086 and 092 issue"
+    );
+}
+
 // ===========================================================================
 // D4 — migration 092's narrowing of the group-creation bootstrap arm
 // ===========================================================================
@@ -2351,9 +2481,11 @@ fn d4_migration_086_installs_no_policy() {
 ///
 /// **WHAT THIS TEST DELIBERATELY DOES NOT PIN: `proowner` and `proacl`.** It
 /// greps `prosrc` for a predicate name, which survives any ownership change — so
-/// it cannot see the one degradation that reverts 092 silently, a roster
-/// predicate whose definer frame is not admitted by `epigraph_definer_bypass()`
-/// and whose `NOT EXISTS` therefore admits every group. That pin is
+/// it cannot see a roster predicate whose definer frame is not admitted by
+/// `epigraph_definer_bypass()`. The sentence that stood here said such a frame's
+/// `NOT EXISTS` "admits every group". MEASURED before migration 094, it failed
+/// with `stack depth limit exceeded` instead (see `## Status at migration 094`),
+/// and since 094 the body returns FALSE without reading. That pin is
 /// `schema_contract.rs::migration_092_roster_definer_is_revoked_from_public`, on
 /// the template 086 and 089 each established, and the deploy-time half is
 /// `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. Named here because a

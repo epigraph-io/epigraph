@@ -2626,3 +2626,443 @@ async fn event_list_still_suppresses_on_the_app_role_under_force(pool: PgPool) {
          passed on the unfixed tree."
     );
 }
+
+// ===========================================================================
+// Migration 094 — a definer frame `epigraph_definer_bypass()` does not admit
+// refuses to answer, instead of answering from a policy-filtered read
+// ===========================================================================
+
+/// Re-own a definer body, as the superuser harness pool.
+///
+/// This is how the state 086's and 092's guarded `ALTER FUNCTION … OWNER TO`
+/// can leave behind is produced on purpose: an owner that is NOT a member of
+/// `epigraph_maintenance` (060 only `RAISE NOTICE`s when it cannot create the
+/// role, and an operator re-own or a restore reaches the same catalog state).
+/// `epigraph_app` stands in for "some non-member role". It is not a member,
+/// which the tests below assert rather than assume.
+async fn reown_definer(pool: &PgPool, signature: &str, owner: &str) {
+    use sqlx::Executor;
+    // Both arguments are test-local literals, never caller data; there is no
+    // bind for an identifier in `ALTER FUNCTION`.
+    pool.execute(format!("ALTER FUNCTION public.{signature} OWNER TO {owner}").as_str())
+        .await
+        .unwrap_or_else(|e| panic!("ALTER FUNCTION {signature} OWNER TO {owner}: {e}"));
+}
+
+/// Put a definer body back the way 086's and 092's guarded `DO` blocks leave
+/// it: owned by `epigraph_maintenance`, with `EXECUTE` granted to
+/// `epigraph_app`.
+///
+/// The grant is re-issued because `ALTER … OWNER TO` rewrites the ACL. After
+/// [`reown_definer`] to `epigraph_app`, the app role's EXECUTE is its OWNER
+/// entry, and moving ownership away turns that entry into the new owner's. The
+/// app role is then left with no EXECUTE at all, which fails closed on a missing
+/// grant and would make a restore arm pass or fail for the wrong reason.
+async fn restore_definer(pool: &PgPool, signature: &str) {
+    use sqlx::Executor;
+    reown_definer(pool, signature, "epigraph_maintenance").await;
+    pool.execute(format!("GRANT EXECUTE ON FUNCTION public.{signature} TO epigraph_app").as_str())
+        .await
+        .unwrap_or_else(|e| panic!("GRANT EXECUTE ON FUNCTION {signature} TO epigraph_app: {e}"));
+}
+
+/// A one-connection pool whose every connection is `SET SESSION AUTHORIZATION
+/// epigraph_app`, the shape `hidden_claim_ids_still_classifies_on_the_app_role_under_force`
+/// establishes. The two repo functions under test take a `&PgPool`.
+async fn app_role_pool(pool: &PgPool) -> PgPool {
+    let url = fixture::database_url_for(pool).await;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET SESSION AUTHORIZATION epigraph_app")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("app-role pool")
+}
+
+/// `(SQLSTATE, primary message)` of a database error, or `None` for anything
+/// that is not one.
+fn db_refusal(e: &sqlx::Error) -> Option<(String, String)> {
+    e.as_database_error().map(|d| {
+        (
+            d.code().map(|c| c.to_string()).unwrap_or_default(),
+            d.message().to_string(),
+        )
+    })
+}
+
+/// **Migration 094, the 086 half.** When `epigraph_claim_tenancy_by_ids`' owner
+/// is not admitted by `epigraph_definer_bypass()`, both repo functions that read
+/// through it return an ERROR, for every caller. Before 094 they returned
+/// `Ok`, and the answer was wrong in the delivering direction.
+///
+/// # The failure this closes, measured rather than argued
+///
+/// Before 094 the body was a plain `LANGUAGE sql` read of `claims`. An owner
+/// that the bypass does not admit reads `claims` under `claims_tenancy` like any
+/// other reader, so the private row vanishes from BOTH arms of each set
+/// difference at once. `hidden_claim_ids` then answered `Ok({})`, which both of
+/// its callers read as "nothing is hidden", and `EventRepository::list`
+/// returned the event naming the private claim to a stranger. Nothing errored,
+/// and the only control that could see the ownership was the `verify`
+/// pre-flight, which no documented step runs after 086 applies. That was the
+/// fail-open residual `locked_decisions.rs`' D1 bullets recorded at PR-24 and
+/// PR-25.
+///
+/// # Why an ERROR and not an empty or a full answer
+///
+/// The function returns rows, so it has no value that means "deny". Returning
+/// nothing is the collapse above. Returning every id as hidden would drop every
+/// event naming any uuid, silently and with a 200. Raising is the only answer
+/// that is both conservative and visible, and both callers already map `Err` to
+/// a refusal: `routes/webhooks.rs::agent_may_receive` suppresses the delivery,
+/// and `routes/events.rs`, `graph_snapshot` and MCP `list_events` fail the
+/// request. That is an OUTAGE of those surfaces while the owner is wrong, and
+/// 094's header records it as the price, not as free.
+///
+/// # Both connections, because the frame ignores the caller
+///
+/// A `SECURITY DEFINER` frame runs as its owner whatever the calling role is,
+/// so the superuser harness pool is refused too. That arm also shows the guard
+/// is not keyed on `session_user`: the harness is a superuser, and
+/// `epigraph_bypass()` (the `session_user` variant) is true there.
+///
+/// # The last arm is the calibration that the refusal is about the OWNER
+///
+/// Re-owning to `epigraph_maintenance` restores the answer on the same pool and
+/// the same viewer. Without it, an error for an unrelated reason (a missing
+/// grant, a broken body) would satisfy every assertion before it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify(pool: PgPool) {
+    use epigraph_db::repos::{ClaimRepository, EventRepository};
+    use epigraph_db::{DbError, Viewer};
+
+    const SIGNATURE: &str = "epigraph_claim_tenancy_by_ids(uuid[])";
+
+    let (member_agent, group) = fixture::seed_agent_with_group(&pool, "094-read-member").await;
+    let (stranger_agent, _) = fixture::seed_agent_with_group(&pool, "094-read-stranger").await;
+    let public_id = fixture::seed_public_claim(&pool, member_agent, "094 public claim").await;
+    let private_id =
+        fixture::seed_group_claim(&pool, member_agent, group, "094 private claim").await;
+    let ids = [public_id, private_id];
+    let ev_private = EventRepository::insert(
+        &pool,
+        "094.names_private",
+        Some(member_agent),
+        &serde_json::json!({ "claim_id": private_id }),
+    )
+    .await
+    .expect("seed event naming the private claim");
+    let stranger = Viewer::resolve(&pool, stranger_agent)
+        .await
+        .expect("resolve stranger");
+
+    // ---- CALIBRATION, with the owner 086 installs.
+    let hidden = ClaimRepository::hidden_claim_ids(&pool, &stranger, &ids)
+        .await
+        .expect("calibration probe");
+    assert_eq!(
+        hidden,
+        std::collections::HashSet::from([private_id]),
+        "CALIBRATION: with 086's owner the private id is hidden from a stranger and the public \
+         one is not. Otherwise the fixture cannot detect a hidden id at all."
+    );
+    let listed = EventRepository::list(&pool, &stranger, None, Some(member_agent), 100)
+        .await
+        .expect("calibration list");
+    assert!(
+        !listed.iter().any(|e| e.id == ev_private),
+        "CALIBRATION: with 086's owner the event naming the private claim is suppressed"
+    );
+
+    // ---- DEGRADE. The app role gets its table grants first, so the pre-094
+    // body answers from a POLICY-FILTERED read rather than failing on a missing
+    // `SELECT` grant. That is the configuration the residual was about.
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    reown_definer(&pool, SIGNATURE, "epigraph_app").await;
+    let (owner, admitted): (String, bool) = sqlx::query_as(
+        "SELECT r.rolname::text, pg_has_role(r.oid, 'epigraph_maintenance', 'MEMBER') \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = 'public.epigraph_claim_tenancy_by_ids(uuid[])'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read the new owner");
+    assert!(
+        owner == "epigraph_app" && !admitted,
+        "PREMISE: the body must now be owned by a role that is NOT a member of \
+         epigraph_maintenance, or nothing below is about a degraded frame. Got owner {owner}, \
+         member = {admitted}"
+    );
+
+    let app_pool = app_role_pool(&pool).await;
+    for (label, p) in [("app-role", &app_pool), ("superuser harness", &pool)] {
+        match ClaimRepository::hidden_claim_ids(p, &stranger, &ids).await {
+            Err(DbError::QueryFailed { source }) => {
+                let (code, message) = db_refusal(&source).unwrap_or_else(|| {
+                    panic!("{label}: hidden_claim_ids failed, but not in the database: {source}")
+                });
+                assert_eq!(
+                    code, "42501",
+                    "{label}: the refusal must be 094's insufficient_privilege, not an \
+                     unrelated failure. Message: {message}"
+                );
+                assert!(
+                    message.contains("epigraph_claim_tenancy_by_ids")
+                        && message.contains("epigraph_maintenance"),
+                    "{label}: the refusal must name the function and the role its owner lacks, \
+                     or an operator reading the log cannot act on it. Message: {message}"
+                );
+            }
+            other => panic!(
+                "{label}: hidden_claim_ids must REFUSE when its definer frame is not admitted. \
+                 Before migration 094 it returned Ok with the private id missing, because the \
+                 frame read claims under claims_tenancy and both arms of the set difference \
+                 lost the row together, and both callers read that as \"nothing is hidden\" \
+                 and deliver. Got: {other:?}"
+            ),
+        }
+
+        match EventRepository::list(p, &stranger, None, Some(member_agent), 100).await {
+            Err(e) => {
+                let (code, message) = db_refusal(&e).unwrap_or_else(|| {
+                    panic!("{label}: EventRepository::list failed, but not in the database: {e}")
+                });
+                assert_eq!(code, "42501", "{label}: message {message}");
+                assert!(
+                    message.contains("epigraph_claim_tenancy_by_ids"),
+                    "{label}: message {message}"
+                );
+            }
+            Ok(rows) => panic!(
+                "{label}: EventRepository::list must REFUSE when its definer frame is not \
+                 admitted. It is the sole tenancy filter for the persisted half of \
+                 GET /api/v1/events, for graph_snapshot and for MCP list_events. Before \
+                 migration 094 it returned the event naming the private claim to a stranger \
+                 (returned it: {}). Rows: {:?}",
+                rows.iter().any(|r| r.id == ev_private),
+                rows.iter().map(|r| r.id).collect::<Vec<_>>()
+            ),
+        }
+    }
+
+    // ---- CALIBRATION, the other way: restore the owner and the same pool and
+    // viewer get their answer back. The refusal above is keyed on the owner.
+    restore_definer(&pool, SIGNATURE).await;
+    let restored = ClaimRepository::hidden_claim_ids(&app_pool, &stranger, &ids)
+        .await
+        .expect("with the owner restored the probe answers again on the app role");
+    assert_eq!(
+        restored,
+        std::collections::HashSet::from([private_id]),
+        "with the owner restored the app-role probe must classify exactly as the calibration did"
+    );
+    let relisted = EventRepository::list(&app_pool, &stranger, None, Some(member_agent), 100)
+        .await
+        .expect("with the owner restored the list answers again on the app role");
+    assert!(
+        !relisted.iter().any(|e| e.id == ev_private),
+        "with the owner restored the event naming the private claim is suppressed again"
+    );
+}
+
+/// Like [`read_as_creator`], but returns the database error instead of
+/// panicking inside the helper, so a test can assert on it.
+async fn try_read_as_creator(
+    pool: &PgPool,
+    f: &CreatorArmFixture,
+) -> Result<(i64, i64, i64), String> {
+    async fn counts(
+        conn: &mut sqlx::PgConnection,
+        group: Uuid,
+        other: Uuid,
+    ) -> Result<(i64, i64, i64), sqlx::Error> {
+        let g = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM groups WHERE id = $1")
+            .bind(group)
+            .fetch_one(&mut *conn)
+            .await?;
+        let m = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(group)
+        .bind(other)
+        .fetch_one(&mut *conn)
+        .await?;
+        let e = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM group_key_epochs WHERE group_id = $1",
+        )
+        .bind(group)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok((g, m, e))
+    }
+
+    let (group, creator, other) = (f.group, f.creator, f.other);
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", &creator.to_string()).await;
+        let out = counts(&mut conn, group, other)
+            .await
+            .map_err(|e| e.to_string());
+        (conn, out)
+    })
+    .await
+}
+
+/// A principal creating a new group with `GroupRepository::create_with_admin`'s
+/// first statement, on an `epigraph_app` connection stamped with a principal and
+/// no groups — the connection shape
+/// [`the_three_statement_bootstrap_still_succeeds_under_the_roster_bound_arm`]
+/// uses.
+async fn try_bootstrap_group(pool: &PgPool, principal: Uuid) -> Result<Uuid, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        set_gucs(&mut conn, "", "", &principal.to_string()).await;
+        let r = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ('094-boot', 'did:probe:' || gen_random_uuid()::text, $1, 'team', $2) \
+             RETURNING id",
+        )
+        .bind(vec![5u8; 32])
+        .bind(principal)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// **Migration 094, the 092 half.** When `epigraph_group_roster_admits_principal`'s
+/// owner is not admitted by `epigraph_definer_bypass()`, the predicate answers
+/// FALSE without reading `group_memberships`.
+///
+/// # What the degraded predicate actually did before 094 — a correction
+///
+/// 092's section 5, `tenancy_backfill.rs`' 092 entry and
+/// `schema_contract.rs::migration_092_roster_definer_is_revoked_from_public` all
+/// say an unadmitted frame "reads nothing, `NOT EXISTS` is TRUE, and it
+/// ADMITS", silently reverting 092 to 077's unbounded arm. MEASURED on this
+/// fixture before 094, that is not what happens. The unadmitted frame's read of
+/// `group_memberships` is filtered by `group_memberships_tenancy`, whose creator
+/// disjunct calls `epigraph_is_group_creator`, which calls this predicate again,
+/// in a frame that is again not admitted. 092 section 6 records that the definer
+/// frame is what stops that recursion. Without it the read of any roster row
+/// other than the principal's own recurses until PostgreSQL raises `54001 stack
+/// depth limit exceeded`. So the removed creator below got an ERROR, not an
+/// admit, and a LIVE creator whose own row was not scanned first got the same
+/// error. The residual was fail-ERRATIC, not fail-open, and what kept it from
+/// admitting was a recursion nobody designed as a control.
+///
+/// # What 094 does instead, and the price, which is asserted rather than hidden
+///
+/// The body now checks `epigraph_definer_bypass()` first and returns FALSE
+/// without reading when it is not admitted. That is the direction every sibling
+/// body already fails in (092 section 5), and it does not depend on the
+/// recursion. The price is group creation. The bootstrap arm is this predicate,
+/// so under a non-member owner `INSERT INTO groups … RETURNING` is refused.
+/// Before 094 it succeeded, because an empty roster read as empty either way.
+/// Commit db2ac67b declined exactly this trade-off. 094 takes it, and it is
+/// recorded as an explicit decision in `docs/tenancy/progress.json`. The
+/// refusal is asserted below so that a later edit that quietly re-admits the
+/// bootstrap under a degraded owner fails here.
+///
+/// # The last arm is the calibration that the refusal is about the OWNER
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_roster_predicate_whose_owner_is_not_admitted_answers_false(pool: PgPool) {
+    const SIGNATURE: &str = "epigraph_group_roster_admits_principal(uuid)";
+
+    let f = creator_arm_fixture(&pool, "094-roster").await;
+    let (newcomer, _) = fixture::seed_agent_with_group(&pool, "094-roster-newcomer").await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+
+    // ---- CALIBRATION, with the owner 092 installs.
+    assert_eq!(
+        try_read_as_creator(&pool, &f).await,
+        Ok((1, 1, 1)),
+        "CALIBRATION: a live creator reads its group, the other member's roster row and the \
+         epoch through the bootstrap arm alone"
+    );
+
+    // ---- DEGRADE. `ALTER … OWNER TO` rewrites the ACL, and the old owner's
+    // implicit EXECUTE goes with it. `epigraph_is_group_creator` runs as
+    // `epigraph_maintenance` and calls this predicate, so without the re-grant
+    // every call through it fails on a missing EXECUTE. That fails closed too,
+    // but for a reason other than the one under test. A non-member owner with
+    // its grants intact is what a no-opped `OWNER TO` actually leaves.
+    reown_definer(&pool, SIGNATURE, "epigraph_app").await;
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION public.epigraph_group_roster_admits_principal(uuid) \
+         TO epigraph_maintenance",
+    )
+    .execute(&pool)
+    .await
+    .expect("keep the maintenance-owned caller able to call it");
+    let admitted: bool = sqlx::query_scalar(
+        "SELECT pg_has_role(p.proowner, 'epigraph_maintenance', 'MEMBER') FROM pg_proc p \
+          WHERE p.oid = 'public.epigraph_group_roster_admits_principal(uuid)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read the new owner's membership");
+    assert!(
+        !admitted,
+        "PREMISE: the new owner must NOT be a member of epigraph_maintenance"
+    );
+
+    // The creator leaves the group. Another member stays, so the roster is not
+    // empty and the bootstrap window is closed.
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(f.group)
+    .bind(f.creator)
+    .execute(&pool)
+    .await
+    .expect("revoke the creator's own membership");
+
+    assert_eq!(
+        try_read_as_creator(&pool, &f).await,
+        Ok((0, 0, 0)),
+        "with a non-member owner, a creator whose own membership has ended must be DENIED the \
+         group, the rest of its roster and its epochs, and denied cleanly. Before migration \
+         094 this read failed with `stack depth limit exceeded`: the unadmitted frame's read \
+         of group_memberships re-entered this predicate through group_memberships_tenancy's \
+         creator disjunct. A NOT EXISTS over an incomplete read would ADMIT, and only that \
+         unplanned recursion was stopping it."
+    );
+
+    let boot = try_bootstrap_group(&pool, newcomer).await;
+    let code = boot
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .and_then(|e| e.code())
+        .map(|c| c.to_string());
+    assert_eq!(
+        code.as_deref(),
+        Some("42501"),
+        "THE RECORDED PRICE. With a non-member owner the bootstrap arm answers FALSE, so group \
+         creation's `INSERT … RETURNING` is refused by groups_tenancy. Before migration 094 it \
+         succeeded. 094 chooses the refusal, and progress.json records that decision. If \
+         this now succeeds, the predicate is answering from an unadmitted frame again. \
+         Got: {boot:?}"
+    );
+
+    // ---- CALIBRATION, the other way. Restore the owner, and the bootstrap
+    // succeeds for the same principal on the same connection shape. The removed
+    // creator stays denied, now through 092's real narrowing and not through the
+    // guard.
+    restore_definer(&pool, SIGNATURE).await;
+    try_bootstrap_group(&pool, newcomer)
+        .await
+        .expect("with the owner restored, group creation's first statement is admitted again");
+    assert_eq!(
+        try_read_as_creator(&pool, &f).await,
+        Ok((0, 0, 0)),
+        "with the owner restored, the removed creator is still denied, by 092's narrowing"
+    );
+}

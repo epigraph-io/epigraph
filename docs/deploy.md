@@ -1081,3 +1081,44 @@ library recall has no principal at all, so there is no personal group to name
 and migration 062's `recall_events_group_needs_real_group` CHECK forbids
 substituting a sentinel. Rows from that path remain `('public', world)` and are
 identifiable by `agent_id IS NULL`.
+
+## Migration 094 — the tenancy definer bodies fail closed when their owner is wrong
+
+Deferred-commitment batch `fix/deferred-2026-09-22-lane-b`. One migration,
+`094_definer_bodies_fail_closed.sql`, no binary change is required with it.
+
+**What changes.** `epigraph_claim_tenancy_by_ids` (086) and
+`epigraph_group_roster_admits_principal` (092) are `SECURITY DEFINER` bodies
+whose reads are complete only while their OWNER is a member of
+`epigraph_maintenance`. 086 and 092 set that owner inside an
+`IF EXISTS (pg_roles)` guard that silently no-ops on a cluster where the role
+was missing at the time (060 only `RAISE NOTICE`s), and a re-own or a restore
+reaches the same state. Before 094, such an owner made 086 report "nothing
+hidden", which leaked group-private claim events through the event surfaces,
+and made 092 fail erratically with `stack depth limit exceeded`. From 094 on:
+
+| Body | Wrong owner, before 094 | Wrong owner, from 094 |
+|---|---|---|
+| `epigraph_claim_tenancy_by_ids` | returns fewer rows, no error: private claim events are DELIVERED | RAISES `42501`: `GET /api/v1/events`, `GET /api/v1/graph/snapshot/:version` and MCP `list_events` fail, webhook deliveries are suppressed |
+| `epigraph_group_roster_admits_principal` | `54001 stack depth limit exceeded` on some group reads | returns FALSE: group creation is refused (`42501` from `groups_tenancy`), and a creator is denied a group it can reach only through the creator arm |
+
+On a correctly migrated database, where both owners are `epigraph_maintenance`,
+nothing changes. The trade-off is recorded in `docs/tenancy/progress.json` under
+`decisions_taken.definer_bodies_fail_closed_2026_09_22`.
+
+**REQUIRED: run `epigraph-tenancy-backfill verify` AFTER 083, 086, 089, 092 and
+094 are applied, and require exit 0.** Every earlier documented `verify` run
+(plan §9.2 step 11c, and the two above, before 074 and before 084) happens
+before those functions exist, and `verify` SKIPS a definer entry whose function
+is absent. It prints a `NOTE: skipping the ownership check …` line and still
+exits 0. So until this run, no documented step has checked 086's, 089's or
+092's body. 083's is checked only if the pre-084 run happened after 083 applied. A
+`FAIL: public.<fn> is owned by '<role>' …` line names the function and prints
+the one-line fix (`ALTER FUNCTION public.<fn> OWNER TO epigraph_maintenance`).
+The run must print no `skipping the ownership check` line. If it does, the
+migration that installs that function has not been applied.
+
+Symptoms that mean this check was skipped and an owner is wrong: `42501` errors
+naming `epigraph_claim_tenancy_by_ids` in the API or MCP logs (the error's HINT
+carries the fix), or group creation failing with `new row violates row-level
+security policy for table "groups"`.

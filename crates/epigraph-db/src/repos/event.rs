@@ -131,15 +131,28 @@ impl EventRepository {
     /// hoist ONE call over both arms in a CTE. Here the ids arrive from a
     /// per-row, per-match `regexp_matches` correlation, which no CTE can be
     /// hoisted over, so the two arms call the definer separately. They cannot
-    /// disagree about the row set: the function is `LANGUAGE sql STABLE`, so
-    /// both calls within one statement are evaluated against one snapshot and
-    /// return the same rows for the same argument. This is the snapshot
+    /// disagree about the row set: the function is `STABLE` (`LANGUAGE sql` in
+    /// 086, `plpgsql` since migration 094, and both read the calling
+    /// statement's snapshot), so both calls within one statement are evaluated
+    /// against one snapshot and return the same rows for the same argument. This is the snapshot
     /// argument, not PR-24's one-CTE argument, which is about making the
     /// symmetry legible rather than about a divergence risk.
     ///
     /// A `Bypass` viewer still short-circuits through the existing mechanism:
     /// `splice` renders it to a bare separator, the two arms coincide, and the
     /// difference is empty. Nothing hand-rolls that branch.
+    ///
+    /// ## A definer frame that has lost its authority is an error, not an answer
+    ///
+    /// Since migration 094 the function RAISES `42501` when
+    /// `epigraph_definer_bypass()` does not admit its frame, i.e. when its owner
+    /// is not a member of `epigraph_maintenance`. Before 094 such a frame read
+    /// `claims` under the policy, both arms lost the private row together, and
+    /// every event was returned. That was the fail-open residual PR-25 recorded.
+    /// So this function now returns `Err` for the whole page, and all three
+    /// callers fail the request. That is an outage while the owner is wrong,
+    /// which is the price 094's header records. Pinned by
+    /// `epigraph-db/tests/rls_enforcement.rs::a_tenancy_read_definer_whose_owner_is_not_admitted_refuses_to_classify`.
     ///
     /// ## Ordering: 086 must be applied before a binary carrying this serves traffic
     ///
