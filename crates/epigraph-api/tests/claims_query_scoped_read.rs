@@ -538,3 +538,119 @@ fn methodology_params() -> ClaimQueryParams {
         ..base_params()
     }
 }
+
+/// THE SEVEN VALIDATION EARLY-RETURNS, ON THE SHIPPING ARM, answer 400 before
+/// any connection is acquired.
+///
+/// The `not(db)` unit tests in `routes/claims_query.rs` assert the same 400s,
+/// but only for the build nothing ships. This arm asserts them for the `db`
+/// build, and it also pins the placement that the handler's comment used to
+/// call "an observation, not an enforced invariant": the viewer-stamped
+/// connection is acquired AFTER the validation block.
+///
+/// The instrument is an `AppState` with NO `ScopedPool` (`with_db` leaves
+/// `scoped` as `None`), on which `read_as` always refuses. A request that gets
+/// as far as acquiring therefore answers 500 "Failed to acquire a scoped
+/// connection", and that is asserted first as the CALIBRATION. Each invalid
+/// parameter must then answer `ValidationError` naming its own field. If the
+/// acquire is hoisted above the validation, every case below turns into the
+/// calibration's 500, and so does a validation that simply stops running.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_invalid_parameter_answers_400_before_a_connection_is_acquired(pool: PgPool) {
+    let (agent, _group) = seed_agent_with_group(&pool, "cq-validation").await;
+    let viewer = || async {
+        epigraph_db::visibility::Viewer::resolve(&pool, agent)
+            .await
+            .expect("resolve")
+    };
+    let unscoped = || AppState::with_db(pool.clone(), ApiConfig::default());
+
+    // CALIBRATION: valid parameters on this state reach the acquire and are
+    // refused there. Without this, a 400 below could not be told apart from a
+    // state that answers 400 to everything.
+    let calibration = list_claims_query(
+        ViewerExtractor(viewer().await),
+        State(unscoped()),
+        Query(base_params()),
+    )
+    .await
+    .expect_err("CALIBRATION: an AppState with no ScopedPool must refuse at read_as");
+    match calibration {
+        epigraph_api::errors::ApiError::InternalError { message } => assert_eq!(
+            message, "Failed to acquire a scoped connection",
+            "CALIBRATION: the refusal must come from read_as"
+        ),
+        other => panic!("CALIBRATION: expected read_as's 500, got {other:?}"),
+    }
+
+    let cases: [(&str, ClaimQueryParams); 7] = [
+        (
+            "truth_min",
+            ClaimQueryParams {
+                truth_min: Some(1.5),
+                ..base_params()
+            },
+        ),
+        (
+            "truth_max",
+            ClaimQueryParams {
+                truth_max: Some(-0.1),
+                ..base_params()
+            },
+        ),
+        (
+            "sort_by",
+            ClaimQueryParams {
+                sort_by: Some("content".to_string()),
+                ..base_params()
+            },
+        ),
+        (
+            "sort_order",
+            ClaimQueryParams {
+                sort_order: Some("sideways".to_string()),
+                ..base_params()
+            },
+        ),
+        (
+            "content_contains",
+            ClaimQueryParams {
+                content_contains: Some("x".repeat(1025)),
+                ..base_params()
+            },
+        ),
+        (
+            "methodology",
+            ClaimQueryParams {
+                methodology: Some("not-a-methodology".to_string()),
+                ..base_params()
+            },
+        ),
+        (
+            "evidence_type",
+            ClaimQueryParams {
+                evidence_type: Some("not-an-evidence-type".to_string()),
+                ..base_params()
+            },
+        ),
+    ];
+
+    let mut wrong = Vec::new();
+    for (want_field, params) in cases {
+        let got = list_claims_query(
+            ViewerExtractor(viewer().await),
+            State(unscoped()),
+            Query(params),
+        )
+        .await;
+        match got {
+            Err(epigraph_api::errors::ApiError::ValidationError { field, .. })
+                if field == want_field => {}
+            other => wrong.push(format!(
+                "{want_field}: want ValidationError on `{want_field}`, got {:?}",
+                other.map(|_| "200")
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -318,16 +318,15 @@ pub async fn list_claims_query(
     // early-returns above answer without touching the database, and hoisting the
     // acquire over them would hold a pooled connection across every 400.
     //
-    // READ THAT AS AN OBSERVATION, NOT AN ENFORCED INVARIANT. Nothing in the
-    // gate catches a hoist: this file's only unit-test module is gated
-    // `#[cfg(all(test, not(feature = "db")))]` while the crate's `default` is
-    // `["db"]`, so those ~20 validation tests never compile in the shipping
-    // configuration, and neither scoped-read test file drives an invalid
-    // parameter and asserts a 400. A future author who hoists the acquire — a
-    // natural-looking simplification, since it removes the two-return-path
-    // awkwardness `finish_scoped_read` exists to absorb — gets a green run. The
-    // placement is correct today and is a connection-footprint choice, not a
-    // correctness one.
+    // ENFORCED, for this arm, by
+    // `tests/claims_query_scoped_read.rs::every_invalid_parameter_answers_400_before_a_connection_is_acquired`.
+    // It drives each of the seven through an `AppState` whose `read_as` always
+    // refuses, so a hoist turns every 400 into a 500 and fails it (measured by
+    // planting the hoist). This used to say "an observation, not an enforced
+    // invariant", and that was true: the only validation tests were this file's
+    // `#[cfg(all(test, not(feature = "db")))]` module, which never builds in the
+    // shipping configuration and at the time built in none. That module now
+    // runs in CI's no-db step, but it covers the `not(db)` arm only.
     //
     // THE ERROR SHAPE IS PART OF THE TEMPLATE (see `routes/lineage.rs::get_lineage`).
     // `read_as`'s refusal reason is a paragraph of internal design prose aimed at
