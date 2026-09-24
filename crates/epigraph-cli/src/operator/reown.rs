@@ -778,8 +778,14 @@ fn tally(
 ///
 /// Under `apply`, the manifest is created and the whole plan recorded before
 /// the first batch, each batch commits on its own, and the run stops at the
-/// first failed batch. Otherwise the batches run inside ONE transaction, each
-/// under a savepoint, and the transaction is rolled back at the end.
+/// first failed batch. Otherwise each batch runs in its OWN transaction, which
+/// is rolled back as soon as the batch ends: a dry run against production
+/// holds a batch's row and table locks for that batch only, never for the
+/// whole run (review finding: one transaction with savepoints kept every
+/// batch's `FOR UPDATE` and cascade row locks until the end, because
+/// `RELEASE SAVEPOINT` keeps locks). The cost is that a batch does not see an
+/// earlier batch's effects, which only changes how rows shared across batches
+/// are checked, not what the plan reports.
 ///
 /// # Errors
 /// A failure outside a batch (planning, the manifest, the connection).
@@ -969,21 +975,12 @@ pub async fn run(
             }
         }
     } else {
-        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         for (i, batch) in batches.iter().enumerate() {
-            sqlx::query("SAVEPOINT reown_batch")
-                .execute(&mut *tx)
-                .await?;
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
             let r = run_batch(&mut tx, &ctx, batch, &mut sink, &mut caches).await;
-            let sp = if r.is_ok() {
-                "RELEASE SAVEPOINT reown_batch"
-            } else {
-                "ROLLBACK TO SAVEPOINT reown_batch"
-            };
-            sqlx::query(sp).execute(&mut *tx).await?;
+            tx.rollback().await?;
             tally(&mut report, out, i + 1, total, r, false)?;
         }
-        tx.rollback().await?;
     }
     report.manifest_rows = sink.len();
 
@@ -1021,7 +1018,9 @@ pub async fn run(
     if !opts.apply {
         writeln!(
             out,
-            "DRY RUN: everything above ran in one transaction and was rolled back."
+            "DRY RUN: each batch above ran in its own transaction and was rolled back, so no \
+             lock outlived its batch; a batch does not see an earlier batch's effects, so a row \
+             shared across batches is checked against its current state."
         )?;
     }
     if report.batch_failures.is_empty() && opts.apply && report.claims_moved < plan.eligible.len() {

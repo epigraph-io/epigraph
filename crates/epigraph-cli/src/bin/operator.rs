@@ -66,8 +66,8 @@ enum Command {
         /// fsynced before the first write under `--apply`.
         #[arg(long)]
         manifest_out: PathBuf,
-        /// Perform the writes. Without it, the whole run happens in one
-        /// transaction that is rolled back.
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back when the batch ends.
         #[arg(long)]
         apply: bool,
         /// Claims per transaction.

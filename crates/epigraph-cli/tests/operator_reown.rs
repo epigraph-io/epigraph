@@ -1123,6 +1123,104 @@ async fn an_in_flight_insert_into_an_unkeyed_table_blocks_the_batch(pool: PgPool
     );
 }
 
+/// A dry run holds no lock past its own batch (review finding: one transaction
+/// with savepoints kept every batch's `FOR UPDATE` until the whole run ended,
+/// because `RELEASE SAVEPOINT` keeps locks, so a large dry run against
+/// production blocked application writers to every claim it had visited).
+///
+/// Batch 1 is `c_world`, batch 2 is `c_personal`. A second transaction holds
+/// `FOR KEY SHARE` on `c_personal`, so the dry run's batch 2 waits on it. While
+/// it waits, `c_world` — batch 1's claim — must be lockable `FOR UPDATE NOWAIT`
+/// from outside: batch 1's transaction is already gone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_holds_no_lock_past_its_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let cf = dir.join("two.txt");
+    std::fs::write(&cf, format!("{}\n{}\n", fx.c_world, fx.c_personal)).unwrap();
+    let mf = dir.join("m.jsonl");
+    let op = fx.operator.to_string();
+    let url = fixture::database_url_for(&pool).await;
+
+    let mut holder = pool.begin().await.expect("holder tx");
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR KEY SHARE")
+        .bind(fx.c_personal)
+        .execute(&mut *holder)
+        .await
+        .expect("hold batch 2's claim");
+    let args: Vec<String> = [
+        "reown-claims",
+        "--claims-file",
+        cf.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--derived",
+        "follow-claim",
+        "--manifest-out",
+        mf.to_str().unwrap(),
+        "--batch-size",
+        "1",
+        "--lock-timeout",
+        "8s",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let run = tokio::task::spawn_blocking(move || {
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_with_env(
+            &a,
+            &[(DSN_ENV, url.as_str())],
+            &["DATABASE_URL", "MAINTENANCE_DATABASE_URL"],
+        )
+    });
+
+    // Wait until the dry run is blocked in batch 2 on the holder.
+    let mut waiting = false;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                AND query ILIKE '%FOR UPDATE%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            waiting = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        waiting,
+        "PREMISE: the dry run's batch 2 waits on the held claim"
+    );
+
+    let mut probe = pool.begin().await.expect("probe tx");
+    let batch1 = sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(fx.c_world)
+        .execute(&mut *probe)
+        .await;
+    probe.rollback().await.ok();
+    holder.rollback().await.expect("release batch 2");
+    let r = run.await.expect("join");
+
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        batch1.is_ok(),
+        "while the dry run sat in batch 2, batch 1's claim was still locked by it: {:?}",
+        batch1.err()
+    );
+    assert!(
+        r.stdout
+            .contains("each batch above ran in its own transaction"),
+        "{}",
+        r.show()
+    );
+    assert!(!mf.exists(), "a dry run writes no manifest");
+}
+
 /// A row can become unreadable to an unstamped application session without
 /// its visibility column changing — here a RESTRICTIVE policy that hides rows
 /// owned by the target group from `epigraph_app`. The readability census, taken

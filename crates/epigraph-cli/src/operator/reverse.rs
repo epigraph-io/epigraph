@@ -386,21 +386,14 @@ pub async fn run(
             }
         }
     } else {
-        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        // One transaction PER BATCH, rolled back at once: a dry run holds a
+        // batch's locks for that batch only (see `reown::run`).
         for (i, batch) in batches.iter().enumerate() {
-            sqlx::query("SAVEPOINT reverse_batch")
-                .execute(&mut *tx)
-                .await?;
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
             let r = run_batch(&mut tx, &specs, &unkeyed, &res, batch, &opts.lock_timeout).await;
-            let sp = if r.is_ok() {
-                "RELEASE SAVEPOINT reverse_batch"
-            } else {
-                "ROLLBACK TO SAVEPOINT reverse_batch"
-            };
-            sqlx::query(sp).execute(&mut *tx).await?;
+            tx.rollback().await?;
             tally(&mut report, out, i + 1, total, r, false)?;
         }
-        tx.rollback().await?;
     }
     for (id, why) in &report.held {
         writeln!(out, "HELD\t{id}\t{why}")?;
@@ -432,7 +425,9 @@ pub async fn run(
     if !opts.apply {
         writeln!(
             out,
-            "DRY RUN: everything above ran in one transaction and was rolled back."
+            "DRY RUN: each batch above ran in its own transaction and was rolled back, so no \
+             lock outlived its batch; a batch does not see an earlier batch's effects, so a row \
+             shared across batches is checked against its current state."
         )?;
     }
     Ok(report)
