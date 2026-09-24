@@ -301,9 +301,14 @@ impl EpiGraphMcpFull {
 
         // PR-09: the server agent needs a personal group, or the viewer it
         // resolves to has an empty group set and reads public rows only. See
-        // the doc comment above. Idempotent (`ON CONFLICT (did_key)`), so the
-        // found branch pays one cheap upsert per process, not per call — this
-        // runs once and is then served from `cached`.
+        // the doc comment above. Migration 105's contract: a LIVE membership
+        // reads and writes nothing (role kept); a REVOKED one is refused with
+        // `DbError::MembershipRevoked` (RVK01) and a group squatting the
+        // agent's did_key with `PersonalGroupNotOwned` (RVK02), each logged
+        // below as a warning, never restored; only an agent with no row of
+        // any state is provisioned. It runs once per PROCESS: every session
+        // shares this cell (`SessionFactory`), and later calls are served
+        // from `cached`.
         match self.pool.acquire().await {
             Ok(mut conn) => {
                 if let Err(e) =
