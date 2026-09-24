@@ -85,7 +85,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if report.db_ahead {
+    // `run_migrations` returns `db_ahead` only when the opt-in was given (a
+    // strict run is refused instead), but the claim below is about the opt-in,
+    // so it is keyed on the opt-in rather than inferred from the report.
+    if report.db_ahead && opts.allow_db_ahead {
         eprintln!(
             "WARNING: database schema head {} is AHEAD of this binary's head {}; proceeding \
              because the rollback opt-in is set",

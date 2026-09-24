@@ -40,6 +40,15 @@ nonzero, and never prints the marker, when:
 * after running, any migration embedded in the binary is not recorded as
   successfully applied.
 
+Both checks and the run itself happen on one connection holding sqlx's
+migration advisory lock, so a second `epigraph-migrate` (or a boot-time
+migrate) cannot slip a newer migration in between the check and the run.
+Two migrators started together against a *fresh* database can still fail one
+of them with a `40P01` deadlock between that lock and a `CREATE INDEX
+CONCURRENTLY` migration; that predates #492 (raw `sqlx::migrate!` does the
+same), the losing run exits nonzero without the marker, and re-running it is
+safe.
+
 A database that stops at an older head *because the binary itself is stale*
 (built before the newer migrations existed) still reports `ok` — the binary
 cannot know migrations it was never built with — but the marker now shows its

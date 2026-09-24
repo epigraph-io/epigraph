@@ -17,7 +17,20 @@
 //!   database can still apply an older embedded migration the database lacks.
 //! * **after** running: every embedded (up) migration must be recorded in
 //!   `_sqlx_migrations` with `success = true`. This is a SET check, not
-//!   `max >= head`, so a gap under a present head cannot hide.
+//!   `max >= head`, so a gap under a present head cannot hide. The
+//!   database-ahead gate is evaluated again here, so a strict run never
+//!   reports success against a database ahead of it.
+//!
+//! Both reads and the run happen on ONE connection holding sqlx's migration
+//! advisory lock, so no other lock-respecting migrator can change
+//! `_sqlx_migrations` between the checks and the run.
+//!
+//! **What this cannot catch.** A binary knows only the migrations it was built
+//! with. A stale binary run against a database at or below its own head —
+//! #492's headline measurement, a head-59 build on an empty database — reaches
+//! ITS head and succeeds; the only signal is `binary_head=59` in the marker
+//! line. Detecting that needs an expected head supplied from outside the
+//! binary (the deploy's target revision), which this module does not take.
 //!
 //! The comparison itself is the pure [`compare_schema_heads`] plus the pure
 //! gates [`check_before_run`] / [`check_after_run`], so every branch —
@@ -29,6 +42,9 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+
+use sqlx::migrate::Migrate;
+use sqlx::Connection;
 
 /// Environment variable that opts in to running against a database whose
 /// applied head is above this binary's embedded head. Parsed with the same
@@ -105,16 +121,32 @@ pub fn compare_schema_heads(applied_ok: &[i64], embedded: &[i64]) -> SchemaHeads
     }
 }
 
+/// Embedded versions recorded as applied after the run that were not recorded
+/// before it. Rows that are not in this binary's embedded set are never
+/// counted: this process cannot have applied them.
+#[must_use]
+pub fn newly_applied(applied_before: &[i64], applied_after: &[i64], embedded: &[i64]) -> usize {
+    let before: BTreeSet<i64> = applied_before.iter().copied().collect();
+    let embedded: BTreeSet<i64> = embedded.iter().copied().collect();
+    applied_after
+        .iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|v| embedded.contains(v) && !before.contains(v))
+        .count()
+}
+
 /// Why [`run_migrations`] refused or failed.
 #[derive(Debug)]
 pub enum MigrationError {
     /// Reading `_sqlx_migrations` failed.
     Query(sqlx::Error),
     /// `sqlx::migrate::Migrator::run` failed (checksum mismatch, dirty
-    /// version, a migration that RAISEd, ...).
+    /// version, a migration that RAISEd, ...), or taking sqlx's migration lock
+    /// failed.
     Migrate(sqlx::migrate::MigrateError),
-    /// The database has applied migrations this binary does not embed. Nothing
-    /// was applied.
+    /// The database has applied migrations above this binary's head. When
+    /// raised before the run, nothing was applied.
     DbAheadOfBinary {
         db_head: i64,
         binary_head: i64,
@@ -185,9 +217,13 @@ pub struct MigrationReport {
     pub db_head_before: Option<i64>,
     /// Database head after this run. Always `>= binary_head` on success.
     pub db_head: i64,
-    /// Migrations this run applied.
+    /// Embedded migrations this run applied. Read under sqlx's migration lock
+    /// and restricted to the embedded set, so another migrator's rows are not
+    /// counted.
     pub applied_this_run: usize,
-    /// The database was ahead of the binary and the caller opted in.
+    /// The database is ahead of the binary. Only ever `true` when the caller
+    /// set [`MigrateOptions::allow_db_ahead`]; a strict run returns
+    /// [`MigrationError::DbAheadOfBinary`] instead.
     pub db_ahead: bool,
 }
 
@@ -205,9 +241,7 @@ impl fmt::Display for MigrationReport {
     }
 }
 
-/// Gate evaluated BEFORE `Migrator::run`: refuse a database ahead of the
-/// binary unless `opts.allow_db_ahead`.
-pub fn check_before_run(heads: &SchemaHeads, opts: MigrateOptions) -> Result<(), MigrationError> {
+fn refuse_ahead(heads: &SchemaHeads, opts: MigrateOptions) -> Result<(), MigrationError> {
     match heads.db_head {
         Some(db_head) if heads.db_ahead() && !opts.allow_db_ahead => {
             Err(MigrationError::DbAheadOfBinary {
@@ -220,13 +254,23 @@ pub fn check_before_run(heads: &SchemaHeads, opts: MigrateOptions) -> Result<(),
     }
 }
 
-/// Gate evaluated AFTER `Migrator::run`: every embedded migration must be
+/// Gate evaluated BEFORE `Migrator::run`: refuse a database ahead of the
+/// binary unless `opts.allow_db_ahead`.
+pub fn check_before_run(heads: &SchemaHeads, opts: MigrateOptions) -> Result<(), MigrationError> {
+    refuse_ahead(heads, opts)
+}
+
+/// Gate evaluated AFTER `Migrator::run`: the database-ahead gate again (a
+/// strict run never reports success against a database ahead of it, whatever
+/// happened between the reads), then every embedded migration must be
 /// recorded as successfully applied.
 pub fn check_after_run(
     before: &SchemaHeads,
     after: &SchemaHeads,
     applied_this_run: usize,
+    opts: MigrateOptions,
 ) -> Result<MigrationReport, MigrationError> {
+    refuse_ahead(after, opts)?;
     match after.db_head {
         Some(db_head) if after.missing.is_empty() && db_head >= after.binary_head => {
             Ok(MigrationReport {
@@ -284,15 +328,15 @@ fn versions_of(migrator: &sqlx::migrate::Migrator) -> Vec<i64> {
 
 /// Versions recorded with `success = true`; empty when `_sqlx_migrations`
 /// does not exist yet (a fresh database).
-async fn applied_versions(pool: &epigraph_db::PgPool) -> Result<Vec<i64>, sqlx::Error> {
+async fn applied_versions(conn: &mut sqlx::PgConnection) -> Result<Vec<i64>, sqlx::Error> {
     let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     if !exists {
         return Ok(Vec::new());
     }
     sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
 }
 
@@ -300,14 +344,20 @@ async fn applied_versions(pool: &epigraph_db::PgPool) -> Result<Vec<i64>, sqlx::
 /// binary's head.
 ///
 /// Refuses (before applying anything) when the database is ahead of the
-/// binary, unless `opts.allow_db_ahead`; fails when, after running, any
-/// embedded migration is not recorded as applied. On success the returned
-/// [`MigrationReport`] names both heads — callers log it rather than a bare
-/// "ok".
+/// binary, unless `opts.allow_db_ahead`; fails when, after
+/// running, any embedded migration is not recorded as applied. On success the
+/// returned [`MigrationReport`] names both heads — callers log it rather than a
+/// bare "ok".
 ///
-/// The pre-run read is outside sqlx's advisory lock. A concurrent migrator can
-/// only move the head UP between that read and `run`, which the post-run check
-/// re-reads, so the race cannot produce a false success.
+/// **Locking.** The pre-run read, `Migrator::run` and the post-run read all
+/// happen on one dedicated connection that holds sqlx's migration advisory
+/// lock (the same key `Migrator::run` takes, which is re-entrant per session)
+/// for the whole sequence. A second lock-respecting migrator therefore cannot
+/// write `_sqlx_migrations` between the check and the run — the window the
+/// #492 review measured a strict head-59 run reporting success against a
+/// head-101 database through. The connection is detached from the pool and
+/// CLOSED on every exit path, which releases the lock even when sqlx's own
+/// `run` returns early on error without unlocking.
 pub async fn run_migrations(
     pool: &epigraph_db::PgPool,
     opts: MigrateOptions,
@@ -324,9 +374,31 @@ pub async fn run_migrator(
     pool: &epigraph_db::PgPool,
     opts: MigrateOptions,
 ) -> Result<MigrationReport, MigrationError> {
-    let embedded = versions_of(migrator);
+    // Detached: a connection holding a session-level advisory lock must never
+    // go back into the pool, where the next borrower would silently inherit it.
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(MigrationError::Query)?
+        .detach();
+    let result = run_locked(migrator, &mut conn, opts).await;
+    // Ending the session releases every advisory lock it holds, including the
+    // extra re-entrant hold sqlx's `run` leaves behind when it errors.
+    if let Err(e) = conn.close().await {
+        tracing::warn!(error = %e, "closing the migration connection failed");
+    }
+    result
+}
 
-    let applied_before = applied_versions(pool)
+async fn run_locked(
+    migrator: &sqlx::migrate::Migrator,
+    conn: &mut sqlx::PgConnection,
+    opts: MigrateOptions,
+) -> Result<MigrationReport, MigrationError> {
+    conn.lock().await.map_err(MigrationError::Migrate)?;
+
+    let embedded = versions_of(migrator);
+    let applied_before = applied_versions(conn)
         .await
         .map_err(MigrationError::Query)?;
     let before = compare_schema_heads(&applied_before, &embedded);
@@ -343,18 +415,26 @@ pub async fn run_migrator(
         );
     }
 
-    migrator.run(pool).await.map_err(MigrationError::Migrate)?;
+    // On THIS session, so sqlx's own `pg_advisory_lock` nests inside ours.
+    // `run_direct` rather than `run(&mut *conn)`: the latter makes this
+    // future fail "implementation of `Acquire` is not general enough" as soon
+    // as it must be `Send` (a `tokio::spawn`), which is the case sqlx added
+    // `run_direct` for. It is `#[doc(hidden)]` in sqlx 0.8.6 — pinned by
+    // Cargo.lock, so an upgrade that drops it fails to compile, not silently.
+    migrator
+        .run_direct(&mut *conn)
+        .await
+        .map_err(MigrationError::Migrate)?;
 
-    let applied_after = applied_versions(pool)
+    let applied_after = applied_versions(conn)
         .await
         .map_err(MigrationError::Query)?;
     let after = compare_schema_heads(&applied_after, &embedded);
-    let before_set: BTreeSet<i64> = applied_before.into_iter().collect();
-    let applied_this_run = applied_after
-        .iter()
-        .filter(|v| !before_set.contains(v))
-        .count();
-    check_after_run(&before, &after, applied_this_run)
+    let applied_this_run = newly_applied(&applied_before, &applied_after, &embedded);
+    let report = check_after_run(&before, &after, applied_this_run, opts)?;
+
+    conn.unlock().await.map_err(MigrationError::Migrate)?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -362,6 +442,12 @@ mod tests {
     use super::*;
 
     const EMBEDDED: &[i64] = &[1, 2, 3, 36, 37, 38, 59, 60, 101];
+    const STRICT: MigrateOptions = MigrateOptions {
+        allow_db_ahead: false,
+    };
+    const ALLOW: MigrateOptions = MigrateOptions {
+        allow_db_ahead: true,
+    };
 
     #[test]
     fn fresh_database_is_missing_everything_and_not_ahead() {
@@ -370,7 +456,7 @@ mod tests {
         assert_eq!(h.db_head, None);
         assert_eq!(h.missing, EMBEDDED.to_vec());
         assert!(!h.db_ahead());
-        check_before_run(&h, MigrateOptions::default()).expect("fresh DB is not ahead");
+        check_before_run(&h, STRICT).expect("fresh DB is not ahead");
     }
 
     #[test]
@@ -381,8 +467,8 @@ mod tests {
         let h = compare_schema_heads(&applied, EMBEDDED);
         assert!(h.missing.is_empty());
         assert!(!h.db_ahead(), "035 is below the head, not ahead: {h:?}");
-        check_before_run(&h, MigrateOptions::default()).expect("gap is tolerated");
-        let r = check_after_run(&h, &h, 0).expect("at head");
+        check_before_run(&h, STRICT).expect("gap is tolerated");
+        let r = check_after_run(&h, &h, 0, STRICT).expect("at head");
         assert_eq!((r.db_head, r.binary_head, r.db_ahead), (101, 101, false));
     }
 
@@ -394,7 +480,7 @@ mod tests {
         let before = compare_schema_heads(&[], EMBEDDED);
         let after = compare_schema_heads(&[1, 2, 3, 36, 37, 38, 59], EMBEDDED);
         assert_eq!(after.missing, vec![60, 101]);
-        let err = check_after_run(&before, &after, 7).expect_err("behind must fail");
+        let err = check_after_run(&before, &after, 7, STRICT).expect_err("behind must fail");
         match &err {
             MigrationError::DbBehindBinary {
                 db_head,
@@ -418,7 +504,7 @@ mod tests {
         let h = compare_schema_heads(&applied, EMBEDDED);
         assert_eq!(h.db_head, Some(101));
         assert!(matches!(
-            check_after_run(&h, &h, 0),
+            check_after_run(&h, &h, 0, STRICT),
             Err(MigrationError::DbBehindBinary { ref missing, .. }) if missing == &vec![60]
         ));
     }
@@ -429,7 +515,7 @@ mod tests {
         applied.extend([102, 107]);
         let h = compare_schema_heads(&applied, EMBEDDED);
         assert_eq!(h.ahead, vec![102, 107]);
-        let err = check_before_run(&h, MigrateOptions::default()).expect_err("must refuse");
+        let err = check_before_run(&h, STRICT).expect_err("must refuse");
         let msg = err.to_string();
         for needle in [
             "107",
@@ -446,21 +532,43 @@ mod tests {
     }
 
     #[test]
+    fn database_ahead_after_the_run_is_refused_on_a_strict_run() {
+        // Review finding 1: the after-run gate used to ignore `opts` and
+        // report `db_ahead: true` as success. Strict must refuse whenever the
+        // post-run read shows an unknown version, whatever the pre-run read saw.
+        let before = compare_schema_heads(EMBEDDED, EMBEDDED);
+        let mut applied = EMBEDDED.to_vec();
+        applied.push(102);
+        let after = compare_schema_heads(&applied, EMBEDDED);
+        assert!(matches!(
+            check_after_run(&before, &after, 0, STRICT),
+            Err(MigrationError::DbAheadOfBinary { ref ahead, .. }) if ahead == &vec![102]
+        ));
+        let r = check_after_run(&before, &after, 0, ALLOW).expect("opt-in reports");
+        assert!(r.db_ahead && r.to_string().contains("db_ahead_of_binary=allowed"));
+    }
+
+    #[test]
     fn database_ahead_proceeds_when_opted_in_and_is_reported() {
         let mut applied = EMBEDDED.to_vec();
         applied.push(102);
         let h = compare_schema_heads(&applied, EMBEDDED);
-        check_before_run(
-            &h,
-            MigrateOptions {
-                allow_db_ahead: true,
-            },
-        )
-        .expect("opt-in proceeds");
-        let r = check_after_run(&h, &h, 0).expect("not behind");
+        check_before_run(&h, ALLOW).expect("opt-in proceeds");
+        let r = check_after_run(&h, &h, 0, ALLOW).expect("not behind");
         assert!(r.db_ahead);
         assert_eq!((r.db_head, r.binary_head), (102, 101));
         assert!(r.to_string().contains("db_ahead_of_binary=allowed"));
+    }
+
+    #[test]
+    fn newly_applied_counts_only_embedded_versions_that_were_absent() {
+        // Review finding 4: a row another build wrote (102, 95) or that was
+        // already there (1, 2) is not a migration this run applied.
+        let before = [1, 2, 35];
+        let after = [1, 2, 3, 35, 36, 95, 102];
+        assert_eq!(newly_applied(&before, &after, EMBEDDED), 2); // 3 and 36
+        assert_eq!(newly_applied(&after, &after, EMBEDDED), 0);
+        assert_eq!(newly_applied(&[], EMBEDDED, EMBEDDED), EMBEDDED.len());
     }
 
     #[test]

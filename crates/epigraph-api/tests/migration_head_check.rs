@@ -299,3 +299,191 @@ async fn binary_refuses_a_database_ahead_and_honours_both_opt_ins(pool: PgPool) 
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Review findings on the first cut (Refs #492)
+//
+// These arms use only the API the first cut already had
+// (`run_migrator` / `run_migrations` / `MigrationError::DbAheadOfBinary { .. }`
+// / the report's existing fields), so restoring the first cut's `migrate.rs`
+// makes them FAIL rather than stop compiling.
+// ---------------------------------------------------------------------------
+
+use sqlx::migrate::Migrate;
+use sqlx::Connection;
+use std::time::Duration;
+
+/// The seed head for the race arms: below [`STALE_HEAD`], so the stale run
+/// has real work (`SEED_HEAD+1 ..= STALE_HEAD`) that a refusal must prevent.
+const SEED_HEAD: i64 = 50;
+
+/// A connection OUTSIDE `pool`, so a lock leaked onto one of the pool's
+/// connections cannot be re-entered by accident.
+async fn fresh_connection(pool: &PgPool) -> sqlx::PgConnection {
+    sqlx::PgConnection::connect(&database_url_for(pool).await)
+        .await
+        .expect("open a connection outside the pool")
+}
+
+/// Block until some session in this database is WAITING for an advisory lock
+/// (sqlx's migration lock is the only one these tests take). Hard timeout, so
+/// a regression fails instead of hanging.
+async fn wait_for_blocked_advisory_lock(pool: &PgPool) {
+    for _ in 0..600 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pg_locks \
+             WHERE locktype = 'advisory' AND NOT granted \
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the migrator never blocked on the advisory lock");
+}
+
+/// Fixture for review findings 1 and 4: seed to [`SEED_HEAD`], hold sqlx's
+/// migration lock, start a stale head-[`STALE_HEAD`] run, and while it waits
+/// record a migration a NEWER build applied (`binary_head() + 1`). Returns
+/// the run's result and the version recorded.
+async fn race_stale_run_against_newer_migrator(
+    pool: &PgPool,
+    opts: MigrateOptions,
+) -> (
+    Result<epigraph_api::migrate::MigrationReport, MigrationError>,
+    i64,
+) {
+    run_migrator(&stale_migrator(SEED_HEAD), pool, STRICT)
+        .await
+        .expect("seed");
+
+    let mut holder = fresh_connection(pool).await;
+    holder.lock().await.expect("hold the migration lock");
+
+    let task_pool = pool.clone();
+    let run =
+        tokio::spawn(
+            async move { run_migrator(&stale_migrator(STALE_HEAD), &task_pool, opts).await },
+        );
+    wait_for_blocked_advisory_lock(pool).await;
+
+    let future = binary_head() + 1;
+    record_future_migration(pool, future).await;
+    holder.unlock().await.expect("release the migration lock");
+
+    let result = tokio::time::timeout(Duration::from_secs(300), run)
+        .await
+        .expect("the stale run did not finish")
+        .expect("the stale run panicked");
+    (result, future)
+}
+
+#[sqlx::test(migrations = false)]
+async fn strict_run_racing_a_newer_migrator_is_refused_before_applying_anything(pool: PgPool) {
+    let (result, future) = race_stale_run_against_newer_migrator(&pool, STRICT).await;
+    // The first cut read heads OUTSIDE the lock, saw 50, then applied 51..=59
+    // and returned Ok with db_ahead=true on this strict run.
+    assert!(
+        matches!(result, Err(MigrationError::DbAheadOfBinary { .. })),
+        "a strict run must never succeed against a database ahead of it: {result:?}"
+    );
+    let msg = result.expect_err("checked above").to_string();
+    assert!(msg.contains(&future.to_string()), "{msg}");
+
+    // Refused BEFORE running: nothing above the seed except the newer row.
+    let applied = successful_versions(&pool).await;
+    assert!(
+        applied.iter().all(|v| *v <= SEED_HEAD || *v == future),
+        "the refused run applied migrations: {applied:?}"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn opted_in_run_racing_a_newer_migrator_counts_only_its_own_migrations(pool: PgPool) {
+    let (result, future) = race_stale_run_against_newer_migrator(&pool, ALLOW_AHEAD).await;
+    let r = result.expect("the opt-in proceeds");
+    assert!(r.db_ahead);
+    assert_eq!(r.db_head, future);
+    // This run applied SEED_HEAD+1..=STALE_HEAD and nothing else; the row the
+    // newer build wrote is not its migration. The first cut counted it too.
+    let own = embedded_migration_versions()
+        .into_iter()
+        .filter(|v| *v > SEED_HEAD && *v <= STALE_HEAD)
+        .count();
+    assert!(
+        own > 0,
+        "fixture has nothing between {SEED_HEAD} and {STALE_HEAD}"
+    );
+    assert_eq!(
+        r.applied_this_run, own,
+        "applied_this_run must count only this run's own migrations"
+    );
+    assert_eq!(
+        r.db_head_before,
+        Some(future),
+        "the pre-run read must happen under the lock"
+    );
+}
+
+/// Is every advisory lock in this database released? Polls for up to 500 ms,
+/// because a closed session's backend drops its locks asynchronously.
+///
+/// Why `pg_locks` and not "can a fresh connection take the lock": the
+/// `#[sqlx::test]` pool closes idle connections after 1 s (sqlx-postgres
+/// 0.8.6 `testing/mod.rs`, `idle_timeout`), so a lock leaked onto an idle
+/// pooled connection vanishes on its own before a blocking probe times out.
+/// Measured: a blocking-probe version of this check did NOT see a
+/// deliberately leaked pooled lock. A production pool idles for minutes.
+async fn advisory_locks_released(pool: &PgPool) -> bool {
+    for _ in 0..10 {
+        let held: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pg_locks \
+             WHERE locktype = 'advisory' AND granted \
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_locks");
+        if held == 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[sqlx::test(migrations = false)]
+async fn migration_lock_is_released_after_a_refusal_and_after_a_sqlx_error(pool: PgPool) {
+    // Refusal path.
+    run_migrator(&stale_migrator(STALE_HEAD), &pool, STRICT)
+        .await
+        .expect("seed");
+    record_future_migration(&pool, binary_head() + 1).await;
+    epigraph_api::run_migrations(&pool, STRICT)
+        .await
+        .expect_err("refused");
+    assert!(
+        advisory_locks_released(&pool).await,
+        "a refusal left the migration lock held"
+    );
+
+    // sqlx error path: `Migrator::run` returns early WITHOUT unlocking on a
+    // checksum mismatch, so a connection that goes back to the pool keeps the
+    // lock for as long as it idles there.
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x00'::bytea WHERE version = 1")
+        .execute(&pool)
+        .await
+        .expect("corrupt a checksum");
+    let err = epigraph_api::run_migrations(&pool, ALLOW_AHEAD)
+        .await
+        .expect_err("checksum mismatch must fail");
+    assert!(matches!(err, MigrationError::Migrate(_)), "{err:?}");
+    assert!(
+        advisory_locks_released(&pool).await,
+        "a failed sqlx run left the migration lock held on a pooled connection"
+    );
+}
