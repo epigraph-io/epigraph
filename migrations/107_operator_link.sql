@@ -303,9 +303,24 @@
 --     group: a row made before the retire would otherwise survive it, and
 --     review measured the retired identity writing a claim owned by the
 --     operator's group through it. The check runs under row locks on the
---     agent's membership rows and on the group row, so no such row can be
---     inserted or promoted between the check and the commit; migration 109's
---     trigger refuses one being added afterwards. EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
+--     agent's membership rows and on the group row. Those locks close two
+--     concurrent orders: an UPDATE promoting or reviving the agent's existing
+--     row (it waits on the row lock, then the check sees it), and an INSERT
+--     whose foreign-key check reached the group row first (the retire waits
+--     for it to commit, then sees the row). Migration 109's trigger refuses a
+--     row added after the retire commits.
+--
+--     RESIDUAL, REASONED AND NOT MEASURED: an app INSERT whose 109 BEFORE
+--     trigger runs while the retire is still uncommitted (so it sees no retired
+--     row) and whose end-of-statement foreign-key check then waits on the
+--     retire's group-row lock proceeds once the retire commits: the retire's
+--     check could not see the uncommitted row, and the trigger has already
+--     passed. That window is one statement wide, needs an operator enrolling
+--     the very agent being retired at the same moment, and ends with a live
+--     writer row beside a retired link, which a re-run of the retire refuses
+--     loudly (the live writer/admin check above) and a revoke ends.
+--
+-- EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
 -- two preludes are deliberately written out twice rather than shared through a
 -- third definer, so each function can be reviewed on its own page; both are
 -- exercised by `operator_link.rs`.
@@ -780,9 +795,10 @@ BEGIN
     -- that row. Refused, not revoked here: revoking is the operator's decision
     -- and has its own last-admin rules. Locked first, in the order every
     -- roster writer takes them (the agent's rows in the group, then the
-    -- `groups` row, whose FOR UPDATE also blocks a concurrent membership
-    -- INSERT's foreign-key share lock), so no row can appear or be promoted
-    -- between this check and the commit.
+    -- `groups` row, whose FOR UPDATE also conflicts with a concurrent
+    -- membership INSERT's foreign-key share lock). That closes a concurrent
+    -- promotion and an INSERT whose foreign-key check got there first; one
+    -- trigger-first INSERT order remains open (section 7's RESIDUAL).
     PERFORM 1 FROM public.group_memberships m
      WHERE m.group_id = v_group AND m.agent_id = p_agent
        FOR UPDATE;
