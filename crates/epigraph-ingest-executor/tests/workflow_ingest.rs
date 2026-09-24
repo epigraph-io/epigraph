@@ -88,9 +88,13 @@ async fn execute_is_idempotent(pool: PgPool) {
     let extraction = build_minimal_workflow_extraction("executor-idempotent-test");
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
 
-    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("first call");
+    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("first call");
     assert!(
         !r1.already_ingested,
         "first ingest should not short-circuit"
@@ -101,9 +105,13 @@ async fn execute_is_idempotent(pool: PgPool) {
         "first ingest should write executes edges"
     );
 
-    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("second call");
+    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("second call");
     assert!(
         r2.already_ingested,
         "second ingest should hit the idempotency gate"
@@ -145,9 +153,13 @@ async fn execute_smoke(pool: PgPool) {
     let extraction = build_minimal_workflow_extraction("executor-smoke-test");
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
 
-    let r = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("ingest must succeed");
+    let r = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("ingest must succeed");
 
     assert!(!r.already_ingested);
     assert!(
@@ -180,7 +192,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     let parent_extraction = build_minimal_workflow_extraction("parent_workflow_v1");
     let parent_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&parent_extraction);
     let parent = epigraph_ingest_executor::execute_workflow_ingest_plan(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &parent_plan,
         &parent_extraction,
     )
@@ -191,7 +203,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     let variant_extraction = build_workflow_with_parent("variant_v1", "parent_workflow_v1");
     let variant_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&variant_extraction);
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &variant_plan,
         &variant_extraction,
     )
@@ -219,7 +231,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
 
     // Step 4: re-ingest must be idempotent — still exactly one edge.
     let _result2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &variant_plan,
         &variant_extraction,
     )
@@ -274,9 +286,13 @@ async fn a_kind_with_shell_syntax_costs_its_label_not_the_whole_ingest(pool: PgP
         victim.id
     };
 
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("one unusable kind label must not abort the whole workflow ingest");
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("one unusable kind label must not abort the whole workflow ingest");
 
     assert_eq!(
         result.claims_ingested, planned_count,

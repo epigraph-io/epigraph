@@ -139,8 +139,26 @@ pub async fn recompute_beliefs(
             .next()
             .expect("frames is non-empty: checked above");
         let mut wrote_any = false;
-        match epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id)
-            .await
+        // UNSTAMPED, and deliberately so: `recompute_beliefs` is one of the three
+        // MAINTENANCE tools, hard-gated off by
+        // `maintenance.rs::maintenance_tools_run_on_the_maintenance_connection()
+        // == false`, and its target is the MAINTENANCE connection rather than a
+        // stamped one — a bulk recompute is authored by nobody, so there is no
+        // author whose viewer could stamp it. Converting the three tools' query
+        // plumbing is PR-17. The `&mut *` below is a mechanical consequence of the
+        // engine signature change and moves N pool checkouts onto ONE connection;
+        // it changes no tenancy context, because the connection carries none.
+        let mut conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, "recompute skipped: {e}");
+                continue;
+            }
+        };
+        match epigraph_engine::edge_factor::recompute_claim_cached_belief(
+            &mut conn, viewer, claim_id,
+        )
+        .await
         {
             Ok(true) => {
                 frame_writes += 1;

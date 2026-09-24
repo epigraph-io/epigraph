@@ -1575,7 +1575,11 @@ async fn recall_with_context_writes_its_own_audit_row(pool: PgPool) {
     let para =
         diverse_fixture::seed_paragraph(&pool, agent, paper, "audited para", &pgvec, None).await;
 
-    let server = build_test_server(pool.clone());
+    // WITH a `ScopedPool`: the audit owner is read on a transaction stamped from
+    // the principal's own viewer and never minted (#493); without one the row
+    // is dropped. See `recall_audit_wiring.rs::build_test_server`.
+    let server =
+        build_test_server(pool.clone()).with_scoped_pool(viewerfx::scoped_pool(&pool).await);
     let result = recall_with_context_with_pgvec(
         &server,
         &viewer,

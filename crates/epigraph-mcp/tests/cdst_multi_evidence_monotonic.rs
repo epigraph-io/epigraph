@@ -70,9 +70,12 @@ async fn add_evidence(
 /// Seed the binary frame and return its id (creates it if absent).
 async fn get_or_create_binary_frame(pool: &PgPool) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
-    epigraph_mcp::tools::ds_auto::ensure_binary_frame(pool, &viewer)
-        .await
-        .expect("ensure_binary_frame")
+    epigraph_mcp::tools::ds_auto::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("ensure_binary_frame")
 }
 
 /// Insert a legacy mixed-format BBA directly into mass_functions.
@@ -199,7 +202,7 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .await;
 
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         &[
             BatchDsEntry {
@@ -276,7 +279,7 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
     let claim_id = seed_claim(&pool, "1c1360bb variant-2opp regression claim", 0.5).await;
 
     let (_frame_id, _wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         &[
             BatchDsEntry {

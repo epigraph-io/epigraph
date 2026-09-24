@@ -24,11 +24,9 @@ use crate::system_agent::get_or_create_system_agent;
 /// `kind` is MACHINE-DERIVED — it is `planned.properties["kind"]`, i.e. whatever
 /// the extraction LLM emitted — not a value a caller typed. Since backlog
 /// f6310444, `ClaimRepository::create_with_id_if_absent` refuses any label
-/// containing `$`, and this executor walks a whole plan on a shared pool with no
-/// enclosing transaction. Passing such a `kind` straight through would therefore
-/// abort the ENTIRE workflow ingest at the first offending claim (e.g. a plan
-/// emitting `kind = "cost_$_per_unit"`), leaving the claims already inserted
-/// behind as a partial ingest, to punish the caller for one cosmetic label on
+/// containing `$`. Passing such a `kind` straight through would therefore abort
+/// the ENTIRE workflow ingest at the first offending claim (e.g. a plan emitting
+/// `kind = "cost_$_per_unit"`), to punish the caller for one cosmetic label on
 /// one node.
 ///
 /// So the machine-derived label is DROPPED with a warning rather than escalated
@@ -36,6 +34,14 @@ use crate::system_agent::get_or_create_system_agent;
 /// can reach `claims.labels` from any path — while confining the blast radius of
 /// bad LLM output to the label it affects. The `claim` label, which is what the
 /// structural queries filter on, always survives.
+///
+/// One half of the original argument has since dissolved and is recorded rather
+/// than deleted: this used to say the abort left "the claims already inserted
+/// behind as a partial ingest", because the walk ran on a shared pool with no
+/// enclosing transaction. It now runs inside the caller's transaction, so an
+/// abort leaves nothing behind. The trade is still worth making — a whole
+/// document's ingest lost to one cosmetic label is the wrong price — but it is
+/// now "fails cleanly" rather than "fails dirty".
 ///
 /// Note the asymmetry with the caller-supplied paths (`submit_claim`, `memorize`,
 /// HTTP `POST /claims`), which REFUSE the write outright: there the caller can
@@ -160,8 +166,33 @@ pub struct WorkflowIngestExecutionResult {
 /// inserts the workflow row, ensures author and system agents, persists each
 /// planned claim with dedup, writes `workflow —executes→ claim` edges, and
 /// emits the intra-claim plan edges.
+///
+/// # This takes a CONNECTION, and the caller must have stamped it
+///
+/// Every row below is owned by the `workflow-ingest-system` agent's personal
+/// group (see `decl`), and migration 077's `WITH CHECK` on `claims` and `edges`
+/// asks about the ROW's owner group. On the unstamped pool this whole function
+/// was refused on a cleanly-migrated schema — `new row violates row-level
+/// security policy for table "claims"`, the refusal that made `store_workflow`
+/// entirely unavailable. Callers resolve
+/// [`crate::system_agent::system_agent_write_authority`] and pass
+/// `&mut *ScopedPool::begin_as(&authority.viewer)`; see that function for the
+/// measurement of which identity the stamp must be.
+///
+/// # And it must be a TRANSACTION, not just a connection
+///
+/// This walk previously ran statement-by-statement on a shared pool with no
+/// enclosing transaction (the note on [`labels_for_planned_kind`] says so in as
+/// many words), so a refusal partway through left the `workflows` row, the
+/// claims inserted so far and their `executes` edges behind as a partial ingest.
+/// Handed `&mut *tx` every statement here is one unit: the ingest either lands
+/// or leaves nothing. That is safe to retry precisely because every write is
+/// keyed on a DETERMINISTIC id with an `ON CONFLICT` clause — `insert_root` on
+/// `(canonical_name, generation)`, `create_with_id_if_absent` on `(id)`,
+/// `create_if_not_exists` on the edge triple — so a re-run after a rollback
+/// converges rather than accumulating rows.
 pub async fn execute_workflow_ingest_plan(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
@@ -194,14 +225,14 @@ pub async fn execute_workflow_ingest_plan(
 
     // ── 1. Idempotency gate: skip if workflow row already processed ──────
     if let Some(existing_id) =
-        WorkflowRepository::find_root_by_canonical(pool, canonical_name, generation).await?
+        WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation).await?
     {
         let edge_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM edges \
              WHERE source_id = $1 AND source_type = 'workflow' AND relationship = 'executes'",
         )
         .bind(existing_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         if edge_count > 0 {
@@ -223,17 +254,18 @@ pub async fn execute_workflow_ingest_plan(
     }
 
     // ── 2. Ensure system agent ───────────────────────────────────────────
-    let system_agent_id = get_or_create_system_agent(pool).await?;
+    let system_agent_id = get_or_create_system_agent(&mut *conn).await?;
 
     // ── 3. Insert workflow row (idempotent) ──────────────────────────────
     let parent_id = if let Some(ref pcn) = extraction.source.parent_canonical_name {
-        WorkflowRepository::find_root_by_canonical(pool, pcn, generation.saturating_sub(1)).await?
+        WorkflowRepository::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1))
+            .await?
     } else {
         None
     };
 
     WorkflowRepository::insert_root(
-        pool,
+        &mut *conn,
         workflow_id,
         canonical_name,
         generation,
@@ -251,8 +283,8 @@ pub async fn execute_workflow_ingest_plan(
     // can still see the lineage. Idempotent on re-ingest via
     // create_if_not_exists.
     let variant_of_edge_created = if let Some(parent_id_uuid) = parent_id {
-        EdgeRepository::create_if_not_exists(
-            pool,
+        EdgeRepository::create_if_not_exists_conn(
+            &mut *conn,
             workflow_id,
             "workflow",
             parent_id_uuid,
@@ -277,14 +309,14 @@ pub async fn execute_workflow_ingest_plan(
         let (_did, pub_key_bytes) =
             epigraph_crypto::did_key::did_key_for_author(None, &author.name);
         let agent_uuid: Uuid = if let Some(existing) =
-            AgentRepository::get_by_public_key(pool, &pub_key_bytes)
+            AgentRepository::get_by_public_key(&mut *conn, &pub_key_bytes)
                 .await
                 .map_err(|e| IngestExecutorError::AgentCreation(format!("author lookup: {e}")))?
         {
             existing.id.into()
         } else {
             let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create(pool, &author_agent)
+            let created = AgentRepository::create_conn(&mut *conn, &author_agent)
                 .await
                 .map_err(|e| IngestExecutorError::AgentCreation(format!("author create: {e}")))?;
             created.id.into()
@@ -305,7 +337,7 @@ pub async fn execute_workflow_ingest_plan(
     // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
     // instance-wide workflow content -- so the system agent's own group is the
     // declaration, publicly visible.
-    let decl = ClaimRepository::default_decl_for_author_pool(pool, system_agent_id).await?;
+    let decl = ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?;
 
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
@@ -320,8 +352,8 @@ pub async fn execute_workflow_ingest_plan(
             .unwrap_or("workflow_claim");
         let labels = labels_for_planned_kind(kind);
 
-        let was_new = ClaimRepository::create_with_id_if_absent(
-            pool,
+        let was_new = ClaimRepository::create_with_id_if_absent_conn(
+            &mut *conn,
             planned.id,
             &planned.content,
             &planned.content_hash,
@@ -364,7 +396,7 @@ pub async fn execute_workflow_ingest_plan(
                 .bind(&properties)
                 .bind(lineage_uuid)
                 .bind(planned.id)
-                .execute(pool)
+                .execute(&mut *conn)
                 .await?;
             claims_ingested += 1;
             inserted.push((planned.id, planned.content.clone()));
@@ -376,16 +408,59 @@ pub async fn execute_workflow_ingest_plan(
     }
 
     // ── 6. workflow —executes→ claim edges ──────────────────────────────
+    //
+    // `plan_index` IS LOAD-BEARING AND IT IS NEW. Every reader that maps a
+    // hierarchical workflow's steps to "plan order" ordered by `e.created_at
+    // ASC, c.id ASC`, and that worked only because each edge was inserted on its
+    // OWN pool checkout and so got its own `NOW()`. The readers, all now keyed on
+    // this ordinal with `created_at` as the fallback:
+    //
+    // * `WorkflowRepository::resolve_steps_to_heads`, `::resolve_steps_to_heads_batched`
+    //   and `::step_texts_for_hierarchical` (`epigraph-db/src/repos/workflow.rs`);
+    // * the two `report_hierarchical_outcome` handlers that turn a caller's
+    //   `step_index` into a `behavioral_executions.step_claim_id` —
+    //   `epigraph-mcp/src/tools/workflow_hierarchical.rs` and
+    //   `epigraph-api/src/routes/workflows.rs`;
+    // * `workflow_steps::find_phase` and `workflow_steps::ordered_steps`'s
+    //   fallback ordering in this crate.
+    //
+    // The first revision of this comment claimed "every reader" after moving
+    // only two of them. The report handlers were among those left behind, and
+    // they failed SILENTLY: MEASURED on the real binary as `epigraph_app`, a
+    // 6-step workflow reported with step_index 0..5 attached 4 of the 6
+    // `behavioral_executions` rows to the WRONG step claim, on both schema
+    // configurations, with `isError: false`.
+    // `epigraph-mcp/tests/plan_order_under_one_transaction.rs` pins it.
+    //
+    // `claims.created_at` ties the same way — every claim in the plan is written
+    // in this transaction — so a reader choosing among a workflow's claims by
+    // `c.created_at` needs this ordinal too, not just the edge readers.
+    //
+    // Inside one transaction `NOW()` is TRANSACTION-start time in PostgreSQL, so
+    // every edge in a plan shares it exactly, the tiebreak falls through to
+    // `c.id ASC` — a content-derived UUID — and the steps come back in an
+    // arbitrary order. MEASURED, not anticipated:
+    // `find_workflow_union_hierarchical_test::find_workflow_returns_a_workflow_that_store_workflow_created`
+    // failed with `["record the outcome", "recall recent theme claims", "cluster
+    // without wipe_first"]` against a plan that ordered them the other way round.
+    //
+    // So the ordinal is recorded explicitly instead of being inferred from a
+    // timestamp. That is strictly more robust than what it replaces: a
+    // `created_at` tiebreak was already fragile for two edges written inside the
+    // same clock tick, which is why `c.id ASC` was there at all.
     let mut executes_edges = 0_usize;
-    for planned in &plan.claims {
-        let (_row, _was_created) = EdgeRepository::create_if_not_exists(
-            pool,
+    for (plan_index, planned) in plan.claims.iter().enumerate() {
+        let (_row, _was_created) = EdgeRepository::create_if_not_exists_conn(
+            &mut *conn,
             workflow_id,
             "workflow",
             planned.id,
             "claim",
             "executes",
-            Some(serde_json::json!({"level": planned.level})),
+            Some(serde_json::json!({
+                "level": planned.level,
+                "plan_index": plan_index,
+            })),
             None,
             None,
         )
@@ -415,8 +490,8 @@ pub async fn execute_workflow_ingest_plan(
             .copied()
             .unwrap_or(edge.target_id);
 
-        let (row, was_created) = EdgeRepository::create_if_not_exists(
-            pool,
+        let (row, was_created) = EdgeRepository::create_if_not_exists_conn(
+            &mut *conn,
             src,
             &src_type,
             tgt,

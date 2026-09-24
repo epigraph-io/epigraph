@@ -66,7 +66,11 @@ async fn store(
 /// deployment with a dead embedder also lands in.
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_workflow_returns_a_workflow_that_store_workflow_created(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    // `store_workflow` now REFUSES rather than falling back to the unstamped pool, so
+    // this fixture needs the scoped variant. A plain `build_test_server` here fails
+    // with "this MCP server was not built from a ScopedPool", which is the conversion
+    // working: a write that cannot be stamped is not attempted.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let viewer = fixture::public_viewer(&pool).await;
     let goal = format!("cumulative theme maintenance probe {}", Uuid::new_v4());
     let steps = [
@@ -129,7 +133,11 @@ async fn find_workflow_returns_a_workflow_that_store_workflow_created(pool: PgPo
 /// `wipe_first=true` and destroyed 76 themes.
 #[sqlx::test(migrations = "../../migrations")]
 async fn hierarchical_workflow_with_no_steps_is_withheld(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    // `store_workflow` now REFUSES rather than falling back to the unstamped pool, so
+    // this fixture needs the scoped variant. A plain `build_test_server` here fails
+    // with "this MCP server was not built from a ScopedPool", which is the conversion
+    // working: a write that cannot be stamped is not attempted.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let viewer = fixture::public_viewer(&pool).await;
     let goal = format!("stepless hierarchical probe {}", Uuid::new_v4());
     let workflow_id = store(&server, &viewer, &goal, &[]).await;
@@ -195,7 +203,11 @@ async fn hierarchical_workflow_with_no_steps_is_withheld(pool: PgPool) {
 /// must put the hierarchical row first.
 #[sqlx::test(migrations = "../../migrations")]
 async fn closer_hierarchical_workflow_outranks_a_distant_flat_claim(pool: PgPool) {
-    let server = build_test_server(pool.clone());
+    // `store_workflow` now REFUSES rather than falling back to the unstamped pool, so
+    // this fixture needs the scoped variant. A plain `build_test_server` here fails
+    // with "this MCP server was not built from a ScopedPool", which is the conversion
+    // working: a write that cannot be stamped is not attempted.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let viewer = fixture::public_viewer(&pool).await;
     let query_pgvec = axis_pgvec_1536(0);
 

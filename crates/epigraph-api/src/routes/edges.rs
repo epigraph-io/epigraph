@@ -329,8 +329,21 @@ async fn trigger_edge_ds_recomputation(
         return Ok(()); // source claim doesn't exist — skip silently
     };
 
+    // STILL UNSTAMPED. This is the HTTP twin of MCP `link_epistemic`, which WAS
+    // stamped in this change, and the asymmetry is deliberate rather than an
+    // omission: `epigraph-api`'s request path is converted shard by shard under
+    // `epigraph-db/tests/no_unscoped_pool.rs`, which counts `routes/edges.rs` at 7
+    // unconverted sites and requires a shard to lower its own row. Converting one
+    // site here out of band would lower that row for a handler whose other six
+    // sites still reach the raw pool, which is the "looks converted" shape this
+    // programme has already paid for. The acquire below is mechanical: it moves N
+    // pool checkouts onto ONE connection, which is what makes the per-edge
+    // savepoint inside the helper meaningful, and carries no tenancy context.
+    let mut wire_conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: format!("edge auto-wire: could not acquire: {e}"),
+    })?;
     let outcome = auto_wire_edge_if_epistemic(
-        pool,
+        &mut wire_conn,
         viewer,
         was_created,
         edge_id,
@@ -463,19 +476,27 @@ async fn recompute_claim_belief(
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<(), crate::errors::ApiError> {
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(pool, viewer, claim_id)
-        .await
-        .map(|recomputed| {
-            if recomputed {
-                tracing::info!(
-                    claim = %claim_id,
-                    "Dependent claim recomputed via 1-hop propagation"
-                );
-            }
-        })
-        .map_err(|e| crate::errors::ApiError::DatabaseError {
-            message: format!("Failed to recompute dependent claim belief: {e}"),
-        })
+    // Unstamped for the reason recorded above on `auto_wire_edge_if_epistemic`.
+    let mut recompute_conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: format!("belief recompute: could not acquire: {e}"),
+    })?;
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(
+        &mut recompute_conn,
+        viewer,
+        claim_id,
+    )
+    .await
+    .map(|recomputed| {
+        if recomputed {
+            tracing::info!(
+                claim = %claim_id,
+                "Dependent claim recomputed via 1-hop propagation"
+            );
+        }
+    })
+    .map_err(|e| crate::errors::ApiError::DatabaseError {
+        message: format!("Failed to recompute dependent claim belief: {e}"),
+    })
 }
 
 // =============================================================================

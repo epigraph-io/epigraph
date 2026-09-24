@@ -123,11 +123,12 @@ async fn viewer_resolve_reaches_the_authors_memberships_on_an_unstamped_app_sess
 /// the measurement that says why rather than leaving it to a comment nobody can
 /// check.
 ///
-/// `personal_group_of`'s doc states its read-first order as a SECURITY property:
-/// `epigraph_ensure_personal_group`'s membership statement is
+/// `personal_group_of`'s doc stated its read-first order as a SECURITY property:
+/// migration 077's `epigraph_ensure_personal_group` membership statement was
 /// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL,
-/// role = 'admin'`, so the mint path REVIVES a revoked membership, and the
-/// lookup is what keeps a write path from reaching it. That property holds only
+/// role = 'admin'`, so the mint path REVIVED a revoked membership, and the
+/// lookup was what kept a write path from reaching it. Migration 105 makes the
+/// mint refuse a revoked row instead; the second half below now pins that. That property holds only
 /// if the lookup can see the row. On an unstamped `epigraph_app` session it
 /// cannot: `groups_tenancy`'s USING is `bypass OR definer_bypass OR id =
 /// ANY(session_groups) OR created_by_agent_id = principal_id` (migration 077
@@ -188,11 +189,23 @@ async fn the_personal_group_lookup_is_blind_on_an_unstamped_app_session(pool: Pg
     .expect("count live memberships");
     assert_eq!(live_before, 0, "CALIBRATION: the revoke took effect");
 
-    sqlx::query_scalar::<_, uuid::Uuid>("SELECT public.epigraph_ensure_personal_group($1)")
-        .bind(author)
-        .fetch_one(&pool)
-        .await
-        .expect("re-mint the personal group the way the blind read's fallback would");
+    // Since migration 105 the mint REFUSES a revoked row (SQLSTATE RVK01)
+    // instead of reviving it. Before 105 this call succeeded and `live_after`
+    // below was 1 — the revival this arm used to pin as the reason the blind
+    // read must not reach a write path. The blind read is still blind (first
+    // half); what it can reach is no longer a revival.
+    let err =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT public.epigraph_ensure_personal_group($1)")
+            .bind(author)
+            .fetch_one(&pool)
+            .await
+            .expect_err("the blind read's fallback must now be refused, not revive");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))
+            .as_deref(),
+        Some(epigraph_db::PERSONAL_MEMBERSHIP_REVOKED)
+    );
     let live_after: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM group_memberships \
           WHERE agent_id = $1 AND group_id = $2 AND revoked_at IS NULL",
@@ -203,12 +216,10 @@ async fn the_personal_group_lookup_is_blind_on_an_unstamped_app_session(pool: Pg
     .await
     .expect("count live memberships");
     assert_eq!(
-        live_after, 1,
-        "the mint path is expected to REVIVE the revoked membership — that is why it must not \
-         be reachable from a write path. If this ever returns 0 the `ON CONFLICT … DO UPDATE SET \
-         revoked_at = NULL` was narrowed, and the argument in \
-         `epigraph-mcp/src/claim_helper.rs::begin_author_stamped_tx` needs revisiting rather \
-         than quietly becoming stale."
+        live_after, 0,
+        "the mint path must NOT revive the revoked membership (migration 105). If this ever \
+         returns 1 again the refusal was undone, and a blind read on a write path is once more \
+         a privilege restoration — see `epigraph-mcp/src/claim_helper.rs::begin_author_stamped_tx`."
     );
 }
 

@@ -20,10 +20,17 @@ use epigraph_mcp::tools::paper_queries::query_paper;
 use epigraph_mcp::types::QueryPaperParams;
 use sqlx::PgPool;
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built FROM A `ScopedPool`: the document ingest walk now runs in one
+/// transaction stamped from the ingesting agent and refuses (nothing written) on
+/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
+/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
+/// refusal.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
@@ -40,7 +47,7 @@ fn result_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     let doi = "10.48550/arXiv.2504.18085";
 
     // Simulate a crashed partial ingestion: the paper row and one claim exist,
@@ -104,7 +111,7 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn query_paper_reports_zero_for_unknown_doi(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
 
     let result = query_paper(
         &server,

@@ -19,3 +19,5 @@ dh.*
 # A local DSN file. The harness reads its credentials from the environment; if
 # you keep one here for convenience it must never be committed.
 dsn
+.uelock.*
+ueh.*

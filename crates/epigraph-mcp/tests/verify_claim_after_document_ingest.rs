@@ -43,10 +43,17 @@ const SECTION: &str = "Methods";
 const PARAGRAPH: &str = "Tips were functionalized under ultra-high vacuum before each run.";
 const ATOM: &str = "Tip functionalization occurred under ultra-high vacuum.";
 
-fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+/// Built FROM A `ScopedPool`: the document ingest walk now runs in one
+/// transaction stamped from the ingesting agent and refuses (nothing written) on
+/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
+/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
+/// refusal.
+async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
-    let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, false)
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 fn extraction() -> DocumentExtraction {
@@ -84,7 +91,7 @@ fn extraction() -> DocumentExtraction {
 #[sqlx::test(migrations = "../../migrations")]
 async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     do_ingest_document(&server, &viewer, &extraction())
         .await
         .expect("document ingests");
@@ -130,7 +137,7 @@ async fn freshly_ingested_spine_rows_are_not_accused_of_tampering(pool: PgPool) 
 #[sqlx::test(migrations = "../../migrations")]
 async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     do_ingest_document_spine(&server, &extraction())
         .await
         .expect("spine ingests");
@@ -162,7 +169,7 @@ async fn spine_ingest_rows_are_not_accused_of_tampering(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_tampered_spine_row_is_reported_undecided_not_clean(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone());
+    let server = make_server(pool.clone()).await;
     do_ingest_document_spine(&server, &extraction())
         .await
         .expect("spine ingests");

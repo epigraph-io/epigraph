@@ -72,7 +72,7 @@ async fn insert_claim_with_label(pool: &PgPool, agent: Uuid, content: &str, labe
 async fn wire_bba(pool: &PgPool, claim_id: Uuid, agent_id: Uuid) {
     let viewer = fixture::public_viewer(pool).await;
     tools::ds_auto::auto_wire_ds_update(
-        pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         claim_id,
         agent_id,
@@ -414,9 +414,12 @@ async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool:
             .fetch_one(&pool)
             .await
             .expect("belief_frame_id");
-    let binary = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
-        .await
-        .expect("ensure_binary_frame");
+    let binary = epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("ensure_binary_frame");
     assert_eq!(
         cached_frame,
         Some(binary),

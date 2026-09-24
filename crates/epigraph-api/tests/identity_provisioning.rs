@@ -725,15 +725,19 @@ async fn ensure_for_client_refuses_to_adopt_an_ed25519_squatter(pool: PgPool) {
     assert!(after.0.is_none());
 }
 
-/// `ensure_personal_group` must REVIVE a revoked epoch-0 membership.
+/// `ensure_personal_group` must NOT revive a revoked epoch-0 membership.
 ///
-/// The untargeted `ON CONFLICT DO NOTHING` it used to carry did not conflict on
-/// the partial index `group_memberships_one_live` (there is no live row) but did
-/// conflict on the composite `(group_id, agent_id, epoch)` UNIQUE — so the
-/// insert silently no-op'd and the agent had NO live membership in its own
-/// personal group, permanently, because every later mint hit the same conflict.
+/// This arm used to pin the opposite. Migration 077's body ended in `ON
+/// CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL, role =
+/// 'admin'`, and this test asserted the revival, on the argument that an
+/// untargeted `DO NOTHING` would leave the agent "with NO live membership in its
+/// own personal group, permanently". That permanence is the POINT when the row
+/// was revoked on purpose: an operator's revocation is not something a token
+/// mint, a recall or a new MCP session has standing to reverse, and three
+/// callers reached the revival from a blind read (F1, #493, #498). Migration 105
+/// refuses instead, with a named error; restoring the row is an operator action.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_revoked_personal_group_membership_is_revived(pool: PgPool) {
+async fn a_revoked_personal_group_membership_is_not_revived(pool: PgPool) {
     let key: [u8; 32] = *blake3::hash(b"personal-revive").as_bytes();
     let agent: (Uuid,) = sqlx::query_as(
         "INSERT INTO agents (public_key, display_name) VALUES ($1, 'p') RETURNING id",
@@ -756,25 +760,217 @@ async fn a_revoked_personal_group_membership_is_revived(pool: PgPool) {
         .unwrap();
 
     let again =
-        epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, agent.0)
-            .await
-            .expect("second call");
-    assert_eq!(again, group_id, "the personal group id is deterministic");
+        epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, agent.0).await;
+    assert!(
+        matches!(again, Err(epigraph_db::DbError::MembershipRevoked { .. })),
+        "a revoked membership must be refused by name, got {again:?}"
+    );
 
     let role = epigraph_db::GroupMembershipRepository::get_member_role(&pool, group_id, agent.0)
         .await
         .unwrap();
     assert_eq!(
-        role.as_deref(),
-        Some("admin"),
-        "the agent must hold a LIVE role='admin' membership in its own personal group"
+        role, None,
+        "the agent must hold NO live membership: still revoked"
     );
 
-    // Exactly one row: revived, not duplicated.
+    // Exactly one row: neither revived nor duplicated.
     let n: (i64,) = sqlx::query_as("SELECT count(*) FROM group_memberships WHERE group_id = $1")
         .bind(group_id)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(n.0, 1);
+}
+
+/// The token-mint caller of `ensure_personal_group`: an agent client whose real
+/// ed25519 agent row holds only a REVOKED personal membership.
+///
+/// `ensure_for_client` adopts that row and, as its last step, provisions the
+/// personal group. Migration 077's body revived the revocation there, on the
+/// cold path of the client's first mint. Now the step refuses by name, the
+/// caller's transaction is aborted, and the client is left UNLINKED — the token
+/// route maps the refusal to 403 (`oauth/token.rs::principal_agent_id`), and
+/// every later mint refuses the same way until an operator restores the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_first_mint_for_a_revoked_agent_is_refused_and_leaves_it_revoked(pool: PgPool) {
+    let pubkey: [u8; 32] = *blake3::hash(b"revoked-signer").as_bytes();
+    let real: (Uuid,) = sqlx::query_as(
+        "INSERT INTO agents (public_key, display_name, key_kind) \
+         VALUES ($1, 'revoked signer', 'ed25519') RETURNING id",
+    )
+    .bind(pubkey.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("seed ed25519 agent");
+    let mut conn = pool.acquire().await.unwrap();
+    let group =
+        epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, real.0)
+            .await
+            .expect("provision");
+    drop(conn);
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(real.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // `agents_must_have_owner`: an agent client needs an owning client row.
+    let owner: (Uuid,) = sqlx::query_as(
+        r#"INSERT INTO oauth_clients
+            (client_id, client_name, client_type, allowed_scopes, granted_scopes, status)
+           VALUES ('epigraph_owner_revoked', 'Owner', 'human', '{}', '{}', 'active') RETURNING id"#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed owner client");
+    let client: (Uuid,) = sqlx::query_as(
+        r#"INSERT INTO oauth_clients
+            (client_id, client_name, client_type, allowed_scopes, granted_scopes, status, owner_id)
+           VALUES ($1, 'revoked agent', 'agent', '{}', '{}', 'active', $2) RETURNING id"#,
+    )
+    .bind(hex::encode(pubkey))
+    .bind(owner.0)
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent client");
+
+    // The same shape as `principal_agent_id`: one transaction.
+    let mut tx = pool.begin().await.unwrap();
+    let res =
+        epigraph_db::repos::agent::AgentRepository::ensure_for_client(&mut tx, client.0).await;
+    drop(tx);
+    assert!(
+        matches!(res, Err(epigraph_db::DbError::MembershipRevoked { .. })),
+        "the first mint for a revoked agent must be refused by name, got {res:?}"
+    );
+
+    let live: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(real.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live.0, 0, "the revocation must stand");
+    let linked: (Option<Uuid>,) =
+        sqlx::query_as("SELECT agent_id FROM oauth_clients WHERE id = $1")
+            .bind(client.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        linked.0.is_none(),
+        "the refused mint must leave the client unlinked"
+    );
+
+    // And the HTTP mapping is a 403, not a 500.
+    let api: epigraph_api::errors::ApiError = epigraph_db::DbError::MembershipRevoked {
+        message: "x".to_string(),
+    }
+    .into();
+    assert!(
+        matches!(api, epigraph_api::errors::ApiError::Forbidden { .. }),
+        "a revoked membership is a denial, got {api:?}"
+    );
+}
+
+/// `POST /api/v1/submit/packet` by an author whose personal membership is
+/// REVOKED: a 403 that names neither the agent nor the group, nothing written,
+/// the revocation standing. The route builds its own `(StatusCode,
+/// ErrorResponse)` pairs, so `From<DbError>`'s 403 did not reach it. Before
+/// `submit.rs::author_tenancy_error` it answered 500 with migration 105's
+/// message, agent and group ids included, in the body (batch F review).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_author_packet_is_a_403_that_leaks_no_ids(pool: PgPool) {
+    let pubkey: [u8; 32] = *blake3::hash(b"revoked-packet-author").as_bytes();
+    let (author,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO agents (public_key, display_name, key_kind) \
+         VALUES ($1, 'revoked packet author', 'ed25519') RETURNING id",
+    )
+    .bind(pubkey.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("seed ed25519 agent");
+    let mut conn = pool.acquire().await.unwrap();
+    let group =
+        epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, author)
+            .await
+            .expect("provision");
+    drop(conn);
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(author)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let bearer = {
+        let cfg = epigraph_api::oauth::JwtConfig::from_secret(
+            std::env::var("EPIGRAPH_JWT_SECRET")
+                .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string())
+                .as_bytes(),
+        );
+        cfg.issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:write".to_string()],
+            "service",
+            None,
+            Some(author),
+            chrono::Duration::minutes(60),
+        )
+        .unwrap()
+        .0
+    };
+    let packet = json!({
+        "claim": {
+            "content": "a claim by a revoked author",
+            "initial_truth": 0.9,
+            "agent_id": author,
+        },
+        "evidence": [],
+        "reasoning_trace": {
+            "methodology": "inductive",
+            "inputs": [],
+            "confidence": 0.8,
+            "explanation": "revoked-author packet test",
+        },
+        "signature": "0".repeat(128),
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/submit/packet")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::from(packet.to_string()))
+        .unwrap();
+    let resp = app(pool.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a revoked author is a denial, not a server fault: {text}"
+    );
+    assert!(
+        !text.contains(&author.to_string()) && !text.contains(&group.to_string()),
+        "the body must not carry the agent or group id: {text}"
+    );
+    let (claims,): (i64,) = sqlx::query_as("SELECT count(*) FROM claims WHERE agent_id = $1")
+        .bind(author)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(claims, 0, "nothing may be written");
+    let (live,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM group_memberships WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(author)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "the revocation must stand");
 }

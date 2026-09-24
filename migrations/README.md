@@ -234,6 +234,63 @@ Current reservation:
   `100` was: it has never been applied to a deployed database — production is at
   59.
 
+- **102–104**: UNALLOCATED. Held on this line for the open branch
+  `feat/operator-scoped-ownership` while it carried `102`–`104`; that branch
+  renumbered them to `107`–`109` when `105`/`106` shipped (see "Why 107–109"
+  below). Nothing may be allocated here: a throwaway that ran the branch's
+  old files still carries these versions with different checksums.
+- **105**: public `personal_group_no_revival` (batch F; backlog F2 `af7c58d9`,
+  the root of F1 `da432f25`, #493 and #498's `system_agent_write_authority`
+  finding). `CREATE OR REPLACE` of migration 077's
+  `epigraph_ensure_personal_group(uuid) RETURNS uuid`, same signature: a LIVE
+  personal membership is returned with its role kept and nothing written; only
+  REVOKED rows (any epoch) RAISE SQLSTATE `RVK01`, which
+  `epigraph-db/src/errors.rs` maps to `DbError::MembershipRevoked`; no row of
+  any state provisions exactly as before. Before any of that, the group under
+  the canonical did_key must be the agent's own (`kind = 'personal'` and
+  `created_by_agent_id` = the agent), or it RAISEs SQLSTATE `RVK02`
+  (`DbError::PersonalGroupNotOwned`): a group another agent created under that
+  key is a squat, not a personal group. 077's body ended in `ON CONFLICT …
+  DO UPDATE SET revoked_at = NULL, role = 'admin'`, so every call revived a
+  revocation and promoted a demotion. Re-states 077's owner / `REVOKE … FROM
+  PUBLIC` / `GRANT EXECUTE … TO epigraph_app` block (idempotent). Pinned by
+  `epigraph-db/tests/personal_group_no_revival.rs` as `epigraph_app`. **No undo
+  runbook ships**: reversing it is re-running 077's function body, which
+  restores the defect; it creates and changes no rows. **No deploy
+  precondition.** **Claimed 2026-09-24.** **Applied to a throwaway database
+  only, NOT to any deployed database.**
+- **106**: public `community_membership_integrity` (batch F follow-on; F4a
+  `afb1cfaf`, F4b `7cdea6f1`). Two `SECURITY DEFINER` functions,
+  `epigraph_community_add_member(uuid, uuid, uuid)` and
+  `epigraph_community_remove_member(uuid, uuid, uuid)`, each of which takes the
+  community group's roster lock, then its `groups` row lock (which serialises
+  first joiners over an empty roster), decides under both, and writes — one
+  statement for `CommunityRepository`. Rules: add needs a LIVE member, except a
+  group that has NEVER had a membership row of any state (a group emptied by
+  removals does not re-open); a revoked row is restored at the requested
+  `reader` role, never its old one. Only a LIVE admin may restore a revoked
+  row (`'denied_readmit'` otherwise), so a live reader cannot undo an
+  eviction. Remove needs the perspective's owner
+  (leaving) or a LIVE admin (evicting), and never removes the last live admin
+  (`'last_admin'`, nothing written). The actor is `epigraph_principal_id()`
+  unless `epigraph_bypass()`; a mismatched `p_actor` is DENIED. The
+  `community_members` DELETE runs in the caller's statement, because
+  `epigraph_maintenance` holds no DELETE (070). Owner `epigraph_maintenance`,
+  `REVOKE … FROM PUBLIC`, `GRANT EXECUTE … TO epigraph_app`. Also `REVOKE
+  DELETE ON group_memberships FROM epigraph_app`: the membership table is an
+  append-and-revoke ledger, 105's and 106's rules both rest on rows never
+  disappearing, and the FOR ALL policy let a stamped agent delete its own and
+  its groups' rows (measured: a revoked agent re-provisioned as live admin, a
+  reader deleted its admin's row, an emptied group re-bootstrapped). Pinned by
+  `epigraph-db/tests/community_membership_integrity.rs` as `epigraph_app`.
+  **No undo runbook ships**: reversing it is two `DROP FUNCTION IF EXISTS`
+  (named in the file), `GRANT DELETE ON group_memberships TO epigraph_app`
+  (which restores the hole), and the pre-batch-F `community.rs`; it creates no
+  rows. **No deploy precondition in this repository**; deploy note: a consumer
+  OUTSIDE this repository that deletes `group_memberships` rows as
+  `epigraph_app` will get 42501 after this file (none exists in-tree; not
+  verified for out-of-repo consumers). **Claimed 2026-09-24.** **Applied to a
+  throwaway database only, NOT to any deployed database.**
 - **Why 107–109 and not 102–104.** The operator-ownership branch was authored
   as `102`–`104` while `main` held those numbers for it. `main` then shipped
   `105` and `106` (batch F) and production applied them. sqlx applies every

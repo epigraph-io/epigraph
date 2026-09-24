@@ -772,7 +772,9 @@ pub struct EvaluateWorkflowPromotionParams {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
-    #[schemars(description = "Zero-based index of the step in the workflow")]
+    #[schemars(
+        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+    )]
     pub step_index: usize,
 
     #[schemars(description = "What the workflow plan said to do for this step")]
@@ -790,7 +792,9 @@ pub struct StepExecution {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReportWorkflowOutcomeParams {
-    #[schemars(description = "UUID of the workflow claim to report on")]
+    #[schemars(
+        description = "UUID of the workflow: a workflows-table id (from store_workflow / ingest_workflow / find_workflow), or a legacy flat workflow claim id."
+    )]
     pub workflow_id: String,
 
     #[schemars(description = "true if the workflow succeeded, false if it failed")]
@@ -800,7 +804,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub execution_log: Vec<StepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')"
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim; not stored for a workflows-table id."
     )]
     pub outcome_details: String,
 
@@ -810,14 +814,16 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. Falls back to the workflow's goal if omitted. More specific goal text improves future affinity matching."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
     )]
     pub goal_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeprecateWorkflowParams {
-    #[schemars(description = "UUID of the workflow to deprecate")]
+    #[schemars(
+        description = "UUID of the workflow to deprecate. A hierarchical workflows-table id deprecates only that workflows row, not its thesis or step claims (see the tool description)."
+    )]
     pub workflow_id: String,
 
     #[schemars(
@@ -885,7 +891,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2)."
+        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -913,12 +919,12 @@ pub struct ReportHierarchicalOutcomeParams {
     pub success: bool,
 
     #[schemars(
-        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges so per-step evidence accrues."
+        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges and recorded as one behavioral_executions row (no evidence row, no belief change)."
     )]
     pub step_executions: Vec<HierarchicalStepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Currently accepted but not stored."
     )]
     pub outcome_details: String,
 
@@ -934,7 +940,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run. More specific goal text improves future affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
     )]
     pub goal_text: Option<String>,
 }
@@ -1040,16 +1046,26 @@ pub struct SubmitDsEvidenceParams {
     pub reliability: Option<f64>,
 
     #[schemars(
-        description = "Combination method: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, Inagaki"
+        description = "Combination method label: Dempster (default), Conjunctive, YagerOpen, \
+                       YagerClosed, DuboisPrade, Inagaki. Validated, stored on the BBA and echoed \
+                       as method_used, but it does NOT change the returned belief: the claim's \
+                       belief is always recomputed by the shared adaptive combine."
     )]
     pub combination_method: Option<String>,
 
     #[schemars(
-        description = "Inagaki gamma parameter (only used with Inagaki method, default 0.5)"
+        description = "Inagaki gamma parameter. Currently has no effect: it is neither stored nor \
+                       used by the belief recompute."
     )]
     pub gamma: Option<f64>,
 
-    #[schemars(description = "Perspective UUID for scoped combination (optional)")]
+    #[schemars(
+        description = "Optional perspective UUID stored on the BBA. It is part of the BBA's \
+                       replacement key: a resubmission by this agent for the same claim, frame and \
+                       perspective_id replaces the earlier BBA, while a different perspective_id adds \
+                       a separate one. It does not scope the combination: the returned belief \
+                       combines every BBA on the claim and frame regardless of perspective."
+    )]
     pub perspective_id: Option<String>,
 
     #[schemars(
@@ -1272,6 +1288,44 @@ pub struct UpdateResponse {
     pub truth_before: f64,
     pub truth_after: f64,
     pub evidence_id: String,
+    /// Whether the Dempster-Shafer wiring for this submission landed. Always
+    /// `true` in a response.
+    ///
+    /// Introduced by #497, when the DS wiring ran on a sibling pool connection
+    /// after the evidence row had already self-committed, so a wire failure was
+    /// reported as a SUCCESS with `belief_wired: false` rather than as an error
+    /// for work the database had kept. D2 (Unit E) put evidence -> BBA ->
+    /// `truth_value` -> labels in ONE author-stamped transaction, so a wire
+    /// failure now rolls every one of those writes back and the tool returns an
+    /// ERROR naming the failing step (`assign_claim: …`, `store BBA: …`,
+    /// `update_claim_belief: …`). There is no longer a partially-successful
+    /// outcome for this flag to disclose, and nothing is left behind: an
+    /// identical re-submit of the same `evidence_data` is admitted once the
+    /// cause is fixed (pinned in
+    /// `tests/update_with_evidence_ds_wiring_failure_is_atomic.rs`).
+    ///
+    /// The field is RETAINED, constant `true`, because clients of #497 may
+    /// already read it; `true` means what it always meant — a fresh BBA was
+    /// materialized and `truth_after` / `belief` / `plausibility` /
+    /// `pignistic_prob` describe the new epistemic state. Compare
+    /// [`LinkEpistemicResponse::belief_wired`], which is still a live
+    /// best-effort disclosure.
+    pub belief_wired: bool,
+    /// Whether THIS submission's BBA is persisted in `mass_functions`. Always
+    /// `true` in a response.
+    ///
+    /// #497 defined it as always `true` when `belief_wired` is `true`, and used
+    /// `false` to separate a first-step from a late-step wire drop on the old
+    /// best-effort path. Under D2 both drops are a rolled-back ERROR — a BBA
+    /// written before a late-step failure is rolled back with everything else —
+    /// so no response can carry `false`. Retained for client compatibility.
+    pub bba_stored: bool,
+    /// Always absent from a response since D2. #497 reported the DS wiring's
+    /// step-prefixed error here on its best-effort path; that text is now the
+    /// tool's -32603 error MESSAGE instead, because the failure rolls the whole
+    /// submission back. Kept (skipped when `None`) for client compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_wire_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1626,6 +1680,10 @@ pub struct IngestDocumentSpineResponse {
     /// as new in this ingest. Atomize exactly these paragraphs, then call
     /// `ingest_document_inline` with atoms filled for those paths only.
     pub new_paragraph_paths: Vec<String>,
+    /// Spine nodes this ingest resolved to that belong to a group the ingesting
+    /// agent cannot write, so the document's `doi:` label was not added to them.
+    /// See `IngestDocumentResponse::converged_claims_unlabelled`.
+    pub converged_claims_unlabelled: usize,
     /// `true` when every paragraph in the extraction already existed; nothing new was written.
     pub already_ingested: bool,
 }
@@ -1822,7 +1880,7 @@ pub struct LinkEpistemicParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or cites, a structural edge that moves no belief. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 
@@ -1845,13 +1903,17 @@ pub struct LinkEpistemicBelief {
 
 /// Response for the `link_epistemic` MCP tool.
 ///
-/// `was_created=true` means a new edge row was inserted and belief wiring was
-/// attempted; `false` means an edge with the same `(source, target,
-/// relationship)` already existed (idempotent re-hit — no re-wire). `belief_wired`
-/// is `true` only when the engine actually materialized a BBA and recomputed
-/// the target (engine outcome `Wired`); it is `false` for idempotent re-hits and
-/// for the no-op wiring outcomes (source has no belief interval, vacuous
-/// transfer, or a recompute error). `target_belief` is a best-effort read of the
+/// `was_created=true` means a new edge row was inserted; `false` means an edge
+/// with the same `(source, target, relationship)` — or, for a symmetric
+/// relationship, the same unordered pair — already existed (idempotent re-hit).
+/// Belief wiring is attempted on EVERY call, re-hits included. `belief_wired` is
+/// `true` only when THIS call materialized the edge's BBA and recomputed the
+/// target (engine outcome `Wired`), which a re-hit can do when the edge had no
+/// BBA yet and its source has since gained belief. It is `false` when no belief
+/// moved: the edge was already wired, the source has no belief interval, the
+/// transfer was vacuous, the relationship is structural, or the wire was
+/// refused or failed (e.g. a target owned by a group this server's agent cannot
+/// write) — the edge row stays either way. `target_belief` is a best-effort read of the
 /// target's cached DS columns after the recompute (`None` if the target carries
 /// no belief yet or the read failed).
 #[derive(Debug, Serialize)]
@@ -1894,6 +1956,25 @@ pub struct IngestDocumentResponse {
     pub claims_ds_wired: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_frame_id: Option<String>,
+    /// Claims this ingest RESOLVED TO (content-addressed convergence onto a row
+    /// that already existed) but could not tag with the document's `doi:` label,
+    /// because they belong to a group the ingesting agent cannot write. The paper
+    /// still `asserts` each of them; only the label is missing. Disclosed rather
+    /// than swallowed, so a caller counting a paper's claim set by label can
+    /// see the gap.
+    ///
+    /// **Who actually sees it.** This response reaches a caller only from the
+    /// operator `ingest-document` CLI, which calls `do_ingest_document`
+    /// synchronously (`ingest_document_spine` returns its own response type
+    /// with the same field). The two DETACHED MCP tools, `ingest_document` and
+    /// `ingest_document_inline`, answer `queued` and run `do_ingest_document`
+    /// in a spawned task whose response is dropped — for them the count reaches
+    /// only the server log (one WARN per unlabelled claim, target
+    /// `tenancy.scoped_write`). A caller
+    /// of those tools that needs the gap must compare the paper's `asserts`
+    /// edges against its `doi:` label set itself. Stated because an earlier
+    /// summary described this field as the disclosure for every ingest path.
+    pub converged_claims_unlabelled: usize,
     pub already_ingested: bool,
 }
 
