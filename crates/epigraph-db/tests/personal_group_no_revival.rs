@@ -300,20 +300,29 @@ async fn stamped<'a>(
     tx
 }
 
-/// THE SQUAT (review finding, LOW). Agent Z, as `epigraph_app` stamped as
-/// itself, creates a group under VICTIM's canonical personal did_key and seats
-/// itself in it as admin. The policies admit both writes: `groups_tenancy`'s
-/// WITH CHECK pins only `created_by_agent_id` to the principal, and 092's
-/// creator arm admits the first roster row. Provisioning the victim must then
-/// REFUSE (RVK02) rather than seat it beside the squatter.
+/// THE SQUAT (review finding, LOW). Agent Z creates a group under VICTIM's
+/// canonical personal did_key and seats itself in it as admin; provisioning the
+/// victim must then REFUSE (RVK02) rather than seat it beside the squatter.
+///
+/// Two layers now hold this, and the test pins both:
+///
+/// * NEW squats are refused at INSERT by migration 108
+///   (`groups_personal_identity_names_creator`): as `epigraph_app` stamped as
+///   Z, the row is `42501`. Before 108, `groups_tenancy`'s WITH CHECK pinned
+///   only `created_by_agent_id` to the principal, and 092's creator arm
+///   admitted the first roster row, so both writes succeeded.
+/// * A squat that PREDATES 108 (a database that ran 077..106 with a squat in
+///   it, which is exactly the upgrade path) is still refused at USE by 105's
+///   RVK02. Seeded on the superuser harness, which 108 admits as bypass.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_squatted_personal_group_is_refused(pool: PgPool) {
     let app = app_pool(&pool).await;
     let squatter = seed_agent(&pool).await;
     let victim = seed_agent(&pool).await;
 
+    // Layer 1: 108 refuses the squat itself.
     let mut tx = stamped(&app, squatter, &[]).await;
-    let g: Uuid = sqlx::query_scalar(
+    let refused = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
          VALUES ('squat', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $2) \
          RETURNING id",
@@ -322,17 +331,37 @@ async fn a_squatted_personal_group_is_refused(pool: PgPool) {
     .bind(squatter)
     .fetch_one(&mut *tx)
     .await
-    .expect("the policies admit the squatting group row");
+    .expect_err("migration 108 refuses a personal did_key that does not name its creator");
+    assert_eq!(
+        refused
+            .as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))
+            .as_deref(),
+        Some("42501"),
+        "{refused}"
+    );
+    drop(tx);
+
+    // Layer 2: a squat from before 108, seeded as the superuser harness.
+    let g: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('squat', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $2) \
+         RETURNING id",
+    )
+    .bind(victim)
+    .bind(squatter)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a pre-108 squat on the harness");
     sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
          VALUES ($1, $2, ''::bytea, 0, 'admin')",
     )
     .bind(g)
     .bind(squatter)
-    .execute(&mut *tx)
+    .execute(&pool)
     .await
-    .expect("the creator arm admits the squatter's own admin row");
-    tx.commit().await.unwrap();
+    .expect("seat the squatter in its squat");
 
     let res = ensure_as_app(&app, victim).await;
     match res {
