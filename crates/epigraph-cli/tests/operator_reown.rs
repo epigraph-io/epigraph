@@ -1310,3 +1310,301 @@ async fn link_retired_dry_run_apply_and_refusal(pool: PgPool) {
         again.show()
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Opt-in evidence hiding (Amendment 2): selectors, preview and refusals
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn evidence_typed(pool: &PgPool, claim: Uuid, ty: &str, labels: &[&str], text: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content, labels) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(claim)
+    .bind(ty)
+    .bind(h32(id))
+    .bind(text)
+    .bind(labels.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+    .execute(pool)
+    .await
+    .expect("seed typed evidence");
+    id
+}
+
+struct HideFx {
+    fx: Fx,
+    ev_testimony: Uuid,
+    ev_labelled: Uuid,
+    stray: Uuid,
+    dir: PathBuf,
+    claims: PathBuf,
+    ids: PathBuf,
+}
+
+const LONG_TESTIMONY: &str = "A witness statement that runs well past eighty characters,\n\
+                              with a line break inside it, so the preview must cut and flatten it.";
+
+async fn hide_fixture(pool: &PgPool) -> HideFx {
+    let fx = seed(pool).await;
+    let ev_testimony = evidence_typed(pool, fx.c_world, "testimony", &[], LONG_TESTIMONY).await;
+    let ev_labelled = evidence_typed(
+        pool,
+        fx.c_personal,
+        "document",
+        &["private"],
+        "labelled private",
+    )
+    .await;
+    let stray = Uuid::new_v4();
+    let dir = scratch_dir();
+    let claims = dir.join("hide-claims.txt");
+    std::fs::write(
+        &claims,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            fx.c_world, fx.c_personal, fx.c_unlinked, fx.c_private
+        ),
+    )
+    .unwrap();
+    let ids = dir.join("hide-ids.txt");
+    // ev_private is already group-private: selected, and left as it is.
+    std::fs::write(&ids, format!("{}\n{stray}\n", fx.ev_private)).unwrap();
+    HideFx {
+        fx,
+        ev_testimony,
+        ev_labelled,
+        stray,
+        dir,
+        claims,
+        ids,
+    }
+}
+
+async fn hide_run(pool: &PgPool, h: &HideFx, extra: &[&str]) -> Run {
+    let op = h.fx.operator.to_string();
+    let mut args = vec![
+        "hide-evidence",
+        "--claims-file",
+        h.claims.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--hide-evidence-type",
+        "testimony",
+        "--hide-evidence-label",
+        "private",
+        "--hide-evidence-ids",
+        h.ids.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    run_op(pool, &args).await
+}
+
+/// The dry run of `hide-evidence` reports per-type and per-claim counts and an
+/// 80-character, single-line preview of every selected row; selectors are a
+/// union; an id outside scope and a claim that is not the operator's are
+/// reported; and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hide_evidence_dry_run_previews_and_writes_nothing(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    let before = snapshot(&pool, false).await;
+    let r = hide_run(&pool, &h, &[]).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let o = &r.stdout;
+    assert!(
+        o.contains("HIDE-PLAN: 2 evidence row(s) would become visibility=group")
+            && o.contains("(1 selected row(s) already not public"),
+        "{}",
+        r.show()
+    );
+    assert!(o.contains("HIDE-TYPE\ttestimony\t1"), "{o}");
+    assert!(o.contains("HIDE-TYPE\tdocument\t1"), "{o}");
+    assert!(
+        o.contains(&format!("HIDE-CLAIM\t{}\t1", h.fx.c_world)),
+        "{o}"
+    );
+    assert!(
+        o.contains(&format!("HIDE-CLAIM\t{}\t1", h.fx.c_personal)),
+        "{o}"
+    );
+    let flat: String = LONG_TESTIMONY
+        .chars()
+        .take(80)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    assert!(
+        o.contains(&format!(
+            "HIDE\t{}\t{}\ttestimony\t{flat}\n",
+            h.ev_testimony, h.fx.c_world
+        )),
+        "{o}"
+    );
+    assert!(o.contains(&format!("HIDE\t{}\t", h.ev_labelled)), "{o}");
+    assert!(
+        o.contains(&format!("HIDE-OUT-OF-SCOPE\t{}", h.stray)),
+        "{o}"
+    );
+    assert!(
+        o.contains(&format!("HELD\t{}\tneither owned", h.fx.c_unlinked)),
+        "{o}"
+    );
+    assert!(o.contains("DRY RUN: nothing was written"), "{o}");
+    assert!(!o.contains("HIDING WILL NOT BE ENFORCED"), "{o}");
+    assert_same(&before, &snapshot(&pool, false).await, "hide dry run");
+}
+
+/// `--apply` needs `--confirm-hide <N>` equal to the planned count, and then
+/// refuses because the kernel guard that keeps a hidden row hidden is absent
+/// from this schema. Nothing is written on any of the three.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hide_apply_requires_the_confirm_count_and_the_kernel_guard(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    let before = snapshot(&pool, false).await;
+    let none = hide_run(&pool, &h, &["--apply"]).await;
+    assert_eq!(none.code, 1, "{}", none.show());
+    assert!(
+        none.stderr.contains("requires --confirm-hide 2"),
+        "{}",
+        none.show()
+    );
+    let wrong = hide_run(&pool, &h, &["--apply", "--confirm-hide", "3"]).await;
+    assert_eq!(wrong.code, 1, "{}", wrong.show());
+    assert!(
+        wrong
+            .stderr
+            .contains("does not match the planned hidden-row count 2"),
+        "{}",
+        wrong.show()
+    );
+    let right = hide_run(&pool, &h, &["--apply", "--confirm-hide", "2"]).await;
+    assert_eq!(right.code, 1, "{}", right.show());
+    assert!(
+        right
+            .stderr
+            .contains("kernel guard that keeps a hidden row hidden"),
+        "{}",
+        right.show()
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "refused hides");
+}
+
+/// Can an UNSTAMPED `epigraph_app` session read evidence row `ev`?
+async fn app_reads_evidence(pool: &PgPool, ev: Uuid) -> i64 {
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence WHERE id = $1")
+        .bind(ev)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    n
+}
+
+/// B-H4. A stand-in for production's orphan `evidence_privacy`: a PERMISSIVE
+/// always-true SELECT policy. First the measurement that makes it matter — an
+/// unstamped `epigraph_app` session reads the group-private evidence row with
+/// it and not without it. Then: the dry run warns loudly, `--apply` refuses
+/// without `--accept-unenforced-hide`, and with it gets past that check to the
+/// next refusal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unenforced_hide_is_detected_warned_and_refused(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    assert_eq!(app_reads_evidence(&pool, h.fx.ev_private).await, 0);
+    exec(
+        &pool,
+        "CREATE POLICY evidence_privacy ON evidence AS PERMISSIVE FOR SELECT USING (true)",
+    )
+    .await;
+    assert_eq!(
+        app_reads_evidence(&pool, h.fx.ev_private).await,
+        1,
+        "the stand-in must defeat group visibility, or this test proves nothing"
+    );
+
+    let before = snapshot(&pool, false).await;
+    let dry = hide_run(&pool, &h, &[]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("WARNING: HIDING WILL NOT BE ENFORCED")
+            && dry.stdout.contains("evidence_privacy"),
+        "{}",
+        dry.show()
+    );
+    let refused = hide_run(&pool, &h, &["--apply", "--confirm-hide", "2"]).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused.stderr.contains("--accept-unenforced-hide"),
+        "{}",
+        refused.show()
+    );
+    let accepted = hide_run(
+        &pool,
+        &h,
+        &["--apply", "--confirm-hide", "2", "--accept-unenforced-hide"],
+    )
+    .await;
+    assert_eq!(accepted.code, 1, "{}", accepted.show());
+    assert!(
+        accepted.stderr.contains("kernel guard")
+            && !accepted.stderr.contains("--accept-unenforced-hide"),
+        "past the policy check, the guard refuses: {}",
+        accepted.show()
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "unenforced hide");
+}
+
+/// `reown-claims` with a hide selector: the dry run prints the hide plan and
+/// still runs the re-own (without the hide); `--apply` refuses BEFORE the
+/// manifest and before any write, so it never runs half of what it was asked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reown_with_hide_flags_previews_and_refuses_apply_before_writing(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    let cf = claims_file(&h.dir, &h.fx);
+    let mf = h.dir.join("m.jsonl");
+    let op = h.fx.operator.to_string();
+    let base = [
+        "reown-claims",
+        "--claims-file",
+        cf.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--derived",
+        "follow-claim",
+        "--manifest-out",
+        mf.to_str().unwrap(),
+        "--hide-evidence-type",
+        "testimony",
+    ];
+    let before = snapshot(&pool, false).await;
+    let dry = run_op(&pool, &base).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("HIDE-PLAN: 1 evidence row(s)"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains(&format!("HIDE\t{}", h.ev_testimony)),
+        "{}",
+        dry.show()
+    );
+    assert!(dry.stdout.contains("HIDE: not simulated"), "{}", dry.show());
+    assert!(dry.stdout.contains("claims moved: 3"), "{}", dry.show());
+
+    let mut apply: Vec<&str> = base.to_vec();
+    apply.extend_from_slice(&["--apply", "--confirm-hide", "1"]);
+    let r = run_op(&pool, &apply).await;
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("kernel guard"), "{}", r.show());
+    assert!(!mf.exists(), "refused before the manifest");
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "refused hide re-own",
+    );
+}

@@ -35,6 +35,7 @@
 //! `epigraph_db::assert_maintenance_privilege` (which is conditioned on row
 //! security being active): it is unconditional.
 
+pub mod hide;
 pub mod link;
 pub mod manifest;
 pub mod reown;

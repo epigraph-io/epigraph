@@ -123,6 +123,9 @@ pub struct Options {
     pub apply: bool,
     pub batch_size: usize,
     pub lock_timeout: String,
+    /// The opt-in hide flags (Amendment 2). With no selector set the run is
+    /// exactly the Amendment 1 re-own.
+    pub hide: super::hide::HideArgs,
 }
 
 /// Why a listed claim is not moved.
@@ -860,6 +863,31 @@ pub async fn run(
             "SHARED-FRAGMENTS\t{}\t(also the provenance of a claim not being moved; they move \
              with the eligible claim, and stay public)",
             report.spill.shared_fragments
+        )?;
+    }
+
+    // ---- opt-in hiding (Amendment 2) ----
+    let selector = super::hide::Selector::from_args(&opts.hide)?;
+    if !selector.is_empty() {
+        let hide_plan = super::hide::plan(&selector, &plan.attached);
+        super::hide::print(out, &hide_plan)?;
+        let policies = super::hide::extra_evidence_policies(conn).await?;
+        super::hide::warn_unenforced(out, &policies)?;
+        let guard = super::hide::guard_status(conn).await?;
+        if opts.apply {
+            // Refused BEFORE the manifest and before any write: a re-own that
+            // was asked to hide must not run half of what it was asked.
+            super::hide::refuse_apply(&hide_plan, &opts.hide, &policies, guard)?;
+        }
+        writeln!(
+            out,
+            "HIDE: not simulated in this dry run; the re-own below runs WITHOUT it. --apply \
+             with a hide selector refuses in this build ({})",
+            if guard.complete() {
+                "it has no hide write path"
+            } else {
+                "the kernel pin guard is absent from this schema"
+            }
         )?;
     }
 

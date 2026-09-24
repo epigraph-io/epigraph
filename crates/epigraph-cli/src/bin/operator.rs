@@ -16,9 +16,11 @@
 //!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
 //!     epigraph-operator reown-reverse --manifest reown-1.jsonl [--apply]
+//!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
+//!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f]
 
 use clap::{Parser, Subcommand};
-use epigraph_cli::operator::{self, link, reown, reverse};
+use epigraph_cli::operator::{self, hide, link, reown, reverse};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -74,6 +76,24 @@ enum Command {
         /// `lock_timeout` for each batch (a PostgreSQL interval).
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
+        /// Opt-in evidence hiding. With none of these the run is unchanged.
+        #[command(flatten)]
+        hide: hide::HideArgs,
+    },
+    /// Report (and, where the schema allows, hide) selected evidence on claims
+    /// that are not moving.
+    HideEvidence {
+        /// One claim UUID per line: the claims whose evidence is in scope.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The operator's agent id.
+        #[arg(long)]
+        operator: Uuid,
+        #[command(flatten)]
+        hide: hide::HideArgs,
+        /// Hide the selected rows. Refused in this build; see `hide.rs`.
+        #[arg(long)]
+        apply: bool,
     },
     /// Restore every row a manifest names to the owner it recorded.
     ReownReverse {
@@ -140,6 +160,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             apply,
             batch_size,
             lock_timeout,
+            hide,
         } => {
             let ids = operator::read_ids_file(&claims_file)?;
             if ids.is_empty() {
@@ -152,6 +173,7 @@ async fn main_inner() -> anyhow::Result<i32> {
                 apply,
                 batch_size,
                 lock_timeout,
+                hide,
             };
             reown::validate(&opts)?;
             let report = reown::run(&mut conn, &opts, &ids, &mut stdout).await?;
@@ -160,6 +182,19 @@ async fn main_inner() -> anyhow::Result<i32> {
             } else {
                 2
             })
+        }
+        Command::HideEvidence {
+            claims_file,
+            operator: op,
+            hide,
+            apply,
+        } => {
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            hide::run_standalone(&mut conn, op, &ids, &hide, apply, &mut stdout).await?;
+            Ok(0)
         }
         Command::ReownReverse {
             manifest,
