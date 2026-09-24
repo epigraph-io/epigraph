@@ -167,7 +167,7 @@ fn refresh_allowed(
 /// concurrent mints for one client — on every refresh, forever, for a value the
 /// caller is holding. It does ONE read: the operated-agent refusal below.
 ///
-/// # Operated agents are stdio-only (migration 102)
+/// # Operated agents are stdio-only (migration 107)
 ///
 /// Both paths end in [`refuse_operated_agent`]: an agent with a live ACTING
 /// operator link (`epigraph_operator_actor`) gets no token, in every grant arm,
@@ -216,7 +216,7 @@ async fn refuse_operated_agent(state: &AppState, agent_id: uuid::Uuid) -> Result
             tracing::warn!(
                 agent_id = %agent_id,
                 operator_id = %link.operator_id,
-                "token refused: the agent is operated (migration 102) and operated agents are \
+                "token refused: the agent is operated (migration 107) and operated agents are \
                  stdio-only"
             );
             Err(ApiError::Forbidden {
@@ -643,10 +643,10 @@ async fn handle_refresh_token(
     // WHEN THE OLD TOKEN IS BURNED (rotation). A DENIAL burns it on purpose --
     // a suspended client, an identity no longer allowlisted, an operated agent
     // keeps no reusable token -- but a FAILURE to answer must not: before
-    // migration 102 nothing between the revoke and the mint could fail on a
+    // migration 107 nothing between the revoke and the mint could fail on a
     // warm client, and `principal_agent_id` now reads the operator link on
     // every refresh. An `InternalError` there (e.g. a missing EXECUTE grant on
-    // `epigraph_operator_actor`, which 102 section 6 names an outage) used to
+    // `epigraph_operator_actor`, which 107 section 6 names an outage) used to
     // outlive the outage: the token was already revoked, so every refreshing
     // client lost its chain. So the client is loaded and every check runs
     // FIRST, and the token is revoked only once the refresh is either denied or

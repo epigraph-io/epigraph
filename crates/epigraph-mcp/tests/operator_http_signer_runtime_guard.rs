@@ -184,7 +184,7 @@ async fn call(client: &reqwest::Client, url: &str, token: &str, session: &str, i
 enum LinkKind {
     Acting,
     Retired,
-    /// The signer becomes some OTHER agent's operator (102 section 9).
+    /// The signer becomes some OTHER agent's operator (107 section 9).
     Operator,
 }
 
@@ -265,7 +265,7 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
     );
 }
 
-/// The signer becomes some other agent's OPERATOR after startup (102 section
+/// The signer becomes some other agent's OPERATOR after startup (107 section
 /// 9): on an unauthenticated transport every caller IS the signer, so the
 /// listener must refuse rather than hand every caller the operator arm.
 #[sqlx::test(migrations = "../../migrations")]

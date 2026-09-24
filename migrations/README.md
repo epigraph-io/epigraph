@@ -234,7 +234,20 @@ Current reservation:
   `100` was: it has never been applied to a deployed database — production is at
   59.
 
-- **102**: public `operator_link` — operator-scoped ownership. One
+- **Why 107–109 and not 102–104.** The operator-ownership branch was authored
+  as `102`–`104` while `main` held those numbers for it. `main` then shipped
+  `105` and `106` (batch F) and production applied them. sqlx applies every
+  pending version in order, so on production a `102`–`104` would have run
+  AFTER `105`/`106`, while a fresh install runs them BEFORE: two orders over
+  the same `group_memberships` and personal-group definers, and no guarantee
+  of one final state. Renumbered to `107`–`109`, which run after `106` on
+  every database. `102`–`104` were only ever applied to throwaway databases,
+  and are left unallocated (a gap sqlx accepts) rather than reused, so no
+  throwaway that ran the old files can meet a different file under the same
+  version. Checked before renaming: no `origin/*` ref and no open PR carries
+  a `107`–`110`.
+
+- **107**: public `operator_link` — operator-scoped ownership. One
   definer-only table and two `SECURITY DEFINER` functions.
   `operator_links(agent_id PK, operator_id, operator_group_id, retired)` is the link
   RECORD: ENABLE + FORCE row security, an INSERT policy admitting only
@@ -264,19 +277,19 @@ Current reservation:
   `OPERATED_BY` auth-lineage edges name more than one principal), and a third
   refusal-only read, `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`),
   lets the HTTP listeners refuse to serve as a signer that is anyone's
-  operator (102 section 9). The table
+  operator (107 section 9). The table
   is registered with the FORCE ratchets (`FORCE_PROTECTED_SET`,
   `rls_enforcement.rs::PROTECTED`, `locked_decisions.rs::OPERATOR_TABLES`,
   `docs/runbooks/079-undo.sql`). Pinned by
-  `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted` and
+  `schema_contract.rs::migration_107_operator_definers_are_owned_and_granted` and
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`; behaviour in
   `epigraph-db/tests/operator_link.rs`. **Deploy order:** a binary carrying
   `default_decl_for_author`'s operator lookup fails closed on every claim write
-  against a database without 102, so apply 102 first. `epigraph-migrate` runs
+  against a database without 107, so apply 107 first. `epigraph-migrate` runs
   only as the API's `ExecStartPre`, and the HTTP MCP listeners check the
-  signer's operator records (102's reads) fail-closed on EVERY tool call, read
+  signer's operator records (107's reads) fail-closed on EVERY tool call, read
   tools included, and at startup: restart the API (or run `epigraph-migrate`)
-  so 102–104 are applied BEFORE restarting `epigraph-mcp`, or every HTTP MCP
+  so 107–109 are applied BEFORE restarting `epigraph-mcp`, or every HTTP MCP
   call is refused until they are. Allocated here, not in
   `093–099`, because this is not one of the obligation batches that block is
   reserved for. Like `100` and `101` it sits inside internal's `060–112`; see
@@ -285,11 +298,11 @@ Current reservation:
   binary that no longer calls them. **Applied to a throwaway database only, NOT
   to any deployed database.**
 
-- **103**: public `groups_identity_immutable` — one invoker trigger function
+- **108**: public `groups_identity_immutable` — one invoker trigger function
   (`epigraph_groups_identity_immutable`) and a `BEFORE UPDATE` trigger on
   `groups` that raises `42501` when `created_by_agent_id`, `did_key` or `kind`
   changes outside `epigraph_bypass()` / `epigraph_definer_bypass()`. Closes a
-  pre-existing 077 hole that 102 made reachable: `groups_tenancy`'s WITH CHECK
+  pre-existing 077 hole that 107 made reachable: `groups_tenancy`'s WITH CHECK
   let any member rewrite a group's creator to itself, and 092's creator arm
   then made an operated `writer` admin-equivalent in its operator's group.
   A second invoker trigger, `groups_personal_identity_names_creator`
@@ -300,12 +313,12 @@ Current reservation:
   did (as `personal` or, through `create_with_admin`, as `team`) and block every
   link to that operator permanently. Behaviour in
   `epigraph-db/tests/operator_link.rs::an_operated_writer_cannot_rewrite_its_operator_groups_identity`.
-  Like 100–102 it sits inside internal's `060–112`. **No undo runbook ships**:
+  Like 100, 101 and 107 it sits inside internal's `060–112`. **No undo runbook ships**:
   undo is the `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked
-  before claiming: no remote branch carries a `103`. **Applied to a throwaway
+  before claiming: no remote branch carries a `108`. **Applied to a throwaway
   database only, NOT to any deployed database.**
 
-- **104**: public `group_memberships_guards` — roster guards the tenancy
+- **109**: public `group_memberships_guards` — roster guards the tenancy
   policy cannot express, as invoker `BEFORE` triggers on `group_memberships`.
   `group_memberships_no_hard_delete` raises `42501` on any `DELETE` outside
   `epigraph_bypass()` / `epigraph_definer_bypass()`: 077's FOR ALL
@@ -315,18 +328,18 @@ Current reservation:
   `UPDATE ... SET revoked_at`, as every in-tree path already does; a cascaded
   delete from `agents` fires the trigger too. `group_memberships_no_retired_writer`
   raises `42501` on an INSERT or UPDATE that leaves a live `writer`/`admin` row
-  for an agent in the group its RETIRED operator link names (102 section 7):
+  for an agent in the group its RETIRED operator link names (107 section 7):
   review showed the operator could otherwise enrol a retired identity, whose key
   may be public, as a writer by an ordinary roster write. Behaviour in
-  `epigraph-db/tests/operator_link.rs`. Like 100–103 it sits inside internal's
+  `epigraph-db/tests/operator_link.rs`. Like 100, 101, 107 and 108 it sits inside internal's
   `060–112`. **No undo runbook ships**: undo is the `DROP TRIGGER` /
   `DROP FUNCTION` statements named in the file. Checked before claiming: no
-  remote branch carries a `104`. **Applied to a throwaway database only, NOT
+  remote branch carries a `109`. **Applied to a throwaway database only, NOT
   to any deployed database.**
 
-- **105+**: public next
+- **110+**: public next
 
-Next public migration **outside both reserved tenancy ranges** must be `105` or
+Next public migration **outside both reserved tenancy ranges** must be `110` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

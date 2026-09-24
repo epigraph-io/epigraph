@@ -1092,11 +1092,11 @@ pub async fn update_with_evidence(
 ///
 /// A server WITH a declared signer keeps the strict behavior unchanged.
 ///
-/// ## The operator arm (migration 102)
+/// ## The operator arm (migration 107)
 ///
 /// Added BESIDE every branch above, never in place of one. It asks two
 /// DIFFERENT questions, one per side, and uses a different definer read for
-/// each (`migrations/102_operator_link.sql` section 5):
+/// each (`migrations/107_operator_link.sql` section 5):
 ///
 /// - `author_op(target)` = `AgentRepository::operator_of_author` — "whose are
 ///   this author's claims?", from the `operator_links` record alone, RETIRED
@@ -1159,7 +1159,7 @@ pub(crate) async fn require_owner_or_admin(
         }
         // Between the principal check and the denial, deliberately: every
         // ALLOW above is unchanged. One visible difference on the DENY path: a
-        // failed operator lookup (e.g. a database without migration 102) now
+        // failed operator lookup (e.g. a database without migration 107) now
         // returns an internal error instead of the ownership denial text — the
         // gate does not decide on an answer it did not get.
         if let Some(caller) = auth.agent_id {
@@ -1202,8 +1202,8 @@ pub(crate) async fn require_owner_or_admin(
     }
 
     // The operator arm runs AFTER the undeclared-signer arm, so that arm is
-    // byte-for-byte the pre-102 behaviour — including when the operator lookup
-    // fails (e.g. a database without migration 102), where it still warns and
+    // byte-for-byte the pre-107 behaviour — including when the operator lookup
+    // fails (e.g. a database without migration 107), where it still warns and
     // allows instead of returning an internal error. The order changes no
     // decision: an undeclared (random, per-process) signer can be neither
     // operated (`operator::check_operator_transport` refuses it) nor anyone's
@@ -1230,7 +1230,7 @@ pub(crate) async fn require_owner_or_admin(
 /// The operator arm of [`require_owner_or_admin`]; see its doc for the rule.
 ///
 /// The TARGET side reads `AgentRepository::operator_of_author` and the CALLER
-/// side `AgentRepository::operator_actor` (migration 102's two definer reads).
+/// side `AgentRepository::operator_actor` (migration 107's two definer reads).
 /// Swapping either is a defect: an author read on the caller side would let a
 /// retired identity — whose key may be exposed — act for its operator, and an
 /// actor read on the target side would take the operator's ownership of a

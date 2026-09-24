@@ -1,4 +1,4 @@
--- 102_operator_link.sql
+-- 107_operator_link.sql
 -- Operator-scoped ownership: an agent process that is DECLARED to act for a
 -- human operator writes into that operator's personal group, and the operator
 -- (and the operator's other agents) own what it writes.
@@ -81,7 +81,7 @@
 --     in Z's group. Every in-tree personal-group writer (077's
 --     `epigraph_ensure_personal_group`, 071's shim, `tenancy_backfill`) stamps
 --     the agent itself as creator, so this refuses nothing legitimate. Since
---     migration 103 section 3 the squat itself is refused at INSERT; this
+--     migration 108 section 3 the squat itself is refused at INSERT; this
 --     check remains for a squat that predates it.
 --   * the `operator_links` row is keyed on the agent and inserted
 --     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
@@ -99,7 +99,7 @@
 -- revoked agent X ran `DELETE FROM group_memberships WHERE agent_id = X` ->
 -- `DELETE 1`, and the next stdio restart's link re-created a live writer row.
 -- Gating the membership on the link-row insert closes it for this function,
--- and migration 104 refuses every hard DELETE of a membership outside
+-- and migration 109 refuses every hard DELETE of a membership outside
 -- maintenance, so the history cannot be erased at the RLS layer either.
 --
 -- ===================================================================
@@ -212,7 +212,7 @@
 -- `epigraph_definer_bypass()` admits, i.e. while the OWNER is a member of
 -- `epigraph_maintenance`. The `OWNER TO` below sits in a `pg_roles` guard and
 -- can silently no-op, so it is pinned in CI by
--- `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted`
+-- `schema_contract.rs::migration_107_operator_definers_are_owned_and_granted`
 -- and at deploy by `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. The
 -- failure directions of a wrong OWNER are both CLOSED: an unbypassed read reads
 -- no link (agents author into their own group and own nothing through an
@@ -269,23 +269,23 @@
 --
 -- `ClaimRepository::default_decl_for_author` calls `epigraph_operator_actor`, so a
 -- binary carrying this change FAILS CLOSED on every claim write against a
--- database that has not applied 102 (`42883 function does not exist`). Apply
--- 102 before, or with, the binary.
+-- database that has not applied 107 (`42883 function does not exist`). Apply
+-- 107 before, or with, the binary.
 --
 -- THE MCP SERVERS DO NOT MIGRATE. `epigraph-migrate` runs only as the API
--- service's `ExecStartPre`, and every HTTP MCP tool call now depends on 102's
+-- service's `ExecStartPre`, and every HTTP MCP tool call now depends on 107's
 -- reads: `epigraph_mcp::operator::refuse_linked_http_signer` resolves the
 -- signer agent and reads `epigraph_operator_of_author` and
 -- `epigraph_operates_agents` before dispatch, fail-closed, and the startup gate
 -- exits on a failed lookup. So restarting `epigraph-mcp` onto this binary
--- BEFORE the database has 102 refuses every HTTP call, read-only tools
+-- BEFORE the database has 107 refuses every HTTP call, read-only tools
 -- included. Restart the API (or run `epigraph-migrate`) first, then the MCP
 -- servers. That coupling is deliberate: the guard does not serve on an answer
 -- it did not get.
 --
 -- HTTP LISTENERS ON FIRST DEPLOY. An HTTP listener refuses to start, and
 -- refuses every call, while its signer has an `operator_links` row
--- (`epigraph_mcp::operator`). A freshly applied 102 creates the table EMPTY and
+-- (`epigraph_mcp::operator`). A freshly applied 107 creates the table EMPTY and
 -- writes no row, so no existing HTTP signer can be refused by it on first
 -- deploy; only a later, explicit link of that signer can. (An earlier form of
 -- this file counted "OPERATED_BY edge + live membership" as a link, and every

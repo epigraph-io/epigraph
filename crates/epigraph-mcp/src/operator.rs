@@ -1,4 +1,4 @@
-//! Operator-scoped ownership at process startup (migration 102).
+//! Operator-scoped ownership at process startup (migration 107).
 //!
 //! A per-agent stdio process that the host starts with `--operator-id` /
 //! `EPIGRAPH_OPERATOR_ID` records, once, that its signer agent is operated by
@@ -33,7 +33,7 @@
 //! refusal at once rather than at the next restart.
 //!
 //! Both HTTP checks also refuse a signer that is anyone's OPERATOR
-//! (`AgentRepository::operates_agents`, migration 102 section 9): on
+//! (`AgentRepository::operates_agents`, migration 107 section 9): on
 //! `--allow-unauthenticated-http` every caller IS the signer, and would satisfy
 //! "caller is the operator of the claim's author" for every linked agent.
 //!
@@ -96,7 +96,7 @@ pub fn check_operator_transport(
 /// Refuse to serve HTTP when this process's signer agent already has an
 /// operator link of either kind (see the module doc for why the author record,
 /// retired links included, is the predicate), or is itself some agent's
-/// OPERATOR (migration 102 section 9).
+/// OPERATOR (migration 107 section 9).
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
@@ -129,7 +129,7 @@ pub async fn refuse_operated_http_signer(
         .map_err(|e| {
             format!(
                 "could not check whether this listener's signer agent {agent_id} has an operator \
-                 link (is migration 102 applied?): {e}"
+                 link (is migration 107 applied?): {e}"
             )
         })?;
     if let Some(link) = link {
@@ -140,7 +140,7 @@ pub async fn refuse_operated_http_signer(
         .map_err(|e| {
             format!(
                 "could not check whether this listener's signer agent {agent_id} is an operator \
-                 (is migration 102 applied?): {e}"
+                 (is migration 107 applied?): {e}"
             )
         })?;
     if operates {
@@ -165,7 +165,7 @@ fn linked_http_signer_reason(agent_id: Uuid, link: &AuthorOperator) -> String {
     )
 }
 
-/// The refusal text for a signer that is some agent's OPERATOR (102 section 9).
+/// The refusal text for a signer that is some agent's OPERATOR (107 section 9).
 fn operator_http_signer_reason(agent_id: Uuid) -> String {
     format!(
         "this HTTP listener's signer agent {agent_id} is the operator of linked agents. On an \
@@ -220,7 +220,7 @@ pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), M
 }
 
 /// The operator half of [`refuse_linked_http_signer`]: refuse while this
-/// server's signer is anyone's OPERATOR (102 section 9). Fails closed.
+/// server's signer is anyone's OPERATOR (107 section 9). Fails closed.
 async fn refuse_operator_http_signer(
     server: &EpiGraphMcpFull,
     agent_id: Uuid,
@@ -327,7 +327,7 @@ pub async fn self_link(
 pub enum LinkStatus {
     /// The link is live: this agent authors into the operator's group.
     Live,
-    /// The agent's link record is RETIRED (migration 102 section 7) and is never
+    /// The agent's link record is RETIRED (migration 107 section 7) and is never
     /// promoted to an acting link.
     Retired,
     /// The agent's membership was revoked and deliberately not restored.

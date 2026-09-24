@@ -1,4 +1,4 @@
-//! Migration 102: operator links, the grant that authorizes them, the
+//! Migration 107: operator links, the grant that authorizes them, the
 //! never-revive rule, and the authoring path that reads them.
 //!
 //! # Why most arms here run as `epigraph_app` through SET SESSION AUTHORIZATION
@@ -128,7 +128,7 @@ async fn epigraph_app_cannot_execute_link_operator(pool: PgPool) {
         "the refusal must be observed from a session whose session_user IS the app role"
     );
     let err = refused.expect_err(
-        "epigraph_app executed epigraph_link_operator. 102 must REVOKE EXECUTE from PUBLIC and \
+        "epigraph_app executed epigraph_link_operator. 107 must REVOKE EXECUTE from PUBLIC and \
          from epigraph_app, or the request DSN can enrol any agent in any operator's group",
     );
     assert_eq!(
@@ -337,7 +337,7 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
     );
 }
 
-/// An app session cannot hard-delete a membership (migration 104 section 1).
+/// An app session cannot hard-delete a membership (migration 109 section 1).
 ///
 /// Review's two arms, both as `epigraph_app` stamped exactly as
 /// `Viewer::resolve` stamps the principal:
@@ -478,7 +478,7 @@ async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
     .expect("auth-lineage edge");
 }
 
-/// A SHARED HTTP SIGNER is neither linkable nor an operator (102 section 9).
+/// A SHARED HTTP SIGNER is neither linkable nor an operator (107 section 9).
 ///
 /// Review's scope note: a mistaken entry for the shared signer in a
 /// link-retired agents file would make the operator the owner of every HTTP
@@ -837,7 +837,7 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
     .expect("privilege probe");
     assert!(
         !app_may_insert,
-        "102 must REVOKE ALL on operator_links FROM epigraph_app: 077's default privileges \
+        "107 must REVOKE ALL on operator_links FROM epigraph_app: 077's default privileges \
          grant it INSERT on every new table"
     );
 
@@ -879,17 +879,17 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
 /// merely CARRIES an operator's `did:epigraph:personal:<operator>` key, created
 /// by someone else, is not the operator's group.
 ///
-/// * ARM A (migration 103 section 3) — principal `Z`, on `epigraph_app`
+/// * ARM A (migration 108 section 3) — principal `Z`, on `epigraph_app`
 ///   stamped as itself, can no longer pre-create `did:epigraph:personal:D` for
 ///   an operator `D` that has no personal group yet, as `kind='personal'` OR as
 ///   `kind='team'` (`GroupRepository::create_with_admin` takes a caller-supplied
-///   did_key). Before 103's insert guard the personal arm returned `INSERT 0 1`
+///   did_key). Before 108's insert guard the personal arm returned `INSERT 0 1`
 ///   and the squat blocked `D` permanently (`groups_block_delete`, section 2's
 ///   immutability). CALIBRATION in the same shape: `Z` creates a `team` group
 ///   with a non-personal key, and a fresh `W` creates its OWN canonical
 ///   personal group — both accepted.
 /// * ARM B — defense in depth for a squat that exists anyway (written here on
-///   the superuser harness, e.g. from before 103): linking an agent to `D` must
+///   the superuser harness, e.g. from before 108): linking an agent to `D` must
 ///   REFUSE rather than enrol it as a writer in `Z`'s group, and a link record
 ///   pointing at the squatted group still reads as no link.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1229,7 +1229,7 @@ async fn write_claim_trace_evidence_into(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Retired links (migration 102 section 7): the operator owns a retired
+// Retired links (migration 107 section 7): the operator owns a retired
 // identity's claims, and the identity gains ZERO write authority.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1270,7 +1270,7 @@ async fn epigraph_app_cannot_execute_link_retired_agent(pool: PgPool) {
     })
     .await;
     let err = refused.expect_err(
-        "epigraph_app executed epigraph_link_retired_agent: 102 must REVOKE EXECUTE from PUBLIC \
+        "epigraph_app executed epigraph_link_retired_agent: 107 must REVOKE EXECUTE from PUBLIC \
          and from epigraph_app",
     );
     assert_eq!(
@@ -1393,7 +1393,7 @@ async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
 }
 
 /// The operator cannot hand a retired identity write authority through an
-/// ordinary roster write (migration 104 section 2).
+/// ordinary roster write (migration 109 section 2).
 ///
 /// Review's attack: O, stamped as admin of its personal group, inserted a
 /// `writer` row for retired R, and R then wrote a claim owned by O's group,
@@ -1647,7 +1647,7 @@ async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgP
     }
 }
 
-/// Migration 103 (review attack 2c): an operated WRITER cannot make itself an
+/// Migration 108 (review attack 2c): an operated WRITER cannot make itself an
 /// admin of its operator's group by rewriting the group's creator.
 ///
 /// As `epigraph_app`, stamped from the operated agent's own `Viewer::resolve`
@@ -1655,7 +1655,7 @@ async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgP
 ///
 /// * rewriting the operator group's `created_by_agent_id` to itself — the one
 ///   UPDATE `groups_tenancy`'s WITH CHECK admits on that row, and the review's
-///   exact attack — is refused by 103's trigger, and so is the follow-on
+///   exact attack — is refused by 108's trigger, and so is the follow-on
 ///   enrolment of a third agent;
 /// * rewriting `did_key` or `kind` on a group the agent legitimately created
 ///   (its own personal group, where the WITH CHECK passes) is refused by the
@@ -1736,7 +1736,7 @@ async fn an_operated_writer_cannot_rewrite_its_operator_groups_identity(pool: Pg
         assert!(
             err.to_string()
                 .contains("immutable outside a maintenance session"),
-            "{what}: the refusal must be migration 103's trigger, not the RLS policy: {err}"
+            "{what}: the refusal must be migration 108's trigger, not the RLS policy: {err}"
         );
     }
     assert_eq!(

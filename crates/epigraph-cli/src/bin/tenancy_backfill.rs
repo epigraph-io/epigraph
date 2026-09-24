@@ -1006,18 +1006,18 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_is_instance_admin", 83),
     ("epigraph_inherit_fragment_tenancy_stmt", 89),
     ("epigraph_group_roster_admits_principal", 92),
-    // 102, operator-scoped ownership. Deferred for the same structural reason
+    // 107, operator-scoped ownership. Deferred for the same structural reason
     // as 092. All fail CLOSED under a non-member owner: the two reads
     // (`epigraph_operator_actor`, `epigraph_operator_of_author`) read no link
     // (operated agents silently author into their own group again, and
     // operators silently own nothing) and the two link functions are refused
     // by the tenancy policies — so the stake is a feature silently OFF, which
     // is exactly what a green pre-flight must not hide.
-    ("epigraph_operator_actor", 102),
-    ("epigraph_operator_of_author", 102),
-    ("epigraph_operates_agents", 102),
-    ("epigraph_link_operator", 102),
-    ("epigraph_link_retired_agent", 102),
+    ("epigraph_operator_actor", 107),
+    ("epigraph_operator_of_author", 107),
+    ("epigraph_operates_agents", 107),
+    ("epigraph_link_operator", 107),
+    ("epigraph_link_retired_agent", 107),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -1188,28 +1188,28 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     Ok(failures)
 }
 
-/// Migration 102's EXECUTE grants to `epigraph_app`, which the ownership check
+/// Migration 107's EXECUTE grants to `epigraph_app`, which the ownership check
 /// above does not see. Returns the number of failing checks.
 ///
 /// # Why this is its own check
 ///
 /// [`verify_definer_ownership`] proves each body is OWNED by a maintenance
-/// member. It says nothing about who may CALL it, and for 102 both directions
+/// member. It says nothing about who may CALL it, and for 107 both directions
 /// matter:
 ///
 /// * the two READS (`epigraph_operator_actor`, `epigraph_operator_of_author`)
 ///   must be EXECUTE-able by `epigraph_app`. `default_decl_for_author` calls the
 ///   actor read on EVERY claim write, so a missing grant is not a feature
-///   quietly off — it is `42501` on every app-DSN claim write, an outage. 102
+///   quietly off — it is `42501` on every app-DSN claim write, an outage. 107
 ///   grants it inside `IF EXISTS (… 'epigraph_app')`, so a cluster where the app
-///   role is provisioned AFTER 102 ran carries no grant, and the ownership check
+///   role is provisioned AFTER 107 ran carries no grant, and the ownership check
 ///   still passes green (review finding F8). The third read,
 ///   `epigraph_operates_agents`, is refusal-only, and the HTTP listener's guard
 ///   calls it on every tool call and fails CLOSED, so a missing grant there
 ///   refuses every HTTP call: the same class of outage.
 /// * the two LINK functions (`epigraph_link_operator`,
 ///   `epigraph_link_retired_agent`) must NOT be. A grant there lets the request
-///   DSN record operator links, which is the whole of 102's trust basis.
+///   DSN record operator links, which is the whole of 107's trust basis.
 ///
 /// Each function is checked only when it exists (the same deferral as
 /// [`DEFERRED_DEFINER_FUNCTIONS`]), and the whole check only when the app role
@@ -1274,15 +1274,15 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             failures += 1;
             if *app_must_execute {
                 eprintln!(
-                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Migration 102 grants it only if \
-                     the role existed when 102 ran; without it every claim write on the app DSN \
+                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Migration 107 grants it only if \
+                     the role existed when 107 ran; without it every claim write on the app DSN \
                      fails with 42501 (the authoring path calls it per write). Re-issue: GRANT \
                      EXECUTE ON FUNCTION {signature} TO {APP_ROLE};"
                 );
             } else {
                 eprintln!(
                     "FAIL: {APP_ROLE} CAN EXECUTE {signature}. The request DSN could then record \
-                     operator links itself, which is the whole of migration 102's trust basis. \
+                     operator links itself, which is the whole of migration 107's trust basis. \
                      Re-issue: REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {APP_ROLE};"
                 );
             }

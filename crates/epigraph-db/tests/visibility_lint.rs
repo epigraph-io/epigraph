@@ -937,33 +937,33 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent.rs",
         "operator_actor",
-        "READ through migration 102's `epigraph_operator_actor` SECURITY DEFINER function, not of \
+        "READ through migration 107's `epigraph_operator_actor` SECURITY DEFINER function, not of \
          a table. It must answer on an UNSTAMPED epigraph_app session (brief constraint 4: a \
          viewer-gated read there is blind and turns read-then-mint into re-mint), so a Viewer \
          would be the wrong control. It returns only (operator agent id, operator personal group \
          id) for the NAMED agent — the operator relationship is public through the OPERATED_BY \
          edge (agent endpoints stamp ('public', world) in 070/072) and a personal group's id \
-         derives from the public `did:epigraph:personal:<agent>` key; 102 section 5 records the \
+         derives from the public `did:epigraph:personal:<agent>` key; 107 section 5 records the \
          one liveness bit it adds.",
     ),
     (
         "agent.rs",
         "operator_of_author",
-        "READ through migration 102's `epigraph_operator_of_author` SECURITY DEFINER function; \
+        "READ through migration 107's `epigraph_operator_of_author` SECURITY DEFINER function; \
          same reason as `operator_actor`. It returns only (operator agent id, operator personal \
          group id, retired) for the NAMED agent.",
     ),
     (
         "agent.rs",
         "operates_agents",
-        "READ through migration 102's `epigraph_operates_agents` SECURITY DEFINER function; \
+        "READ through migration 107's `epigraph_operates_agents` SECURITY DEFINER function; \
          same reason as `operator_actor`. It returns one boolean for the NAMED agent (does any \
          link name it as operator), used only to REFUSE an HTTP listener's signer.",
     ),
     (
         "agent.rs",
         "link_operator",
-        "WRITE through migration 102's `epigraph_link_operator` SECURITY DEFINER function, which \
+        "WRITE through migration 107's `epigraph_link_operator` SECURITY DEFINER function, which \
          is EXECUTE-able by epigraph_maintenance only; the CONNECTION's privilege is the \
          authorisation (an epigraph_app connection gets 42501), so there is nothing for a Viewer \
          to filter. Returns only the outcome of the named (agent, operator) link.",
@@ -971,7 +971,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent.rs",
         "link_retired_agent",
-        "WRITE through migration 102's `epigraph_link_retired_agent` SECURITY DEFINER function, \
+        "WRITE through migration 107's `epigraph_link_retired_agent` SECURITY DEFINER function, \
          EXECUTE-able by epigraph_maintenance only, exactly as `link_operator`: the CONNECTION's \
          privilege is the authorisation, so there is nothing for a Viewer to filter. Returns only \
          the outcome of the named (agent, operator) retired link.",

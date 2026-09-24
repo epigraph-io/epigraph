@@ -1,4 +1,4 @@
--- 103_groups_identity_immutable.sql
+-- 108_groups_identity_immutable.sql
 -- A group's IDENTITY columns -- `created_by_agent_id`, `did_key`, `kind` --
 -- cannot be changed by an application session.
 --
@@ -6,7 +6,7 @@
 -- on `groups`. No table, no policy change, no rows written.
 --
 -- ===================================================================
--- 1. THE HOLE (pre-existing since 077; 102 is the first path that exposes it)
+-- 1. THE HOLE (pre-existing since 077; 107 is the first path that exposes it)
 --
 -- `groups_tenancy` (077) is `FOR ALL`, USING "any group in the session's
 -- groups" and WITH CHECK `created_by_agent_id = epigraph_principal_id()`. For
@@ -16,7 +16,7 @@
 -- enrolment and key epochs.
 --
 -- MEASURED by review (attack 2c) as `SET SESSION AUTHORIZATION epigraph_app`,
--- stamped exactly as `Viewer::resolve` stamps an agent A that migration 102
+-- stamped exactly as `Viewer::resolve` stamps an agent A that migration 107
 -- linked as a `writer` in its operator's personal group:
 --
 --   UPDATE groups SET created_by_agent_id = A WHERE id = <operator group>
@@ -68,7 +68,7 @@
 -- only asks that the NEW row name the session principal as creator, so ANY
 -- principal Z could INSERT a group carrying `did:epigraph:personal:<N>` for an
 -- operator N that has no personal group yet (MEASURED by review, attack 2: as
--- `epigraph_app` stamped as Z, `INSERT 0 1`). 102's link functions then refuse
+-- `epigraph_app` stamped as Z, `INSERT 0 1`). 107's link functions then refuse
 -- N as an operator ("is not a personal group created by that operator"), which
 -- is correct, but the squat row can never be removed by the app
 -- (`groups_block_delete`) or re-keyed (section 2), so the squatter blocks N's
@@ -82,7 +82,7 @@
 -- `personal` unless BOTH hold: `kind = 'personal'` and
 -- `did_key = 'did:epigraph:personal:' || created_by_agent_id`. Every in-tree
 -- personal-group writer already produces exactly that row (077's
--- `epigraph_ensure_personal_group`, 102's link functions and 071's shim run as
+-- `epigraph_ensure_personal_group`, 107's link functions and 071's shim run as
 -- definers; `tenancy_backfill` runs on a maintenance DSN), so this refuses
 -- nothing legitimate. Squatting becomes impossible rather than merely refused
 -- at link time.

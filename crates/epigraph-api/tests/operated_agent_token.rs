@@ -1,4 +1,4 @@
-//! Operated agents are stdio-only, enforced at TOKEN ISSUANCE (migration 102,
+//! Operated agents are stdio-only, enforced at TOKEN ISSUANCE (migration 107,
 //! stage-2 brief A3).
 //!
 //! An operated agent holds a `writer` membership in its operator's personal
@@ -248,7 +248,7 @@ async fn an_agent_linked_after_minting_cannot_refresh(pool: PgPool) {
 /// Review's measurement: with `epigraph_operator_actor` renamed away, the
 /// refresh returned 500 AFTER rotation had already revoked the token, and once
 /// the function was back the same token was 401 "Invalid or expired refresh
-/// token": an outage of the read (102 section 6 names a missing EXECUTE grant
+/// token": an outage of the read (107 section 6 names a missing EXECUTE grant
 /// one) cost every refreshing client its chain, and the loss outlived the
 /// outage. The token must be burned only once the refresh is denied or about
 /// to mint.

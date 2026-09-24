@@ -646,7 +646,7 @@ impl ClaimRepository {
     /// authenticated principal at token mint (PR-02), so on a live path this is
     /// a lookup, not a write.
     ///
-    /// # An OPERATED author writes into its operator's group (migration 102)
+    /// # An OPERATED author writes into its operator's group (migration 107)
     ///
     /// When `agent_id` has an ACTING operator link
     /// ([`AgentRepository::operator_actor`](crate::repos::AgentRepository::operator_actor)),
@@ -673,7 +673,7 @@ impl ClaimRepository {
     /// # Errors
     /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
     /// `DbError::QueryFailed` for other database failures — including a
-    /// database that has not applied migration 102, which fails CLOSED here
+    /// database that has not applied migration 107, which fails CLOSED here
     /// rather than authoring as if the author had no operator.
     pub async fn default_decl_for_author(
         conn: &mut sqlx::PgConnection,
@@ -8386,7 +8386,7 @@ impl ClaimRepository {
         // upsert only to discard them.
         //
         // `default_decl_for_author`, not `personal_group_of`: an actor with an
-        // ACTING operator link (migration 102) authors into its OPERATOR's
+        // ACTING operator link (migration 107) authors into its OPERATOR's
         // personal group, exactly as every other authoring path does, so a
         // merge by a model-bumped job does not split its work across groups
         // again (review finding: the merged claim landed in the agent's own

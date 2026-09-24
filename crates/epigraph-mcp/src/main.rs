@@ -108,7 +108,7 @@ struct Cli {
     #[arg(long)]
     read_only: bool,
 
-    /// The agent that OPERATES this process's signer agent (migration 102).
+    /// The agent that OPERATES this process's signer agent (migration 107).
     ///
     /// When set, startup records `signer --OPERATED_BY--> operator` plus a
     /// `writer` membership in the operator's personal group, once

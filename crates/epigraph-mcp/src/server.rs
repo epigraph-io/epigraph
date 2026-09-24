@@ -2024,7 +2024,7 @@ impl ServerHandler for EpiGraphMcpFull {
                 return Err(err);
             }
             // An HTTP listener must never serve as an operator-linked signer
-            // (migration 102): it authors every caller's claims as this one
+            // (migration 107): it authors every caller's claims as this one
             // agent. The startup gate (`operator::refuse_operated_http_signer`)
             // runs once; this re-checks on EVERY call, so a link recorded after
             // startup refuses at once instead of taking effect until the next

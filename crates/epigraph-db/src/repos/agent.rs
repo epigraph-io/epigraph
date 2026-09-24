@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// One ACTING operator link: the operator's agent id and the id of the
 /// operator's personal group, which owns the operated agent's new claims.
 ///
-/// Produced only by [`AgentRepository::operator_actor`] (migration 102's
+/// Produced only by [`AgentRepository::operator_actor`] (migration 107's
 /// `epigraph_operator_actor`): a not-retired link record, a live
 /// `writer`/`admin` membership, and the operator's own personal group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,14 +22,14 @@ pub struct OperatorLink {
 
 /// The operator an AUTHOR's claims belong to, from the link record alone.
 ///
-/// Produced only by [`AgentRepository::operator_of_author`] (migration 102's
+/// Produced only by [`AgentRepository::operator_of_author`] (migration 107's
 /// `epigraph_operator_of_author`). Includes RETIRED links, and says nothing
 /// about whether the agent may act: that is [`OperatorLink`]'s question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct AuthorOperator {
     pub operator_id: Uuid,
     pub operator_group_id: Uuid,
-    /// The link is retired (migration 102 section 7): the agent never acts for
+    /// The link is retired (migration 107 section 7): the agent never acts for
     /// the operator.
     pub retired: bool,
 }
@@ -55,7 +55,7 @@ pub struct OperatorLinkOutcome {
     /// the operator's group: a live membership whose role is no longer
     /// `writer`/`admin` is not a link.
     pub link_live: bool,
-    /// The agent's link record is RETIRED (migration 102 section 7). A retired
+    /// The agent's link record is RETIRED (migration 107 section 7). A retired
     /// link is never promoted: the call inserted no membership, and the agent
     /// authors into its own group.
     pub link_retired: bool,
@@ -1377,7 +1377,7 @@ impl AgentRepository {
     }
 
     /// "May `agent_id` act for an operator?" — its ACTING operator link, through
-    /// migration 102's `epigraph_operator_actor` definer read, or `None`.
+    /// migration 107's `epigraph_operator_actor` definer read, or `None`.
     ///
     /// An acting link is an `operator_links` row that is NOT retired AND a live
     /// `writer`/`admin` membership for the agent in the group that row names,
@@ -1405,7 +1405,7 @@ impl AgentRepository {
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the function is absent (a database that has not
-    /// applied migration 102) or the read fails. Deliberately NOT mapped to
+    /// applied migration 107) or the read fails. Deliberately NOT mapped to
     /// "no operator": a binary that cannot ask must not author as if the answer
     /// were no.
     pub async fn operator_actor(
@@ -1439,7 +1439,7 @@ impl AgentRepository {
     }
 
     /// "Whose are `agent_id`'s claims?" — the operator named by its link
-    /// record, through migration 102's `epigraph_operator_of_author`, or `None`.
+    /// record, through migration 107's `epigraph_operator_of_author`, or `None`.
     ///
     /// From the `operator_links` row ALONE: RETIRED links are included, and no
     /// membership is consulted, so an operator keeps ownership of what an agent
@@ -1479,15 +1479,15 @@ impl AgentRepository {
     }
 
     /// "Does any agent name `agent_id` as its operator?", through migration
-    /// 102's `epigraph_operates_agents` (retired links included).
+    /// 107's `epigraph_operates_agents` (retired links included).
     ///
-    /// REFUSAL-ONLY (102 section 9): an HTTP listener must not serve as a
+    /// REFUSAL-ONLY (107 section 9): an HTTP listener must not serve as a
     /// signer that is anyone's operator, because on an unauthenticated HTTP
     /// transport every anonymous caller IS the signer, and would then satisfy
     /// "caller is the operator of the claim's author". Never use it to GRANT.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if the read fails (e.g. a database without 102).
+    /// `DbError::QueryFailed` if the read fails (e.g. a database without 107).
     pub async fn operates_agents(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
@@ -1511,7 +1511,7 @@ impl AgentRepository {
     }
 
     /// Record that `agent_id` is operated by `operator_id`, through migration
-    /// 102's `epigraph_link_operator`.
+    /// 107's `epigraph_link_operator`.
     ///
     /// **The caller's connection privilege is the authorization.** The function
     /// is EXECUTE-able by `epigraph_maintenance` (and superusers) only; on an
@@ -1547,7 +1547,7 @@ impl AgentRepository {
     }
 
     /// Record that the RETIRED agent `agent_id`'s claims belong to
-    /// `operator_id`, through migration 102's `epigraph_link_retired_agent`.
+    /// `operator_id`, through migration 107's `epigraph_link_retired_agent`.
     ///
     /// Writes the `operator_links` row with `retired = true` and the
     /// `OPERATED_BY` edge, and creates NO membership: a retired identity's key

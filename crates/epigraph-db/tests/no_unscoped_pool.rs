@@ -466,7 +466,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
          D-PR17-live-memberships-is-parameterised-not-principal-bound. A shard that 'converts' \
          this deadlocks the bootstrap rather than fixing a leak. The second, beside it and run \
-         concurrently with it, is AgentRepository::operator_actor_pool: migration 102's \
+         concurrently with it, is AgentRepository::operator_actor_pool: migration 107's \
          `epigraph_operator_actor` SECURITY DEFINER read, which must answer BEFORE there is a \
          viewer (it decides whether the principal gets one: an operated agent is stdio-only), \
          reads no tenancy-partitioned row, and returns only the named principal's own link.",
@@ -521,7 +521,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
         14,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
-         The fourteenth site is `refuse_operated_agent` (migration 102): it asks, before minting, \
+         The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
          whether the agent has an ACTING operator link, through the `epigraph_operator_actor` \
          SECURITY DEFINER read, which answers without a stamp and returns only the named agent's \
          operator — the same pre-authentication reason, re-read for it.",

@@ -1,10 +1,10 @@
-//! `require_owner_or_admin`'s operator arm (migration 102), driven through the
+//! `require_owner_or_admin`'s operator arm (migration 107), driven through the
 //! REAL ownership-gated tools so the actual gate runs.
 //!
 //! # What is under test, and what is not
 //!
 //! The gate's decision depends on who authored the target claim and on the
-//! operator links migration 102 records — never on RLS — so the superuser
+//! operator links migration 107 records — never on RLS — so the superuser
 //! `#[sqlx::test]` harness observes it faithfully: a refusal here is the gate's
 //! refusal, and an admitted call is asserted by its committed effect
 //! (`is_current` flipped, `resolved` label present), not by an `Ok` alone. The
@@ -160,7 +160,7 @@ async fn labels(pool: &PgPool, claim: Uuid) -> Vec<String> {
 
 /// Two agents under one operator — the model-bump case: the new identity may
 /// retire (supersede) and resolve its sibling's claims over stdio, with a
-/// DECLARED signer, where the pre-102 gate refused.
+/// DECLARED signer, where the pre-107 gate refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_sibling_agent_under_the_same_operator_may_retire_its_claims(pool: PgPool) {
     let operator = agent(&pool, "operator").await;
@@ -486,20 +486,20 @@ async fn a_revoked_link_grants_nothing(pool: PgPool) {
     assert!(!is_current(&pool, mine).await);
 }
 
-/// Review finding F12: on stdio the pre-102 undeclared-signer arm (warn and
-/// allow) must behave exactly as before 102, including when the operator lookup
+/// Review finding F12: on stdio the pre-107 undeclared-signer arm (warn and
+/// allow) must behave exactly as before 107, including when the operator lookup
 /// FAILS. The operator arm therefore runs after it.
 ///
 /// The lookup is made to fail by dropping the author read (the state of a
-/// database without migration 102's read).
+/// database without migration 107's read).
 ///
 /// * CALIBRATION: a DECLARED stdio signer's cross-agent supersede now surfaces
 ///   the lookup failure as an error (the gate does not decide ownership on an
 ///   answer it did not get), so the failure is real.
 /// * The same supersede from an UNDECLARED signer is still allowed (its
-///   pre-102 warn-and-allow), rather than turned into an internal error.
+///   pre-107 warn-and-allow), rather than turned into an internal error.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_undeclared_stdio_signer_keeps_its_pre_102_arm_when_the_operator_lookup_fails(
+async fn an_undeclared_stdio_signer_keeps_its_pre_107_arm_when_the_operator_lookup_fails(
     pool: PgPool,
 ) {
     let author = agent(&pool, "author").await;
@@ -522,7 +522,7 @@ async fn an_undeclared_stdio_signer_keeps_its_pre_102_arm_when_the_operator_look
     assert!(is_current(&pool, c).await);
 
     supersede(&undeclared, &pool, c, None).await.expect(
-        "an undeclared stdio signer's cross-agent supersede must keep its pre-102 \
+        "an undeclared stdio signer's cross-agent supersede must keep its pre-107 \
          warn-and-allow even when the operator lookup would fail",
     );
     assert!(!is_current(&pool, c).await);

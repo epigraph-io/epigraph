@@ -1297,13 +1297,13 @@ async fn verify_covers_the_092_roster_definer_once_its_migration_is_applied(pool
     );
 }
 
-/// `verify` checks migration 102's EXECUTE grants to `epigraph_app`, in both
+/// `verify` checks migration 107's EXECUTE grants to `epigraph_app`, in both
 /// directions (review finding F8).
 ///
 /// * A missing grant on the actor read is an OUTAGE, not a feature quietly
 ///   off: `default_decl_for_author` calls it on every claim write, so every
-///   app-DSN claim write fails 42501. 102 grants it only if the app role
-///   existed when 102 ran, and the ownership check passes green regardless.
+///   app-DSN claim write fails 42501. 107 grants it only if the app role
+///   existed when 107 ran, and the ownership check passes green regardless.
 /// * A grant on a link function hands the request DSN the power to record
 ///   operator links.
 ///
@@ -1320,7 +1320,7 @@ async fn verify_checks_the_operator_function_grants_to_the_app_role(pool: PgPool
         "CALIBRATION: verify passes at head; stderr:\n{stderr}"
     );
 
-    // The app role provisioned after 102 ran: no EXECUTE on the actor read.
+    // The app role provisioned after 107 ran: no EXECUTE on the actor read.
     sqlx::query(
         "REVOKE EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) FROM epigraph_app",
     )

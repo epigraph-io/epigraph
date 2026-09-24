@@ -1,4 +1,4 @@
--- 104_group_memberships_guards.sql
+-- 109_group_memberships_guards.sql
 -- Roster guards on `group_memberships` that the tenancy policy cannot express.
 --
 -- Two invoker trigger functions and two BEFORE triggers on
@@ -17,7 +17,7 @@
 -- `Viewer::resolve` stamps a principal:
 --
 --   * a revoked operated agent X deleted its own revoked row (`DELETE 1`), and
---     102's link then re-created a live writer row (closed separately in 102:
+--     107's link then re-created a live writer row (closed separately in 107:
 --     the membership is now inserted only by the call that records the link);
 --   * a live operated writer Y deleted its OPERATOR's `admin` row in the
 --     operator's personal group (`DELETE 1`). The operator then failed
@@ -52,7 +52,7 @@
 -- ===================================================================
 -- 2. A RETIRED IDENTITY NEVER HOLDS WRITE AUTHORITY IN ITS OPERATOR'S GROUP
 --
--- 102 section 7: a RETIRED link gives the operator ownership of a historical
+-- 107 section 7: a RETIRED link gives the operator ownership of a historical
 -- identity's claims and gives the identity ZERO write authority, because many
 -- retired keys are publicly recomputable or were printed to logs.
 -- `epigraph_link_retired_agent` creates no membership, but nothing stopped one
@@ -70,7 +70,7 @@
 -- reviving a revoked row and promoting a `reader` are the same hole. A
 -- `reader` row is allowed: it grants no write. The `WHEN` clause keeps the
 -- trigger off every other row. The retired bit is read through
--- `epigraph_operator_of_author` (102, EXECUTE granted to `epigraph_app`),
+-- `epigraph_operator_of_author` (107, EXECUTE granted to `epigraph_app`),
 -- because an app session cannot see `operator_links`.
 --
 -- ===================================================================
@@ -118,7 +118,7 @@ BEGIN
                 WHERE o.retired AND o.operator_group_id = NEW.group_id) THEN
         RAISE EXCEPTION 'group_memberships: agent % has a RETIRED operator link to group %, '
                         'and a retired identity may hold no live writer or admin membership '
-                        'there (migration 102 section 7)', NEW.agent_id, NEW.group_id
+                        'there (migration 107 section 7)', NEW.agent_id, NEW.group_id
             USING ERRCODE = '42501';
     END IF;
     RETURN NEW;
