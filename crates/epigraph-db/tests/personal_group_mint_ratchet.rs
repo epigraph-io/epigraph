@@ -13,52 +13,77 @@
 //! the revival from the function; this file keeps the CALLERS from growing
 //! again unreviewed, and keeps the revival from reappearing as a copy.
 //!
-//! # The three arms
+//! # The four arms
 //!
 //! 1. [`every_path_to_the_personal_group_mint_is_registered`] — an exact-set
 //!    ratchet over `crates/*/src/**/*.rs` (bins and `#[cfg(test)]` modules
 //!    included) of calls to the function (both spellings) and to every helper
 //!    that wraps it. `(file, callee, count)` must equal [`REGISTER`] exactly: a
 //!    new site ADDS a tuple, a removed one leaves a stale entry, and both fail.
-//! 2. [`no_new_revival_statement_in_source`] — the revival itself, as a
-//!    statement shape: `revoked_at = NULL` anywhere in comment-stripped source
-//!    outside [`REVIVE_REGISTER`]. It catches a copy of the statement (the
-//!    backfill carried one) that arm 1 cannot, because a copy calls nothing.
-//! 3. [`the_live_function_body_does_not_revive`] — the LAST migration that
-//!    defines `epigraph_ensure_personal_group` must not contain `revoked_at =
-//!    NULL` outside SQL comments. A later `CREATE OR REPLACE` that restored
-//!    077's body would otherwise pass arms 1 and 2 untouched.
+//! 2. [`no_new_revival_statement_in_source_or_migrations`] — the revival
+//!    itself, as a statement shape: `revoked_at = NULL` in ANY spelling
+//!    (case-insensitive, any whitespace around `=`, quoted identifiers) in
+//!    comment-stripped `crates/*/src` AND `migrations/*.sql`, outside
+//!    [`REVIVE_REGISTER`]. It catches a copy of the statement (the backfill
+//!    carried one) that arm 1 cannot, because a copy calls nothing.
+//! 3. [`the_latest_definitions_do_not_revive`] — for each function in
+//!    [`GUARDED_DEFINERS`], the LAST migration that `CREATE`s it (optional
+//!    `public.` prefix, any case, any whitespace, any parameter name) must
+//!    carry exactly the registered number of revivals in that definition. A
+//!    later `CREATE OR REPLACE` that restored 077's body, or a redefinition of
+//!    106's `epigraph_community_remove_member` that revives, fails here.
+//! 4. [`no_live_function_body_revives`] — the database's own answer, on a
+//!    test database migrated 001→head: every function in `pg_proc` whose
+//!    source matches `revoked_at\s*=\s*null` (case-insensitive) must be in
+//!    [`LIVE_REVIVE_ALLOWLIST`]. `pg_proc` holds only the CURRENT definitions,
+//!    so this covers 105, 106 and any future definer however its migration
+//!    spells the name, including a function arms 2 and 3 have never heard of.
+//!    It calibrates itself by creating a reviving function first.
 //!
-//! [`the_scanner_sees_calls_and_ignores_prose`] is the calibration: it feeds the
-//! scanner synthetic source, so a scanner that silently matched nothing could
-//! not keep arm 1 green.
+//! [`the_scanner_sees_calls_and_ignores_prose`] and
+//! [`the_revival_matcher_sees_every_spelling`] are the calibrations: they feed
+//! the scanners synthetic source, so a scanner that silently matched nothing
+//! could not keep arms 1-3 green.
 //!
 //! # ITS BLIND SPOTS, stated so a green run is not over-read
 //!
 //! * **Wrappers not in [`WATCHED`].** It follows the helpers listed there and
-//!   nothing further up. Two wrappers are deliberately NOT expanded, each with
-//!   its own pin instead:
+//!   nothing further up. `system_agent_write_authority` IS watched: its two
+//!   callers, `api/routes/workflows.rs` and `mcp/claim_helper.rs`, are in the
+//!   register, and its own mint runs only after a stamped read proved the
+//!   agent has no row at all (`scripts/e2e/probe-unit-e.sh`'s REVOKED/READER
+//!   arms). The wrappers deliberately NOT expanded, each with its own pin:
 //!   - `EpiGraphMcpFull::agent_id` has a call site in nearly every tool; its
 //!     one `ensure_personal_group` call runs once per PROCESS
-//!     (`SessionFactory` shares the cell), pinned by
-//!     `epigraph-mcp/tests/per_session_agent_resolution.rs`.
-//!   - `system_agent_write_authority`'s mint runs only after a stamped read
-//!     proved the agent has no row at all; pinned by
-//!     `scripts/e2e/probe-unit-e.sh`'s REVOKED/READER arms.
+//!     (`SessionFactory` shares the cell), pinned by `server.rs`'s
+//!     `session_factory_tests`. The outcome (no revival, no ingest) is pinned
+//!     by `epigraph-mcp/tests/per_session_agent_resolution.rs`.
+//!   - `create_claim_idempotent`, `IngestTx::owner_decl` and the two
+//!     `begin_system_ingest_stamped_tx` (MCP `claim_helper.rs`, API
+//!     `routes/workflows.rs`) wrap a watched call and are called from many
+//!     tools. The watched call inside each is registered, and every path
+//!     through them ends in migration 105's definer.
 //!
 //!   A NEW wrapper — a function that calls one of these and is then called
 //!   from elsewhere — is caught once (its own call to the watched helper) and
 //!   then not followed. Adding it to [`WATCHED`] is the reviewer's job.
 //! * **SQL built at runtime.** A statement assembled with `format!` whose
-//!   function name is split across literals, or read from a file, is invisible.
-//!   So is a revival spelled other than `revoked_at = NULL` (e.g. `revoked_at =
-//!   $3` bound to NULL) for arm 2.
+//!   function name or column is split across literals, or read from a file, is
+//!   invisible to arms 1-3 (arm 4 still sees any function it creates).
+//! * **Revivals not spelled `revoked_at = NULL`.** Arms 2-4 match that
+//!   assignment in any case and spacing, and nothing else. `revoked_at = $3`
+//!   bound to NULL, the row-constructor form `SET (revoked_at, role) = (NULL,
+//!   'admin')`, `revoked_at = CASE … END`, and a DELETE-then-reinsert all pass
+//!   all three. The behavioural arms (`personal_group_no_revival.rs`,
+//!   `community_membership_integrity.rs`, as `epigraph_app`) are the backstop
+//!   for the functions they call; a Rust-source copy on a path no behavioural
+//!   arm drives has none.
 //! * **Test files.** `crates/*/tests/` is NOT scanned: fixtures there provision
 //!   and revoke memberships on purpose. `#[cfg(test)]` modules inside `src/`
 //!   ARE scanned and registered.
-//! * **Outside `crates/*/src`.** The workspace member `tests/engine-integration`
-//!   (no watched call at the time of writing) and the e2e shell scripts are not
-//!   scanned. `scripts/e2e/probe-workflow.sh` calls
+//! * **Outside `crates/*/src` and `migrations/`.** The workspace member
+//!   `tests/engine-integration` (no watched call at the time of writing) and
+//!   the e2e shell scripts are not scanned. `scripts/e2e/probe-workflow.sh` calls
 //!   `epigraph_ensure_personal_group` in raw SQL, for freshly created fixture
 //!   agents only, on a throwaway database; after migration 105 a revoked row
 //!   there would RAISE `RVK01` and abort the probe rather than revive.
@@ -86,6 +111,9 @@ const WATCHED: &[&str] = &[
     // API helper every token-mint site goes through.
     "ensure_for_client",
     "principal_agent_id",
+    // The ingest executor's system-agent preflight, whose last step can
+    // provision (`system_agent.rs`).
+    "system_agent_write_authority",
 ];
 
 // ===========================================================================
@@ -244,6 +272,22 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "Policies route, system agent's declaration on `state.db_pool`. Definer answer.",
     ),
     (
+        "epigraph-mcp/src/claim_helper.rs",
+        "system_agent_write_authority",
+        1,
+        "`begin_system_ingest_stamped_tx` (store_workflow, workflow ingest, add_step, \
+         delete_step). The preflight's own mint runs only for an agent with no row of any state; \
+         a revoked or reader system agent is refused (AgentCreation -> INTERNAL_ERROR, #498's \
+         choice: the system agent's membership is operator configuration, not the caller's).",
+    ),
+    (
+        "epigraph-api/src/routes/workflows.rs",
+        "system_agent_write_authority",
+        1,
+        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step). Same \
+         preflight, same refusals (InternalError).",
+    ),
+    (
         "epigraph-cli/src/bin/hypothesis.rs",
         "default_decl_for_author",
         1,
@@ -257,14 +301,53 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
 ];
 
-/// `(file under crates/, occurrences, why)` of the literal revival statement
-/// shape `revoked_at = NULL` (whitespace-normalised, comments stripped).
-const REVIVE_REGISTER: &[(&str, usize, &str)] = &[(
-    "epigraph-db/src/repos/instance_admin.rs",
-    1,
-    "`InstanceAdminRepository::grant` on `instance_admins`, NOT a group membership: an \
+/// `(repo-relative file, occurrences, why)` of the revival statement shape
+/// `revoked_at = NULL` in any spelling ([`revival_count`]), comments stripped,
+/// over `crates/*/src/**/*.rs` and `migrations/*.sql`.
+const REVIVE_REGISTER: &[(&str, usize, &str)] = &[
+    (
+        "crates/epigraph-db/src/repos/instance_admin.rs",
+        1,
+        "`InstanceAdminRepository::grant` on `instance_admins`, NOT a group membership: an \
          explicit operator re-grant on the maintenance connection (migration 083 revokes \
          INSERT/UPDATE on the table from `epigraph_app`).",
+    ),
+    (
+        "migrations/071_ownership_compat_shim.sql",
+        1,
+        "`epigraph_ownership_transcribe()`'s personal-group revival. HISTORY: migration 084 \
+         drops the function (`no_live_function_body_revives` confirms it is not live).",
+    ),
+    (
+        "migrations/077_rls_policies.sql",
+        1,
+        "077's `epigraph_ensure_personal_group` body, the defect itself. HISTORY: superseded by \
+         105 (`the_latest_definitions_do_not_revive` pins that 105 is the latest definition).",
+    ),
+    (
+        "migrations/106_community_membership_integrity.sql",
+        1,
+        "`epigraph_community_add_member`'s restore of a REVOKED community row at the requested \
+         `reader` role, reachable only by a live admin actor (`'denied_readmit'` otherwise); \
+         pinned by `community_membership_integrity.rs`.",
+    ),
+];
+
+/// Every function whose LATEST migration definition arm 3 checks, with the
+/// number of revivals that definition may carry and the markers it must
+/// contain (normalised: lowercase, no whitespace). `(name, revivals, markers)`.
+const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
+    ("epigraph_ensure_personal_group", 0, &["rvk01", "rvk02"]),
+    ("epigraph_community_remove_member", 0, &[]),
+    ("epigraph_community_add_member", 1, &["denied_readmit"]),
+];
+
+/// Functions the LIVE database may hold whose source matches
+/// `revoked_at\s*=\s*null`, each with its reason. Exact set.
+const LIVE_REVIVE_ALLOWLIST: &[(&str, &str)] = &[(
+    "epigraph_community_add_member",
+    "106: restores a REVOKED community row at `reader`, only for a live admin actor; never a \
+     personal group, never at the old role.",
 )];
 
 fn crates_root() -> PathBuf {
@@ -455,6 +538,75 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Lowercase, `"` removed, every whitespace run collapsed to one space, and
+/// no space at all next to `=`, `(`, `)`, `.` or `,`. In this form
+/// `revoked_at = NULL`, `REVOKED_AT=null` and `"revoked_at"\n = Null` all read
+/// `revoked_at=null`, and `CREATE OR REPLACE\n FUNCTION "public" . "f" (`
+/// reads `create or replace function public.f(`, while word boundaries (a
+/// space) survive everywhere else.
+fn normalise(s: &str) -> String {
+    let tight = |c: char| matches!(c, '=' | '(' | ')' | '.' | ',');
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for c in s.chars().filter(|c| *c != '"').flat_map(char::to_lowercase) {
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !out.is_empty() && !tight(c) && !out.ends_with(tight) {
+            out.push(' ');
+        }
+        pending_space = false;
+        out.push(c);
+    }
+    out
+}
+
+/// Occurrences of the revival assignment `revoked_at = NULL` in any case and
+/// spacing. `revoked_at IS NULL` (a predicate) does not match; neither does
+/// `revoked_at = NULLIF(…)` or a column merely ending in `revoked_at`.
+fn revival_count(text: &str) -> usize {
+    let n = normalise(text);
+    let needle = "revoked_at=null";
+    let b = n.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(off) = n[from..].find(needle) {
+        let start = from + off;
+        let end = start + needle.len();
+        let lead = start == 0 || !is_ident(b[start - 1]);
+        let tail = end >= b.len() || !is_ident(b[end]);
+        if lead && tail {
+            count += 1;
+        }
+        from = end;
+    }
+    count
+}
+
+fn repo_root() -> PathBuf {
+    crates_root().parent().expect("repo root").to_path_buf()
+}
+
+fn repo_rel(p: &Path) -> String {
+    p.strip_prefix(repo_root())
+        .expect("under the repo")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn migration_files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(migrations_root())
+        .expect("read migrations/")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .collect();
+    files.sort();
+    files
+}
+
 #[test]
 fn every_path_to_the_personal_group_mint_is_registered() {
     let measured = measured_calls();
@@ -484,31 +636,53 @@ fn every_path_to_the_personal_group_mint_is_registered() {
 }
 
 #[test]
-fn no_new_revival_statement_in_source() {
+fn no_new_revival_statement_in_source_or_migrations() {
     let mut measured: BTreeMap<String, usize> = BTreeMap::new();
     for p in src_files() {
-        let text = collapse_ws(&strip_comments(&std::fs::read_to_string(&p).unwrap()));
-        let n = text.matches("revoked_at = NULL").count();
+        let n = revival_count(&strip_comments(&std::fs::read_to_string(&p).unwrap()));
         if n > 0 {
-            measured.insert(rel(&p), n);
+            measured.insert(repo_rel(&p), n);
+        }
+    }
+    for p in migration_files() {
+        let n = revival_count(&strip_sql_comments(&std::fs::read_to_string(&p).unwrap()));
+        if n > 0 {
+            measured.insert(repo_rel(&p), n);
         }
     }
     let expected: BTreeMap<String, usize> = REVIVE_REGISTER
         .iter()
         .map(|(f, n, _)| ((*f).to_string(), *n))
         .collect();
+    for (_, _, why) in REVIVE_REGISTER {
+        assert!(
+            why.len() > 40,
+            "every revive register entry must carry its reason"
+        );
+    }
     assert_eq!(
         measured, expected,
-        "a `revoked_at = NULL` statement appeared, moved or disappeared in production source. \
-         A revival of a revoked membership is an operator decision; if this one is, register \
-         it in REVIVE_REGISTER with the reason."
+        "a `revoked_at = NULL` assignment (any case or spacing) appeared, moved or disappeared \
+         in production source or a migration. A revival of a revoked membership is an \
+         operator decision; if this one is, register it in REVIVE_REGISTER with the reason."
     );
 }
 
-/// Strip `--` line comments from SQL (not inside '…' literals).
+/// Strip `/* … */` block comments, then `--` line comments (not inside '…'
+/// literals), from SQL.
 fn strip_sql_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    for line in sql.lines() {
+    let mut no_blocks = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(i) = rest.find("/*") {
+        no_blocks.push_str(&rest[..i]);
+        rest = match rest[i + 2..].find("*/") {
+            Some(j) => &rest[i + 2 + j + 2..],
+            None => "",
+        };
+    }
+    no_blocks.push_str(rest);
+    let mut out = String::with_capacity(no_blocks.len());
+    for line in no_blocks.lines() {
         let mut in_str = false;
         let mut cut = line.len();
         let bytes = line.as_bytes();
@@ -528,35 +702,116 @@ fn strip_sql_comments(sql: &str) -> String {
     out
 }
 
+/// The LAST `CREATE [OR REPLACE] FUNCTION [public.]<name>(` across the
+/// migrations, normalised and comment-stripped: the text from that header to
+/// the next function `CREATE` in the same file (or its end), and the file.
+fn latest_definition(name: &str) -> Option<(PathBuf, String)> {
+    let heads = [
+        format!("create or replace function {name}("),
+        format!("create or replace function public.{name}("),
+        format!("create function {name}("),
+        format!("create function public.{name}("),
+    ];
+    let mut found = None;
+    for p in migration_files() {
+        let n = normalise(&strip_sql_comments(&std::fs::read_to_string(&p).unwrap()));
+        let Some(at) = heads.iter().filter_map(|h| n.rfind(h.as_str())).max() else {
+            continue;
+        };
+        let after = &n[at + 1..];
+        let end = ["create or replace function", "create function"]
+            .iter()
+            .filter_map(|k| after.find(k))
+            .min()
+            .map_or(n.len(), |e| at + 1 + e);
+        found = Some((p.clone(), n[at..end].to_string()));
+    }
+    found
+}
+
 #[test]
-fn the_live_function_body_does_not_revive() {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(migrations_root())
-        .expect("read migrations/")
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
-        .collect();
-    files.sort();
-    let definer = files
-        .iter()
-        .rfind(|p| {
-            strip_sql_comments(&std::fs::read_to_string(p).unwrap())
-                .contains("FUNCTION public.epigraph_ensure_personal_group(p_agent uuid)")
-        })
-        .expect("some migration defines epigraph_ensure_personal_group");
-    let body = collapse_ws(&strip_sql_comments(
-        &std::fs::read_to_string(definer).unwrap(),
-    ));
+fn the_latest_definitions_do_not_revive() {
+    for (name, revivals, markers) in GUARDED_DEFINERS {
+        let (file, body) =
+            latest_definition(name).unwrap_or_else(|| panic!("some migration must define {name}"));
+        assert_eq!(
+            revival_count(&body),
+            *revivals,
+            "the latest definition of {name} ({}) carries a different number of \
+             `revoked_at = NULL` assignments than GUARDED_DEFINERS registers",
+            file.display()
+        );
+        for m in *markers {
+            assert!(
+                body.contains(m),
+                "the latest definition of {name} ({}) must contain `{m}`",
+                file.display()
+            );
+        }
+    }
+    let (ensure_file, _) = latest_definition("epigraph_ensure_personal_group").unwrap();
     assert!(
-        !body.contains("revoked_at = NULL"),
-        "the latest definition of epigraph_ensure_personal_group ({}) contains `revoked_at = \
-         NULL`: migration 105's contract is refuse, never revive",
-        definer.display()
+        repo_rel(&ensure_file).as_str() >= "migrations/105_personal_group_no_revival.sql",
+        "105 or later must hold the latest definition of epigraph_ensure_personal_group, got {}",
+        ensure_file.display()
     );
+}
+
+/// ARM 4. The live database: every function whose CURRENT source assigns
+/// `revoked_at = NULL` (any case or spacing) must be allow-listed. Calibrated
+/// in-test: a reviving function is created in this throwaway database first,
+/// and the scan must flag it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_live_function_body_revives(pool: sqlx::PgPool) {
+    const LIVE_REVIVERS: &str = "SELECT p.proname::text FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \
+           AND p.prosrc ~* 'revoked_at\\s*=\\s*null' \
+         ORDER BY 1";
+
+    // CALIBRATION: spelled the way the review's respellings were (lowercase
+    // `null`, no spaces, no schema prefix).
+    sqlx::query(
+        "CREATE FUNCTION ratchet_calibration_revive(p uuid) RETURNS void \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           UPDATE group_memberships SET revoked_at=null, role='admin' WHERE agent_id = p; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the calibration function");
+    let with_calibration: Vec<String> = sqlx::query_scalar(LIVE_REVIVERS)
+        .fetch_all(&pool)
+        .await
+        .expect("scan pg_proc");
     assert!(
-        body.contains("RVK01"),
-        "the latest definition ({}) must raise the named refusal RVK01",
-        definer.display()
+        with_calibration
+            .iter()
+            .any(|n| n == "ratchet_calibration_revive"),
+        "the pg_proc scan must flag a reviving body; flagged {with_calibration:?}"
+    );
+    sqlx::query("DROP FUNCTION ratchet_calibration_revive(uuid)")
+        .execute(&pool)
+        .await
+        .expect("drop the calibration function");
+
+    let live: Vec<String> = sqlx::query_scalar(LIVE_REVIVERS)
+        .fetch_all(&pool)
+        .await
+        .expect("scan pg_proc");
+    let mut allowed = Vec::new();
+    for (name, why) in LIVE_REVIVE_ALLOWLIST {
+        assert!(
+            why.len() > 40,
+            "every allow-list entry must carry its reason"
+        );
+        allowed.push((*name).to_string());
+    }
+    assert_eq!(
+        live, allowed,
+        "a function in the migrated database assigns `revoked_at = NULL`. Reviving a revoked \
+         membership is an operator decision; a definer that does it needs a reviewed \
+         LIVE_REVIVE_ALLOWLIST entry."
     );
 }
 
@@ -593,4 +848,44 @@ fn the_scanner_sees_calls_and_ignores_prose() {
     ))
     .contains("revoked_at = NULL"));
     assert!(!strip_sql_comments("-- ON CONFLICT DO UPDATE SET revoked_at = NULL").contains("NULL"));
+}
+
+/// CALIBRATION for arms 2 and 3: every respelling the batch F review used to
+/// slip past the old exact-string match is seen, and non-revivals are not.
+#[test]
+fn the_revival_matcher_sees_every_spelling() {
+    for spelled in [
+        "UPDATE group_memberships SET revoked_at = NULL, role = 'admin'",
+        "DO UPDATE SET revoked_at = null, role = 'admin'",
+        "SET revoked_at=NULL, role='admin'",
+        "SET \"revoked_at\"\n   =\n Null",
+        "set REVOKED_AT = NULL::timestamptz",
+    ] {
+        assert_eq!(revival_count(spelled), 1, "must see: {spelled}");
+    }
+    for not_a_revival in [
+        "WHERE revoked_at IS NULL",
+        "SET revoked_at = now()",
+        "SET revoked_at = NULLIF(x, y)",
+        "SET unrevoked_at = NULL",
+    ] {
+        assert_eq!(
+            revival_count(not_a_revival),
+            0,
+            "must not see: {not_a_revival}"
+        );
+    }
+    assert_eq!(
+        revival_count(&strip_sql_comments(
+            "/* SET revoked_at = NULL */ SELECT 1; -- revoked_at = NULL"
+        )),
+        0,
+        "comments are not statements"
+    );
+    // Arm 3's definition finder: unqualified, quoted, split across lines, any
+    // case.
+    let n = normalise("create or replace\n  function Epigraph_Ensure_Personal_Group (p uuid)");
+    assert!(n.contains("create or replace function epigraph_ensure_personal_group("));
+    let q = normalise("CREATE FUNCTION \"public\" . \"epigraph_community_add_member\"(a uuid)");
+    assert!(q.contains("create function public.epigraph_community_add_member("));
 }
