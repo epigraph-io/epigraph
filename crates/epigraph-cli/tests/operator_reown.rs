@@ -664,6 +664,19 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
     );
     assert!(o.contains(&format!("SPILL-WRITER\t{}", fx.stranger)), "{o}");
     assert!(o.contains("SHARED-FRAGMENTS\t1"), "{o}");
+    // The review's finding: `edge_prior` (c_world -> held c_third) is
+    // rewritten to the meet although c_third does not move. It must be
+    // reported against c_world, and the edges between two MOVING claims
+    // (edge_plain, edge_w) must not be.
+    assert!(
+        o.contains(&format!("NEIGHBOUR-EDGES\t{}\t1\t", fx.c_world)),
+        "{o}"
+    );
+    assert!(
+        !o.contains(&format!("NEIGHBOUR-EDGES\t{}\t", fx.c_personal))
+            && !o.contains(&format!("NEIGHBOUR-EDGES\t{}\t", fx.c_actor)),
+        "{o}"
+    );
     assert!(
         o.contains("evidence: rows moved: 4, all public before and after"),
         "{o}"

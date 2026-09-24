@@ -430,11 +430,16 @@ pub struct Spill {
     pub unattributed: BTreeMap<String, usize>,
     /// Fragments that are also the provenance of a claim not being moved.
     pub shared_fragments: usize,
+    /// Per eligible claim: edges whose OTHER endpoint is a claim that is not
+    /// moving (held, or not listed). The trigger recomputes their owner as
+    /// the meet, so a held claim's neighbourhood is rewritten too.
+    pub neighbour_edges: BTreeMap<Uuid, usize>,
 }
 
 async fn spill(
     conn: &mut PgConnection,
     attached: &Snapshot,
+    eligible: &BTreeSet<Uuid>,
     operator: Uuid,
     caches: &mut Caches,
 ) -> anyhow::Result<Spill> {
@@ -442,6 +447,16 @@ async fn spill(
     for a in attached.values() {
         if a.shared_outside {
             s.shared_fragments += 1;
+        }
+        if a.table == "edges"
+            && a.claims
+                .iter()
+                .chain(a.neighbours.iter())
+                .any(|c| !eligible.contains(c))
+        {
+            for c in a.claims.intersection(eligible) {
+                *s.neighbour_edges.entry(*c).or_default() += 1;
+            }
         }
         match a.writer {
             Some(w) => {
@@ -1021,7 +1036,15 @@ pub async fn run(
     for (t, _) in plan.attached.keys() {
         *report.plan_attached_by_table.entry(t.clone()).or_default() += 1;
     }
-    report.spill = spill(conn, &plan.attached, opts.operator, &mut caches).await?;
+    let eligible_set: BTreeSet<Uuid> = plan.eligible.iter().map(|c| c.id).collect();
+    report.spill = spill(
+        conn,
+        &plan.attached,
+        &eligible_set,
+        opts.operator,
+        &mut caches,
+    )
+    .await?;
 
     writeln!(
         out,
@@ -1082,6 +1105,14 @@ pub async fn run(
             "SHARED-FRAGMENTS\t{}\t(also the provenance of a claim not being moved; they move \
              with the eligible claim, and stay public)",
             report.spill.shared_fragments
+        )?;
+    }
+    for (c, n) in &report.spill.neighbour_edges {
+        writeln!(
+            out,
+            "NEIGHBOUR-EDGES\t{c}\t{n}\t(edges to a claim that is NOT moving: the trigger \
+             recomputes their owner as the meet of their endpoints, so that claim's \
+             neighbourhood is rewritten too; they stay public, and the manifest records them)"
         )?;
     }
 
