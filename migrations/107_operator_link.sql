@@ -356,6 +356,29 @@
 -- anyone's operator, through the refusal-only read
 -- `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`).
 --
+-- THE FINGERPRINT IS FORGEABLE, SO IT IS A FIRST-LINK CHECK ONLY. The edges it
+-- counts are not a trusted record: `edges_tenancy` admits an app session's
+-- insert of an agent-to-agent edge (070/072 stamp agent endpoints
+-- `('public', world)`), and REST `create_edge` accepts OPERATED_BY with
+-- arbitrary properties, so neither the relationship nor a `source` property
+-- can tell a lineage edge from a forged one. Review measured the consequence:
+-- `epigraph_app` stamped as an unrelated principal inserted two
+-- `X --OPERATED_BY--> {c, d}` edges, and the next `epigraph_link_operator(X, O)`
+-- -- X's own stdio relink, which `epigraph-mcp` treats as fatal -- raised
+-- 55000. The forged edges granted nothing (the actor read was unchanged), but
+-- they denied service. So both checks are skipped on an EXACT relink, i.e.
+-- when an `operator_links` row for the same (agent, operator) pair already
+-- exists: the relink records nothing new, and a linked agent that later
+-- becomes a shared signer is still refused on HTTP by `epigraph_mcp::operator`.
+--
+-- RESIDUAL, ACCEPTED: a FIRST link can still be refused by forged edges (from
+-- the agent, or from the operator, which blocks every new link to it). That
+-- refusal is loud, writes nothing, and fails closed; a stdio process that has
+-- never been linked stops at startup with the fingerprint message, and the
+-- operator can see the edges that caused it. Closing it needs app sessions to
+-- stop writing OPERATED_BY edges whose source is another agent, which is an
+-- `edges` policy change outside this file.
+--
 -- ===================================================================
 -- 10. LINK WRITES ARE SERIALISED
 --
@@ -532,20 +555,27 @@ BEGIN
                         'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
-    -- A SHARED SIGNER is neither linkable nor an operator (section 9).
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_operator: agent % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing to link it', p_agent
-            USING ERRCODE = '55000';
-    END IF;
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_operator: operator % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing it as an operator', p_operator
-            USING ERRCODE = '55000';
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
+    -- on a FIRST link only: an exact relink (a row for this very pair already
+    -- exists) records nothing new, and the edges the check counts are
+    -- writable by any app session, so counting them on a relink turned forged
+    -- edges into a fatal stdio startup for an agent that was already linked.
+    IF NOT EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.operator_id = p_operator) THEN
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_operator: agent % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing to link it', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_operator: operator % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
     END IF;
 
     -- (a) The operator's personal group, through THE personal-group definer,
@@ -684,20 +714,27 @@ BEGIN
                         'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
-    -- A SHARED SIGNER is neither linkable nor an operator (section 9).
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing to link it', p_agent
-            USING ERRCODE = '55000';
-    END IF;
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_retired_agent: operator % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing it as an operator', p_operator
-            USING ERRCODE = '55000';
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
+    -- on a FIRST link only: an exact relink (a row for this very pair already
+    -- exists) records nothing new, and the edges the check counts are
+    -- writable by any app session, so counting them on a relink turned forged
+    -- edges into a fatal stdio startup for an agent that was already linked.
+    IF NOT EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.operator_id = p_operator) THEN
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_agent: agent % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing to link it', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_agent: operator % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
     END IF;
 
     -- The operator's personal group, through the one personal-group definer:

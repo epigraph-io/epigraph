@@ -575,6 +575,62 @@ async fn a_shared_signer_is_refused_as_agent_and_as_operator(pool: PgPool) {
     );
 }
 
+/// Forged OPERATED_BY edges cannot make an existing link's relink fatal
+/// (107 section 9: the fingerprint is a FIRST-link check).
+///
+/// Review measured the denial of service: an unrelated app principal inserted
+/// two `X --OPERATED_BY--> {c, d}` edges, and X's next stdio relink
+/// (`epigraph_link_operator(X, O)`, fatal at startup) raised 55000. Forging
+/// two edges from O did the same to every agent linked to O. Here both
+/// forgeries are made, and the relinks of the existing links (acting and
+/// retired) still succeed and still report the link.
+///
+/// CALIBRATION: the fingerprint still refuses a FIRST link, for a fresh agent
+/// with the same two edges and for a fresh agent naming the forged operator
+/// (the accepted residual), so the relink arm is the pair-exists skip and not
+/// a check that was switched off.
+#[sqlx::test(migrations = "../../migrations")]
+async fn forged_lineage_edges_cannot_break_an_existing_links_relink(pool: PgPool) {
+    let operator = seed_bare_agent(&pool).await;
+    let x = seed_bare_agent(&pool).await;
+    let r = seed_bare_agent(&pool).await;
+    let (c, d) = (seed_bare_agent(&pool).await, seed_bare_agent(&pool).await);
+    assert!(link(&pool, x, operator).await.link_live);
+    assert!(link_retired(&pool, r, operator).await.link_created);
+
+    for forged_from in [x, r, operator] {
+        lineage_edge(&pool, forged_from, c).await;
+        lineage_edge(&pool, forged_from, d).await;
+    }
+
+    let relinked = link(&pool, x, operator).await;
+    assert!(
+        relinked.link_live,
+        "the relink of an existing acting link lost the link: {relinked:?}"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let retired_again = AgentRepository::link_retired_agent(&mut conn, r, operator)
+        .await
+        .expect("the relink of an existing retired link must not be refused by forged edges");
+    assert!(
+        !retired_again.link_created && retired_again.link_retired,
+        "{retired_again:?}"
+    );
+
+    // CALIBRATION: first links are still fingerprinted.
+    let fresh = seed_bare_agent(&pool).await;
+    lineage_edge(&pool, fresh, c).await;
+    lineage_edge(&pool, fresh, d).await;
+    let err = AgentRepository::link_operator(&mut conn, fresh, seed_bare_agent(&pool).await)
+        .await
+        .expect_err("CALIBRATION: a first link of a two-edge agent is still refused");
+    assert!(err.to_string().contains("more than one principal"), "{err}");
+    let err = AgentRepository::link_operator(&mut conn, seed_bare_agent(&pool).await, operator)
+        .await
+        .expect_err("CALIBRATION (the residual): a first link to the forged operator is refused");
+    assert!(err.to_string().contains("more than one principal"), "{err}");
+}
+
 /// `link_live` reports what the authoring and ownership paths will actually
 /// read, not merely that a membership row is live.
 ///
