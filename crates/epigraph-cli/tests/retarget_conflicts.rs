@@ -491,17 +491,18 @@ async fn dry_run_calls_the_llm_and_writes_nothing(pool: PgPool) {
 
     assert_eq!(llm.call_count(), 1, "the dry-run plan is a REAL LLM plan");
     assert_eq!(run.plan[0].chosen_atom_ids, vec![w.atoms[0], w.atoms[1]]);
-    assert!(run.applied.is_empty());
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        0,
-        "dry run must send no request"
-    );
+    // The observable effects first, so a broken gate fails on WHAT it wrote.
     assert_eq!(
         snapshot(&pool, &w).await,
         before,
         "dry run must write nothing"
     );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "dry run must send no request"
+    );
+    assert!(run.applied.is_empty());
     let parent_props = &edges_between(&pool, w.source, w.parent, "contradicts").await[0].1;
     assert!(parent_props.get("retargeted_to").is_none());
     let raw = std::fs::read_to_string(&manifest).unwrap();
