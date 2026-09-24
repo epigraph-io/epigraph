@@ -72,6 +72,11 @@
 -- `epigraph_operator_of_author` (107, EXECUTE granted to `epigraph_app`),
 -- because an app session cannot see `operator_links`.
 --
+-- The trigger covers rows written AFTER the retire. A row that PREDATES it is
+-- 107's: `epigraph_link_retired_agent` refuses the retire while the agent holds
+-- a live `writer`/`admin` row in the operator's group, checked under row locks
+-- (107 section 7), so between the two a retired identity never holds one.
+--
 -- Batch F has no counterpart to this rule, so it is kept. Its writers do not
 -- meet it: 106's `epigraph_community_add_member` restores a revoked row only at
 -- `reader`, and 105's `epigraph_ensure_personal_group` writes only the agent's
