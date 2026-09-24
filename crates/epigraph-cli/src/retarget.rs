@@ -384,7 +384,10 @@ pub fn read_retarget_manifest(
 }
 
 #[cfg(feature = "db")]
-pub use db::{apply_entry, apply_retarget, load_retarget_items, EdgeApiClient};
+pub use db::{
+    apply_entry, apply_retarget, load_retarget_items, run_retarget, EdgeApiClient, RetargetOptions,
+    RetargetRun,
+};
 
 #[cfg(feature = "db")]
 mod db {
@@ -687,6 +690,58 @@ mod db {
             Err(e) => applied.errors.push(format!("mark parent: {e}")),
         }
         Ok(Some(applied))
+    }
+
+    /// What one `--retarget` invocation does, besides the manifest path.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RetargetOptions {
+        pub include_marked: bool,
+        pub limit: usize,
+        pub batch_size: usize,
+        /// `false` (the default in the binary) is the dry run: the LLM is
+        /// called and the manifest written, and NOTHING reaches the API.
+        pub apply: bool,
+    }
+
+    /// The outcome of [`run_retarget`].
+    #[derive(Debug, Default)]
+    pub struct RetargetRun {
+        pub plan: Vec<RetargetPlanEntry>,
+        /// Empty on a dry run.
+        pub applied: Vec<AppliedEntry>,
+    }
+
+    /// The whole `--retarget` / `--retarget --apply` flow, as the binary runs
+    /// it: load candidates → (none: return, no LLM call) → plan through the
+    /// LLM → append plan lines to `manifest` → if and only if
+    /// `opts.apply`, write through `api` and append the applied lines.
+    ///
+    /// # Errors
+    /// Database or manifest I/O failure; `opts.apply` without an `api`.
+    pub async fn run_retarget(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        llm: &dyn epigraph_interfaces::LlmProvider,
+        api: Option<&EdgeApiClient>,
+        manifest: &std::path::Path,
+        opts: RetargetOptions,
+    ) -> Result<RetargetRun, Box<dyn std::error::Error>> {
+        let items = load_retarget_items(pool, viewer, opts.include_marked, opts.limit).await?;
+        if items.is_empty() {
+            return Ok(RetargetRun::default());
+        }
+        let plan = super::plan_retarget(&items, llm, opts.batch_size).await;
+        super::append_jsonl(manifest, &plan)?;
+        if !opts.apply {
+            return Ok(RetargetRun {
+                plan,
+                applied: vec![],
+            });
+        }
+        let api = api.ok_or("retarget apply requires an API client")?;
+        let applied = apply_retarget(pool, viewer, api, &plan).await?;
+        super::append_jsonl(manifest, &applied)?;
+        Ok(RetargetRun { plan, applied })
     }
 
     /// Apply every `atoms` entry in `plan`, in order.

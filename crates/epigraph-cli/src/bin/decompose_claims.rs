@@ -65,8 +65,8 @@ use epigraph_cli::decompose::{
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
-    append_jsonl, apply_retarget, load_retarget_items, plan_retarget, read_retarget_manifest,
-    verdict, EdgeApiClient,
+    append_jsonl, apply_retarget, load_retarget_items, read_retarget_manifest, run_retarget,
+    verdict, EdgeApiClient, RetargetOptions,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -654,24 +654,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::RetargetDryRun(manifest) | Mode::RetargetApply(manifest) => {
             let apply = cli.apply;
             fresh_manifest(&manifest)?;
-            let limit = usize::try_from(cli.limit.max(1)).unwrap_or(1);
-            let items = load_retarget_items(pool, viewer, cli.include_marked, limit).await?;
+            let opts = RetargetOptions {
+                include_marked: cli.include_marked,
+                limit: usize::try_from(cli.limit.max(1)).unwrap_or(1),
+                batch_size: cli.batch_size,
+                apply,
+            };
+            let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
+            // The dry run is handed NO API client at all, so it cannot write
+            // even through a bug in the `apply` gate below it.
+            let api = apply.then(|| EdgeApiClient {
+                http,
+                api_base,
+                token,
+            });
+            let run =
+                run_retarget(pool, viewer, llm.as_ref(), api.as_ref(), &manifest, opts).await?;
             eprintln!(
                 "retarget: {} conflict edges on decomposed parents{}",
-                items.len(),
+                run.plan.len(),
                 if cli.include_marked {
                     " (including already-marked)"
                 } else {
                     " (already-marked edges skipped)"
                 }
             );
-            if items.is_empty() {
+            if run.plan.is_empty() {
                 return Ok(());
             }
-            let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
-            let plan = plan_retarget(&items, llm.as_ref(), cli.batch_size).await;
-            append_jsonl(&manifest, &plan)?;
-            print_retarget_plan(&plan);
+            print_retarget_plan(&run.plan);
             eprintln!("manifest: {}", manifest.display());
             if !apply {
                 eprintln!(
@@ -680,14 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
-            let api = EdgeApiClient {
-                http,
-                api_base,
-                token,
-            };
-            let applied = apply_retarget(pool, viewer, &api, &plan).await?;
-            append_jsonl(&manifest, &applied)?;
-            print_applied(&applied);
+            print_applied(&run.applied);
         }
         Mode::RetargetApplyPlan(manifest) => {
             let plan = read_retarget_manifest(&manifest)?;
