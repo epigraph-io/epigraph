@@ -7,10 +7,11 @@
 //! subcommand connects on `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` alone and refuses
 //! a session user that is not a member of `epigraph_maintenance`.
 //!
-//! Exit codes: 0 success; 1 refused or failed before writing; 2 a batch
-//! violated an invariant and was rolled back (under `--apply` the run stops
-//! there); 3 `link-retired` refused at least one id, or `reown-reverse` HELD at
-//! least one claim (it is not fully restored).
+//! Exit codes: 0 success; 1 refused or failed before writing (for
+//! `hide-evidence --apply`, also an invariant violation, rolled back); 2 a
+//! batch violated an invariant and was rolled back (under `--apply` the run
+//! stops there); 3 `link-retired` refused at least one id, or `reown-reverse`
+//! HELD at least one claim or hidden row (it is not fully restored).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> [--apply]
@@ -18,7 +19,9 @@
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
 //!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
 //!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
-//!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f]
+//!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
+//!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
+//!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{self, hide, link, reown, reverse};
@@ -81,8 +84,8 @@ enum Command {
         #[command(flatten)]
         hide: hide::HideArgs,
     },
-    /// Report (and, where the schema allows, hide) selected evidence on claims
-    /// that are not moving.
+    /// Report, and with `--apply` hide and pin, selected evidence on the
+    /// operator's claims. Reversed by `reown-reverse --manifest`.
     HideEvidence {
         /// One claim UUID per line: the claims whose evidence is in scope.
         #[arg(long)]
@@ -92,9 +95,23 @@ enum Command {
         operator: Uuid,
         #[command(flatten)]
         hide: hide::HideArgs,
-        /// Hide the selected rows. Refused in this build; see `hide.rs`.
+        /// Hide the selected rows. Needs `--confirm-hide <N>` and
+        /// `--manifest-out`, and the kernel pin guard (migration 110).
         #[arg(long)]
         apply: bool,
+        /// Where to write the undo manifest under `--apply`. Must not exist.
+        /// Written and fsynced before the write.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// Recorded on every pin.
+        #[arg(
+            long,
+            default_value = "hidden by the operator (epigraph-operator hide-evidence)"
+        )]
+        reason: String,
+        /// `lock_timeout` for the write (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
     },
     /// Restore every row a manifest's run moved to the owner it recorded.
     ReownReverse {
@@ -191,12 +208,23 @@ async fn main_inner() -> anyhow::Result<i32> {
             operator: op,
             hide,
             apply,
+            manifest_out,
+            reason,
+            lock_timeout,
         } => {
             let ids = operator::read_ids_file(&claims_file)?;
             if ids.is_empty() {
                 anyhow::bail!("no claim ids in {}", claims_file.display());
             }
-            hide::run_standalone(&mut conn, op, &ids, &hide, apply, &mut stdout).await?;
+            let opts = hide::Standalone {
+                operator: op,
+                args: hide,
+                apply,
+                manifest_out,
+                reason,
+                lock_timeout,
+            };
+            hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
             Ok(0)
         }
         Command::ReownReverse {

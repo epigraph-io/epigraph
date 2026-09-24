@@ -1,7 +1,7 @@
 //! `epigraph-operator`: the reviewed, in-repo tool for the one-time operator
 //! ownership backfill that migration 107 left out of scope.
 //!
-//! Three subcommands, each dry-run by default:
+//! Four subcommands, each dry-run by default:
 //!
 //! * `link-retired` — call `epigraph_link_retired_agent` for a list of
 //!   historical agent identities, so the operator OWNS their claims while the
@@ -12,7 +12,11 @@
 //! * `reown-reverse` — restore every row a manifest's run moved to the owner it
 //!   recorded, as a compare-and-swap against the post-state and neighbour
 //!   records the run wrote (a claim something has moved since is HELD, exit
-//!   3). Several `--manifest`s are applied newest-first by `created_at`.
+//!   3). Several `--manifest`s are applied newest-first by `created_at`. A
+//!   `hide-evidence` manifest is reversed too (unpinned, prior tenancy back).
+//! * `hide-evidence` — hide and PIN selected evidence rows on the operator's
+//!   claims (Amendment 2; migration 110's `evidence_visibility_pins` keeps
+//!   them hidden), under the guards and manifest `hide`'s module doc lists.
 //!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an

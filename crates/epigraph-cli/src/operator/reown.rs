@@ -1126,17 +1126,21 @@ pub async fn run(
         let guard = super::hide::guard_status(conn).await?;
         if opts.apply {
             // Refused BEFORE the manifest and before any write: a re-own that
-            // was asked to hide must not run half of what it was asked.
+            // was asked to hide must not run half of what it was asked. The
+            // plan's own refusals first, so their messages still name the
+            // count, the unenforced policy or the missing guard.
             super::hide::refuse_apply(&hide_plan, &opts.hide, &policies, guard)?;
+            super::hide::refuse_hide_in_reown()?;
         }
         writeln!(
             out,
-            "HIDE: not simulated in this dry run; the re-own below runs WITHOUT it. --apply \
-             with a hide selector refuses in this build ({})",
+            "HIDE: not simulated in this dry run; the re-own below runs WITHOUT it. \
+             reown-claims --apply with a hide selector refuses: re-own first, then run \
+             hide-evidence --apply over the moved claims{}",
             if guard.complete() {
-                "it has no hide write path"
+                ""
             } else {
-                "the kernel pin guard is absent from this schema"
+                " (and the kernel pin guard, migration 110, is absent from this schema)"
             }
         )?;
     }

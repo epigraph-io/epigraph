@@ -519,6 +519,10 @@ pub struct Report {
     pub already: usize,
     pub missing_rows: usize,
     pub batch_failures: Vec<(usize, String)>,
+    /// Hide manifests: rows unpinned and put back on their prior tenancy.
+    pub evidence_unhidden: usize,
+    /// Hide manifests: rows already on their prior tenancy, unpinned.
+    pub evidence_already: usize,
 }
 
 fn tally(
@@ -609,9 +613,17 @@ pub async fn run(
     let specs = tables::propagated_tables(conn).await?;
     let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
     tables::probe_session_switch(conn).await?;
+    // A hide manifest (`hide-evidence --apply`) is reversed by
+    // `hide::reverse_manifest`; every other manifest is a re-own. Both kinds
+    // share one newest-first order, so a hide over re-owned claims is undone
+    // before the re-own it followed.
     let mut resolved = Vec::with_capacity(ordered.len());
     for (p, m) in &ordered {
-        resolved.push((p, resolve(m, &specs)?));
+        if super::hide::is_hide_manifest(m) {
+            resolved.push((p, None, m));
+        } else {
+            resolved.push((p, Some(resolve(m, &specs)?), m));
+        }
     }
     writeln!(
         out,
@@ -620,7 +632,44 @@ pub async fn run(
         if opts.apply { "APPLY" } else { "DRY-RUN" }
     )?;
     let mut report = Report::default();
-    'manifests: for (path, res) in &resolved {
+    'manifests: for (path, res, m) in &resolved {
+        let Some(res) = res else {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            let r = super::hide::reverse_manifest(&mut tx, m, &opts.lock_timeout).await;
+            let ok = r.is_ok();
+            if opts.apply && ok {
+                tx.commit().await?;
+            } else {
+                tx.rollback().await?;
+            }
+            match r {
+                Ok(u) => {
+                    writeln!(
+                        out,
+                        "HIDE-MANIFEST\t{}\tOK\t{} row(s) unhidden, {} already unhidden, {} held, \
+                         {} no longer exist",
+                        path.display(),
+                        u.restored,
+                        u.already,
+                        u.held.len(),
+                        u.missing
+                    )?;
+                    report.evidence_unhidden += u.restored;
+                    report.evidence_already += u.already;
+                    report.missing_rows += u.missing;
+                    report.held.extend(u.held);
+                }
+                Err(e) => {
+                    writeln!(out, "HIDE-MANIFEST\t{}\tROLLED BACK\t{e:#}", path.display())?;
+                    report.batch_failures.push((0, format!("{e:#}")));
+                    if opts.apply {
+                        writeln!(out, "STOPPED: no further manifest was attempted")?;
+                        break 'manifests;
+                    }
+                }
+            }
+            continue;
+        };
         writeln!(
             out,
             "MANIFEST\t{}\ttarget_group={}\tclaims={}\tmoved={}\trows={}",
@@ -662,7 +711,19 @@ pub async fn run(
         "  claims planned but never moved by their run (untouched): {}",
         report.never_moved
     )?;
-    writeln!(out, "  claims HELD: {}", report.held.len())?;
+    writeln!(out, "  claims or hidden rows HELD: {}", report.held.len())?;
+    if report.evidence_unhidden + report.evidence_already > 0 {
+        writeln!(
+            out,
+            "  hidden evidence rows unhidden (unpinned, prior tenancy restored): {}",
+            report.evidence_unhidden
+        )?;
+        writeln!(
+            out,
+            "  hidden evidence rows already on their prior state: {}",
+            report.evidence_already
+        )?;
+    }
     for (t, n) in &report.rows_restored {
         writeln!(out, "  {t}: rows restored to their own recorded owner: {n}")?;
     }

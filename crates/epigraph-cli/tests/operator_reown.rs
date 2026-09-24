@@ -2244,11 +2244,12 @@ async fn hide_evidence_dry_run_previews_and_writes_nothing(pool: PgPool) {
     assert_same(&before, &snapshot(&pool, false).await, "hide dry run");
 }
 
-/// `--apply` needs `--confirm-hide <N>` equal to the planned count, and then
-/// refuses because the kernel guard that keeps a hidden row hidden is absent
-/// from this schema. Nothing is written on any of the three.
+/// `--apply` needs `--confirm-hide <N>` equal to the planned count, then
+/// `--manifest-out`, and it refuses on a schema without the kernel guard
+/// (migration 110's pin table), before the manifest. Nothing is written on any
+/// of the four.
 #[sqlx::test(migrations = "../../migrations")]
-async fn hide_apply_requires_the_confirm_count_and_the_kernel_guard(pool: PgPool) {
+async fn hide_apply_requires_the_confirm_count_a_manifest_and_the_kernel_guard(pool: PgPool) {
     let h = hide_fixture(&pool).await;
     let before = snapshot(&pool, false).await;
     let none = hide_run(&pool, &h, &["--apply"]).await;
@@ -2267,16 +2268,35 @@ async fn hide_apply_requires_the_confirm_count_and_the_kernel_guard(pool: PgPool
         "{}",
         wrong.show()
     );
-    let right = hide_run(&pool, &h, &["--apply", "--confirm-hide", "2"]).await;
-    assert_eq!(right.code, 1, "{}", right.show());
+    let no_manifest = hide_run(&pool, &h, &["--apply", "--confirm-hide", "2"]).await;
+    assert_eq!(no_manifest.code, 1, "{}", no_manifest.show());
     assert!(
-        right
+        no_manifest.stderr.contains("requires --manifest-out"),
+        "{}",
+        no_manifest.show()
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "refused hides");
+
+    // Without the guard: the pin table gone, `guard_status` reads the catalog.
+    exec(&pool, "DROP TABLE evidence_visibility_pins").await;
+    let mf = h.dir.join("guardless.jsonl");
+    let m = mf.to_str().unwrap();
+    let guardless = hide_run(
+        &pool,
+        &h,
+        &["--apply", "--confirm-hide", "2", "--manifest-out", m],
+    )
+    .await;
+    assert_eq!(guardless.code, 1, "{}", guardless.show());
+    assert!(
+        guardless
             .stderr
             .contains("kernel guard that keeps a hidden row hidden"),
         "{}",
-        right.show()
+        guardless.show()
     );
-    assert_same(&before, &snapshot(&pool, false).await, "refused hides");
+    assert!(!mf.exists(), "refused before the manifest");
+    assert_same(&before, &snapshot(&pool, false).await, "guardless hide");
 }
 
 /// Can an UNSTAMPED `epigraph_app` session read evidence row `ev`?
@@ -2299,8 +2319,9 @@ async fn app_reads_evidence(pool: &PgPool, ev: Uuid) -> i64 {
 /// always-true SELECT policy. First the measurement that makes it matter — an
 /// unstamped `epigraph_app` session reads the group-private evidence row with
 /// it and not without it. Then: the dry run warns loudly, `--apply` refuses
-/// without `--accept-unenforced-hide`, and with it gets past that check to the
-/// next refusal.
+/// without `--accept-unenforced-hide`, and with it hides and pins the rows but
+/// reports them NOT ENFORCED (measured: the app session still reads them),
+/// and `reown-reverse` restores the prior state exactly.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unenforced_hide_is_detected_warned_and_refused(pool: PgPool) {
     let h = hide_fixture(&pool).await;
@@ -2332,20 +2353,46 @@ async fn an_unenforced_hide_is_detected_warned_and_refused(pool: PgPool) {
         "{}",
         refused.show()
     );
+    let mf = h.dir.join("unenforced.jsonl");
     let accepted = hide_run(
         &pool,
         &h,
-        &["--apply", "--confirm-hide", "2", "--accept-unenforced-hide"],
+        &[
+            "--apply",
+            "--confirm-hide",
+            "2",
+            "--accept-unenforced-hide",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+        ],
     )
     .await;
-    assert_eq!(accepted.code, 1, "{}", accepted.show());
+    assert_eq!(accepted.code, 0, "{}", accepted.show());
     assert!(
-        accepted.stderr.contains("kernel guard")
-            && !accepted.stderr.contains("--accept-unenforced-hide"),
-        "past the policy check, the guard refuses: {}",
+        accepted
+            .stdout
+            .contains("NOT ENFORCED while evidence_privacy"),
+        "an accepted unenforced hide must say so: {}",
         accepted.show()
     );
-    assert_same(&before, &snapshot(&pool, false).await, "unenforced hide");
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await,
+        (h.fx.target, "group".to_string()),
+        "the row is hidden and pinned"
+    );
+    assert_eq!(
+        app_reads_evidence(&pool, h.ev_testimony).await,
+        1,
+        "and still readable to an app session while the permissive policy exists: MEASURED, \
+         which is exactly why the run refused without --accept-unenforced-hide"
+    );
+    let rv = reverse(&pool, &mf, true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "unenforced hide reversed",
+    );
 }
 
 /// `reown-claims` with a hide selector: the dry run prints the hide plan and
@@ -2390,12 +2437,209 @@ async fn reown_with_hide_flags_previews_and_refuses_apply_before_writing(pool: P
     apply.extend_from_slice(&["--apply", "--confirm-hide", "1"]);
     let r = run_op(&pool, &apply).await;
     assert_eq!(r.code, 1, "{}", r.show());
-    assert!(r.stderr.contains("kernel guard"), "{}", r.show());
+    assert!(
+        r.stderr
+            .contains("reown-claims does not hide under --apply"),
+        "{}",
+        r.show()
+    );
     assert!(!mf.exists(), "refused before the manifest");
     assert_same(
         &before,
         &snapshot(&pool, false).await,
         "refused hide re-own",
+    );
+}
+
+async fn tenancy_of(pool: &PgPool, ev: Uuid) -> (Uuid, String) {
+    sqlx::query_as("SELECT owner_group_id, visibility::text FROM evidence WHERE id = $1")
+        .bind(ev)
+        .fetch_one(pool)
+        .await
+        .expect("evidence tenancy")
+}
+
+async fn pins(pool: &PgPool) -> Vec<(Uuid, Uuid)> {
+    sqlx::query_as(
+        "SELECT evidence_id, pinned_by FROM evidence_visibility_pins ORDER BY evidence_id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("pins")
+}
+
+async fn hide_apply(pool: &PgPool, h: &HideFx, manifest: &std::path::Path) -> Run {
+    hide_run(
+        pool,
+        h,
+        &[
+            "--apply",
+            "--confirm-hide",
+            "2",
+            "--manifest-out",
+            manifest.to_str().unwrap(),
+        ],
+    )
+    .await
+}
+
+/// B-H1 end to end. `hide-evidence --apply` hides and pins EXACTLY the two
+/// selected public rows (the already-private one is left as it is), changes
+/// no other row of any snapshot table, and an unstamped app session loses
+/// exactly those two. `reown-reverse` on its manifest restores the snapshot
+/// byte for byte and removes both pins; a second reverse changes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hide_evidence_apply_hides_exactly_the_selected_rows_and_reverse_restores_them(
+    pool: PgPool,
+) {
+    let h = hide_fixture(&pool).await;
+    let before = snapshot(&pool, false).await;
+    let private_before = tenancy_of(&pool, h.fx.ev_private).await;
+    assert_eq!(app_reads_evidence(&pool, h.ev_testimony).await, 1);
+    assert_eq!(app_reads_evidence(&pool, h.ev_labelled).await, 1);
+
+    let mf = h.dir.join("hide.jsonl");
+    let r = hide_apply(&pool, &h, &mf).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(r.stdout.contains("INVARIANTS: held"), "{}", r.show());
+    assert!(
+        r.stdout.contains("HIDDEN: 2 evidence row(s)"),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("HIDE-SURFACE\tedges\t"), "{}", r.show());
+    for ev in [h.ev_testimony, h.ev_labelled] {
+        assert_eq!(
+            tenancy_of(&pool, ev).await,
+            (h.fx.target, "group".to_string()),
+            "a selected row is hidden into the operator's group"
+        );
+        assert_eq!(
+            app_reads_evidence(&pool, ev).await,
+            0,
+            "and unreadable to the app"
+        );
+    }
+    assert_eq!(tenancy_of(&pool, h.fx.ev_private).await, private_before);
+    let mut want = vec![
+        (h.ev_testimony, h.fx.operator),
+        (h.ev_labelled, h.fx.operator),
+    ];
+    want.sort();
+    assert_eq!(
+        pins(&pool).await,
+        want,
+        "both rows are pinned, by the operator"
+    );
+
+    // Nothing else changed: every snapshot table but `evidence` is identical,
+    // and in `evidence` exactly the two selected rows differ.
+    let after = snapshot(&pool, false).await;
+    let mut b2 = before.clone();
+    let mut a2 = after.clone();
+    let (be, ae) = (
+        b2.remove("evidence").unwrap(),
+        a2.remove("evidence").unwrap(),
+    );
+    assert_same(&b2, &a2, "every table but evidence");
+    let changed: Vec<&String> = be.iter().filter(|r| !ae.contains(r)).collect();
+    assert_eq!(
+        changed.len(),
+        2,
+        "exactly two evidence rows changed: {changed:?}"
+    );
+    for row in changed {
+        assert!(
+            row.contains(&h.ev_testimony.to_string()) || row.contains(&h.ev_labelled.to_string()),
+            "an unselected evidence row changed: {row}"
+        );
+    }
+
+    // The manifest names both rows, hidden, prior and post.
+    let text = std::fs::read_to_string(&mf).unwrap();
+    assert!(text.contains("\"operation\":\"hide-evidence\""), "{text}");
+    assert_eq!(text.matches("\"hidden\":true").count(), 4, "{text}");
+
+    // A dry reverse reports and rolls back.
+    let dry = reverse(&pool, &mf, false).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("OK\t2 row(s) unhidden"),
+        "{}",
+        dry.show()
+    );
+    assert_same(&after, &snapshot(&pool, false).await, "dry reverse");
+
+    let rv = reverse(&pool, &mf, true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, false).await, "hide reversed");
+    assert!(pins(&pool).await.is_empty(), "reversal removes the pins");
+    assert_eq!(app_reads_evidence(&pool, h.ev_testimony).await, 1);
+
+    let again = reverse(&pool, &mf, true).await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again
+            .stdout
+            .contains("0 row(s) unhidden, 2 already unhidden"),
+        "{}",
+        again.show()
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "second reverse");
+}
+
+/// The point of the pin: a hidden row stays hidden through a later evidence
+/// INSERT for its claim (070 arm c) and a later re-own of its claim (072 arm
+/// d), where it follows the claim's new owner and stays `group`. A reverse
+/// then HOLDS that row (its state and its claim moved since the hide) and
+/// restores the other one, exit 3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_row_survives_later_writes_and_reverse_holds_it_once_its_claim_moved(
+    pool: PgPool,
+) {
+    let h = hide_fixture(&pool).await;
+    let mf = h.dir.join("hide.jsonl");
+    let r = hide_apply(&pool, &h, &mf).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+
+    let late = evidence_typed(&pool, h.fx.c_world, "document", &[], "a later public row").await;
+    assert_eq!(tenancy_of(&pool, late).await.1, "public");
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await,
+        (h.fx.target, "group".to_string()),
+        "an evidence INSERT for the claim must not re-publish the hidden row"
+    );
+
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(h.fx.c_world)
+        .bind(h.fx.third_group)
+        .execute(&pool)
+        .await
+        .expect("a later re-own of the claim");
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await,
+        (h.fx.third_group, "group".to_string()),
+        "a re-own moves the hidden row with its claim and keeps it group"
+    );
+    assert_eq!(app_reads_evidence(&pool, h.ev_testimony).await, 0);
+
+    let rv = reverse(&pool, &mf, true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        rv.stdout.contains(&format!("HELD\t{}", h.ev_testimony)),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await,
+        (h.fx.third_group, "group".to_string()),
+        "a held row is not touched"
+    );
+    assert_eq!(pins(&pool).await, vec![(h.ev_testimony, h.fx.operator)]);
+    assert_eq!(
+        tenancy_of(&pool, h.ev_labelled).await.1,
+        "public",
+        "the row whose claim did not move is restored"
     );
 }
 
