@@ -360,8 +360,9 @@ async fn main() {
             std::env::var("EPIGRAPH_MIGRATE_ON_BOOT").ok().as_deref(),
         ) {
             // Same schema-head checks as `epigraph-migrate` (issue #492): a
-            // database ahead of this binary is refused unless
-            // EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD opts in to the rollback case.
+            // database carrying migrations this binary does not embed is
+            // refused unless EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD opts in to the
+            // rollback case.
             let report = epigraph_api::run_migrations(
                 &pool,
                 epigraph_api::migrate::MigrateOptions::from_env(),
@@ -373,6 +374,7 @@ async fn main() {
                 binary_head = report.binary_head,
                 applied = report.applied_this_run,
                 db_ahead = report.db_ahead,
+                ahead = ?report.ahead,
                 "Migrations up to date"
             );
         } else {

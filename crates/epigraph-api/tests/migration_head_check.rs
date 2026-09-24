@@ -429,6 +429,55 @@ async fn opted_in_run_racing_a_newer_migrator_counts_only_its_own_migrations(poo
     );
 }
 
+/// The largest version below the binary head that the binary does not embed,
+/// excluding internal's 035 (the one exempted foreign version) — e.g. a slot
+/// in the reserved 093-099 headroom a newer build could fill.
+fn unembedded_version_below_head() -> i64 {
+    let embedded = embedded_migration_versions();
+    (1..binary_head())
+        .rev()
+        .find(|v| *v != 35 && !embedded.contains(v))
+        .expect("the embedded set has no gap below its head")
+}
+
+#[sqlx::test(migrations = false)]
+async fn unknown_version_below_the_head_is_refused_unless_opted_in(pool: PgPool) {
+    epigraph_api::run_migrations(&pool, STRICT)
+        .await
+        .expect("migrate to head");
+    let gap = unembedded_version_below_head();
+    record_future_migration(&pool, gap).await;
+
+    // The head is unchanged, so a head comparison alone cannot see this.
+    let err = epigraph_api::run_migrations(&pool, STRICT)
+        .await
+        .expect_err("a newer build's migration below the head must be refused");
+    assert!(
+        matches!(err, MigrationError::DbAheadOfBinary { .. }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains(&gap.to_string()), "{err}");
+
+    let r = epigraph_api::run_migrations(&pool, ALLOW_AHEAD)
+        .await
+        .expect("opt-in proceeds");
+    assert!(r.db_ahead);
+    assert_eq!((r.db_head, r.binary_head), (binary_head(), binary_head()));
+    assert_eq!(r.applied_this_run, 0);
+}
+
+#[sqlx::test(migrations = false)]
+async fn internal_035_below_the_head_is_still_tolerated(pool: PgPool) {
+    epigraph_api::run_migrations(&pool, STRICT)
+        .await
+        .expect("migrate to head");
+    record_future_migration(&pool, 35).await;
+    let r = epigraph_api::run_migrations(&pool, STRICT)
+        .await
+        .expect("prod's 035 must not trip the refusal");
+    assert!(!r.db_ahead);
+}
+
 /// Is every advisory lock in this database released? Polls for up to 500 ms,
 /// because a closed session's backend drops its locks asynchronously.
 ///

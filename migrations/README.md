@@ -461,13 +461,24 @@ mismatch* is not. Prod's missing version 35 is the benign case: there is no
 public `035_*.sql` at all, 035 belongs to internal, and prod's 036/037/038
 descriptions match the public filenames.
 
-Since issue #492 the flag no longer hides a database that is AHEAD of the
-binary: `run_migrations` refuses, before applying anything, when
-`_sqlx_migrations` holds a successful version above the binary's highest
-embedded migration, unless `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1`
-opts in to a rollback. A gap BELOW the head (the 035 case) is still tolerated.
-A database that ever ran internal's `060`–`112` above public's head therefore
-now trips that refusal — deliberately; see the paragraph above.
+Since issue #492 the flag no longer hides a database that carries migrations
+the binary does not embed: `run_migrations` refuses, before applying anything,
+when `_sqlx_migrations` holds a successful version the binary does not embed,
+unless `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` opts in to a
+rollback. That covers versions above the binary's head AND versions that fill a
+gap below it — a newer build's file in this README's reserved headroom
+(`093`–`099`) or held block (`102`–`104`) sits below a head-`106` binary's head
+and is exactly as unknown to it. The only tolerated unknown is internal's
+`035`, listed in `crates/epigraph-api/src/migrate.rs::KNOWN_FOREIGN_VERSIONS`
+on the strength of the 2026-09-02 measurement above; any other version found on
+a deployed database must be identified and either added there with its
+provenance or dealt with by the opt-in. Consequences, all deliberate:
+
+* a database that ever ran internal's `060`–`112` trips the refusal (see the
+  paragraph above);
+* a database migrated by a `feat/operator-scoped-ownership` build (`102`/`103`)
+  is refused by a `main` build that does not embed them, until that branch
+  lands.
 
 ## Migration Order
 

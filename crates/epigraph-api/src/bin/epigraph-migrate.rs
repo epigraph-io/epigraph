@@ -90,9 +90,10 @@ async fn main() {
     // so it is keyed on the opt-in rather than inferred from the report.
     if report.db_ahead && opts.allow_db_ahead {
         eprintln!(
-            "WARNING: database schema head {} is AHEAD of this binary's head {}; proceeding \
-             because the rollback opt-in is set",
-            report.db_head, report.binary_head
+            "WARNING: the database has applied migration version(s) {:?} that this binary \
+             does not embed (database head {}, binary head {}); proceeding because the \
+             rollback opt-in is set",
+            report.ahead, report.db_head, report.binary_head
         );
     }
     tracing::info!(

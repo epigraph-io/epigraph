@@ -29,16 +29,26 @@ the `migrations: ok` marker and now names both heads, e.g.
 nonzero, and never prints the marker, when:
 
 * the database is **ahead** of the binary — `_sqlx_migrations` holds a
-  successful version above the highest migration embedded in this build. The
-  binary is stale; deploy one built from the revision that applied that
-  version. Nothing is applied. For a *deliberate* rollback to an older build,
-  re-run with `--allow-db-ahead` or `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` (the
-  env var also covers `EPIGRAPH_MIGRATE_ON_BOOT=1` on the server); it then
-  applies pending migrations at or below its own head, leaves the newer ones in
-  place, prints a `WARNING`, and appends `db_ahead_of_binary=allowed` to the
-  marker line.
+  successful version this build does not embed. That is a version above the
+  binary's highest embedded migration, *or* one that fills a gap below it (a
+  newer build's migration in reserved headroom such as `093`–`099`, or the
+  `102`–`103` a `feat/operator-scoped-ownership` build would apply), which the
+  head alone cannot show. The one exemption is `epigraph-internal`'s `035`
+  (`KNOWN_FOREIGN_VERSIONS` in `crates/epigraph-api/src/migrate.rs`). The
+  binary is stale; deploy one built from the revision that applied those
+  versions — the refusal lists them. Nothing is applied. For a *deliberate*
+  rollback to an older build, re-run with `--allow-db-ahead` or
+  `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` (the env var also covers
+  `EPIGRAPH_MIGRATE_ON_BOOT=1` on the server); it then applies the pending
+  migrations it embeds, leaves the unknown ones in place, prints a `WARNING`
+  naming them, and appends `db_ahead_of_binary=allowed` to the marker line.
 * after running, any migration embedded in the binary is not recorded as
   successfully applied.
+
+The `035` exemption rests on `migrations/README.md`'s 2026-09-02 measurement
+of prod, not on a fresh read. If a deployed database carries any other
+non-embedded version, the first strict run refuses — fail-closed, nothing
+applied — until the version is identified.
 
 Both checks and the run itself happen on one connection holding sqlx's
 migration advisory lock, so a second `epigraph-migrate` (or a boot-time

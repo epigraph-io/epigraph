@@ -10,27 +10,23 @@
 //! [`run_migrations`] now brackets `Migrator::run` with two checks and returns
 //! a [`MigrationReport`] naming both heads:
 //!
-//! * **before** running: if the database's applied head is ABOVE the binary's
-//!   embedded head, refuse — unless the caller opted in with
-//!   [`MigrateOptions::allow_db_ahead`] (the rollback case). The refusal
-//!   happens before anything is applied, because a stale binary against a newer
-//!   database can still apply an older embedded migration the database lacks.
+//! * **before** running: if the database has applied a version this binary
+//!   does not embed — above its head, OR a gap-filler below it (a newer
+//!   build's migration in reserved headroom such as `093`–`099`) — refuse,
+//!   unless the caller opted in with [`MigrateOptions::allow_db_ahead`] (the
+//!   rollback case). [`KNOWN_FOREIGN_VERSIONS`] are exempt. The refusal
+//!   happens before anything is applied, because a stale binary against a
+//!   newer database can still apply an older embedded migration the database
+//!   lacks.
 //! * **after** running: every embedded (up) migration must be recorded in
 //!   `_sqlx_migrations` with `success = true`. This is a SET check, not
-//!   `max >= head`, so a gap under a present head cannot hide. The
-//!   database-ahead gate is evaluated again here, so a strict run never
-//!   reports success against a database ahead of it.
+//!   `max >= head`, so a gap under a present head cannot hide. The unknown-
+//!   version gate is evaluated again here, so a strict run never reports
+//!   success against a database carrying a version it does not embed.
 //!
 //! Both reads and the run happen on ONE connection holding sqlx's migration
 //! advisory lock, so no other lock-respecting migrator can change
 //! `_sqlx_migrations` between the checks and the run.
-//!
-//! **What this cannot catch.** A binary knows only the migrations it was built
-//! with. A stale binary run against a database at or below its own head —
-//! #492's headline measurement, a head-59 build on an empty database — reaches
-//! ITS head and succeeds; the only signal is `binary_head=59` in the marker
-//! line. Detecting that needs an expected head supplied from outside the
-//! binary (the deploy's target revision), which this module does not take.
 //!
 //! The comparison itself is the pure [`compare_schema_heads`] plus the pure
 //! gates [`check_before_run`] / [`check_after_run`], so every branch —
@@ -46,21 +42,37 @@ use std::fmt;
 use sqlx::migrate::Migrate;
 use sqlx::Connection;
 
-/// Environment variable that opts in to running against a database whose
-/// applied head is above this binary's embedded head. Parsed with the same
+/// Environment variable that opts in to running against a database that has
+/// applied migrations this binary does not embed. Parsed with the same
 /// trim/case-fold rule as `EPIGRAPH_MIGRATE_ON_BOOT` (`1`/`true`/`yes`).
 pub const ALLOW_DB_AHEAD_ENV: &str = "EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD";
 
 /// `epigraph-migrate` command-line spelling of the same opt-in.
 pub const ALLOW_DB_AHEAD_FLAG: &str = "--allow-db-ahead";
 
+/// Applied versions that no public build embeds and that are nonetheless
+/// benign, so they never count as "unknown to this binary".
+///
+/// * `35` — `epigraph-internal`'s `claim_supersession`, applied to prod on
+///   2026-05-22. Public has no `035_*.sql`; it renumbered the same files to
+///   `036`–`038`, and prod's 036/037/038 descriptions match the public
+///   filenames (`migrations/README.md`, "The epigraph-internal overlap").
+///
+/// This list rests on that README's 2026-09-02 measurement of prod, not on a
+/// fresh read. If a deployed database carries any OTHER version the binary
+/// does not embed, a strict run refuses (nothing applied, nonzero exit) until
+/// the version is either added here with its provenance or the operator opts
+/// in.
+pub const KNOWN_FOREIGN_VERSIONS: &[i64] = &[35];
+
 /// Caller policy for [`run_migrations`].
 ///
-/// `Default` is the strict policy: a database ahead of the binary is refused.
+/// `Default` is the strict policy: a database carrying migrations this binary
+/// does not embed is refused.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MigrateOptions {
-    /// Proceed (with a WARN) when the database's applied head is above this
-    /// binary's embedded head. Meant for a deliberate rollback to an older
+    /// Proceed (with a WARN) when the database has applied migrations this
+    /// binary does not embed. Meant for a deliberate rollback to an older
     /// build; never set it to silence a refusal you have not diagnosed.
     pub allow_db_ahead: bool,
 }
@@ -88,13 +100,15 @@ pub struct SchemaHeads {
     pub db_head: Option<i64>,
     /// Embedded versions NOT recorded as successfully applied.
     pub missing: Vec<i64>,
-    /// Successfully applied versions above `binary_head` — the migrations a
-    /// newer build applied that this binary knows nothing about.
+    /// Successfully applied versions this binary does NOT embed, above or
+    /// below `binary_head`, excluding [`KNOWN_FOREIGN_VERSIONS`]: the
+    /// migrations a newer (or different) build applied that this binary knows
+    /// nothing about.
     pub ahead: Vec<i64>,
 }
 
 impl SchemaHeads {
-    /// The database has applied a migration above this binary's head.
+    /// The database has applied a migration this binary does not embed.
     #[must_use]
     pub fn db_ahead(&self) -> bool {
         !self.ahead.is_empty()
@@ -104,9 +118,9 @@ impl SchemaHeads {
 /// Pure comparison of the applied set against the embedded set.
 ///
 /// `applied_ok` must hold only versions whose row has `success = true`.
-/// Versions below `binary_head` that the binary does not embed (e.g. prod's
-/// `epigraph-internal` version 035, see `migrations/README.md`) are neither
-/// `missing` nor `ahead`: they are the gap `set_ignore_missing(true)` exists to
+/// A version that is applied but not embedded is `ahead` wherever it sits —
+/// above the head, or in a gap below it — unless it is one of
+/// [`KNOWN_FOREIGN_VERSIONS`], the gap `set_ignore_missing(true)` exists to
 /// tolerate.
 #[must_use]
 pub fn compare_schema_heads(applied_ok: &[i64], embedded: &[i64]) -> SchemaHeads {
@@ -117,7 +131,11 @@ pub fn compare_schema_heads(applied_ok: &[i64], embedded: &[i64]) -> SchemaHeads
         binary_head,
         db_head: applied.iter().next_back().copied(),
         missing: embedded.difference(&applied).copied().collect(),
-        ahead: applied.range(binary_head + 1..).copied().collect(),
+        ahead: applied
+            .difference(&embedded)
+            .copied()
+            .filter(|v| !KNOWN_FOREIGN_VERSIONS.contains(v))
+            .collect(),
     }
 }
 
@@ -145,8 +163,9 @@ pub enum MigrationError {
     /// version, a migration that RAISEd, ...), or taking sqlx's migration lock
     /// failed.
     Migrate(sqlx::migrate::MigrateError),
-    /// The database has applied migrations above this binary's head. When
-    /// raised before the run, nothing was applied.
+    /// The database has applied migrations this binary does not embed
+    /// (`ahead`, above or below `binary_head`). When raised before the run,
+    /// nothing was applied.
     DbAheadOfBinary {
         db_head: i64,
         binary_head: i64,
@@ -172,14 +191,15 @@ impl fmt::Display for MigrationError {
                 ahead,
             } => write!(
                 f,
-                "REFUSING: database schema head is {db_head} but this binary embeds migrations \
-                 only up to {binary_head} ({n} applied version(s) unknown to it: {ahead:?}). \
-                 This binary is older than the schema, and a stale build must not report \
-                 success. Deploy a binary built from the revision that applied \
-                 {db_head}. If this is a DELIBERATE rollback to an older build, re-run with \
-                 {ALLOW_DB_AHEAD_FLAG} (epigraph-migrate) or {ALLOW_DB_AHEAD_ENV}=1 (any \
-                 entry point); pending migrations at or below {binary_head} are then applied \
-                 and the newer ones are left in place.",
+                "REFUSING: the database has {n} applied migration version(s) this binary does \
+                 not embed: {ahead:?} (database head {db_head}, binary head {binary_head}). A \
+                 newer or different build migrated this database, so this binary is older \
+                 than the schema, and a stale build must not report success. Deploy a binary \
+                 built from the revision that applied {ahead:?}. If this is a DELIBERATE \
+                 rollback to an older build, re-run with {ALLOW_DB_AHEAD_FLAG} \
+                 (epigraph-migrate) or {ALLOW_DB_AHEAD_ENV}=1 (any entry point); pending \
+                 migrations this binary embeds are then applied and the unknown ones are left \
+                 in place.",
                 n = ahead.len(),
             ),
             Self::DbBehindBinary {
@@ -221,10 +241,13 @@ pub struct MigrationReport {
     /// and restricted to the embedded set, so another migrator's rows are not
     /// counted.
     pub applied_this_run: usize,
-    /// The database is ahead of the binary. Only ever `true` when the caller
-    /// set [`MigrateOptions::allow_db_ahead`]; a strict run returns
-    /// [`MigrationError::DbAheadOfBinary`] instead.
+    /// The database carries migrations this binary does not embed. Only ever
+    /// `true` when the caller set [`MigrateOptions::allow_db_ahead`]; a strict
+    /// run returns [`MigrationError::DbAheadOfBinary`] instead.
     pub db_ahead: bool,
+    /// The applied versions this binary does not embed (empty unless
+    /// `db_ahead`).
+    pub ahead: Vec<i64>,
 }
 
 impl fmt::Display for MigrationReport {
@@ -254,16 +277,16 @@ fn refuse_ahead(heads: &SchemaHeads, opts: MigrateOptions) -> Result<(), Migrati
     }
 }
 
-/// Gate evaluated BEFORE `Migrator::run`: refuse a database ahead of the
-/// binary unless `opts.allow_db_ahead`.
+/// Gate evaluated BEFORE `Migrator::run`: refuse a database carrying
+/// migrations this binary does not embed unless `opts.allow_db_ahead`.
 pub fn check_before_run(heads: &SchemaHeads, opts: MigrateOptions) -> Result<(), MigrationError> {
     refuse_ahead(heads, opts)
 }
 
-/// Gate evaluated AFTER `Migrator::run`: the database-ahead gate again (a
-/// strict run never reports success against a database ahead of it, whatever
-/// happened between the reads), then every embedded migration must be
-/// recorded as successfully applied.
+/// Gate evaluated AFTER `Migrator::run`: the unknown-version gate again (a
+/// strict run never reports success against a database it does not fully
+/// know, whatever happened between the reads), then every embedded migration
+/// must be recorded as successfully applied.
 pub fn check_after_run(
     before: &SchemaHeads,
     after: &SchemaHeads,
@@ -279,6 +302,7 @@ pub fn check_after_run(
                 db_head,
                 applied_this_run,
                 db_ahead: after.db_ahead(),
+                ahead: after.ahead.clone(),
             })
         }
         _ => Err(MigrationError::DbBehindBinary {
@@ -298,14 +322,15 @@ pub fn check_after_run(
 ///    no public file (`migrations/README.md`, "The epigraph-internal overlap");
 ///    without the flag every run there fails `VersionMissing(35)`.
 /// 2. **The rollback case.** Running an older build against a database a newer
-///    build migrated means the database holds versions above this binary's
-///    head. Without the flag sqlx rejects that with `VersionMissing` before the
-///    [`MigrateOptions::allow_db_ahead`] opt-in could ever take effect.
+///    build migrated means the database holds versions this binary does not
+///    embed. Without the flag sqlx rejects that with `VersionMissing` before
+///    the [`MigrateOptions::allow_db_ahead`] opt-in could ever take effect.
 ///
-/// What the flag no longer does is make the database-ahead case SILENT: that
-/// is [`check_before_run`]'s job, which refuses it by default. (A database that
-/// ever ran `epigraph-internal`'s 060–112 therefore now trips the refusal —
-/// intended: `migrations/README.md` calls that version space a minefield.)
+/// What the flag no longer does is make an unknown version SILENT: that is
+/// [`check_before_run`]'s job, which refuses it by default unless it is one of
+/// [`KNOWN_FOREIGN_VERSIONS`]. (A database that ever ran `epigraph-internal`'s
+/// 060–112 therefore now trips the refusal — intended: `migrations/README.md`
+/// calls that version space a minefield.)
 fn embedded_migrator() -> sqlx::migrate::Migrator {
     let mut migrator = sqlx::migrate!("../../migrations");
     migrator.set_ignore_missing(true);
@@ -343,8 +368,8 @@ async fn applied_versions(conn: &mut sqlx::PgConnection) -> Result<Vec<i64>, sql
 /// Apply all pending embedded migrations, then prove the database reached this
 /// binary's head.
 ///
-/// Refuses (before applying anything) when the database is ahead of the
-/// binary, unless `opts.allow_db_ahead`; fails when, after
+/// Refuses (before applying anything) when the database carries a migration
+/// this binary does not embed, unless `opts.allow_db_ahead`; fails when, after
 /// running, any embedded migration is not recorded as applied. On success the
 /// returned [`MigrationReport`] names both heads — callers log it rather than a
 /// bare "ok".
@@ -408,8 +433,9 @@ async fn run_locked(
             db_head = before.db_head,
             binary_head = before.binary_head,
             ahead = ?before.ahead,
-            "database schema is AHEAD of this binary; proceeding because {} / {} opted in \
-             (rollback case). This binary does not know the schema it is running against.",
+            "database has applied migrations this binary does not embed; proceeding because \
+             {} / {} opted in (rollback case). This binary does not know the schema it is \
+             running against.",
             ALLOW_DB_AHEAD_FLAG,
             ALLOW_DB_AHEAD_ENV,
         );
@@ -460,16 +486,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_version_below_head_is_a_tolerated_gap() {
+    fn known_foreign_version_below_head_is_a_tolerated_gap() {
         // prod's epigraph-internal 035: applied, not embedded, below the head.
         let mut applied = EMBEDDED.to_vec();
         applied.push(35);
         let h = compare_schema_heads(&applied, EMBEDDED);
         assert!(h.missing.is_empty());
-        assert!(!h.db_ahead(), "035 is below the head, not ahead: {h:?}");
+        assert!(!h.db_ahead(), "035 is a known foreign version: {h:?}");
         check_before_run(&h, STRICT).expect("gap is tolerated");
         let r = check_after_run(&h, &h, 0, STRICT).expect("at head");
         assert_eq!((r.db_head, r.binary_head, r.db_ahead), (101, 101, false));
+    }
+
+    #[test]
+    fn unknown_version_below_head_is_refused_like_one_above_it() {
+        // Review finding 3: a newer build's migration in reserved headroom
+        // (093-099) sits BELOW a head-101 binary's head. It is still a
+        // migration this binary does not know.
+        let mut applied = EMBEDDED.to_vec();
+        applied.push(95);
+        let h = compare_schema_heads(&applied, EMBEDDED);
+        assert_eq!(h.ahead, vec![95]);
+        assert_eq!(h.db_head, Some(101), "the head alone cannot see it");
+        let err = check_before_run(&h, STRICT).expect_err("gap-filler must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("[95]"), "refusal must name the version: {msg}");
+        assert!(msg.contains("REFUSING"), "{msg}");
+        check_before_run(&h, ALLOW).expect("opt-in proceeds");
+        let r = check_after_run(&h, &h, 0, ALLOW).expect("opt-in reports");
+        assert!(r.db_ahead);
+        assert_eq!(r.ahead, vec![95]);
     }
 
     #[test]
@@ -579,6 +625,7 @@ mod tests {
             db_head: 101,
             applied_this_run: 42,
             db_ahead: false,
+            ahead: Vec::new(),
         };
         assert_eq!(r.to_string(), "db_head=101 binary_head=101 applied=42");
     }
@@ -588,5 +635,15 @@ mod tests {
         let v = embedded_migration_versions();
         assert!(v.len() > 50, "embedded set suspiciously small: {}", v.len());
         assert!(v.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn known_foreign_versions_are_not_embedded() {
+        // An exemption for a version the binary itself ships would be dead
+        // code at best and would hide a real gap at worst.
+        let v = embedded_migration_versions();
+        for f in KNOWN_FOREIGN_VERSIONS {
+            assert!(!v.contains(f), "{f} is embedded; drop it from the list");
+        }
     }
 }
