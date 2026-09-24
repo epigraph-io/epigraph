@@ -96,7 +96,9 @@
 --     self-link. That is deliberate: only the group's admin (the operator) or
 --     maintenance can revoke that row, and linking agents into a group whose
 --     owner was revoked from it would hand them write authority the owner no
---     longer has. Restoring the row is an operator action (105's HINT).
+--     longer has. Restoring the row is an operator action (105's HINT). For
+--     the same reason an EXISTING acting link stops acting while that row is
+--     revoked (section 5's operator's-own-row conjunct).
 --   * the `operator_links` row is keyed on the agent and inserted
 --     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
 --     ever: a row naming a DIFFERENT operator is refused rather than replaced,
@@ -181,9 +183,22 @@
 --     refusal-only checks (an HTTP listener must not serve as a linked signer).
 --   * `epigraph_operator_actor(agent)` -- "may this agent act for an
 --     operator?" Requires a NOT-retired row, a live `writer`/`admin`
---     membership in the group the row names, and that group being the
---     operator's own personal group. It is used for the CALLER side of the
+--     membership in the group the row names, that group being the
+--     operator's own personal group, AND the operator's OWN row in that group
+--     being live `writer`/`admin`. It is used for the CALLER side of the
 --     ownership rule and by `ClaimRepository::default_decl_for_author`.
+--
+-- The operator's-own-row conjunct is section 3's RVK01 rationale applied to
+-- links that already exist: a new link into a group whose owner was revoked
+-- from it is refused because it "would hand them write authority the owner no
+-- longer has", and an EXISTING actor must not keep acting for that owner
+-- either (review measured an actor still resolving (O, OG) after O's own row
+-- was revoked, while a new link to O raised RVK01). What the conjunct does NOT
+-- end is the agent's own writer ROW, which `Viewer::resolve` still counts for
+-- an explicit write into OG; ending it is the ordinary revoke of that row.
+-- Every HTTP refusal (token issuance, both viewer extractors, webhook
+-- delivery) keys on the link RECORD, not on this read, so an agent this
+-- conjunct stops from acting stays stdio-only.
 --
 -- Why authoring must use the ACTOR read: a retired identity has no membership,
 -- so if it ever ran again and `default_decl_for_author` chose its OPERATOR's
@@ -276,7 +291,21 @@
 -- (any row), an agent that already operates others, an agent already linked to
 -- a different operator, and 105's two refusals on the operator's own personal
 -- group (`RVK02`: a squatted key; `RVK01`: the operator's own row is only
--- revoked). EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
+-- revoked). And two of its own, both 55000 with a HINT, both raised before
+-- anything is written:
+--
+--   * an ACTOR (not retired) row for the same pair: a retire is not a
+--     demotion, the row is never edited, and `ON CONFLICT DO NOTHING` would
+--     have left the agent acting while reporting success (review measured
+--     `link_created=f, link_retired=f` with the actor read unchanged). The
+--     way to end an actor's authority is to revoke its membership.
+--   * a LIVE `writer`/`admin` membership for the agent in the operator's
+--     group: a row made before the retire would otherwise survive it, and
+--     review measured the retired identity writing a claim owned by the
+--     operator's group through it. The check runs under row locks on the
+--     agent's membership rows and on the group row, so no such row can be
+--     inserted or promoted between the check and the commit; migration 109's
+--     trigger refuses one being added afterwards. EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
 -- two preludes are deliberately written out twice rather than shared through a
 -- third definer, so each function can be reviewed on its own page; both are
 -- exercised by `operator_link.rs`.
@@ -340,6 +369,50 @@
 -- `epigraph_mcp::operator` additionally refuse to serve as a signer that is
 -- anyone's operator, through the refusal-only read
 -- `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`).
+--
+-- THE FINGERPRINT IS FORGEABLE, SO IT IS A FIRST-LINK CHECK ONLY. The edges it
+-- counts are not a trusted record: `edges_tenancy` admits an app session's
+-- insert of an agent-to-agent edge (070/072 stamp agent endpoints
+-- `('public', world)`), and REST `create_edge` accepts OPERATED_BY with
+-- arbitrary properties, so neither the relationship nor a `source` property
+-- can tell a lineage edge from a forged one. Review measured the consequence:
+-- `epigraph_app` stamped as an unrelated principal inserted two
+-- `X --OPERATED_BY--> {c, d}` edges, and the next `epigraph_link_operator(X, O)`
+-- -- X's own stdio relink, which `epigraph-mcp` treats as fatal -- raised
+-- 55000. The forged edges granted nothing (the actor read was unchanged), but
+-- they denied service. So both checks are skipped on an EXACT relink, i.e.
+-- when an `operator_links` row for the same (agent, operator) pair already
+-- exists: the relink records nothing new, and a linked agent that later
+-- becomes a shared signer is still refused on HTTP by `epigraph_mcp::operator`.
+--
+-- RESIDUAL, ACCEPTED: a FIRST link can still be refused by forged edges (from
+-- the agent, or from the operator, which blocks every new link to it). That
+-- refusal is loud, writes nothing, and fails closed; a stdio process that has
+-- never been linked stops at startup with the fingerprint message, and the
+-- operator can see the edges that caused it. Closing it needs app sessions to
+-- stop writing OPERATED_BY edges whose source is another agent, which is an
+-- `edges` policy change outside this file.
+--
+-- ===================================================================
+-- 10. LINK WRITES ARE SERIALISED
+--
+-- Every refusal above that reads `operator_links` (single hop from both ends,
+-- one operator per agent) is a read of COMMITTED state, and neither function
+-- used to take a lock, so two concurrent calls each passed the other's
+-- uncommitted row. Review measured it: with `link(X, O)` held open,
+-- `link(O, P)` returned `link_live = t` without blocking, and after both
+-- committed `operator_links` held X -> O and O -> P with the actor read
+-- answering for both -- the chain the single-hop rule exists to refuse, and
+-- exactly the shape of a host boot where several stdio servers start at once.
+-- So both functions take ONE transaction-scoped advisory lock,
+-- `pg_advisory_xact_lock(hashtext('epigraph.operator_links'))`, before any
+-- check. A table lock is not an option: `LOCK TABLE ... IN SHARE ROW
+-- EXCLUSIVE MODE` needs UPDATE/DELETE/TRUNCATE on the table, and the owner
+-- these functions run as (`epigraph_maintenance`) holds only SELECT and
+-- INSERT on it, by design (section 4). The lock is global, not per agent,
+-- because the refusals span two agents' rows; link calls are rare (a stdio
+-- start, an operator CLI run), so the serialisation costs nothing measurable.
+-- `operator_link.rs::concurrent_links_cannot_build_a_two_hop_chain` pins it.
 -- ===================================================================
 
 -- The link record. See section 4.
@@ -403,6 +476,13 @@ SET search_path = public, pg_temp AS $$
        AND m.role IN ('writer', 'admin')
      WHERE l.agent_id = p_agent
        AND NOT l.retired
+       -- The OPERATOR's own row in its own group is live (section 5): an agent
+       -- does not act for an operator who no longer holds the group.
+       AND EXISTS (SELECT 1 FROM public.group_memberships om
+                    WHERE om.group_id = l.operator_group_id
+                      AND om.agent_id = l.operator_id
+                      AND om.revoked_at IS NULL
+                      AND om.role IN ('writer', 'admin'))
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) FROM PUBLIC;
 
@@ -450,6 +530,10 @@ BEGIN
         RAISE EXCEPTION 'epigraph_link_operator: agent % cannot be its own operator', p_agent
             USING ERRCODE = '22023';
     END IF;
+    -- Serialise every link write (section 10). Taken before any check reads
+    -- `operator_links`, so under READ COMMITTED each check below sees every
+    -- link committed by the call this one waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
         RAISE EXCEPTION 'epigraph_link_operator: agent % does not exist', p_agent
             USING ERRCODE = '22023';
@@ -485,20 +569,27 @@ BEGIN
                         'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
-    -- A SHARED SIGNER is neither linkable nor an operator (section 9).
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_operator: agent % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing to link it', p_agent
-            USING ERRCODE = '55000';
-    END IF;
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_operator: operator % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing it as an operator', p_operator
-            USING ERRCODE = '55000';
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
+    -- on a FIRST link only: an exact relink (a row for this very pair already
+    -- exists) records nothing new, and the edges the check counts are
+    -- writable by any app session, so counting them on a relink turned forged
+    -- edges into a fatal stdio startup for an agent that was already linked.
+    IF NOT EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.operator_id = p_operator) THEN
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_operator: agent % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing to link it', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_operator: operator % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
     END IF;
 
     -- (a) The operator's personal group, through THE personal-group definer,
@@ -606,6 +697,10 @@ BEGIN
                         p_agent
             USING ERRCODE = '22023';
     END IF;
+    -- Serialise every link write (section 10). Taken before any check reads
+    -- `operator_links`, so under READ COMMITTED each check below sees every
+    -- link committed by the call this one waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
         RAISE EXCEPTION 'epigraph_link_retired_agent: agent % does not exist', p_agent
             USING ERRCODE = '22023';
@@ -633,20 +728,42 @@ BEGIN
                         'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
-    -- A SHARED SIGNER is neither linkable nor an operator (section 9).
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing to link it', p_agent
-            USING ERRCODE = '55000';
+    -- A retire is not a demotion (section 7). An ACTOR row for this very pair
+    -- cannot be turned into a retired one -- `operator_links` rows are never
+    -- edited -- so `ON CONFLICT (agent_id) DO NOTHING` below would leave it
+    -- acting and report success. Refused instead, so the caller cannot
+    -- believe a key was de-authorized when it was not.
+    IF EXISTS (SELECT 1 FROM public.operator_links l
+                WHERE l.agent_id = p_agent AND l.operator_id = p_operator
+                  AND NOT l.retired) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % already has an ACTOR (not '
+                        'retired) link to operator %, and a retired link cannot replace it',
+                        p_agent, p_operator
+            USING ERRCODE = '55000',
+                  HINT = 'End its authority by revoking its membership in the operator''s '
+                         'group; the operator keeps ownership of its claims either way.';
     END IF;
-    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
-         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
-        RAISE EXCEPTION 'epigraph_link_retired_agent: operator % carries OPERATED_BY auth-lineage edges to more '
-                        'than one principal, the fingerprint of a shared HTTP signer; '
-                        'refusing it as an operator', p_operator
-            USING ERRCODE = '55000';
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
+    -- on a FIRST link only: an exact relink (a row for this very pair already
+    -- exists) records nothing new, and the edges the check counts are
+    -- writable by any app session, so counting them on a relink turned forged
+    -- edges into a fatal stdio startup for an agent that was already linked.
+    IF NOT EXISTS (SELECT 1 FROM public.operator_links l
+                    WHERE l.agent_id = p_agent AND l.operator_id = p_operator) THEN
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_agent: agent % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing to link it', p_agent
+                USING ERRCODE = '55000';
+        END IF;
+        IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+             WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+            RAISE EXCEPTION 'epigraph_link_retired_agent: operator % carries OPERATED_BY auth-lineage edges to '
+                            'more than one principal, the fingerprint of a shared HTTP '
+                            'signer; refusing it as an operator', p_operator
+                USING ERRCODE = '55000';
+        END IF;
     END IF;
 
     -- The operator's personal group, through the one personal-group definer:
@@ -654,6 +771,31 @@ BEGIN
     v_group_existed := EXISTS (SELECT 1 FROM public.groups g
                                 WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
     v_group := public.epigraph_ensure_personal_group(p_operator);
+
+    -- ZERO write authority is a precondition, not a hope (section 7). A live
+    -- `writer`/`admin` row for the agent in the operator's group -- the
+    -- routine "add my agents to my group", made BEFORE the retire -- would
+    -- survive it, and `Viewer::resolve` counts it: review measured a retired
+    -- identity inserting a claim owned by the operator's group through exactly
+    -- that row. Refused, not revoked here: revoking is the operator's decision
+    -- and has its own last-admin rules. Locked first, in the order every
+    -- roster writer takes them (the agent's rows in the group, then the
+    -- `groups` row, whose FOR UPDATE also blocks a concurrent membership
+    -- INSERT's foreign-key share lock), so no row can appear or be promoted
+    -- between this check and the commit.
+    PERFORM 1 FROM public.group_memberships m
+     WHERE m.group_id = v_group AND m.agent_id = p_agent
+       FOR UPDATE;
+    PERFORM 1 FROM public.groups g WHERE g.id = v_group FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM public.group_memberships m
+                WHERE m.group_id = v_group AND m.agent_id = p_agent
+                  AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % holds a live writer/admin '
+                        'membership in operator group %, and a retired identity may hold no '
+                        'write authority there', p_agent, v_group
+            USING ERRCODE = '55000',
+                  HINT = 'Revoke that membership first, then retire the agent.';
+    END IF;
 
     -- The record, retired. No membership: see section 7.
     INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
@@ -670,10 +812,10 @@ BEGIN
                           AND e.relationship = 'OPERATED_BY');
     GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
 
-    -- `membership_live` REPORTS a pre-existing live membership (e.g. the agent
-    -- was an actor before it was retired); it is never created or changed
-    -- here. A retired identity has zero write authority only while this is
-    -- false, so the caller must see it.
+    -- `membership_live` REPORTS a live membership of any role; it is never
+    -- created or changed here. A live writer/admin row was refused above, so
+    -- a true value here is a `reader` row (no write authority). Callers still
+    -- treat it as a refusal-worthy surprise, not a success.
     RETURN QUERY
     SELECT v_group,
            NOT v_group_existed,

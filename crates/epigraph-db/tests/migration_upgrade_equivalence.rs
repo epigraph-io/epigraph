@@ -18,11 +18,14 @@
 //! Catalog state by NAME, never by OID: policies (command, roles, permissive,
 //! USING, WITH CHECK), every non-system function (identity arguments, body,
 //! SECURITY DEFINER, `proconfig`, owner, ACL), every relation's kind, owner, ACL
-//! and RLS/FORCE flags, columns (type, default, nullability), constraints
-//! (`pg_get_constraintdef`), indexes (`pg_get_indexdef`), triggers
+//! and RLS/FORCE flags, columns (type, default, nullability), column-level ACLs
+//! (`pg_attribute.attacl`, which a relation ACL does not show), default
+//! privileges (`pg_default_acl`, which decide what a LATER table is granted),
+//! constraints (`pg_get_constraintdef`), indexes (`pg_get_indexdef`), triggers
 //! (`pg_get_triggerdef` plus `tgenabled`), and the `_sqlx_migrations` version and
-//! checksum list. The comparison is CALIBRATED in-test: a stray GRANT and a
-//! disabled trigger on one side must both show up in the diff.
+//! checksum list. The comparison is CALIBRATED in-test: a stray GRANT, a stray
+//! column GRANT, a stray default privilege and a disabled trigger on one side
+//! must each show up in the diff.
 //!
 //! # What it cannot prove
 //!
@@ -104,6 +107,24 @@ async fn snapshot(pool: &PgPool) -> BTreeSet<String> {
                 AND n.nspname NOT LIKE 'pg_toast%'",
         ),
         (
+            "column_acl",
+            "SELECT format('%s.%s.%s acl=%s', n.nspname, c.relname, a.attname, a.attacl::text)
+               FROM pg_attribute a
+               JOIN pg_class c ON c.oid = a.attrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE a.attacl IS NOT NULL AND NOT a.attisdropped
+                AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                AND n.nspname NOT LIKE 'pg_toast%'",
+        ),
+        (
+            "default_acl",
+            "SELECT format('role=%s schema=%s objtype=%s acl=%s',
+                    pg_get_userbyid(d.defaclrole),
+                    coalesce(d.defaclnamespace::regnamespace::text, '-'),
+                    d.defaclobjtype, d.defaclacl::text)
+               FROM pg_default_acl d",
+        ),
+        (
             "column",
             "SELECT format('%s.%s.%s type=%s default=%s nullable=%s',
                     table_schema, table_name, column_name, data_type,
@@ -139,13 +160,21 @@ async fn snapshot(pool: &PgPool) -> BTreeSet<String> {
                FROM _sqlx_migrations",
         ),
     ];
+    // Kinds a correct schema may legitimately hold none of: no migration grants
+    // a column-level privilege today, and default privileges exist only where
+    // 077's guarded `ALTER DEFAULT PRIVILEGES` found its roles. Their presence
+    // on ONE side is still a diff line, which the calibration below proves.
+    const MAY_BE_EMPTY: &[&str] = &["column_acl", "default_acl"];
     let mut out = BTreeSet::new();
     for (kind, sql) in QUERIES {
         let rows: Vec<String> = sqlx::query_scalar(sql)
             .fetch_all(pool)
             .await
             .unwrap_or_else(|e| panic!("snapshot {kind}: {e}"));
-        assert!(!rows.is_empty(), "snapshot {kind} read nothing");
+        assert!(
+            !rows.is_empty() || MAY_BE_EMPTY.contains(kind),
+            "snapshot {kind} read nothing"
+        );
         out.extend(rows.into_iter().map(|r| format!("{kind} {r}")));
     }
     out
@@ -239,11 +268,19 @@ async fn an_upgrade_from_the_production_head_equals_a_fresh_install(pool: PgPool
     let installed = snapshot(&fresh).await;
     let (only_upgraded, only_fresh) = diff(&upgraded, &installed);
 
-    // CALIBRATION: two known differences on the fresh side must both surface.
+    // CALIBRATION: four known differences on the fresh side must each surface.
     sqlx::query("GRANT INSERT ON public.operator_links TO PUBLIC")
         .execute(&fresh)
         .await
         .expect("calibration grant");
+    sqlx::query("GRANT UPDATE (revoked_at) ON public.group_memberships TO PUBLIC")
+        .execute(&fresh)
+        .await
+        .expect("calibration column grant");
+    sqlx::query("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC")
+        .execute(&fresh)
+        .await
+        .expect("calibration default privilege");
     sqlx::query(
         "ALTER TABLE public.group_memberships \
          DISABLE TRIGGER group_memberships_no_retired_writer",
@@ -259,6 +296,10 @@ async fn an_upgrade_from_the_production_head_equals_a_fresh_install(pool: PgPool
     let seen_trigger = cal
         .iter()
         .any(|l| l.starts_with("trigger ") && l.contains("group_memberships_no_retired_writer"));
+    let seen_column_grant = cal
+        .iter()
+        .any(|l| l.starts_with("column_acl public.group_memberships.revoked_at "));
+    let seen_default_acl = cal.iter().any(|l| l.starts_with("default_acl "));
 
     fresh.close().await;
     sqlx::query(&format!("DROP DATABASE \"{fresh_name}\" WITH (FORCE)"))
@@ -267,9 +308,10 @@ async fn an_upgrade_from_the_production_head_equals_a_fresh_install(pool: PgPool
         .expect("drop the fresh sibling");
 
     assert!(
-        seen_grant && seen_trigger,
-        "CALIBRATION: the snapshot must see a stray grant ({seen_grant}) and a disabled \
-         trigger ({seen_trigger}); it saw {cal:#?}"
+        seen_grant && seen_trigger && seen_column_grant && seen_default_acl,
+        "CALIBRATION: the snapshot must see a stray grant ({seen_grant}), a disabled trigger \
+         ({seen_trigger}), a stray column grant ({seen_column_grant}) and a stray default \
+         privilege ({seen_default_acl}); it saw {cal:#?}"
     );
     assert!(
         only_upgraded.is_empty() && only_fresh.is_empty(),

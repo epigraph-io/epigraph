@@ -388,13 +388,18 @@ Current reservation:
   before claiming: no remote branch carries a `108`. **Applied to a throwaway
   database only, NOT to any deployed database.**
 
-- **109**: public `group_memberships_guards` — a roster guard the tenancy
-  policy cannot express, as an invoker `BEFORE` trigger on `group_memberships`.
+- **109**: public `group_memberships_guards` — two roster guards the tenancy
+  policy cannot express, as invoker `BEFORE` triggers on `group_memberships`.
   `group_memberships_no_retired_writer` raises `42501` on an INSERT or UPDATE
   that leaves a live `writer`/`admin` row for an agent in the group its RETIRED
   operator link names (107 section 7): review showed the operator could
   otherwise enrol a retired identity, whose key may be public, as a writer by an
-  ordinary roster write. Hard deletes are NOT this file's: its first form
+  ordinary roster write. `group_memberships_identity_immutable` raises `42501`
+  on an UPDATE that changes a row's `group_id` or `agent_id` outside
+  `epigraph_bypass()` / `epigraph_definer_bypass()`: moving a row is a DELETE of
+  its (group, agent) by another statement, which 106's REVOKE DELETE does not
+  cover (section 3; no application path changes either column). Hard deletes
+  are NOT this file's: its first form
   carried a `group_memberships_no_hard_delete` trigger, and 106's `REVOKE
   DELETE ON group_memberships FROM epigraph_app` now closes the same hole on
   every database this file can run on, so the trigger was removed (the file's

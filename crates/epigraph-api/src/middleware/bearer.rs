@@ -341,11 +341,14 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
         // are stdio-only and token issuance refuses them, but a token minted
         // BEFORE the link would otherwise carry the operator's personal group
         // in this viewer's WRITABLE set until it expired (15 min for an agent
-        // token, 1 h for a human or service one). Read concurrently with the
-        // resolve, so it adds no latency.
+        // token, 1 h for a human or service one). Keyed on the link RECORD
+        // (any state, retired included), not on the acting read: the acting
+        // read can say "not acting" while the agent's writer row in the
+        // operator's group is live (see `oauth::token::principal_agent_id`).
+        // Read concurrently with the resolve, so it adds no latency.
         let (viewer, actor) = tokio::join!(
             epigraph_db::Viewer::resolve(&state.db_pool, principal),
-            epigraph_db::AgentRepository::operator_actor_pool(&state.db_pool, principal),
+            epigraph_db::AgentRepository::operator_of_author_pool(&state.db_pool, principal),
         );
         match actor {
             Ok(None) => {}

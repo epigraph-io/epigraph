@@ -435,3 +435,63 @@ async fn a_revoked_agent_cannot_delete_its_row_and_reprovision(pool: PgPool) {
     );
     assert_eq!(rows(&pool, agent).await, vec![(0, "admin".into(), false)]);
 }
+
+/// THE LEDGER, BY UPDATE (review finding, HIGH). Moving a revoked row to
+/// another group erases the revocation from the personal group exactly as a
+/// DELETE does, and 106's REVOKE DELETE does not cover an UPDATE. Migration 109
+/// section 3 refuses any change to a row's `group_id` / `agent_id` from an app
+/// session, so the move is 42501 and provisioning still refuses.
+///
+/// CALIBRATION: the same stamped session CAN create the team group (the
+/// premise of the attack), so the refusal is the move and not a session that
+/// can write nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_agent_cannot_move_its_row_out_and_reprovision(pool: PgPool) {
+    let app = app_pool(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let personal = ensure_as_app(&app, agent).await.expect("provision");
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let team = Uuid::new_v4();
+    let mut tx = stamped(&app, agent, &[]).await;
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'scratch', 'did:epigraph:team:' || $1::text, $2, 'team', $3)",
+    )
+    .bind(team)
+    .bind(vec![0xEEu8; 32])
+    .bind(agent)
+    .execute(&mut *tx)
+    .await
+    .expect("CALIBRATION: the revoked agent may create a group it owns");
+    let moved = sqlx::query(
+        "UPDATE group_memberships SET group_id = $1 WHERE agent_id = $2 AND group_id = $3",
+    )
+    .bind(team)
+    .bind(agent)
+    .bind(personal)
+    .execute(&mut *tx)
+    .await;
+    let code = moved
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .and_then(|d| d.code().map(|c| c.to_string()));
+    assert_eq!(
+        code.as_deref(),
+        Some("42501"),
+        "an app session moved a revoked membership row to another group, got {moved:?}"
+    );
+    let _ = tx.commit().await;
+
+    let res = ensure_as_app(&app, agent).await;
+    assert!(
+        matches!(res, Err(DbError::MembershipRevoked { .. })),
+        "still refused, got {res:?}"
+    );
+    assert_eq!(rows(&pool, agent).await, vec![(0, "admin".into(), false)]);
+}

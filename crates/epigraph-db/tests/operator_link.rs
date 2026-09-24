@@ -482,6 +482,132 @@ async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
     .expect("auth-lineage edge");
 }
 
+/// No app session can move a membership row between groups or agents
+/// (migration 109 section 3). Review measured two moves:
+///
+/// * an operated writer X, stamped from its live set, moved its OPERATOR's
+///   admin row out of the operator's group (`UPDATE 1`);
+/// * an operator O2 whose own row was revoked moved that row into a group it
+///   had just created, after which `epigraph_link_operator(new, O2)` went from
+///   RVK01 to `link_live = t, membership_created = t`.
+///
+/// Both are now 42501 and the rows are where they were. CALIBRATION: the
+/// operator's ordinary revoke of X (an UPDATE of `revoked_at`) still works as
+/// an app session, so the trigger refuses the identity change and not every
+/// UPDATE.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_session_cannot_move_a_membership_row(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "x").await;
+    assert!(link(&pool, x, operator).await.link_live);
+    let code_of = |r: &Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        r.as_ref().err().and_then(sqlstate)
+    };
+
+    // X moves the operator's admin row into its own group.
+    let xv = Viewer::resolve(&pool, x).await.expect("x viewer");
+    let moved = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &xv).await;
+        let r = sqlx::query(
+            "UPDATE group_memberships SET group_id = $1 WHERE group_id = $2 AND agent_id = $3",
+        )
+        .bind(x_group)
+        .bind(op_group)
+        .bind(operator)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&moved).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "an operated writer moved its operator's admin row out of the operator's group: {moved:?}"
+    );
+    assert_eq!(
+        membership_rows(&pool, op_group, operator).await,
+        vec![("admin".to_string(), false, 0)]
+    );
+
+    // A revoked operator moves its own row out of its group.
+    let (o2, og2) = fixture::seed_agent_with_group(&pool, "o2").await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(og2)
+    .bind(o2)
+    .execute(&pool)
+    .await
+    .expect("maintenance: revoke o2's own row");
+    let scratch = Uuid::new_v4();
+    let moved = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.principal_id', $1, false)",
+        )
+        .bind(o2.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp o2");
+        sqlx::query(
+            "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ($1, 'o2-scratch', 'did:epigraph:team:' || $1::text, $2, 'team', $3)",
+        )
+        .bind(scratch)
+        .bind(vec![0xEFu8; 32])
+        .bind(o2)
+        .execute(&mut *conn)
+        .await
+        .expect("CALIBRATION: o2 may create a group it owns");
+        let r = sqlx::query(
+            "UPDATE group_memberships SET group_id = $1 WHERE group_id = $2 AND agent_id = $3",
+        )
+        .bind(scratch)
+        .bind(og2)
+        .bind(o2)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&moved).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "a revoked operator moved its own revoked row out of its group: {moved:?}"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_operator(&mut conn, seed_bare_agent(&pool).await, o2)
+        .await
+        .expect_err("a link to an operator whose own row is revoked is still RVK01");
+    assert!(
+        matches!(err, epigraph_db::DbError::MembershipRevoked { .. }),
+        "{err:?}"
+    );
+    drop(conn);
+
+    // CALIBRATION: the operator's ordinary revoke of X is an UPDATE too.
+    let ov = Viewer::resolve(&pool, operator)
+        .await
+        .expect("operator viewer");
+    let revoked = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &ov).await;
+        let r = sqlx::query(
+            "UPDATE group_memberships SET revoked_at = now() \
+              WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(op_group)
+        .bind(x)
+        .execute(&mut *conn)
+        .await
+        .expect("CALIBRATION: the operator revokes X as an app session");
+        (conn, r.rows_affected())
+    })
+    .await;
+    assert_eq!(revoked, 1, "CALIBRATION: the revoke UPDATE landed");
+}
+
 /// A SHARED HTTP SIGNER is neither linkable nor an operator (107 section 9).
 ///
 /// Review's scope note: a mistaken entry for the shared signer in a
@@ -573,6 +699,62 @@ async fn a_shared_signer_is_refused_as_agent_and_as_operator(pool: PgPool) {
             .expect("operator-side read"),
         "the refused signer operates nobody"
     );
+}
+
+/// Forged OPERATED_BY edges cannot make an existing link's relink fatal
+/// (107 section 9: the fingerprint is a FIRST-link check).
+///
+/// Review measured the denial of service: an unrelated app principal inserted
+/// two `X --OPERATED_BY--> {c, d}` edges, and X's next stdio relink
+/// (`epigraph_link_operator(X, O)`, fatal at startup) raised 55000. Forging
+/// two edges from O did the same to every agent linked to O. Here both
+/// forgeries are made, and the relinks of the existing links (acting and
+/// retired) still succeed and still report the link.
+///
+/// CALIBRATION: the fingerprint still refuses a FIRST link, for a fresh agent
+/// with the same two edges and for a fresh agent naming the forged operator
+/// (the accepted residual), so the relink arm is the pair-exists skip and not
+/// a check that was switched off.
+#[sqlx::test(migrations = "../../migrations")]
+async fn forged_lineage_edges_cannot_break_an_existing_links_relink(pool: PgPool) {
+    let operator = seed_bare_agent(&pool).await;
+    let x = seed_bare_agent(&pool).await;
+    let r = seed_bare_agent(&pool).await;
+    let (c, d) = (seed_bare_agent(&pool).await, seed_bare_agent(&pool).await);
+    assert!(link(&pool, x, operator).await.link_live);
+    assert!(link_retired(&pool, r, operator).await.link_created);
+
+    for forged_from in [x, r, operator] {
+        lineage_edge(&pool, forged_from, c).await;
+        lineage_edge(&pool, forged_from, d).await;
+    }
+
+    let relinked = link(&pool, x, operator).await;
+    assert!(
+        relinked.link_live,
+        "the relink of an existing acting link lost the link: {relinked:?}"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let retired_again = AgentRepository::link_retired_agent(&mut conn, r, operator)
+        .await
+        .expect("the relink of an existing retired link must not be refused by forged edges");
+    assert!(
+        !retired_again.link_created && retired_again.link_retired,
+        "{retired_again:?}"
+    );
+
+    // CALIBRATION: first links are still fingerprinted.
+    let fresh = seed_bare_agent(&pool).await;
+    lineage_edge(&pool, fresh, c).await;
+    lineage_edge(&pool, fresh, d).await;
+    let err = AgentRepository::link_operator(&mut conn, fresh, seed_bare_agent(&pool).await)
+        .await
+        .expect_err("CALIBRATION: a first link of a two-edge agent is still refused");
+    assert!(err.to_string().contains("more than one principal"), "{err}");
+    let err = AgentRepository::link_operator(&mut conn, seed_bare_agent(&pool).await, operator)
+        .await
+        .expect_err("CALIBRATION (the residual): a first link to the forged operator is refused");
+    assert!(err.to_string().contains("more than one principal"), "{err}");
 }
 
 /// `link_live` reports what the authoring and ownership paths will actually
@@ -1130,6 +1312,131 @@ async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPo
     assert!(retired_link.link_created, "{retired_link:?}");
 }
 
+/// An EXISTING acting link stops acting while the operator's OWN row in its
+/// group is revoked, and acts again once that row is restored.
+///
+/// Review measured the gap: with the operator's row revoked, a NEW link to it
+/// raised RVK01 ("would hand them write authority the owner no longer has"),
+/// while an agent linked before the revoke still resolved (O, OG) through the
+/// actor read, so it kept authoring into OG and acting for O in
+/// `require_owner_or_admin`.
+///
+/// CALIBRATION: the actor read answers before the revoke and after the
+/// restore, so the refusal is the operator's row and not the fixture.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_acting_link_stops_acting_while_its_operators_own_row_is_revoked(pool: PgPool) {
+    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (actor, own_group) = fixture::seed_agent_with_group(&pool, "actor").await;
+    assert!(link(&pool, actor, operator).await.link_live);
+    let acting = |pool: PgPool| async move {
+        AgentRepository::operator_actor_pool(&pool, actor)
+            .await
+            .expect("actor read")
+            .map(|l| (l.operator_id, l.operator_group_id))
+    };
+    assert_eq!(
+        acting(pool.clone()).await,
+        Some((operator, group)),
+        "CALIBRATION: the link acts before the operator's row is revoked"
+    );
+
+    let set_revoked = |pool: PgPool, revoked: bool| async move {
+        sqlx::query(
+            "UPDATE group_memberships \
+                SET revoked_at = CASE WHEN $3 THEN now() ELSE NULL END \
+              WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(group)
+        .bind(operator)
+        .bind(revoked)
+        .execute(&pool)
+        .await
+        .expect("maintenance: set the operator's own row");
+    };
+    set_revoked(pool.clone(), true).await;
+    assert_eq!(
+        acting(pool.clone()).await,
+        None,
+        "an actor kept acting for an operator whose own row in its group is revoked"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let decl = ClaimRepository::default_decl_for_author(&mut conn, actor)
+        .await
+        .expect("default_decl_for_author");
+    drop(conn);
+    assert_eq!(
+        owner_of(decl),
+        own_group,
+        "the actor must author into its own group while its operator's row is revoked"
+    );
+
+    set_revoked(pool.clone(), false).await;
+    assert_eq!(
+        acting(pool.clone()).await,
+        Some((operator, group)),
+        "CALIBRATION: restoring the operator's row restores the link"
+    );
+}
+
+/// Two link calls racing cannot build the X -> O -> P chain the single-hop
+/// rule refuses (107 section 10).
+///
+/// Review measured the race: session 1 held `link(X, O)` open, session 2's
+/// `link(O, P)` returned `link_live = t` without blocking (its "is O itself
+/// operated?" check read committed state and saw nothing), and after both
+/// committed the actor read answered for X AND for O.
+///
+/// Here connection 1 holds `link(X, O)` uncommitted while connection 2 runs
+/// `link(O, P)`. With the advisory lock, connection 2 is still WAITING after
+/// the pause, and once connection 1 commits it is refused with 55000 (O already
+/// operates X, the second end of the single-hop check). The
+/// sequential refusal of the same order is `a_second_operator_and_a_self_link_are_refused`'s
+/// territory; this arm is only about the window.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_links_cannot_build_a_two_hop_chain(pool: PgPool) {
+    let x = seed_bare_agent(&pool).await;
+    let o = seed_bare_agent(&pool).await;
+    let p = seed_bare_agent(&pool).await;
+
+    let mut c1 = pool.begin().await.expect("begin connection 1");
+    let first = AgentRepository::link_operator(&mut c1, x, o)
+        .await
+        .expect("link(X, O) on connection 1");
+    assert!(
+        first.link_live,
+        "PREMISE: X -> O is an acting link: {first:?}"
+    );
+
+    let pool2 = pool.clone();
+    let second = tokio::spawn(async move {
+        let mut c2 = pool2.acquire().await.expect("acquire connection 2");
+        AgentRepository::link_operator(&mut c2, o, p).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert!(
+        !second.is_finished(),
+        "link(O, P) finished while link(X, O) was uncommitted: the two calls were not \
+         serialised, so its single-hop check read a state without X -> O"
+    );
+    c1.commit().await.expect("commit connection 1");
+
+    let err = second
+        .await
+        .expect("join connection 2")
+        .expect_err("link(O, P) after X -> O committed must be refused: O already operates X");
+    assert!(
+        format!("{err:?}").contains("already operates other agents"),
+        "expected the single-hop refusal, got {err:?}"
+    );
+    assert!(
+        AgentRepository::operator_actor_pool(&pool, o)
+            .await
+            .expect("actor read")
+            .is_none(),
+        "O acts for P: the chain X -> O -> P was built"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constraint 4 and the authoring path.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1640,23 +1947,114 @@ async fn link_retired_agent_refuses_and_never_touches_a_membership(pool: PgPool)
         .expect_err("an agent linked to a different operator");
     assert!(err.to_string().contains("already has a link"), "{err}");
 
-    // An ACTOR whose membership the operator revoked: the retired call leaves
-    // the actor row and the revoked membership exactly as they were.
+    // An ACTOR whose membership the operator revoked: the retire is REFUSED (a
+    // retire is not a demotion, and the row is never edited), and the actor
+    // row and the revoked membership are left exactly as they were.
     let former_actor = seed_bare_agent(&pool).await;
     link(&pool, former_actor, operator).await;
     GroupMembershipRepository::revoke_member_unless_last_admin(&pool, op_group, former_actor)
         .await
         .expect("revoke");
-    let out = link_retired(&pool, former_actor, operator).await;
-    assert!(
-        !out.link_created && !out.link_retired && !out.membership_live,
-        "{out:?}"
-    );
+    let err = AgentRepository::link_retired_agent(&mut conn, former_actor, operator)
+        .await
+        .expect_err("retiring over an actor row must be refused");
+    assert!(err.to_string().contains("ACTOR (not retired)"), "{err}");
     assert_eq!(link_row(&pool, former_actor).await, Some((operator, false)));
     assert_eq!(
         membership_rows(&pool, op_group, former_actor).await,
         vec![("writer".to_string(), true, 0)],
         "the retired link must never revive or otherwise touch an existing membership"
+    );
+}
+
+/// Retiring an agent that still holds WRITE authority in the operator's group
+/// is refused, and so is retiring an agent whose link is still ACTING.
+///
+/// Review measured both as silent successes:
+///
+/// * the operator, as `epigraph_app`, added R as a `writer` in its group (the
+///   routine "add my agents to my group"); `epigraph_link_retired_agent(R, O)`
+///   then returned `link_created=t, membership_live=t`, and R, stamped from its
+///   live set, inserted a claim owned by the operator's group. 109's trigger
+///   guards only rows written AFTER the retire.
+/// * an acting A2: the retire returned `link_created=f, link_retired=f`
+///   (`ON CONFLICT DO NOTHING`), and A2 was still an actor.
+///
+/// CALIBRATION: once the writer row is revoked the same retire succeeds with
+/// no live membership, and a `reader` row (no write authority) does not
+/// refuse, so the refusal is the write authority and not any roster row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retiring_an_agent_that_still_holds_write_authority_is_refused(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let writer = seed_bare_agent(&pool).await;
+    let reader = seed_bare_agent(&pool).await;
+
+    // The operator enrols its agents, as `epigraph_app` stamped from its own
+    // viewer: the path review measured, not a harness shortcut.
+    let v = Viewer::resolve(&pool, operator)
+        .await
+        .expect("operator viewer");
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &v).await;
+        for (agent, role) in [(writer, "writer"), (reader, "reader")] {
+            sqlx::query(
+                "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+                 VALUES ($1, $2, ''::bytea, 0, $3)",
+            )
+            .bind(op_group)
+            .bind(agent)
+            .bind(role)
+            .execute(&mut *conn)
+            .await
+            .expect("PREMISE: the operator can enrol its agent as an app session");
+        }
+        (conn, ())
+    })
+    .await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_retired_agent(&mut conn, writer, operator)
+        .await
+        .expect_err("retiring an agent with a live writer row in the operator group");
+    assert!(err.to_string().contains("live writer/admin"), "{err}");
+    assert_eq!(
+        link_row(&pool, writer).await,
+        None,
+        "a refused retire wrote a link row"
+    );
+
+    // CALIBRATION: a reader row grants no write and does not refuse.
+    let out = AgentRepository::link_retired_agent(&mut conn, reader, operator)
+        .await
+        .expect("CALIBRATION: a reader row does not refuse the retire");
+    assert!(out.link_created && out.link_retired, "{out:?}");
+
+    // CALIBRATION: revoke the writer row; the retire now succeeds.
+    GroupMembershipRepository::revoke_member_unless_last_admin(&pool, op_group, writer)
+        .await
+        .expect("revoke the writer row");
+    let out = AgentRepository::link_retired_agent(&mut conn, writer, operator)
+        .await
+        .expect("CALIBRATION: the retire succeeds once the writer row is revoked");
+    assert!(
+        out.link_created && out.link_retired && !out.membership_live,
+        "{out:?}"
+    );
+
+    // An ACTING link cannot be retired either.
+    let actor = seed_bare_agent(&pool).await;
+    assert!(link(&pool, actor, operator).await.link_live);
+    let err = AgentRepository::link_retired_agent(&mut conn, actor, operator)
+        .await
+        .expect_err("retiring an acting link must be refused, not reported as done");
+    assert!(err.to_string().contains("ACTOR (not retired)"), "{err}");
+    assert!(
+        AgentRepository::operator_actor(&mut conn, actor)
+            .await
+            .expect("actor read")
+            .is_some(),
+        "the refused retire must leave the acting link exactly as it was"
     );
 }
 

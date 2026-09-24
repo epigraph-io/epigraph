@@ -169,14 +169,24 @@ fn refresh_allowed(
 ///
 /// # Operated agents are stdio-only (migration 107)
 ///
-/// Both paths end in [`refuse_operated_agent`]: an agent with a live ACTING
-/// operator link (`epigraph_operator_actor`) gets no token, in every grant arm,
-/// because this function is the one choke point all four mint sites share. An
-/// operated agent's writer membership puts its operator's personal group in
-/// the `Viewer` of any token minted for it, so an OAuth token would carry the
+/// Both paths end in [`refuse_operated_agent`]: an agent with ANY operator
+/// link record (`epigraph_operator_of_author`: acting, retired, or with its
+/// membership revoked) gets no token, in every grant arm, because this
+/// function is the one choke point all four mint sites share. An operated
+/// agent's writer membership puts its operator's personal group in the
+/// `Viewer` of any token minted for it, so an OAuth token would carry the
 /// operator's write authority onto the HTTP surface. A link-time "has no OAuth
 /// client" check would not be enough — a client can be approved after the
 /// link — so the refusal is at issuance, re-read on every mint.
+///
+/// The refusal keys on the link RECORD, not on the acting read
+/// (`epigraph_operator_actor`), because what reaches the HTTP surface is the
+/// agent's MEMBERSHIP, and the acting read can answer "not acting" while that
+/// membership is live: a retired link over a writer row that predates it, or
+/// (migration 107 section 5) an acting link whose operator's own row was
+/// revoked. Keying on the acting read handed both a token that carried the
+/// operator group's write authority. A linked agent is stdio-only whatever the
+/// state of its link.
 ///
 /// This is on the write path of every token mint, so a failure here is an
 /// authentication failure — it is deliberately NOT best-effort.
@@ -201,9 +211,10 @@ pub(crate) async fn principal_agent_id(
     Ok(agent_id)
 }
 
-/// Refuse to mint a token for an agent with a live ACTING operator link. See
-/// [`principal_agent_id`]. A RETIRED link does not refuse: a retired agent
-/// holds no membership, so its token carries no operator authority.
+/// Refuse to mint a token for an agent with any operator link record. See
+/// [`principal_agent_id`]. A RETIRED link refuses too: `epigraph_link_retired_agent`
+/// creates no membership, but a writer row that predates the retire, or one a
+/// concurrent roster write added, would otherwise ride the token onto HTTP.
 ///
 /// # Errors
 /// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the
@@ -212,12 +223,13 @@ pub(crate) async fn principal_agent_id(
 async fn refuse_operated_agent(state: &AppState, agent_id: uuid::Uuid) -> Result<(), ApiError> {
     use epigraph_db::repos::agent::AgentRepository;
 
-    match AgentRepository::operator_actor_pool(&state.db_pool, agent_id).await {
+    match AgentRepository::operator_of_author_pool(&state.db_pool, agent_id).await {
         Ok(None) => Ok(()),
         Ok(Some(link)) => {
             tracing::warn!(
                 agent_id = %agent_id,
                 operator_id = %link.operator_id,
+                retired = link.retired,
                 "token refused: the agent is operated (migration 107) and operated agents are \
                  stdio-only"
             );
@@ -656,7 +668,7 @@ async fn handle_refresh_token(
     // migration 107 nothing between the revoke and the mint could fail on a
     // warm client, and `principal_agent_id` now reads the operator link on
     // every refresh. An `InternalError` there (e.g. a missing EXECUTE grant on
-    // `epigraph_operator_actor`, which 107 section 6 names an outage) used to
+    // `epigraph_operator_of_author`, which 107 section 6 names an outage) used to
     // outlive the outage: the token was already revoked, so every refreshing
     // client lost its chain. So the client is loaded and every check runs
     // FIRST, and the token is revoked only once the refresh is either denied or
