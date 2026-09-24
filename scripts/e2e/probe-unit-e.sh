@@ -37,6 +37,10 @@
 #                   to a deliberately public throwaway seed; never a real key.
 : "${E2E_SU_DSN:?set E2E_SU_DSN (superuser DSN for the throwaway e2e database)}"
 : "${E2E_APP_DSN:?set E2E_APP_DSN (least-privilege app DSN; rolbypassrls MUST be false)}"
+# Refuse a DSN on the production port (or with no port) before anything runs;
+# sets E2E_SU_PORT, which every psql call below passes as -p.
+# shellcheck source=dsn-guard.sh
+. "$(cd "$(dirname "$0")" && pwd)/dsn-guard.sh"
 E2E_SU_PW="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://[^:]+:([^@]*)@.*#\1#')"
 E2E_SU_USER="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://([^:]+):.*#\1#')"
 E2E_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
@@ -51,13 +55,13 @@ SOCK="$E2E/ue.sock.$LABEL"
 H=(-H Content-Type:application/json -H Accept:application/json,text/event-stream)
 export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
-q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
+q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
 
 echo "### binary: $BIN"
 # Serialized for the same reason as every other script here: TRUNCATE + count.
 LOCKFIFO="$E2E/.uelock.$LABEL"
 rm -f "$LOCKFIFO"; mkfifo "$LOCKFIFO"
-PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
+PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
   -c "SELECT pg_advisory_lock(918273645);" -f "$LOCKFIFO" >/dev/null 2>&1 &
 LOCKPID=$!
 exec 9>"$LOCKFIFO"

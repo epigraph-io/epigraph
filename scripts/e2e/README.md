@@ -33,13 +33,21 @@ environment, and every script refuses with a usage message when either is unset.
 > `epigraph-mcp-http.service` / `epigraph-mcp-auth.service` signing key. Never
 > point this at a real deployment's key.
 
+Both DSNs must name an **explicit port on the test cluster** (5433 on the
+reference host). Every script sources `dsn-guard.sh` first, which refuses a DSN
+with no port or on port 5432 (the production cluster) before any `psql` or
+server start, and passes the DSN's port to every `psql` call as `-p`. Before
+that guard the scripts ignored the DSN's port, so the superuser half
+(migrations, policy replay, `TRUNCATE`) went to libpq's default, 5432, unless
+the caller also exported `PGPORT`.
+
 The database must be migrated `001 → head` from empty and its name should end in
 `_test`. `epigraph_db_repo_test` will **not** work: it has no tenancy migrations
 and fails closed at 060.
 
 ```bash
-export E2E_SU_DSN='postgres://<su>:<pw>@127.0.0.1:5432/epigraph_e2e_test'
-export E2E_APP_DSN='postgres://epigraph_app:<pw>@127.0.0.1:5432/epigraph_e2e_test'
+export E2E_SU_DSN='postgres://<su>:<pw>@127.0.0.1:5433/epigraph_e2e_test'
+export E2E_APP_DSN='postgres://epigraph_app:<pw>@127.0.0.1:5433/epigraph_e2e_test'
 ```
 
 ## The two schema configurations
