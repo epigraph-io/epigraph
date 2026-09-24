@@ -288,9 +288,24 @@ Current reservation:
   before claiming: no remote branch carries a `103`. **Applied to a throwaway
   database only, NOT to any deployed database.**
 
-- **104+**: public next
+- **104**: public `group_memberships_guards` — roster guards the tenancy
+  policy cannot express, as invoker `BEFORE` triggers on `group_memberships`.
+  `group_memberships_no_hard_delete` raises `42501` on any `DELETE` outside
+  `epigraph_bypass()` / `epigraph_definer_bypass()`: 077's FOR ALL
+  `group_memberships_tenancy` let any member hard-delete any row of its group,
+  and review used that to erase a revoked operated agent's history and to
+  delete an operator's own admin row from under it. Removal is a soft
+  `UPDATE ... SET revoked_at`, as every in-tree path already does; a cascaded
+  delete from `agents` fires the trigger too. Behaviour in
+  `epigraph-db/tests/operator_link.rs`. Like 100–103 it sits inside internal's
+  `060–112`. **No undo runbook ships**: undo is the `DROP TRIGGER` /
+  `DROP FUNCTION` statements named in the file. Checked before claiming: no
+  remote branch carries a `104`. **Applied to a throwaway database only, NOT
+  to any deployed database.**
 
-Next public migration **outside both reserved tenancy ranges** must be `104` or
+- **105+**: public next
+
+Next public migration **outside both reserved tenancy ranges** must be `105` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

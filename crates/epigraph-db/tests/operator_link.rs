@@ -334,6 +334,117 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
     );
 }
 
+/// An app session cannot hard-delete a membership (migration 104 section 1).
+///
+/// Review's two arms, both as `epigraph_app` stamped exactly as
+/// `Viewer::resolve` stamps the principal:
+///
+/// * ARM X — the revoked agent X deletes its OWN revoked row (077's USING
+///   admits `agent_id = epigraph_principal_id()`), erasing the revocation's
+///   history;
+/// * ARM Y — a live operated writer Y deletes its OPERATOR's `admin` row in the
+///   operator's personal group (USING admits every row of a group in the
+///   session's set), after which the operator could no longer revoke Y.
+///
+/// Each arm first proves, from the same stamped session, that RLS lets it SEE
+/// the row — so the refusal is the trigger, not the policy hiding the row. The
+/// CALIBRATION is the soft path: the operator, stamped, can still revoke Y with
+/// an UPDATE, so the guard removed nothing an in-tree path uses.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_session_cannot_hard_delete_a_membership(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let x = seed_bare_agent(&pool).await;
+    let y = seed_bare_agent(&pool).await;
+    link(&pool, x, operator).await;
+    link(&pool, y, operator).await;
+    assert_eq!(
+        operator_group(&pool, operator).await,
+        group,
+        "PREMISE: the link used the operator's own personal group"
+    );
+    GroupMembershipRepository::revoke_member_unless_last_admin(&pool, group, x)
+        .await
+        .expect("the operator revokes X");
+
+    // ARM X.
+    let x_viewer = Viewer::resolve(&pool, x).await.expect("resolve X");
+    let (visible, deleted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &x_viewer).await;
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(group)
+        .bind(x)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count X's own row");
+        let r = sqlx::query("DELETE FROM group_memberships WHERE group_id = $1 AND agent_id = $2")
+            .bind(group)
+            .bind(x)
+            .execute(&mut *conn)
+            .await;
+        (conn, (visible, r))
+    })
+    .await;
+    assert_eq!(visible, 1, "PREMISE: X's session can see its own revoked row");
+    let err = deleted.expect_err("ARM X: a revoked agent erased its own revocation history");
+    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        membership_rows(&pool, group, x).await,
+        vec![("writer".to_string(), true, 0)],
+        "ARM X: the revoked row must survive"
+    );
+
+    // ARM Y.
+    let y_viewer = Viewer::resolve(&pool, y).await.expect("resolve Y");
+    let (visible, deleted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &y_viewer).await;
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(group)
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("count the operator's row");
+        let r = sqlx::query("DELETE FROM group_memberships WHERE group_id = $1 AND agent_id = $2")
+            .bind(group)
+            .bind(operator)
+            .execute(&mut *conn)
+            .await;
+        (conn, (visible, r))
+    })
+    .await;
+    assert_eq!(visible, 1, "PREMISE: Y's session can see the operator's admin row");
+    let err = deleted.expect_err("ARM Y: an operated writer deleted its operator's admin row");
+    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        membership_rows(&pool, group, operator).await,
+        vec![("admin".to_string(), false, 0)],
+        "ARM Y: the operator's admin row must survive"
+    );
+
+    // CALIBRATION: the soft path still works for the operator.
+    let o_viewer = Viewer::resolve(&pool, operator).await.expect("resolve O");
+    let revoked = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &o_viewer).await;
+        let r = sqlx::query(
+            "UPDATE group_memberships SET revoked_at = now() \
+              WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(group)
+        .bind(y)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the operator's soft revoke must still work")
+    .rows_affected();
+    assert_eq!(revoked, 1, "CALIBRATION: the operator revokes Y with an UPDATE");
+}
+
 /// `link_live` reports what the authoring and ownership paths will actually
 /// read, not merely that a membership row is live.
 ///
