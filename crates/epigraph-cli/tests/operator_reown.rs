@@ -983,6 +983,58 @@ async fn a_write_outside_the_set_rolls_back_its_batch(pool: PgPool) {
     assert_batch_rolls_back(&pool, &fx, "table recall_events").await;
 }
 
+/// The batch's `SELECT ... FOR UPDATE` is what excludes a concurrent derived
+/// INSERT: that INSERT takes `FOR KEY SHARE` on its parent claim through the
+/// foreign key, and the re-own's own `UPDATE claims SET owner_group_id` takes
+/// only `FOR NO KEY UPDATE`, which does NOT conflict with it. So a second
+/// transaction holding `FOR KEY SHARE` on a claim (exactly what an in-flight
+/// evidence INSERT holds) must make the batch wait, hit `--lock-timeout`, and
+/// roll back — which also proves the lock timeout is wired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_concurrent_derived_insert_lock_blocks_the_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, false).await;
+    let mut holder = pool.begin().await.expect("holder tx");
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR KEY SHARE")
+        .bind(fx.c_world)
+        .execute(&mut *holder)
+        .await
+        .expect("hold FOR KEY SHARE");
+    let cf = claims_file(&dir, &fx);
+    let mf = dir.join("m.jsonl");
+    let op = fx.operator.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "reown-claims",
+            "--claims-file",
+            cf.to_str().unwrap(),
+            "--operator",
+            &op,
+            "--derived",
+            "follow-claim",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--lock-timeout",
+            "500ms",
+            "--batch-size",
+            "10",
+            "--apply",
+        ],
+    )
+    .await;
+    holder.rollback().await.expect("release");
+    assert_eq!(r.code, 2, "{}", r.show());
+    assert!(r.stdout.contains("lock timeout"), "{}", r.show());
+    assert!(r.stdout.contains("ROLLED BACK"), "{}", r.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "lock-timed-out batch",
+    );
+}
+
 /// A row can become unreadable to an unstamped application session without
 /// its visibility column changing — here a RESTRICTIVE policy that hides rows
 /// owned by the target group from `epigraph_app`. The readability census, taken
