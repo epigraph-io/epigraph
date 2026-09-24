@@ -139,8 +139,71 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 pub async fn submit_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
-    mut params: SubmitClaimParams,
+    params: SubmitClaimParams,
 ) -> Result<CallToolResult, McpError> {
+    let sub = match prepare_submission(server, viewer, params).await? {
+        PreparedSubmission::Existing(response) => return Ok(response),
+        PreparedSubmission::Fresh(sub) => *sub,
+    };
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "submit_claim")
+        .await?;
+    let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
+    // COMMIT. Everything after this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
+    finish_submission(server, viewer, sub, written, "submit_claim").await
+}
+
+/// What [`prepare_submission`] decided.
+enum PreparedSubmission {
+    /// The novelty gate matched an existing claim: this is the response, and
+    /// nothing is to be written.
+    Existing(CallToolResult),
+    /// A submission to write.
+    Fresh(Box<Submission>),
+}
+
+/// Everything [`write_submission`] and [`finish_submission`] need, computed once
+/// by [`prepare_submission`] before any transaction opens.
+struct Submission {
+    params: SubmitClaimParams,
+    agent_id: Uuid,
+    agent_id_typed: AgentId,
+    pub_key: [u8; 32],
+    confidence: f64,
+    weight: f64,
+    raw_truth: f64,
+    claim: Claim,
+    content_hash: [u8; 32],
+    methodology: Methodology,
+    evidence_type: EvidenceType,
+    pending_embedding: Option<String>,
+}
+
+/// What [`write_submission`] wrote.
+struct WrittenSubmission {
+    claim: Claim,
+    was_created: bool,
+    ds: Option<ds_auto::DsAutoResult>,
+}
+
+/// Phase 1 of a submission: validation, the signed [`Claim`], and the write-side
+/// novelty gate. Nothing is written.
+///
+/// # Why a submission is three phases
+///
+/// `submit_claim` is also the first write of `resolve_backlog_item`, and that tool
+/// must commit its resolution claim, its `justifies` edges and the original's
+/// `resolved` label as ONE fact. It used to call `submit_claim` whole, which
+/// committed the resolution claim on its own transaction before the edges and
+/// the label patch ran, so a failure after it left a resolution claim for an item
+/// still reading as open. Splitting the pipeline lets that caller run
+/// [`write_submission`] on its own transaction and share one code path with
+/// `submit_claim` rather than a copy of it.
+async fn prepare_submission(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    mut params: SubmitClaimParams,
+) -> Result<PreparedSubmission, McpError> {
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
@@ -244,16 +307,18 @@ pub async fn submit_claim(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
-                return success_json(&SubmitClaimResponse {
-                    claim_id: existing_id.to_string(),
-                    truth_value: existing.truth_value.value(),
-                    content_hash: ContentHasher::to_hex(&existing.content_hash),
-                    embedded: false,
-                    belief: None,
-                    plausibility: None,
-                    pignistic_prob: None,
-                    frame_id: None,
-                });
+                return Ok(PreparedSubmission::Existing(success_json(
+                    &SubmitClaimResponse {
+                        claim_id: existing_id.to_string(),
+                        truth_value: existing.truth_value.value(),
+                        content_hash: ContentHasher::to_hex(&existing.content_hash),
+                        embedded: false,
+                        belief: None,
+                        plausibility: None,
+                        pignistic_prob: None,
+                        frame_id: None,
+                    },
+                )?));
             }
             // Insert / InsertFlagged: stash the already-generated,
             // pgvector-formatted embedding so the was_created branch below
@@ -272,6 +337,46 @@ pub async fn submit_claim(
         // feature existed — insert, then embed best-effort post-insert.
     }
 
+    Ok(PreparedSubmission::Fresh(Box::new(Submission {
+        params,
+        agent_id,
+        agent_id_typed,
+        pub_key,
+        confidence,
+        weight,
+        raw_truth,
+        claim,
+        content_hash,
+        methodology,
+        evidence_type,
+        pending_embedding,
+    })))
+}
+
+/// Phase 2 of a submission: every write, on the caller's author-stamped
+/// transaction. See the comment at the top of the body for why they share one.
+/// The caller COMMITs.
+async fn write_submission(
+    conn: &mut sqlx::PgConnection,
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    sub: &Submission,
+    tool_name: &'static str,
+) -> Result<WrittenSubmission, McpError> {
+    let Submission {
+        params,
+        agent_id,
+        agent_id_typed,
+        pub_key,
+        confidence,
+        weight,
+        claim,
+        methodology,
+        evidence_type,
+        ..
+    } = sub;
+    let (agent_id, agent_id_typed, pub_key, confidence, weight) =
+        (*agent_id, *agent_id_typed, *pub_key, *confidence, *weight);
     // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
     //
     // Claim + labels + Trace + Evidence + the two verb-edges + `update_trace_id`
@@ -294,12 +399,10 @@ pub async fn submit_claim(
     // embedding is deliberately outside, below the commit: that is CLAUDE.md's
     // policy (best-effort, post-commit, warn on failure, never block the write),
     // and a provider round trip must not hold a transaction open.
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_claim").await?;
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&mut tx, viewer, &claim, "submit_claim")
+        crate::claim_helper::create_claim_idempotent(&mut *conn, viewer, claim, tool_name)
             .await?;
     let claim_uuid = claim.id.as_uuid();
 
@@ -309,7 +412,7 @@ pub async fn submit_claim(
     // correctly if a future label rule is added to the repo layer. Inside the
     // transaction, so a rejected label no longer leaves a labelled-nothing claim.
     if !params.labels.is_empty() {
-        ClaimRepository::update_labels_conn(&mut tx, claim_uuid, &params.labels, &[])
+        ClaimRepository::update_labels_conn(&mut *conn, claim_uuid, &params.labels, &[])
             .await
             .map_err(db_caller_error)?;
     }
@@ -321,7 +424,7 @@ pub async fn submit_claim(
         agent_id_typed,
         pub_key,
         evidence_hash,
-        evidence_type,
+        evidence_type.clone(),
         Some(params.evidence_data.clone()),
         claim.id,
     );
@@ -331,7 +434,7 @@ pub async fn submit_claim(
         e
     };
 
-    let explanation = params.reasoning.unwrap_or_else(|| {
+    let explanation = params.reasoning.clone().unwrap_or_else(|| {
         format!(
             "Claim submitted via MCP with {} methodology",
             params.methodology
@@ -340,7 +443,7 @@ pub async fn submit_claim(
     let trace = ReasoningTrace::new(
         agent_id_typed,
         pub_key,
-        methodology,
+        *methodology,
         vec![TraceInput::Evidence {
             id: evidence_with_sig.id,
         }],
@@ -351,10 +454,10 @@ pub async fn submit_claim(
     // Persist Trace + Evidence on every submission. In the transaction: a
     // refusal here now rolls the claim back instead of committing it as an
     // orphan.
-    ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
+    ReasoningTraceRepository::create(&mut *conn, &trace, claim.id)
         .await
         .map_err(internal_error)?;
-    EvidenceRepository::create(&mut *tx, &evidence_with_sig)
+    EvidenceRepository::create(&mut *conn, &evidence_with_sig)
         .await
         .map_err(internal_error)?;
 
@@ -374,25 +477,25 @@ pub async fn submit_claim(
     // skip-on-resubmit rule. Aligning the API to MCP's accumulating semantics is
     // spec backlog item #10.
     crate::claim_helper::emit_verb_edge_best_effort(
-        &mut tx,
+        &mut *conn,
         claim_uuid,
         "claim",
         evidence_with_sig.id.as_uuid(),
         "evidence",
         "DERIVED_FROM",
         Some(serde_json::json!({"was_created": was_created})),
-        "submit_claim",
+        tool_name,
     )
     .await?;
     crate::claim_helper::emit_verb_edge_best_effort(
-        &mut tx,
+        &mut *conn,
         claim_uuid,
         "claim",
         trace.id.as_uuid(),
         "trace",
         "HAS_TRACE",
         Some(serde_json::json!({"was_created": was_created})),
-        "submit_claim",
+        tool_name,
     )
     .await?;
 
@@ -407,7 +510,7 @@ pub async fn submit_claim(
     // rewrite settled provenance.
     let needs_trace_link = was_created || claim.trace_id.is_none();
     if needs_trace_link {
-        ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
+        ClaimRepository::update_trace_id_conn(&mut *conn, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
     }
@@ -429,7 +532,7 @@ pub async fn submit_claim(
     let ds = if was_created {
         Some(
             crate::claim_helper::wire_ds_for_new_claim_in_tx(
-                &mut tx,
+                &mut *conn,
                 viewer,
                 agent_id,
                 claim_uuid,
@@ -440,7 +543,7 @@ pub async fn submit_claim(
                     evidence_type: Some(&params.evidence_type),
                 },
                 /* persist_truth_from_pignistic */ true,
-                "submit_claim",
+                tool_name,
             )
             .await?,
         )
@@ -451,8 +554,37 @@ pub async fn submit_claim(
         None
     };
 
-    // COMMIT. Everything below this line is post-commit and best-effort.
-    tx.commit().await.map_err(internal_error)?;
+    Ok(WrittenSubmission {
+        claim,
+        was_created,
+        ds,
+    })
+}
+
+/// Phase 3 of a submission, after COMMIT: the best-effort embedding (CLAUDE.md's
+/// policy) and the response.
+async fn finish_submission(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    sub: Submission,
+    written: WrittenSubmission,
+    tool_name: &'static str,
+) -> Result<CallToolResult, McpError> {
+    let Submission {
+        params,
+        agent_id,
+        raw_truth,
+        content_hash,
+        mut pending_embedding,
+        ..
+    } = sub;
+    let WrittenSubmission {
+        claim,
+        was_created,
+        ds,
+    } = written;
+    let claim_uuid = claim.id.as_uuid();
+
 
     // EMBEDDING. Gated on `was_created` OR "the canonical row is missing its
     // vector", never on `was_created` alone.
@@ -511,7 +643,7 @@ pub async fn submit_claim(
                 claim_uuid,
                 &text,
                 pending_embedding.take(),
-                "submit_claim",
+                tool_name,
             )
             .await
         }
@@ -1189,9 +1321,26 @@ pub(crate) async fn require_owner_or_admin(
 /// `add=["resolved"]`. The original keeps `is_current=true` and
 /// `supersedes=None` — retirement is label-side, not lineage-side.
 ///
-/// Partial-failure semantics: if the label PATCH on the original fails
-/// after the resolution claim is created, returns an error including
-/// the `resolution_claim_id` so the reconciler can back-fill.
+/// # All-or-nothing, on ONE author-stamped transaction
+///
+/// The resolution claim, its `justifies` edges and the original's `resolved`
+/// label commit together, or nothing does. It used to call `submit_claim`
+/// whole, which committed the resolution claim on its own transaction and then
+/// wrote the edges and the label patch on the unstamped pool. A failure there
+/// returned an error carrying a `resolution_claim_id` for the reconciler to
+/// back-fill, over a committed resolution for an item still reading as open:
+/// partial state by contract. The label PATCH is an `UPDATE claims` that
+/// `claims_tenancy`'s WITH CHECK refuses on an unstamped session, so on a
+/// cleanly-migrated schema that partial state was the normal outcome.
+///
+/// The stamp is `server.agent_id()`'s, the author of the resolution claim, as
+/// for every other MCP write. The label PATCH therefore succeeds for an item
+/// owned by that agent's group, which is the item the stdio ownership gate
+/// admits. A `claims:admin` HTTP caller retiring ANOTHER agent's item is
+/// refused on a cleanly-migrated schema with nothing written: carrying the
+/// caller's admin authority into a group this process cannot write is the
+/// cross-agent ownership question (#374), not a stamping one. Only the
+/// embedding of the resolution claim runs after COMMIT, best-effort.
 pub async fn resolve_backlog_item(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1201,10 +1350,26 @@ pub async fn resolve_backlog_item(
     let original_id = parse_uuid(&params.original_id)?;
     let original_claim_id = ClaimId::from_uuid(original_id);
 
+    // THE GATE READS RUN ON A STAMPED TRANSACTION, not the unstamped pool, and
+    // it is a separate one from the write transaction below. The transaction is
+    // needed because on an unstamped session `claims_tenancy`'s USING admits only
+    // public rows, so a group-private original or basis read "not found" even for
+    // its own author: the gate refused the one population the write stamp
+    // exists to admit. It is SEPARATE because the submission's first phase can
+    // call the embedding provider (the novelty gate), and a provider round trip
+    // must not hold a transaction open. This one only reads; dropping it rolls
+    // back nothing.
+    let mut gate_tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "resolve_backlog_item",
+    )
+    .await?;
+
     // Confirm the target exists; we do NOT require the "backlog" label —
     // a stricter precondition belongs to the call site (HTTP filters /
     // operator UI) rather than the verb.
-    let original = ClaimRepository::get_by_id(&server.pool, viewer, original_claim_id)
+    let original = ClaimRepository::get_by_id(&mut *gate_tx, viewer, original_claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {original_id} not found")))?;
@@ -1244,7 +1409,7 @@ pub async fn resolve_backlog_item(
                  cannot be its own justification"
             )));
         }
-        ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(basis_uuid))
+        ClaimRepository::get_by_id(&mut *gate_tx, viewer, ClaimId::from_uuid(basis_uuid))
             .await
             .map_err(internal_error)?
             .ok_or_else(|| {
@@ -1254,8 +1419,10 @@ pub async fn resolve_backlog_item(
             basis_ids.push(basis_uuid);
         }
     }
+    drop(gate_tx);
 
-    // 1. Submit the resolution claim via the canonical pipeline.
+    // 1. The resolution claim, through the canonical pipeline's first phase
+    //    (validation + signing). Nothing is written yet.
     let methodology = params
         .methodology
         .unwrap_or_else(|| "expert_elicitation".to_string());
@@ -1279,18 +1446,42 @@ pub async fn resolve_backlog_item(
         // never suppress or flag them via the semantic gate.
         novelty_threshold: Some(0.0),
     };
-    let submit_result = submit_claim(server, viewer, submit_params).await?;
-    let resolution_id = extract_submit_claim_id(&submit_result)?;
+    let sub = match prepare_submission(server, viewer, submit_params).await? {
+        PreparedSubmission::Fresh(sub) => *sub,
+        // Unreachable at `novelty_threshold = 0.0`: no distance is below zero,
+        // so the gate never returns an existing claim for a resolution. Refused
+        // rather than trusted, because following it would retire the item
+        // against a claim this call did not write.
+        PreparedSubmission::Existing(_) => {
+            return Err(internal_error(
+                "resolve_backlog_item: the novelty gate returned an existing claim for a \
+                 resolution at threshold 0.0; refusing to retire the item against a claim this \
+                 call did not write. Nothing was written.",
+            ))
+        }
+    };
 
-    // 2. Record the closure basis as `resolution -justifies-> basis` edges,
-    //    BEFORE the label patch. Ordering again: the item must not read as
-    //    closed until its basis is on the graph, because a closure with a
-    //    `resolved` label and no basis is precisely the un-reopenable state
-    //    this records against.
+    // THE ONE TRANSACTION. Resolution claim, `justifies` edges and the label
+    // PATCH all run on it; see the function doc.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        sub.agent_id,
+        "resolve_backlog_item",
+    )
+    .await?;
+    let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
+    let resolution_uuid = written.claim.id.as_uuid();
+    let resolution_id = resolution_uuid.to_string();
+
+    // 2. Record the closure basis as `basis -justifies-> resolution` edges,
+    //    BEFORE the label patch. The item must not read as closed until its
+    //    basis is on the graph, because a closure with a `resolved` label and
+    //    no basis is precisely the un-reopenable state this records against.
+    //    Now that both are in one transaction the order is also what a reader
+    //    of this function sees, not a partial-failure guarantee.
     //
-    //    `create_if_not_exists` keys on (source, target, relationship), so a
-    //    retried call re-asserts rather than duplicating.
-    let resolution_uuid = parse_uuid(&resolution_id)?;
+    //    `create_if_not_exists_conn` keys on (source, target, relationship), so
+    //    a retried call re-asserts rather than duplicating.
     let mut basis_edge_ids: Vec<String> = Vec::with_capacity(basis_ids.len());
     for basis_uuid in &basis_ids {
         // Direction is `basis -justifies-> resolution`, NOT the reverse. Two
@@ -1309,8 +1500,14 @@ pub async fn resolve_backlog_item(
         // carries no BBA and the cascade's BBA filter skips it regardless of
         // direction. This direction is a precondition for a future fix, not the
         // fix itself.
-        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists(
-            &server.pool,
+        //
+        // TENANCY. 070's trigger owns the edge by its endpoints: world-owned
+        // when both are public (the resolution claim is public), otherwise the
+        // private basis's group. A private basis is readable here only if it is
+        // this agent's own (the viewer check above), so its edge lands in a group
+        // this stamp can write.
+        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists_conn(
+            &mut tx,
             *basis_uuid,
             "claim",
             resolution_uuid,
@@ -1324,47 +1521,37 @@ pub async fn resolve_backlog_item(
             None,
         )
         .await
-        .map_err(|e| McpError {
-            code: rmcp::model::ErrorCode::INTERNAL_ERROR,
-            message: format!(
-                "resolution claim {resolution_id} created but failed to record basis \
-                 {basis_uuid}: {e}"
-            )
-            .into(),
-            data: Some(serde_json::json!({
-                "resolution_claim_id": resolution_id,
-                "original_id": original_id.to_string(),
-            })),
+        .map_err(|e| {
+            internal_error(format!(
+                "resolve_backlog_item: could not record basis {basis_uuid}: {e}. Nothing was \
+                 written: the resolution claim was rolled back with it."
+            ))
         })?;
         basis_edge_ids.push(row.id.to_string());
     }
 
-    // 3. PATCH the original's labels: add "resolved", keep "backlog".
-    //    Best-effort: if this fails the resolution claim already exists,
-    //    return a partial-success error so the reconciler can back-fill.
-    let after_labels = match ClaimRepository::update_labels(
-        &server.pool,
+    // 3. PATCH the original's labels: add "resolved", keep "backlog". In the
+    //    same transaction: a refusal here rolls back the resolution claim and
+    //    its edges, so an item is never left open beside a resolution of it.
+    let after_labels = ClaimRepository::update_labels_conn(
+        &mut tx,
         original_id,
         &["resolved".to_string()],
         &[],
     )
     .await
-    {
-        Ok(labels) => labels,
-        Err(e) => {
-            return Err(McpError {
-                code: rmcp::model::ErrorCode::INTERNAL_ERROR,
-                message: format!(
-                    "resolution claim {resolution_id} created but failed to patch original {original_id}: {e}"
-                )
-                .into(),
-                data: Some(serde_json::json!({
-                    "resolution_claim_id": resolution_id,
-                    "original_id": original_id.to_string(),
-                })),
-            });
-        }
-    };
+    .map_err(|e| {
+        internal_error(format!(
+            "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing was \
+             written: the resolution claim and its basis edges were rolled back with it."
+        ))
+    })?;
+
+    tx.commit().await.map_err(internal_error)?;
+
+    // After COMMIT, best-effort: the resolution claim's embedding, exactly as
+    // `submit_claim` does it. Its response is not returned; this tool's is.
+    let _ = finish_submission(server, viewer, sub, written, "submit_claim").await;
 
     success_json(&serde_json::json!({
         "resolution_claim_id": resolution_id,
@@ -1384,24 +1571,6 @@ pub async fn resolve_backlog_item(
 /// `POST /api/v1/edges`. Lowercase matches the claim→claim cluster it belongs
 /// with: `alternative_of`, `asserts`, `decomposes_to`.
 pub const JUSTIFIES_RELATIONSHIP: &str = "justifies";
-
-/// Pull `claim_id` out of a `submit_claim` response. Mirrors the
-/// `first_text` helper in `tests/common/mod.rs` (the proven shape for
-/// pattern-matching `CallToolResult.content` in this rmcp version).
-fn extract_submit_claim_id(result: &CallToolResult) -> Result<String, McpError> {
-    let text = result
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.as_str())
-        .ok_or_else(|| internal_error("submit_claim returned no text content"))?;
-    let parsed: serde_json::Value = serde_json::from_str(text).map_err(internal_error)?;
-    parsed
-        .get("claim_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| internal_error("submit_claim response missing claim_id"))
-}
 
 /// The one label that carries RETIREMENT semantics.
 ///

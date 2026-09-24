@@ -88,32 +88,6 @@ use std::path::{Path, PathBuf};
 // ===========================================================================
 const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
-        "tools/claims.rs",
-        "ClaimRepository::update_labels",
-        1,
-        "`resolve_backlog_item`'s step 3, the `resolved` label PATCH on the ORIGINAL backlog \
-         claim. RE-MEASURED a second time, and the previous correction was itself wrong: it said \
-         this was the `update_labels` TOOL, but the only `ClaimRepository::update_labels(&server.pool` \
-         in this file is inside `resolve_backlog_item`, and the `update_labels` tool SUCCEEDS on a \
-         cleanly-migrated schema as `epigraph_app` (`scripts/e2e/probe-tools.sh` CONFIG A: \
-         `labelled=1`). A tier-A `UPDATE claims` on a claim that is frequently ANOTHER agent's, \
-         so its stamp is an ownership question, not a mechanical conversion. Not in E1/E2.",
-    ),
-    (
-        "tools/claims.rs",
-        "EdgeRepository::create_if_not_exists",
-        1,
-        "`resolve_backlog_item`'s `basis -justifies-> resolution` edge. RE-MEASURED: this entry \
-         previously read \"`update_with_evidence`'s CHALLENGED/SUPPORTED verb-edge\", and there \
-         is no such call site — `update_with_evidence` emits no verb-edge, and neither \
-         `CHALLENGED` nor `SUPPORTED` appears anywhere in this file. An inherited description \
-         that names the wrong tool sends the next reader to convert the wrong line, so it is \
-         corrected here rather than carried. `edges` carries an orphan `edges_privacy` policy, so \
-         it lands in production and is refused on a clean migrate. Not in E1/E2: \
-         `resolve_backlog_item` is its own tool with its own population and its own ownership \
-         question (the basis claims are frequently another agent's).",
-    ),
-    (
         "tools/dedup_sweep.rs",
         "server.pool.acquire",
         1,

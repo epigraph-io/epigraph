@@ -11,8 +11,9 @@
 #   edges         link_hierarchical, link_alternative, link_epistemic (with a
 #                 belief-bearing source), patch_edge, delete_edge on
 #                 own-private and foreign-private endpoints
-#   resolve       resolve_backlog_item, with a public and a private basis, own
-#                 and foreign backlog items, and an injected mid-call refusal
+#   resolve       resolve_backlog_item on the server agent's own backlog items,
+#                 with a public, an own-private and a foreign-private basis, and
+#                 an injected mid-call refusal of the justifies edge
 #   submit_ds     submit_claim's DS wiring commits with the claim
 #   maintenance   recompute_beliefs, sweep_semantic_duplicates and
 #                 backfill_embeddings under three server configurations:
