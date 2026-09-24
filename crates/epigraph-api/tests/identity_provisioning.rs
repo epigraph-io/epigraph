@@ -876,3 +876,100 @@ async fn a_first_mint_for_a_revoked_agent_is_refused_and_leaves_it_revoked(pool:
         "a revoked membership is a denial, got {api:?}"
     );
 }
+
+/// `POST /api/v1/submit/packet` by an author whose personal membership is
+/// REVOKED: a 403 that names neither the agent nor the group, nothing written,
+/// the revocation standing. The route builds its own `(StatusCode,
+/// ErrorResponse)` pairs, so `From<DbError>`'s 403 did not reach it. Before
+/// `submit.rs::author_tenancy_error` it answered 500 with migration 105's
+/// message, agent and group ids included, in the body (batch F review).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_author_packet_is_a_403_that_leaks_no_ids(pool: PgPool) {
+    let pubkey: [u8; 32] = *blake3::hash(b"revoked-packet-author").as_bytes();
+    let (author,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO agents (public_key, display_name, key_kind) \
+         VALUES ($1, 'revoked packet author', 'ed25519') RETURNING id",
+    )
+    .bind(pubkey.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("seed ed25519 agent");
+    let mut conn = pool.acquire().await.unwrap();
+    let group = epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, author)
+        .await
+        .expect("provision");
+    drop(conn);
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(author)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let bearer = {
+        let cfg = epigraph_api::oauth::JwtConfig::from_secret(
+            std::env::var("EPIGRAPH_JWT_SECRET")
+                .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string())
+                .as_bytes(),
+        );
+        cfg.issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:write".to_string()],
+            "service",
+            None,
+            Some(author),
+            chrono::Duration::minutes(60),
+        )
+        .unwrap()
+        .0
+    };
+    let packet = json!({
+        "claim": {
+            "content": "a claim by a revoked author",
+            "initial_truth": 0.9,
+            "agent_id": author,
+        },
+        "evidence": [],
+        "reasoning_trace": {
+            "methodology": "inductive",
+            "inputs": [],
+            "confidence": 0.8,
+            "explanation": "revoked-author packet test",
+        },
+        "signature": "0".repeat(128),
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/submit/packet")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::from(packet.to_string()))
+        .unwrap();
+    let resp = app(pool.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a revoked author is a denial, not a server fault: {text}"
+    );
+    assert!(
+        !text.contains(&author.to_string()) && !text.contains(&group.to_string()),
+        "the body must not carry the agent or group id: {text}"
+    );
+    let (claims,): (i64,) = sqlx::query_as("SELECT count(*) FROM claims WHERE agent_id = $1")
+        .bind(author)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(claims, 0, "nothing may be written");
+    let (live,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM group_memberships WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(author)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "the revocation must stand");
+}
