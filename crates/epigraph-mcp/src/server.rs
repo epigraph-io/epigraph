@@ -123,6 +123,78 @@ impl EpiGraphMcpFull {
     }
 }
 
+/// Builds the per-session servers of ONE HTTP listener, all sharing ONE
+/// resolution of the server's own `agents.id`.
+///
+/// # Why this exists (backlog F1, `da432f25`)
+///
+/// rmcp's streamable-HTTP transport calls its factory closure once per SESSION,
+/// and `main` used to build each session's server with
+/// [`EpiGraphMcpFull::new_shared_with_federation`], which gives every server a
+/// fresh, EMPTY `agent_db_id` cell. So [`EpiGraphMcpFull::agent_id`]'s
+/// resolution — which ends in PR-09's `ensure_personal_group` call on the
+/// UNSTAMPED pool — ran once per session, not once per process. On the old
+/// migration-077 function that call is `ON CONFLICT … DO UPDATE SET revoked_at
+/// = NULL, role = 'admin'`, so every new HTTP session re-opened any revocation
+/// an operator had made of the server agent's personal membership. MEASURED on
+/// the real binary as `epigraph_app` (`scripts/e2e/probe-unit-e.sh`,
+/// PERSONAL-REVOKED fresh-session arm): `personal:admin(revoked)` came back
+/// `(live)` and the first `ingest_document_inline` of the new session committed
+/// +4 claims under it.
+///
+/// # The choice: resolve once per process, rather than discriminate per session
+///
+/// The alternative the backlog names is to apply the
+/// `system_agent_write_authority` discriminator (a stamped read of the agent's
+/// own rows) inside `agent_id()` on every session. That keeps one provisioning
+/// attempt per session and makes each one safe. Sharing the cell removes the
+/// attempts instead: the per-session servers are clones of one template, and
+/// `EpiGraphMcpFull` is `Clone` over `Arc`s, so the clone SHARES `agent_db_id`.
+/// MEASURED (`pg_stat_user_functions.calls` for `epigraph_ensure_personal_group`,
+/// real binary as `epigraph_app`, `--allow-unauthenticated-http`, boot plus three
+/// sequential sessions each calling one tool): 4 calls with a fresh cell per
+/// session (the boot probe plus one per session), 1 call with the shared cell. A per-session write on what is, for every tool, a read
+/// path is the thing removed. It does NOT stop the one remaining per-process
+/// call from reviving a revocation made before the process started; that is
+/// the provisioning function's own contract to fix, not this cache's.
+///
+/// # What is per-session, and stays so
+///
+/// Only `seen_auth_lineage`, the `OPERATED_BY` memo, whose doc makes it
+/// per-session; [`Self::session`] resets it. Everything else a session server
+/// holds is either immutable configuration or an `Arc` the old constructor
+/// already shared (`signer`, `embedder`, `federation`, the `ScopedPool`).
+///
+/// # A cost, stated
+///
+/// `agent_id()` holds the cell's mutex across its database awaits. Sharing the
+/// cell means that, until the FIRST resolution succeeds, concurrent sessions
+/// queue on one mutex rather than each resolving on its own. After it succeeds
+/// the lock is a cache read. `auth::UnauthenticatedPrincipal`'s cooldown already
+/// bounds the unauthenticated listener's retry rate during an outage.
+#[derive(Clone)]
+pub struct SessionFactory {
+    template: EpiGraphMcpFull,
+}
+
+impl SessionFactory {
+    /// Wrap a fully configured server (scoped pool, signer-identity flag and
+    /// policy gate already applied) as the template every session clones.
+    #[must_use]
+    pub fn new(template: EpiGraphMcpFull) -> Self {
+        Self { template }
+    }
+
+    /// A server for one new session: a clone of the template that SHARES its
+    /// `agent_db_id` cell and starts with an empty `OPERATED_BY` memo.
+    #[must_use]
+    pub fn session(&self) -> EpiGraphMcpFull {
+        let mut srv = self.template.clone();
+        srv.seen_auth_lineage = Arc::new(Mutex::new(HashSet::new()));
+        srv
+    }
+}
+
 /// Lets `auth::UnauthenticatedPrincipal` re-attempt the resolution on a later
 /// request instead of treating a boot-time failure as final.
 ///
