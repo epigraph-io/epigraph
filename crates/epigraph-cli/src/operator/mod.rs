@@ -9,8 +9,10 @@
 //! * `reown-claims` — move an explicit list of claims (and every row the
 //!   tenancy trigger cascades from them) into the operator's personal group,
 //!   under a manifest written and fsynced BEFORE the first write.
-//! * `reown-reverse` — restore every row a manifest names to the owner it
-//!   recorded.
+//! * `reown-reverse` — restore every row a manifest's run moved to the owner it
+//!   recorded, as a compare-and-swap against the post-state and neighbour
+//!   records the run wrote (a claim something has moved since is HELD, exit
+//!   3). Several `--manifest`s are applied newest-first by `created_at`.
 //!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
