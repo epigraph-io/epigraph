@@ -18,13 +18,9 @@
 <section class="section" aria-labelledby="content-title">
   <h2 id="content-title" class="section__title">Content</h2>
   {%- if let Some(c) = content %}
-  {%- if c.redacted %}
-  <p class="claim-text--redacted">Content hidden. You do not have access to the claim this evidence supports.</p>
-  {%- else %}
   <div class="evidence-content prose">{{ c.text }}</div>
   {%- if c.cut %}
   <p class="small muted">This content is long; only the beginning is shown.</p>
-  {%- endif %}
   {%- endif %}
   {%- else %}
   <p class="muted">No content was recorded for this evidence.</p>
@@ -50,7 +46,7 @@
   {%- if let Some(lc) = linked_claim %}
   {%- match lc.text %}
   {%- when Degraded::Available { data } %}
-  <p><a class="entity-row__text{% if data.redacted %} claim-text--redacted{% endif %}" href="{{ lc.url }}">{{ data.text }}</a></p>
+  <p><a class="entity-row__text" href="{{ lc.url }}">{{ data.text }}</a></p>
   {%- when Degraded::Unavailable { reason } %}
   <p><a href="{{ lc.url }}">Claim {{ lc.short }}</a></p>
   <p class="section-unavailable">{{ reason }}</p>

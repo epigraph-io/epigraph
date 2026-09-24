@@ -15,7 +15,7 @@
 
 <header class="entity-head">
   <p class="entity-kind">Version history</p>
-  <h1 class="claim-text{% if heading.redacted %} claim-text--redacted{% endif %}">{{ heading.text }}</h1>
+  <h1 class="claim-text">{{ heading.text }}</h1>
 </header>
 
 <section class="section" aria-labelledby="versions-title">
@@ -44,7 +44,7 @@
         <span class="badge">You are here</span>
         {%- endif %}
       </div>
-      <p class="version__text{% if v.text.redacted %} claim-text--redacted{% endif %}">{{ v.text.text }}</p>
+      <p class="version__text">{{ v.text.text }}</p>
       <p class="small muted">Recorded {{ v.created }} · truth value <span class="num">{{ v.truth }}</span></p>
     </li>
     {%- endfor %}

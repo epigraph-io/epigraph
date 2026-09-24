@@ -14,7 +14,6 @@ pub const ENV_PORT: &str = "EPIGRAPH_EXPLORER_PORT";
 pub const ENV_PUBLIC_BASE_URL: &str = "EPIGRAPH_EXPLORER_PUBLIC_BASE_URL";
 pub const ENV_OAUTH_BASE_URL: &str = "EPIGRAPH_OAUTH_BASE_URL";
 pub const ENV_CLIENT_ID: &str = "EPIGRAPH_EXPLORER_CLIENT_ID";
-pub const ENV_PUBLIC_UNFURL: &str = "EPIGRAPH_EXPLORER_PUBLIC_UNFURL";
 pub const ENV_FRAME_ANCESTORS: &str = "EPIGRAPH_EXPLORER_FRAME_ANCESTORS";
 pub const ENV_UPSTREAM_CONCURRENCY: &str = "EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY";
 pub const ENV_UPSTREAM_TIMEOUT_MS: &str = "EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS";
@@ -67,8 +66,6 @@ pub struct Config {
     pub oauth_base_url: Url,
     /// Pre-registered OAuth client id; `None` disables sign-in.
     pub client_id: Option<String>,
-    /// Render OG text for anonymous `/claim/:id` from an anonymous upstream read.
-    pub public_unfurl: bool,
     /// CSP `frame-ancestors` source list.
     pub frame_ancestors: String,
     /// Global upstream semaphore size.
@@ -90,7 +87,6 @@ impl std::fmt::Debug for Config {
             .field("base_path", &self.base_path)
             .field("oauth_base_url", &self.oauth_base_url.as_str())
             .field("client_id", &self.client_id)
-            .field("public_unfurl", &self.public_unfurl)
             .field("frame_ancestors", &self.frame_ancestors)
             .field("upstream_concurrency", &self.upstream_concurrency)
             .field("upstream_timeout", &self.upstream_timeout)
@@ -157,7 +153,6 @@ impl Config {
             other => other,
         };
 
-        let public_unfurl = parse_bool(ENV_PUBLIC_UNFURL, get(ENV_PUBLIC_UNFURL), false)?;
         let insecure_cookies = parse_bool(ENV_INSECURE_COOKIES, get(ENV_INSECURE_COOKIES), false)?;
 
         let frame_ancestors = match lookup(ENV_FRAME_ANCESTORS) {
@@ -206,7 +201,6 @@ impl Config {
             base_path,
             oauth_base_url,
             client_id,
-            public_unfurl,
             frame_ancestors,
             upstream_concurrency,
             upstream_timeout: Duration::from_millis(timeout_ms),
@@ -372,7 +366,6 @@ mod tests {
         assert_eq!(c.port, 8096);
         assert_eq!(c.oauth_base_url, c.api_url);
         assert_eq!(c.client_id, None);
-        assert!(!c.public_unfurl);
         assert_eq!(c.frame_ancestors, DEFAULT_FRAME_ANCESTORS);
         assert_eq!(c.upstream_concurrency, 6);
         assert_eq!(c.upstream_timeout, Duration::from_millis(8000));
@@ -522,7 +515,6 @@ mod tests {
             (ENV_UPSTREAM_TIMEOUT_MS, "-5"),
             (ENV_PORT, "0"),
             (ENV_PORT, "70000"),
-            (ENV_PUBLIC_UNFURL, "maybe"),
             (ENV_INSECURE_COOKIES, "2"),
         ] {
             let err = cfg(&[BASE, (var, val)]).unwrap_err();
@@ -535,13 +527,7 @@ mod tests {
 
     #[test]
     fn bools_parse() {
-        let c = cfg(&[
-            BASE,
-            (ENV_PUBLIC_UNFURL, "TRUE"),
-            (ENV_INSECURE_COOKIES, "1"),
-        ])
-        .unwrap();
-        assert!(c.public_unfurl);
+        let c = cfg(&[BASE, (ENV_INSECURE_COOKIES, "TRUE")]).unwrap();
         assert!(c.insecure_cookies);
         assert!(!c.cookie_secure());
     }

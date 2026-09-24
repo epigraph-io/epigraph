@@ -67,8 +67,7 @@
   color: var(--support);
 }
 
-.badge--superseded,
-.badge--hidden {
+.badge--superseded {
   font-style: italic;
 }
 

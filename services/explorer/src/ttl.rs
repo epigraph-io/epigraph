@@ -132,7 +132,7 @@ type AnyArc = Arc<dyn Any + Send + Sync>;
 ///
 /// Keys must include the viewer's [`crate::auth::RequestAuth::cache_key`]
 /// whenever the cached value came from an authenticated upstream call:
-/// upstream redaction differs per viewer.
+/// upstream visibility differs per viewer.
 #[derive(Clone, Default)]
 pub struct ResponseCache {
     map: TtlMap<String, AnyArc>,

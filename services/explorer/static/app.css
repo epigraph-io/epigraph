@@ -161,11 +161,6 @@ samp,
   overflow-wrap: break-word;
 }
 
-.claim-text--redacted {
-  color: var(--text-muted);
-  font-style: italic;
-}
-
 /* ---- focus & accessibility ---------------------------------------------- */
 
 :focus-visible {

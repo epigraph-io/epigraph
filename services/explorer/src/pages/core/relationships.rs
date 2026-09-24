@@ -210,7 +210,6 @@ pub struct Neighbour {
     pub text: String,
     /// `None` for entity types without a page (paper, trace, …).
     pub href: Option<String>,
-    pub redacted: bool,
     pub truth_value: Option<f64>,
     pub pignistic_prob: Option<f64>,
     /// `Some(false)` for a superseded claim.
@@ -247,9 +246,9 @@ pub struct Outlinks {
     pub families: Vec<FamilyGroup>,
     /// Edges upstream returned (after its degree cap).
     pub shown_edges: usize,
-    /// `/ego`'s `total_edges`: edges before the degree cap, already net of
-    /// anything dropped for redaction, so it never counts neighbours this
-    /// viewer may not see.
+    /// `/ego`'s `total_edges`: edges before the degree cap, counted inside
+    /// the viewer-filtered read, so it never counts neighbours this viewer
+    /// may not see.
     pub total_edges: u64,
     /// `/ego`'s `truncated`: the degree cap cut edges. Never inferred from
     /// the counts — see [`group_outlinks`].
@@ -287,6 +286,7 @@ pub fn group_outlinks(ego: &EgoResponse, links: &Links) -> Outlinks {
     let center = ego.center.id;
     // (family, relationship order, relationship key, direction rank) → group
     let mut groups: Vec<((Family, usize, String, u8), RelGroup)> = Vec::new();
+    let mut shown_edges = 0usize;
 
     for edge in &ego.edges {
         let direction = match edge.direction {
@@ -308,8 +308,20 @@ pub fn group_outlinks(ego: &EgoResponse, links: &Links) -> Outlinks {
         let dir_rank = u8::from(direction == EdgeDirection::In);
         let sort_key = (family, order, key.clone(), dir_rank);
 
-        let node = ego.nodes.iter().find(|n| n.id == neighbour_id);
+        // Upstream hydrates every endpoint it returns — a claim the viewer
+        // may not read is dropped along with its edges. An id that reaches
+        // here with no node is therefore one we are not entitled to name:
+        // drop the edge rather than synthesise "claim <short-id>" from it.
+        let Some(node) = ego
+            .nodes
+            .iter()
+            .chain(std::iter::once(&ego.center))
+            .find(|n| n.id == neighbour_id)
+        else {
+            continue;
+        };
         let neighbour = neighbour(neighbour_id, edge_type, node, links);
+        shown_edges += 1;
 
         match groups.iter_mut().find(|(k, _)| *k == sort_key) {
             Some((_, g)) => {
@@ -343,65 +355,59 @@ pub fn group_outlinks(ego: &EgoResponse, links: &Links) -> Outlinks {
     }
 
     // Truncation is upstream's to declare. Inferring it from
-    // `total_edges > edges.len()` also fired when the missing edges were
-    // dropped by *redaction*, which put a dead "explore the rest" link on the
-    // page (the graph view reads the same `/ego` route) and told the viewer
-    // exactly how many neighbours are hidden from them. `/ego`'s `total_edges`
-    // is redaction-aware and its `truncated` means degree-cap truncation, so
-    // both are taken as given; the `.max(shown_edges)` fixup that papered over
-    // the mismatch goes with them.
+    // `total_edges > edges.len()` also fires when the missing edges are ones
+    // the viewer may not see, which puts a dead "explore the rest" link on
+    // the page (the graph view reads the same `/ego` route) and tells the
+    // viewer exactly how many neighbours are hidden from them. `/ego` counts
+    // `total_edges` inside its viewer-filtered read and its `truncated` means
+    // degree-cap truncation, so both are taken as given; the
+    // `.max(shown_edges)` fixup that papered over the mismatch goes with them.
     Outlinks {
         families,
-        shown_edges: ego.edges.len(),
+        shown_edges,
         total_edges: ego.total_edges,
         truncated: ego.truncated,
         graph_url: links.claim_graph(center),
     }
 }
 
-fn neighbour(id: Uuid, edge_type: &str, node: Option<&EgoNode>, links: &Links) -> Neighbour {
-    let entity_type = node
-        .map(|n| n.entity_type.as_str())
-        .filter(|t| !t.is_empty())
-        .unwrap_or(edge_type)
-        .to_ascii_lowercase();
-    let redacted =
-        node.is_some_and(|n| n.redacted || n.content.as_deref() == Some(crate::upstream::REDACTED));
-    let text = if redacted {
-        "Content hidden".to_string()
+fn neighbour(id: Uuid, edge_type: &str, node: &EgoNode, links: &Links) -> Neighbour {
+    let entity_type = if node.entity_type.trim().is_empty() {
+        edge_type
     } else {
-        let label = node
-            .map(|n| n.label.trim())
-            .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case(&entity_type))
-            .map(str::to_string)
-            .or_else(|| {
-                node.and_then(|n| n.content.as_deref())
-                    .map(str::trim)
-                    .filter(|c| !c.is_empty())
-                    .map(str::to_string)
-            });
-        match label {
-            Some(l) => truncate_chars(&super::vocab::one_line(&l), NEIGHBOUR_TEXT_CHARS),
-            None => format!(
-                "{} {}",
-                if entity_type.is_empty() {
-                    "entity"
-                } else {
-                    &entity_type
-                },
-                short_id(id)
-            ),
-        }
+        node.entity_type.trim()
+    }
+    .to_ascii_lowercase();
+    let label = Some(node.label.trim())
+        .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case(&entity_type))
+        .map(str::to_string)
+        .or_else(|| {
+            node.content
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+        });
+    let text = match label {
+        Some(l) => truncate_chars(&super::vocab::one_line(&l), NEIGHBOUR_TEXT_CHARS),
+        None => format!(
+            "{} {}",
+            if entity_type.is_empty() {
+                "entity"
+            } else {
+                &entity_type
+            },
+            short_id(id)
+        ),
     };
     Neighbour {
         id,
         href: links.entity(&entity_type, id),
         entity_type,
         text,
-        redacted,
-        truth_value: node.and_then(|n| n.truth_value),
-        pignistic_prob: node.and_then(|n| n.pignistic_prob),
-        is_current: node.and_then(|n| n.is_current),
+        truth_value: node.truth_value,
+        pignistic_prob: node.pignistic_prob,
+        is_current: node.is_current,
     }
 }
 
@@ -424,7 +430,6 @@ mod tests {
             pignistic_prob: None,
             labels: vec![],
             is_current: None,
-            redacted: false,
         }
     }
 
@@ -502,13 +507,13 @@ mod tests {
         paper_edge.source_type = "paper".into();
         let mut agent_edge = edge(1, 6, "ATTRIBUTED_TO", "out");
         agent_edge.target_type = "agent".into();
-        let mut redacted = node(7, "claim", "[REDACTED]");
-        redacted.redacted = true;
         let ego = EgoResponse {
             center: node(1, "claim", "c"),
-            nodes: vec![node(4, "paper", "paper"), redacted],
-            edges: vec![paper_edge, agent_edge, edge(1, 7, "refines", "out")],
-            total_edges: 3,
+            // `paper` is hydrated, `agent` is one of upstream's unhydrated
+            // nodes (label == entity_type, no content).
+            nodes: vec![node(4, "paper", "paper"), node(6, "agent", "agent")],
+            edges: vec![paper_edge, agent_edge],
+            total_edges: 2,
             truncated: false,
         };
         let o = group_outlinks(&ego, &links());
@@ -525,13 +530,39 @@ mod tests {
             agent.href.as_deref(),
             Some(format!("/explorer/agent/{}", id(6)).as_str())
         );
-        let hidden = all.iter().find(|n| n.id == id(7)).unwrap();
-        assert!(hidden.redacted);
-        assert_eq!(hidden.text, "Content hidden");
         assert!(!o.truncated);
     }
 
-    /// `/ego` subtracts redaction-dropped edges from `total_edges` and sets
+    /// A claim the viewer may not read is absent from `nodes` (`68b8a8b1`).
+    /// An edge naming one must be dropped, not rendered as a linked
+    /// "claim <short-id>" — that fallback was the last path by which an
+    /// invisible claim's uuid could reach a page.
+    #[test]
+    fn edges_whose_neighbour_is_absent_are_dropped() {
+        let ego = EgoResponse {
+            center: node(1, "claim", "centre"),
+            nodes: vec![node(2, "claim", "two")],
+            edges: vec![edge(1, 2, "supports", "out"), edge(1, 7, "refines", "out")],
+            total_edges: 2,
+            truncated: false,
+        };
+        let o = group_outlinks(&ego, &links());
+        let all: Vec<&Neighbour> = o
+            .families
+            .iter()
+            .flat_map(|f| f.groups.iter().flat_map(|g| g.neighbours.iter()))
+            .collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, id(2));
+        assert_eq!(o.shown_edges, 1, "the dropped edge is not counted as shown");
+        let rendered = format!("{o:?}");
+        assert!(
+            !rendered.contains(&id(7).to_string()),
+            "the absent claim's id must not reach the page: {rendered}"
+        );
+    }
+
+    /// `/ego` counts `total_edges` inside its viewer-filtered read and sets
     /// `truncated` only for its degree cap. A response where the two simply
     /// disagree (fewer edges than `total_edges`, `truncated: false`) must not
     /// raise the truncation notice: that link is dead — the graph view reads

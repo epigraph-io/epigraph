@@ -250,10 +250,19 @@ impl<'a> Api<'a> {
             return decode(first);
         }
 
+        // The API distinguishes "token carries no agent_id; re-authenticate
+        // to obtain a token bound to a principal" from "Invalid token:
+        // ExpiredSignature". Both arrive as a bare 401, so an operator can
+        // only tell a pre-tenancy token from an expired one if the Explorer
+        // says which it was.
+        let reason = error_message(&first);
+
         let RequestAuth::Session { id, .. } = &self.auth else {
-            return Err(UpstreamError::Unauthorized {
-                message: error_message(&first),
-            });
+            // Anonymous and DevBearer have no refresh token, so there is no
+            // retry: a dev bearer minted without an `agent_id`, or past its
+            // TTL, fails every page with no recovery but re-minting it.
+            tracing::info!(%path, auth = ?self.auth, upstream_reason = %reason, "upstream 401 on a non-session request; no refresh is possible");
+            return Err(UpstreamError::Unauthorized { message: reason });
         };
 
         let stale = token.unwrap_or_default();
@@ -262,7 +271,7 @@ impl<'a> Api<'a> {
             // Upstream said no (invalid_grant, revoked, no such session):
             // the credential is dead, so the session is too.
             Err(e @ (auth::RefreshError::Rejected(_) | auth::RefreshError::NoSession)) => {
-                tracing::info!(error = %e, %path, "upstream 401 and refresh rejected; ending session");
+                tracing::info!(error = %e, %path, upstream_reason = %reason, "upstream 401 and refresh rejected; ending session");
                 self.state.sessions.remove(id);
                 return Err(UpstreamError::SessionExpired);
             }
@@ -272,7 +281,7 @@ impl<'a> Api<'a> {
             // not sign every user out. `degrade` renders this as an
             // unavailable section, and the next request refreshes again.
             Err(e) => {
-                tracing::warn!(error = %e, %path, "upstream 401 but the refresh could not reach upstream; keeping the session");
+                tracing::warn!(error = %e, %path, upstream_reason = %reason, "upstream 401 but the refresh could not reach upstream; keeping the session");
                 return Err(UpstreamError::Transport(e.to_string()));
             }
         };
@@ -282,7 +291,10 @@ impl<'a> Api<'a> {
             .exchange(&method, path, query, body.as_deref(), Some(&fresh))
             .await?;
         if second.status == StatusCode::UNAUTHORIZED {
-            tracing::info!(%path, "upstream 401 after refresh; ending session");
+            // A refreshed token still rejected. The refresh grant runs
+            // `principal_agent_id`, so this is not a missing principal:
+            // the session is genuinely over.
+            tracing::info!(%path, first_reason = %reason, upstream_reason = %error_message(&second), "upstream 401 after refresh; ending session");
             self.state.sessions.remove(id);
             return Err(UpstreamError::SessionExpired);
         }

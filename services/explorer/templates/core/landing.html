@@ -22,7 +22,7 @@
 </section>
 
 <section class="section" aria-labelledby="stats-title">
-  <h2 id="stats-title" class="section__title">The graph today</h2>
+  <h2 id="stats-title" class="section__title">What you can see</h2>
   {%- match stats %}
   {%- when Degraded::Available { data } %}
   <dl class="stats">
@@ -30,9 +30,7 @@
     <div class="stats__item"><dt>{{ s.label }}</dt><dd class="num">{{ s.value }}</dd></div>
     {%- endfor %}
   </dl>
-  {%- if let Some(c) = data.computed %}
-  <p class="small muted">Counted {{ c }}.</p>
-  {%- endif %}
+  <p class="small muted">These are the rows you can read, not the size of the whole graph: another reader sees different numbers.{% if let Some(c) = data.computed %} Counted {{ c }}.{% endif %}</p>
   {%- when Degraded::Unavailable { reason } %}
   <p class="section-unavailable">{{ reason }}</p>
   {%- endmatch %}

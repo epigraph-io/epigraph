@@ -15,7 +15,7 @@
 
 <header class="entity-head">
   <p class="entity-kind">Provenance</p>
-  <h1 class="claim-text{% if heading.redacted %} claim-text--redacted{% endif %}">{{ heading.text }}</h1>
+  <h1 class="claim-text">{{ heading.text }}</h1>
   <p class="muted">The claims this one derives from, following supports,
   corroborates, elaborates and decomposes_to back to their sources, and
   supersedes back to older versions.</p>
@@ -60,18 +60,15 @@
           {%- if n.superseded %}
           <span class="badge badge--superseded">Superseded</span>
           {%- endif %}
-          {%- if n.text.redacted %}
-          <span class="badge badge--hidden">Hidden</span>
-          {%- endif %}
           {%- if n.in_cycle %}
           <span class="badge badge--cycle">In a cycle</span>
           {%- endif %}
         </div>
-        <p class="chain-node__text{% if n.text.redacted %} claim-text--redacted{% endif %}"><a href="{{ n.url }}">{{ n.text.text }}</a></p>
+        <p class="chain-node__text"><a href="{{ n.url }}">{{ n.text.text }}</a></p>
         {%- if !n.links.is_empty() %}
         <ul class="chain-links">
           {%- for l in n.links %}
-          <li><span class="rel">{{ l.phrase }}</span> <a href="{{ l.other.url }}"{% if l.other.redacted %} class="claim-text--redacted"{% endif %}>{{ l.other.label }}</a></li>
+          <li><span class="rel">{{ l.phrase }}</span> <a href="{{ l.other.url }}">{{ l.other.label }}</a></li>
           {%- endfor %}
         </ul>
         {%- endif %}
@@ -93,7 +90,7 @@
     {%- for cycle in layout.cycles %}
     <li class="cycle">
       {%- for r in cycle %}
-      <a href="{{ r.url }}"{% if r.redacted %} class="claim-text--redacted"{% endif %}>{{ r.label }}</a>{% if !loop.last %} <span class="rel" aria-label="linked to">→</span> {% endif %}
+      <a href="{{ r.url }}">{{ r.label }}</a>{% if !loop.last %} <span class="rel" aria-label="linked to">→</span> {% endif %}
       {%- endfor %}
     </li>
     {%- endfor %}

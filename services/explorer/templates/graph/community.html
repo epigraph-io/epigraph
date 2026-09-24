@@ -16,9 +16,9 @@
 {% include "graph/_not_permalink.html" %}
 
 <section class="section" aria-labelledby="claims-title">
-  <h2 id="claims-title" class="section__title">Claims <span class="small muted">{{ claims.len() }} of {{ total_size }}</span></h2>
+  <h2 id="claims-title" class="section__title">Claims <span class="small muted">{{ claims.len() }}</span></h2>
   {%- if truncated %}
-  <p class="small muted">Showing the {{ claims.len() }} best-connected claims of {{ total_size }}.</p>
+  <p class="small muted">Showing the {{ claims.len() }} best-connected claims of this community.</p>
   {%- endif %}
   {%- if claims.is_empty() %}
   <p class="muted">This community has no claims to show.</p>
@@ -26,7 +26,7 @@
   <ol class="link-list graph-list">
     {%- for c in claims %}
     <li class="graph-row">
-      <a href="{{ c.href }}"{% if c.redacted %} class="muted"{% endif %}>{{ c.label }}</a>
+      <a href="{{ c.href }}">{{ c.label }}</a>
       <span class="small muted num">belief {{ c.betp }}</span>
     </li>
     {%- endfor %}

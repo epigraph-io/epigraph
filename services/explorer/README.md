@@ -9,8 +9,9 @@ graph canvas.
 
 It is a **backend-for-frontend**. It holds no data. Every read goes to
 `epigraph-api` with the signed-in viewer's own bearer token, so the API's
-access control and redaction decide what each viewer sees. The Explorer never
-uses a service token of its own.
+per-viewer visibility decides what each viewer sees: a row the viewer may not
+read is **absent** from the response, never blanked. The Explorer never uses a
+service token of its own.
 
 - Crate and binary: `epigraph-explorer` (Rust, axum 0.8, askama templates).
 - Standalone crate: it has its own empty `[workspace]`, its own `Cargo.lock`
@@ -42,7 +43,7 @@ uses a service token of its own.
      │                             │  EPIGRAPH_API_URL (loopback)
      │                             ▼
      │   /oauth/authorize  epigraph-api  :8080   (systemd: epigraph-api.service)
-     └─────────────────────▶   /api/v1/*  ── reads, with redaction per viewer
+     └─────────────────────▶   /api/v1/*  ── reads, filtered per viewer
         (top-level              /oauth/*   ── authorization server
          navigation, to                   │
          EPIGRAPH_OAUTH_BASE_URL)         │
@@ -103,12 +104,11 @@ code **2**.
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
 | `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
 | `EPIGRAPH_EXPLORER_CLIENT_ID` | unset | The `client_id` of the pre-registered OAuth client (see Operator setup). If it is unset, sign-in is disabled and a warning is logged at startup. Whitespace is rejected. |
-| `EPIGRAPH_EXPLORER_PUBLIC_UNFURL` | `false` | If `true`, an anonymous `/claim/{id}` renders OpenGraph text from an anonymous upstream read, unless that read is redacted. Otherwise it shows a generic card. Accepts `true/false/1/0/yes/no/on/off`. |
 | `EPIGRAPH_EXPLORER_FRAME_ANCESTORS` | `https://www.notion.so https://*.notion.so https://*.notion.site` | The CSP `frame-ancestors` source list, space-separated. `;`, `,`, control characters and non-ASCII are rejected. Setting it **explicitly empty** means `'none'` (no framing at all). |
 | `EPIGRAPH_EXPLORER_UPSTREAM_CONCURRENCY` | `6` | Size of the global semaphore on upstream calls, clamped to 1–8. The API's database pool has 10 connections, shared with every other client. A clamped value is logged. |
 | `EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` | `8000` | Timeout for each upstream call, clamped to 250–60000. The time spent waiting for the semaphore counts against it. |
 | `EPIGRAPH_EXPLORER_INSECURE_COOKIES` | `false` | Drops `Secure` from the first-party session cookie. **Only for plain-http local development.** Logged as a warning. |
-| `EPIGRAPH_EXPLORER_DEV_BEARER` | unset | **Development only.** A bearer token used for every request that has no session. The process refuses to start with it unless the host of `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` is exactly `localhost` or `127.0.0.1`. Logged as a warning and redacted from logs. |
+| `EPIGRAPH_EXPLORER_DEV_BEARER` | unset | **Development only.** A bearer token used for every request that has no session. The process refuses to start with it unless the host of `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` is exactly `localhost` or `127.0.0.1`. Logged as a warning and redacted from logs. It must be a token minted by the **current** `/oauth/token`, because the API rejects a token that carries no `agent_id`; there is no refresh on this path, so it dies at its TTL (see Local development). |
 | `RUST_LOG` | `info` | A `tracing-subscriber` filter, e.g. `info,epigraph_explorer=debug`. |
 
 Fixed limits, which are not configurable:
@@ -127,7 +127,6 @@ EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com/explorer
 EPIGRAPH_API_URL=http://127.0.0.1:8080
 EPIGRAPH_OAUTH_BASE_URL=https://api.example.com
 EPIGRAPH_EXPLORER_CLIENT_ID=epigraph_explorer
-# EPIGRAPH_EXPLORER_PUBLIC_UNFURL=false
 # RUST_LOG=info
 ```
 
@@ -176,8 +175,23 @@ cargo run
 
 Run `bootstrap_clients` from the repo root with `DATABASE_URL` pointing at the
 dev database. This is the only place a service-style token touches the
-Explorer, and the startup check keeps it on localhost. When the token expires
-the API returns 401 and pages redirect to sign-in; mint a new one and restart.
+Explorer, and the startup check keeps it on localhost.
+
+**The dev bearer has no refresh, and it must carry a principal.** A
+`RequestAuth::DevBearer` is deliberately excluded from the refresh-and-retry
+path (`src/upstream/mod.rs`), so there is no recovery when the API rejects it:
+every page renders "Sign in to see this." Two ways to land there, and both
+look identical from the browser:
+
+- the token expired (1 h for `client_credentials`), or
+- the token carries no `agent_id`, so the API's `ViewerExtractor` 401s it with
+  *"token carries no agent_id; re-authenticate to obtain a token bound to a
+  principal"*. Every grant on the current `/oauth/token` populates it, so this
+  only happens with a token minted before tenancy, or pasted from an old note.
+
+The Explorer logs the API's own reason on each upstream 401
+(`upstream_reason=…`), so `RUST_LOG=info` tells the two apart. The fix for
+both is the same: mint a fresh token and restart.
 
 **With real sign-in.** Insert an `oauth_clients` row whose `redirect_uris`
 contains `http://localhost:8096/auth/callback` into the **dev** database (the
@@ -234,6 +248,18 @@ The row has to meet these constraints:
   authorization-code grant never checks a secret.
 - **Empty scopes are correct.** The scopes a token carries come from the
   signing-in user's own per-user client (`google:<sub>`), not from this row.
+- **No `agent_id` column, on purpose.** The token endpoint materialises the
+  principal at **mint** time and links it write-once
+  (`principal_agent_id` → `AgentRepository::ensure_for_client`;
+  `OAuthClientRepository::set_agent_id` guards with `AND agent_id IS NULL`),
+  so clients that predate tenancy acquire theirs on their next token. Do not
+  add the column to this INSERT.
+- **Do not give this row group memberships.** The same rule that decides the
+  scopes decides the tenancy principal: a signed-in user's principal is their
+  **own** `google:<sub>` client's agent, never `epigraph_explorer`'s. Granting
+  this row groups does nothing today, and it is the obvious wrong fix for a
+  user who sees an empty result set — the right fix is that user's own group
+  membership.
 
 To move the Explorer to a new public URL, update the row:
 
@@ -351,9 +377,10 @@ Then sign in through the browser and open a claim.
 
 - **Bearer forwarding, and no service token.** Every upstream call carries the
   viewer's own access token, and anonymous calls carry none. The API's
-  per-viewer redaction is what protects content; the Explorer adds no
-  privileges of its own. It never sends a token it knows is stale, because
-  the API returns 401 for a present-but-invalid bearer even on public routes.
+  per-viewer visibility filtering is what protects content; the Explorer adds
+  no privileges of its own. It never sends a token it knows is stale, because
+  the API returns 401 for a present-but-invalid bearer even on the two
+  allowlisted routes.
   It refreshes a token 60 s before expiry. After an upstream 401 it refreshes
   and retries once, and a second 401 ends the session. Refresh runs one
   at a time per session, and the rotated refresh token is stored every time.
@@ -362,14 +389,25 @@ Then sign in through the browser and open a claim.
   not reach `/oauth/token` at all — a restart, a timeout, a 5xx — keeps the
   session and reports the ordinary "API unavailable" failure, so an API
   restart does not sign every user out.
-- **Redaction short-circuit.** The kernel's §2.6 sweep made every read route
-  the Explorer renders from apply what `GET /claims/{id}` applies — claim
-  text the requester may not read comes back as `"[REDACTED]"` from
-  `/claims/{id}/history`, `/agents/{id}/claims`, `/frames/{id}/claims`,
-  `/claims/by-labels`, `/search/semantic` and both graph `expand` routes. The
-  Explorer keeps its own short-circuit on top: if `GET /claims/{id}` returns
-  `"[REDACTED]"`, it skips every other content-bearing call for that page, so
-  the text never reaches OpenGraph tags and the calls are never made.
+- **Absence, not blanking.** A row the viewer may not read is **absent** from
+  the API's response — omitted from a list, or a 404 that is byte-identical to
+  the one a nonexistent id gets. It is never returned blanked as
+  `"[REDACTED]"`; the kernel deleted that mechanism (`68b8a8b1`). The Explorer
+  follows the same rule, and it is a rule about *this* UI as much as the API:
+  there is **no "hidden claim" page**. `/claim/{id}`, `/claim/{id}/graph`,
+  `/claim/{id}/history` and `/claim/{id}/provenance` for a claim this viewer
+  may not read all render the ordinary not-found page, because a distinct "you
+  may not have access" page would rebuild in the UI exactly the existence
+  oracle the API removed. Two places where an id could still leak are closed
+  here rather than upstream: an edge whose endpoint is not among the nodes the
+  response carried is **dropped**, not rendered as a linked "Claim
+  <short-id>"; and `/community/{id}` no longer prints the cluster's
+  `total_size`, because that metadata is not viewer-filtered and the
+  difference against the filtered list is a count of what the viewer cannot
+  see.
+- **Counts are per-viewer.** `/api/v1/stats` is filtered like every other
+  read, so the landing page's numbers are "rows you can see", not the size of
+  the corpus, and two signed-in readers get different ones. The page says so.
 - **Sign-in** uses the authorization-code flow with mandatory PKCE S256
   against the API's own authorization server, with `scope=claims:read`. The
   code lives 60 s upstream and is redeemed immediately. No token ever appears
@@ -419,12 +457,18 @@ Then sign in through the browser and open a claim.
   When an id has gone stale, its view says "view expired — clustering has
   re-run". The share buttons on those views copy the centre **claim's** URL,
   which is stable. Share claim links, not cluster links.
-- **OpenGraph unfurls stop working after tenancy.** Unfurl bots have no
-  session. Today, anonymous claim reads work on `main`, so
-  `EPIGRAPH_EXPLORER_PUBLIC_UNFURL=true` can put claim text in link previews.
-  Once the tenancy work deploys, anonymous callers get nothing, and the
-  Explorer will not use a service token to get around that. Previews will
-  fall back to a generic card until a public-share design exists (plan §4).
+- **OpenGraph unfurls never contain claim text.** Unfurl bots have no
+  session, and there is no anonymous claim read to fall back on: the API's
+  public allowlist is exactly `/health`, `/api/v1/openapi.json` and the OAuth
+  paths, pinned by a lint (`crates/epigraph-api/tests/public_router_allowlist.rs`).
+  An anonymous `/claim/{id}` is therefore a sign-in prompt with a generic card
+  ("A claim in EpiGraph"), and it makes **no upstream call at all**. The
+  `EPIGRAPH_EXPLORER_PUBLIC_UNFURL` knob that used to switch this is gone: it
+  could only ever buy a request that 401s. Setting the variable now does
+  nothing. Real previews need a public-share design in the kernel — a signed
+  per-claim share token, or an explicit `visibility = 'public'` read on the
+  allowlist — and the Explorer will not use a service token to get around
+  that.
 - **The session store is credential storage.** When a token is refreshed,
   the API issues it with the user's **full** granted scopes, whatever was
   requested at sign-in. Those scopes include write scopes such as
@@ -436,12 +480,16 @@ Then sign in through the browser and open a claim.
 - **Sessions are in memory, so a restart signs everyone out.** They are also
   not shared between processes, so run **one** instance. A second instance
   behind a load balancer would sign users out at random.
-- **Pages need sign-in even before tenancy.** The graph overview and expand
-  routes are on the API's protected router. Anonymous visitors therefore get
-  the sign-in redirect everywhere except `/claim/{id}`.
+- **Every page needs sign-in.** Every API read needs a viewer, so anonymous
+  visitors get the sign-in redirect everywhere except `/health`, `/auth/*`,
+  `/static/*` and `/claim/{id}`, which answers 200 with a sign-in prompt so
+  that a shared link does not unfurl as the login page.
 - **Who can sign in** is decided by the API's Google allowlist, not by the
   Explorer (Operator setup §2).
-- **After tenancy deploys,** tokens minted before it carry no `agent_id`,
-  and the API returns 401 for them. The Explorer's refresh-and-retry-once
-  gets a fresh token for them. Users whose refresh also fails are asked to
-  sign in again.
+- **A token minted before tenancy carries no `agent_id`,** and the API
+  returns 401 for it — deliberately a 401 and not a 403, because the remedy is
+  to re-mint it. For a session this is invisible: the Explorer's
+  refresh-and-retry-once gets a fresh token, and every grant on the current
+  `/oauth/token` populates `agent_id`, so the retry succeeds. Users whose
+  refresh *also* fails are asked to sign in again. `EPIGRAPH_EXPLORER_DEV_BEARER`
+  has no refresh and does not recover (see Local development).

@@ -8,17 +8,18 @@
 //! ```text
 //! { "center": uuid|null,
 //!   "nodes": [{ id, entity_type, label, content, truth_value, pignistic_prob,
-//!               labels, is_current, redacted, is_center, frame_id, atom_count,
+//!               labels, is_current, is_center, frame_id, atom_count,
 //!               kind, href, expand_href, graph_href }],
 //!   "edges": [{ id, source, target, relationship, family, directed, strength }],
 //!   "total_edges": n, "truncated": bool, "hidden_nodes": n, … }
 //! ```
 //!
 //! Every URL in it is built here from [`Links`] (base-path aware), so the
-//! JS never assembles one. Redacted nodes lose their text, labels and
-//! numbers before they leave the BFF. The overviews are cached for 60 s per
-//! viewer ([`RequestAuth::cache_key`]); upstream redaction differs per
-//! viewer, so one viewer's cached body is never served to another.
+//! JS never assembles one. A claim the viewer may not read is absent from
+//! the upstream payload entirely (`68b8a8b1`), so no node here needs
+//! blanking. The overviews are cached for 60 s per viewer
+//! ([`RequestAuth::cache_key`]); upstream visibility differs per viewer, so
+//! one viewer's cached body is never served to another.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -41,9 +42,7 @@ use crate::upstream::graph::{
     CommunitiesOverview, CompoundGroup, NeighborhoodExpand, NeighborhoodMode, ThemesOverview,
     WeightedEdge,
 };
-use crate::upstream::{
-    truncate_chars, EgoNode, EgoResponse, DEFAULT_EGO_DEGREE, MAX_EGO_DEGREE, REDACTED,
-};
+use crate::upstream::{truncate_chars, EgoNode, EgoResponse, DEFAULT_EGO_DEGREE, MAX_EGO_DEGREE};
 
 /// Most nodes a canvas payload carries (plan §3.6); graph.js enforces the
 /// same cap across merges.
@@ -58,8 +57,6 @@ pub const OVERVIEW_EDGE_CAP: usize = 2000;
 pub const LABEL_CHARS: usize = 160;
 /// Claim text carried for the canvas side panel.
 pub const CONTENT_CHARS: usize = 1000;
-/// Shown in place of a claim the viewer may not read.
-pub const HIDDEN_LABEL: &str = "Hidden claim";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -90,7 +87,7 @@ pub struct CanvasGraph {
 pub struct CanvasNode {
     pub id: Uuid,
     pub entity_type: String,
-    /// One line, ≤ [`LABEL_CHARS`]; [`HIDDEN_LABEL`] when redacted.
+    /// One line, ≤ [`LABEL_CHARS`].
     pub label: String,
     /// Claim text for the side panel, ≤ [`CONTENT_CHARS`].
     pub content: Option<String>,
@@ -98,7 +95,6 @@ pub struct CanvasNode {
     pub pignistic_prob: Option<f64>,
     pub labels: Vec<String>,
     pub is_current: Option<bool>,
-    pub redacted: bool,
     pub is_center: bool,
     /// Hue key for the canvas (neighbourhood nodes only).
     pub frame_id: Option<Uuid>,
@@ -108,9 +104,10 @@ pub struct CanvasNode {
     pub kind: Option<String>,
     /// The node's page, if its entity type has one.
     pub href: Option<String>,
-    /// `/bff/graph/ego/:id` — claims the viewer can read only.
+    /// `/bff/graph/ego/:id`. Every node upstream returns is one the viewer
+    /// may read, so every claim node gets one.
     pub expand_href: Option<String>,
-    /// `/claim/:id/graph` — claims the viewer can read only.
+    /// `/claim/:id/graph`.
     pub graph_href: Option<String>,
 }
 
@@ -152,50 +149,25 @@ pub fn one_line(s: &str, max: usize) -> String {
 
 impl CanvasNode {
     /// A claim node from an expand payload, where `label` is the claim text
-    /// itself (or [`REDACTED`]).
+    /// itself.
     pub fn from_claim_label(id: Uuid, label: &str, links: &Links) -> Self {
-        let redacted = label.trim() == REDACTED;
-        let mut n = CanvasNode {
+        CanvasNode {
             id,
             entity_type: "claim".into(),
-            label: String::new(),
-            content: None,
+            label: non_empty_line(label).unwrap_or_else(|| id.to_string()),
+            content: Some(truncate_chars(label.trim(), CONTENT_CHARS)),
             truth_value: None,
             pignistic_prob: None,
             labels: Vec::new(),
             is_current: None,
-            redacted,
             is_center: false,
             frame_id: None,
             atom_count: None,
             kind: None,
             href: Some(links.claim(id)),
-            expand_href: None,
-            graph_href: None,
-        };
-        if redacted {
-            n.label = HIDDEN_LABEL.into();
-        } else {
-            n.label = non_empty_line(label).unwrap_or_else(|| id.to_string());
-            n.content = Some(truncate_chars(label.trim(), CONTENT_CHARS));
-            n.expand_href = Some(links.bff_graph_ego(id, None));
-            n.graph_href = Some(links.claim_graph(id));
+            expand_href: Some(links.bff_graph_ego(id, None)),
+            graph_href: Some(links.claim_graph(id)),
         }
-        n
-    }
-
-    /// Drop everything a redacted node must not carry.
-    fn scrub(&mut self) {
-        self.redacted = true;
-        self.label = HIDDEN_LABEL.into();
-        self.content = None;
-        self.labels.clear();
-        self.truth_value = None;
-        self.pignistic_prob = None;
-        self.is_current = None;
-        self.frame_id = None;
-        self.expand_href = None;
-        self.graph_href = None;
     }
 }
 
@@ -206,14 +178,11 @@ fn non_empty_line(s: &str) -> Option<String> {
 
 fn ego_node(n: EgoNode, is_center: bool, links: &Links) -> CanvasNode {
     let is_claim = n.entity_type.eq_ignore_ascii_case("claim");
-    let redacted = n.redacted
-        || n.label.trim() == REDACTED
-        || n.content.as_deref().map(str::trim) == Some(REDACTED);
     let label = non_empty_line(&n.label)
         .or_else(|| n.content.as_deref().and_then(non_empty_line))
         .or_else(|| non_empty_line(&n.entity_type))
         .unwrap_or_else(|| n.id.to_string());
-    let mut node = CanvasNode {
+    CanvasNode {
         id: n.id,
         href: links.entity(&n.entity_type, n.id),
         expand_href: is_claim.then(|| links.bff_graph_ego(n.id, None)),
@@ -228,16 +197,11 @@ fn ego_node(n: EgoNode, is_center: bool, links: &Links) -> CanvasNode {
         pignistic_prob: n.pignistic_prob,
         labels: n.labels,
         is_current: n.is_current,
-        redacted: false,
         is_center,
         frame_id: None,
         atom_count: None,
         kind: None,
-    };
-    if redacted {
-        node.scrub();
     }
-    node
 }
 
 /// Keep the first [`VISIBLE_NODE_CAP`] distinct nodes and the edges whose
@@ -262,12 +226,11 @@ fn cap_graph(
     (kept, edges, hidden)
 }
 
-/// `/claims/:id/ego` → canvas. The centre is always the first node; a
-/// redacted centre keeps no edges (upstream sends none either).
+/// `/claims/:id/ego` → canvas. The centre is always the first node. A
+/// centre the viewer may not read is a 404 upstream, so it never gets here.
 pub fn canvas_from_ego(ego: EgoResponse, links: &Links) -> CanvasGraph {
     let center_id = ego.center.id;
     let center = ego_node(ego.center, true, links);
-    let center_redacted = center.redacted;
 
     let mut nodes = Vec::with_capacity(ego.nodes.len() + 1);
     nodes.push(center);
@@ -277,22 +240,19 @@ pub fn canvas_from_ego(ego: EgoResponse, links: &Links) -> CanvasGraph {
             .filter(|n| n.id != center_id)
             .map(|n| ego_node(n, false, links)),
     );
-    let edges = if center_redacted {
-        Vec::new()
-    } else {
-        ego.edges
-            .into_iter()
-            .map(|e| CanvasEdge {
-                id: e.id.to_string(),
-                source: e.source_id,
-                target: e.target_id,
-                family: relationship_family(&e.relationship),
-                relationship: e.relationship,
-                directed: true,
-                strength: None,
-            })
-            .collect()
-    };
+    let edges: Vec<CanvasEdge> = ego
+        .edges
+        .into_iter()
+        .map(|e| CanvasEdge {
+            id: e.id.to_string(),
+            source: e.source_id,
+            target: e.target_id,
+            family: relationship_family(&e.relationship),
+            relationship: e.relationship,
+            directed: true,
+            strength: None,
+        })
+        .collect();
     let (nodes, edges, hidden_nodes) = cap_graph(nodes, edges);
     CanvasGraph {
         center: Some(center_id),
@@ -335,21 +295,14 @@ impl CanvasEdge {
 pub struct GroupItem {
     pub compound_id: Uuid,
     pub label: String,
-    pub redacted: bool,
     pub member_count: usize,
     pub href: String,
 }
 
 fn group_item(g: CompoundGroup, links: &Links) -> GroupItem {
-    let redacted = g.label.trim() == REDACTED;
     GroupItem {
         compound_id: g.compound_id,
-        label: if redacted {
-            HIDDEN_LABEL.into()
-        } else {
-            non_empty_line(&g.label).unwrap_or_else(|| g.compound_id.to_string())
-        },
-        redacted,
+        label: non_empty_line(&g.label).unwrap_or_else(|| g.compound_id.to_string()),
         member_count: g.member_atom_ids.len(),
         href: links.claim(g.compound_id),
     }
@@ -372,10 +325,8 @@ pub fn canvas_from_neighborhood(
                         let mut node = CanvasNode::from_claim_label(n.id, &n.label, links);
                         node.kind = Some(n.kind).filter(|k| !k.is_empty());
                         node.atom_count = (n.atom_count > 0).then_some(n.atom_count);
-                        if !node.redacted {
-                            node.pignistic_prob = n.pignistic_prob;
-                            node.frame_id = n.frame_id;
-                        }
+                        node.pignistic_prob = n.pignistic_prob;
+                        node.frame_id = n.frame_id;
                         node
                     })
                     .collect::<Vec<_>>();
@@ -402,10 +353,8 @@ pub fn canvas_from_neighborhood(
                     .map(|n| {
                         let mut node = CanvasNode::from_claim_label(n.id, &n.label, links);
                         node.kind = Some("atom".into());
-                        if !node.redacted {
-                            node.pignistic_prob = n.pignistic_prob;
-                            node.frame_id = n.frame_id;
-                        }
+                        node.pignistic_prob = n.pignistic_prob;
+                        node.frame_id = n.frame_id;
                         node
                     })
                     .collect::<Vec<_>>();
@@ -710,13 +659,13 @@ mod tests {
         json!({
             "center": {"id": uuid(1), "entity_type": "claim", "label": "Centre\nclaim",
                        "content": "Centre claim", "truth_value": 0.7, "pignistic_prob": 0.8,
-                       "labels": ["x"], "is_current": true, "redacted": false},
+                       "labels": ["x"], "is_current": true},
             "nodes": [
-                {"id": uuid(2), "entity_type": "claim", "label": "Secret", "content": "[REDACTED]",
-                 "truth_value": 0.2, "labels": ["private"], "is_current": true, "redacted": true},
-                {"id": uuid(3), "entity_type": "paper", "label": "paper", "redacted": false},
-                {"id": uuid(4), "entity_type": "Agent", "label": "Ada", "redacted": false},
-                {"id": uuid(4), "entity_type": "Agent", "label": "Ada again", "redacted": false}
+                {"id": uuid(2), "entity_type": "claim", "label": "Second", "content": "Second claim",
+                 "truth_value": 0.2, "labels": ["private"], "is_current": true},
+                {"id": uuid(3), "entity_type": "paper", "label": "paper"},
+                {"id": uuid(4), "entity_type": "Agent", "label": "Ada"},
+                {"id": uuid(4), "entity_type": "Agent", "label": "Ada again"}
             ],
             "edges": [
                 {"id": uuid(10), "source_id": uuid(1), "target_id": uuid(2),
@@ -737,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn ego_canvas_maps_links_redaction_and_dedupes() {
+    fn ego_canvas_maps_links_and_dedupes() {
         let ego: EgoResponse = serde_json::from_value(ego_json()).unwrap();
         let g = canvas_from_ego(ego, &links());
         assert_eq!(g.center, Some(uuid(1)));
@@ -765,12 +714,15 @@ mod tests {
             Some(&*links().claim_graph(uuid(1)))
         );
 
-        let hidden = &g.nodes[1];
-        assert!(hidden.redacted);
-        assert_eq!(hidden.label, HIDDEN_LABEL);
-        assert!(hidden.content.is_none() && hidden.labels.is_empty());
-        assert!(hidden.truth_value.is_none() && hidden.expand_href.is_none());
-        assert_eq!(hidden.href.as_deref(), Some(&*links().claim(uuid(2))));
+        let second = &g.nodes[1];
+        assert_eq!(second.label, "Second");
+        assert_eq!(second.content.as_deref(), Some("Second claim"));
+        assert_eq!(second.truth_value, Some(0.2));
+        assert_eq!(
+            second.expand_href.as_deref(),
+            Some(&*links().bff_graph_ego(uuid(2), None))
+        );
+        assert_eq!(second.href.as_deref(), Some(&*links().claim(uuid(2))));
 
         let paper = &g.nodes[2];
         assert!(paper.href.is_none(), "papers have no page");
@@ -784,17 +736,6 @@ mod tests {
         assert_eq!(g.edges[1].source, uuid(3));
         assert_eq!(g.edges[1].target, uuid(1));
         assert!(g.edges.iter().all(|e| e.directed));
-    }
-
-    #[test]
-    fn redacted_centre_keeps_no_edges() {
-        let mut v = ego_json();
-        v["center"]["redacted"] = json!(true);
-        v["center"]["content"] = json!("[REDACTED]");
-        let g = canvas_from_ego(serde_json::from_value(v).unwrap(), &links());
-        assert!(g.nodes[0].redacted && g.nodes[0].is_center);
-        assert_eq!(g.nodes[0].label, HIDDEN_LABEL);
-        assert!(g.edges.is_empty());
     }
 
     #[test]
@@ -824,7 +765,7 @@ mod tests {
             "nodes": [
                 {"id": uuid(1), "label": "Compound one", "kind": "compound", "atom_count": 4,
                  "pignistic_prob": 0.9, "frame_id": uuid(70)},
-                {"id": uuid(2), "label": "[REDACTED]", "kind": "standalone", "atom_count": 0,
+                {"id": uuid(2), "label": "Standalone claim", "kind": "standalone", "atom_count": 0,
                  "pignistic_prob": 0.1, "frame_id": uuid(71)}
             ],
             "induced_edges": [{"source": uuid(1), "target": uuid(2), "relationship": "supports",
@@ -844,9 +785,9 @@ mod tests {
         assert_eq!(g.nodes[0].atom_count, Some(4));
         assert_eq!(g.nodes[0].frame_id, Some(uuid(70)));
         assert_eq!(g.nodes[0].kind.as_deref(), Some("compound"));
-        assert!(g.nodes[1].redacted);
-        assert_eq!(g.nodes[1].pignistic_prob, None);
-        assert_eq!(g.nodes[1].frame_id, None);
+        assert_eq!(g.nodes[1].label, "Standalone claim");
+        assert_eq!(g.nodes[1].pignistic_prob, Some(0.1));
+        assert_eq!(g.nodes[1].frame_id, Some(uuid(71)));
         assert_eq!(g.nodes[1].atom_count, None);
 
         // induced+direct `supports` share a key; the CONTRADICTS duplicate collapses.

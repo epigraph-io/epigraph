@@ -3,7 +3,8 @@
 //!
 //! Upstream JSON is shaped exactly as the mapping reports record it
 //! (claims-endpoints §7, graph-entity-endpoints §4-§9, plan §2.1), including
-//! omitted optional fields, both error-body formats and redaction.
+//! omitted optional fields, both error-body formats, and the
+//! absent-not-blanked rule for rows the viewer may not read.
 
 mod common;
 
@@ -22,7 +23,10 @@ const V1: &str = "11111111-5f43-4c4b-9a52-3f0d1e2c7a10";
 const V3: &str = "33333333-5f43-4c4b-9a52-3f0d1e2c7a10";
 const ANC: &str = "44444444-5f43-4c4b-9a52-3f0d1e2c7a10";
 const OLD: &str = "55555555-5f43-4c4b-9a52-3f0d1e2c7a10";
-const HIDDEN: &str = "66666666-5f43-4c4b-9a52-3f0d1e2c7a10";
+const DEEP: &str = "66666666-5f43-4c4b-9a52-3f0d1e2c7a10";
+/// An ancestor this viewer may not read: it appears in an edge, but
+/// upstream returns no node for it.
+const ABSENT: &str = "77777777-5f43-4c4b-9a52-3f0d1e2c7a10";
 const AGENT: &str = "a9e7c1d2-0000-4c4b-9a52-3f0d1e2c7a10";
 const FRAME: &str = "f4a3e2d1-0000-4c4b-9a52-3f0d1e2c7a10";
 const PARENT_FRAME: &str = "f4a3e2d1-1111-4c4b-9a52-3f0d1e2c7a10";
@@ -283,12 +287,12 @@ async fn history_lists_versions_marking_current_superseded_and_duplicates() {
     app.upstream.verify().await;
 }
 
-/// Post-§2.6-sweep shape: the requested claim is readable but an *older*
-/// version is not, because each version is a distinct claim with its own
-/// ownership row and `versioning::claim_history` redacts them one by one.
-/// The hidden version must read as hidden, never as the literal marker.
+/// Post-tenancy shape: each version is a distinct claim with its own
+/// ownership row, and `versioning::claim_history` FILTERS them — a version
+/// this viewer may not read is a missing row, never a blanked one. The page
+/// must therefore show no gap marker, no placeholder and no id for it.
 #[tokio::test]
-async fn history_renders_a_per_version_redaction_as_hidden_text() {
+async fn history_omits_versions_the_viewer_cannot_read() {
     let app = spawn().await;
     get_ok(
         &app,
@@ -296,13 +300,15 @@ async fn history_renders_a_per_version_redaction_as_hidden_text() {
         claim_json("Water boils at 100 °C at sea level."),
     )
     .await;
+    // A third version (V3) exists upstream that this viewer may not read.
+    // It is simply absent, and `total_versions` counts only what came back.
     get_ok(
         &app,
         &format!("/api/v1/claims/{CLAIM}/history"),
         json!({
             "claim_id": CLAIM,
             "versions": [
-                {"claim_id": V1, "content": "[REDACTED]", "truth_value": null,
+                {"claim_id": V1, "content": "Water boils at 99 °C.", "truth_value": null,
                  "version": 1, "is_current": false, "created_at": "2025-12-01T00:00:00Z",
                  "superseded_by": CLAIM},
                 {"claim_id": CLAIM, "content": "Water boils at 100 °C at sea level.",
@@ -318,22 +324,26 @@ async fn history_renders_a_per_version_redaction_as_hidden_text() {
         .get_as(&format!("/explorer/claim/{CLAIM}/history"), &sid)
         .await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains("Water boils at 99 °C."));
+    assert!(res.body.contains("Water boils at 100 °C at sea level."));
     assert!(
-        !res.body.contains("[REDACTED]"),
-        "the marker is never shown verbatim: {}",
+        !res.body.contains("Content hidden") && !res.body.contains("Hidden"),
+        "no placeholder row survives: {}",
         res.body
     );
-    assert!(res.body.contains("Content hidden"), "{}", res.body);
-    assert!(res.body.contains("claim-text--redacted"), "{}", res.body);
-    // The readable version is unaffected.
-    assert!(res.body.contains("Water boils at 100 °C at sea level."));
+    assert!(
+        !res.body.contains(V3),
+        "and nothing on the page names the version that was filtered out: {}",
+        res.body
+    );
 }
 
-/// The same for `/agents/:id/claims`: attribution to an agent this viewer can
-/// see says nothing about who may read the claim, so `agents::agent_claims`
-/// redacts the page and the Explorer must render that as hidden.
+/// The same for `/agents/:id/claims`: attribution to an agent this viewer
+/// can see says nothing about who may read the claim, so
+/// `agents::agent_claims` filters the rows AND the `total` off one
+/// connection. The page must keep paging correct and show no placeholder.
 #[tokio::test]
-async fn agent_attributed_claims_render_redacted_rows_as_hidden_text() {
+async fn agent_attributed_claims_omit_rows_the_viewer_cannot_read() {
     let app = spawn().await;
     get_ok(&app, &format!("/api/v1/agents/{AGENT}"), agent_json(AGENT)).await;
     get_ok(
@@ -342,27 +352,22 @@ async fn agent_attributed_claims_render_redacted_rows_as_hidden_text() {
         json!({
             "agent_id": AGENT,
             "items": [
-                {"id": CLAIM, "content": "[REDACTED]", "truth_value": null,
-                 "agent_id": AGENT, "created_at": "2026-01-02T03:04:05Z",
-                 "attribution": {}},
                 {"id": V1, "content": "Water boils at 99 °C.", "truth_value": 0.3,
                  "agent_id": AGENT, "created_at": "2025-12-01T00:00:00Z",
                  "attribution": {}}
             ],
-            "total": 2, "limit": 20, "offset": 0
+            // `total` is filtered off the same connection, so it matches what
+            // came back and the pager offers no page that would be empty.
+            "total": 1, "limit": 20, "offset": 0
         }),
     )
     .await;
     let sid = app.sign_in("tok");
     let res = app.get_as(&format!("/explorer/agent/{AGENT}"), &sid).await;
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    assert!(
-        !res.body.contains("[REDACTED]"),
-        "the marker is never shown verbatim: {}",
-        res.body
-    );
-    assert!(res.body.contains("Content hidden"), "{}", res.body);
     assert!(res.body.contains("Water boils at 99 °C."));
+    assert!(!res.body.contains("Content hidden"), "{}", res.body);
+    assert!(!res.body.contains(CLAIM), "{}", res.body);
 }
 
 #[tokio::test]
@@ -394,15 +399,17 @@ async fn history_escapes_hostile_content() {
     assert_escaped(&res.body);
 }
 
+/// A claim this viewer may not read 404s at `GET /claims/:id`, so the
+/// history page is the ordinary not-found page and `/history` is never
+/// called.
 #[tokio::test]
-async fn history_of_a_redacted_claim_makes_no_content_bearing_call() {
+async fn history_of_an_invisible_claim_is_the_404_page() {
     let app = spawn().await;
-    get_ok(
-        &app,
-        &format!("/api/v1/claims/{CLAIM}"),
-        claim_json("[REDACTED]"),
-    )
-    .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}")))
+        .respond_with(json_404("Claim", CLAIM))
+        .mount(&app.upstream)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/claims/{CLAIM}/history")))
         .respond_with(ok(history_json()))
@@ -413,10 +420,8 @@ async fn history_of_a_redacted_claim_makes_no_content_bearing_call() {
     let res = app
         .get_as(&format!("/explorer/claim/{CLAIM}/history"), &sid)
         .await;
-    assert_eq!(res.status, StatusCode::OK);
-    assert!(res.body.contains("claim-text--redacted"));
-    assert!(res.body.contains("version history is not shown"));
-    assert!(!res.body.contains("[REDACTED]"));
+    assert_eq!(res.status, StatusCode::NOT_FOUND);
+    assert!(res.body.contains("We could not find that claim."));
     assert!(!res.body.contains("Water boils"));
     app.upstream.verify().await;
 }
@@ -472,34 +477,38 @@ async fn history_section_degrades_when_the_history_call_fails() {
 // ---- /claim/:id/provenance -----------------------------------------------------
 
 /// Root ← ANC (supports), root → OLD (supersedes; OLD not current),
-/// ANC ← HIDDEN (redacted, depth 2), and a HIDDEN ↔ ANC cycle. Evidence
-/// first, root last, as the repo's Kahn sort emits them.
+/// ANC ← DEEP (depth 2), a DEEP ↔ ANC cycle, and one edge from ABSENT — an
+/// ancestor this viewer may not read, so upstream sends the edge but no
+/// node. Evidence first, root last, as the repo's Kahn sort emits them.
 fn chain_json(truncated: bool) -> Value {
     json!({
         "root": CLAIM,
         "nodes": [
-            {"id": HIDDEN, "content": "[REDACTED]", "truth_value": 0.9, "labels": [],
-             "is_current": true, "depth": 2, "redacted": true},
+            {"id": DEEP, "content": "Vapour pressure equals ambient pressure.",
+             "truth_value": 0.9, "labels": [], "is_current": true, "depth": 2},
             {"id": ANC, "content": "Boiling point depends on pressure.", "truth_value": 0.7,
-             "labels": ["physics"], "is_current": true, "depth": 1, "redacted": false},
+             "labels": ["physics"], "is_current": true, "depth": 1},
             {"id": OLD, "content": "Water boils at 99 °C.", "truth_value": 0.3,
-             "labels": [], "is_current": false, "depth": 1, "redacted": false},
+             "labels": [], "is_current": false, "depth": 1},
             {"id": CLAIM, "content": "Water boils at 100 °C at sea level.", "truth_value": 0.8,
-             "labels": [], "is_current": true, "depth": 0, "redacted": false}
+             "labels": [], "is_current": true, "depth": 0}
         ],
         "edges": [
             {"source": ANC, "target": CLAIM, "relationship": "supports"},
             {"source": CLAIM, "target": OLD, "relationship": "supersedes"},
-            {"source": HIDDEN, "target": ANC, "relationship": "corroborates"},
-            {"source": ANC, "target": HIDDEN, "relationship": "elaborates"}
+            {"source": DEEP, "target": ANC, "relationship": "corroborates"},
+            {"source": ANC, "target": DEEP, "relationship": "elaborates"},
+            // An ancestor this viewer may not read: upstream returns no node
+            // for ABSENT, so this edge names an id and nothing else.
+            {"source": ABSENT, "target": CLAIM, "relationship": "derived_from"}
         ],
         "truncated": truncated,
-        "cycles": [[ANC, HIDDEN]]
+        "cycles": [[ANC, DEEP]]
     })
 }
 
 #[tokio::test]
-async fn provenance_renders_levels_edges_cycles_and_redaction() {
+async fn provenance_renders_levels_edges_and_cycles() {
     let app = spawn().await;
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/claims/{CLAIM}/provenance-chain")))
@@ -525,7 +534,7 @@ async fn provenance_renders_levels_edges_cycles_and_redaction() {
     assert!(b.contains("This claim"));
     assert!(b.contains("Direct sources · depth 1"));
     assert!(b.contains("Depth 2"));
-    for id in [ANC, OLD, HIDDEN] {
+    for id in [ANC, OLD, DEEP] {
         assert!(
             b.contains(&format!("href=\"/explorer/claim/{id}\"")),
             "{id}"
@@ -535,12 +544,15 @@ async fn provenance_renders_levels_edges_cycles_and_redaction() {
     assert!(b.contains("<span class=\"rel\">supports</span>"));
     assert!(b.contains("<span class=\"rel\">superseded by</span>"));
     assert!(b.contains("<span class=\"rel\">corroborates</span>"));
-    // The superseded ancestor is flagged; the redacted one is hidden.
+    // The superseded ancestor is flagged.
     assert!(b.contains("chain-node--superseded"));
     assert!(b.contains("badge--superseded"));
-    assert!(b.contains("badge--hidden"));
-    assert!(b.contains("Hidden claim 66666666"));
-    assert!(!b.contains("[REDACTED]"));
+    // An edge naming an id with no node is a claim this viewer may not
+    // read. It is dropped, not rendered as a linked "Claim <short-id>" —
+    // that fallback was the last path by which such an id reached a page.
+    assert!(!b.contains(ABSENT), "{b}");
+    assert!(!b.contains("Claim 77777777"), "{b}");
+    assert!(!b.contains("derived from"), "{b}");
     // Cycles are listed.
     assert!(b.contains("id=\"cycles-title\""));
     assert!(b.contains("badge--cycle"));
@@ -674,9 +686,9 @@ async fn provenance_escapes_hostile_content() {
             "root": CLAIM,
             "nodes": [
                 {"id": ANC, "content": HOSTILE_ATTR, "truth_value": 0.5,
-                 "labels": [HOSTILE], "is_current": true, "depth": 1, "redacted": false},
+                 "labels": [HOSTILE], "is_current": true, "depth": 1},
                 {"id": CLAIM, "content": HOSTILE, "truth_value": 0.5, "labels": [],
-                 "is_current": true, "depth": 0, "redacted": false}
+                 "is_current": true, "depth": 0}
             ],
             "edges": [{"source": ANC, "target": CLAIM, "relationship": HOSTILE}],
             "truncated": false,
@@ -943,7 +955,7 @@ async fn agent_escapes_hostile_content_and_refuses_unsafe_links() {
     let mut claims = attributed_json(1, 2, 0);
     claims["items"][0]["content"] = json!(HOSTILE);
     claims["items"].as_array_mut().unwrap().push(
-        json!({"id": CLAIM, "content": "[REDACTED]", "truth_value": 0.1,
+        json!({"id": CLAIM, "content": HOSTILE_ATTR, "truth_value": 0.1,
                      "agent_id": AGENT, "trace_id": null,
                      "created_at": "2026-01-02T03:04:05Z",
                      "updated_at": "2026-01-02T03:04:05Z", "attribution": {}}),
@@ -967,11 +979,6 @@ async fn agent_escapes_hostile_content_and_refuses_unsafe_links() {
         !res.body.contains("https://ror.org/"),
         "an invalid ROR id is not linked"
     );
-    assert!(
-        res.body.contains("Content hidden."),
-        "redacted attributed claim"
-    );
-    assert!(!res.body.contains("[REDACTED]"));
 }
 
 #[tokio::test]
@@ -1017,8 +1024,10 @@ fn frame_rows(n: usize, offset: usize) -> Value {
         .map(|i| {
             let k = offset + i;
             if k == 1 {
+                // A row with no belief numbers at all — upstream omits them
+                // rather than sending a placeholder row.
                 json!({"claim_id": format!("d0000000-0000-4000-8000-{k:012}"),
-                       "content": "[REDACTED]", "hypothesis_index": null,
+                       "content": format!("Frame claim {k}"), "hypothesis_index": null,
                        "belief": null, "plausibility": null, "ignorance": null,
                        "mass_on_missing": null})
             } else {
@@ -1069,8 +1078,9 @@ async fn frame_page_renders_definition_and_a_page_of_claims() {
     )));
     assert!(b.contains("Hypothesis: at 100 °C"));
     assert!(b.contains("plausibility <span class=\"num\">0.75</span>"));
-    assert!(b.contains("Content hidden."));
-    assert!(!b.contains("[REDACTED]"));
+    // `frame_claims_sorted` carries a viewer, so a row this viewer may not
+    // read is absent from the list — never a placeholder in it.
+    assert!(!b.contains("Content hidden."), "{b}");
     app.upstream.verify().await;
 }
 
@@ -1304,15 +1314,19 @@ async fn evidence_escapes_hostile_content_and_never_links_unsafe_urls() {
         .contains("<span class=\"mono\">javascript:alert(1)</span>"));
 }
 
+/// The evidence row's `claim_id` comes from an unfiltered edge lookup
+/// upstream, so the linked claim can 404 while the row itself is visible.
+/// That degrades the linked-claim SECTION; it does not turn the page into a
+/// 404, and it never blanks the evidence content.
 #[tokio::test]
-async fn redacted_evidence_makes_no_claim_call() {
+async fn evidence_whose_linked_claim_404s_degrades_that_section() {
     let app = spawn().await;
     get_ok(
         &app,
         &format!("/api/v1/evidence/{EVIDENCE}"),
         json!({
             "id": EVIDENCE, "claim_id": CLAIM, "agent_id": AGENT,
-            "evidence_type": "document", "content": "[REDACTED]",
+            "evidence_type": "document", "content": "The measured boiling point.",
             "content_hash": "00ff", "source_url": null,
             "created_at": "2026-01-02T03:04:05+00:00"
         }),
@@ -1320,8 +1334,8 @@ async fn redacted_evidence_makes_no_claim_call() {
     .await;
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/claims/{CLAIM}")))
-        .respond_with(ok(claim_json("secret")))
-        .expect(0)
+        .respond_with(json_404("Claim", CLAIM))
+        .expect(1)
         .mount(&app.upstream)
         .await;
     let sid = app.sign_in("tok");
@@ -1329,9 +1343,9 @@ async fn redacted_evidence_makes_no_claim_call() {
         .get_as(&format!("/explorer/evidence/{EVIDENCE}"), &sid)
         .await;
     assert_eq!(res.status, StatusCode::OK);
-    assert!(res.body.contains("Content hidden."));
-    assert!(!res.body.contains("[REDACTED]"));
-    assert!(!res.body.contains("secret"));
+    assert!(res.body.contains("The measured boiling point."));
+    assert!(res.body.contains("section-unavailable"));
+    assert!(!res.body.contains("Content hidden."), "{}", res.body);
     app.upstream.verify().await;
 }
 
