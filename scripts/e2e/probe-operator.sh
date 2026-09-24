@@ -13,7 +13,9 @@
 #
 #   OP-APP    `--operator-id` on the LEAST-PRIVILEGE DSN (E2E_APP_DSN). The
 #             link function is EXECUTE-able by epigraph_maintenance only, so
-#             startup must exit non-zero with the EXECUTE-grant text, and write
+#             startup must exit non-zero on a 42501 for that function (its
+#             EXECUTE-grant text alone is the fallback for ANY error, so the
+#             cause is matched too), and write
 #             no operator_links row and no membership.
 #   OP-RVK01  an operator whose OWN row in its personal group is only REVOKED.
 #             105's epigraph_ensure_personal_group raises RVK01 inside the link
@@ -115,10 +117,19 @@ LINKS="$(agent_of_model "$OP1")"
 M1_AFTER="$(q "SELECT count(*) FROM group_memberships WHERE group_id = '$G1'")"
 echo "   exit=$RC links=$LINKS memberships: $M1_BEFORE -> $M1_AFTER"
 grep -E 'ERROR:' "$E2E/op.app.$LABEL.err" | head -2 | cut -c1-300 | sed 's/^/   /'
+# The EXECUTE-grant hint is the refusal text's FALLBACK branch, printed for any
+# error that is not RVK01/RVK02, so it alone would also pass a startup that
+# failed for an unrelated reason. The cause itself must be the 42501 on the
+# link function.
+grep -oE 'permission denied for function epigraph_link_operator' "$E2E/op.app.$LABEL.err" \
+  | head -1 | sed 's/^/   cause: /'
 OK=false
 if [ "$RC" != "0" ] && [ "$RC" != "running" ] && [ "$LINKS" = 0 ] && [ "$M1_BEFORE" = "$M1_AFTER" ] \
-   && grep -q 'EXECUTE-able by epigraph_maintenance only' "$E2E/op.app.$LABEL.err"; then OK=true; fi
-verdict "$OK" "refused at startup with the EXECUTE-grant text, +0 links, +0 memberships"
+   && grep -q 'EXECUTE-able by epigraph_maintenance only' "$E2E/op.app.$LABEL.err" \
+   && grep -q 'permission denied for function epigraph_link_operator' "$E2E/op.app.$LABEL.err"; then
+  OK=true
+fi
+verdict "$OK" "refused at startup by 42501 on epigraph_link_operator, +0 links, +0 memberships"
 
 # ---------------------------------------------------------------------------
 echo
