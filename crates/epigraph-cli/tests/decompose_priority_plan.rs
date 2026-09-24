@@ -254,6 +254,31 @@ async fn ids_file_reports_every_named_id_it_does_not_decompose(pool: PgPool) {
         .any(|(id, why)| *id == backlog && *why == Ineligible::Backlog));
     assert_eq!(sel.not_undecomposed, vec![atom, absent]);
 
+    // `--limit 1`: the second eligible id is REPORTED as over the limit, not
+    // silently dropped; a repeated id is chosen once.
+    let mut repeated = named.clone();
+    repeated.insert(1, ok_b);
+    let limited = select_candidates(
+        &pool,
+        &viewer,
+        Priority::Oldest,
+        Some(&repeated),
+        EligibilityFilters::default(),
+        1,
+        10_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&limited), vec![ok_b]);
+    assert_eq!(limited.over_limit, vec![ok_a]);
+    let every_named_is_accounted_for = named.iter().all(|id| {
+        limited.chosen.iter().any(|c| c.id == *id)
+            || limited.over_limit.contains(id)
+            || limited.not_undecomposed.contains(id)
+            || limited.skipped.iter().any(|(s, _)| s == id)
+    });
+    assert!(every_named_is_accounted_for, "{limited:?}");
+
     // Opting out of both filters decomposes the two skipped ids too.
     let all = select_candidates(
         &pool,

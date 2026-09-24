@@ -868,6 +868,12 @@ fn report_selection(
                  (absent, retired, telemetry, already decomposed, or an atom)"
             );
         }
+        for id in &sel.over_limit {
+            eprintln!(
+                "SKIP {id} (named in --ids-file): eligible but past --limit; raise --limit \
+                 or re-run with the remaining ids"
+            );
+        }
     }
 }
 

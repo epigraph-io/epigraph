@@ -693,6 +693,9 @@ mod db_writes {
         /// True when the scan stopped at `max_scan` with the population not
         /// exhausted and fewer than `limit` chosen.
         pub scan_capped: bool,
+        /// `--ids-file` ids that are eligible but fell past `--limit`, in file
+        /// order. Reported, not silently dropped.
+        pub over_limit: Vec<Uuid>,
     }
 
     /// Choose up to `limit` eligible candidates.
@@ -737,11 +740,15 @@ mod db_writes {
                 .copied()
                 .filter(|id| !present.contains(id) && seen.insert(*id))
                 .collect();
+            // A repeated id in the file must not be decomposed twice.
+            let mut taken = std::collections::HashSet::new();
             for r in rows {
-                if sel.chosen.len() >= limit {
-                    break;
+                if !taken.insert(r.id) {
+                    continue;
                 }
                 match super::check_eligibility(&r.content, &r.labels, filters) {
+                    // Past `--limit`: named, eligible, and NOT silently dropped.
+                    Ok(()) if sel.chosen.len() >= limit => sel.over_limit.push(r.id),
                     Ok(()) => sel.chosen.push(r),
                     Err(why) => sel.skipped.push((r.id, why)),
                 }
