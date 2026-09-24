@@ -984,11 +984,12 @@ pub async fn report_workflow_outcome(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    // ── THE EVIDENCE WRITE IS DELIBERATELY *NOT* STAMPED YET ────────────
+    // ── HISTORY: WHY THE EVIDENCE WRITE WAS ONCE LEFT UNSTAMPED ─────────
     //
-    // Same site, same argument and the same measurement as
-    // `tools::claims::update_with_evidence`, which was unstamped for this reason
-    // earlier in this branch. `evidence` is tier-A under migration 077's strict
+    // Superseded by the D2 block below, which stamps it; kept because the
+    // measurement is what D2 had to answer. Same site, same argument and the same
+    // measurement as `tools::claims::update_with_evidence`, which was unstamped
+    // for this reason earlier in this branch. `evidence` is tier-A under migration 077's strict
     // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on the
     // unstamped pool this INSERT is refused on a cleanly-migrated schema — and
     // that refusal is currently the tool's WHOLE outcome, because nothing has
@@ -1067,15 +1068,14 @@ pub async fn report_workflow_outcome(
     .await
     .map_err(internal_error)?;
 
-    // Derive truth_value from CDST pignistic probability. `UPDATE claims`, so
-    // stamped — and this one STAYS stamped even though the evidence INSERT above
-    // did not. The asymmetry is the same one `update_with_evidence` records, and
-    // it is about position rather than preference: this is the tool's last HARD
-    // write, so a self-committing stamped unit here opens no orphan window —
-    // nothing after it can fail with it half-landed. What does follow is
-    // `BehavioralExecutionRepository::create`, which is warn-only and targets
-    // `behavioral_executions`: `relrowsecurity = f` with zero policies, so it is
-    // refused on neither configuration. That site is registered as a residual in
+    // Derive truth_value from CDST pignistic probability. `UPDATE claims`, and it
+    // commits in the SAME stamped transaction as the evidence INSERT and the DS
+    // wiring above — there is no longer an unstamped write before it, and no
+    // self-committing unit of its own. It is the tool's last HARD write: what
+    // follows the commit is `BehavioralExecutionRepository::create`, which is
+    // warn-only and targets `behavioral_executions`: `relrowsecurity = f` with
+    // zero policies, so it is refused on neither configuration. That site is
+    // registered as a residual in
     // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
     // After the DS wiring necessarily, because the value comes from it.
     let after = TruthValue::clamped(ds.pignistic_prob);
