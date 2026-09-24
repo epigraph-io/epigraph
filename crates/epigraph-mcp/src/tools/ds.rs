@@ -303,11 +303,24 @@ pub async fn submit_ds_evidence(
     .await
     .map_err(internal_error)?;
 
-    tx.commit().await.map_err(internal_error)?;
-
     // Read back exactly what the shared recompute path just wrote, so the
     // response can never drift from what a later `recompute_beliefs` call
     // (with no new evidence) would produce.
+    //
+    // ON THE WRITE TRANSACTION, BEFORE THE COMMIT (backlog F3, `15c00c7a`).
+    // This read used to run after `tx.commit()`, on `server.pool`, so every way
+    // it could fail — the claim invisible to the request viewer below, or
+    // invisible to the pool's UNSTAMPED `epigraph_app` connection, which hides
+    // every `group`-visibility row — returned an error for a frame assignment,
+    // BBA and recomputed belief that had already committed. The description's
+    // contract is "a refusal … writes nothing", so the read that can refuse now
+    // runs where a refusal still rolls everything back: `?` below drops `tx`
+    // uncommitted. MEASURED before the move
+    // (`tests/ds_evidence_no_error_after_commit.rs`): the server agent's OWN
+    // group-private claim on an `epigraph_app` pool answered "claim … not
+    // found" with 1 BBA and 1 `claim_frames` row committed, and so did a
+    // request viewer that cannot read the claim. On the transaction the read
+    // sees what the author's stamp sees, which is the row it just updated.
     let (belief, plausibility, mass_on_empty, pignistic_prob, mass_on_missing): (
         f64,
         f64,
@@ -348,13 +361,16 @@ pub async fn submit_ds_evidence(
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_optional(&server.pool)
+        q.fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?
             .ok_or_else(|| {
                 rmcp::model::ErrorData::invalid_request(format!("claim {claim_id} not found"), None)
             })?
     };
+
+    tx.commit().await.map_err(internal_error)?;
+
     let betp = pignistic_prob.unwrap_or(0.0);
     let ign = plausibility - belief;
 
