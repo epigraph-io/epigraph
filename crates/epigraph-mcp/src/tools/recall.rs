@@ -362,23 +362,19 @@ impl std::fmt::Display for AuditOwnerUnresolved {
 ///
 /// # Errors
 /// [`AuditOwnerUnresolved`] — see that type: every variant means drop the row.
+///
+/// # Returns the stamped transaction too
+///
+/// Alongside the group, the open transaction the read ran on, stamped from the
+/// principal's own viewer, so that [`write_recall_audit`] inserts the audit row
+/// on it (see that function for why the insert cannot run on the pool). A
+/// caller that only wants the group drops it, which rolls the read back.
 pub(crate) async fn recall_audit_owner_group(
     scoped: Option<&epigraph_db::ScopedPool>,
     principal: Option<Uuid>,
-) -> Result<Uuid, AuditOwnerUnresolved> {
+) -> Result<(Uuid, epigraph_db::ScopedTx<'_>), AuditOwnerUnresolved> {
     let principal = principal.ok_or(AuditOwnerUnresolved::NoPrincipal)?;
     let scoped = scoped.ok_or(AuditOwnerUnresolved::NoScopedPool)?;
-    // Read-only here; dropping the transaction rolls it back.
-    let (group, _tx) = audit_owner_on_stamped_tx(scoped, principal).await?;
-    Ok(group)
-}
-
-/// [`recall_audit_owner_group`]'s body, returning the principal-stamped
-/// transaction it read on so that [`write_recall_audit`] can insert on it.
-async fn audit_owner_on_stamped_tx(
-    scoped: &epigraph_db::ScopedPool,
-    principal: Uuid,
-) -> Result<(Uuid, epigraph_db::ScopedTx<'_>), AuditOwnerUnresolved> {
     let viewer = epigraph_db::Viewer::resolve(scoped.inner(), principal)
         .await
         .map_err(AuditOwnerUnresolved::Lookup)?;
@@ -430,13 +426,7 @@ pub(crate) async fn write_recall_audit(
     principal: Option<Uuid>,
     build: impl FnOnce(Uuid) -> epigraph_db::NewRecallEvent,
 ) -> Result<Uuid, RecallAuditNotWritten> {
-    let principal = principal
-        .ok_or(AuditOwnerUnresolved::NoPrincipal)
-        .map_err(RecallAuditNotWritten::Unresolved)?;
-    let scoped = scoped
-        .ok_or(AuditOwnerUnresolved::NoScopedPool)
-        .map_err(RecallAuditNotWritten::Unresolved)?;
-    let (group, mut tx) = audit_owner_on_stamped_tx(scoped, principal)
+    let (group, mut tx) = recall_audit_owner_group(scoped, principal)
         .await
         .map_err(RecallAuditNotWritten::Unresolved)?;
     let id = epigraph_db::RecallEventRepository::log(&mut *tx, build(group))
@@ -2581,7 +2571,9 @@ mod tests {
         let scoped = scoped(&pool).await;
         assert!(
             matches!(
-                recall_audit_owner_group(Some(&scoped), None).await,
+                recall_audit_owner_group(Some(&scoped), None)
+                    .await
+                    .map(|(g, _)| g),
                 Err(AuditOwnerUnresolved::NoPrincipal)
             ),
             "no principal must be an error the caller has to handle, never an \
@@ -2589,7 +2581,9 @@ mod tests {
         );
         assert!(
             matches!(
-                recall_audit_owner_group(None, Some(Uuid::new_v4())).await,
+                recall_audit_owner_group(None, Some(Uuid::new_v4()))
+                    .await
+                    .map(|(g, _)| g),
                 Err(AuditOwnerUnresolved::NoScopedPool)
             ),
             "without a ScopedPool the only remaining read is the blind unstamped one \
@@ -2599,7 +2593,9 @@ mod tests {
         // this read path mints nothing for it.
         assert!(
             matches!(
-                recall_audit_owner_group(Some(&scoped), Some(Uuid::new_v4())).await,
+                recall_audit_owner_group(Some(&scoped), Some(Uuid::new_v4()))
+                    .await
+                    .map(|(g, _)| g),
                 Err(AuditOwnerUnresolved::NoLivePersonalGroup)
             ),
             "a principal with no live personal group must take the drop path"
@@ -2620,9 +2616,11 @@ mod tests {
 
         let first = recall_audit_owner_group(Some(&scoped), Some(agent))
             .await
+            .map(|(g, _)| g)
             .expect("a live principal resolves");
         let second = recall_audit_owner_group(Some(&scoped), Some(agent))
             .await
+            .map(|(g, _)| g)
             .expect("and resolves again");
         assert_eq!(first, group, "the owner is the principal's personal group");
         assert_eq!(first, second, "one agent, one personal group, every call");
@@ -2636,7 +2634,9 @@ mod tests {
         let agent = seed_agent(&pool, "audit-owner-unprovisioned").await;
         assert!(personal_group_row(&pool, agent).await.is_none());
 
-        let res = recall_audit_owner_group(Some(&scoped), Some(agent)).await;
+        let res = recall_audit_owner_group(Some(&scoped), Some(agent))
+            .await
+            .map(|(g, _)| g);
         assert!(
             matches!(res, Err(AuditOwnerUnresolved::NoLivePersonalGroup)),
             "an unprovisioned principal's audit is dropped, got {res:?}"
@@ -2673,7 +2673,9 @@ mod tests {
             "revoke"
         );
 
-        let res = recall_audit_owner_group(Some(&scoped), Some(agent)).await;
+        let res = recall_audit_owner_group(Some(&scoped), Some(agent))
+            .await
+            .map(|(g, _)| g);
         assert!(
             matches!(res, Err(AuditOwnerUnresolved::NoLivePersonalGroup)),
             "a revoked principal's audit is dropped, got {res:?}"
