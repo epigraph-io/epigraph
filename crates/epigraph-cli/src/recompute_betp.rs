@@ -113,8 +113,12 @@ pub async fn preview_claim(
     let frames = claim_frames(pool, claim_id).await?;
     let mut out = Vec::with_capacity(frames.len());
     for frame_id in frames {
+        // An operator one-shot, run on whatever DSN the operator supplies — in
+        // practice a superuser, where a stamp is inert. The acquire is mechanical:
+        // it moves the whole recompute onto ONE connection.
+        let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
         if let Some(preview) = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
-            pool, viewer, claim_id, frame_id,
+            &mut conn, viewer, claim_id, frame_id,
         )
         .await?
         {
@@ -140,7 +144,13 @@ pub async fn run_claim(
 ) -> Result<usize, String> {
     // Backlog 696d3a1c: one frame owns the shared claims.* cache. Looping over
     // every frame wrote it repeatedly and let the alphabetically last win.
+    // An operator one-shot, run on whatever DSN the operator supplies — in
+    // practice a superuser, where a stamp is inert. The acquire is mechanical:
+    // the whole recompute rides ONE connection instead of a checkout per
+    // statement.
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     let did =
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id).await?;
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, viewer, claim_id)
+            .await?;
     Ok(usize::from(did))
 }

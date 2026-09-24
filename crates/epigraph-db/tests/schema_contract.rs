@@ -1163,7 +1163,7 @@ async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
     );
 }
 
-/// Migration 102's operator-link definer bodies: `SECURITY DEFINER`, owned by
+/// Migration 107's operator-link definer bodies: `SECURITY DEFINER`, owned by
 /// `epigraph_maintenance`, an EXPLICIT ACL with no `PUBLIC` grant, and the
 /// asymmetric role grant that IS the trust basis — `epigraph_app` may ASK who an
 /// agent's operator is (the actor and author reads) and may NOT record a link
@@ -1179,7 +1179,7 @@ async fn migration_092_roster_definer_is_revoked_from_public(pool: PgPool) {
 /// `operator_link.rs::epigraph_app_cannot_execute_link_operator` and
 /// `epigraph_app_cannot_execute_link_retired_agent`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn migration_102_operator_definers_are_owned_and_granted(pool: PgPool) {
+async fn migration_107_operator_definers_are_owned_and_granted(pool: PgPool) {
     for (name, signature, volatility, app_may_execute) in [
         (
             "epigraph_operator_actor",
@@ -1224,7 +1224,7 @@ async fn migration_102_operator_definers_are_owned_and_granted(pool: PgPool) {
         .await
         .expect("pg_proc lookup");
         let (secdef, owner, vol, acl) =
-            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 102)"));
+            meta.unwrap_or_else(|| panic!("public.{name} must exist (migration 107)"));
         assert!(
             secdef,
             "{name} must stay SECURITY DEFINER: it reads/writes edges, groups and \

@@ -158,7 +158,7 @@ pub async fn request_viewer(
             .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None));
     }
     // HTTP: an OPERATED principal gets no viewer. Operated agents are
-    // stdio-only (migration 102); token issuance refuses them, but a token
+    // stdio-only (migration 107); token issuance refuses them, but a token
     // minted BEFORE the link would otherwise carry the operator's group in
     // this viewer until it expired. Checked concurrently with the resolve, so
     // it adds a round trip of work but no latency.

@@ -45,9 +45,27 @@ pub async fn supersede_claim(
     //
     // Reported rather than silent so a caller reading a downstream claim
     // straight after this call can see exactly what was repaired.
-    let cascade =
-        epigraph_engine::retraction_cascade::cascade_after_supersede(&server.pool, viewer, new_id)
-            .await;
+    //
+    // STILL UNSTAMPED, and named rather than quietly converted. The cascade walks
+    // DOWNSTREAM claims, whose owner groups are arbitrary — it re-derives belief on
+    // whatever supported the retracted claim — so there is no single viewer whose
+    // writable set covers its target population, and stamping it from
+    // `server.agent_id()` would convert "refused for some rows" into "refused for
+    // some rows while looking converted". Which authority a retraction cascade
+    // carries across group boundaries is a tenancy-model decision, not a
+    // mechanical conversion; `crates/epigraph-mcp/tests/residual_unstamped_writes.rs`
+    // keeps both cascade sites in the residual register. The acquire below is a
+    // mechanical consequence of the engine signature change: it moves the whole
+    // cascade onto ONE connection instead of a checkout per statement, which is a
+    // coherence improvement and NOT a tenancy stamp.
+    let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
+    let cascade = epigraph_engine::retraction_cascade::cascade_after_supersede(
+        &mut cascade_conn,
+        viewer,
+        new_id,
+    )
+    .await;
+    drop(cascade_conn);
 
     Ok(CallToolResult::success(vec![Content::text(
         serde_json::to_string_pretty(&serde_json::json!({
@@ -83,8 +101,10 @@ pub async fn mark_duplicate(
     // (orphaned + stranded edge-factor BBAs) and hands back what still has to
     // be re-derived through the DS pipeline. Same best-effort contract as
     // supersede: the dedup's own failure is an error, the cascade's is not.
+    // Unstamped for the reason recorded on `cascade_after_supersede` above.
+    let mut cascade_conn = server.pool.acquire().await.map_err(internal_error)?;
     let cascade = epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-        &server.pool,
+        &mut cascade_conn,
         viewer,
         dup_claim_id.into(),
         canon,

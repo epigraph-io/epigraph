@@ -50,7 +50,12 @@ async fn e2e_empty_thesis_rejected_before_db_write() {
 
     let plan = build_ingest_plan(&extraction);
 
-    let result = execute_workflow_ingest_plan(&pool, &plan, &extraction).await;
+    let result = execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await;
 
     assert!(result.is_err(), "empty thesis must be rejected");
     match result.unwrap_err() {

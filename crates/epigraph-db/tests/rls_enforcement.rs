@@ -177,7 +177,7 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
     (
         "operator_links",
         "UPDATE",
-        "The operator-link record (102) is written once, by \
+        "The operator-link record (107) is written once, by \
          `epigraph_link_operator`'s definer frame, and never edited: a link is \
          ended by revoking the agent's membership, not by changing this row. \
          Under FORCE the absent policy default-denies every non-superuser role, \

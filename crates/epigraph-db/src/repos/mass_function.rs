@@ -449,9 +449,9 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn delete_for_perspective(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn delete_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         perspective_id: Uuid,
     ) -> Result<u64, DbError> {
         let result = sqlx::query(
@@ -461,7 +461,7 @@ impl MassFunctionRepository {
             "#,
         )
         .bind(perspective_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected())
@@ -501,8 +501,11 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn clear_claim_belief(pool: &PgPool, claim_id: Uuid) -> Result<u64, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn clear_claim_belief<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        claim_id: Uuid,
+    ) -> Result<u64, DbError> {
         let result = sqlx::query(
             r#"
             UPDATE claims
@@ -515,7 +518,7 @@ impl MassFunctionRepository {
             "#,
         )
         .bind(claim_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected())
@@ -532,9 +535,9 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn update_claim_belief(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn update_claim_belief<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         cached: CachedBelief,
     ) -> Result<(), DbError> {
@@ -567,7 +570,7 @@ impl MassFunctionRepository {
         .bind(mass_on_missing)
         .bind(claim_id)
         .bind(cached.belief_frame_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())
@@ -587,16 +590,16 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn update_claim_classification(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn update_claim_classification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         classification: &str,
     ) -> Result<(), DbError> {
         sqlx::query("UPDATE claims SET classification = $1, updated_at = NOW() WHERE id = $2")
             .bind(classification)
             .bind(claim_id)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(())
     }

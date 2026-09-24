@@ -278,7 +278,7 @@ async fn an_http_listener_refuses_a_signer_that_already_has_an_operator_link(poo
         ),
     }
 
-    // A signer that is some agent's OPERATOR refuses too (102 section 9): on an
+    // A signer that is some agent's OPERATOR refuses too (107 section 9): on an
     // unauthenticated transport every caller IS the signer, and would own every
     // claim the linked agent authored.
     let (operator_signer, operator_key) = register_signer(&pool, 0x66).await;

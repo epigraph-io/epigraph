@@ -51,9 +51,13 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
     );
 
     // First run: every planned claim is newly inserted and must be surfaced.
-    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("first call");
+    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("first call");
     assert!(!r1.already_ingested);
     assert_eq!(r1.claims_ingested, planned_count);
     assert_eq!(
@@ -72,9 +76,13 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
     }
 
     // Second run: idempotency gate fires; no new surfacing.
-    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("second call");
+    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("second call");
     assert!(r2.already_ingested);
     assert!(
         r2.inserted.is_empty(),
@@ -104,9 +112,13 @@ async fn returns_empty_inserted_on_partial_dedup(pool: PgPool) {
     );
 
     // First run: writes workflow row + claims + executes edges normally.
-    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("first call");
+    let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("first call");
     assert!(!r1.already_ingested);
     assert_eq!(r1.claims_ingested, planned_count);
     assert_eq!(r1.inserted.len(), planned_count);
@@ -131,9 +143,13 @@ async fn returns_empty_inserted_on_partial_dedup(pool: PgPool) {
 
     // Re-run: idempotency gate must NOT fire (edge_count == 0), executor
     // falls through to claim-walk where every claim hits was_new=false.
-    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("second call after edge wipe");
+    let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("second call after edge wipe");
     assert!(
         !r2.already_ingested,
         "gate must not fire when executes edges are absent"

@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// One ACTING operator link: the operator's agent id and the id of the
 /// operator's personal group, which owns the operated agent's new claims.
 ///
-/// Produced only by [`AgentRepository::operator_actor`] (migration 102's
+/// Produced only by [`AgentRepository::operator_actor`] (migration 107's
 /// `epigraph_operator_actor`): a not-retired link record, a live
 /// `writer`/`admin` membership, and the operator's own personal group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,14 +22,14 @@ pub struct OperatorLink {
 
 /// The operator an AUTHOR's claims belong to, from the link record alone.
 ///
-/// Produced only by [`AgentRepository::operator_of_author`] (migration 102's
+/// Produced only by [`AgentRepository::operator_of_author`] (migration 107's
 /// `epigraph_operator_of_author`). Includes RETIRED links, and says nothing
 /// about whether the agent may act: that is [`OperatorLink`]'s question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct AuthorOperator {
     pub operator_id: Uuid,
     pub operator_group_id: Uuid,
-    /// The link is retired (migration 102 section 7): the agent never acts for
+    /// The link is retired (migration 107 section 7): the agent never acts for
     /// the operator.
     pub retired: bool,
 }
@@ -55,7 +55,7 @@ pub struct OperatorLinkOutcome {
     /// the operator's group: a live membership whose role is no longer
     /// `writer`/`admin` is not a link.
     pub link_live: bool,
-    /// The agent's link record is RETIRED (migration 102 section 7). A retired
+    /// The agent's link record is RETIRED (migration 107 section 7). A retired
     /// link is never promoted: the call inserted no membership, and the agent
     /// authors into its own group.
     pub link_retired: bool,
@@ -174,11 +174,29 @@ pub struct AgentRepository;
 impl AgentRepository {
     /// Create a new agent in the database
     ///
+    /// Takes an `Acquire` so the agent row and its `agent.registered` event ride
+    /// ONE connection — the caller's transaction when there is one. `&PgPool`
+    /// implements `Acquire`, so every existing call site is unchanged.
+    ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` if an agent with the same public key already exists.
     /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool, agent))]
     pub async fn create(pool: &PgPool, agent: &Agent) -> Result<Agent, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_conn(&mut conn, agent).await
+    }
+
+    /// [`Self::create`] on a connection the caller owns, so the `agents` row and
+    /// its `agent.registered` event ride the caller's transaction. Concrete
+    /// `&mut PgConnection` for the reason given on
+    /// [`crate::ClaimRepository::create_with_id_if_absent_conn`].
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_conn(
+        conn: &mut sqlx::PgConnection,
+        agent: &Agent,
+    ) -> Result<Agent, DbError> {
         let id: Uuid = agent.id.into();
         let public_key = &agent.public_key;
         let display_name = agent.display_name.as_deref();
@@ -198,7 +216,7 @@ impl AgentRepository {
             agent.orcid.as_deref(),
             agent.ror_id.as_deref(),
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|err| {
             if let sqlx::Error::Database(ref db_err) = err {
@@ -219,12 +237,14 @@ impl AgentRepository {
                 reason: "public_key is not 32 bytes".to_string(),
             })?;
 
-        // Fire-and-forget agent.registered event (closes #61).
-        // The downstream write has already committed (we hold `row`); the
-        // event log is a separate observability surface and must not roll
-        // back the agent on failure.
-        let _ = crate::repos::EventRepository::publish_or_log(
-            pool,
+        // Fire-and-forget agent.registered event (closes #61). The event log
+        // is a separate observability surface and must not roll back the agent
+        // on failure — and once the caller can hand us a transaction, "must not
+        // roll back" needs a SAVEPOINT rather than a swallowed error, or the
+        // failure is merely DEFERRED to a COMMIT that PostgreSQL answers with
+        // `ROLLBACK` and no error at all. `publish_or_log_conn` takes it.
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
             "agent.registered",
             Some(row.id),
             &serde_json::json!({
@@ -363,9 +383,8 @@ impl AgentRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, public_key))]
-    pub async fn get_by_public_key(
-        pool: &PgPool,
+    pub async fn get_by_public_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         public_key: &[u8; 32],
     ) -> Result<Option<Agent>, DbError> {
         let row = sqlx::query!(
@@ -376,7 +395,7 @@ impl AgentRepository {
             "#,
             public_key.as_slice()
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {
@@ -1211,8 +1230,11 @@ impl AgentRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if any statement fails,
     /// `DbError::InvalidData` if `client_row_id` names no `oauth_clients` row,
-    /// and `DbError::DuplicateKey` if the derived key is squatted by a row that
-    /// is not a `derived` OAuth principal.
+    /// `DbError::DuplicateKey` if the derived key is squatted by a row that
+    /// is not a `derived` OAuth principal, and `DbError::MembershipRevoked` if
+    /// the adopted agent holds only a revoked personal-group membership (step
+    /// 6 no longer restores it; the RAISE aborts the caller's transaction, so
+    /// the client stays unlinked).
     #[instrument(skip(conn))]
     pub async fn ensure_for_client(
         conn: &mut sqlx::PgConnection,
@@ -1318,24 +1340,43 @@ impl AgentRepository {
         Ok(AgentId::from_uuid(agent_id))
     }
 
-    /// Idempotently create the agent's personal group and its own live
-    /// `role='admin'` membership in it. Returns the group id.
+    /// Resolve the agent's personal group, provisioning it the FIRST time.
+    /// Returns the group id.
     ///
-    /// **The two statements live in `public.epigraph_ensure_personal_group()`
-    /// (migration 077), not here.** They are a bootstrap: the mint runs before
-    /// any principal exists, so no membership-keyed policy on `groups` or
-    /// `group_memberships` can admit them. Expressing that as a policy arm was
-    /// tried and was wrong — the only predicate available to a policy is the
-    /// row's own shape, and `did_key` is derived from `created_by_agent_id`, so
-    /// such an arm references no session state and grants every connection read
-    /// of every personal group and every personal-group membership row,
-    /// `wrapped_key_share` included. A `SECURITY DEFINER` writer confines the
-    /// bootstrap to the two statements that need it and leaves the policies with
-    /// no personal-group arm in either direction. The behaviour, the
-    /// deterministic `did:epigraph:personal:<uuid>` key and the
-    /// revive-on-conflict semantics described below are unchanged; see the
-    /// migration for why the composite `(group_id, agent_id, epoch)` target is
-    /// the correct one.
+    /// **The statements live in `public.epigraph_ensure_personal_group()`, not
+    /// here** — created by migration 077, whose body migration 105 replaced.
+    /// They are a bootstrap: the mint runs before any principal exists, so no
+    /// membership-keyed policy on `groups` or `group_memberships` can admit
+    /// them. Expressing that as a policy arm was tried and was wrong — the only
+    /// predicate available to a policy is the row's own shape, and `did_key` is
+    /// derived from `created_by_agent_id`, so such an arm references no session
+    /// state and grants every connection read of every personal group and every
+    /// personal-group membership row, `wrapped_key_share` included. A
+    /// `SECURITY DEFINER` function confines the bootstrap to the statements
+    /// that need it and leaves the policies with no personal-group arm in
+    /// either direction.
+    ///
+    /// # The contract (migration 105)
+    ///
+    /// For the (personal group, agent) pair, across every epoch:
+    ///
+    /// * a LIVE row exists — returns the group and writes NOTHING; the row's
+    ///   role is kept, so a deliberate demotion to `reader` stands;
+    /// * only REVOKED rows exist — refuses with [`DbError::MembershipRevoked`]
+    ///   (SQLSTATE `RVK01`). Reversing a revocation is an operator action;
+    /// * no row of any state — provisions the group (if absent) and one live
+    ///   epoch-0 `admin` membership.
+    ///
+    /// Migration 077's body instead ended in `ON CONFLICT (group_id, agent_id,
+    /// epoch) DO UPDATE SET revoked_at = NULL, role = 'admin'`, so every call
+    /// revived a revoked membership and promoted a demoted one. Any caller that
+    /// read "no group" on an UNSTAMPED `epigraph_app` connection — where
+    /// `groups_tenancy` hides the group — and then called this reached that
+    /// revival: PR-09's `EpiGraphMcpFull::agent_id` (per HTTP session), the
+    /// recall audit (#493), and the ingest executor's system agent (#498).
+    ///
+    /// The refusal is a RAISE, not a NULL return, so a raw-SQL caller cannot
+    /// mistake it for success, and it aborts the caller's transaction.
     ///
     /// Idempotency comes from a deterministic `did_key`
     /// (`did:epigraph:personal:<agent_uuid>`) against the existing
@@ -1349,19 +1390,10 @@ impl AgentRepository {
     /// created either — `group_memberships` has no FK to it, and the
     /// membership's `wrapped_key_share` is empty for the same reason.
     ///
-    /// The membership insert targets the composite
-    /// `(group_id, agent_id, epoch)` UNIQUE and **revives** on conflict. An
-    /// untargeted `ON CONFLICT DO NOTHING` was wrong: if the epoch-0 row exists
-    /// with `revoked_at` set, the partial index `group_memberships_one_live`
-    /// does not conflict but the composite UNIQUE does, so the insert silently
-    /// no-ops and the agent has NO live membership in its own personal group —
-    /// permanently, since every later mint hits the same conflict. Targeting the
-    /// composite is safe here precisely because a personal group has exactly one
-    /// member at exactly one epoch, so no OTHER live row can exist for the
-    /// partial index to trip over.
-    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if either statement fails.
+    /// Returns [`DbError::MembershipRevoked`] if the agent holds only revoked
+    /// rows in its personal group, and `DbError::QueryFailed` if a statement
+    /// fails.
     #[instrument(skip(conn))]
     pub async fn ensure_personal_group(
         conn: &mut sqlx::PgConnection,
@@ -1377,7 +1409,7 @@ impl AgentRepository {
     }
 
     /// "May `agent_id` act for an operator?" — its ACTING operator link, through
-    /// migration 102's `epigraph_operator_actor` definer read, or `None`.
+    /// migration 107's `epigraph_operator_actor` definer read, or `None`.
     ///
     /// An acting link is an `operator_links` row that is NOT retired AND a live
     /// `writer`/`admin` membership for the agent in the group that row names,
@@ -1405,7 +1437,7 @@ impl AgentRepository {
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the function is absent (a database that has not
-    /// applied migration 102) or the read fails. Deliberately NOT mapped to
+    /// applied migration 107) or the read fails. Deliberately NOT mapped to
     /// "no operator": a binary that cannot ask must not author as if the answer
     /// were no.
     pub async fn operator_actor(
@@ -1439,7 +1471,7 @@ impl AgentRepository {
     }
 
     /// "Whose are `agent_id`'s claims?" — the operator named by its link
-    /// record, through migration 102's `epigraph_operator_of_author`, or `None`.
+    /// record, through migration 107's `epigraph_operator_of_author`, or `None`.
     ///
     /// From the `operator_links` row ALONE: RETIRED links are included, and no
     /// membership is consulted, so an operator keeps ownership of what an agent
@@ -1479,15 +1511,15 @@ impl AgentRepository {
     }
 
     /// "Does any agent name `agent_id` as its operator?", through migration
-    /// 102's `epigraph_operates_agents` (retired links included).
+    /// 107's `epigraph_operates_agents` (retired links included).
     ///
-    /// REFUSAL-ONLY (102 section 9): an HTTP listener must not serve as a
+    /// REFUSAL-ONLY (107 section 9): an HTTP listener must not serve as a
     /// signer that is anyone's operator, because on an unauthenticated HTTP
     /// transport every anonymous caller IS the signer, and would then satisfy
     /// "caller is the operator of the claim's author". Never use it to GRANT.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if the read fails (e.g. a database without 102).
+    /// `DbError::QueryFailed` if the read fails (e.g. a database without 107).
     pub async fn operates_agents(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
@@ -1511,7 +1543,7 @@ impl AgentRepository {
     }
 
     /// Record that `agent_id` is operated by `operator_id`, through migration
-    /// 102's `epigraph_link_operator`.
+    /// 107's `epigraph_link_operator`.
     ///
     /// **The caller's connection privilege is the authorization.** The function
     /// is EXECUTE-able by `epigraph_maintenance` (and superusers) only; on an
@@ -1526,10 +1558,18 @@ impl AgentRepository {
     /// [`OperatorLinkOutcome::link_live`] report `false`). See the migration's
     /// section 3.
     ///
+    /// The OPERATOR's personal group is resolved through migration 105's
+    /// `epigraph_ensure_personal_group` (107 section 3), so its two refusals
+    /// surface here as themselves.
+    ///
     /// # Errors
-    /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
-    /// self-link, an operator that is itself operated, or an agent already
-    /// linked to a DIFFERENT live operator; the database message names which.
+    /// [`DbError::MembershipRevoked`] (RVK01) when the operator's own membership
+    /// of its personal group is only revoked; [`DbError::PersonalGroupNotOwned`]
+    /// (RVK02) when the group under the operator's personal did_key is not the
+    /// operator's own. Both write nothing. `DbError::QueryFailed` for a
+    /// permission refusal, a missing agent, a self-link, an operator that is
+    /// itself operated, or an agent already linked to a DIFFERENT live
+    /// operator; the database message names which.
     pub async fn link_operator(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
@@ -1547,7 +1587,7 @@ impl AgentRepository {
     }
 
     /// Record that the RETIRED agent `agent_id`'s claims belong to
-    /// `operator_id`, through migration 102's `epigraph_link_retired_agent`.
+    /// `operator_id`, through migration 107's `epigraph_link_retired_agent`.
     ///
     /// Writes the `operator_links` row with `retired = true` and the
     /// `OPERATED_BY` edge, and creates NO membership: a retired identity's key
@@ -1561,10 +1601,12 @@ impl AgentRepository {
     /// changes an existing row or membership.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
-    /// self-link, an operator that is itself operated, an agent that already
-    /// operates others or is linked to a DIFFERENT operator, or an operator
-    /// group the operator did not create; the database message names which.
+    /// [`DbError::MembershipRevoked`] (RVK01) / [`DbError::PersonalGroupNotOwned`]
+    /// (RVK02) from the operator's own personal group, exactly as
+    /// [`Self::link_operator`]; both write nothing. `DbError::QueryFailed` for a
+    /// permission refusal, a missing agent, a self-link, an operator that is
+    /// itself operated, or an agent that already operates others or is linked
+    /// to a DIFFERENT operator; the database message names which.
     pub async fn link_retired_agent(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,

@@ -337,7 +337,7 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
             });
         };
 
-        // An OPERATED principal gets no viewer (migration 102). Operated agents
+        // An OPERATED principal gets no viewer (migration 107). Operated agents
         // are stdio-only and token issuance refuses them, but a token minted
         // BEFORE the link would otherwise carry the operator's personal group
         // in this viewer's WRITABLE set until it expired (15 min for an agent

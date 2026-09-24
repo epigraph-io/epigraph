@@ -196,11 +196,13 @@ impl GroupMembershipRepository {
     /// `groups`, then `group_key_epochs`, and the `FOR UPDATE` above does NOT
     /// change it: it is on `group_memberships`, the table this transaction
     /// already took first. That is why it was preferred to locking the
-    /// `groups` row instead — no site in this codebase takes a `groups` row
-    /// lock, and introducing one here would invert the order against
-    /// `CommunityRepository::remove_member`, which holds a `group_memberships`
-    /// row while it writes `groups` for the SAME id (the community projection
-    /// is id-preserving). `GroupKeyEpochRepository::rotate_conn` takes the same
+    /// `groups` row instead — taking one here FIRST would invert the order
+    /// against `CommunityRepository::remove_member`, which holds the
+    /// `group_memberships` roster while it writes `groups` for the SAME id (the
+    /// community projection is id-preserving). Since batch F that function's
+    /// definer (`epigraph_community_remove_member`, migration 106) and its
+    /// `add_member` twin DO take a `groups` row lock, but only AFTER the same
+    /// roster lock, so the order is unchanged. `GroupKeyEpochRepository::rotate_conn` takes the same
     /// two it needs in the same relative order — roster first, epoch row
     /// second — for exactly this reason: the reverse would let a rotation
     /// holding the epoch row wait on a removal holding the roster while the
@@ -567,5 +569,125 @@ impl GroupMembershipRepository {
                 .await?;
 
         Ok(rows)
+    }
+
+    /// How many REVOKED membership rows `agent_id` holds, read through the
+    /// policy's OWN-ROW arm.
+    ///
+    /// # The discriminator a provisioning mint must consult first
+    ///
+    /// Migration 077's `epigraph_ensure_personal_group` ended in `ON CONFLICT
+    /// (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL, role =
+    /// 'admin'`: called for an agent that already held a revoked row in its
+    /// personal group, it REVIVED that admin membership. So "this agent cannot
+    /// see its personal group" did not on its own license a mint — "never
+    /// provisioned" and "deliberately revoked" both look like that — and this
+    /// count is what tells them apart: `0` means there is no revoked row. Since
+    /// migration 105 the function refuses a revoked row itself; this read is
+    /// how a caller learns WHY before it asks. (A live `reader` row is the other thing the same
+    /// `DO UPDATE` would silently change; it is live, so the personal group is
+    /// visible to a stamped caller and never reaches the mint branch at all.)
+    ///
+    /// # The connection MUST be stamped with `agent_id` as its principal
+    ///
+    /// Migration 077's `group_memberships_tenancy` `USING` carries the arm
+    /// `agent_id = epigraph_principal_id()`, which admits an agent's own rows
+    /// whatever their state and whatever the session's group set — including an
+    /// EMPTY one, which is exactly what `ScopedPool::begin_as` stamps from the
+    /// viewer `Viewer::resolve` returns for an agent with no live membership.
+    /// MEASURED as `epigraph_app` (`rolbypassrls = false`) on a database
+    /// migrated 001→head, for an agent whose only membership had been revoked:
+    ///
+    /// ```text
+    /// unstamped                          own rows (any state) = 0   <- blind
+    /// principal-only stamp, no groups    own rows (any state) = 1
+    ///                                    own REVOKED rows     = 1
+    /// principal-only stamp, OTHER agent  that agent's rows    = 0
+    /// ```
+    ///
+    /// The consumer's end-to-end arm (revoke the ingest system agent's
+    /// membership, call `store_workflow`, re-read `revoked_at`) is
+    /// `scripts/e2e/probe-unit-e.sh`'s REVOKED arm.
+    ///
+    /// Unstamped it returns `0` for EVERY agent — wrong in exactly the direction
+    /// that re-opens the revival — so it takes a connection, never a pool, and
+    /// the caller owns the stamp.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn count_own_revoked_rows_conn(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<i64, DbError> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM group_memberships \
+              WHERE agent_id = $1 AND revoked_at IS NOT NULL",
+        )
+        .bind(agent_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(n)
+    }
+
+    /// The id of `agent_id`'s personal group (`did:epigraph:personal:<uuid>`) as
+    /// THIS connection can see it — a pure read that never mints.
+    ///
+    /// `ClaimRepository::personal_group_of` is the read-first-then-mint twin;
+    /// this is the half of it that cannot write. On a connection stamped from the
+    /// agent's own viewer, `None` means the agent holds no LIVE membership of its
+    /// personal group (`groups_tenancy` admits a group through `id =
+    /// ANY(session_groups)`, or to its creator only while the roster admits them
+    /// — migration 092). It does NOT mean the group does not exist: pair it with
+    /// [`Self::count_own_rows_any_state_conn`] before treating `None` as "never
+    /// provisioned".
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn visible_personal_group_conn(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<Uuid>, DbError> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(agent_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(id)
+    }
+
+    /// Whether THIS connection's stamp may write rows owned by `group_id`:
+    /// `group_id = ANY(epigraph_writable_groups())`, evaluated on the caller's
+    /// own connection — a pure read that never mints.
+    ///
+    /// It is the exact question migration 077's `WITH CHECK (owner_group_id =
+    /// ANY(epigraph_writable_groups()))` will ask of every row the caller then
+    /// writes on the same connection, asked BEFORE the first write so a refusal
+    /// can be reported with nothing written. It reads no table: the answer comes
+    /// from the `epigraph.writable_group_ids` GUC the stamp set (migration 067),
+    /// so a live `reader` membership answers `false`, and an UNSTAMPED
+    /// connection answers `false` for every group (the function is `{}` without
+    /// the GUC) — it fails closed.
+    ///
+    /// It deliberately takes a connection and not a `Viewer`: a `Viewer`'s
+    /// `writable_groups()` is the set a stamp was COMPUTED from, while this asks
+    /// the set the connection actually CARRIES, which is what the `WITH CHECK`
+    /// evaluates.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn session_can_write_group_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let writable: bool =
+            sqlx::query_scalar("SELECT $1 = ANY(public.epigraph_writable_groups()::uuid[])")
+                .bind(group_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        Ok(writable)
     }
 }

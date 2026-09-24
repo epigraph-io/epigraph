@@ -2121,7 +2121,7 @@ const PRIVATIZATION_TABLES: &[&str] = &[
     "instance_admins",
 ];
 
-/// The operator-link record migration 102 creates and FORCEs.
+/// The operator-link record migration 107 creates and FORCEs.
 ///
 /// A FOURTH TERM, for the reason [`PRIVATIZATION_TABLES`] is a third: it is
 /// FORCEd by the migration that creates it, not by 079, and it is neither a

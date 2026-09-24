@@ -1,4 +1,4 @@
--- 102_operator_link.sql
+-- 107_operator_link.sql
 -- Operator-scoped ownership: an agent process that is DECLARED to act for a
 -- human operator writes into that operator's personal group, and the operator
 -- (and the operator's other agents) own what it writes.
@@ -46,11 +46,21 @@
 -- ===================================================================
 -- 3. RECORDED ONCE: NEVER REVIVE, NEVER ADMIN
 --
--- `epigraph_ensure_personal_group` (077) upserts the membership with
--- `ON CONFLICT ... DO UPDATE SET revoked_at = NULL, role = 'admin'` -- correct
--- for an agent's OWN group at token mint, and the privilege-revival bug of
--- issue #493 if reused here. This file neither calls it nor copies its conflict
--- clause:
+-- Two memberships are involved, and they are written by different code:
+--
+--   * the OPERATOR's own membership of its own personal group (and the group
+--     itself) goes through `epigraph_ensure_personal_group`, the one
+--     personal-group definer. Since migration 105 it never revives and never
+--     promotes: a live row is returned untouched, only-revoked rows RAISE
+--     `RVK01`, a squatted key RAISEs `RVK02`, and only "no row of any state"
+--     provisions. Both RAISEs are REFUSALS of the link here (step (a) of each
+--     link function), and they abort the call before anything is written. An
+--     earlier form of this file inlined its own copy of the group and admin-row
+--     mint, because 077's body of that function revived (#493); after 105 the
+--     copy was a second mint with a second squat check, and is gone.
+--   * the AGENT's `writer` membership in the operator's group is not a
+--     personal-group membership at all, so it is written here, directly, and
+--     never through that function:
 --
 --   * the agent's membership is inserted ONLY by the call whose
 --     `INSERT INTO operator_links ... ON CONFLICT (agent_id) DO NOTHING`
@@ -65,24 +75,28 @@
 --     guard existed; `operator_link.rs::a_hard_deleted_revocation_is_not_revived_by_a_relink`).
 --   * the role is `writer`, never `admin`, so an operated agent can write rows
 --     the operator's group owns and cannot manage that group's membership.
---   * the operator's group is created (if absent) with
---     `created_by_agent_id = p_operator`, NEVER the agent. 077/092's group
---     creator arm grants enrol and key-epoch rights to the creator while it
---     holds a live membership; stamping the agent as creator would make its
---     `writer` row admin-equivalent. When this function creates the group it
---     seeds the operator's own `admin` row, also DO NOTHING.
+--   * the operator's group is created (if absent) by
+--     `epigraph_ensure_personal_group(p_operator)`, so its creator is the
+--     OPERATOR, never the agent. 077/092's group creator arm grants enrol and
+--     key-epoch rights to the creator while it holds a live membership;
+--     stamping the agent as creator would make its `writer` row
+--     admin-equivalent.
 --   * an EXISTING group is accepted only if it is `kind = 'personal'` AND
---     `created_by_agent_id = p_operator`, and `epigraph_operator_actor` applies
---     the same test. The did_key alone is not proof: `groups_tenancy`'s WITH
---     CHECK lets ANY principal insert a group it creates, including one
---     carrying `did:epigraph:personal:<someone else>` (measured by review as
---     `epigraph_app` stamped as a principal Z, for an operator with no personal
---     group yet), and the link would then have enrolled the agent as a writer
---     in Z's group. Every in-tree personal-group writer (077's
---     `epigraph_ensure_personal_group`, 071's shim, `tenancy_backfill`) stamps
---     the agent itself as creator, so this refuses nothing legitimate. Since
---     migration 103 section 3 the squat itself is refused at INSERT; this
---     check remains for a squat that predates it.
+--     `created_by_agent_id = p_operator` -- 105's RVK02 test, the same one
+--     `epigraph_operator_actor` applies. The did_key alone is not proof: before
+--     migration 108, `groups_tenancy`'s WITH CHECK let ANY principal insert a
+--     group it creates carrying `did:epigraph:personal:<someone else>`
+--     (measured by review as `epigraph_app` stamped as a principal Z, for an
+--     operator with no personal group yet), and the link would then have
+--     enrolled the agent as a writer in Z's group. 108 section 3 refuses a new
+--     squat at INSERT; RVK02 refuses one that predates it, which is exactly
+--     what an upgraded database can hold.
+--   * an operator whose own membership of its own group is only REVOKED gets
+--     `RVK01`, and so does every link to it, including every stdio restart's
+--     self-link. That is deliberate: only the group's admin (the operator) or
+--     maintenance can revoke that row, and linking agents into a group whose
+--     owner was revoked from it would hand them write authority the owner no
+--     longer has. Restoring the row is an operator action (105's HINT).
 --   * the `operator_links` row is keyed on the agent and inserted
 --     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
 --     ever: a row naming a DIFFERENT operator is refused rather than replaced,
@@ -99,8 +113,10 @@
 -- revoked agent X ran `DELETE FROM group_memberships WHERE agent_id = X` ->
 -- `DELETE 1`, and the next stdio restart's link re-created a live writer row.
 -- Gating the membership on the link-row insert closes it for this function,
--- and migration 104 refuses every hard DELETE of a membership outside
--- maintenance, so the history cannot be erased at the RLS layer either.
+-- and migration 106 (batch F, which runs before this file on every database)
+-- revokes DELETE on `group_memberships` from `epigraph_app`, so the history
+-- cannot be erased from an app session either (109 section 1 records why this
+-- branch carries no second, trigger-based guard for the same thing).
 --
 -- ===================================================================
 -- 4. THE LINK RECORD IS A DEFINER-ONLY TABLE, NOT AN EDGE
@@ -212,7 +228,7 @@
 -- `epigraph_definer_bypass()` admits, i.e. while the OWNER is a member of
 -- `epigraph_maintenance`. The `OWNER TO` below sits in a `pg_roles` guard and
 -- can silently no-op, so it is pinned in CI by
--- `schema_contract.rs::migration_102_operator_definers_are_owned_and_granted`
+-- `schema_contract.rs::migration_107_operator_definers_are_owned_and_granted`
 -- and at deploy by `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`. The
 -- failure directions of a wrong OWNER are both CLOSED: an unbypassed read reads
 -- no link (agents author into their own group and own nothing through an
@@ -258,8 +274,9 @@
 -- Its refusals are `epigraph_link_operator`'s, for the same reasons: a
 -- self-link, a missing agent or operator, an operator that is itself operated
 -- (any row), an agent that already operates others, an agent already linked to
--- a different operator, and an operator group the operator did not create.
--- EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
+-- a different operator, and 105's two refusals on the operator's own personal
+-- group (`RVK02`: a squatted key; `RVK01`: the operator's own row is only
+-- revoked). EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
 -- two preludes are deliberately written out twice rather than shared through a
 -- third definer, so each function can be reviewed on its own page; both are
 -- exercised by `operator_link.rs`.
@@ -269,23 +286,23 @@
 --
 -- `ClaimRepository::default_decl_for_author` calls `epigraph_operator_actor`, so a
 -- binary carrying this change FAILS CLOSED on every claim write against a
--- database that has not applied 102 (`42883 function does not exist`). Apply
--- 102 before, or with, the binary.
+-- database that has not applied 107 (`42883 function does not exist`). Apply
+-- 107 before, or with, the binary.
 --
 -- THE MCP SERVERS DO NOT MIGRATE. `epigraph-migrate` runs only as the API
--- service's `ExecStartPre`, and every HTTP MCP tool call now depends on 102's
+-- service's `ExecStartPre`, and every HTTP MCP tool call now depends on 107's
 -- reads: `epigraph_mcp::operator::refuse_linked_http_signer` resolves the
 -- signer agent and reads `epigraph_operator_of_author` and
 -- `epigraph_operates_agents` before dispatch, fail-closed, and the startup gate
 -- exits on a failed lookup. So restarting `epigraph-mcp` onto this binary
--- BEFORE the database has 102 refuses every HTTP call, read-only tools
+-- BEFORE the database has 107 refuses every HTTP call, read-only tools
 -- included. Restart the API (or run `epigraph-migrate`) first, then the MCP
 -- servers. That coupling is deliberate: the guard does not serve on an answer
 -- it did not get.
 --
 -- HTTP LISTENERS ON FIRST DEPLOY. An HTTP listener refuses to start, and
 -- refuses every call, while its signer has an `operator_links` row
--- (`epigraph_mcp::operator`). A freshly applied 102 creates the table EMPTY and
+-- (`epigraph_mcp::operator`). A freshly applied 107 creates the table EMPTY and
 -- writes no row, so no existing HTTP signer can be refused by it on first
 -- deploy; only a later, explicit link of that signer can. (An earlier form of
 -- this file counted "OPERATED_BY edge + live membership" as a link, and every
@@ -420,7 +437,7 @@ SET search_path = public, pg_temp AS $$
 DECLARE
     v_group     uuid;
     v_other     uuid;
-    v_new_group uuid;
+    v_group_existed boolean;
     v_link_rows integer := 0;
     v_mem_rows  integer := 0;
     v_edge_rows integer := 0;
@@ -484,42 +501,25 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
-    -- (a) The operator's personal group, spelled exactly as
-    -- `epigraph_ensure_personal_group` spells it, created BY THE OPERATOR.
-    INSERT INTO public.groups (display_name, did_key, public_key, kind,
-                               created_by_agent_id)
-    VALUES ('personal:' || p_operator::text,
-            'did:epigraph:personal:' || p_operator::text,
-            ''::bytea, 'personal', p_operator)
-    ON CONFLICT DO NOTHING
-    RETURNING id INTO v_new_group;
-
-    IF v_new_group IS NOT NULL THEN
-        v_group := v_new_group;
-        -- A group this call created has an empty roster; give the operator the
-        -- admin row its own token mint would have. DO NOTHING, never revive.
-        INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
-                                              epoch, role)
-        VALUES (v_group, p_operator, ''::bytea, 0, 'admin')
-        ON CONFLICT DO NOTHING;
-    ELSE
-        SELECT g.id INTO v_group FROM public.groups g
-         WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text;
-    END IF;
-
-    -- The group must BE the operator's: a personal group the operator
-    -- created. See section 3. A row that merely carries the operator's
-    -- did_key -- pre-created by someone else, which `groups_tenancy`'s creator
-    -- WITH CHECK permits for any principal -- is refused rather than joined.
-    IF NOT EXISTS (SELECT 1 FROM public.groups g
-                    WHERE g.id = v_group
-                      AND g.kind = 'personal'
-                      AND g.created_by_agent_id = p_operator) THEN
-        RAISE EXCEPTION 'epigraph_link_operator: the group carrying did:epigraph:personal:% '
-                        'is not a personal group created by that operator; refusing to enrol '
-                        '% in it', p_operator, p_agent
-            USING ERRCODE = '55000';
-    END IF;
+    -- (a) The operator's personal group, through THE personal-group definer,
+    -- `epigraph_ensure_personal_group` (migration 105), and nothing else. It is
+    -- the one place a personal group and its first admin row are minted, and
+    -- its contract is exactly what this link needs (section 3):
+    --   * a live row for the operator -> the group, nothing written;
+    --   * no row of any state         -> the group (if absent) and the
+    --                                    operator's own epoch-0 admin row;
+    --   * only REVOKED rows            -> RAISE 'RVK01': the operator's own
+    --                                    membership of its own group was
+    --                                    revoked, and linking agents into that
+    --                                    group is refused, not papered over;
+    --   * a group under the key that is not the operator's own (a squat that
+    --     predates 108) -> RAISE 'RVK02'.
+    -- Both RAISEs abort this whole call before anything below is written; the
+    -- Rust callers map them to `DbError::MembershipRevoked` /
+    -- `DbError::PersonalGroupNotOwned`.
+    v_group_existed := EXISTS (SELECT 1 FROM public.groups g
+                                WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
+    v_group := public.epigraph_ensure_personal_group(p_operator);
 
     -- (b) The link record: recorded once. See section 4.
     INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id)
@@ -565,7 +565,7 @@ BEGIN
     -- agent authored into the operator's group when it did not.
     RETURN QUERY
     SELECT v_group,
-           v_new_group IS NOT NULL,
+           NOT v_group_existed,
            v_mem_rows > 0,
            EXISTS (SELECT 1 FROM public.group_memberships m
                     WHERE m.group_id = v_group AND m.agent_id = p_agent
@@ -593,7 +593,7 @@ SET search_path = public, pg_temp AS $$
 DECLARE
     v_group     uuid;
     v_other     uuid;
-    v_new_group uuid;
+    v_group_existed boolean;
     v_link_rows integer := 0;
     v_edge_rows integer := 0;
 BEGIN
@@ -649,34 +649,11 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
-    INSERT INTO public.groups (display_name, did_key, public_key, kind,
-                               created_by_agent_id)
-    VALUES ('personal:' || p_operator::text,
-            'did:epigraph:personal:' || p_operator::text,
-            ''::bytea, 'personal', p_operator)
-    ON CONFLICT DO NOTHING
-    RETURNING id INTO v_new_group;
-
-    IF v_new_group IS NOT NULL THEN
-        v_group := v_new_group;
-        INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share,
-                                              epoch, role)
-        VALUES (v_group, p_operator, ''::bytea, 0, 'admin')
-        ON CONFLICT DO NOTHING;
-    ELSE
-        SELECT g.id INTO v_group FROM public.groups g
-         WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text;
-    END IF;
-
-    IF NOT EXISTS (SELECT 1 FROM public.groups g
-                    WHERE g.id = v_group
-                      AND g.kind = 'personal'
-                      AND g.created_by_agent_id = p_operator) THEN
-        RAISE EXCEPTION 'epigraph_link_retired_agent: the group carrying '
-                        'did:epigraph:personal:% is not a personal group created by that '
-                        'operator; refusing to link % to it', p_operator, p_agent
-            USING ERRCODE = '55000';
-    END IF;
+    -- The operator's personal group, through the one personal-group definer:
+    -- see `epigraph_link_operator` step (a). RVK01 / RVK02 abort the call.
+    v_group_existed := EXISTS (SELECT 1 FROM public.groups g
+                                WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
+    v_group := public.epigraph_ensure_personal_group(p_operator);
 
     -- The record, retired. No membership: see section 7.
     INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
@@ -699,7 +676,7 @@ BEGIN
     -- false, so the caller must see it.
     RETURN QUERY
     SELECT v_group,
-           v_new_group IS NOT NULL,
+           NOT v_group_existed,
            v_link_rows > 0,
            EXISTS (SELECT 1 FROM public.operator_links l
                     WHERE l.agent_id = p_agent AND l.retired),

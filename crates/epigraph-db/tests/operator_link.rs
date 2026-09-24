@@ -1,4 +1,4 @@
-//! Migration 102: operator links, the grant that authorizes them, the
+//! Migration 107: operator links, the grant that authorizes them, the
 //! never-revive rule, and the authoring path that reads them.
 //!
 //! # Why most arms here run as `epigraph_app` through SET SESSION AUTHORIZATION
@@ -128,7 +128,7 @@ async fn epigraph_app_cannot_execute_link_operator(pool: PgPool) {
         "the refusal must be observed from a session whose session_user IS the app role"
     );
     let err = refused.expect_err(
-        "epigraph_app executed epigraph_link_operator. 102 must REVOKE EXECUTE from PUBLIC and \
+        "epigraph_app executed epigraph_link_operator. 107 must REVOKE EXECUTE from PUBLIC and \
          from epigraph_app, or the request DSN can enrol any agent in any operator's group",
     );
     assert_eq!(
@@ -337,7 +337,11 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
     );
 }
 
-/// An app session cannot hard-delete a membership (migration 104 section 1).
+/// An app session cannot hard-delete a membership. The mechanism is migration
+/// 106's `REVOKE DELETE ON group_memberships FROM epigraph_app`; 109 section 1
+/// records why this branch dropped its own BEFORE DELETE trigger for the same
+/// thing, and this test is what keeps the REVOKE load-bearing for the operator
+/// arms below (re-granting DELETE makes both arms fail).
 ///
 /// Review's two arms, both as `epigraph_app` stamped exactly as
 /// `Viewer::resolve` stamps the principal:
@@ -350,7 +354,7 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
 ///   session's set), after which the operator could no longer revoke Y.
 ///
 /// Each arm first proves, from the same stamped session, that RLS lets it SEE
-/// the row — so the refusal is the trigger, not the policy hiding the row. The
+/// the row — so the refusal is the privilege, not the policy hiding the row. The
 /// CALIBRATION is the soft path: the operator, stamped, can still revoke Y with
 /// an UPDATE, so the guard removed nothing an in-tree path uses.
 #[sqlx::test(migrations = "../../migrations")]
@@ -478,7 +482,7 @@ async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
     .expect("auth-lineage edge");
 }
 
-/// A SHARED HTTP SIGNER is neither linkable nor an operator (102 section 9).
+/// A SHARED HTTP SIGNER is neither linkable nor an operator (107 section 9).
 ///
 /// Review's scope note: a mistaken entry for the shared signer in a
 /// link-retired agents file would make the operator the owner of every HTTP
@@ -837,7 +841,7 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
     .expect("privilege probe");
     assert!(
         !app_may_insert,
-        "102 must REVOKE ALL on operator_links FROM epigraph_app: 077's default privileges \
+        "107 must REVOKE ALL on operator_links FROM epigraph_app: 077's default privileges \
          grant it INSERT on every new table"
     );
 
@@ -879,17 +883,17 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
 /// merely CARRIES an operator's `did:epigraph:personal:<operator>` key, created
 /// by someone else, is not the operator's group.
 ///
-/// * ARM A (migration 103 section 3) — principal `Z`, on `epigraph_app`
+/// * ARM A (migration 108 section 3) — principal `Z`, on `epigraph_app`
 ///   stamped as itself, can no longer pre-create `did:epigraph:personal:D` for
 ///   an operator `D` that has no personal group yet, as `kind='personal'` OR as
 ///   `kind='team'` (`GroupRepository::create_with_admin` takes a caller-supplied
-///   did_key). Before 103's insert guard the personal arm returned `INSERT 0 1`
+///   did_key). Before 108's insert guard the personal arm returned `INSERT 0 1`
 ///   and the squat blocked `D` permanently (`groups_block_delete`, section 2's
 ///   immutability). CALIBRATION in the same shape: `Z` creates a `team` group
 ///   with a non-personal key, and a fresh `W` creates its OWN canonical
 ///   personal group — both accepted.
 /// * ARM B — defense in depth for a squat that exists anyway (written here on
-///   the superuser harness, e.g. from before 103): linking an agent to `D` must
+///   the superuser harness, e.g. from before 108): linking an agent to `D` must
 ///   REFUSE rather than enrol it as a writer in `Z`'s group, and a link record
 ///   pointing at the squatted group still reads as no link.
 #[sqlx::test(migrations = "../../migrations")]
@@ -989,14 +993,27 @@ async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
             "linking to an operator whose did_key is squatted must be refused, not enrol the \
              agent in the squatter's group",
         );
+    // The refusal is 105's RVK02, raised by the one personal-group definer the
+    // link resolves the operator's group through (107 section 3).
     assert!(
-        err.to_string()
-            .contains("not a personal group created by that operator"),
-        "{err}"
+        matches!(err, epigraph_db::DbError::PersonalGroupNotOwned { .. }),
+        "expected RVK02 (DbError::PersonalGroupNotOwned), got {err:?}"
+    );
+    let err = AgentRepository::link_retired_agent(&mut conn, e, d)
+        .await
+        .expect_err("a retired link to a squatted operator must be refused too");
+    assert!(
+        matches!(err, epigraph_db::DbError::PersonalGroupNotOwned { .. }),
+        "expected RVK02 (DbError::PersonalGroupNotOwned), got {err:?}"
     );
     assert!(
         membership_rows(&pool, squatted, e).await.is_empty(),
         "the refused link enrolled the agent in the squatter's group"
+    );
+    assert_eq!(
+        link_row(&pool, e).await,
+        None,
+        "a refused link wrote an operator_links row"
     );
 
     // Defense in depth: a link record naming the squatted group reads as none.
@@ -1026,6 +1043,91 @@ async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
             .is_none(),
         "epigraph_operator_actor accepted a group the operator did not create"
     );
+}
+
+/// 105's RVK01, reached through the link (107 section 3). An operator whose
+/// own membership of its own personal group is only REVOKED cannot have agents
+/// linked into that group, as an actor or as a retired identity: the link
+/// function resolves the operator's group through
+/// `epigraph_ensure_personal_group`, whose only-revoked arm RAISEs, and the
+/// call is refused before anything is written — no link row, no membership, no
+/// edge. Before the delegation the link carried its own group lookup and
+/// linked the agent regardless.
+///
+/// CALIBRATION: once the operator's own row is restored (an operator action;
+/// here on the harness), the same two calls succeed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPool) {
+    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let actor = seed_bare_agent(&pool).await;
+    let retired = seed_bare_agent(&pool).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(operator)
+    .execute(&pool)
+    .await
+    .expect("revoke the operator's own row");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_operator(&mut conn, actor, operator)
+        .await
+        .expect_err("a link into a group its operator was revoked from must be refused");
+    assert!(
+        matches!(err, epigraph_db::DbError::MembershipRevoked { .. }),
+        "expected RVK01 (DbError::MembershipRevoked), got {err:?}"
+    );
+    let err = AgentRepository::link_retired_agent(&mut conn, retired, operator)
+        .await
+        .expect_err("a retired link to such an operator must be refused too");
+    assert!(
+        matches!(err, epigraph_db::DbError::MembershipRevoked { .. }),
+        "expected RVK01 (DbError::MembershipRevoked), got {err:?}"
+    );
+
+    for agent in [actor, retired] {
+        assert_eq!(
+            link_row(&pool, agent).await,
+            None,
+            "a refused link wrote a link row"
+        );
+        assert!(
+            membership_rows(&pool, group, agent).await.is_empty(),
+            "a refused link wrote a membership"
+        );
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'OPERATED_BY'",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("count edges");
+        assert_eq!(edges, 0, "a refused link wrote an OPERATED_BY edge");
+    }
+    assert_eq!(
+        membership_rows(&pool, group, operator).await,
+        vec![("admin".to_string(), true, 0)],
+        "the refusal must not have revived the operator's own row either"
+    );
+
+    // CALIBRATION: restore the operator's row; the same calls now link.
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = NULL WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(operator)
+    .execute(&pool)
+    .await
+    .expect("operator action: restore the operator's own row");
+    let linked = AgentRepository::link_operator(&mut conn, actor, operator)
+        .await
+        .expect("CALIBRATION: the link succeeds once the operator's row is live");
+    assert!(linked.link_live && !linked.group_created, "{linked:?}");
+    let retired_link = AgentRepository::link_retired_agent(&mut conn, retired, operator)
+        .await
+        .expect("CALIBRATION: the retired link succeeds too");
+    assert!(retired_link.link_created, "{retired_link:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1229,7 +1331,7 @@ async fn write_claim_trace_evidence_into(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Retired links (migration 102 section 7): the operator owns a retired
+// Retired links (migration 107 section 7): the operator owns a retired
 // identity's claims, and the identity gains ZERO write authority.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1270,7 +1372,7 @@ async fn epigraph_app_cannot_execute_link_retired_agent(pool: PgPool) {
     })
     .await;
     let err = refused.expect_err(
-        "epigraph_app executed epigraph_link_retired_agent: 102 must REVOKE EXECUTE from PUBLIC \
+        "epigraph_app executed epigraph_link_retired_agent: 107 must REVOKE EXECUTE from PUBLIC \
          and from epigraph_app",
     );
     assert_eq!(
@@ -1393,7 +1495,7 @@ async fn a_retired_agent_gains_no_write_authority(pool: PgPool) {
 }
 
 /// The operator cannot hand a retired identity write authority through an
-/// ordinary roster write (migration 104 section 2).
+/// ordinary roster write (migration 109 section 2).
 ///
 /// Review's attack: O, stamped as admin of its personal group, inserted a
 /// `writer` row for retired R, and R then wrote a claim owned by O's group,
@@ -1647,7 +1749,7 @@ async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgP
     }
 }
 
-/// Migration 103 (review attack 2c): an operated WRITER cannot make itself an
+/// Migration 108 (review attack 2c): an operated WRITER cannot make itself an
 /// admin of its operator's group by rewriting the group's creator.
 ///
 /// As `epigraph_app`, stamped from the operated agent's own `Viewer::resolve`
@@ -1655,7 +1757,7 @@ async fn the_author_read_and_the_actor_read_answer_different_questions(pool: PgP
 ///
 /// * rewriting the operator group's `created_by_agent_id` to itself — the one
 ///   UPDATE `groups_tenancy`'s WITH CHECK admits on that row, and the review's
-///   exact attack — is refused by 103's trigger, and so is the follow-on
+///   exact attack — is refused by 108's trigger, and so is the follow-on
 ///   enrolment of a third agent;
 /// * rewriting `did_key` or `kind` on a group the agent legitimately created
 ///   (its own personal group, where the WITH CHECK passes) is refused by the
@@ -1736,7 +1838,7 @@ async fn an_operated_writer_cannot_rewrite_its_operator_groups_identity(pool: Pg
         assert!(
             err.to_string()
                 .contains("immutable outside a maintenance session"),
-            "{what}: the refusal must be migration 103's trigger, not the RLS policy: {err}"
+            "{what}: the refusal must be migration 108's trigger, not the RLS policy: {err}"
         );
     }
     assert_eq!(

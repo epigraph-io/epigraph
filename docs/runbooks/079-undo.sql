@@ -101,8 +101,8 @@ DECLARE t text;
           -- they ran.
           'privatization_plans','privatization_plan_items',
           'privatization_audit','instance_admins',
-          -- ---- the operator-link record (102) ----------------------------
-          -- FORCEd by 102 at creation, on the same precedent and for the same
+          -- ---- the operator-link record (107) ----------------------------
+          -- FORCEd by 107 at creation, on the same precedent and for the same
           -- boot-assertion reason as the four above.
           'operator_links'];
 BEGIN

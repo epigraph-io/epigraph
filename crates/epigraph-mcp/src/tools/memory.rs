@@ -216,27 +216,28 @@ pub async fn memorize(
     // twice). The embed below is deliberately NOT gated the same way — see the
     // comment there and `tools::claims::submit_claim`, which carries the long
     // form of both halves.
+    //
+    // One transaction, stamped from the AUTHOR's viewer: `claim_frames`,
+    // `mass_functions` and the cached-belief `UPDATE claims` land together or not
+    // at all. `memorize` passes `persist_truth_from_pignistic = false` — unlike
+    // `submit_claim` it does not derive a `truth_value` from the BBA, so there is
+    // no second write to keep consistent with it.
     let ds = if was_created {
-        match ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            viewer,
-            claim_uuid,
+        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
+            server,
             agent_id,
+            claim_uuid,
+            viewer,
             ds_auto::DsAutoInput {
                 confidence,
                 weight: 0.6,
                 supports: true,
                 evidence_type: None,
             },
+            /* persist_truth_from_pignistic */ false,
+            "memorize",
         )
         .await
-        {
-            Ok(r) => Some(r),
-            Err(e) => {
-                tracing::warn!(claim_id = %claim_uuid, "ds auto-wire memorize failed: {e}");
-                None
-            }
-        }
     } else {
         // Option A: a dedup hit. AUTHORED already fired in the helper, and Trace
         // + Evidence + `update_trace_id` ran above IF and only if the canonical
@@ -901,32 +902,34 @@ async fn recall_post_embed(
             // it regroups the response without changing the set.
             "diversity_radius": params.diversity_radius,
         });
-        let pool = server.pool.clone();
+        let scoped = server.scoped.clone();
         tokio::spawn(async move {
-            // Unresolvable ⇒ DROP, never widen. See `recall_audit_owner_group`.
-            let owner_group_id =
-                match super::recall::recall_audit_owner_group(&pool, principal).await {
-                    Ok(g) => g,
-                    Err(e) => {
-                        tracing::warn!(reason = %e, "recall audit skipped rather than widened");
-                        return;
+            // Unresolvable ⇒ DROP, never widen, and never mint (#493). The row
+            // is written on the principal-stamped transaction that resolved its
+            // owner; see `recall::write_recall_audit`.
+            let written =
+                super::recall::write_recall_audit(scoped.as_ref(), principal, |owner_group_id| {
+                    epigraph_db::NewRecallEvent {
+                        id: event_id,
+                        agent_id: principal,
+                        tool: "recall".to_string(),
+                        query_text,
+                        query_pgvector,
+                        params: params_json,
+                        returned_claim_ids,
+                        owner_group_id: Some(owner_group_id),
                     }
-                };
-            let event = epigraph_db::NewRecallEvent {
-                id: event_id,
-                agent_id: principal,
-                tool: "recall".to_string(),
-                query_text,
-                query_pgvector,
-                params: params_json,
-                returned_claim_ids,
-                owner_group_id: Some(owner_group_id),
-            };
-            if let Err(e) = epigraph_db::RecallEventRepository::log(&pool, event).await {
-                tracing::warn!(
+                })
+                .await;
+            match written {
+                Ok(_) => {}
+                Err(super::recall::RecallAuditNotWritten::Unresolved(e)) => {
+                    tracing::warn!(reason = %e, "recall audit skipped rather than widened");
+                }
+                Err(super::recall::RecallAuditNotWritten::Write(e)) => tracing::warn!(
                     error = %e,
                     "recall audit log failed; recall itself unaffected"
-                );
+                ),
             }
         });
     }
@@ -1017,6 +1020,9 @@ struct RecallEnvelope {
     /// Present only when the caller asked for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     epistemic_partition: Option<crate::types::EpistemicPartition<RecallResult>>,
+    /// Same contract as `RecallWithContextResponse::recall_event_id`: the id the
+    /// audit row is written under, minted before an asynchronous best-effort
+    /// write, so it does not prove a row exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

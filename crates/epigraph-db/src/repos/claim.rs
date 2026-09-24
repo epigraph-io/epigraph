@@ -644,9 +644,9 @@ impl ClaimRepository {
     ///
     /// `ensure_personal_group` is idempotent and is already called for every
     /// authenticated principal at token mint (PR-02), so on a live path this is
-    /// a lookup, not a write.
+    /// a lookup, not a write (migration 105's live path writes nothing).
     ///
-    /// # An OPERATED author writes into its operator's group (migration 102)
+    /// # An OPERATED author writes into its operator's group (migration 107)
     ///
     /// When `agent_id` has an ACTING operator link
     /// ([`AgentRepository::operator_actor`](crate::repos::AgentRepository::operator_actor)),
@@ -671,9 +671,11 @@ impl ClaimRepository {
     /// it wrote (`operator_link.rs::a_retired_agent_gains_no_write_authority`).
     ///
     /// # Errors
-    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
+    /// Returns `DbError::MembershipRevoked` if the author holds only revoked rows
+    /// in its personal group (and has no acting operator link),
+    /// `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
     /// `DbError::QueryFailed` for other database failures — including a
-    /// database that has not applied migration 102, which fails CLOSED here
+    /// database that has not applied migration 107, which fails CLOSED here
     /// rather than authoring as if the author had no operator.
     pub async fn default_decl_for_author(
         conn: &mut sqlx::PgConnection,
@@ -687,47 +689,49 @@ impl ClaimRepository {
         ))
     }
 
-    /// The id of `agent_id`'s personal group: **read first, mint only if
-    /// absent.**
+    /// The id of `agent_id`'s personal group, resolved by the `SECURITY DEFINER`
+    /// function alone: **no read on the caller's connection first.**
     ///
-    /// The read-first order is a security property, not an optimisation.
-    /// `AgentRepository::ensure_personal_group`'s membership statement is
-    /// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
-    /// NULL, role = 'admin'`, so calling it unconditionally **revives a revoked
-    /// membership as admin**. That is correct where it is called from — PR-02's
-    /// token mint, where the principal is authenticating and its own personal
-    /// group must work — and wrong on a write path, where restoring a
-    /// membership somebody deliberately revoked would be a privilege change
-    /// hidden inside an unrelated claim insert.
+    /// # Why the read-first lookup was removed (batch F)
     ///
-    /// The lookup below cannot revive anything. The mint runs only when the
-    /// group does not exist at all, and then there is no membership to revive.
+    /// This used to `SELECT id FROM groups WHERE did_key = …` on the caller's
+    /// connection and call `ensure_personal_group` only on a miss, and the doc
+    /// called that order a SECURITY property: migration 077's function revived a
+    /// revoked membership as admin, and the lookup was what kept a write path
+    /// from reaching it. The property held only where the lookup could see the
+    /// row, and the callers were not all such places:
     ///
-    /// The `did_key` is the deterministic
-    /// `did:epigraph:personal:<agent_uuid>`, spelled the same way
-    /// `ensure_personal_group` spells it: nothing on `agents` records which
-    /// group is the personal one, so that key against `groups_did_key_key
-    /// UNIQUE` is the whole of the identification. A second spelling here would
-    /// silently resolve a different row — which is exactly the defect the test
-    /// fixture `seed_agent_with_group` had until PR-16.
+    /// * on an UNSTAMPED `epigraph_app` connection — `default_decl_for_author_pool`
+    ///   from the API routes, `personal_group_of_pool` from the recall audit
+    ///   (#493) — `groups_tenancy` hides every group, so the read was BLIND and
+    ///   every call took the reviving mint;
+    /// * on a BYPASSRLS connection (the operator CLI's maintenance pool, the
+    ///   `Privileged` ingest arm) the read was not blind, and so it returned the
+    ///   personal group of an agent whose membership was REVOKED — a claim
+    ///   authored by a revoked agent was quietly owned by the group it had been
+    ///   revoked from.
+    ///
+    /// Migration 105 moved the discrimination into the function, which reads
+    /// every row in its definer frame: a live membership returns the group with
+    /// no write, only-revoked rows raise [`DbError::MembershipRevoked`], and only
+    /// an agent with no row at all is provisioned. Calling it directly gives the
+    /// SAME answer on every connection role, which a read on the caller's
+    /// connection cannot.
+    ///
+    /// The `did_key` is the deterministic `did:epigraph:personal:<agent_uuid>`,
+    /// spelled once, in the function: nothing on `agents` records which group is
+    /// the personal one.
     ///
     /// # Errors
-    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent (the
-    /// mint path FKs to `agents`), and `DbError::QueryFailed` otherwise.
+    /// Returns [`DbError::MembershipRevoked`] if the agent holds only revoked
+    /// rows in its personal group, `DbError::ForeignKeyViolation` if `agent_id`
+    /// names no agent (the mint path FKs to `agents`), and
+    /// `DbError::QueryFailed` otherwise.
     async fn personal_group_of(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
     ) -> Result<Uuid, DbError> {
-        let existing: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
-        )
-        .bind(agent_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        match existing {
-            Some(g) => Ok(g),
-            None => crate::repos::AgentRepository::ensure_personal_group(conn, agent_id).await,
-        }
+        crate::repos::AgentRepository::ensure_personal_group(conn, agent_id).await
     }
 
     /// [`Self::default_decl_for_author`] for a caller holding a pool rather
@@ -755,8 +759,10 @@ impl ClaimRepository {
     /// same owner and `visibility = 'group'`. Returning the id keeps that
     /// choice at the call site instead of hiding it in a helper's name.
     ///
-    /// Read-first, mint-if-absent, with the security property that ordering
-    /// carries — see [`Self::personal_group_of`].
+    /// Resolved by the definer function alone, never by a read on the pool's
+    /// (unstamped) connection — see [`Self::personal_group_of`]. It has no
+    /// production caller since the recall audit stopped using it (#493); the
+    /// audit must never provision, and this can.
     ///
     /// # Errors
     /// As [`Self::personal_group_of`], plus `DbError::ConnectionFailed` if no
@@ -877,6 +883,34 @@ impl ClaimRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, claim))]
     pub async fn create(pool: &PgPool, claim: &Claim, decl: TenancyDecl) -> Result<Claim, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_conn(&mut conn, claim, decl).await
+    }
+
+    /// [`Self::create`] on a connection the caller owns — the form a
+    /// tenancy-stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so the dedup probe, the
+    /// INSERT and the event are one implementation. `ingest_document`'s atoms
+    /// (level 3, content-addressed) are written through it, and on an unstamped
+    /// checkout migration 077's `claims_tenancy` `WITH CHECK` refuses the INSERT
+    /// on a cleanly-migrated schema; handed `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` the atom rides the same transaction
+    /// as the document's other rows.
+    ///
+    /// The `claim.created` event moved to `publish_or_log_conn`: it is a
+    /// SWALLOWED failure, and inside a caller's transaction a swallowed failure is
+    /// a deferred silent ROLLBACK at COMMIT unless it is SAVEPOINT-wrapped (hard
+    /// constraint #6). On a bare pooled connection that SAVEPOINT is a real
+    /// `BEGIN`/`COMMIT` around the one INSERT, which is what the pool path did.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+    ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -896,7 +930,7 @@ impl ClaimRepository {
                FROM claims WHERE content_hash = $1 LIMIT 1"#,
             content_hash.as_slice()
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(existing_row) = existing {
@@ -932,7 +966,7 @@ impl ClaimRepository {
             decl.visibility_bind(),
             decl.owner_group_bind()
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         // Fire-and-forget claim.created event (closes #61). This is the
@@ -940,8 +974,8 @@ impl ClaimRepository {
         // (MCP ingestion paths, API conventions, paper repo, tests). The
         // dedup early-return above does NOT emit, so resubmissions of an
         // existing content_hash do not pollute the audit log.
-        let _ = crate::repos::EventRepository::publish_or_log(
-            pool,
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
             "claim.created",
             Some(row.agent_id),
             &serde_json::json!({
@@ -977,13 +1011,31 @@ impl ClaimRepository {
         claim_id: ClaimId,
         properties: serde_json::Value,
     ) -> Result<(), DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::set_properties_conn(&mut conn, claim_id, properties).await
+    }
+
+    /// [`Self::set_properties`] on a connection the caller owns, so an ingest's
+    /// hierarchy metadata lands in the same stamped transaction as the claim it
+    /// describes. `rows_affected() == 0` stays an ERROR here, and that matters
+    /// more on a stamped connection than it did on the pool: an `UPDATE` that
+    /// `claims_tenancy`'s USING hides matches zero rows WITHOUT raising, so this
+    /// check is what keeps an invisible target from reading as success.
+    ///
+    /// # Errors
+    /// As [`Self::set_properties`].
+    pub async fn set_properties_conn(
+        conn: &mut sqlx::PgConnection,
+        claim_id: ClaimId,
+        properties: serde_json::Value,
+    ) -> Result<(), DbError> {
         let id: Uuid = claim_id.into();
         let result = sqlx::query!(
             "UPDATE claims SET properties = $2, updated_at = NOW() WHERE id = $1",
             id,
             properties
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -5167,6 +5219,26 @@ impl ClaimRepository {
     /// skipped via `ON CONFLICT (id) DO NOTHING`). Used by ingest paths that
     /// generate deterministic UUIDs and rely on idempotent re-runs.
     ///
+    /// # Why this takes an `Acquire` rather than a `&PgPool`
+    ///
+    /// Migration 077's `claims_tenancy` `WITH CHECK` asks
+    /// `owner_group_id = ANY(epigraph_writable_groups())`, and on an unstamped
+    /// pool checkout that set is `{}` — so on a cleanly-migrated schema this
+    /// INSERT is **refused**, which is how `store_workflow` came to be entirely
+    /// unavailable (`new row violates row-level security policy for table
+    /// "claims"`, raised from `epigraph-ingest-executor`). MEASURED as
+    /// `epigraph_app` (`rolbypassrls = false`) on a database migrated 001→head
+    /// from empty: this statement is refused unstamped, refused when stamped
+    /// from a *different* real group, and admitted when stamped from the group
+    /// the row is owned by.
+    ///
+    /// A generic `Acquire` rather than `&mut PgConnection` because every
+    /// existing caller passes `&pool` and `&PgPool` implements `Acquire`: the
+    /// twelve unconverted call sites keep their current behaviour verbatim,
+    /// while a converted caller passes `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` and both statements below ride
+    /// that one stamped transaction.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` for non-conflict failures, or
     /// `DbError::InvalidData` if a label carries unexpanded shell syntax.
@@ -5177,9 +5249,46 @@ impl ClaimRepository {
     // thinking about the field — which is the shape a `Default` impl grows out
     // of, and D1 is the rule that says there must not be one.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
+        id: Uuid,
+        content: &str,
+        content_hash: &[u8; 32],
+        agent_id: Uuid,
+        truth: TruthValue,
+        labels: &[String],
+        decl: TenancyDecl,
+    ) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_with_id_if_absent_conn(
+            &mut conn,
+            id,
+            content,
+            content_hash,
+            agent_id,
+            truth,
+            labels,
+            decl,
+        )
+        .await
+    }
+
+    /// [`Self::create_with_id_if_absent`] on a connection the caller owns — the
+    /// form a stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one statement
+    /// pair and one tenancy argument. A concrete `&mut PgConnection` rather than
+    /// a generic `Acquire`: the workflow-ingest path reaches this through
+    /// `#[tool_router]`'s boxed `dyn Future + Send`, and an `Acquire<'a>` bound
+    /// there fails to prove `for<'x> &'x mut PgConnection: Acquire<'x>`
+    /// ("implementation of `sqlx::Acquire` is not general enough"). Measured, not
+    /// anticipated.
+    ///
+    /// # Errors
+    /// As [`Self::create_with_id_if_absent`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_id_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         content: &str,
         content_hash: &[u8; 32],
@@ -5208,7 +5317,7 @@ impl ClaimRepository {
         .bind(labels)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
         let was_inserted = row.map(|(b,)| b).unwrap_or(false);
@@ -5217,10 +5326,18 @@ impl ClaimRepository {
         // insertion. ON CONFLICT (id) DO NOTHING swallows duplicate-id paths,
         // and we rely on `was_inserted` (xmax=0 only on freshly-inserted rows)
         // to skip emission for idempotent re-runs.
+        //
+        // `publish_or_log_conn`, NOT `publish_or_log`: this is a swallowed
+        // failure, and once the caller can hand us a transaction a swallowed
+        // failure stops being fire-and-forget and becomes a DEFERRED abort —
+        // PostgreSQL answers the eventual `COMMIT` with `ROLLBACK` and no error,
+        // so the tool reports success having written nothing. The `_conn`
+        // variant wraps the INSERT in a SAVEPOINT, which keeps "the event is
+        // best-effort" true inside a transaction instead of only outside one.
         if was_inserted {
             let truth_value = truth.value();
-            let _ = crate::repos::EventRepository::publish_or_log(
-                pool,
+            let _ = crate::repos::EventRepository::publish_or_log_conn(
+                &mut *conn,
                 "claim.created",
                 Some(agent_id),
                 &serde_json::json!({
@@ -6151,6 +6268,28 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<DedupRepair, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::mark_duplicate_with_repair_conn(&mut conn, dup, canonical).await
+    }
+
+    /// [`Self::mark_duplicate_with_repair`] on a connection the caller owns.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one
+    /// implementation. `begin()` below opens a real transaction when this
+    /// connection is not already in one and a **SAVEPOINT** when it is, so the
+    /// repair stays atomic in both shapes.
+    ///
+    /// A concrete `&mut PgConnection` rather than a generic `Acquire` for the
+    /// reason recorded on [`Self::create_with_id_if_absent_conn`].
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_with_repair`].
+    pub async fn mark_duplicate_with_repair_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<DedupRepair, DbError> {
+        use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         if dup_uuid == canon_uuid {
@@ -6158,7 +6297,7 @@ impl ClaimRepository {
                 source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
             });
         }
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
         let canon_exists: bool =
             sqlx::query_scalar(
                 r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -8149,7 +8288,6 @@ impl ClaimRepository {
     /// duplicates, non-current, already-superseded) and `DbError::NotFound`
     /// when a source id does not exist.
     #[instrument(skip(pool, merged_content), fields(n_sources = source_ids.len()))]
-    #[allow(clippy::too_many_lines)]
     pub async fn consolidate(
         pool: &PgPool,
         source_ids: &[Uuid],
@@ -8159,6 +8297,53 @@ impl ClaimRepository {
         reason: &str,
         acting_agent_id: Uuid,
     ) -> Result<ConsolidateResult, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::consolidate_conn(
+            &mut conn,
+            source_ids,
+            merged_content,
+            merged_truth,
+            mode,
+            reason,
+            acting_agent_id,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate`] on a connection the caller owns — the form a
+    /// tenancy-stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one
+    /// implementation. `begin()` below issues a real `BEGIN` on a bare pooled
+    /// connection — exactly what `pool.begin()` did — and a `SAVEPOINT` inside a
+    /// caller's transaction, so the merge is one unit in both shapes.
+    ///
+    /// # Why a stamped caller needs this
+    ///
+    /// On an unstamped pool checkout, migration 077's `claims_tenancy` `WITH
+    /// CHECK` has an empty writable set, so the merged-claim INSERT is refused
+    /// for every caller on a cleanly-migrated schema — `consolidate_claims` was
+    /// unavailable there. And the all-public branch's `personal_group_of` read
+    /// was BLIND on that connection (`groups_tenancy` has no true arm), so it
+    /// took the mint path on every merge: migration 077's reviving `ON
+    /// CONFLICT` inside an unrelated write — hard constraint #3's hazard. Since
+    /// batch F `personal_group_of` asks the definer function directly, which
+    /// (migration 105) returns a live group without writing and refuses a
+    /// revoked one, so the answer no longer depends on the stamp.
+    ///
+    /// # Errors
+    /// As [`Self::consolidate`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn consolidate_conn(
+        conn: &mut sqlx::PgConnection,
+        source_ids: &[Uuid],
+        merged_content: &str,
+        merged_truth: f64,
+        mode: ConsolidateMode,
+        reason: &str,
+        acting_agent_id: Uuid,
+    ) -> Result<ConsolidateResult, DbError> {
+        use sqlx::Acquire;
         let protocol = |m: String| DbError::QueryFailed {
             source: sqlx::Error::Protocol(m),
         };
@@ -8178,7 +8363,7 @@ impl ClaimRepository {
             return Err(protocol("consolidate: merged_content is empty".into()));
         }
 
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         // Lock every source up front so a concurrent merge/supersede cannot
         // interleave between validation and retirement.
@@ -8386,15 +8571,15 @@ impl ClaimRepository {
         // upsert only to discard them.
         //
         // `default_decl_for_author`, not `personal_group_of`: an actor with an
-        // ACTING operator link (migration 102) authors into its OPERATOR's
+        // ACTING operator link (migration 107) authors into its OPERATOR's
         // personal group, exactly as every other authoring path does, so a
         // merge by a model-bumped job does not split its work across groups
         // again (review finding: the merged claim landed in the agent's own
         // group while every source sat in the operator's). An unlinked,
         // revoked or retired actor falls through to `personal_group_of`, which
-        // reads first and mints only if absent -- see its doc for why calling
-        // `ensure_personal_group` unconditionally here would revive a revoked
-        // membership as a side effect of a merge.
+        // resolves through the definer function: it (migration 105) returns a
+        // live group without writing and refuses a revoked membership rather
+        // than reviving it as a side effect of a merge. See its doc.
         let decl = match merged_owner {
             Some(g) => TenancyDecl::group(g),
             None => Self::default_decl_for_author(&mut tx, acting_agent_id).await?,
