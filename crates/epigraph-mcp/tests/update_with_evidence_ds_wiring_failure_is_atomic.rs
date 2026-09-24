@@ -73,6 +73,7 @@ mod common;
 use common::*;
 
 use epigraph_mcp::types::UpdateWithEvidenceParams;
+use tracing_test::traced_test;
 
 fn json_of(out: rmcp::model::CallToolResult) -> serde_json::Value {
     let text = out
@@ -165,6 +166,7 @@ async fn deny_the_cached_belief_write(pool: &PgPool) {
 }
 
 /// A first-step drop is an ERROR naming the step, and writes nothing.
+#[traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_first_step_ds_failure_is_an_error_and_commits_nothing(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -196,6 +198,16 @@ async fn a_first_step_ds_failure_is_an_error_and_commits_nothing(pool: PgPool) {
     assert!(
         err.message.starts_with("assign_claim:"),
         "the error must carry the failing step as its prefix; got {err:?}"
+    );
+
+    // And visible to the operator, not only the caller: `internal_error` does
+    // not log, so the warn at the `auto_wire_ds_update` call site is the only
+    // server-log record of this dropped wire. #497 added it so one log query
+    // ("ds auto-wire failed") finds every dropped wire across tools; the suffix
+    // asserted here is unique to this site.
+    assert!(
+        logs_contain("Rolled back; nothing from this submission was stored"),
+        "a dropped DS wire in update_with_evidence must be logged as well as returned"
     );
 
     // And the atomicity half: nothing at all landed — no evidence row, no BBA,

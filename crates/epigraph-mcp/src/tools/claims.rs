@@ -966,7 +966,21 @@ pub async fn update_with_evidence(
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| {
+        // Logged as well as returned. `internal_error` only builds the
+        // `McpError`, so without this a dropped wire here would never reach
+        // the server log. #497 added this warn so that one log query
+        // ("ds auto-wire failed") finds every dropped wire, whichever tool
+        // dropped it; `submit_claim`'s path emits the same prefix with the same
+        // `claim_id`/`tool` fields. The wording differs because the outcome
+        // does: here the whole submission is rolled back.
+        tracing::warn!(
+            claim_id = %claim_id,
+            tool = "update_with_evidence",
+            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
+        );
+        internal_error(e)
+    })?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
     //
