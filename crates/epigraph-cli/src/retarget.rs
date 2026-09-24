@@ -71,6 +71,28 @@ Example output: {"0": {"atoms": [1]}, "1": "whole", "2": "unclear", "3": {"atoms
 Items:
 {items}"#;
 
+/// The spelling `POST /api/v1/edges` accepts for a conflict relationship.
+///
+/// The HTTP whitelist (`routes/edges.rs::VALID_RELATIONSHIPS`) is
+/// case-sensitive and holds `refutes` in lower case but `contradicts` ONLY as
+/// `CONTRADICTS`, while MCP `link_epistemic` (the path most production conflict
+/// edges were filed through) stores lower-case `contradicts`. Re-sending the
+/// parent's stored spelling therefore 400s for the commonest case, measured by
+/// this branch's integration test before this function existed.
+///
+/// The belief effect is spelling-independent (`restriction_kind_with_profile`
+/// lower-cases), and the pre-create check matches `lower(relationship)`, so an
+/// existing atom edge of either spelling is still found. A relationship this
+/// function does not know is returned unchanged and left to the API to judge.
+/// `tests/retarget_conflicts.rs` pins both mappings against the live whitelist.
+pub fn api_relationship(stored: &str) -> String {
+    match stored.to_ascii_lowercase().as_str() {
+        "contradicts" => "CONTRADICTS".to_string(),
+        "refutes" => "refutes".to_string(),
+        _ => stored.to_string(),
+    }
+}
+
 /// One conflict edge to retarget, with the parent's atoms in their stable
 /// numbering order (index = position in `atoms`).
 #[derive(Debug, Clone, PartialEq)]
@@ -625,7 +647,12 @@ mod db {
                 "model": entry.model,
             });
             match api
-                .create_edge(entry.source_id, atom, &entry.relationship, props)
+                .create_edge(
+                    entry.source_id,
+                    atom,
+                    &super::api_relationship(&entry.relationship),
+                    props,
+                )
                 .await
             {
                 Ok((id, true)) => applied.created_edge_ids.push(id),
