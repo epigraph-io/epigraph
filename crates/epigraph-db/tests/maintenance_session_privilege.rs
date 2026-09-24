@@ -34,9 +34,7 @@ use sqlx::PgPool;
 async fn a_session_on_an_unprivileged_connection_refuses_itself(pool: PgPool) {
     // Unprivileged: the maintenance pool re-authorizes as `epigraph_app`.
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
-    let scoped = fixture::scoped_pool(&pool)
-        .await
-        .with_maintenance_pool(app);
+    let scoped = fixture::scoped_pool(&pool).await.with_maintenance_pool(app);
     let mut session = scoped
         .maintenance_session(SystemReason::BeliefRecomputation)
         .await

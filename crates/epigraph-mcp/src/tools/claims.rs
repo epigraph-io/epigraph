@@ -145,8 +145,8 @@ pub async fn submit_claim(
         PreparedSubmission::Existing(response) => return Ok(response),
         PreparedSubmission::Fresh(sub) => *sub,
     };
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "submit_claim")
-        .await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "submit_claim").await?;
     let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
     // COMMIT. Everything after this line is post-commit and best-effort.
     tx.commit().await.map_err(internal_error)?;
@@ -402,8 +402,7 @@ async fn write_submission(
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&mut *conn, viewer, claim, tool_name)
-            .await?;
+        crate::claim_helper::create_claim_idempotent(&mut *conn, viewer, claim, tool_name).await?;
     let claim_uuid = claim.id.as_uuid();
 
     // Already validated above, before the claim write. This call can now only
@@ -584,7 +583,6 @@ async fn finish_submission(
         ds,
     } = written;
     let claim_uuid = claim.id.as_uuid();
-
 
     // EMBEDDING. Gated on `was_created` OR "the canonical row is missing its
     // vector", never on `was_created` alone.
@@ -1463,12 +1461,9 @@ pub async fn resolve_backlog_item(
 
     // THE ONE TRANSACTION. Resolution claim, `justifies` edges and the label
     // PATCH all run on it; see the function doc.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(
-        server,
-        sub.agent_id,
-        "resolve_backlog_item",
-    )
-    .await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, sub.agent_id, "resolve_backlog_item")
+            .await?;
     let written = write_submission(&mut tx, server, viewer, &sub, "submit_claim").await?;
     let resolution_uuid = written.claim.id.as_uuid();
     let resolution_id = resolution_uuid.to_string();
@@ -1533,19 +1528,15 @@ pub async fn resolve_backlog_item(
     // 3. PATCH the original's labels: add "resolved", keep "backlog". In the
     //    same transaction: a refusal here rolls back the resolution claim and
     //    its edges, so an item is never left open beside a resolution of it.
-    let after_labels = ClaimRepository::update_labels_conn(
-        &mut tx,
-        original_id,
-        &["resolved".to_string()],
-        &[],
-    )
-    .await
-    .map_err(|e| {
-        internal_error(format!(
+    let after_labels =
+        ClaimRepository::update_labels_conn(&mut tx, original_id, &["resolved".to_string()], &[])
+            .await
+            .map_err(|e| {
+                internal_error(format!(
             "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing was \
              written: the resolution claim and its basis edges were rolled back with it."
         ))
-    })?;
+            })?;
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -1764,9 +1755,12 @@ pub async fn patch_claim(
     // `claims:admin` caller should carry write authority into a group this
     // process cannot write is the cross-agent ownership question (#374), not a
     // stamping one.
-    let mut tx =
-        crate::claim_helper::begin_author_stamped_tx(server, server.agent_id().await?, "patch_claim")
-            .await?;
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "patch_claim",
+    )
+    .await?;
 
     // The CALLER's read authority, on the same transaction. Before this,
     // `patch_claim` checked caller visibility only on the retirement-label path

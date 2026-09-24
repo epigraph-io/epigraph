@@ -158,7 +158,10 @@ async fn a_principal_cannot_act_on_a_claim_it_cannot_read() {
         let status = resp.status().as_u16();
         let after = state_of(&pool, c).await;
         if expect_ok {
-            assert_eq!(status, 200, "calibration ({visibility}): PATCH must succeed");
+            assert_eq!(
+                status, 200,
+                "calibration ({visibility}): PATCH must succeed"
+            );
             assert!(after.2, "calibration: the property must land");
         } else {
             assert_eq!(
@@ -184,7 +187,10 @@ async fn a_principal_cannot_act_on_a_claim_it_cannot_read() {
                 status, 200,
                 "calibration ({visibility}): deprecate must succeed"
             );
-            assert!(!after.0, "calibration: the workflow claim must be deprecated");
+            assert!(
+                !after.0,
+                "calibration: the workflow claim must be deprecated"
+            );
         } else {
             assert_eq!(
                 status, 404,

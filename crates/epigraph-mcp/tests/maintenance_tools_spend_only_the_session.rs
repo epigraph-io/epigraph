@@ -71,7 +71,12 @@ fn the_three_maintenance_tools_name_no_server_pool() {
         let src = std::fs::read_to_string(tools_dir().join(file)).expect("read tool source");
         let stripped = strip_line_comments(&src);
         let body = function_body(&stripped, func);
-        for needle in ["server.pool", "_server.pool", ".pool.acquire", ".pool.begin"] {
+        for needle in [
+            "server.pool",
+            "_server.pool",
+            ".pool.acquire",
+            ".pool.begin",
+        ] {
             if body.contains(needle) {
                 findings.push(format!("tools/{file}::{func} names `{needle}`"));
             }
@@ -102,5 +107,8 @@ fn the_stripper_keeps_code() {
     let stripped = strip_line_comments(src);
     let body = function_body(&stripped, "backfill_embeddings");
     assert_eq!(body.matches("server.pool").count(), 1, "body was: {body}");
-    assert!(!body.contains("next"), "the body must stop at the next item");
+    assert!(
+        !body.contains("next"),
+        "the body must stop at the next item"
+    );
 }

@@ -115,9 +115,10 @@ async fn dry_run_reports_without_mutating(pool: PgPool) {
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            params(true))
-            .await
-            .expect("sweep"),
+            params(true),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(j["dry_run"], serde_json::json!(true));
@@ -155,9 +156,10 @@ async fn execute_collapses_exact_restatements_keeping_highest_truth(pool: PgPool
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            params(false))
-            .await
-            .expect("sweep"),
+            params(false),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(j["pairs_marked"], serde_json::json!(1));
@@ -219,9 +221,10 @@ async fn similar_but_distinct_text_is_never_auto_collapsed(pool: PgPool) {
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            params(false))
-            .await
-            .expect("sweep"),
+            params(false),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(
@@ -267,9 +270,10 @@ async fn transitive_similarity_forms_one_cluster(pool: PgPool) {
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            params(true))
-            .await
-            .expect("sweep"),
+            params(true),
+        )
+        .await
+        .expect("sweep"),
     );
 
     let clusters = j["clusters"].as_array().unwrap();
@@ -328,9 +332,10 @@ async fn excluded_claim_classes_are_not_swept(pool: PgPool) {
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            params(true))
-            .await
-            .expect("sweep"),
+            params(true),
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(
@@ -368,9 +373,10 @@ async fn next_offset_advances_for_resumable_paging(pool: PgPool) {
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            p)
-            .await
-            .expect("sweep"),
+            p,
+        )
+        .await
+        .expect("sweep"),
     );
 
     assert_eq!(j["scanned"], serde_json::json!(2));
@@ -450,9 +456,10 @@ async fn execute_repairs_the_survivors_belief_not_just_the_supersedes_pointer(po
                 .maintenance_session(epigraph_db::visibility::SystemReason::DedupSweep)
                 .await
                 .expect("a maintenance session over the test database"),
-            params(false))
-            .await
-            .expect("sweep"),
+            params(false),
+        )
+        .await
+        .expect("sweep"),
     );
     assert_eq!(j["pairs_marked"], serde_json::json!(1));
     assert!(
