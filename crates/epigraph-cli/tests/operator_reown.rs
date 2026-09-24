@@ -2500,6 +2500,62 @@ async fn app_reads_evidence(pool: &PgPool, ev: Uuid) -> i64 {
     n
 }
 
+/// Row security DISABLED on `evidence` is an unenforced hide too (stage-3
+/// review, LOW: the dry run looked only at `pg_policies`, so a schema where
+/// every row is readable produced a clean preview). The dry run warns, and
+/// `--apply` refuses without `--accept-unenforced-hide`, writing nothing.
+///
+/// PREMISE: with row security disabled an unstamped app session reads the
+/// group-private row it could not read before, so the warning is not noise.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_disabled_row_security_on_evidence_is_warned_and_refused(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    assert_eq!(app_reads_evidence(&pool, h.fx.ev_private).await, 0);
+    exec(&pool, "ALTER TABLE evidence DISABLE ROW LEVEL SECURITY").await;
+    assert_eq!(
+        app_reads_evidence(&pool, h.fx.ev_private).await,
+        1,
+        "PREMISE: with row security disabled every row is readable"
+    );
+
+    let before = snapshot(&pool, false).await;
+    let dry = hide_run(&pool, &h, &[]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("WARNING: HIDING WILL NOT BE ENFORCED")
+            && dry
+                .stdout
+                .contains("row level security is DISABLED on evidence"),
+        "{}",
+        dry.show()
+    );
+    let mf = h.dir.join("hide-rls.jsonl");
+    let refused = hide_run(
+        &pool,
+        &h,
+        &[
+            "--apply",
+            "--confirm-hide",
+            "2",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused.stderr.contains("--accept-unenforced-hide") && refused.stderr.contains("DISABLED"),
+        "{}",
+        refused.show()
+    );
+    assert!(!mf.exists(), "refused before the manifest");
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "refused hide with row security disabled",
+    );
+}
+
 /// B-H4. A stand-in for production's orphan `evidence_privacy`: a PERMISSIVE
 /// always-true SELECT policy. First the measurement that makes it matter — an
 /// unstamped `epigraph_app` session reads the group-private evidence row with

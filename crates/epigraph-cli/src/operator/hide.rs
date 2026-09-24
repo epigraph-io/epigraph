@@ -27,7 +27,8 @@
 //!    migration; USING effectively TRUE), so while it exists any application
 //!    session reads a `group` evidence row and hiding has NO effect.
 //!    [`extra_evidence_policies`] finds every permissive SELECT-capable policy
-//!    on `evidence` other than `evidence_tenancy`. A dry run prints a loud
+//!    on `evidence` other than `evidence_tenancy`, and row security DISABLED on
+//!    `evidence` (no policy applies at all then). A dry run prints a loud
 //!    warning; `--apply` refuses unless `--accept-unenforced-hide` is given,
 //!    and then reports the rows as hidden-but-UNENFORCED.
 //! 3. The kernel guard (B-H2): the pin table and BOTH pin-aware trigger
@@ -365,14 +366,22 @@ pub async fn guard_status(conn: &mut PgConnection) -> anyhow::Result<GuardStatus
     })
 }
 
-/// Permissive policies on `evidence`, other than `evidence_tenancy`, that
-/// apply to reads (`cmd` ALL or SELECT). Each is OR'ed with the tenancy policy,
-/// so any one whose USING admits a `group` row defeats hiding.
+/// The entry [`extra_evidence_policies`] adds when row security is DISABLED on
+/// `evidence`: no policy is consulted at all then, so every row is readable.
+pub const RLS_DISABLED: &str = "ROW LEVEL SECURITY DISABLED on evidence";
+
+/// Every reason a hide would not be enforced: the permissive policies on
+/// `evidence`, other than `evidence_tenancy`, that apply to reads (`cmd` ALL or
+/// SELECT; each is OR'ed with the tenancy policy, so any one whose USING admits
+/// a `group` row defeats hiding), and [`RLS_DISABLED`] when
+/// `pg_class.relrowsecurity` is false for `evidence` (then no policy applies
+/// and a clean-looking preview would be a lie: stage-3 review measured a dry
+/// run with no warning after `DISABLE ROW LEVEL SECURITY`).
 ///
 /// # Errors
 /// The catalog read fails.
 pub async fn extra_evidence_policies(conn: &mut PgConnection) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(
+    let mut reasons: Vec<String> = sqlx::query_scalar(
         "SELECT policyname::text FROM pg_policies \
           WHERE schemaname = 'public' AND tablename = 'evidence' \
             AND permissive = 'PERMISSIVE' AND cmd IN ('ALL', 'SELECT') \
@@ -380,7 +389,42 @@ pub async fn extra_evidence_policies(conn: &mut PgConnection) -> anyhow::Result<
           ORDER BY 1",
     )
     .fetch_all(&mut *conn)
-    .await?)
+    .await?;
+    let rls: bool = sqlx::query_scalar(
+        "SELECT relrowsecurity FROM pg_class WHERE oid = 'public.evidence'::regclass",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !rls {
+        reasons.push(RLS_DISABLED.to_string());
+    }
+    Ok(reasons)
+}
+
+/// One human sentence for the reasons [`extra_evidence_policies`] returned.
+fn describe_unenforced(reasons: &[String]) -> String {
+    let policies: Vec<&str> = reasons
+        .iter()
+        .map(String::as_str)
+        .filter(|r| *r != RLS_DISABLED)
+        .collect();
+    let mut parts = Vec::new();
+    if reasons.iter().any(|r| r == RLS_DISABLED) {
+        parts.push(
+            "row level security is DISABLED on evidence, so no policy is consulted and every \
+             row is readable"
+                .to_string(),
+        );
+    }
+    if !policies.is_empty() {
+        parts.push(format!(
+            "permissive polic{} on evidence other than evidence_tenancy: {} (permissive \
+             policies are OR'ed, so they admit group rows to every application session)",
+            if policies.len() == 1 { "y" } else { "ies" },
+            policies.join(", ")
+        ));
+    }
+    parts.join("; and ")
 }
 
 /// The loud warning a dry run prints when hiding would not be enforced.
@@ -393,12 +437,10 @@ pub fn warn_unenforced(out: &mut dyn std::io::Write, policies: &[String]) -> any
     }
     writeln!(
         out,
-        "WARNING: HIDING WILL NOT BE ENFORCED. Permissive polic{} on evidence other than \
-         evidence_tenancy: {}. Permissive policies are OR'ed, so an application session can \
-         still read a visibility=group evidence row. --apply refuses unless \
-         --accept-unenforced-hide is given.",
-        if policies.len() == 1 { "y" } else { "ies" },
-        policies.join(", ")
+        "WARNING: HIDING WILL NOT BE ENFORCED. {}. An application session can still read a \
+         visibility=group evidence row. --apply refuses unless --accept-unenforced-hide is \
+         given.",
+        describe_unenforced(policies)
     )?;
     Ok(())
 }
@@ -428,12 +470,9 @@ pub fn refuse_apply(
     }
     if !policies.is_empty() && !args.accept_unenforced_hide {
         bail!(
-            "hiding would NOT be enforced: permissive polic{} {} on evidence admit group rows \
-             to every application session. Drop {} first, or pass --accept-unenforced-hide; \
-             refusing",
-            if policies.len() == 1 { "y" } else { "ies" },
-            policies.join(", "),
-            if policies.len() == 1 { "it" } else { "them" }
+            "hiding would NOT be enforced: {}. Fix that first, or pass \
+             --accept-unenforced-hide; refusing",
+            describe_unenforced(policies)
         );
     }
     if !guard.complete() {
@@ -685,8 +724,8 @@ pub async fn run_standalone(
                     String::new()
                 } else {
                     format!(
-                        ". NOT ENFORCED while {} exist(s): an application session can still \
-                         read them",
+                        ". NOT ENFORCED while {} remain(s): an application session can \
+                         still read them",
                         policies.join(", ")
                     )
                 }
