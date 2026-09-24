@@ -370,15 +370,35 @@ async fn attach_maintenance_pool(
             // still see the corpus. Still not attached. This binary has no
             // pre-077 deployment to serve, and attaching an unprivileged pool
             // would make the per-call check the only guard.
+            // WARN when the variable was simply not set (the documented fallback
+            // to the app DSN, which on a least-privilege deployment is never
+            // privileged, and a normal state for a per-client stdio process),
+            // ERROR when an operator CONFIGURED a maintenance DSN that cannot
+            // bypass. Measured on the e2e harness: every server started without
+            // the variable logged this line at ERROR, which is noise that trains
+            // operators to ignore the configured case.
             Ok(_) | Err(_) => {
-                tracing::error!(
-                    target: "tenancy.maintenance",
-                    dsn_source = source.as_str(),
-                    rls_active = privilege.rls_active,
-                    "the maintenance DSN's role does not satisfy epigraph_bypass(); not attaching \
-                     it. The three maintenance tools will refuse. Set MAINTENANCE_DATABASE_URL to \
-                     a role that is a member of epigraph_maintenance."
-                );
+                if source == epigraph_db::MaintenanceDsnSource::FellBackToApplicationDsn {
+                    tracing::warn!(
+                        target: "tenancy.maintenance",
+                        dsn_source = source.as_str(),
+                        rls_active = privilege.rls_active,
+                        "MAINTENANCE_DATABASE_URL is not set and the application DSN cannot \
+                         bypass RLS; no maintenance pool attached. The three maintenance tools \
+                         will refuse until MAINTENANCE_DATABASE_URL names a member of \
+                         epigraph_maintenance."
+                    );
+                } else {
+                    tracing::error!(
+                        target: "tenancy.maintenance",
+                        dsn_source = source.as_str(),
+                        rls_active = privilege.rls_active,
+                        "the maintenance DSN's role does not satisfy epigraph_bypass(); not \
+                         attaching it. The three maintenance tools will refuse. Set \
+                         MAINTENANCE_DATABASE_URL to a role that is a member of \
+                         epigraph_maintenance."
+                    );
+                }
                 scoped
             }
         },
