@@ -23,23 +23,81 @@
 //! plus `DECOMPOSE_FIXTURE_PATH=<file.json>` to exercise the atom/edge WRITE
 //! path deterministically without an LLM call — see [`FixtureLlmClient`] for
 //! the file format.
+//!
+//! # Selection (`--priority`, `--ids-file`, eligibility filters)
+//!
+//! `--priority oldest` (default) is the historical `created_at ASC` crawl.
+//! `--priority conflict` puts undecomposed claims that are the TARGET of a
+//! contradicts/refutes edge first (edge count desc, newest edge, id), then
+//! REPORTS the decomposed parents that are still conflict targets — those go
+//! to `--retarget`, not to the LLM again. `--priority recent` is newest first.
+//! `--ids-file` names claims explicitly (one UUID per line, `#` comments).
+//!
+//! Two filters default ON: skip `backlog`-labelled claims
+//! (`--include-backlog`) and skip claims that look atomic, one sentence and
+//! ≤ 160 chars (`--include-short`, see `epigraph_cli::decompose::looks_atomic`).
+//! Every explicit `--ids-file` id a filter rejects is printed with its reason.
+//! The population is paged so filters never starve a run; `--max-scan` bounds
+//! the rows read.
+//!
+//! # Modes
+//!
+//! * default — select, decompose through the LLM, persist.
+//! * `--dry-run` — select and print; no LLM call, no write.
+//! * `--plan <file>` — select, CALL the LLM, print the proposed atoms, write a
+//!   JSONL plan; nothing is written to the graph and no API auth is needed.
+//! * `--apply-plan <file>` — persist exactly that plan with NO LLM call. A plan
+//!   line whose parent has since been decomposed, retired, or edited is
+//!   refused and reported.
+//! * `--retarget` — move contradicts/refutes edges from decomposed parents to
+//!   the atoms they dispute (`epigraph_cli::retarget`). DRY RUN by default: the
+//!   LLM is called, the mapping printed, a manifest written (`--manifest`),
+//!   nothing else. `--retarget --apply` writes through the API;
+//!   `--retarget --apply-plan <manifest>` applies a reviewed manifest with no
+//!   LLM call.
+//!
+//! Every writing mode resolves API auth BEFORE any LLM call (gh-375).
 
 use clap::Parser;
-use epigraph_cli::decompose::{run_decomposition_batches, BatchClaim};
+use epigraph_cli::decompose::{
+    persist_planned, plan_decomposition_batches, read_plan_jsonl, run_decomposition_batches,
+    select_candidates, verify_plan, write_plan_jsonl, BatchClaim, EligibilityFilters, Priority,
+};
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
-use epigraph_db::ClaimRepository;
+use epigraph_cli::retarget::{
+    append_jsonl, apply_retarget, load_retarget_items, plan_retarget, read_retarget_manifest,
+    verdict, EdgeApiClient,
+};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Parser)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PriorityArg {
+    Conflict,
+    Recent,
+    Oldest,
+}
+
+impl From<PriorityArg> for Priority {
+    fn from(p: PriorityArg) -> Self {
+        match p {
+            PriorityArg::Conflict => Priority::Conflict,
+            PriorityArg::Recent => Priority::Recent,
+            PriorityArg::Oldest => Priority::Oldest,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
 #[command(
     name = "decompose_claims",
-    about = "Decompose undecomposed compound claims into atoms"
+    about = "Decompose undecomposed compound claims into atoms, or retarget conflict edges onto atoms"
 )]
 struct Cli {
-    /// Max claims to process this run.
+    /// Max claims (or, with --retarget, conflict edges) to process this run.
     #[arg(long, default_value_t = 200)]
     limit: i64,
-    /// Claims per LLM call.
+    /// Claims (or retarget items) per LLM call.
     #[arg(long, default_value_t = 10)]
     batch_size: usize,
     /// LLM provider selector for create_llm_client ("epigraph" auto, or
@@ -47,9 +105,160 @@ struct Cli {
     /// DECOMPOSE_FIXTURE_PATH).
     #[arg(long, default_value = "epigraph")]
     provider: String,
-    /// Parse/enumerate only — do not call the LLM or write anything.
+    /// Enumerate only — do not call the LLM or write anything. With
+    /// --retarget this is already the default and the LLM IS called.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    /// Candidate order.
+    #[arg(long, value_enum, default_value_t = PriorityArg::Oldest)]
+    priority: PriorityArg,
+    /// Decompose exactly these claim ids (one UUID per line; blank lines and
+    /// `#` comments ignored), still subject to the eligibility filters.
+    #[arg(long)]
+    ids_file: Option<PathBuf>,
+    /// Do not skip `backlog`-labelled claims.
+    #[arg(long, default_value_t = false)]
+    include_backlog: bool,
+    /// Do not skip claims that look atomic (one sentence, <= 160 chars).
+    #[arg(long, default_value_t = false)]
+    include_short: bool,
+    /// Stop reading the undecomposed population after this many rows.
+    #[arg(long, default_value_t = 20_000)]
+    max_scan: usize,
+    /// Call the LLM, print the proposed atoms, write this JSONL plan, and
+    /// write NOTHING to the graph.
+    #[arg(long)]
+    plan: Option<PathBuf>,
+    /// Persist exactly this plan (or, with --retarget, this manifest) with no
+    /// LLM call.
+    #[arg(long)]
+    apply_plan: Option<PathBuf>,
+    /// Retarget contradicts/refutes edges from decomposed parents onto atoms.
+    #[arg(long, default_value_t = false)]
+    retarget: bool,
+    /// With --retarget: perform the writes (default is a dry run).
+    #[arg(long, default_value_t = false)]
+    apply: bool,
+    /// With --retarget: manifest path to write (default
+    /// `retarget-manifest-<UTC timestamp>.jsonl`). Refused if it exists.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    /// With --retarget: also re-plan edges already marked `retargeted_to`.
+    #[arg(long, default_value_t = false)]
+    include_marked: bool,
+}
+
+/// What this invocation does. Derived from the flags by [`resolve_mode`], a
+/// pure function so the flag rules are unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// `--dry-run`: select and print.
+    Enumerate,
+    /// `--plan <file>`.
+    Plan(PathBuf),
+    /// `--apply-plan <file>`.
+    ApplyPlan(PathBuf),
+    /// Select, LLM, persist.
+    Run,
+    /// `--retarget` without `--apply`.
+    RetargetDryRun(PathBuf),
+    /// `--retarget --apply`.
+    RetargetApply(PathBuf),
+    /// `--retarget --apply-plan <manifest>`.
+    RetargetApplyPlan(PathBuf),
+}
+
+impl Mode {
+    /// Whether this mode writes through the API and therefore needs auth
+    /// resolved up front. `Run` depends on the provider (see
+    /// [`provider_writes_to_api`]).
+    fn writes(&self, provider: &str) -> bool {
+        match self {
+            Mode::Enumerate | Mode::Plan(_) | Mode::RetargetDryRun(_) => false,
+            Mode::Run => provider_writes_to_api(provider),
+            Mode::ApplyPlan(_) | Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_) => true,
+        }
+    }
+}
+
+fn default_manifest_path(now: chrono::DateTime<chrono::Utc>) -> PathBuf {
+    PathBuf::from(format!(
+        "retarget-manifest-{}.jsonl",
+        now.format("%Y%m%dT%H%M%SZ")
+    ))
+}
+
+fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, String> {
+    if cli.plan.is_some() && cli.apply_plan.is_some() {
+        return Err("--plan and --apply-plan are mutually exclusive".into());
+    }
+    if cli.dry_run && (cli.apply || cli.apply_plan.is_some()) {
+        return Err("--dry-run cannot be combined with --apply or --apply-plan".into());
+    }
+    if cli.apply_plan.is_some() && cli.ids_file.is_some() {
+        return Err(
+            "--apply-plan persists the plan's own claims; --ids-file does not apply".into(),
+        );
+    }
+    if cli.retarget {
+        if cli.plan.is_some() {
+            return Err(
+                "--retarget's dry run IS its plan: use --manifest <file>, then \
+                 --retarget --apply-plan <file>"
+                    .into(),
+            );
+        }
+        if cli.ids_file.is_some() {
+            return Err(
+                "--ids-file selects claims to decompose; it does not apply to --retarget".into(),
+            );
+        }
+        if let Some(m) = &cli.apply_plan {
+            if cli.apply {
+                return Err("--apply-plan already applies; drop --apply".into());
+            }
+            return Ok(Mode::RetargetApplyPlan(m.clone()));
+        }
+        let manifest = cli
+            .manifest
+            .clone()
+            .unwrap_or_else(|| default_manifest_path(now));
+        return Ok(if cli.apply {
+            Mode::RetargetApply(manifest)
+        } else {
+            Mode::RetargetDryRun(manifest)
+        });
+    }
+    if cli.apply || cli.manifest.is_some() || cli.include_marked {
+        return Err("--apply, --manifest and --include-marked require --retarget".into());
+    }
+    if let Some(p) = &cli.plan {
+        return Ok(Mode::Plan(p.clone()));
+    }
+    if let Some(p) = &cli.apply_plan {
+        return Ok(Mode::ApplyPlan(p.clone()));
+    }
+    if cli.dry_run {
+        return Ok(Mode::Enumerate);
+    }
+    Ok(Mode::Run)
+}
+
+/// Parse an `--ids-file`: one UUID per line, blank lines and `#` comments
+/// ignored. A malformed line is an error naming the line, not a skip.
+fn parse_ids_file(raw: &str) -> Result<Vec<uuid::Uuid>, String> {
+    let mut out = Vec::new();
+    for (n, line) in raw.lines().enumerate() {
+        let t = line.split('#').next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        out.push(
+            uuid::Uuid::parse_str(t)
+                .map_err(|e| format!("--ids-file line {}: {t:?} is not a UUID: {e}", n + 1))?,
+        );
+    }
+    Ok(out)
 }
 
 /// Treat a set-but-empty env var as absent.
@@ -257,9 +466,154 @@ fn provider_writes_to_api(provider: &str) -> bool {
     provider != "mock"
 }
 
+/// Resolve the bearer token for API writes, or fail fast (gh-375). Called
+/// BEFORE any LLM work in every writing mode.
+async fn resolve_token(
+    api_base: &str,
+    http: &reqwest::Client,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // EPIGRAPH_TOKEN if present (non-empty) and used as-is; otherwise mint a
+    // fresh bearer token from service-client credentials via
+    // client_credentials, so container deployments work without a token-mint
+    // preamble in the schedule. If NEITHER is available, fail fast HERE —
+    // before the LLM batches run — rather than proceeding with an empty
+    // bearer token that only surfaces as a 401 after every batch has already
+    // been paid for (gh-375).
+    //
+    // Diagnostic-only logging: never the token value itself, only its
+    // provenance and length (distinguishes "empty" from "present but wrong"
+    // without leaking the credential — backlog a422da87's reported
+    // non-determinism needs exactly this to disambiguate an auth failure from
+    // a URL-builder failure across repeated scheduled runs).
+    let plan = resolve_auth_plan(
+        std::env::var("EPIGRAPH_TOKEN").ok(),
+        resolve_service_credentials(
+            std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok(),
+            std::env::var("EPIGRAPH_SERVICE_SECRET").ok(),
+        ),
+    )?;
+    Ok(match plan {
+        AuthPlan::UseToken(t) => {
+            eprintln!("token: using EPIGRAPH_TOKEN from env (len={})", t.len());
+            t
+        }
+        AuthPlan::Mint {
+            client_id,
+            client_secret,
+        } => {
+            let token_url =
+                resolve_token_url(std::env::var("EPIGRAPH_OAUTH_TOKEN_URL").ok(), api_base);
+            eprintln!("token: minting via client_credentials at {token_url}");
+            let minted = mint_service_token(&client_id, &client_secret, &token_url, http).await?;
+            eprintln!(
+                "token: minted via client_credentials (len={})",
+                minted.len()
+            );
+            minted
+        }
+    })
+}
+
+/// Canonical atom create via `POST /api/v1/claims`: signing + DS + embed on
+/// write.
+///
+/// methodology/evidence_type belong in `properties` (JSONB); top-level they
+/// were unknown fields and silently dropped. `if_not_exists=true`: when a
+/// prior run already decomposed the same parent, identical atom text produces
+/// the same content_hash. Without this flag the API returns 409; with it,
+/// create_or_get returns the existing claim ID so persist_decomposition can
+/// re-wire edges idempotently.
+async fn submit_atom(
+    http: reqwest::Client,
+    api_base: String,
+    token: String,
+    atom_text: String,
+    generality: i64,
+    parent_agent_id: uuid::Uuid,
+) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
+    // Diagnostic-only (backlog a422da87): build+log the URL BEFORE sending, so
+    // a RelativeUrlWithoutBase-style construction bug is visible even if the
+    // request itself never reaches the wire.
+    let url = format!("{api_base}/api/v1/claims");
+    eprintln!("POST {url}");
+    let resp = match http
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "content": atom_text,
+            "agent_id": parent_agent_id,
+            "initial_truth": 0.5,
+            "if_not_exists": true,
+            "properties": {
+                "methodology": "inductive_generalization",
+                "evidence_type": "logical"
+            },
+            "labels": ["atom", format!("generality:{generality}")],
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "POST {url} FAILED before a response was received: \
+                 is_builder={} is_request={} is_connect={} is_timeout={} \
+                 detail={e}",
+                e.is_builder(),
+                e.is_request(),
+                e.is_connect(),
+                e.is_timeout()
+            );
+            return Err(e.into());
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        eprintln!("POST {url} -> HTTP {status}, body={body}");
+        return Err(format!("POST {url} -> HTTP {status}: {body}").into());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let id = v
+        .get("id")
+        .or_else(|| v.get("claim_id"))
+        .and_then(|x| x.as_str())
+        .ok_or("API create returned no claim id")?;
+    Ok(uuid::Uuid::parse_str(id)?)
+}
+
+/// Print a plan (proposed atoms per claim) to stdout.
+fn print_plan(plans: &[epigraph_cli::decompose::PlannedDecomposition]) {
+    for p in plans {
+        let note = if p.atoms.len() <= 1 {
+            " (already atomic; would be skipped)"
+        } else {
+            ""
+        };
+        println!("{}\t{} atoms{note}", p.claim_id, p.atoms.len());
+        for (a, g) in p.atoms.iter().zip(p.generality.iter()) {
+            println!("    [gen {g}] {a}");
+        }
+    }
+}
+
+/// Refuse to overwrite a manifest: plan lines accumulating from two runs in
+/// one file would make `--apply-plan` apply both.
+fn fresh_manifest(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if path.exists() {
+        return Err(format!(
+            "manifest {} already exists; pass a new --manifest path",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let mode = resolve_mode(&cli, chrono::Utc::now())?;
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
@@ -276,176 +630,329 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let viewer = session.viewer();
     let pool = maint.pool();
 
-    let claims = ClaimRepository::list_undecomposed(pool, viewer, cli.limit, 0).await?;
-    eprintln!("found {} undecomposed claims", claims.len());
-    if cli.dry_run || claims.is_empty() {
-        for c in &claims {
-            println!("{}\t{}", c.id.as_uuid(), c.content);
-        }
-        return Ok(());
-    }
-
-    // Prepaid Claude path. create_llm_client("epigraph") returns the first
-    // active provider (Anthropic-from-env, OAuth-preferred); "mock" for smoke;
-    // "fixture" for a deterministic, credential-free write-path exercise.
-    let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
-    let embedder = epigraph_cli::embedding_service();
-
-    // API submit closure — canonical claim create (embed + DS + sign on write).
-    // EPIGRAPH_API takes precedence; EPIGRAPH_API_URL is the container-standard
-    // name exposed by epiclaw-host. If neither is set we fall back to localhost.
+    // API base: EPIGRAPH_API takes precedence; EPIGRAPH_API_URL is the
+    // container-standard name exposed by epiclaw-host. If neither is set we
+    // fall back to localhost.
     let api_base = resolve_api_base(
         std::env::var("EPIGRAPH_API").ok(),
         std::env::var("EPIGRAPH_API_URL").ok(),
     );
-
-    eprintln!("api_base={api_base}");
-
     let http = reqwest::Client::new();
 
-    // EPIGRAPH_TOKEN if present (non-empty) and used as-is; otherwise mint a
-    // fresh bearer token from service-client credentials via
-    // client_credentials, so container deployments work without a token-mint
-    // preamble in the schedule. If NEITHER is available, fail fast HERE —
-    // before the LLM batches run — rather than proceeding with an empty
-    // bearer token that only surfaces as a 401 after every batch has already
-    // been paid for (gh-375).
-    //
-    // Skipped entirely for a provider that cannot reach the write path; see
-    // `provider_writes_to_api`.
-    //
-    // Diagnostic-only logging: never the token value itself, only its
-    // provenance and length (distinguishes "empty" from "present but wrong"
-    // without leaking the credential — backlog a422da87's reported
-    // non-determinism needs exactly this to disambiguate an auth failure from
-    // a URL-builder failure across repeated scheduled runs).
-    let token = if provider_writes_to_api(&cli.provider) {
-        let plan = resolve_auth_plan(
-            std::env::var("EPIGRAPH_TOKEN").ok(),
-            resolve_service_credentials(
-                std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok(),
-                std::env::var("EPIGRAPH_SERVICE_SECRET").ok(),
-            ),
-        )?;
-        match plan {
-            AuthPlan::UseToken(t) => {
-                eprintln!("token: using EPIGRAPH_TOKEN from env (len={})", t.len());
-                t
-            }
-            AuthPlan::Mint {
-                client_id,
-                client_secret,
-            } => {
-                let token_url =
-                    resolve_token_url(std::env::var("EPIGRAPH_OAUTH_TOKEN_URL").ok(), &api_base);
-                eprintln!("token: minting via client_credentials at {token_url}");
-                let minted =
-                    mint_service_token(&client_id, &client_secret, &token_url, &http).await?;
-                eprintln!(
-                    "token: minted via client_credentials (len={})",
-                    minted.len()
-                );
-                minted
-            }
-        }
+    // Auth FIRST in every writing mode, before any LLM call (gh-375). Skipped
+    // entirely for a mode that cannot reach the write path; see
+    // `Mode::writes` / `provider_writes_to_api`.
+    let token = if mode.writes(&cli.provider) {
+        eprintln!("api_base={api_base}");
+        resolve_token(&api_base, &http).await?
     } else {
-        eprintln!(
-            "token: not resolved — --provider {} performs no API write",
-            cli.provider
-        );
+        eprintln!("token: not resolved — this mode performs no API write");
         String::new()
     };
 
-    // The parent claims the runner iterates. `agent_id` rides along because
-    // atoms inherit their parent compound claim's author, and the parent
-    // varies across a batch.
-    let batch_claims: Vec<BatchClaim> = claims
-        .iter()
-        .map(|c| BatchClaim {
-            claim_id: c.id.as_uuid(),
-            agent_id: c.agent_id.as_uuid(),
-            content: c.content.clone(),
-        })
-        .collect();
-
-    let totals = run_decomposition_batches(
-        pool,
-        viewer,
-        &batch_claims,
-        llm.as_ref(),
-        cli.batch_size,
-        embedder,
-        move |atom_text, generality, parent_agent_id| {
-            let http = http.clone();
-            let api_base = api_base.clone();
-            let token = token.clone();
-            async move {
-                // Canonical create via API: signing + DS + embed-on-write.
-                // methodology/evidence_type belong in `properties` (JSONB);
-                // top-level they were unknown fields and silently dropped.
-                // if_not_exists=true: when a prior run already decomposed
-                // the same parent, identical atom text produces the same
-                // content_hash. Without this flag the API returns 409;
-                // with it, create_or_get returns the existing claim ID so
-                // persist_decomposition can re-wire edges idempotently.
-                // Diagnostic-only (backlog a422da87): build+log the URL BEFORE
-                // sending, so a RelativeUrlWithoutBase-style construction bug
-                // is visible even if the request itself never reaches the wire.
-                let url = format!("{api_base}/api/v1/claims");
-                eprintln!("POST {url}");
-                let resp = match http
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&serde_json::json!({
-                        "content": atom_text,
-                        "agent_id": parent_agent_id,
-                        "initial_truth": 0.5,
-                        "if_not_exists": true,
-                        "properties": {
-                            "methodology": "inductive_generalization",
-                            "evidence_type": "logical"
-                        },
-                        "labels": ["atom", format!("generality:{generality}")],
-                    }))
-                    .send()
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!(
-                            "POST {url} FAILED before a response was received: \
-                                     is_builder={} is_request={} is_connect={} is_timeout={} \
-                                     detail={e}",
-                            e.is_builder(),
-                            e.is_request(),
-                            e.is_connect(),
-                            e.is_timeout()
-                        );
-                        return Err(e.into());
-                    }
-                };
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    eprintln!("POST {url} -> HTTP {status}, body={body}");
-                    return Err(format!("POST {url} -> HTTP {status}: {body}").into());
+    match mode {
+        Mode::RetargetDryRun(manifest) | Mode::RetargetApply(manifest) => {
+            let apply = cli.apply;
+            fresh_manifest(&manifest)?;
+            let limit = usize::try_from(cli.limit.max(1)).unwrap_or(1);
+            let items = load_retarget_items(pool, viewer, cli.include_marked, limit).await?;
+            eprintln!(
+                "retarget: {} conflict edges on decomposed parents{}",
+                items.len(),
+                if cli.include_marked {
+                    " (including already-marked)"
+                } else {
+                    " (already-marked edges skipped)"
                 }
-                let v: serde_json::Value = resp.json().await?;
-                let id = v
-                    .get("id")
-                    .or_else(|| v.get("claim_id"))
-                    .and_then(|x| x.as_str())
-                    .ok_or("API create returned no claim id")?;
-                Ok(uuid::Uuid::parse_str(id)?)
+            );
+            if items.is_empty() {
+                return Ok(());
             }
-        },
-    )
-    .await?;
-    eprintln!(
-        "decompose complete: {} atoms, {} decomposes_to edges",
-        totals.atoms, totals.edges
-    );
+            let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
+            let plan = plan_retarget(&items, llm.as_ref(), cli.batch_size).await;
+            append_jsonl(&manifest, &plan)?;
+            print_retarget_plan(&plan);
+            eprintln!("manifest: {}", manifest.display());
+            if !apply {
+                eprintln!(
+                    "dry run: nothing written. Re-run with --apply, or --apply-plan {}",
+                    manifest.display()
+                );
+                return Ok(());
+            }
+            let api = EdgeApiClient {
+                http,
+                api_base,
+                token,
+            };
+            let applied = apply_retarget(pool, viewer, &api, &plan).await?;
+            append_jsonl(&manifest, &applied)?;
+            print_applied(&applied);
+        }
+        Mode::RetargetApplyPlan(manifest) => {
+            let plan = read_retarget_manifest(&manifest)?;
+            eprintln!(
+                "retarget: applying {} plan entries from {} (no LLM call)",
+                plan.len(),
+                manifest.display()
+            );
+            let api = EdgeApiClient {
+                http,
+                api_base,
+                token,
+            };
+            let applied = apply_retarget(pool, viewer, &api, &plan).await?;
+            append_jsonl(&manifest, &applied)?;
+            print_applied(&applied);
+        }
+        Mode::ApplyPlan(path) => {
+            let planned = read_plan_jsonl(&path)?;
+            eprintln!(
+                "apply-plan: {} plan lines from {} (no LLM call)",
+                planned.len(),
+                path.display()
+            );
+            let (ok, drifted) = verify_plan(pool, viewer, planned).await?;
+            for (p, why) in &drifted {
+                eprintln!("REFUSED {}: {why:?}", p.claim_id);
+            }
+            let embedder = epigraph_cli::embedding_service();
+            let submit = move |t: String, g: i64, a: uuid::Uuid| {
+                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a)
+            };
+            let totals = persist_planned(pool, viewer, &ok, embedder, &submit).await?;
+            eprintln!(
+                "apply-plan complete: {} applied, {} refused, {} atoms, {} decomposes_to edges",
+                ok.len(),
+                drifted.len(),
+                totals.atoms,
+                totals.edges
+            );
+        }
+        Mode::Enumerate | Mode::Plan(_) | Mode::Run => {
+            let filters = EligibilityFilters {
+                skip_backlog: !cli.include_backlog,
+                skip_short: !cli.include_short,
+            };
+            let ids = match &cli.ids_file {
+                Some(p) => Some(parse_ids_file(&std::fs::read_to_string(p)?)?),
+                None => None,
+            };
+            let limit = usize::try_from(cli.limit.max(1)).unwrap_or(1);
+            let sel = select_candidates(
+                pool,
+                viewer,
+                cli.priority.into(),
+                ids.as_deref(),
+                filters,
+                limit,
+                cli.max_scan,
+            )
+            .await?;
+            report_selection(&sel, ids.is_some(), cli.priority);
+            if cli.priority == PriorityArg::Conflict {
+                report_decomposed_conflict_parents(pool, viewer).await?;
+            }
+            let claims: Vec<BatchClaim> = sel
+                .chosen
+                .iter()
+                .map(|c| BatchClaim {
+                    claim_id: c.id,
+                    agent_id: c.agent_id,
+                    content: c.content.clone(),
+                })
+                .collect();
+            if matches!(mode, Mode::Enumerate) || claims.is_empty() {
+                for c in &claims {
+                    println!("{}\t{}", c.claim_id, c.content);
+                }
+                return Ok(());
+            }
+            // Prepaid Claude path. create_llm_client("epigraph") returns the
+            // first active provider (Anthropic-from-env, OAuth-preferred);
+            // "mock" for smoke; "fixture" for a deterministic, credential-free
+            // write-path exercise.
+            let llm = resolve_llm_client(&cli.provider, std::env::var(FIXTURE_PATH_ENV).ok())?;
+            if let Mode::Plan(path) = &mode {
+                let plans = plan_decomposition_batches(&claims, llm.as_ref(), cli.batch_size).await;
+                write_plan_jsonl(path, &plans)?;
+                print_plan(&plans);
+                eprintln!(
+                    "plan: {} of {} claims answered; written to {} — nothing persisted. \
+                     Apply with --apply-plan {}",
+                    plans.len(),
+                    claims.len(),
+                    path.display(),
+                    path.display()
+                );
+                return Ok(());
+            }
+            let embedder = epigraph_cli::embedding_service();
+            let totals = run_decomposition_batches(
+                pool,
+                viewer,
+                &claims,
+                llm.as_ref(),
+                cli.batch_size,
+                embedder,
+                move |t, g, a| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a),
+            )
+            .await?;
+            eprintln!(
+                "decompose complete: {} atoms, {} decomposes_to edges",
+                totals.atoms, totals.edges
+            );
+        }
+    }
     Ok(())
+}
+
+/// Summarize what selection chose and passed over. Every explicit
+/// `--ids-file` id that is not decomposed is printed WITH its reason.
+fn report_selection(
+    sel: &epigraph_cli::decompose::Selection,
+    explicit: bool,
+    priority: PriorityArg,
+) {
+    let backlog = sel
+        .skipped
+        .iter()
+        .filter(|(_, w)| matches!(w, epigraph_cli::decompose::Ineligible::Backlog))
+        .count();
+    let atomic = sel.skipped.len() - backlog;
+    eprintln!(
+        "selection: priority={priority:?}{} scanned={} chosen={} skipped_backlog={backlog} \
+         skipped_looks_atomic={atomic}",
+        if explicit { " (ids-file order)" } else { "" },
+        sel.scanned,
+        sel.chosen.len(),
+    );
+    if sel.scan_capped {
+        eprintln!(
+            "selection: stopped at --max-scan={} rows before reaching --limit; raise --max-scan \
+             or change --priority",
+            sel.scanned
+        );
+    }
+    if explicit {
+        for (id, why) in &sel.skipped {
+            eprintln!("SKIP {id} (named in --ids-file): {why}");
+        }
+        for id in &sel.not_undecomposed {
+            eprintln!(
+                "SKIP {id} (named in --ids-file): not in the undecomposed population \
+                 (absent, retired, telemetry, already decomposed, or an atom)"
+            );
+        }
+    }
+}
+
+/// `--priority conflict`'s second half: decomposed parents that are STILL
+/// conflict targets. They are not sent to the LLM again; they are reported
+/// for `--retarget`.
+async fn report_decomposed_conflict_parents(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let items = load_retarget_items(pool, viewer, false, 10_000).await?;
+    let mut by_parent: std::collections::BTreeMap<uuid::Uuid, usize> =
+        std::collections::BTreeMap::new();
+    for i in &items {
+        *by_parent.entry(i.parent_id).or_default() += 1;
+    }
+    let mut ranked: Vec<(uuid::Uuid, usize)> = by_parent.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    eprintln!(
+        "conflict: {} decomposed parents still carry {} unmarked conflict edges — \
+         route to --retarget, not the LLM",
+        ranked.len(),
+        items.len()
+    );
+    for (parent, n) in ranked {
+        eprintln!("RETARGET-CANDIDATE {parent}\t{n} conflict edges");
+    }
+    Ok(())
+}
+
+fn print_retarget_plan(plan: &[epigraph_cli::retarget::RetargetPlanEntry]) {
+    let mut left: Vec<&epigraph_cli::retarget::RetargetPlanEntry> = Vec::new();
+    for e in plan {
+        if e.verdict == verdict::ATOMS {
+            println!(
+                "{}\t{} {} -> parent {} => atoms {:?}",
+                e.edge_id, e.source_id, e.relationship, e.parent_id, e.chosen_atom_ids
+            );
+        } else {
+            left.push(e);
+        }
+    }
+    for e in &left {
+        println!(
+            "{}\tLEFT ON PARENT ({}{}) {} {} -> parent {}",
+            e.edge_id,
+            e.verdict,
+            e.reason
+                .as_deref()
+                .map(|r| format!(": {r}"))
+                .unwrap_or_default(),
+            e.source_id,
+            e.relationship,
+            e.parent_id
+        );
+    }
+    let count = |v: &str| plan.iter().filter(|e| e.verdict == v).count();
+    eprintln!(
+        "retarget plan: {} edges — atoms={} whole={} unclear={} malformed={} no_answer={} llm_error={}",
+        plan.len(),
+        count(verdict::ATOMS),
+        count(verdict::WHOLE),
+        count(verdict::UNCLEAR),
+        count(verdict::MALFORMED),
+        count(verdict::NO_ANSWER),
+        count(verdict::LLM_ERROR),
+    );
+}
+
+fn print_applied(applied: &[epigraph_cli::retarget::AppliedEntry]) {
+    let mut created = 0;
+    let mut existing = 0;
+    let mut blocked = 0;
+    let mut unwired = 0;
+    let mut marked = 0;
+    for a in applied {
+        created += a.created_edge_ids.len();
+        existing += a.existing_edge_ids.len();
+        blocked += a.blocked_by_retired_edge.len();
+        unwired += a
+            .created_edge_ids
+            .iter()
+            .filter(|id| !a.ds_wired_edge_ids.contains(id))
+            .count();
+        if a.parent_marked {
+            marked += 1;
+        }
+        for err in &a.errors {
+            eprintln!("ERROR edge {}: {err}", a.edge_id);
+        }
+        for atom in &a.blocked_by_retired_edge {
+            eprintln!(
+                "BLOCKED edge {}: a retired edge to atom {atom} exists; not resurrected",
+                a.edge_id
+            );
+        }
+    }
+    eprintln!(
+        "retarget apply: {} entries — created={created} existing={existing} \
+         blocked_by_retired={blocked} parents_marked={marked} created_but_not_ds_wired={unwired}",
+        applied.len()
+    );
+    if unwired > 0 {
+        eprintln!(
+            "note: {unwired} created edges carry no DS BBA yet — their source claim has no \
+             belief interval (SourceFactorless); they will wire when the source acquires belief \
+             and the edge is re-asserted"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -457,6 +964,106 @@ mod tests {
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- mode resolution ---
+
+    use super::{parse_ids_file, resolve_mode, Cli, Mode};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    fn mode_of(args: &[&str]) -> Result<Mode, String> {
+        let mut argv = vec!["decompose_claims"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        resolve_mode(&cli, now)
+    }
+
+    /// No flags = the historical write run, `oldest` order.
+    #[test]
+    fn no_flags_is_a_normal_run_in_oldest_order() {
+        assert_eq!(mode_of(&[]).unwrap(), Mode::Run);
+        let cli = Cli::try_parse_from(["decompose_claims"]).unwrap();
+        assert_eq!(cli.priority, super::PriorityArg::Oldest);
+        assert!(
+            !cli.include_backlog && !cli.include_short,
+            "filters default ON"
+        );
+    }
+
+    /// `--retarget` is a DRY RUN unless `--apply` is given, and neither dry
+    /// mode resolves API auth.
+    #[test]
+    fn retarget_defaults_to_dry_run_and_only_apply_writes() {
+        let dry = mode_of(&["--retarget"]).unwrap();
+        assert_eq!(
+            dry,
+            Mode::RetargetDryRun(PathBuf::from("retarget-manifest-20260924T120000Z.jsonl"))
+        );
+        assert!(!dry.writes("epigraph"), "a dry run must not need auth");
+        let apply = mode_of(&["--retarget", "--apply", "--manifest", "m.jsonl"]).unwrap();
+        assert_eq!(apply, Mode::RetargetApply(PathBuf::from("m.jsonl")));
+        assert!(apply.writes("mock"), "apply writes regardless of provider");
+        assert_eq!(
+            mode_of(&["--retarget", "--apply-plan", "m.jsonl"]).unwrap(),
+            Mode::RetargetApplyPlan(PathBuf::from("m.jsonl"))
+        );
+    }
+
+    /// `--plan` needs no auth (it writes nothing); `--apply-plan` does.
+    #[test]
+    fn plan_writes_nothing_and_apply_plan_writes() {
+        let plan = mode_of(&["--plan", "p.jsonl"]).unwrap();
+        assert_eq!(plan, Mode::Plan(PathBuf::from("p.jsonl")));
+        assert!(!plan.writes("epigraph"));
+        let apply = mode_of(&["--apply-plan", "p.jsonl"]).unwrap();
+        assert_eq!(apply, Mode::ApplyPlan(PathBuf::from("p.jsonl")));
+        assert!(
+            apply.writes("mock"),
+            "apply-plan POSTs whatever the provider"
+        );
+        assert!(!Mode::Enumerate.writes("epigraph"));
+    }
+
+    #[test]
+    fn contradictory_flag_combinations_are_refused() {
+        for args in [
+            &["--plan", "a", "--apply-plan", "b"][..],
+            &["--dry-run", "--apply-plan", "b"],
+            &["--retarget", "--dry-run", "--apply"],
+            &["--apply"],
+            &["--manifest", "m"],
+            &["--include-marked"],
+            &["--retarget", "--plan", "p"],
+            &["--retarget", "--ids-file", "i"],
+            &["--retarget", "--apply", "--apply-plan", "m"],
+            &["--apply-plan", "p", "--ids-file", "i"],
+        ] {
+            assert!(mode_of(args).is_err(), "{args:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn ids_file_parses_uuids_comments_and_blank_lines() {
+        let a = "0b5d5c1e-8f2a-4b7e-9a51-2d9f3c8e1a01";
+        let b = "0b5d5c1e-8f2a-4b7e-9a51-2d9f3c8e1a02";
+        let raw = format!("# header\n{a}\n\n  {b}   # trailing comment\n");
+        let ids = parse_ids_file(&raw).unwrap();
+        assert_eq!(
+            ids,
+            vec![
+                uuid::Uuid::parse_str(a).unwrap(),
+                uuid::Uuid::parse_str(b).unwrap()
+            ]
+        );
+        let err = parse_ids_file(&format!("{a}\nnot-a-uuid\n")).unwrap_err();
+        assert!(
+            err.contains("line 2"),
+            "a bad line is an error naming it: {err}"
+        );
+    }
 
     // --- fail-fast auth resolution (gh-375) ---
     //
