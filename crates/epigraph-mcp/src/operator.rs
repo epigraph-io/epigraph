@@ -455,7 +455,10 @@ mod tests {
                 message: "m".into(),
             },
         );
-        assert!(revoked.contains("RVK01") && !revoked.contains("EXECUTE-able"), "{revoked}");
+        assert!(
+            revoked.contains("RVK01") && !revoked.contains("EXECUTE-able"),
+            "{revoked}"
+        );
         let squat = super::link_refusal_text(
             a,
             o,
@@ -463,7 +466,10 @@ mod tests {
                 message: "m".into(),
             },
         );
-        assert!(squat.contains("RVK02") && !squat.contains("EXECUTE-able"), "{squat}");
+        assert!(
+            squat.contains("RVK02") && !squat.contains("EXECUTE-able"),
+            "{squat}"
+        );
         let other = super::link_refusal_text(
             a,
             o,

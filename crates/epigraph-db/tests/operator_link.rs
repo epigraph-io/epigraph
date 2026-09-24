@@ -1087,7 +1087,11 @@ async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPo
     );
 
     for agent in [actor, retired] {
-        assert_eq!(link_row(&pool, agent).await, None, "a refused link wrote a link row");
+        assert_eq!(
+            link_row(&pool, agent).await,
+            None,
+            "a refused link wrote a link row"
+        );
         assert!(
             membership_rows(&pool, group, agent).await.is_empty(),
             "a refused link wrote a membership"
