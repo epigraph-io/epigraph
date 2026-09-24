@@ -429,15 +429,30 @@ async fn opted_in_run_racing_a_newer_migrator_counts_only_its_own_migrations(poo
     );
 }
 
-/// The largest version below the binary head that the binary does not embed,
-/// excluding internal's 035 (the one exempted foreign version) — e.g. a slot
-/// in the reserved 093-099 headroom a newer build could fill.
-fn unembedded_version_below_head() -> i64 {
-    let embedded = embedded_migration_versions();
-    (1..binary_head())
-        .rev()
-        .find(|v| *v != 35 && !embedded.contains(v))
-        .expect("the embedded set has no gap below its head")
+/// The real embedded set with ONE version below the head removed — a binary
+/// built before a newer build filled that slot (e.g. the reserved 093-099
+/// headroom). Same head as the current binary, so a head comparison alone
+/// cannot tell the two apart. Built rather than found: once every reserved
+/// slot is claimed the tree has no free gap to borrow.
+fn holed_migrator(hole: i64) -> sqlx::migrate::Migrator {
+    let mut m = sqlx::migrate!("../../migrations");
+    m.migrations = Cow::Owned(
+        m.migrations
+            .iter()
+            .filter(|x| x.version != hole)
+            .cloned()
+            .collect(),
+    );
+    m.set_ignore_missing(true);
+    m
+}
+
+/// The embedded version just below the head: the hole [`holed_migrator`]
+/// punches, so the holed binary keeps the current head.
+fn version_below_head() -> i64 {
+    let v = embedded_migration_versions();
+    assert!(v.len() >= 2, "need two embedded versions");
+    v[v.len() - 2]
 }
 
 #[sqlx::test(migrations = false)]
@@ -445,20 +460,21 @@ async fn unknown_version_below_the_head_is_refused_unless_opted_in(pool: PgPool)
     epigraph_api::run_migrations(&pool, STRICT)
         .await
         .expect("migrate to head");
-    let gap = unembedded_version_below_head();
-    record_future_migration(&pool, gap).await;
+    let hole = version_below_head();
+    let holed = holed_migrator(hole);
 
-    // The head is unchanged, so a head comparison alone cannot see this.
-    let err = epigraph_api::run_migrations(&pool, STRICT)
+    // The holed binary's head equals the database's head; only the set
+    // comparison sees that `hole` is applied but unknown to it.
+    let err = run_migrator(&holed, &pool, STRICT)
         .await
         .expect_err("a newer build's migration below the head must be refused");
     assert!(
         matches!(err, MigrationError::DbAheadOfBinary { .. }),
         "{err:?}"
     );
-    assert!(err.to_string().contains(&gap.to_string()), "{err}");
+    assert!(err.to_string().contains(&hole.to_string()), "{err}");
 
-    let r = epigraph_api::run_migrations(&pool, ALLOW_AHEAD)
+    let r = run_migrator(&holed, &pool, ALLOW_AHEAD)
         .await
         .expect("opt-in proceeds");
     assert!(r.db_ahead);
