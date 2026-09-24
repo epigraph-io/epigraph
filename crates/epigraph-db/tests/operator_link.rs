@@ -1196,6 +1196,62 @@ async fn an_acting_link_stops_acting_while_its_operators_own_row_is_revoked(pool
     );
 }
 
+/// Two link calls racing cannot build the X -> O -> P chain the single-hop
+/// rule refuses (107 section 10).
+///
+/// Review measured the race: session 1 held `link(X, O)` open, session 2's
+/// `link(O, P)` returned `link_live = t` without blocking (its "is O itself
+/// operated?" check read committed state and saw nothing), and after both
+/// committed the actor read answered for X AND for O.
+///
+/// Here connection 1 holds `link(X, O)` uncommitted while connection 2 runs
+/// `link(O, P)`. With the advisory lock, connection 2 is still WAITING after
+/// the pause, and once connection 1 commits it is refused with 55000 (O already
+/// operates X, the second end of the single-hop check). The
+/// sequential refusal of the same order is `a_second_operator_and_a_self_link_are_refused`'s
+/// territory; this arm is only about the window.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_links_cannot_build_a_two_hop_chain(pool: PgPool) {
+    let x = seed_bare_agent(&pool).await;
+    let o = seed_bare_agent(&pool).await;
+    let p = seed_bare_agent(&pool).await;
+
+    let mut c1 = pool.begin().await.expect("begin connection 1");
+    let first = AgentRepository::link_operator(&mut c1, x, o)
+        .await
+        .expect("link(X, O) on connection 1");
+    assert!(first.link_live, "PREMISE: X -> O is an acting link: {first:?}");
+
+    let pool2 = pool.clone();
+    let second = tokio::spawn(async move {
+        let mut c2 = pool2.acquire().await.expect("acquire connection 2");
+        AgentRepository::link_operator(&mut c2, o, p).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert!(
+        !second.is_finished(),
+        "link(O, P) finished while link(X, O) was uncommitted: the two calls were not \
+         serialised, so its single-hop check read a state without X -> O"
+    );
+    c1.commit().await.expect("commit connection 1");
+
+    let err = second
+        .await
+        .expect("join connection 2")
+        .expect_err("link(O, P) after X -> O committed must be refused: O already operates X");
+    assert!(
+        format!("{err:?}").contains("already operates other agents"),
+        "expected the single-hop refusal, got {err:?}"
+    );
+    assert!(
+        AgentRepository::operator_actor_pool(&pool, o)
+            .await
+            .expect("actor read")
+            .is_none(),
+        "O acts for P: the chain X -> O -> P was built"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constraint 4 and the authoring path.
 // ─────────────────────────────────────────────────────────────────────────────

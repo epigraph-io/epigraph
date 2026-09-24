@@ -355,6 +355,27 @@
 -- `epigraph_mcp::operator` additionally refuse to serve as a signer that is
 -- anyone's operator, through the refusal-only read
 -- `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`).
+--
+-- ===================================================================
+-- 10. LINK WRITES ARE SERIALISED
+--
+-- Every refusal above that reads `operator_links` (single hop from both ends,
+-- one operator per agent) is a read of COMMITTED state, and neither function
+-- used to take a lock, so two concurrent calls each passed the other's
+-- uncommitted row. Review measured it: with `link(X, O)` held open,
+-- `link(O, P)` returned `link_live = t` without blocking, and after both
+-- committed `operator_links` held X -> O and O -> P with the actor read
+-- answering for both -- the chain the single-hop rule exists to refuse, and
+-- exactly the shape of a host boot where several stdio servers start at once.
+-- So both functions take ONE transaction-scoped advisory lock,
+-- `pg_advisory_xact_lock(hashtext('epigraph.operator_links'))`, before any
+-- check. A table lock is not an option: `LOCK TABLE ... IN SHARE ROW
+-- EXCLUSIVE MODE` needs UPDATE/DELETE/TRUNCATE on the table, and the owner
+-- these functions run as (`epigraph_maintenance`) holds only SELECT and
+-- INSERT on it, by design (section 4). The lock is global, not per agent,
+-- because the refusals span two agents' rows; link calls are rare (a stdio
+-- start, an operator CLI run), so the serialisation costs nothing measurable.
+-- `operator_link.rs::concurrent_links_cannot_build_a_two_hop_chain` pins it.
 -- ===================================================================
 
 -- The link record. See section 4.
@@ -472,6 +493,10 @@ BEGIN
         RAISE EXCEPTION 'epigraph_link_operator: agent % cannot be its own operator', p_agent
             USING ERRCODE = '22023';
     END IF;
+    -- Serialise every link write (section 10). Taken before any check reads
+    -- `operator_links`, so under READ COMMITTED each check below sees every
+    -- link committed by the call this one waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
         RAISE EXCEPTION 'epigraph_link_operator: agent % does not exist', p_agent
             USING ERRCODE = '22023';
@@ -628,6 +653,10 @@ BEGIN
                         p_agent
             USING ERRCODE = '22023';
     END IF;
+    -- Serialise every link write (section 10). Taken before any check reads
+    -- `operator_links`, so under READ COMMITTED each check below sees every
+    -- link committed by the call this one waited for.
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
     IF NOT EXISTS (SELECT 1 FROM public.agents WHERE id = p_agent) THEN
         RAISE EXCEPTION 'epigraph_link_retired_agent: agent % does not exist', p_agent
             USING ERRCODE = '22023';
