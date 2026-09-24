@@ -99,8 +99,10 @@
 -- revoked agent X ran `DELETE FROM group_memberships WHERE agent_id = X` ->
 -- `DELETE 1`, and the next stdio restart's link re-created a live writer row.
 -- Gating the membership on the link-row insert closes it for this function,
--- and migration 109 refuses every hard DELETE of a membership outside
--- maintenance, so the history cannot be erased at the RLS layer either.
+-- and migration 106 (batch F, which runs before this file on every database)
+-- revokes DELETE on `group_memberships` from `epigraph_app`, so the history
+-- cannot be erased from an app session either (109 section 1 records why this
+-- branch carries no second, trigger-based guard for the same thing).
 --
 -- ===================================================================
 -- 4. THE LINK RECORD IS A DEFINER-ONLY TABLE, NOT AN EDGE

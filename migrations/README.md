@@ -375,24 +375,22 @@ Current reservation:
   before claiming: no remote branch carries a `108`. **Applied to a throwaway
   database only, NOT to any deployed database.**
 
-- **109**: public `group_memberships_guards` — roster guards the tenancy
-  policy cannot express, as invoker `BEFORE` triggers on `group_memberships`.
-  `group_memberships_no_hard_delete` raises `42501` on any `DELETE` outside
-  `epigraph_bypass()` / `epigraph_definer_bypass()`: 077's FOR ALL
-  `group_memberships_tenancy` let any member hard-delete any row of its group,
-  and review used that to erase a revoked operated agent's history and to
-  delete an operator's own admin row from under it. Removal is a soft
-  `UPDATE ... SET revoked_at`, as every in-tree path already does; a cascaded
-  delete from `agents` fires the trigger too. `group_memberships_no_retired_writer`
-  raises `42501` on an INSERT or UPDATE that leaves a live `writer`/`admin` row
-  for an agent in the group its RETIRED operator link names (107 section 7):
-  review showed the operator could otherwise enrol a retired identity, whose key
-  may be public, as a writer by an ordinary roster write. Behaviour in
-  `epigraph-db/tests/operator_link.rs`. Like 100, 101, 107 and 108 it sits inside internal's
-  `060–112`. **No undo runbook ships**: undo is the `DROP TRIGGER` /
-  `DROP FUNCTION` statements named in the file. Checked before claiming: no
-  remote branch carries a `109`. **Applied to a throwaway database only, NOT
-  to any deployed database.**
+- **109**: public `group_memberships_guards` — a roster guard the tenancy
+  policy cannot express, as an invoker `BEFORE` trigger on `group_memberships`.
+  `group_memberships_no_retired_writer` raises `42501` on an INSERT or UPDATE
+  that leaves a live `writer`/`admin` row for an agent in the group its RETIRED
+  operator link names (107 section 7): review showed the operator could
+  otherwise enrol a retired identity, whose key may be public, as a writer by an
+  ordinary roster write. Hard deletes are NOT this file's: its first form
+  carried a `group_memberships_no_hard_delete` trigger, and 106's `REVOKE
+  DELETE ON group_memberships FROM epigraph_app` now closes the same hole on
+  every database this file can run on, so the trigger was removed (the file's
+  section 1 records the with/without measurement; the behaviour is identical).
+  Behaviour in `epigraph-db/tests/operator_link.rs`. Like 100, 101, 107 and 108
+  it sits inside internal's `060–112`. **No undo runbook ships**: undo is the
+  `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked before
+  claiming: no remote branch carries a `109`. **Applied to a throwaway database
+  only, NOT to any deployed database.**
 
 - **110+**: public next
 

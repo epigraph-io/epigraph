@@ -337,7 +337,11 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
     );
 }
 
-/// An app session cannot hard-delete a membership (migration 109 section 1).
+/// An app session cannot hard-delete a membership. The mechanism is migration
+/// 106's `REVOKE DELETE ON group_memberships FROM epigraph_app`; 109 section 1
+/// records why this branch dropped its own BEFORE DELETE trigger for the same
+/// thing, and this test is what keeps the REVOKE load-bearing for the operator
+/// arms below (re-granting DELETE makes both arms fail).
 ///
 /// Review's two arms, both as `epigraph_app` stamped exactly as
 /// `Viewer::resolve` stamps the principal:
@@ -350,7 +354,7 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
 ///   session's set), after which the operator could no longer revoke Y.
 ///
 /// Each arm first proves, from the same stamped session, that RLS lets it SEE
-/// the row — so the refusal is the trigger, not the policy hiding the row. The
+/// the row — so the refusal is the privilege, not the policy hiding the row. The
 /// CALIBRATION is the soft path: the operator, stamped, can still revoke Y with
 /// an UPDATE, so the guard removed nothing an in-tree path uses.
 #[sqlx::test(migrations = "../../migrations")]
