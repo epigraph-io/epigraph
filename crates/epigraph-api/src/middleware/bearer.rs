@@ -337,17 +337,56 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
             });
         };
 
-        let viewer = epigraph_db::Viewer::resolve(&state.db_pool, principal)
-            .await
-            .map_err(|e| {
+        // An OPERATED principal gets no viewer (migration 102). Operated agents
+        // are stdio-only and token issuance refuses them, but a token minted
+        // BEFORE the link would otherwise carry the operator's personal group
+        // in this viewer's WRITABLE set until it expired (15 min for an agent
+        // token, 1 h for a human or service one). Read concurrently with the
+        // resolve, so it adds no latency.
+        let (viewer, actor) = tokio::join!(
+            epigraph_db::Viewer::resolve(&state.db_pool, principal),
+            epigraph_db::AgentRepository::operator_actor_pool(&state.db_pool, principal),
+        );
+        match actor {
+            Ok(None) => {}
+            Ok(Some(link)) => {
+                tracing::warn!(
+                    target: "visibility.viewer.rejected",
+                    reason = "operated_principal",
+                    route = %route,
+                    principal = %principal,
+                    operator = %link.operator_id,
+                    "viewer rejected: the principal is an operated agent, and operated agents \
+                     are stdio-only"
+                );
+                return Err(ApiError::Forbidden {
+                    reason: format!(
+                        "agent {principal} is operated by {} and operated agents are \
+                         stdio-only: this token predates the link and carries no HTTP \
+                         authority",
+                        link.operator_id
+                    ),
+                });
+            }
+            Err(e) => {
                 tracing::error!(
                     route = %route,
                     principal = %principal,
                     error = %e,
-                    "failed to resolve viewer group membership"
+                    "failed to check whether the principal is an operated agent"
                 );
-                ApiError::from(e)
-            })?;
+                return Err(ApiError::from(e));
+            }
+        }
+        let viewer = viewer.map_err(|e| {
+            tracing::error!(
+                route = %route,
+                principal = %principal,
+                error = %e,
+                "failed to resolve viewer group membership"
+            );
+            ApiError::from(e)
+        })?;
 
         Ok(Self(viewer))
     }

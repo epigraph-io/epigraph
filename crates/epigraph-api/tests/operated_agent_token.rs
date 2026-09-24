@@ -282,3 +282,96 @@ async fn a_failed_operator_check_does_not_burn_the_refresh_token(pool: PgPool) {
     );
     assert!(body.get("access_token").is_some(), "{body}");
 }
+
+/// A token minted BEFORE the agent was linked carries no HTTP authority after
+/// it (stage-2 review: A3 is enforced at MINT, and `ViewerExtractor` resolves
+/// the writable set from memberships on every request, so the pre-link token
+/// would have carried the operator's group until it expired).
+///
+/// CALIBRATION: the same token, before the link, gets PAST the extractor on
+/// `GET /api/v1/evidence` (a `ViewerExtractor` route) and into the handler.
+/// This harness builds `AppState::with_db`, which carries no `ScopedPool`, so
+/// the handler itself answers 500 "Failed to acquire a scoped connection"; that
+/// handler-specific message is the proof the extractor produced a viewer. The
+/// thing under test is the extractor, which runs before any handler code.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_token_minted_before_the_link_is_refused_by_the_viewer(pool: PgPool) {
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let key = SigningKey::from_bytes(&[0x46; 32]);
+    let (agent, client_id) = agent_with_active_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let mint = json!({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_assertion_type": "urn:epigraph:ed25519",
+        "client_assertion": assertion(&key),
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(mint.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "PREMISE: the unlinked agent mints"
+    );
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let minted: Value = serde_json::from_slice(&bytes).expect("json");
+    let access = minted["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+
+    let read = |app: axum::Router, access: String| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/evidence")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    };
+
+    let (status, body) = read(app.clone(), access.clone()).await;
+    assert!(
+        status != StatusCode::FORBIDDEN
+            && status != StatusCode::UNAUTHORIZED
+            && body.contains("scoped connection"),
+        "CALIBRATION: before the link the token must pass the extractor and reach the handler, \
+         or the refusal below proves nothing: {status} {body}"
+    );
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link the agent after its token was minted");
+    drop(conn);
+
+    let (status, body) = read(app, access).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a token minted before the link still resolved a viewer: its writable set now carries \
+         the operator's group on the HTTP surface: {body}"
+    );
+    assert!(
+        body.contains("stdio-only"),
+        "the refusal must say why: {body}"
+    );
+}

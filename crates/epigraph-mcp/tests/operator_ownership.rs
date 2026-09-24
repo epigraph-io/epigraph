@@ -527,3 +527,50 @@ async fn an_undeclared_stdio_signer_keeps_its_pre_102_arm_when_the_operator_look
     );
     assert!(!is_current(&pool, c).await);
 }
+
+/// Operated agents are stdio-only, and over HTTP that must hold even for a
+/// token minted BEFORE the link (stage-2 review: A3 is enforced at mint).
+///
+/// * the actor arm is stdio-only: an actor's HTTP principal is REFUSED on its
+///   sibling's claim, where the same actor over stdio is admitted;
+/// * `request_viewer` gives an operated HTTP principal no viewer at all;
+/// * CALIBRATION: the operator's own HTTP principal is still admitted on the
+///   same claim, and still gets a viewer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_has_no_operator_authority_over_http(pool: PgPool) {
+    let operator = agent(&pool, "operator").await;
+    let (actor_server, actor) = server_with_seed(&pool, 0x5E).await;
+    let sibling = agent(&pool, "sibling").await;
+    link(&pool, actor, operator).await;
+    link(&pool, sibling, operator).await;
+    let (http_server, _) = server_with_seed(&pool, 0x5F).await;
+
+    let c = own_claim(&pool, sibling).await;
+    let err = supersede(&http_server, &pool, c, Some(&http_auth(Some(actor))))
+        .await
+        .expect_err(
+            "an operated agent's HTTP principal was granted the actor arm: a token minted before \
+             its link would carry the operator's authority onto HTTP",
+        );
+    assert!(err.contains("claims:admin"), "{err}");
+    assert!(is_current(&pool, c).await, "the refused supersede wrote");
+
+    let refused =
+        epigraph_mcp::tools::viewer::request_viewer(&http_server, Some(&http_auth(Some(actor))))
+            .await;
+    let err = refused.expect_err("an operated HTTP principal was given a viewer");
+    assert!(err.message.contains("stdio-only"), "{}", err.message);
+
+    // CALIBRATION: the same actor over stdio is admitted, and the operator's
+    // own HTTP principal is admitted and gets a viewer.
+    supersede(&actor_server, &pool, c, None)
+        .await
+        .expect("CALIBRATION: the actor over stdio acts for the operator");
+    let c2 = own_claim(&pool, sibling).await;
+    supersede(&http_server, &pool, c2, Some(&http_auth(Some(operator))))
+        .await
+        .expect("CALIBRATION: the operator's own HTTP principal is admitted");
+    epigraph_mcp::tools::viewer::request_viewer(&http_server, Some(&http_auth(Some(operator))))
+        .await
+        .expect("CALIBRATION: the operator's HTTP principal gets a viewer");
+}

@@ -1114,7 +1114,11 @@ pub async fn update_with_evidence(
 /// - `actor_op(caller) == author_op(target)`, both present — an agent acting
 ///   for the operator on another of its agents' claims, e.g. a job whose model
 ///   was bumped and so runs under a new identity, over its retired
-///   predecessor's claims.
+///   predecessor's claims. **stdio only.** Operated agents are stdio-only
+///   (token issuance refuses them), but that is enforced at MINT, so a token
+///   minted BEFORE the agent was linked would otherwise carry the actor arm
+///   onto HTTP until it expired (stage-2 review). Over HTTP only the operator
+///   acting directly is admitted.
 ///
 /// A retired identity is never an actor, so it owns nothing through this arm
 /// (its key may be exposed). An operator's OWN directly authored claims are
@@ -1159,7 +1163,8 @@ pub(crate) async fn require_owner_or_admin(
         // returns an internal error instead of the ownership denial text — the
         // gate does not decide on an answer it did not get.
         if let Some(caller) = auth.agent_id {
-            if operator_arm_allows(server, caller, target_agent_id).await? {
+            // `allow_actor = false`: operated agents are stdio-only.
+            if operator_arm_allows(server, caller, target_agent_id, false).await? {
                 return Ok(());
             }
         }
@@ -1203,7 +1208,7 @@ pub(crate) async fn require_owner_or_admin(
     // decision: an undeclared (random, per-process) signer can be neither
     // operated (`operator::check_operator_transport` refuses it) nor anyone's
     // operator.
-    if operator_arm_allows(server, caller_agent, target_agent_id).await? {
+    if operator_arm_allows(server, caller_agent, target_agent_id, true).await? {
         return Ok(());
     }
 
@@ -1232,10 +1237,14 @@ pub(crate) async fn require_owner_or_admin(
 /// retired or revoked agent's claims away. A lookup failure is an error, not a
 /// `false`: the gate must not quietly decide ownership without the answer it
 /// asked for.
+///
+/// `allow_actor` is `false` on the HTTP transport: there only `caller ==
+/// author_op(target)` (the operator itself) is admitted, never the actor arm.
 async fn operator_arm_allows(
     server: &EpiGraphMcpFull,
     caller: uuid::Uuid,
     target: uuid::Uuid,
+    allow_actor: bool,
 ) -> Result<bool, McpError> {
     let Some(target_op) =
         epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, target)
@@ -1248,10 +1257,11 @@ async fn operator_arm_allows(
     };
     let reason = if caller == target_op {
         "caller is the operator of the claim's author"
-    } else if epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
-        .await
-        .map_err(internal_error)?
-        .is_some_and(|l| l.operator_id == target_op)
+    } else if allow_actor
+        && epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+            .await
+            .map_err(internal_error)?
+            .is_some_and(|l| l.operator_id == target_op)
     {
         "caller acts for the operator of the claim's author"
     } else {
