@@ -154,9 +154,9 @@ impl EpiGraphMcpFull {
 /// real binary as `epigraph_app`, `--allow-unauthenticated-http`, boot plus three
 /// sequential sessions each calling one tool): 4 calls with a fresh cell per
 /// session (the boot probe plus one per session), 1 call with the shared cell. A per-session write on what is, for every tool, a read
-/// path is the thing removed. It does NOT stop the one remaining per-process
-/// call from reviving a revocation made before the process started; that is
-/// the provisioning function's own contract to fix, not this cache's.
+/// path is the thing removed. The one remaining per-process call cannot revive
+/// a revocation made before the process started either: since migration 105
+/// the provisioning function refuses a revoked row instead of restoring it.
 ///
 /// # What is per-session, and stays so
 ///
@@ -239,19 +239,21 @@ impl EpiGraphMcpFull {
     ///    `--read-only` server performs these writes on its first tool call.
     ///    That is pre-existing in kind (the `agents` insert) and widened in
     ///    degree here.
-    /// 2. **It is an authority restoration, not just provisioning.**
-    ///    `ensure_personal_group`'s membership insert is
-    ///    `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
-    ///    NULL, role = 'admin'`, so an operator who revoked this membership sees
-    ///    it revived, at admin role, on the next process boot. The reviving form
-    ///    is used rather than a second `DO NOTHING` variant because `repos/agent.rs`
-    ///    documents at length why `DO NOTHING` was wrong (a pre-existing revoked
-    ///    epoch-0 row makes the insert a permanent silent no-op, leaving the
-    ///    agent with no live membership forever), and because this is exactly
-    ///    what every API principal already gets on every `oauth/token.rs` mint.
-    ///    One provisioning path, one behaviour.
-    /// 3. **It fails closed.** A failure warns and leaves the agent with an
-    ///    empty group set, i.e. a viewer that reads public rows only.
+    /// 2. **It provisions; it does not restore.** It used to be an authority
+    ///    restoration: migration 077's `epigraph_ensure_personal_group` ended in
+    ///    `ON CONFLICT … DO UPDATE SET revoked_at = NULL, role = 'admin'`, so an
+    ///    operator who revoked this membership saw it revived, at admin, on the
+    ///    next process boot — and, before `SessionFactory`, on every new HTTP
+    ///    session. Since migration 105 a revoked membership makes the call
+    ///    REFUSE (`DbError::MembershipRevoked`), a live one is returned with its
+    ///    role untouched, and only an agent with no row at all is provisioned.
+    ///    The refusal takes arm 3 below: the id still resolves (it is the
+    ///    process's identity, not an authority grant), and the revocation
+    ///    stands.
+    /// 3. **It fails closed.** A failure — the refusal included — warns and
+    ///    leaves the agent with whatever live groups it has, which for a revoked
+    ///    personal membership means no personal group: its writes are refused
+    ///    by the ingest preflight and the author-stamped transaction.
     pub(crate) async fn agent_id(&self) -> Result<uuid::Uuid, McpError> {
         let mut cached = self.agent_db_id.lock().await;
         if let Some(id) = *cached {
@@ -309,9 +311,10 @@ impl EpiGraphMcpFull {
                 {
                     tracing::warn!(
                         agent_id = %id,
-                        error = ?e,
-                        "failed to ensure the server agent's personal group; its viewer will \
-                         resolve to an empty group set and read public rows only"
+                        error = %e,
+                        "did not provision the server agent's personal group (a revoked \
+                         membership is refused, never restored); its viewer resolves to its \
+                         remaining live groups only"
                     );
                 }
             }

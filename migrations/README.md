@@ -234,9 +234,32 @@ Current reservation:
   `100` was: it has never been applied to a deployed database — production is at
   59.
 
-- **102+**: public next
+- **102–104**: HELD for the open branch `feat/operator-scoped-ownership`, which
+  carries `102_operator_link.sql` and `103_groups_identity_immutable.sql` and
+  may take `104`. Not allocated on this line; that branch records its own
+  entries in the same commit as its files. Recorded here only so no other
+  branch picks a colliding number.
+- **105**: public `personal_group_no_revival` (batch F; backlog F2 `af7c58d9`,
+  the root of F1 `da432f25`, #493 and #498's `system_agent_write_authority`
+  finding). `CREATE OR REPLACE` of migration 077's
+  `epigraph_ensure_personal_group(uuid) RETURNS uuid`, same signature: a LIVE
+  personal membership is returned with its role kept and nothing written; only
+  REVOKED rows (any epoch) RAISE SQLSTATE `RVK01`, which
+  `epigraph-db/src/errors.rs` maps to `DbError::MembershipRevoked`; no row of
+  any state provisions exactly as before. 077's body ended in `ON CONFLICT …
+  DO UPDATE SET revoked_at = NULL, role = 'admin'`, so every call revived a
+  revocation and promoted a demotion. Re-states 077's owner / `REVOKE … FROM
+  PUBLIC` / `GRANT EXECUTE … TO epigraph_app` block (idempotent). Pinned by
+  `epigraph-db/tests/personal_group_no_revival.rs` as `epigraph_app`. **No undo
+  runbook ships**: reversing it is re-running 077's function body, which
+  restores the defect; it creates and changes no rows. **No deploy
+  precondition.** **Claimed 2026-09-24.** **Applied to a throwaway database
+  only, NOT to any deployed database.**
+- **106**: HELD for batch F's follow-on (community membership integrity, F4)
+  should it need a migration; recorded when claimed.
+- **107+**: public next
 
-Next public migration **outside both reserved tenancy ranges** must be `102` or
+Next public migration **outside both reserved tenancy ranges** must be `107` or
 later. Numbers inside 060–090 are allocated by §3.1 of the tenancy plan;
 numbers inside 092–099 are allocated by the obligation batches that follow it.
 Both are claimed one at a time, and a claim is recorded in the tables above **in

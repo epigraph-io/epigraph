@@ -37,11 +37,22 @@ pub fn parse_uuid(s: &str) -> Result<uuid::Uuid, McpError> {
 /// `ValidationError`, and `map_edge_err` in `crate::tools::edge_mutation`,
 /// which does the same for `NotFound`.
 ///
+/// `DbError::MembershipRevoked` (migration 105's refusal to restore a revoked
+/// personal-group membership) is `INVALID_REQUEST`: a denial of authority, not
+/// a server fault, and not something the caller can fix by changing a
+/// parameter either — the same classification `tools::viewer::request_viewer`
+/// uses for a missing principal.
+///
 /// Every other `DbError` variant stays `INTERNAL_ERROR` — a connection fault or
 /// a failed query is not the caller's fault and must not read as one.
 pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
     match e {
         epigraph_db::DbError::InvalidData { reason } => invalid_params(reason),
+        epigraph_db::DbError::MembershipRevoked { message } => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(message),
+            data: None,
+        },
         other => internal_error(other),
     }
 }
@@ -73,5 +84,15 @@ mod tests {
             id: uuid::Uuid::nil(),
         });
         assert_eq!(server.code, ErrorCode::INTERNAL_ERROR);
+
+        let revoked = db_caller_error(epigraph_db::DbError::MembershipRevoked {
+            message: "agent a holds only REVOKED membership(s) of its personal group g".to_string(),
+        });
+        assert_eq!(
+            revoked.code,
+            ErrorCode::INVALID_REQUEST,
+            "a revoked membership is a denial, not a server fault"
+        );
+        assert!(revoked.message.contains("REVOKED"));
     }
 }

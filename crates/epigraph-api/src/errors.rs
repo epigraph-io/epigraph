@@ -390,6 +390,19 @@ impl From<DbError> for ApiError {
                 message: format!("{} already exists", entity),
             },
             DbError::Conflict { reason } => ApiError::Conflict { reason },
+            // Migration 105's refusal to restore a revoked personal-group
+            // membership. A denial, not a fault: 403 on the EXISTING variant
+            // (a new `ApiError` variant would land in the no-db build with no
+            // arm constructing it). The function's text names the agent and
+            // the group, so it is logged rather than put in the body.
+            DbError::MembershipRevoked { message } => {
+                tracing::warn!(detail = %message, "personal-group membership is revoked");
+                ApiError::Forbidden {
+                    reason: "the principal's personal-group membership is revoked; restoring \
+                             it is an operator action"
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,

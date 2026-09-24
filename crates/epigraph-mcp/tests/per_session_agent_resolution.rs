@@ -189,3 +189,56 @@ async fn a_new_session_does_not_revive_a_revoked_server_agent(pool: PgPool) {
     );
     assert!(res.is_err(), "the ingest must be refused, got {res:?}");
 }
+
+/// A RESTARTED process: a new factory, so an empty cell and one real
+/// `ensure_personal_group` call. The shared cell cannot help here — only the
+/// provisioning function's own contract can (migration 105): the call must
+/// refuse, the membership must stay revoked, and nothing may be ingested.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_restarted_process_does_not_revive_a_revoked_server_agent(pool: PgPool) {
+    let first_process = factory_like_main(&pool).await;
+    let agent = first_process
+        .session()
+        .server_agent_id()
+        .await
+        .expect("resolve");
+    let personal = personal_group(&pool, agent).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1 AND group_id = $2",
+    )
+    .bind(agent)
+    .bind(personal)
+    .execute(&pool)
+    .await
+    .unwrap();
+    drop(first_process);
+    let before = claims_by(&pool, agent).await;
+
+    let restarted = factory_like_main(&pool).await;
+    let session = restarted.session();
+    assert_eq!(
+        session
+            .server_agent_id()
+            .await
+            .expect("the id still resolves"),
+        agent,
+        "the refusal must not stop the process from knowing its own identity"
+    );
+    let viewer = fixture::public_viewer(&pool).await;
+    let res = ingest_document_inline(
+        &session,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction: doc("10.9999/per-session-restarted"),
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+    assert_eq!(
+        membership_state(&pool, agent, personal).await,
+        "admin(revoked)",
+        "a restarted process must not revive the revoked personal membership"
+    );
+    assert_eq!(claims_by(&pool, agent).await - before, 0);
+    assert!(res.is_err(), "the ingest must be refused, got {res:?}");
+}

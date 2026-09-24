@@ -153,15 +153,15 @@ async fn author_write_authority<'p>(
 /// `bypass OR definer_bypass OR id = ANY(session_groups) OR created_by_agent_id =
 /// principal_id`, and on an unstamped app session every arm is false. So the read
 /// is BLIND in production and `personal_group_of` would take its mint path on
-/// EVERY submission; `epigraph_ensure_personal_group`'s membership statement is
-/// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL,
-/// role = 'admin'`, which was measured to take a revoked membership from 0 live
-/// rows back to 1. That is a privilege change hidden inside an unrelated claim
-/// insert — exactly what `ClaimRepository::personal_group_of`'s doc says the
-/// read-first order exists to prevent — and it would also make the refusal below
-/// unreachable in production while it still passed under the superuser test
-/// harness. `epigraph-db/tests/author_stamped_write_loop.rs` pins both
-/// measurements.
+/// EVERY submission; migration 077's `epigraph_ensure_personal_group` membership
+/// statement was `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET
+/// revoked_at = NULL, role = 'admin'`, which was measured to take a revoked
+/// membership from 0 live rows back to 1 — a privilege change hidden inside an
+/// unrelated claim insert. Migration 105 makes that call refuse a revoked row
+/// instead of reviving it, so the hazard is gone at its root; the call stays
+/// removed because a per-submission control-plane write on the pool buys
+/// nothing the refusal below does not already report.
+/// `epigraph-db/tests/author_stamped_write_loop.rs` pins both measurements.
 ///
 /// The group is therefore ensured exactly where it already was:
 /// `server.rs::agent_id`'s PR-09 block, once per process, before either caller
@@ -762,9 +762,13 @@ pub async fn create_claim_idempotent(
     // Giving those tools a `visibility` argument is the write-side gate's work,
     // not this PR's; when it arrives, this is the single place it lands for all
     // three.
+    // `db_caller_error`, not `internal_error`: the one caller-side refusal this
+    // can return is migration 105's `MembershipRevoked` (the author's personal
+    // membership is revoked and the provisioning call will not restore it),
+    // which is a denial and must not read as a server fault.
     let decl = ClaimRepository::default_decl_for_author(&mut *conn, claim.agent_id.into())
         .await
-        .map_err(internal_error)?;
+        .map_err(crate::errors::db_caller_error)?;
     let (claim, was_created) = ClaimRepository::create_or_get(&mut *conn, viewer, claim, decl)
         .await
         .map_err(internal_error)?;

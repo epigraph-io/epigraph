@@ -11,6 +11,15 @@ use uuid::Uuid;
 /// drift.
 const CHECK_VIOLATION: &str = "23514";
 
+/// SQLSTATE `RVK01`: `epigraph_ensure_personal_group` refused because the agent
+/// holds only REVOKED membership rows of its personal group (migration 105).
+///
+/// A custom class on purpose: `RV` is outside the standard's reserved `0-4` /
+/// `A-H` classes and outside every class PostgreSQL itself raises, so no
+/// server-side error can be mistaken for this refusal. Spelled once, here, for
+/// the same reason [`CHECK_VIOLATION`] is.
+pub const PERSONAL_MEMBERSHIP_REVOKED: &str = "RVK01";
+
 /// Database operation errors
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -108,6 +117,21 @@ pub enum DbError {
     #[error("Conflict: {reason}")]
     Conflict { reason: String },
 
+    /// The agent's personal-group membership is REVOKED, and the provisioning
+    /// function refused to restore it (SQLSTATE [`PERSONAL_MEMBERSHIP_REVOKED`],
+    /// migration 105).
+    ///
+    /// Migration 077's `epigraph_ensure_personal_group` revived a revoked row as
+    /// `admin` on every call; 105 makes that call refuse instead, and this is the
+    /// named form of the refusal. It is a DENIAL, not a server fault: an operator
+    /// revoked the membership, and reversing that is an operator action. The
+    /// HTTP layer maps it to 403 and the MCP layer to `INVALID_REQUEST`.
+    ///
+    /// `message` is the function's own text (it names the agent and the group),
+    /// carried because a plpgsql `RAISE` has no constraint name to report.
+    #[error("Personal-group membership revoked: {message}")]
+    MembershipRevoked { message: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {
@@ -154,6 +178,15 @@ impl From<sqlx::Error> for DbError {
                     // driver error as `#[source]` and gets the message for
                     // free; a struct variant with no `source` discards it
                     // permanently unless it is copied out now.
+                    message: db_err.message().to_string(),
+                }
+            }
+            // RVK01, migration 105's refusal to revive a revoked personal
+            // membership. Named so no caller has to string-match a message.
+            sqlx::Error::Database(db_err)
+                if db_err.code().as_deref() == Some(PERSONAL_MEMBERSHIP_REVOKED) =>
+            {
+                Self::MembershipRevoked {
                     message: db_err.message().to_string(),
                 }
             }

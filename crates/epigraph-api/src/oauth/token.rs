@@ -172,7 +172,9 @@ fn refresh_allowed(
 ///
 /// # Errors
 /// Returns `ApiError::InternalError` if the transaction cannot be opened,
-/// committed, or if the principal cannot be materialised.
+/// committed, or if the principal cannot be materialised, and
+/// `ApiError::Forbidden` if the principal's personal-group membership is
+/// revoked (migration 105: the provisioning step refuses to restore it).
 #[cfg(feature = "db")]
 pub(crate) async fn principal_agent_id(
     state: &AppState,
@@ -196,10 +198,18 @@ pub(crate) async fn principal_agent_id(
     // `client_type` is read from the locked row inside `ensure_for_client`
     // rather than passed in: a caller cannot then pass one inconsistent with
     // what is stored (`providers::provision` used to hardcode "human").
+    // A revoked personal membership is a REFUSAL (migration 105), not a server
+    // fault: `ensure_for_client`'s last step is `ensure_personal_group`, which
+    // no longer restores a revoked row. The transaction is aborted by the RAISE,
+    // so the client stays UNLINKED and every later mint refuses the same way
+    // until an operator restores the membership — loud, and reversible.
     let agent_id = AgentRepository::ensure_for_client(&mut tx, client_row_id)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to resolve principal agent: {e}"),
+        .map_err(|e| match e {
+            epigraph_db::DbError::MembershipRevoked { .. } => ApiError::from(e),
+            other => ApiError::InternalError {
+                message: format!("Failed to resolve principal agent: {other}"),
+            },
         })?;
 
     tx.commit().await.map_err(|e| ApiError::InternalError {

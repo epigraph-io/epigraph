@@ -574,14 +574,15 @@ impl GroupMembershipRepository {
     ///
     /// # The discriminator a provisioning mint must consult first
     ///
-    /// `epigraph_ensure_personal_group`'s membership statement is `ON CONFLICT
+    /// Migration 077's `epigraph_ensure_personal_group` ended in `ON CONFLICT
     /// (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL, role =
-    /// 'admin'`: called for an agent that already holds a revoked row in its
-    /// personal group, it REVIVES that admin membership. So "this agent cannot
-    /// see its personal group" does not on its own license a mint — "never
+    /// 'admin'`: called for an agent that already held a revoked row in its
+    /// personal group, it REVIVED that admin membership. So "this agent cannot
+    /// see its personal group" did not on its own license a mint — "never
     /// provisioned" and "deliberately revoked" both look like that — and this
-    /// count is what tells them apart: `0` means there is no revoked row a mint
-    /// could revive. (A live `reader` row is the other thing the same
+    /// count is what tells them apart: `0` means there is no revoked row. Since
+    /// migration 105 the function refuses a revoked row itself; this read is
+    /// how a caller learns WHY before it asks. (A live `reader` row is the other thing the same
     /// `DO UPDATE` would silently change; it is live, so the personal group is
     /// visible to a stamped caller and never reaches the mint branch at all.)
     ///

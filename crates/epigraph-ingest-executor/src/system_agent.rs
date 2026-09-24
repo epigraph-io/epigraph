@@ -137,11 +137,16 @@ pub struct SystemAgentAuthority {
 ///                                           ingest committed 3 claims under it
 /// ```
 ///
-/// `epigraph_ensure_personal_group`'s `ON CONFLICT … DO UPDATE SET revoked_at =
-/// NULL, role = 'admin'` is a privilege change, and an operator's revocation is
-/// a decision this path has no standing to reverse. So a revoked row now makes
-/// the ingest refuse, loudly, with nothing written; restoring the membership is
-/// an operator action.
+/// Migration 077's `epigraph_ensure_personal_group` ended in `ON CONFLICT … DO
+/// UPDATE SET revoked_at = NULL, role = 'admin'` — a privilege change — and an
+/// operator's revocation is a decision this path has no standing to reverse. So
+/// a revoked row makes the ingest refuse, loudly, with nothing written;
+/// restoring the membership is an operator action. Since migration 105 the
+/// provisioning function refuses a revoked row itself (`DbError::MembershipRevoked`),
+/// so this check is no longer the only thing between the ingest and a revival;
+/// it stays because it refuses with the operator-facing reason BEFORE any
+/// transaction is spent, and because it also catches the live-`reader` case,
+/// which the function now leaves alone rather than promoting.
 ///
 /// The mint survives for the one case where it cannot revive anything: the agent
 /// has never held a revoked row (a fresh install, or a crash between
@@ -222,11 +227,10 @@ pub async fn system_agent_write_authority(
         drop(tx);
         return Err(refuse(format!(
             "the workflow-ingest-system agent ({agent_id}) has no live membership of its personal \
-             group and holds {revoked} REVOKED membership row(s). Refusing rather than \
-             provisioning: epigraph_ensure_personal_group would revive a revoked admin \
-             membership (ON CONFLICT ... DO UPDATE SET revoked_at = NULL, role = 'admin'), and \
-             reversing a revocation is an operator decision. Restore the membership explicitly \
-             to re-enable workflow ingest"
+             group and holds {revoked} REVOKED membership row(s). Refusing: reversing a \
+             revocation is an operator decision (epigraph_ensure_personal_group refuses it too, \
+             since migration 105). Restore the membership explicitly to re-enable workflow \
+             ingest"
         )));
     }
 
