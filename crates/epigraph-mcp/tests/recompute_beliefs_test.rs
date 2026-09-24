@@ -101,7 +101,9 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
     // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-stale").await;
     let claim = insert_claim(&pool, agent, &format!("recompute-stale-{}", Uuid::new_v4())).await;
@@ -118,7 +120,11 @@ async fn recompute_claim_ids_restores_stale_cache(pool: PgPool) {
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,
@@ -153,14 +159,20 @@ async fn recompute_skips_claim_without_bbas(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
     // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-nobba").await;
     let bare = insert_claim(&pool, agent, &format!("recompute-nobba-{}", Uuid::new_v4())).await;
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![bare.to_string()]),
             labels: None,
@@ -186,7 +198,9 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
     // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-bulk").await;
     // Two claims with BBAs; ephemeral DB so the bulk population is exactly 2.
@@ -202,7 +216,11 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -221,7 +239,11 @@ async fn recompute_bulk_truncates_at_limit(pool: PgPool) {
     // Page 2 picks up the remaining claim and is not truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: None,
@@ -244,7 +266,9 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // recompute_beliefs enumerates via `MassFunctionRepository::list_claim_ids`,
     // whose debug_assert requires a Bypass viewer: a Scoped one would leave every
     // other tenant's cached beliefs stale. Hold the ScopedPool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "recompute-lbl").await;
     let label = format!("rb-lbl-{}", Uuid::new_v4());
@@ -262,7 +286,11 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // limit=1 over 2 labeled claims → one remains → truncated.
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label.clone()]),
@@ -280,7 +308,11 @@ async fn recompute_labels_truncation_is_exact(pool: PgPool) {
     // limit=2 over exactly 2 labeled claims → none remain → NOT truncated.
     let out2 = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![label]),
@@ -373,7 +405,11 @@ async fn recompute_preserves_canonical_frame_belief_across_multiple_frames(pool:
 
     let out = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: Some(vec![claim.to_string()]),
             labels: None,

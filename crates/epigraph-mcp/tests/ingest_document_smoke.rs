@@ -192,7 +192,11 @@ async fn ingested_claims_carry_doi_label_for_recompute(pool: PgPool) {
 
     let result = tools::cdst_maintenance::recompute_beliefs(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("a maintenance session over the test database"),
         RecomputeBeliefsParams {
             claim_ids: None,
             labels: Some(vec![doi_label.to_string()]),

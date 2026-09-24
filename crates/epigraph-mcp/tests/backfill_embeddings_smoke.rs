@@ -75,7 +75,9 @@ async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
     // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
     // debug_asserts a Bypass viewer, because a Scoped one would leave every other
     // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     for _ in 0..3 {
@@ -84,7 +86,11 @@ async fn dry_run_counts_candidates_without_writing(pool: PgPool) {
 
     let out = tools::embeddings::backfill_embeddings(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+            .await
+            .expect("a maintenance session over the test database"),
         BackfillEmbeddingsParams {
             limit: Some(100),
             dry_run: Some(true),
@@ -116,7 +122,9 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
     // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
     // debug_asserts a Bypass viewer, because a Scoped one would leave every other
     // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     for _ in 0..5 {
@@ -125,7 +133,11 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
 
     let out = tools::embeddings::backfill_embeddings(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+            .await
+            .expect("a maintenance session over the test database"),
         BackfillEmbeddingsParams {
             limit: Some(2),
             dry_run: Some(true),
@@ -142,7 +154,11 @@ async fn limit_is_respected_and_clamped(pool: PgPool) {
     // limit below 1 clamps up to 1 rather than returning everything/nothing.
     let out = tools::embeddings::backfill_embeddings(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+            .await
+            .expect("a maintenance session over the test database"),
         BackfillEmbeddingsParams {
             limit: Some(0),
             dry_run: Some(true),
@@ -158,14 +174,20 @@ async fn non_dry_run_with_mock_embedder_fails_loudly(pool: PgPool) {
     // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
     // debug_asserts a Bypass viewer, because a Scoped one would leave every other
     // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     let server = build_server(pool.clone(), false).await;
     let agent = insert_agent(&pool).await;
     insert_unembedded_claim(&pool, agent).await;
 
     let err = tools::embeddings::backfill_embeddings(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+            .await
+            .expect("a maintenance session over the test database"),
         BackfillEmbeddingsParams {
             limit: Some(100),
             dry_run: Some(false),
@@ -186,7 +208,9 @@ async fn zero_candidates_succeeds_even_without_a_key(pool: PgPool) {
     // backfill_embeddings is a maintenance enumerator: `find_claims_needing_embeddings`
     // debug_asserts a Bypass viewer, because a Scoped one would leave every other
     // tenant unembedded. Hold the ScopedPool — dropping it closes the pool.
-    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    // The tool now takes a MaintenanceSession (batch H1), minted at the call
+    // below over this test database: its bypass viewer is what the old
+    // `fixture::bypass` supplied here.
     // No unembedded claims at all => candidates==0 short-circuits BEFORE the
     // mock-embedder guard, so a scheduled run on a drained backlog is a clean
     // no-op rather than a config error.
@@ -194,7 +218,11 @@ async fn zero_candidates_succeeds_even_without_a_key(pool: PgPool) {
 
     let out = tools::embeddings::backfill_embeddings(
         &server,
-        &viewer,
+        &mut fixture::scoped_pool(&pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+            .await
+            .expect("a maintenance session over the test database"),
         BackfillEmbeddingsParams {
             limit: Some(100),
             dry_run: Some(false),
