@@ -102,6 +102,10 @@ pub async fn consolidate_claims(
         // (`DbError::Conflict` -> `ApiError::Conflict`); INVALID_PARAMS is the
         // nearest JSON-RPC code that carries the message to the caller.
         epigraph_db::DbError::Conflict { ref reason } => invalid_params(reason.clone()),
+        // Migration 105's refusal from the all-public branch's owner lookup
+        // (the acting agent's personal membership is revoked, or its did_key
+        // squatted): a denial, INVALID_REQUEST, as on every other write tool.
+        other if other.is_personal_group_refusal() => crate::errors::db_caller_error(other),
         other => internal_error(other),
     })?;
     // The idempotent-return branch rolled its SAVEPOINT back and wrote nothing;
