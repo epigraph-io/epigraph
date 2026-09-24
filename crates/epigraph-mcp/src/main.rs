@@ -564,6 +564,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let read_only = cli.read_only;
         let federation = federation.clone();
 
+        // ONE template per listener; every HTTP session is `sessions.session()`.
+        let template = EpiGraphMcpFull::new_shared_with_federation(
+            pool.clone(),
+            signer,
+            embedder,
+            read_only,
+            federation,
+            llm_identity.clone(),
+        )
+        .with_scoped_pool(scoped.clone());
+        let template = if identity_declared {
+            template
+        } else {
+            template.with_generated_signer_identity()
+        };
+        let sessions = epigraph_mcp::SessionFactory::new(template);
+
         // PR-09: resolve (and, on first boot, create) the server's own agent
         // row + personal group, so the `--allow-unauthenticated-http` middleware
         // has a principal to inject.
@@ -580,26 +597,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // success and therefore already retries.
         let unauthenticated_principal: epigraph_mcp::auth::UnauthenticatedPrincipal =
             if cli.allow_unauthenticated_http {
-                let probe = EpiGraphMcpFull::new_shared_with_federation(
-                    pool.clone(),
-                    signer.clone(),
-                    embedder.clone(),
-                    read_only,
-                    federation.clone(),
-                    llm_identity.clone(),
-                )
-                // Attached here too even though this probe only resolves an
-                // agent id. It is an `Arc<dyn ServerPrincipalSource>` handed to
-                // the middleware and reachable for the life of the listener, so
-                // a version of it that could not stamp a connection would be a
-                // second, quietly write-incapable server object.
-                .with_scoped_pool(scoped.clone());
-                let probe = if identity_declared {
-                    probe
-                } else {
-                    probe.with_generated_signer_identity()
-                };
-                let probe = Arc::new(probe);
+                // The probe is a session of the SAME factory, so it shares the
+                // one per-process `agent_db_id` cell with every HTTP session:
+                // warming it here warms them all. It is an
+                // `Arc<dyn ServerPrincipalSource>` handed to the middleware and
+                // reachable for the life of the listener, so it carries the
+                // template's `ScopedPool` like every other session.
+                let probe = Arc::new(sessions.session());
                 let principal = epigraph_mcp::auth::UnauthenticatedPrincipal::lazily_from(
                     probe.clone() as Arc<dyn epigraph_mcp::auth::ServerPrincipalSource>,
                 );
@@ -623,29 +627,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
         let service = StreamableHttpService::new(
-            move || {
-                let srv = EpiGraphMcpFull::new_shared_with_federation(
-                    pool.clone(),
-                    signer.clone(),
-                    embedder.clone(),
-                    read_only,
-                    federation.clone(),
-                    llm_identity.clone(),
-                )
-                // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101),
-                // and this closure builds a fresh server PER SESSION — so an
-                // attachment on the stdio path alone would leave every real
-                // caller on a server whose `scoped` is `None`, i.e. would turn
-                // the 42501 into a total `submit_claim` / `memorize` refusal.
-                // `ScopedPool` is `Clone` over one inner `PgPool`, so cloning
-                // per session shares the pool rather than opening another.
-                .with_scoped_pool(scoped.clone());
-                Ok(if identity_declared {
-                    srv
-                } else {
-                    srv.with_generated_signer_identity()
-                })
-            },
+            // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and
+            // this closure runs once PER SESSION. Every session is a clone of
+            // the one template above: it carries the template's `ScopedPool`
+            // (an attachment on the stdio path alone would leave every real
+            // caller on a server whose `scoped` is `None`, turning the 42501
+            // into a total `submit_claim` / `memorize` refusal) and SHARES its
+            // `agent_db_id` cell, so the server agent is resolved — and its
+            // personal group provisioned — once per process, not once per
+            // session. See `SessionFactory` for the measurement.
+            move || Ok(sessions.session()),
             Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default(),
         );

@@ -23,6 +23,10 @@
 #                   one run, and it writes to a throwaway database.
 : "${E2E_SU_DSN:?set E2E_SU_DSN}"
 : "${E2E_APP_DSN:?set E2E_APP_DSN}"
+# Refuse a DSN on the production port (or with no port) before anything runs;
+# sets E2E_SU_PORT, which every psql call below passes as -p.
+# shellcheck source=dsn-guard.sh
+. "$(cd "$(dirname "$0")" && pwd)/dsn-guard.sh"
 set -uo pipefail
 BIN="${1:?usage: probe-embed.sh <binary> <label> <a|b>}"
 LABEL="${2:?label}"
@@ -34,7 +38,7 @@ H=(-H Content-Type:application/json -H Accept:application/json,text/event-stream
 SU_PW="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://[^:]+:([^@]*)@.*#\1#')"
 SU_USER="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://([^:]+):.*#\1#')"
 SU_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
-q() { PGPASSWORD="$SU_PW" psql -h 127.0.0.1 -U "$SU_USER" -d "$SU_DB" -tA -c "$1"; }
+q() { PGPASSWORD="$SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$SU_USER" -d "$SU_DB" -tA -c "$1"; }
 E2E_AGENT_KEY="${E2E_AGENT_KEY:-000000000000000000000000000000000000000000000000000000000e2e5eed}"
 
 # OPENAI_API_KEY comes from the ENVIRONMENT only. An earlier revision read it out
@@ -46,7 +50,7 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 echo "### binary: $BIN"
 LOCKFIFO="$E2E/.elock.$LABEL"
 rm -f "$LOCKFIFO"; mkfifo "$LOCKFIFO"
-PGPASSWORD="$SU_PW" psql -h 127.0.0.1 -U "$SU_USER" -d "$SU_DB" -qtA \
+PGPASSWORD="$SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$SU_USER" -d "$SU_DB" -qtA \
   -c "SELECT pg_advisory_lock(918273645);" -f "$LOCKFIFO" >/dev/null 2>&1 &
 LOCKPID=$!
 exec 9>"$LOCKFIFO"

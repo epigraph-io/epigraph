@@ -295,20 +295,82 @@ pub async fn do_link_epistemic(
         // a BBA and recomputed the target (`Wired`). The other outcomes
         // (SourceFactorless / Vacuous / NonEpistemic / already-wired / None-on-error)
         // move no belief, so we honestly report `belief_wired=false`.
-        let outcome = auto_wire_edge_if_epistemic(
-            pool,
-            viewer,
-            was_created,
-            edge_id,
-            wire_source,
-            "claim",
-            wire_target,
-            "claim",
-            &params.relationship,
-            agent_id,
+        //
+        // ONE AUTHOR-STAMPED TRANSACTION, and this is what made `belief_wired`
+        // honest. `auto_wire_edge_if_epistemic` writes `claim_frames`,
+        // `mass_functions` and an `UPDATE claims` on the TARGET; on the unstamped
+        // pool the first of those is refused on a cleanly-migrated schema —
+        // `claim_frames` carries no orphan `*_privacy` policy, so it is refused in
+        // PRODUCTION too — and the failure is swallowed, so the tool reported
+        // `belief_wired: false` and every `supports`/`refutes` edge moved no belief
+        // mass. The refusal is now the only reason that field can be false.
+        //
+        // THE STAMP IS `server.agent_id()`'s, AND THE RESIDUAL IS THE SAME ONE
+        // `submit_ds_evidence` STATES AT ITS OWN SITE: `claim_frames` and
+        // `mass_functions` are CLAIM-DERIVED, so migration 074/070 fill their
+        // tenancy from the TARGET claim and the `WITH CHECK` asks about the
+        // target's group — not the caller's, and not the source author's (which is
+        // what the BBA is ATTRIBUTED to, a different question). So an epistemic
+        // edge into another group's claim stays refused here. Whether an admin
+        // scope should carry write authority into a group it is not a member of is
+        // a tenancy-model decision; `tools/ds.rs` and `tools/claims.rs`
+        // (`update_with_evidence`) carry the same sentence, and
+        // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs` pins the pair.
+        let mut ds_tx = match crate::claim_helper::begin_author_stamped_tx(
+            server,
+            server.agent_id().await?,
+            "link_epistemic",
         )
-        .await;
-        belief_wired = matches!(outcome, Some(EdgeFactorOutcome::Wired));
+        .await
+        {
+            Ok(tx) => Some(tx),
+            Err(e) => {
+                tracing::warn!(
+                    edge = %edge_id,
+                    "edge auto-wire skipped: {}. The edge is durable but moves no belief mass",
+                    e.message
+                );
+                None
+            }
+        };
+        let outcome = match ds_tx.as_mut() {
+            None => None,
+            Some(tx) => {
+                let o = auto_wire_edge_if_epistemic(
+                    tx,
+                    viewer,
+                    was_created,
+                    edge_id,
+                    wire_source,
+                    "claim",
+                    wire_target,
+                    "claim",
+                    &params.relationship,
+                    agent_id,
+                )
+                .await;
+                o
+            }
+        };
+        // Commit only when a BBA was actually materialized. On every other
+        // outcome — NonEpistemic, SourceFactorless, Vacuous, or a swallowed
+        // failure — the transaction is dropped and rolled back, so a partial
+        // wiring is never left behind and the `Wired` verdict and the committed
+        // state cannot disagree.
+        let wired = matches!(outcome, Some(EdgeFactorOutcome::Wired));
+        if let Some(tx) = ds_tx {
+            if wired {
+                if let Err(e) = tx.commit().await {
+                    tracing::warn!(
+                        edge = %edge_id,
+                        "edge auto-wire computed but could not commit: {e}. Nothing was written"
+                    );
+                    belief_wired = false;
+                } else {
+                    belief_wired = true;
+                }
+            }
+        }
     }
 
     if was_created {

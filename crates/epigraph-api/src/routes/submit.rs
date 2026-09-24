@@ -1065,6 +1065,41 @@ struct PersistOutcome {
     evidence_ids: Vec<EvidenceId>,
 }
 
+/// Map a failure to resolve the packet author's owner group.
+///
+/// Migration 105's two refusals (`DbError::is_personal_group_refusal`: the
+/// author's personal membership is REVOKED, or its did_key is squatted) are a
+/// DENIAL, not a server fault: 403, as on every other surface that reaches the
+/// definer (`errors.rs`'s `From<DbError>`). The function's text names the agent
+/// and the group, so it is LOGGED and kept out of the body, as the
+/// `From<DbError>` arm does too. This route builds its own `(StatusCode,
+/// ErrorResponse)` pairs, so it needs its own arm; before it, a revoked author
+/// got a 500 whose body carried both ids.
+#[cfg(feature = "db")]
+fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+    if e.is_personal_group_refusal() {
+        tracing::warn!(
+            detail = %e,
+            "submit_packet refused: the author's personal group cannot own the claim"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            ErrorResponse::new(
+                "Forbidden",
+                "the author's personal-group membership is revoked, or its personal group is not \
+                 usable; restoring it is an operator action. Nothing was written.",
+            ),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorResponse::new(
+            "DatabaseError",
+            format!("Failed to resolve the author's tenancy: {e}"),
+        ),
+    )
+}
+
 #[cfg(feature = "db")]
 async fn persist_packet(
     pool: &epigraph_db::PgPool,
@@ -1146,15 +1181,7 @@ async fn persist_packet(
     // group is the only owner this surface can name without inventing one.
     let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, agent_id.into())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to resolve the author's tenancy: {e}"),
-                ),
-            )
-        })?;
+        .map_err(author_tenancy_error)?;
 
     let (persisted, was_created) =
         epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)

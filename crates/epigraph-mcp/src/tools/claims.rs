@@ -424,39 +424,31 @@ pub async fn submit_claim(
     // into the same frame twice, so a resubmit must not; re-embedding a claim that
     // has no vector is idempotent and is the only way a repaired orphan becomes
     // recallable again.
+    //
+    // Both halves now run in ONE transaction stamped from the AUTHOR's viewer —
+    // `claim_frames`, `mass_functions`, the cached-belief `UPDATE claims`, and the
+    // `truth_value` derived from the pignistic. On the unstamped pool the first
+    // of those was refused outright on a cleanly-migrated schema (`claim_frames`
+    // carries no orphan `*_privacy` policy, which is why `mass_functions` stopped
+    // growing in production), and the `truth_value` write could land while the
+    // BBA it is derived from did not. See
+    // `claim_helper::wire_ds_for_new_claim_author_stamped`.
     let ds = if was_created {
-        let ds_result = ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            viewer,
-            claim_uuid,
+        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
+            server,
             agent_id,
+            claim_uuid,
+            viewer,
             ds_auto::DsAutoInput {
                 confidence,
                 weight,
                 supports: true,
                 evidence_type: Some(&params.evidence_type),
             },
+            /* persist_truth_from_pignistic */ true,
+            "submit_claim",
         )
-        .await;
-        if let Err(ref e) = ds_result {
-            tracing::warn!(claim_id = %claim_uuid, "ds auto-wire failed: {e}");
-        }
-        if let Ok(ref ds) = ds_result {
-            let ds_truth = TruthValue::clamped(ds.pignistic_prob);
-            if let Err(e) = ClaimRepository::update_truth_value(
-                &server.pool,
-                ClaimId::from_uuid(claim_uuid),
-                ds_truth,
-            )
-            .await
-            {
-                tracing::warn!(
-                    claim_id = %claim_uuid,
-                    "failed to update truth from DS pignistic: {e}"
-                );
-            }
-        }
-        ds_result.ok()
+        .await
     } else {
         // Resubmit (Option B): verb-edges already emitted above, and the canonical
         // trace stays as it is unless the claim had none (the orphan-repair arm
@@ -865,69 +857,49 @@ pub async fn update_with_evidence(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    // ── THE EVIDENCE WRITE IS DELIBERATELY *NOT* STAMPED YET ────────────
+    // HISTORY, kept short because the next block supersedes it: before D2 this
+    // evidence INSERT was deliberately left UNSTAMPED. Stamped on its own it
+    // would have had to self-commit (migration 046's
+    // `mass_functions.evidence_id -> evidence(id)` FK, with the DS wiring on a
+    // sibling connection), and the still-unconverted DS wiring then failed at
+    // `claim_frames` — a committed evidence row whose BBA never landed. MEASURED
+    // on the pre-branch binary, CONFIG B: `update_with_evidence` ->
+    // "assign_claim: ... policy for table \"claim_frames\"" with the evidence
+    // row committed.
     //
-    // `evidence` is tier-A under migration 077's strict
-    // `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, so on this
-    // unstamped pool the INSERT is refused on a cleanly-migrated schema — MEASURED
-    // as `new row violates row-level security policy for table "evidence"`. It is
-    // this tool's FIRST write, so today that refusal is also its whole outcome:
-    // the call fails and **nothing is written**.
-    //
-    // A revision of this branch DID stamp it, and that change was MEASURED to be a
-    // regression rather than an improvement. The reason is that stamping this one
-    // INSERT cannot make the tool whole: migration 046 gives
-    // `mass_functions.evidence_id` a FK to `evidence(id)`, and `ds_auto`'s wiring
-    // below runs on a SIBLING pool connection that cannot see an uncommitted row,
-    // so a stamped evidence INSERT has to COMMIT ON ITS OWN before the DS wiring
-    // can reference it. The DS wiring is itself unconverted (it writes
-    // `claim_frames`, which has no orphan `*_privacy` policy), so on a clean
-    // schema it is refused immediately afterwards — with the evidence row already
-    // committed.
-    //
-    // The two configurations, measured with the real binary on a role with
-    // `rolbypassrls = false`:
-    //
-    // * CONFIG B (prod-faithful, `evidence_privacy` present): the INSERT is
-    //   admitted either way, so the stamp changes nothing here at all.
-    // * CONFIG A (clean 001→head): unstamped fails at `evidence` having written
-    //   nothing; stamped commits the evidence row and then drops the wire at
-    //   `claim_frames`.
-    //
-    // So on CONFIG B the stamp changes nothing, and on CONFIG A it converts a
-    // clean refusal into a committed evidence row whose BBA never lands.
-    //
-    // THE RETRY-AMPLIFICATION PREMISE THIS ARGUMENT ONCE LEANT ON WAS WRONG, and
-    // it is corrected here rather than left standing. An earlier form said
-    // `Evidence::new` mints a fresh v4 `EvidenceId` and `EvidenceRepository::
-    // create` has no `ON CONFLICT`, "so every agent retry … appended another
-    // evidence row for the same assertion". An IDENTICAL retry never appends:
-    // `content_hash` is `blake3(evidence_data)` and migration 001's
+    // (An earlier form of this note also called that orphan a RETRY AMPLIFIER —
+    // "`Evidence::new` mints a fresh v4 UUID and `EvidenceRepository::create`
+    // has no `ON CONFLICT`, so each retry appends another row". #497 measured
+    // that premise wrong for an IDENTICAL retry: `content_hash` is
+    // `blake3(evidence_data)` and migration 001's
     // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
-    // refuses it ("Duplicate entity already exists"). Only a RE-WORDED retry
-    // adds a row. Both are measured in
-    // `tests/update_with_evidence_ds_wiring_is_best_effort.rs`.
+    // refuses it as "Duplicate entity already exists". Only a RE-WORDED retry
+    // adds a row. That makes a committed BBA-less row WORSE, not better: it
+    // blocks the identical re-submission that would land the contribution.)
     //
-    // THE CONCLUSION STILL HOLDS WITHOUT THAT PREMISE, and that same constraint
-    // makes it stronger. With the wire best-effort, a stamped INSERT on CONFIG A
-    // would let the call succeed: evidence attached, `belief_wired: false`,
-    // `bba_stored: false`, labels merged. That is CONFIG B's behaviour today. But
-    // the row it leaves is not just untidy. It is BBA-less, no tool mints a BBA
-    // from an existing evidence row, and the unique constraint refuses the
-    // identical re-submission that would otherwise land the contribution once D2
-    // converts the wire. Left unstamped, CONFIG A writes nothing, so that
-    // re-submission stays open. The atomicity half is unchanged: a stamp here
-    // would still commit evidence on its own connection, ahead of the truth/label
-    // unit below. Re-deciding the stamp is D2's call. Its sibling in
-    // `submit_ds_evidence` was KEPT for a different reason — `assign_claim` is
-    // `ON CONFLICT … DO UPDATE` and `store_with_perspective` upserts, so a retry
-    // there re-states rather than accumulates.
+    // ── D2: evidence -> BBA -> truth_value -> labels, ONE STAMPED UNIT ──
     //
-    // This site therefore converts WITH the DS wiring (D2), in the one commit that
-    // can put evidence → BBA → truth_value → labels in a single stamped unit, and
-    // not before. `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` carries
-    // it in the residual register so it cannot be forgotten.
-    EvidenceRepository::create(&server.pool, &evidence)
+    // THE OBJECTION ABOVE IS ANSWERED BY THE TRANSACTION, NOT WAIVED. It said
+    // stamping this INSERT alone "converts a clean refusal into a committed
+    // orphan". That is true of a SELF-COMMITTING stamped INSERT. Here the INSERT
+    // joins the transaction that also carries the DS wiring, the truth write and
+    // the label merge: if any of them fails, nothing is committed, so there is
+    // no BBA-less row left behind to refuse the identical re-submission — the
+    // caller's retry of the same `evidence_data` is the recovery, and it is
+    // pinned in `tests/update_with_evidence_ds_wiring_failure_is_atomic.rs`.
+    //
+    // AND THE FK ORDERING THAT FORCED THE SPLIT DISSOLVES. Migration 046 gives
+    // `mass_functions.evidence_id` a foreign key to `evidence(id)`, which is why
+    // the evidence row had to exist before `auto_wire_ds_update` could reference
+    // it. A foreign key is checked at statement time against the CURRENT
+    // transaction's snapshot, not at commit, so an uncommitted evidence row in
+    // this same transaction satisfies it. The two writes no longer need separate
+    // commits to be orderable.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+            .await?;
+
+    EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
 
@@ -944,7 +916,7 @@ pub async fn update_with_evidence(
     // by the prior column value for supports=true, so the warning is only ever
     // reachable on the NULL-column (no-prior-DS-state) path.
     let pre_pignistic =
-        ClaimRepository::get_belief_columns(&server.pool, viewer, ClaimId::from_uuid(claim_id))
+        ClaimRepository::get_belief_columns(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
             .await
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
@@ -953,78 +925,37 @@ pub async fn update_with_evidence(
     // I-3: use helper that checks CALIBRATION_PATH env var before relative path
     let weight = load_evidence_type_weight(&params.evidence_type);
 
-    // ── CDST UPDATE — BEST-EFFORT, EXACTLY AS IN `submit_claim` ─────────
+    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
     //
-    // This used to be `.map_err(internal_error)?`, i.e. FATAL, and that made the
-    // tool report total failure for a call that had PARTLY SUCCEEDED: the
-    // evidence INSERT above has already committed on its own connection (it has
-    // to — `mass_functions.evidence_id` FKs `evidence(id)` and the wiring below
-    // runs on a SIBLING pool connection that cannot see an uncommitted row), and
-    // it stays committed when the wiring fails. So the caller was handed an error
-    // for work the database had kept.
+    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
+    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
+    // the evidence INSERT had already self-committed on the unstamped pool, the
+    // wiring ran on a sibling pool connection and was refused in production
+    // (`new row violates row-level security policy for table "claim_frames"`),
+    // so a fatal error reported total failure for a call whose evidence row the
+    // database had kept.
     //
-    // `submit_claim` treats the IDENTICAL failure of the IDENTICAL helper as
-    // best-effort (`tracing::warn!` + `ds_result.ok()`, see the comment above its
-    // own transaction). Two tools disagreeing about whether one helper's failure
-    // is fatal is not a policy, it is a discrepancy; this aligns the outlier with
-    // the canonical path rather than inventing a third behaviour.
+    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
+    // so the production refusal it was working around is the thing D2 removes,
+    // and the evidence row is uncommitted until everything below succeeds. A
+    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
+    // truth write, no labels — and an error is now the complete and truthful
+    // answer. Swallowing it instead would commit exactly the BBA-less evidence
+    // row the note above explains is worse than nothing (it blocks the identical
+    // re-submit via `evidence_content_hash_claim_unique`). The error text keeps
+    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
+    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
+    // which is the part of #497's disclosure that still has a referent.
     //
-    // WHY BEST-EFFORT IS THE RIGHT SIDE OF THAT ALIGNMENT. `claim_frames` /
-    // `mass_functions` are written through the pool-bound `ds_auto` helper, which
-    // is still unconverted for migration 077's tenancy stamp, so on a
-    // cleanly-migrated schema this wiring is refused on EVERY call — measured in
-    // production as `new row violates row-level security policy for table
-    // "claim_frames"`, with `mass_functions`' last successful write on
-    // 2026-09-22. Making that refusal fatal does not protect anything: the
-    // evidence is already committed either way, and the only difference is
-    // whether the agent can proceed.
-    //
-    // RECOVERY PATH, AND ITS LIMIT — which of the two applies is `bba_stored`.
-    //
-    // * BBA stored, late step failed: the operator binary
-    //   `recompute_claim_belief` (a `[[bin]]` in the `epigraph-cli` package —
-    //   `cargo run -p epigraph-cli --bin recompute_claim_belief -- --stdin` — not
-    //   an `epigraph-cli` subcommand) draws its connection from
-    //   `MaintenancePool::connect`, so it is not bound by this tool's pool, and
-    //   recomputes the cached DS columns per frame from the claim's STORED
-    //   `mass_functions`. It writes no `truth_value`
-    //   (`MassFunctionRepository::update_claim_belief` sets only the DS
-    //   columns), so `claims.truth_value` stays stale until the next successful
-    //   wire on the claim. It is specifically NOT the `recompute_beliefs` MCP
-    //   tool — that one is hard-disabled by
-    //   `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection()
-    //   -> false` and refuses by construction, so naming it as the remedy would
-    //   send an operator at a door that is welded shut.
-    // * No BBA stored, first step failed — production's `claim_frames` refusal:
-    //   there is nothing for that binary to recompute from, and no existing tool
-    //   mints a BBA from an `evidence` row. Re-submitting is NOT a recovery: an
-    //   identical re-submit is refused by `evidence_content_hash_claim_unique
-    //   UNIQUE (content_hash, claim_id)` (the hash is over `evidence_data`), so
-    //   the BBA-less row blocks it; a re-worded one is admitted as a SECOND
-    //   evidence row for the same assertion, leaving the original BBA-less. Both
-    //   measured in `update_with_evidence_ds_wiring_is_best_effort.rs`. The
-    //   `evidence_id` in the response is the handle for a future
-    //   BBA-from-evidence repair, and for de-duplicating the original row.
-    //
-    // AND IT IS DISCLOSED, NOT SWALLOWED. Returning bare success here would be
-    // the silent-failure mode this codebase has been bitten by repeatedly, so the
-    // response carries `belief_wired: false` (the same contract
-    // `link_epistemic` already publishes) and the belief numbers below are held
-    // honest: see the response construction at the end of this function.
-    //
-    // NOT A CONVERSION. `ds_auto` and `edge_factor` stay exactly as they are —
-    // converting them is a separate unit, and when it lands the `Err` arm here
-    // stops being reachable in normal operation and `belief_wired` becomes
-    // permanently `true`. This change is confined to what happens WHEN it fails.
+    // `submit_claim` still treats its own DS wiring as best-effort, and that is
+    // not a discrepancy: there the CLAIM is the primary write and it has already
+    // committed in its own transaction before the wire runs, so the claim
+    // exists either way. Here the evidence row IS the submission, and it is in
+    // the same unit as its BBA.
     //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    //
-    // The STAGED form is used so the response can say whether this submission's
-    // BBA was persisted before the failure (`bba_stored`). The two outcomes need
-    // opposite recoveries and are otherwise indistinguishable to the caller —
-    // `truth_after == truth_before` and the measures are absent in both.
-    let (ds, ds_failure) = match ds_auto::auto_wire_ds_update_staged(
-        &server.pool,
+    let ds = ds_auto::auto_wire_ds_update(
+        &mut tx,
         viewer,
         claim_id,
         agent_id,
@@ -1035,20 +966,21 @@ pub async fn update_with_evidence(
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
     )
     .await
-    {
-        Ok(ds) => (Some(ds), None),
-        Err(f) => {
-            // Same message shape and same fields as `submit_claim`'s warn, so one
-            // log query finds every dropped wire regardless of which tool dropped it.
-            tracing::warn!(
-                claim_id = %claim_id,
-                bba_stored = f.bba_stored,
-                "ds auto-wire failed: {}",
-                f.error
-            );
-            (None, Some(f))
-        }
-    };
+    .map_err(|e| {
+        // Logged as well as returned. `internal_error` only builds the
+        // `McpError`, so without this a dropped wire here would never reach
+        // the server log. #497 added this warn so that one log query
+        // ("ds auto-wire failed") finds every dropped wire, whichever tool
+        // dropped it; `submit_claim`'s path emits the same prefix with the same
+        // `claim_id`/`tool` fields. The wording differs because the outcome
+        // does: here the whole submission is rolled back.
+        tracing::warn!(
+            claim_id = %claim_id,
+            tool = "update_with_evidence",
+            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
+        );
+        internal_error(e)
+    })?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
     //
@@ -1066,29 +998,7 @@ pub async fn update_with_evidence(
     // strength of a submission the caller was told had failed — the placement rule
     // the caller-label validation at the top of this function already follows.
     //
-    // WHY THIS ONE IS STAMPED WHILE THE EVIDENCE INSERT ABOVE IS NOT, which is
-    // otherwise an inconsistency a reader is right to challenge: these are the
-    // tool's LAST writes, so a self-committing stamped unit here opens no orphan
-    // window — there is nothing after it that can fail with them half-landed. The
-    // evidence INSERT is the FIRST write and is followed by an unconverted step
-    // that is certain to fail on a clean schema, so stamping it would have
-    // committed a row whose BBA never lands — and which, by
-    // `evidence_content_hash_claim_unique`, then refuses the identical
-    // re-submission that could land it later (see the note above the INSERT).
-    //
-    // REACHABILITY, RE-MEASURED AFTER THE DS WIRING ABOVE BECAME BEST-EFFORT.
-    // It used to be true that "neither reaches execution on either
-    // configuration", because a refused wire aborted the whole tool. It is no
-    // longer: on CONFIG B (prod-faithful) the evidence INSERT is admitted, the
-    // wire is dropped with a warn, and this block now RUNS — committing the label
-    // merge with `update_truth_value_conn` skipped, per the note directly below.
-    // On CONFIG A the evidence INSERT is still refused first, so this block is
-    // still unreached there. MEASURED on both via `scripts/e2e/probe-tools.sh`
-    // (real binary, `epigraph_app`, `rolbypassrls = false`), with a `labels`
-    // argument so the merge is observable: CONFIG B `uwe_labelled` 0 → 1 across
-    // the fix; CONFIG A 0 on both binaries, refused at `evidence`.
-    //
-    // AND WHEN IT DOES BECOME REACHABLE IT WILL SERVE ONLY CLAIMS THIS SERVER'S
+    // IT SERVES ONLY CLAIMS THIS SERVER'S
     // GROUP OWNS. The stamp carries `server.agent_id()`'s writable set, and
     // `claims_tenancy`'s `WITH CHECK` asks about the ROW's `owner_group_id` — the
     // TARGET claim's group, not the evidence author's. So `update_with_evidence`
@@ -1099,37 +1009,15 @@ pub async fn update_with_evidence(
     // its `…_lands_when_the_session_carries_the_claims_own_group` pair; the same
     // statement holds for `challenge_claim` and `submit_ds_evidence`, and each
     // states it at its own site. It is a tenancy-model decision, not a defect here.
-    // ── AND WHEN THE WIRING DROPPED, THE LABEL MERGE STILL RUNS ─────────
-    //
-    // `after_truth` is `None` exactly when the wiring failed, because its value
-    // is DERIVED from `ds.pignistic_prob` — with no completed combination there
-    // is no new truth to write (even when this submission's BBA was stored before
-    // a late step failed), and writing the old one back would be a lie dressed as
-    // an update.
-    //
-    // The label merge is NOT gated on the same condition, and that separation is
-    // deliberate. Gating the whole block on "the wiring succeeded" would drop
-    // every submitted label on the DS-failure path, which is precisely backlog
-    // f14592cb (run-tag labels silently lost on every call) reintroduced through
-    // a different door — and a silent loss is the failure mode this change exists
-    // to remove, not one it may trade for. The two facts are independently true:
-    // the labels were submitted and accepted, the belief was not computed. So the
-    // transaction still opens, still carries the author stamp, and commits
-    // whichever of the two writes actually has something to say.
-    let after_truth = ds.as_ref().map(|d| TruthValue::clamped(d.pignistic_prob));
+    let after_truth = TruthValue::clamped(ds.pignistic_prob);
     {
-        let mut tx =
-            crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
-                .await?;
-        if let Some(after_truth) = after_truth {
-            ClaimRepository::update_truth_value_conn(
-                &mut tx,
-                ClaimId::from_uuid(claim_id),
-                after_truth,
-            )
-            .await
-            .map_err(internal_error)?;
-        }
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            ClaimId::from_uuid(claim_id),
+            after_truth,
+        )
+        .await
+        .map_err(internal_error)?;
 
         // Additive label merge on the dedup-match write, mirroring submit_claim's
         // and memorize's dedup-hit behavior: labels union into the claim's
@@ -1149,60 +1037,32 @@ pub async fn update_with_evidence(
     // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
     // pignistic-to-pignistic; when the claim had no prior DS state the column is
     // NULL, so fall back to the truth_value the fresh BBA combined against.
-    //
-    // Only ever computed on the wired path. This warning is a statement about a
-    // COMBINATION that happened ("supporting evidence decreased belief"); with no
-    // combination there is nothing it could be true or false about, and
-    // `pre_pignistic` on its own is a stale column read, not a delta.
     let pre_belief = pre_pignistic.unwrap_or(before);
-    let warning = ds.as_ref().and_then(|d| {
-        (params.supports && d.pignistic_prob < pre_belief).then(|| {
-            "Supporting evidence decreased belief — the new evidence has high \
-             ignorance mass relative to the prior; this is mathematically correct \
-             DS combination, not a bug."
-                .to_string()
-        })
+    let warning = (params.supports && ds.pignistic_prob < pre_belief).then(|| {
+        "Supporting evidence decreased belief — the new evidence has high \
+         ignorance mass relative to the prior; this is mathematically correct \
+         DS combination, not a bug."
+            .to_string()
     });
 
-    // ── THE RESPONSE, WITH THE BELIEF NUMBERS HELD HONEST ───────────────
-    //
-    // `evidence_id` is reported unconditionally because the evidence row is
-    // committed unconditionally — that half genuinely succeeded and the caller
-    // needs the id to find it.
-    //
-    // Everything DS-derived is reported only when the wire COMPLETED — a stored
-    // BBA with no completed combination (a late-step failure) yields no measures:
-    //
-    // * `truth_after` falls back to `before` — the claim's truth_value was not
-    //   updated, so before and after really are equal. Reporting the persisted
-    //   `pignistic_prob` column here instead would manufacture a delta out of a
-    //   previous call's state.
-    // * `belief` / `plausibility` / `pignistic_prob` are `None`, and their
-    //   `skip_serializing_if` makes them ABSENT from the JSON rather than `null`
-    //   or stale. A consumer that reads them gets this submission's measures or
-    //   nothing; it never gets someone else's.
-    // * `belief_wired` is the flag that makes the above legible instead of
-    //   ambiguous: `false` says "`claims.truth_value` and the cached belief
-    //   columns were not updated by this call", so an unchanged `truth_after`
-    //   cannot be misread as "the evidence had no effect on a claim that WAS
-    //   recomputed". It does NOT say no BBA landed — that is `bba_stored`.
-    // * `bba_stored` / `ds_wire_error` say WHICH failure it was. A late-step
-    //   failure has already persisted this submission's BBA (framed reads that
-    //   recompute live from stored BBAs reflect it, and the next successful wire
-    //   combines it); a first-step failure has not. The error text is the same
-    //   string the tool used to return as its -32603 message, so reporting it
-    //   discloses nothing the old contract did not.
+    // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
+    // kept because clients may already read them. Under D2 a success response is
+    // only reachable when the whole unit committed, so they are constant here:
+    // the wire landed (`true`), this submission's BBA is persisted (`true`, which
+    // #497 defines as always true when `belief_wired` is), and there is no wire
+    // error to report. A failed wire never reaches this line — it is the `?`
+    // above, with everything rolled back.
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
-        truth_after: after_truth.map_or(before, |t| t.value()),
+        truth_after: after_truth.value(),
         evidence_id: evidence.id.as_uuid().to_string(),
-        belief_wired: ds.is_some(),
-        bba_stored: ds_failure.as_ref().map_or(true, |f| f.bba_stored),
-        ds_wire_error: ds_failure.map(|f| f.error),
-        belief: ds.as_ref().map(|d| d.belief),
-        plausibility: ds.as_ref().map(|d| d.plausibility),
-        pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),
+        belief_wired: true,
+        bba_stored: true,
+        ds_wire_error: None,
+        belief: Some(ds.belief),
+        plausibility: Some(ds.plausibility),
+        pignistic_prob: Some(ds.pignistic_prob),
         warning,
     })
 }

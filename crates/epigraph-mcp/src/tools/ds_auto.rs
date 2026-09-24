@@ -1,17 +1,16 @@
 //! Auto-wiring of CDST (Calibrated Dempster-Shafer) evidence for claims.
 //!
 //! Every claim-creating or claim-updating tool calls into this module after
-//! persisting the claim. DS is the primary belief authority. `submit_claim` and
-//! `update_with_evidence` both treat a DS-wiring failure as best-effort (the claim /
-//! evidence row is already persisted); `update_with_evidence` additionally reports
-//! the stage of the failure via [`auto_wire_ds_update_staged`].
+//! persisting the claim. DS is the primary belief authority — `update_with_evidence`
+//! propagates errors. `submit_claim` treats DS as best-effort (claim is already persisted).
 //!
 //! Each BBA is Shafer-discounted by its `source_strength` before combination to
 //! prevent runaway confirmation (C2) and dilution attacks (C3).
 
 use std::collections::BTreeSet;
 
-use sqlx::PgPool;
+use sqlx::Acquire;
+
 use uuid::Uuid;
 
 use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
@@ -70,12 +69,12 @@ const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 ///
 /// Handles race conditions: get → create → fallback get.
 pub async fn ensure_binary_frame(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Uuid, String> {
     let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
     ensure_axis_frame(
-        pool,
+        &mut *conn,
         viewer,
         BINARY_FRAME_NAME,
         &hyps,
@@ -95,14 +94,14 @@ pub async fn ensure_binary_frame(
 ///
 /// Handles the create race the same way as before: get → create → fallback get.
 pub async fn ensure_axis_frame(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     name: &str,
     hypotheses: &[String],
     description: Option<&str>,
 ) -> Result<Uuid, String> {
     // Fast path: frame already exists — verify the axis agrees before reuse.
-    if let Some(row) = FrameRepository::get_by_name(pool, viewer, name)
+    if let Some(row) = FrameRepository::get_by_name(&mut *conn, viewer, name)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
@@ -116,11 +115,40 @@ pub async fn ensure_axis_frame(
         return Ok(row.id);
     }
 
-    match FrameRepository::create(pool, name, description, hypotheses).await {
-        Ok(row) => Ok(row.id),
+    // The create runs under its OWN savepoint, and that is not hygiene. Its
+    // failure is SWALLOWED — the arm below falls back to a re-read — and a
+    // swallowed failure inside a caller's transaction aborts that transaction:
+    // the fallback read then fails with `25P02`, every later statement fails,
+    // and the caller's `COMMIT` is answered with `ROLLBACK` and NO error (brief
+    // hard constraint #6). MEASURED by review on `ingest_document`'s post-commit
+    // DS transaction: a declared axis whose frame name exists but is invisible
+    // to the ingesting agent took the document from 3 atom BBAs to 0 — the
+    // binary atoms' BBAs, wired earlier in the same transaction, vanished at
+    // COMMIT — with one WARN and no error. The same abort happens on the race
+    // this fallback was written for (two first creations of one name; the loser
+    // gets `23505`).
+    //
+    // `Connection::begin` on a connection already in a transaction is a
+    // SAVEPOINT; on an autocommit checkout it is a plain transaction. Both are
+    // correct here.
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("frame {name:?}: could not open a savepoint for the create: {e}"))?;
+    let created = FrameRepository::create(&mut *sp, name, description, hypotheses).await;
+    match created {
+        Ok(row) => {
+            sp.commit().await.map_err(|e| {
+                format!("frame {name:?}: could not release the create savepoint: {e}")
+            })?;
+            Ok(row.id)
+        }
         Err(_) => {
+            sp.rollback().await.map_err(|e| {
+                format!("frame {name:?}: could not roll back the failed create: {e}")
+            })?;
             // Race: another connection created it first — re-fetch and re-verify.
-            let row = FrameRepository::get_by_name(pool, viewer, name)
+            let row = FrameRepository::get_by_name(&mut *conn, viewer, name)
                 .await
                 .map_err(|e| format!("fallback get_by_name: {e}"))?
                 .ok_or_else(|| format!("frame {name:?} missing after create attempt"))?;
@@ -272,7 +300,7 @@ pub struct DsAutoInput<'a> {
 /// Creates a BBA, assigns the claim to the binary frame, computes Bel/Pl/BetP,
 /// and updates the claim's DS columns.
 pub async fn auto_wire_ds_for_claim(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     agent_id: Uuid,
@@ -284,7 +312,7 @@ pub async fn auto_wire_ds_for_claim(
         supports,
         evidence_type,
     } = input;
-    let frame_id = ensure_binary_frame(pool, viewer).await?;
+    let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
 
     // Build BBA
@@ -292,7 +320,7 @@ pub async fn auto_wire_ds_for_claim(
     let masses_json = mass_to_json(&bba)?;
 
     // Assign claim to binary frame (hypothesis_index=0 → TRUE)
-    FrameRepository::assign_claim(pool, claim_id, frame_id, Some(0))
+    FrameRepository::assign_claim(&mut *conn, claim_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
@@ -302,7 +330,7 @@ pub async fn auto_wire_ds_for_claim(
     // mass shape (mass = confidence * weight, clamped); using `confidence`
     // here would double-discount.
     MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *conn,
         claim_id,
         frame_id,
         Some(agent_id),
@@ -341,19 +369,20 @@ pub async fn auto_wire_ds_for_claim(
         .unwrap_or_else(|_| {
             epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
         });
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
         .await
         .ok()
         .flatten();
     let per_frame_evidence_weights =
-        FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+        FrameRepository::get_per_frame_evidence_type_weights(&mut *conn, frame_id)
             .await
             .ok()
             .flatten();
 
-    let all_rows = MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id)
-        .await
-        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    let all_rows =
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
     let row = all_rows
         .first()
         .ok_or_else(|| "no BBA row after store_with_perspective".to_string())?;
@@ -370,7 +399,7 @@ pub async fn auto_wire_ds_for_claim(
 
     // Update claim DS columns
     MassFunctionRepository::update_claim_belief(
-        pool,
+        &mut *conn,
         claim_id,
         epigraph_db::CachedBelief {
             belief: bel,
@@ -403,13 +432,9 @@ pub async fn auto_wire_ds_for_claim(
 /// `evidence_id` is passed as `perspective_id` so that each evidence submission
 /// gets its own BBA row rather than upsert-overwriting the previous one on the
 /// unique constraint (claim_id, frame_id, agent_id, perspective_id=NULL).
-///
-/// Thin wrapper over [`auto_wire_ds_update_staged`] for callers that only need
-/// the error text. A caller that has to tell its own caller WHETHER THE BBA
-/// LANDED before the failure (so it can pick a recovery) uses the staged form.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_update(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     agent_id: Uuid,
@@ -419,90 +444,26 @@ pub async fn auto_wire_ds_update(
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
 ) -> Result<DsAutoResult, String> {
-    auto_wire_ds_update_staged(
-        pool,
-        viewer,
-        claim_id,
-        agent_id,
-        confidence,
-        weight,
-        supports,
-        evidence_type_str,
-        evidence_id,
-    )
-    .await
-    .map_err(|f| f.error)
-}
-
-/// Why [`auto_wire_ds_update_staged`] failed, and — the part a bare `String`
-/// cannot carry — whether this call's BBA was already persisted when it did.
-///
-/// The wire is a sequence of SEPARATE pool writes, each auto-committed:
-/// `claim_frames` → evidence perspective → `mass_functions` → cached belief
-/// columns on `claims`. So a failure is not all-or-nothing, and the two halves
-/// need OPPOSITE recoveries:
-///
-/// * `bba_stored == false` — the failure happened at or before
-///   `store_with_perspective`. No `mass_functions` row exists for this
-///   submission (rows from the earlier steps — a `claim_frames` assignment, the
-///   synthetic evidence perspective — may). The evidence contributes nothing to
-///   any belief read until a BBA is minted for it.
-/// * `bba_stored == true` — `store_with_perspective` returned `Ok`, and a LATER
-///   step (re-reading the stored BBAs, parsing one — including a legacy
-///   malformed row — discounting, combining, or `update_claim_belief`) failed.
-///   The BBA is persisted: live framed recomputation from stored BBAs already
-///   includes it, and the next successful wire on this claim combines it. Only
-///   the cached belief columns were left stale.
-///
-/// The flag is set by WHICH STEP returned the error, structurally, not by
-/// parsing the error text.
-#[derive(Debug)]
-pub struct DsUpdateFailure {
-    pub bba_stored: bool,
-    pub error: String,
-}
-
-/// [`auto_wire_ds_update`], with the failure classified by stage. See
-/// [`DsUpdateFailure`].
-#[allow(clippy::too_many_arguments)]
-pub async fn auto_wire_ds_update_staged(
-    pool: &PgPool,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-    agent_id: Uuid,
-    confidence: f64,
-    weight: f64,
-    supports: bool,
-    evidence_type_str: Option<&str>,
-    evidence_id: Option<Uuid>,
-) -> Result<DsAutoResult, DsUpdateFailure> {
-    // Every step up to and including `store_with_perspective` fails with no
-    // BBA stored for this submission.
-    let unstored = |error: String| DsUpdateFailure {
-        bba_stored: false,
-        error,
-    };
-
-    let frame_id = ensure_binary_frame(pool, viewer).await.map_err(unstored)?;
-    let frame = binary_frame().map_err(unstored)?;
+    let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
+    let frame = binary_frame()?;
 
     // Build BBA for this evidence
-    let bba = build_binary_bba(&frame, confidence, weight, supports).map_err(unstored)?;
-    let masses_json = mass_to_json(&bba).map_err(unstored)?;
+    let bba = build_binary_bba(&frame, confidence, weight, supports)?;
+    let masses_json = mass_to_json(&bba)?;
 
     // Ensure assignment exists
-    FrameRepository::assign_claim(pool, claim_id, frame_id, Some(0))
+    FrameRepository::assign_claim(&mut *conn, claim_id, frame_id, Some(0))
         .await
-        .map_err(|e| unstored(format!("assign_claim: {e}")))?;
+        .map_err(|e| format!("assign_claim: {e}"))?;
 
     // Materialize a synthetic perspective with id=evidence_id so the
     // mass_functions.perspective_id FK is satisfied. Without this, every
     // multi-evidence update path (report_workflow_outcome, update_with_evidence)
     // failed with mass_functions_perspective_id_fkey since C-1 (355cf4f).
     if let Some(persp_id) = evidence_id {
-        PerspectiveRepository::ensure_evidence_perspective(pool, persp_id, Some(agent_id))
+        PerspectiveRepository::ensure_evidence_perspective(&mut *conn, persp_id, Some(agent_id))
             .await
-            .map_err(|e| unstored(format!("ensure_evidence_perspective: {e}")))?;
+            .map_err(|e| format!("ensure_evidence_perspective: {e}"))?;
     }
 
     // Store BBA — use evidence_id as perspective_id so each evidence submission
@@ -511,7 +472,7 @@ pub async fn auto_wire_ds_update_staged(
     // discount at combination time); agent confidence is already in the
     // BBA mass shape, storing it here too would double-discount.
     MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *conn,
         claim_id,
         frame_id,
         Some(agent_id),
@@ -525,30 +486,8 @@ pub async fn auto_wire_ds_update_staged(
         evidence_id, // Phase 3: the FK to the evidence row that produced this BBA (issue #197)
     )
     .await
-    .map_err(|e| unstored(format!("store BBA: {e}")))?;
+    .map_err(|e| format!("store BBA: {e}"))?;
 
-    // ── THE BBA IS NOW PERSISTED ─────────────────────────────────────────
-    // Every failure from here on leaves it behind, so it is reported as
-    // `bba_stored: true`.
-    combine_stored_bbas_and_cache(pool, viewer, claim_id, frame_id, &frame, supports)
-        .await
-        .map_err(|error| DsUpdateFailure {
-            bba_stored: true,
-            error,
-        })
-}
-
-/// The post-store half of [`auto_wire_ds_update_staged`]: re-read every stored
-/// binary-frame BBA for the claim, discount, combine, clamp, and write the
-/// cached belief columns.
-async fn combine_stored_bbas_and_cache(
-    pool: &PgPool,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-    frame_id: Uuid,
-    frame: &FrameOfDiscernment,
-    supports: bool,
-) -> Result<DsAutoResult, String> {
     // Retrieve BBAs from ALL 2-hypothesis frames for this claim. The DB JOIN
     // on frames ensures we only include frames with exactly 2 hypotheses —
     // a BBA from a 3+-hypothesis frame whose focal elements happen to use only
@@ -559,9 +498,10 @@ async fn combine_stored_bbas_and_cache(
     // the full evidence history rather than starting fresh from just the new
     // BBA — the root cause of the BetP drop in backlog 30bfbb19
     // (claims c98b6dec, adf396a8: 0.883→0.725, 0.834→0.733).
-    let all_rows = MassFunctionRepository::get_for_claim_binary_frames(pool, viewer, claim_id)
-        .await
-        .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
+    let all_rows =
+        MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
 
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. The Phase 2 helper
@@ -575,7 +515,7 @@ async fn combine_stored_bbas_and_cache(
         .unwrap_or_else(|_| {
             epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
         });
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
+    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
         .await
         .ok()
         .flatten();
@@ -585,7 +525,7 @@ async fn combine_stored_bbas_and_cache(
     // at Tier 1 of `effective_source_strength`. Loaded once above the
     // combine loop. On any DB error we fall through to `None`.
     let per_frame_evidence_weights =
-        FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
+        FrameRepository::get_per_frame_evidence_type_weights(&mut *conn, frame_id)
             .await
             .ok()
             .flatten();
@@ -609,7 +549,7 @@ async fn combine_stored_bbas_and_cache(
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_optional(pool).await.ok().flatten().flatten()
+        q.fetch_optional(&mut *conn).await.ok().flatten().flatten()
     };
 
     let combined = if all_rows.len() <= 1 {
@@ -623,13 +563,13 @@ async fn combine_stored_bbas_and_cache(
             per_frame_evidence_weights.as_ref(),
             &calibration,
         );
-        let mf = parse_stored_bba(frame, &r.masses)?;
+        let mf = parse_stored_bba(&frame, &r.masses)?;
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
     } else {
         // Multiple BBAs — discount each via the helper, then combine.
         let mut mass_fns = Vec::with_capacity(all_rows.len());
         for row in &all_rows {
-            let mf = parse_stored_bba(frame, &row.masses)?;
+            let mf = parse_stored_bba(&frame, &row.masses)?;
             let reliability = effective_source_strength(
                 row,
                 per_frame_intra,
@@ -670,7 +610,7 @@ async fn combine_stored_bbas_and_cache(
     }
 
     MassFunctionRepository::update_claim_belief(
-        pool,
+        &mut *conn,
         claim_id,
         epigraph_db::CachedBelief {
             belief: bel,
@@ -705,7 +645,7 @@ async fn combine_stored_bbas_and_cache(
 /// on a declared axis (issue #222) are wired on their own frame; read those back
 /// per claim via `claim_frames` rather than from this single id.
 pub async fn auto_wire_ds_batch(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     entries: &[BatchDsEntry],
     agent_id: Uuid,
@@ -714,7 +654,7 @@ pub async fn auto_wire_ds_batch(
         return Err("empty batch".to_string());
     }
 
-    let binary_frame_id = ensure_binary_frame(pool, viewer).await?;
+    let binary_frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let binary = binary_frame()?;
     // Axis frames resolved on first use, keyed by frame name. Keeps a sweep of N
     // atoms on one axis to a single get-or-create round trip, as the binary path
@@ -728,18 +668,20 @@ pub async fn auto_wire_ds_batch(
             None => Ok((binary_frame_id, binary.clone(), 0_usize)),
             Some(axis) => match axis_frames.get(&axis.frame) {
                 Some((id, frame)) => Ok((*id, frame.clone(), axis.hypothesis_index)),
-                None => match ensure_axis_frame(pool, viewer, &axis.frame, &axis.hypotheses, None)
-                    .await
-                {
-                    Err(e) => Err(e),
-                    Ok(id) => match axis_frame(&axis.frame, &axis.hypotheses) {
+                None => {
+                    match ensure_axis_frame(&mut *conn, viewer, &axis.frame, &axis.hypotheses, None)
+                        .await
+                    {
                         Err(e) => Err(e),
-                        Ok(frame) => {
-                            axis_frames.insert(axis.frame.clone(), (id, frame.clone()));
-                            Ok((id, frame, axis.hypothesis_index))
-                        }
-                    },
-                },
+                        Ok(id) => match axis_frame(&axis.frame, &axis.hypotheses) {
+                            Err(e) => Err(e),
+                            Ok(frame) => {
+                                axis_frames.insert(axis.frame.clone(), (id, frame.clone()));
+                                Ok((id, frame, axis.hypothesis_index))
+                            }
+                        },
+                    }
+                }
             },
         };
         let (frame_id, frame, idx) = match resolved {
@@ -753,16 +695,46 @@ pub async fn auto_wire_ds_batch(
             }
         };
 
-        if let Err(e) =
-            wire_single_batch_entry(pool, viewer, &frame, frame_id, idx, entry, agent_id).await
+        // SAVEPOINT PER ENTRY, and it is not hygiene. This loop's contract is
+        // "individual failures are logged and skipped", which was expressible as a
+        // swallowed error only while every statement ran on its own pool checkout.
+        // Now that the caller can hand us a TRANSACTION, a swallowed failure does
+        // not skip the entry — it aborts the whole transaction, so every later
+        // entry fails with `25P02 current transaction is aborted` and the eventual
+        // COMMIT is answered with ROLLBACK and NO ERROR. The tool would report a
+        // wired count having written nothing. A savepoint keeps the documented
+        // behaviour: the failing entry is rolled back alone and the rest proceed.
+        let mut sp = match conn.begin().await {
+            Ok(sp) => sp,
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %entry.claim_id,
+                    "ds_auto batch skip (no savepoint; the caller's transaction is already \
+                     unusable): {e}"
+                );
+                break;
+            }
+        };
+        match wire_single_batch_entry(&mut sp, viewer, &frame, frame_id, idx, entry, agent_id).await
         {
-            tracing::warn!(
-                claim_id = %entry.claim_id,
-                "ds_auto batch skip: {e}"
-            );
-            continue;
+            Ok(()) => match sp.commit().await {
+                Ok(()) => wired += 1,
+                Err(e) => tracing::warn!(
+                    claim_id = %entry.claim_id,
+                    "ds_auto batch entry computed but its savepoint could not be released: {e}"
+                ),
+            },
+            Err(e) => {
+                tracing::warn!(
+                    claim_id = %entry.claim_id,
+                    "ds_auto batch skip: {e}"
+                );
+                if let Err(e) = sp.rollback().await {
+                    tracing::warn!("ds_auto batch: savepoint rollback failed: {e}");
+                    break;
+                }
+            }
         }
-        wired += 1;
     }
 
     Ok((binary_frame_id, wired))
@@ -775,7 +747,7 @@ pub async fn auto_wire_ds_batch(
 /// both the BBA's focal element and the `claim_frames.hypothesis_index` the
 /// belief readers target.
 async fn wire_single_batch_entry(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     frame: &FrameOfDiscernment,
     frame_id: Uuid,
@@ -788,12 +760,12 @@ async fn wire_single_batch_entry(
 
     let idx_i32 = i32::try_from(hypothesis_index)
         .map_err(|_| format!("hypothesis_index {hypothesis_index} out of range"))?;
-    FrameRepository::assign_claim(pool, entry.claim_id, frame_id, Some(idx_i32))
+    FrameRepository::assign_claim(&mut *conn, entry.claim_id, frame_id, Some(idx_i32))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
     MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *conn,
         entry.claim_id,
         frame_id,
         Some(agent_id),
@@ -822,7 +794,7 @@ async fn wire_single_batch_entry(
     // just stored, applies `effective_source_strength`, and writes Bel/Pl/BetP
     // (and, on the binary frame, classification) via update_claim_belief.
     epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-        pool,
+        &mut *conn,
         viewer,
         entry.claim_id,
         frame_id,

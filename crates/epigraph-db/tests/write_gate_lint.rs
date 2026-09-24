@@ -154,8 +154,8 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("claim.rs::batch_update_truth_values", "caller-supplied ids"),
     ("claim.rs::evolve_step", "caller-supplied id"),
     (
-        "claim.rs::mark_duplicate_with_repair",
-        "caller-supplied ids",
+        "claim.rs::mark_duplicate_with_repair_conn",
+        "caller-supplied ids (the body moved here from `mark_duplicate_with_repair`, which now delegates; not a new write)",
     ),
     ("claim.rs::merge_properties", "caller-supplied id"),
     ("claim.rs::patch_claim_atomic_conn", "caller-supplied id"),
@@ -260,7 +260,10 @@ const MACRO_WRITE_SITES: &[(&str, &str)] = &[
         "claim.rs::delete",
         "sqlx::query! — takes &PgPool, no route reaches it",
     ),
-    ("claim.rs::set_properties", "sqlx::query!"),
+    (
+        "claim.rs::set_properties_conn",
+        "sqlx::query! (body moved from `set_properties`, which now delegates; not a new write)",
+    ),
     ("claim.rs::update_trace_id", "sqlx::query!"),
     ("claim.rs::update_truth_value", "sqlx::query!"),
     ("edge.rs::retract_between", "sqlx::query!"),
