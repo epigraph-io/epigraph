@@ -27,13 +27,21 @@
 //! `IngestTx::owner_decl` asks `personal = ANY(epigraph_writable_groups())`, a
 //! GUC read — so it is observable here too.
 //!
-//! # Verified to fail
+//! # What these arms pin, and what they no longer pin
 //!
-//! With `SessionFactory::session` reverted to give each session a fresh
-//! `agent_db_id` cell (the pre-fix factory), [`a_new_session_does_not_revive_a_revoked_server_agent`]
-//! FAILS: the new session's `agent_id()` revives the membership, the preflight
-//! passes, and the detached walk commits claims. See the commit message for the
-//! recorded output.
+//! They pin the OUTCOME: a new session, or a restarted process, must not
+//! revive the revoked membership or ingest under it.
+//!
+//! They do NOT pin the once-per-process sharing. Before migration 105 they
+//! did. With `SessionFactory::session` reverted to give each session a fresh
+//! `agent_db_id` cell, [`a_new_session_does_not_revive_a_revoked_server_agent`]
+//! FAILED, because the new session's `agent_id()` revived the membership (see
+//! commit 4bfa0c3e). At the tip it passes with that revert too: 105's function
+//! refuses a revoked row on its own, so the per-session call no longer
+//! revives anything. The batch F review measured this, 3 passed with the
+//! mutation. The sharing is pinned instead by `server.rs`'s
+//! `session_factory_tests`: they check two sessions hold one cell, and that a
+//! new session answers from it without the database.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;

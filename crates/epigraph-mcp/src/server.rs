@@ -2380,3 +2380,72 @@ mod policy_gate_wiring_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod session_factory_tests {
+    //! F1 (`da432f25`): every HTTP session of one listener shares ONE
+    //! resolution of the server agent, so `agent_id()`'s provisioning call runs
+    //! once per process, not once per session.
+    //!
+    //! `epigraph-mcp/tests/per_session_agent_resolution.rs` cannot pin this
+    //! any more. Since migration 105 the provisioning function refuses a
+    //! revoked row by itself, so that file's revoked-server arm also passes
+    //! with a fresh cell per session. The batch F review measured this: 3
+    //! passed with `SessionFactory::session` giving each session a new cell.
+    //! What the shared cell still buys is the removal of the per-session
+    //! write, and only this pin can see that.
+    //!
+    //! No database: the pool is lazy and points at a port nothing listens on,
+    //! so any session that tried to resolve through the database would ERROR
+    //! instead of answering.
+    use super::*;
+
+    fn unreachable_template() -> EpiGraphMcpFull {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+            .expect("a lazy pool never connects at construction");
+        let signer = Arc::new(AgentSigner::from_bytes(&[0x5Eu8; 32]).expect("signer"));
+        let embedder = Arc::new(McpEmbedder::new(pool.clone(), None));
+        EpiGraphMcpFull::new_shared_with_federation(
+            pool,
+            signer,
+            embedder,
+            false,
+            crate::federation::SharedFederation::empty(),
+            None,
+        )
+    }
+
+    /// Structural: two sessions of one factory hold the SAME cell.
+    #[tokio::test]
+    async fn sessions_of_one_factory_share_the_agent_cell() {
+        let sessions = SessionFactory::new(unreachable_template());
+        let (a, b) = (sessions.session(), sessions.session());
+        assert!(
+            Arc::ptr_eq(&a.agent_db_id, &b.agent_db_id),
+            "every session must share the template's agent_db_id cell"
+        );
+        assert!(
+            !Arc::ptr_eq(&a.seen_auth_lineage, &b.seen_auth_lineage),
+            "the OPERATED_BY memo is per-session by contract"
+        );
+    }
+
+    /// Behavioural: once one session has resolved the agent, a NEW session
+    /// answers `agent_id()` from the shared cell without touching the
+    /// database. A fresh cell would try the unreachable pool and error.
+    #[tokio::test]
+    async fn a_new_session_answers_from_the_resolved_cell_without_the_database() {
+        let sessions = SessionFactory::new(unreachable_template());
+        let resolved = uuid::Uuid::new_v4();
+        *sessions.session().agent_db_id.lock().await = Some(resolved);
+
+        let fresh = sessions.session();
+        let got = fresh
+            .agent_id()
+            .await
+            .expect("a new session must not re-resolve through the database");
+        assert_eq!(got, resolved);
+    }
+}
