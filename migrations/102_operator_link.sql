@@ -272,6 +272,17 @@
 -- database that has not applied 102 (`42883 function does not exist`). Apply
 -- 102 before, or with, the binary.
 --
+-- THE MCP SERVERS DO NOT MIGRATE. `epigraph-migrate` runs only as the API
+-- service's `ExecStartPre`, and every HTTP MCP tool call now depends on 102's
+-- reads: `epigraph_mcp::operator::refuse_linked_http_signer` resolves the
+-- signer agent and reads `epigraph_operator_of_author` and
+-- `epigraph_operates_agents` before dispatch, fail-closed, and the startup gate
+-- exits on a failed lookup. So restarting `epigraph-mcp` onto this binary
+-- BEFORE the database has 102 refuses every HTTP call, read-only tools
+-- included. Restart the API (or run `epigraph-migrate`) first, then the MCP
+-- servers. That coupling is deliberate: the guard does not serve on an answer
+-- it did not get.
+--
 -- HTTP LISTENERS ON FIRST DEPLOY. An HTTP listener refuses to start, and
 -- refuses every call, while its signer has an `operator_links` row
 -- (`epigraph_mcp::operator`). A freshly applied 102 creates the table EMPTY and

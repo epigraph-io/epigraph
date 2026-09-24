@@ -272,7 +272,12 @@ Current reservation:
   `tenancy_backfill.rs::DEFERRED_DEFINER_FUNCTIONS`; behaviour in
   `epigraph-db/tests/operator_link.rs`. **Deploy order:** a binary carrying
   `default_decl_for_author`'s operator lookup fails closed on every claim write
-  against a database without 102, so apply 102 first. Allocated here, not in
+  against a database without 102, so apply 102 first. `epigraph-migrate` runs
+  only as the API's `ExecStartPre`, and the HTTP MCP listeners check the
+  signer's operator records (102's reads) fail-closed on EVERY tool call, read
+  tools included, and at startup: restart the API (or run `epigraph-migrate`)
+  so 102–104 are applied BEFORE restarting `epigraph-mcp`, or every HTTP MCP
+  call is refused until they are. Allocated here, not in
   `093–099`, because this is not one of the obligation batches that block is
   reserved for. Like `100` and `101` it sits inside internal's `060–112`; see
   "Version range coordination" above. **No undo runbook ships**: undo is the
