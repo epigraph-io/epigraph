@@ -218,3 +218,53 @@ async fn concurrent_first_provisioning_yields_one_row(pool: PgPool) {
     assert_eq!(a, b, "one personal group");
     assert_eq!(rows(&pool, agent).await, vec![(0, "admin".into(), true)]);
 }
+
+/// `ClaimRepository::default_decl_for_author` (the wrapper every write path's
+/// owner group goes through) gives the SAME answer on every connection role.
+///
+/// It used to read the group on the caller's connection first and mint only on
+/// a miss. As `epigraph_app` unstamped that read was blind (always minted); on
+/// a BYPASSRLS connection it was not, and returned the personal group of an
+/// agent whose membership was REVOKED — so a claim by a revoked author was
+/// owned by the group it had been revoked from. It now asks the definer
+/// function directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owner_group_wrapper_refuses_a_revoked_author_on_every_role(pool: PgPool) {
+    use epigraph_db::ClaimRepository;
+    let app = app_pool(&pool).await;
+
+    // A live author resolves on both roles, to the same group.
+    let live = seed_agent(&pool).await;
+    let g = ensure_as_app(&app, live).await.expect("provision");
+    let mut su = pool.acquire().await.unwrap();
+    let mut ap = app.acquire().await.unwrap();
+    let d_su = ClaimRepository::default_decl_for_author(&mut su, live)
+        .await
+        .expect("live author, superuser");
+    let d_app = ClaimRepository::default_decl_for_author(&mut ap, live)
+        .await
+        .expect("live author, epigraph_app");
+    assert_eq!(d_su.owner_group_bind(), Some(g));
+    assert_eq!(d_app.owner_group_bind(), Some(g));
+
+    // A revoked author is refused on both roles, and stays revoked.
+    let revoked = seed_agent(&pool).await;
+    ensure_as_app(&app, revoked).await.expect("provision");
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(revoked)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r_su = ClaimRepository::default_decl_for_author(&mut su, revoked).await;
+    assert!(
+        matches!(r_su, Err(DbError::MembershipRevoked { .. })),
+        "BYPASSRLS: a revoked author must be refused, not owned by the group it was \
+         revoked from; got {r_su:?}"
+    );
+    let r_app = ClaimRepository::default_decl_for_author(&mut ap, revoked).await;
+    assert!(
+        matches!(r_app, Err(DbError::MembershipRevoked { .. })),
+        "epigraph_app: a revoked author must be refused, got {r_app:?}"
+    );
+    assert_eq!(rows(&pool, revoked).await, vec![(0, "admin".into(), false)]);
+}

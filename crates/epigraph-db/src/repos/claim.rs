@@ -644,11 +644,12 @@ impl ClaimRepository {
     ///
     /// `ensure_personal_group` is idempotent and is already called for every
     /// authenticated principal at token mint (PR-02), so on a live path this is
-    /// a lookup, not a write.
+    /// a lookup, not a write (migration 105's live path writes nothing).
     ///
     /// # Errors
-    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent, and
-    /// `DbError::QueryFailed` for other database failures.
+    /// Returns `DbError::MembershipRevoked` if the author holds only revoked rows
+    /// in its personal group, `DbError::ForeignKeyViolation` if `agent_id` names
+    /// no agent, and `DbError::QueryFailed` for other database failures.
     pub async fn default_decl_for_author(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
@@ -658,47 +659,49 @@ impl ClaimRepository {
         ))
     }
 
-    /// The id of `agent_id`'s personal group: **read first, mint only if
-    /// absent.**
+    /// The id of `agent_id`'s personal group, resolved by the `SECURITY DEFINER`
+    /// function alone: **no read on the caller's connection first.**
     ///
-    /// The read-first order is a security property, not an optimisation.
-    /// `AgentRepository::ensure_personal_group`'s membership statement is
-    /// `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
-    /// NULL, role = 'admin'`, so calling it unconditionally **revives a revoked
-    /// membership as admin**. That is correct where it is called from — PR-02's
-    /// token mint, where the principal is authenticating and its own personal
-    /// group must work — and wrong on a write path, where restoring a
-    /// membership somebody deliberately revoked would be a privilege change
-    /// hidden inside an unrelated claim insert.
+    /// # Why the read-first lookup was removed (batch F)
     ///
-    /// The lookup below cannot revive anything. The mint runs only when the
-    /// group does not exist at all, and then there is no membership to revive.
+    /// This used to `SELECT id FROM groups WHERE did_key = …` on the caller's
+    /// connection and call `ensure_personal_group` only on a miss, and the doc
+    /// called that order a SECURITY property: migration 077's function revived a
+    /// revoked membership as admin, and the lookup was what kept a write path
+    /// from reaching it. The property held only where the lookup could see the
+    /// row, and the callers were not all such places:
     ///
-    /// The `did_key` is the deterministic
-    /// `did:epigraph:personal:<agent_uuid>`, spelled the same way
-    /// `ensure_personal_group` spells it: nothing on `agents` records which
-    /// group is the personal one, so that key against `groups_did_key_key
-    /// UNIQUE` is the whole of the identification. A second spelling here would
-    /// silently resolve a different row — which is exactly the defect the test
-    /// fixture `seed_agent_with_group` had until PR-16.
+    /// * on an UNSTAMPED `epigraph_app` connection — `default_decl_for_author_pool`
+    ///   from the API routes, `personal_group_of_pool` from the recall audit
+    ///   (#493) — `groups_tenancy` hides every group, so the read was BLIND and
+    ///   every call took the reviving mint;
+    /// * on a BYPASSRLS connection (the operator CLI's maintenance pool, the
+    ///   `Privileged` ingest arm) the read was not blind, and so it returned the
+    ///   personal group of an agent whose membership was REVOKED — a claim
+    ///   authored by a revoked agent was quietly owned by the group it had been
+    ///   revoked from.
+    ///
+    /// Migration 105 moved the discrimination into the function, which reads
+    /// every row in its definer frame: a live membership returns the group with
+    /// no write, only-revoked rows raise [`DbError::MembershipRevoked`], and only
+    /// an agent with no row at all is provisioned. Calling it directly gives the
+    /// SAME answer on every connection role, which a read on the caller's
+    /// connection cannot.
+    ///
+    /// The `did_key` is the deterministic `did:epigraph:personal:<agent_uuid>`,
+    /// spelled once, in the function: nothing on `agents` records which group is
+    /// the personal one.
     ///
     /// # Errors
-    /// Returns `DbError::ForeignKeyViolation` if `agent_id` names no agent (the
-    /// mint path FKs to `agents`), and `DbError::QueryFailed` otherwise.
+    /// Returns [`DbError::MembershipRevoked`] if the agent holds only revoked
+    /// rows in its personal group, `DbError::ForeignKeyViolation` if `agent_id`
+    /// names no agent (the mint path FKs to `agents`), and
+    /// `DbError::QueryFailed` otherwise.
     async fn personal_group_of(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
     ) -> Result<Uuid, DbError> {
-        let existing: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
-        )
-        .bind(agent_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        match existing {
-            Some(g) => Ok(g),
-            None => crate::repos::AgentRepository::ensure_personal_group(conn, agent_id).await,
-        }
+        crate::repos::AgentRepository::ensure_personal_group(conn, agent_id).await
     }
 
     /// [`Self::default_decl_for_author`] for a caller holding a pool rather
@@ -726,8 +729,10 @@ impl ClaimRepository {
     /// same owner and `visibility = 'group'`. Returning the id keeps that
     /// choice at the call site instead of hiding it in a helper's name.
     ///
-    /// Read-first, mint-if-absent, with the security property that ordering
-    /// carries — see [`Self::personal_group_of`].
+    /// Resolved by the definer function alone, never by a read on the pool's
+    /// (unstamped) connection — see [`Self::personal_group_of`]. It has no
+    /// production caller since the recall audit stopped using it (#493); the
+    /// audit must never provision, and this can.
     ///
     /// # Errors
     /// As [`Self::personal_group_of`], plus `DbError::ConnectionFailed` if no
@@ -8289,11 +8294,12 @@ impl ClaimRepository {
     /// CHECK` has an empty writable set, so the merged-claim INSERT is refused
     /// for every caller on a cleanly-migrated schema — `consolidate_claims` was
     /// unavailable there. And the all-public branch's `personal_group_of` read
-    /// is BLIND on that connection (`groups_tenancy` has no true arm), so it
-    /// took the mint path on every merge: `epigraph_ensure_personal_group`'s
-    /// reviving `ON CONFLICT` inside an unrelated write — hard constraint #3's
-    /// hazard. Stamped from the acting agent, the read sees the group and mints
-    /// nothing.
+    /// was BLIND on that connection (`groups_tenancy` has no true arm), so it
+    /// took the mint path on every merge: migration 077's reviving `ON
+    /// CONFLICT` inside an unrelated write — hard constraint #3's hazard. Since
+    /// batch F `personal_group_of` asks the definer function directly, which
+    /// (migration 105) returns a live group without writing and refuses a
+    /// revoked one, so the answer no longer depends on the stamp.
     ///
     /// # Errors
     /// As [`Self::consolidate`].
@@ -8534,9 +8540,10 @@ impl ClaimRepository {
         // a no-op retry perform a `groups` upsert and a `group_memberships`
         // upsert only to discard them.
         //
-        // `personal_group_of` reads first and mints only if absent -- see its
-        // doc for why calling `ensure_personal_group` unconditionally here
-        // would revive a revoked membership as a side effect of a merge.
+        // `personal_group_of` resolves through the definer function, which
+        // (migration 105) returns a live group without writing and refuses a
+        // revoked membership rather than reviving it as a side effect of a
+        // merge. See its doc.
         let decl = match merged_owner {
             Some(g) => TenancyDecl::group(g),
             None => TenancyDecl::public(Self::personal_group_of(&mut tx, acting_agent_id).await?),
