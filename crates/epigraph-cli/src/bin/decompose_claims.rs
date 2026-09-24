@@ -179,6 +179,21 @@ impl Mode {
             Mode::ApplyPlan(_) | Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_) => true,
         }
     }
+
+    /// The OAuth scope a minted token must carry for this mode's writes.
+    ///
+    /// Decomposition POSTs `/api/v1/claims` (`claims:write`). Retarget POSTs
+    /// and PATCHes `/api/v1/edges`, which `create_edge` / `patch_edge` gate on
+    /// `edges:write`; a token minted with the historical `claims:write` alone
+    /// would 403 on the first retarget write. The service client must be
+    /// GRANTED `edges:write` for the mint to succeed — an operator check,
+    /// since a refused scope fails the mint before any LLM call.
+    fn mint_scope(&self) -> &'static str {
+        match self {
+            Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_) => "claims:write edges:write",
+            _ => "claims:write",
+        }
+    }
 }
 
 fn default_manifest_path(now: chrono::DateTime<chrono::Utc>) -> PathBuf {
@@ -415,10 +430,13 @@ enum MintError {
 /// already-resolved endpoint/credentials/client rather than reading env or
 /// constructing its own `reqwest::Client`, so it's unit-testable against a
 /// mock HTTP server (wiremock) without touching process env.
+///
+/// `scope` is what the calling mode will spend: see [`Mode::mint_scope`].
 async fn mint_service_token(
     client_id: &str,
     client_secret: &str,
     token_url: &str,
+    scope: &str,
     http: &reqwest::Client,
 ) -> Result<String, MintError> {
     let resp = http
@@ -427,7 +445,7 @@ async fn mint_service_token(
             ("grant_type", "client_credentials"),
             ("client_id", client_id),
             ("client_secret", client_secret),
-            ("scope", "claims:write"),
+            ("scope", scope),
         ])
         .send()
         .await?;
@@ -470,6 +488,7 @@ fn provider_writes_to_api(provider: &str) -> bool {
 /// BEFORE any LLM work in every writing mode.
 async fn resolve_token(
     api_base: &str,
+    scope: &str,
     http: &reqwest::Client,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // EPIGRAPH_TOKEN if present (non-empty) and used as-is; otherwise mint a
@@ -503,8 +522,9 @@ async fn resolve_token(
         } => {
             let token_url =
                 resolve_token_url(std::env::var("EPIGRAPH_OAUTH_TOKEN_URL").ok(), api_base);
-            eprintln!("token: minting via client_credentials at {token_url}");
-            let minted = mint_service_token(&client_id, &client_secret, &token_url, http).await?;
+            eprintln!("token: minting via client_credentials at {token_url} (scope={scope})");
+            let minted =
+                mint_service_token(&client_id, &client_secret, &token_url, scope, http).await?;
             eprintln!(
                 "token: minted via client_credentials (len={})",
                 minted.len()
@@ -644,7 +664,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Mode::writes` / `provider_writes_to_api`.
     let token = if mode.writes(&cli.provider) {
         eprintln!("api_base={api_base}");
-        resolve_token(&api_base, &http).await?
+        resolve_token(&api_base, mode.mint_scope(), &http).await?
     } else {
         eprintln!("token: not resolved — this mode performs no API write");
         String::new()
@@ -1207,6 +1227,56 @@ mod tests {
         assert!(provider_writes_to_api("fixture"));
     }
 
+    /// Retarget writes `/api/v1/edges`, which checks `edges:write`; the mint
+    /// must ask for it, and ONLY the retarget writers widen the scope.
+    #[test]
+    fn only_retarget_writers_mint_edges_write() {
+        assert_eq!(
+            mode_of(&["--retarget", "--apply"]).unwrap().mint_scope(),
+            "claims:write edges:write"
+        );
+        assert_eq!(
+            mode_of(&["--retarget", "--apply-plan", "m"])
+                .unwrap()
+                .mint_scope(),
+            "claims:write edges:write"
+        );
+        assert_eq!(mode_of(&[]).unwrap().mint_scope(), "claims:write");
+        assert_eq!(
+            mode_of(&["--apply-plan", "p"]).unwrap().mint_scope(),
+            "claims:write"
+        );
+    }
+
+    /// The scope reaches the token endpoint's form body verbatim: a mock that
+    /// only answers a request carrying `edges:write` must be satisfied.
+    #[tokio::test]
+    async fn mint_service_token_sends_the_requested_scope() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .and(body_string_contains("scope=claims%3Awrite+edges%3Awrite"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "edge-scoped"})),
+            )
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::new();
+        let token_url = format!("{}/oauth/token", server.uri());
+        let token = mint_service_token(
+            "client-id",
+            "client-secret",
+            &token_url,
+            "claims:write edges:write",
+            &http,
+        )
+        .await
+        .expect("the mock answers only a request carrying edges:write");
+        assert_eq!(token, "edge-scoped");
+    }
+
     // --- mint_service_token: HTTP mock coverage ---
 
     #[tokio::test]
@@ -1223,9 +1293,15 @@ mod tests {
 
         let http = reqwest::Client::new();
         let token_url = format!("{}/oauth/token", server.uri());
-        let token = mint_service_token("client-id", "client-secret", &token_url, &http)
-            .await
-            .expect("mock server returns a valid token");
+        let token = mint_service_token(
+            "client-id",
+            "client-secret",
+            &token_url,
+            "claims:write",
+            &http,
+        )
+        .await
+        .expect("mock server returns a valid token");
         assert_eq!(token, "minted-jwt-value");
     }
 
@@ -1242,9 +1318,15 @@ mod tests {
 
         let http = reqwest::Client::new();
         let token_url = format!("{}/oauth/token", server.uri());
-        let err = mint_service_token("client-id", "wrong-secret", &token_url, &http)
-            .await
-            .expect_err("401 must surface as an Err, not a silently empty string");
+        let err = mint_service_token(
+            "client-id",
+            "wrong-secret",
+            &token_url,
+            "claims:write",
+            &http,
+        )
+        .await
+        .expect_err("401 must surface as an Err, not a silently empty string");
         assert!(matches!(err, MintError::HttpStatus(status) if status == 401));
     }
 
@@ -1259,9 +1341,15 @@ mod tests {
 
         let http = reqwest::Client::new();
         let token_url = format!("{}/oauth/token", server.uri());
-        let err = mint_service_token("client-id", "client-secret", &token_url, &http)
-            .await
-            .expect_err("a malformed JSON body must surface as an Err");
+        let err = mint_service_token(
+            "client-id",
+            "client-secret",
+            &token_url,
+            "claims:write",
+            &http,
+        )
+        .await
+        .expect_err("a malformed JSON body must surface as an Err");
         assert!(matches!(err, MintError::MalformedResponse(_)));
     }
 
@@ -1279,9 +1367,15 @@ mod tests {
 
         let http = reqwest::Client::new();
         let token_url = format!("{}/oauth/token", server.uri());
-        let err = mint_service_token("client-id", "client-secret", &token_url, &http)
-            .await
-            .expect_err("a response with no access_token field must be a clear error");
+        let err = mint_service_token(
+            "client-id",
+            "client-secret",
+            &token_url,
+            "claims:write",
+            &http,
+        )
+        .await
+        .expect_err("a response with no access_token field must be a clear error");
         assert!(matches!(err, MintError::MalformedResponse(_)));
     }
 
