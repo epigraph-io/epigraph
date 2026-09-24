@@ -16,13 +16,20 @@ use epigraph_mcp::types::RecallParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+/// A server WITH a `ScopedPool`, the shape `main` builds on both transports.
+///
+/// Required, not incidental: the audit owner is now read on a transaction
+/// stamped from the request principal's own viewer, never minted on the
+/// unstamped pool (#493, `tools/recall.rs::recall_audit_owner_group`). A server
+/// with no `ScopedPool` has no such transaction and DROPS the audit row.
+async fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false)
+    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false).with_scoped_pool(scoped)
 }
 
 /// A viewer for a REAL principal — an agent row with a personal group.
@@ -94,7 +101,7 @@ async fn recall_logs_the_claim_ids_it_returned(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let hit = seed_claim(&pool, agent, "wextonium audit fixture").await;
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall(&server, &viewer, params("wextonium"))
         .await
         .expect("recall ok");
@@ -153,7 +160,7 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
         .await
         .expect("drop");
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall(&server, &viewer, params("brentalix"))
         .await
         .expect("recall must succeed even when the audit log is unwritable");
@@ -198,7 +205,7 @@ async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
         .unwrap()
         .to_rfc3339();
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let mut p = params("quorbiline");
     p.since = Some(since.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
     recall(&server, &viewer, p).await.expect("recall ok");
@@ -331,7 +338,7 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
     // call takes the PAGE path rather than the empty early return.
     seed_paragraph(&pool, agent, "quorbiline context window fixture", &pgvec).await;
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall_with_context_with_pgvec(
         &server,
         &viewer,
@@ -385,7 +392,7 @@ async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPo
         .await
         .expect("backdate");
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall_with_context_with_pgvec(
         &server,
         &viewer,
@@ -456,7 +463,7 @@ async fn recall_audit_row_is_owned_by_the_request_principal_not_the_process(pool
         .expect("resolve the request principal");
     let hit = seed_claim(&pool, principal, "zelmaraq principal fixture").await;
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let process_agent = server
         .server_agent_id()
         .await

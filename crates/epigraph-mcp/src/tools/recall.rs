@@ -301,7 +301,15 @@ pub(crate) enum AuditOwnerUnresolved {
     /// defensive arm, and it drops rather than widening for the same reason the
     /// lookup failure does.
     NoPrincipal,
-    /// There IS a principal and its personal group could not be resolved.
+    /// The process built no `ScopedPool`, so there is no connection on which
+    /// the principal's own rows are visible. Reading on the unstamped pool
+    /// instead is the defect this helper was rewritten for (#493), so it drops.
+    NoScopedPool,
+    /// The principal holds no LIVE membership of its personal group: never
+    /// provisioned, or revoked. Either way this read path does not provision it
+    /// — see [`recall_audit_owner_group`].
+    NoLivePersonalGroup,
+    /// There IS a principal and the read itself failed.
     Lookup(epigraph_db::DbError),
 }
 
@@ -309,13 +317,20 @@ impl std::fmt::Display for AuditOwnerUnresolved {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoPrincipal => f.write_str("the call carried no principal"),
+            Self::NoScopedPool => {
+                f.write_str("the process has no ScopedPool to read the principal's group on")
+            }
+            Self::NoLivePersonalGroup => f.write_str(
+                "the principal holds no live membership of its personal group (never \
+                 provisioned, or revoked); a recall does not provision one",
+            ),
             Self::Lookup(e) => write!(f, "the principal's personal group could not be read: {e}"),
         }
     }
 }
 
 /// The group that will own a recall audit row: **the request principal's**
-/// personal group.
+/// personal group — READ, never minted.
 ///
 /// `principal` is [`Viewer::principal`](epigraph_db::Viewer::principal), not
 /// `EpiGraphMcpFull::agent_id`, and the distinction is the security property.
@@ -325,16 +340,51 @@ impl std::fmt::Display for AuditOwnerUnresolved {
 /// HTTP transport they are not, and owning the row from the process identity
 /// would both misattribute it and suppress it from the agent that authored it.
 ///
+/// # Why it no longer calls `personal_group_of_pool` (#493)
+///
+/// That helper is read-first-then-MINT, and its read ran on the UNSTAMPED pool,
+/// where `groups_tenancy` hides every group from an `epigraph_app` connection.
+/// So on every recall the read reported "no group", and the mint —
+/// `epigraph_ensure_personal_group`, whose migration-077 body is `ON CONFLICT
+/// … DO UPDATE SET revoked_at = NULL, role = 'admin'` — revived a revoked
+/// principal's personal membership as admin. A recall is a read; it has no
+/// standing to change anyone's membership, so it now never provisions at all.
+///
+/// The read runs on a transaction stamped from the principal's OWN viewer (the
+/// `system_agent_write_authority` pattern), where the personal group is visible
+/// iff the principal holds a live membership of it. Liveness is then checked a
+/// second time against the viewer's group set, which `Viewer::resolve` read
+/// through the `epigraph_live_memberships` definer. The second check is what
+/// makes the answer independent of the connection's role: on a BYPASSRLS
+/// connection the group row reads back whether or not the membership is live,
+/// and "visible" alone would own a revoked principal's audit row by the group
+/// it was revoked from.
+///
 /// # Errors
 /// [`AuditOwnerUnresolved`] — see that type: every variant means drop the row.
 pub(crate) async fn recall_audit_owner_group(
-    pool: &sqlx::PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
     principal: Option<Uuid>,
 ) -> Result<Uuid, AuditOwnerUnresolved> {
     let principal = principal.ok_or(AuditOwnerUnresolved::NoPrincipal)?;
-    epigraph_db::ClaimRepository::personal_group_of_pool(pool, principal)
+    let scoped = scoped.ok_or(AuditOwnerUnresolved::NoScopedPool)?;
+    let viewer = epigraph_db::Viewer::resolve(scoped.inner(), principal)
         .await
-        .map_err(AuditOwnerUnresolved::Lookup)
+        .map_err(AuditOwnerUnresolved::Lookup)?;
+    let mut tx = scoped
+        .begin_as(&viewer)
+        .await
+        .map_err(AuditOwnerUnresolved::Lookup)?;
+    let group =
+        epigraph_db::GroupMembershipRepository::visible_personal_group_conn(&mut tx, principal)
+            .await
+            .map_err(AuditOwnerUnresolved::Lookup)?;
+    // Read-only; dropping the transaction rolls it back.
+    drop(tx);
+    match group {
+        Some(g) if viewer.group_bind().is_some_and(|live| live.contains(&g)) => Ok(g),
+        _ => Err(AuditOwnerUnresolved::NoLivePersonalGroup),
+    }
 }
 
 /// Spawn the fire-and-forget recall audit write (backlog 8cbffa0e).
@@ -358,13 +408,14 @@ fn spawn_recall_audit(
     let query = query.to_string();
     let pgvec = pgvec.to_string();
     let pool = server.pool.clone();
+    let scoped = server.scoped.clone();
     tokio::spawn(async move {
-        // Resolved inside the spawn: everything this needs is an owned `Uuid`,
-        // so nothing here borrows the request, and the group lookup — a pool
-        // acquire, a SELECT, and on an agent's first recall a personal-group
-        // mint — stays off the response path. `058_recall_events.sql`'s own
-        // table comment is the contract: "never blocks a recall".
-        let owner_group_id = match recall_audit_owner_group(&pool, principal).await {
+        // Resolved inside the spawn: everything this needs is owned, so nothing
+        // here borrows the request, and the group lookup — a viewer resolve and
+        // one stamped SELECT, never a mint (#493) — stays off the response
+        // path. `058_recall_events.sql`'s own table comment is the contract:
+        // "never blocks a recall".
+        let owner_group_id = match recall_audit_owner_group(scoped.as_ref(), principal).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(
@@ -406,9 +457,14 @@ pub struct RecallWithContextResponse {
     pub epistemic_partition: Option<crate::types::EpistemicPartition<RecallHit>>,
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
-    /// Id of the audit row logged for this retrieval (backlog 8cbffa0e), so a
-    /// caller can cite which recall fed a downstream decision. Omitted when
-    /// the audit write was not attempted.
+    /// Id the audit row for this retrieval is written under (backlog
+    /// 8cbffa0e), so a caller can cite which recall fed a downstream decision.
+    ///
+    /// The id is minted BEFORE the write, and the write is asynchronous and
+    /// best-effort, so an id is not proof that a row exists: the row is dropped
+    /// (logged server-side, never widened) when the caller has no live
+    /// membership of its own personal group — a recall never provisions one
+    /// (#493) — when the process has no `ScopedPool`, or when the insert fails.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recall_event_id: Option<String>,
 }
@@ -2398,8 +2454,61 @@ pub mod __test_only {
 #[cfg(test)]
 mod tests {
     use super::{recall_audit_owner_group, AuditOwnerUnresolved};
+    use epigraph_db::{AgentRepository, GroupMembershipRepository, GroupRepository, ScopedPool};
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    /// A `ScopedPool` over the `#[sqlx::test]` database. The URL is derived from
+    /// the pool's connect options rather than `SELECT current_database()`
+    /// because `no_inline_sql_in_tools.rs` counts every `sqlx::query*` under
+    /// `src/tools/`, test modules included, and `recall.rs` is registered at
+    /// zero test sites. Same derivation as `maintenance.rs`'s fixture.
+    async fn scoped(pool: &PgPool) -> ScopedPool {
+        let db = pool
+            .connect_options()
+            .get_database()
+            .expect("the #[sqlx::test] pool names its ephemeral database")
+            .to_string();
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let (authority, query) = match base.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (base.as_str(), None),
+        };
+        let prefix = authority
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0;
+        let url = match query {
+            Some(q) => format!("{prefix}/{db}?{q}"),
+            None => format!("{prefix}/{db}"),
+        };
+        ScopedPool::connect(&url, epigraph_db::SessionGucMode::Session)
+            .await
+            .expect("ScopedPool::connect over the ephemeral test database")
+    }
+
+    /// Seeded through the repo layer, not an inline INSERT: `recall.rs` is
+    /// registered in `no_inline_sql_in_tools.rs` at zero cfg(test) SQL sites,
+    /// and a fixture is not a reason to move that number.
+    async fn seed_agent(pool: &PgPool, label: &str) -> Uuid {
+        let pk: [u8; 32] = *Uuid::new_v4().as_bytes().repeat(2).first_chunk().unwrap();
+        AgentRepository::create(
+            pool,
+            &epigraph_core::Agent::new(pk, Some(label.to_string())),
+        )
+        .await
+        .expect("seed agent")
+        .id
+        .as_uuid()
+    }
+
+    async fn personal_group_row(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+        GroupRepository::get_by_did_key(pool, &format!("did:epigraph:personal:{agent}"))
+            .await
+            .expect("group lookup")
+            .map(|g| g.id)
+    }
 
     /// The DROP arms, asserted directly rather than through a handler.
     ///
@@ -2407,59 +2516,113 @@ mod tests {
     /// appeared" — would pass whenever the spawned write is merely slow, which
     /// is the false-green shape this suite rejects elsewhere. At the helper the
     /// answer is a value, not a race.
-    ///
-    /// Both arms exist because they used to be one: the earlier
-    /// `Result<Option<Uuid>, DbError>` spelling made "no principal" a
-    /// SUCCESS that selected the instance-wide declaration, so the two failure
-    /// modes disagreed about whether to publish the row.
     #[sqlx::test(migrations = "../../migrations")]
     async fn an_unresolvable_principal_is_an_error_not_a_widening(pool: PgPool) {
+        let scoped = scoped(&pool).await;
         assert!(
             matches!(
-                recall_audit_owner_group(&pool, None).await,
+                recall_audit_owner_group(Some(&scoped), None).await,
                 Err(AuditOwnerUnresolved::NoPrincipal)
             ),
             "no principal must be an error the caller has to handle, never an \
              owner-less row"
         );
-
-        // A uuid that is not an `agents` row: the group cannot be resolved and
-        // cannot be minted either.
         assert!(
             matches!(
-                recall_audit_owner_group(&pool, Some(Uuid::new_v4())).await,
-                Err(AuditOwnerUnresolved::Lookup(_))
+                recall_audit_owner_group(None, Some(Uuid::new_v4())).await,
+                Err(AuditOwnerUnresolved::NoScopedPool)
             ),
-            "a principal whose group cannot be resolved must take the same drop \
-             path as no principal at all"
+            "without a ScopedPool the only remaining read is the blind unstamped one \
+             (#493); it must drop instead"
+        );
+        // A uuid that is not an `agents` row has no live personal group, and
+        // this read path mints nothing for it.
+        assert!(
+            matches!(
+                recall_audit_owner_group(Some(&scoped), Some(Uuid::new_v4())).await,
+                Err(AuditOwnerUnresolved::NoLivePersonalGroup)
+            ),
+            "a principal with no live personal group must take the drop path"
         );
     }
 
-    /// The positive direction, on the same plant: a real agent resolves, and
-    /// resolves to the SAME group on the second call — `personal_group_of` is
-    /// mint-if-absent, and a helper that minted a fresh group per recall would
-    /// scatter one agent's history across groups instead of scoping it.
+    /// The positive direction: a live member resolves to its personal group,
+    /// and to the SAME group on every call.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn a_real_principal_resolves_to_one_stable_group(pool: PgPool) {
-        // Seeded through the repo layer, not an inline INSERT: `recall.rs` is
-        // registered in `no_inline_sql_in_tools.rs` at zero cfg(test) SQL
-        // sites, and a fixture is not a reason to move that number.
-        let pk: [u8; 32] = *Uuid::new_v4().as_bytes().repeat(2).first_chunk().unwrap();
-        let agent = epigraph_db::AgentRepository::create(
-            &pool,
-            &epigraph_core::Agent::new(pk, Some("audit-owner-fixture".to_string())),
-        )
-        .await
-        .expect("seed agent")
-        .id
-        .as_uuid();
-
-        let first = recall_audit_owner_group(&pool, Some(agent))
+    async fn a_live_principal_resolves_to_its_personal_group(pool: PgPool) {
+        let scoped = scoped(&pool).await;
+        let agent = seed_agent(&pool, "audit-owner-live").await;
+        let mut conn = pool.acquire().await.unwrap();
+        let group = AgentRepository::ensure_personal_group(&mut conn, agent)
             .await
-            .expect("a real principal resolves");
-        let second = recall_audit_owner_group(&pool, Some(agent))
+            .expect("provision");
+        drop(conn);
+
+        let first = recall_audit_owner_group(Some(&scoped), Some(agent))
+            .await
+            .expect("a live principal resolves");
+        let second = recall_audit_owner_group(Some(&scoped), Some(agent))
             .await
             .expect("and resolves again");
+        assert_eq!(first, group, "the owner is the principal's personal group");
         assert_eq!(first, second, "one agent, one personal group, every call");
+    }
+
+    /// #493, the mint half: a recall by a principal with no personal group must
+    /// not provision one. The old helper was read-first-then-MINT.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_recall_never_provisions_a_personal_group(pool: PgPool) {
+        let scoped = scoped(&pool).await;
+        let agent = seed_agent(&pool, "audit-owner-unprovisioned").await;
+        assert!(personal_group_row(&pool, agent).await.is_none());
+
+        let res = recall_audit_owner_group(Some(&scoped), Some(agent)).await;
+        assert!(
+            matches!(res, Err(AuditOwnerUnresolved::NoLivePersonalGroup)),
+            "an unprovisioned principal's audit is dropped, got {res:?}"
+        );
+        assert!(
+            personal_group_row(&pool, agent).await.is_none(),
+            "a recall must not mint a personal group"
+        );
+    }
+
+    /// #493, the revive half: revoke, recall, and the membership is still
+    /// revoked and the audit is dropped rather than owned by the group the
+    /// principal was revoked from.
+    ///
+    /// Under `#[sqlx::test]`'s BYPASSRLS superuser the old helper's read was
+    /// NOT blind, so it found the group and returned it without minting; this
+    /// arm therefore catches the old helper by its `Ok` for a revoked principal.
+    /// The revival itself needs the blind `epigraph_app` read and is measured
+    /// on the real binary by `scripts/e2e/probe-unit-e.sh`'s RECALL arm.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_revoked_principal_is_dropped_and_stays_revoked(pool: PgPool) {
+        let scoped = scoped(&pool).await;
+        let agent = seed_agent(&pool, "audit-owner-revoked").await;
+        let mut conn = pool.acquire().await.unwrap();
+        let group = AgentRepository::ensure_personal_group(&mut conn, agent)
+            .await
+            .expect("provision");
+        drop(conn);
+        assert_eq!(
+            GroupMembershipRepository::remove_member(&pool, group, agent)
+                .await
+                .unwrap(),
+            1,
+            "revoke"
+        );
+
+        let res = recall_audit_owner_group(Some(&scoped), Some(agent)).await;
+        assert!(
+            matches!(res, Err(AuditOwnerUnresolved::NoLivePersonalGroup)),
+            "a revoked principal's audit is dropped, got {res:?}"
+        );
+        assert!(
+            !GroupMembershipRepository::is_member(&pool, group, agent)
+                .await
+                .unwrap(),
+            "the revocation must stand"
+        );
     }
 }

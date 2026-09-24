@@ -903,10 +903,12 @@ async fn recall_post_embed(
             "diversity_radius": params.diversity_radius,
         });
         let pool = server.pool.clone();
+        let scoped = server.scoped.clone();
         tokio::spawn(async move {
-            // Unresolvable ⇒ DROP, never widen. See `recall_audit_owner_group`.
+            // Unresolvable ⇒ DROP, never widen, and never mint (#493). See
+            // `recall_audit_owner_group`.
             let owner_group_id =
-                match super::recall::recall_audit_owner_group(&pool, principal).await {
+                match super::recall::recall_audit_owner_group(scoped.as_ref(), principal).await {
                     Ok(g) => g,
                     Err(e) => {
                         tracing::warn!(reason = %e, "recall audit skipped rather than widened");
@@ -1018,6 +1020,9 @@ struct RecallEnvelope {
     /// Present only when the caller asked for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     epistemic_partition: Option<crate::types::EpistemicPartition<RecallResult>>,
+    /// Same contract as `RecallWithContextResponse::recall_event_id`: the id the
+    /// audit row is written under, minted before an asynchronous best-effort
+    /// write, so it does not prove a row exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     recall_event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
