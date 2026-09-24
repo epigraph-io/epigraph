@@ -1,8 +1,10 @@
 -- 109_group_memberships_guards.sql
--- A roster guard on `group_memberships` that the tenancy policy cannot express.
+-- Two roster guards on `group_memberships` that the tenancy policy cannot
+-- express.
 --
--- One invoker trigger function and one BEFORE trigger on `group_memberships`.
--- No table, no policy change, no grant change, no rows written.
+-- Two invoker trigger functions and two BEFORE triggers on
+-- `group_memberships`. No table, no policy change, no grant change, no rows
+-- written.
 --
 -- ===================================================================
 -- 1. HARD DELETES: MIGRATION 106 OWNS THIS, AND THIS FILE ADDS NOTHING
@@ -77,11 +79,48 @@
 -- which the bypass admits anyway.
 --
 -- ===================================================================
+-- 3. A ROW'S (group_id, agent_id) IS ITS IDENTITY: NO APP SESSION MOVES IT
+--
+-- 106 closed the hard DELETE and section 1 records why nothing is stacked on
+-- it. An UPDATE that changes a row's `group_id` or `agent_id` is the same
+-- hole by another statement: it removes the row from the (group, agent) it
+-- recorded -- a revocation included -- exactly as a DELETE would, and places
+-- it under a (group, agent) that no roster rule vetted as an INSERT.
+-- `group_memberships_tenancy` (077) is FOR ALL and `epigraph_app` holds UPDATE
+-- on the table (the revoke, the epoch rotation and the key re-wrap all UPDATE
+-- it), and no policy or trigger restricted WHICH columns an UPDATE may change.
+-- Review measured the class: a moved revoked row is no longer seen by 105's
+-- "only revoked rows -> RVK01" nor by 107's refusal of links to a revoked
+-- operator, and a moved row of ANOTHER member leaves the group it belonged
+-- to. `operator_link.rs::an_app_session_cannot_move_a_membership_row` and
+-- `personal_group_no_revival.rs::a_revoked_agent_cannot_move_its_row_out_and_reprovision`
+-- pin the refusal.
+--
+-- So a BEFORE UPDATE row trigger refuses, outside the two escape hatches
+-- (`epigraph_bypass()` / `epigraph_definer_bypass()`, as in section 2), any
+-- change to `group_id` or `agent_id` (42501). Nothing in the application
+-- changes either column: every production UPDATE of this table writes
+-- `revoked_at` (`GroupMembershipRepository`), `wrapped_key_share` / `epoch`
+-- (`GroupKeyEpochRepository::rotate_conn`), or `revoked_at` / `role` inside
+-- 106's definer; the ON CONFLICT upserts (077's and the test fixtures') set
+-- `revoked_at` / `role` only. `epoch` stays writable. A trigger, not
+-- column-scoped grants, because a column REVOKE does not subtract from the
+-- table-level UPDATE 077 grants, and replacing that grant with a column list
+-- would have to track every future writable column. The `WHEN` clause keeps
+-- the trigger off every row whose identity does not change, and the
+-- foreign keys to `groups` / `agents` are ON UPDATE NO ACTION, so no
+-- referential action can fire it. Rotating a membership to another group is
+-- a revoke plus an INSERT, each vetted by the policy on its own.
+--
+-- ===================================================================
 -- UNDO
 --
 -- `DROP TRIGGER IF EXISTS group_memberships_no_retired_writer ON public.group_memberships;`
--- then `DROP FUNCTION IF EXISTS public.epigraph_group_memberships_no_retired_writer();`.
--- No rows to un-write. Hard deletes stay refused by 106's REVOKE either way.
+-- then `DROP FUNCTION IF EXISTS public.epigraph_group_memberships_no_retired_writer();`,
+-- and `DROP TRIGGER IF EXISTS group_memberships_identity_immutable ON public.group_memberships;`
+-- then `DROP FUNCTION IF EXISTS public.epigraph_group_memberships_identity_immutable();`.
+-- No rows to un-write. Hard deletes stay refused by 106's REVOKE either way;
+-- dropping the second trigger reopens section 3's move.
 -- **Applied to a throwaway database only, NOT to any deployed database.**
 -- ===================================================================
 
@@ -111,3 +150,26 @@ CREATE TRIGGER group_memberships_no_retired_writer
     FOR EACH ROW
     WHEN (NEW.revoked_at IS NULL AND NEW.role IN ('writer', 'admin'))
     EXECUTE FUNCTION public.epigraph_group_memberships_no_retired_writer();
+
+-- Section 3.
+CREATE OR REPLACE FUNCTION public.epigraph_group_memberships_identity_immutable()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_bypass() OR public.epigraph_definer_bypass() THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'group_memberships: a membership''s group_id and agent_id are its '
+                    'identity and cannot be changed (migration 109 section 3); revoke the '
+                    'row and insert a new one instead'
+        USING ERRCODE = '42501';
+END $$;
+
+DROP TRIGGER IF EXISTS group_memberships_identity_immutable ON public.group_memberships;
+CREATE TRIGGER group_memberships_identity_immutable
+    BEFORE UPDATE OF group_id, agent_id ON public.group_memberships
+    FOR EACH ROW
+    WHEN (OLD.group_id IS DISTINCT FROM NEW.group_id
+          OR OLD.agent_id IS DISTINCT FROM NEW.agent_id)
+    EXECUTE FUNCTION public.epigraph_group_memberships_identity_immutable();

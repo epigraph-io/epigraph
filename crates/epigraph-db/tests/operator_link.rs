@@ -482,6 +482,132 @@ async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
     .expect("auth-lineage edge");
 }
 
+/// No app session can move a membership row between groups or agents
+/// (migration 109 section 3). Review measured two moves:
+///
+/// * an operated writer X, stamped from its live set, moved its OPERATOR's
+///   admin row out of the operator's group (`UPDATE 1`);
+/// * an operator O2 whose own row was revoked moved that row into a group it
+///   had just created, after which `epigraph_link_operator(new, O2)` went from
+///   RVK01 to `link_live = t, membership_created = t`.
+///
+/// Both are now 42501 and the rows are where they were. CALIBRATION: the
+/// operator's ordinary revoke of X (an UPDATE of `revoked_at`) still works as
+/// an app session, so the trigger refuses the identity change and not every
+/// UPDATE.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_app_session_cannot_move_a_membership_row(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "x").await;
+    assert!(link(&pool, x, operator).await.link_live);
+    let code_of = |r: &Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        r.as_ref().err().and_then(sqlstate)
+    };
+
+    // X moves the operator's admin row into its own group.
+    let xv = Viewer::resolve(&pool, x).await.expect("x viewer");
+    let moved = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &xv).await;
+        let r = sqlx::query(
+            "UPDATE group_memberships SET group_id = $1 WHERE group_id = $2 AND agent_id = $3",
+        )
+        .bind(x_group)
+        .bind(op_group)
+        .bind(operator)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&moved).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "an operated writer moved its operator's admin row out of the operator's group: {moved:?}"
+    );
+    assert_eq!(
+        membership_rows(&pool, op_group, operator).await,
+        vec![("admin".to_string(), false, 0)]
+    );
+
+    // A revoked operator moves its own row out of its group.
+    let (o2, og2) = fixture::seed_agent_with_group(&pool, "o2").await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(og2)
+    .bind(o2)
+    .execute(&pool)
+    .await
+    .expect("maintenance: revoke o2's own row");
+    let scratch = Uuid::new_v4();
+    let moved = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', '', false), \
+                    set_config('epigraph.writable_group_ids', '', false), \
+                    set_config('epigraph.principal_id', $1, false)",
+        )
+        .bind(o2.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp o2");
+        sqlx::query(
+            "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+             VALUES ($1, 'o2-scratch', 'did:epigraph:team:' || $1::text, $2, 'team', $3)",
+        )
+        .bind(scratch)
+        .bind(vec![0xEFu8; 32])
+        .bind(o2)
+        .execute(&mut *conn)
+        .await
+        .expect("CALIBRATION: o2 may create a group it owns");
+        let r = sqlx::query(
+            "UPDATE group_memberships SET group_id = $1 WHERE group_id = $2 AND agent_id = $3",
+        )
+        .bind(scratch)
+        .bind(og2)
+        .bind(o2)
+        .execute(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        code_of(&moved).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "a revoked operator moved its own revoked row out of its group: {moved:?}"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_operator(&mut conn, seed_bare_agent(&pool).await, o2)
+        .await
+        .expect_err("a link to an operator whose own row is revoked is still RVK01");
+    assert!(
+        matches!(err, epigraph_db::DbError::MembershipRevoked { .. }),
+        "{err:?}"
+    );
+    drop(conn);
+
+    // CALIBRATION: the operator's ordinary revoke of X is an UPDATE too.
+    let ov = Viewer::resolve(&pool, operator)
+        .await
+        .expect("operator viewer");
+    let revoked = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &ov).await;
+        let r = sqlx::query(
+            "UPDATE group_memberships SET revoked_at = now() \
+              WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(op_group)
+        .bind(x)
+        .execute(&mut *conn)
+        .await
+        .expect("CALIBRATION: the operator revokes X as an app session");
+        (conn, r.rows_affected())
+    })
+    .await;
+    assert_eq!(revoked, 1, "CALIBRATION: the revoke UPDATE landed");
+}
+
 /// A SHARED HTTP SIGNER is neither linkable nor an operator (107 section 9).
 ///
 /// Review's scope note: a mistaken entry for the shared signer in a
@@ -1276,7 +1402,10 @@ async fn concurrent_links_cannot_build_a_two_hop_chain(pool: PgPool) {
     let first = AgentRepository::link_operator(&mut c1, x, o)
         .await
         .expect("link(X, O) on connection 1");
-    assert!(first.link_live, "PREMISE: X -> O is an acting link: {first:?}");
+    assert!(
+        first.link_live,
+        "PREMISE: X -> O is an acting link: {first:?}"
+    );
 
     let pool2 = pool.clone();
     let second = tokio::spawn(async move {
@@ -1863,7 +1992,9 @@ async fn retiring_an_agent_that_still_holds_write_authority_is_refused(pool: PgP
 
     // The operator enrols its agents, as `epigraph_app` stamped from its own
     // viewer: the path review measured, not a harness shortcut.
-    let v = Viewer::resolve(&pool, operator).await.expect("operator viewer");
+    let v = Viewer::resolve(&pool, operator)
+        .await
+        .expect("operator viewer");
     fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         set_gucs_from(&mut conn, &v).await;
         for (agent, role) in [(writer, "writer"), (reader, "reader")] {
@@ -1887,7 +2018,11 @@ async fn retiring_an_agent_that_still_holds_write_authority_is_refused(pool: PgP
         .await
         .expect_err("retiring an agent with a live writer row in the operator group");
     assert!(err.to_string().contains("live writer/admin"), "{err}");
-    assert_eq!(link_row(&pool, writer).await, None, "a refused retire wrote a link row");
+    assert_eq!(
+        link_row(&pool, writer).await,
+        None,
+        "a refused retire wrote a link row"
+    );
 
     // CALIBRATION: a reader row grants no write and does not refuse.
     let out = AgentRepository::link_retired_agent(&mut conn, reader, operator)
