@@ -22,10 +22,10 @@
 //! and a `ScopedRead<'_>` borrowed from `AppState` cannot outlive the request.
 //! Their owner is `ScopedPool::begin_as` plus `Viewer::splice_write`.
 //!
-//! `supersede_claim` additionally carries an open entry whose owner is the
-//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
-//! This shard does not touch it and it stays open. Nothing further about it is
-//! recorded here — see `docs/tenancy/progress.json`.
+//! `supersede_claim`'s ownership read (`F-write-authz-reads-unfiltered`) is
+//! now viewer-filtered on a stamped connection (batch H6): a caller cannot
+//! supersede a claim it cannot read. The write itself is still on the raw
+//! pool, and it is still one of the 8 sites above.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -261,18 +261,45 @@ pub async fn supersede_claim(
             reason: "Truth value must be between 0.0 and 1.0".to_string(),
         })?;
 
-    // 6. Fetch agent_id for event emission before supersession
-    let agent_uuid: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-        .bind(claim_id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("DB error: {e}"),
-        })?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: claim_id.to_string(),
+    // 6. The claim's owner, which the ownership gate below decides on, read
+    //    through the CALLER's viewer on a viewer-stamped connection.
+    //
+    //    This was `SELECT agent_id FROM claims WHERE id = $1` on the raw pool,
+    //    unfiltered while the handler held a Viewer (F-write-authz-reads-unfiltered,
+    //    backlog 30c29c52). A `claims:admin` principal could therefore supersede
+    //    a claim it cannot READ, because the gate asked only whose it was. A claim
+    //    the caller cannot see is now 404, exactly like one that does not exist.
+    //
+    //    READ authority, `{VISIBILITY:c}` through `get_by_id`, and deliberately
+    //    not the write gate `{WRITABLE:c}`. A writable-filtered read would
+    //    also refuse a `claims:admin` supersede of another agent's claim in a
+    //    group the admin cannot write. That supersede works on production's
+    //    schema today, and whether admin scope carries write authority across
+    //    groups is the cross-agent ownership decision (#374), not this read's.
+    let agent_uuid: Uuid = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "supersede_claim",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
         })?;
+        ClaimRepository::get_by_id(&mut *read, &viewer, ClaimId::from_uuid(claim_id))
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("DB error: {e}"),
+            })?
+            .ok_or_else(|| ApiError::NotFound {
+                entity: "Claim".to_string(),
+                id: claim_id.to_string(),
+            })?
+            .agent_id
+            .as_uuid()
+    };
 
     // 6b. Ownership / admin gate
     crate::middleware::scopes::require_owner_or_admin(&auth, agent_uuid)?;

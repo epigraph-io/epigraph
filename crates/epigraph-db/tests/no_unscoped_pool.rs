@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 296;
+const HIGH_WATER: usize = 294;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -590,12 +590,15 @@ const HIGH_WATER: usize = 296;
 /// `HIGH_WATER` 298 -> 297, the file keeping 24 sites. Batch F's community
 /// membership fix took `routes/community.rs` 3 -> 2 and `HIGH_WATER` 297 ->
 /// 296, the file keeping 2 sites, read off `the_scanner_is_not_vacuous`'s own
-/// failure on the converted tree.
+/// failure on the converted tree. Batch H6 took `routes/versioning.rs` 8 -> 7
+/// and `routes/workflows.rs` 24 -> 23 (the two write-path authorization reads
+/// moved onto `AppState::read_as`), so `HIGH_WATER` 296 -> 294 with both files
+/// keeping sites, read off the same failure (`left: 294, right: 296`).
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
-/// 298 sites across 44 files as of this commit. Lower an entry when a shard
+/// 294 sites across 44 files as of this commit. Lower an entry when a shard
 /// converts sites; delete the key when it reaches zero.
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
@@ -804,7 +807,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // blocked at SITE level: `let pool = state.db_pool.clone()` is moved into a
     // detached `tokio::spawn`, which a `ScopedRead<'_>` borrowed from
     // `AppState` cannot outlive.
-    ("routes/versioning.rs", 8),
+    //
+    // 8 -> 7 (batch H6): `supersede_claim`'s ownership read
+    // (`SELECT agent_id FROM claims WHERE id = $1`) moved onto
+    // `AppState::read_as` + `ClaimRepository::get_by_id` with the caller's
+    // viewer (F-write-authz-reads-unfiltered). Five `supersede_claim` sites and
+    // two `mark_duplicate` sites remain, all write. Read off this test's
+    // failure output.
+    ("routes/versioning.rs", 7),
     // `routes/voids.rs` was 3 and is GONE, not zeroed: PR-29, conversion shard 3,
     // moved all three onto `AppState::read_as` across its two handlers.
     // NOT exempt, and the decision is deliberate: a webhook subscription is
@@ -842,7 +852,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // whether it may provision needs a PRINCIPAL-stamped read of the agent's own
     // revoked memberships (the first revision minted on an empty live set and
     // revived a revoked admin). Read off this test's failure output.
-    ("routes/workflows.rs", 24),
+    //
+    // 24 -> 23 (batch H6): `deprecate_workflow`'s existence gate moved onto
+    // `AppState::read_as` + `ClaimRepository::get_by_id_with_labels` with the
+    // caller's viewer (F-write-authz-reads-unfiltered). Read off this test's
+    // failure output.
+    ("routes/workflows.rs", 23),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

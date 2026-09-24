@@ -98,10 +98,10 @@
 //! `("workflows.rs", 4)` accordingly. Nothing further about it is recorded
 //! here — see `docs/tenancy/progress.json`.
 //!
-//! `deprecate_workflow` additionally carries an open entry whose owner is the
-//! write-gate programme, not a read shard: `F-write-authz-reads-unfiltered`.
-//! This shard does not touch it and it stays open. Nothing further about it is
-//! recorded here — see `docs/tenancy/progress.json`.
+//! `deprecate_workflow`'s existence gate (`F-write-authz-reads-unfiltered`) is
+//! now viewer-filtered on a stamped connection (batch H6): a caller cannot
+//! deprecate a workflow claim it cannot read. Its writes are still among the
+//! unconverted sites above.
 //!
 //! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
 //! `("workflows.rs", 4)` and `ROUTE_LAYER_WRITES` still carries
@@ -1398,20 +1398,47 @@ pub async fn deprecate_workflow(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cascade = params.cascade.unwrap_or(false);
 
-    // Verify workflow exists
-    let _exists = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to check workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // The existence gate, read through the CALLER's viewer on a viewer-stamped
+    // connection. It was `SELECT id FROM claims WHERE id = $1 AND 'workflow' =
+    // ANY(labels)` on the raw pool, unfiltered while the handler held a Viewer
+    // (F-write-authz-reads-unfiltered, backlog 30c29c52), and it is this handler's
+    // ONLY gate. A caller could therefore deprecate a workflow claim it cannot
+    // read. An invisible workflow is now 404, exactly like a missing one. Read
+    // authority, not `{WRITABLE:c}`, for the reason given at the same gate in
+    // `versioning.rs::supersede_claim`. Whether a caller should be able to
+    // deprecate a workflow it can read but does not own is the open ownership
+    // question (#374 / backlog 84b2a98d), not this read's.
+    {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "deprecate_workflow",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let found = epigraph_db::ClaimRepository::get_by_id_with_labels(
+            &mut *read,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to check workflow: {e}"),
+        })?;
+        match found {
+            Some((_, labels)) if labels.iter().any(|l| l == "workflow") => {}
+            _ => {
+                return Err(ApiError::NotFound {
+                    entity: "workflow".into(),
+                    id: workflow_id.to_string(),
+                })
+            }
+        }
+    }
 
     // Collect IDs to deprecate
     let mut ids_to_deprecate = vec![workflow_id];
