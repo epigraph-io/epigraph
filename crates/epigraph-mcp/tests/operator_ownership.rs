@@ -533,7 +533,8 @@ async fn an_undeclared_stdio_signer_keeps_its_pre_107_arm_when_the_operator_look
 ///
 /// * the actor arm is stdio-only: an actor's HTTP principal is REFUSED on its
 ///   sibling's claim, where the same actor over stdio is admitted;
-/// * `request_viewer` gives an operated HTTP principal no viewer at all;
+/// * `request_viewer` gives an operated HTTP principal no viewer at all, and
+///   neither does a RETIRED one (the refusal keys on the link record);
 /// * CALIBRATION: the operator's own HTTP principal is still admitted on the
 ///   same claim, and still gets a viewer.
 #[sqlx::test(migrations = "../../migrations")]
@@ -559,6 +560,24 @@ async fn an_operated_agent_has_no_operator_authority_over_http(pool: PgPool) {
         epigraph_mcp::tools::viewer::request_viewer(&http_server, Some(&http_auth(Some(actor))))
             .await;
     let err = refused.expect_err("an operated HTTP principal was given a viewer");
+    assert!(err.message.contains("stdio-only"), "{}", err.message);
+
+    // A RETIRED link is refused too. The acting read says "not acting" for it
+    // (the PREMISE), so a refusal keyed on that read gave the retired agent a
+    // viewer, and with it any writer row it held in the operator's group.
+    let retired = agent(&pool, "retired").await;
+    link_retired(&pool, retired, operator).await;
+    assert!(
+        AgentRepository::operator_actor_pool(&pool, retired)
+            .await
+            .expect("actor read")
+            .is_none(),
+        "PREMISE: a retired link is never an acting one"
+    );
+    let refused =
+        epigraph_mcp::tools::viewer::request_viewer(&http_server, Some(&http_auth(Some(retired))))
+            .await;
+    let err = refused.expect_err("a retired agent's HTTP principal was given a viewer");
     assert!(err.message.contains("stdio-only"), "{}", err.message);
 
     // CALIBRATION: the same actor over stdio is admitted, and the operator's

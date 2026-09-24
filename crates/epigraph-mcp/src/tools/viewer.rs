@@ -160,11 +160,14 @@ pub async fn request_viewer(
     // HTTP: an OPERATED principal gets no viewer. Operated agents are
     // stdio-only (migration 107); token issuance refuses them, but a token
     // minted BEFORE the link would otherwise carry the operator's group in
-    // this viewer until it expired. Checked concurrently with the resolve, so
-    // it adds a round trip of work but no latency.
+    // this viewer until it expired. Keyed on the link RECORD (any state,
+    // retired included), not on the acting read, which can say "not acting"
+    // while the agent's writer row in the operator's group is live. Checked
+    // concurrently with the resolve, so it adds a round trip of work but no
+    // latency.
     let (viewer, actor) = tokio::join!(
         Viewer::resolve(&server.pool, principal),
-        epigraph_db::AgentRepository::operator_actor_pool(&server.pool, principal),
+        epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, principal),
     );
     match actor {
         Ok(None) => {}

@@ -15,15 +15,19 @@
 //! * linked (acting) -> 403;
 //! * CALIBRATION, unlinked, same client shape -> 200 with an access token, so
 //!   the refusal is the link and not the fixture;
-//! * retired link -> 200: a retired agent holds no membership, so its token
-//!   carries no operator authority (documented behaviour, not a gap).
+//! * retired link -> 403, like an acting one: the refusal keys on the link
+//!   RECORD, because a writer row that predates the retire would otherwise
+//!   ride the token onto HTTP (review measured the retire leaving such a row
+//!   live). The arm is calibrated by the same agent minting BEFORE the retire,
+//!   and by the acting read saying "not acting" for it after, so the refusal is
+//!   the record read and not the acting one.
 //!
 //! The REFRESH grant is covered on its own, because it is the arm where the
 //! check's ORDER matters: the old refresh token is burned by rotation, so a
 //! check that fails AFTER the burn cost the client its refresh chain.
 //!
 //! * an agent that is linked AFTER it minted -> its refresh is 403;
-//! * the operated-agent check itself FAILS (the actor read made uncallable)
+//! * the operated-agent check itself FAILS (the link-record read made uncallable)
 //!   -> 500, and the SAME refresh token still refreshes once the read is back:
 //!   a failure to answer never burns the token.
 //!
@@ -173,19 +177,41 @@ async fn an_operated_agent_cannot_mint_a_token_by_assertion(pool: PgPool) {
         "the refusal must say why and name the operator: {body}"
     );
 
-    // A RETIRED link does not refuse: no membership, so no operator authority.
+    // A RETIRED link refuses too. The acting read says "not acting" for a retired
+    // link (the PREMISE below), so a refusal keyed on it minted here -- and a
+    // writer row that predated the retire (review's measurement) then rode the
+    // token onto HTTP. Keyed on the link record, the retired agent is refused
+    // whatever its roster holds.
     let retired_key = SigningKey::from_bytes(&[0x43; 32]);
     let (retired, retired_client) = agent_with_active_client(&pool, &retired_key).await;
+    let (status, body) = assertion_grant(&pool, &retired_client, &retired_key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the agent mints before it is retired: {body}"
+    );
     let mut conn = pool.acquire().await.expect("acquire");
     AgentRepository::link_retired_agent(&mut conn, retired, operator)
         .await
         .expect("retired link");
     drop(conn);
+    assert!(
+        AgentRepository::operator_actor_pool(&pool, retired)
+            .await
+            .expect("actor read")
+            .is_none(),
+        "PREMISE: a retired link is never an acting one"
+    );
     let (status, body) = assertion_grant(&pool, &retired_client, &retired_key).await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "a retired agent holds no membership, so its token carries no operator authority: {body}"
+        StatusCode::FORBIDDEN,
+        "a retired agent minted a token: the refusal keyed on the acting read, which says \
+         'not acting' for a retired link: {body}"
+    );
+    assert!(
+        body.to_string().contains(&operator.to_string()),
+        "the refusal must name the operator: {body}"
     );
 }
 
@@ -255,7 +281,7 @@ async fn an_agent_linked_after_minting_cannot_refresh(pool: PgPool) {
 /// A FAILURE of the operated-agent check (not a refusal) leaves the refresh
 /// token intact.
 ///
-/// Review's measurement: with `epigraph_operator_actor` renamed away, the
+/// Review's measurement: with the operator read renamed away, the
 /// refresh returned 500 AFTER rotation had already revoked the token, and once
 /// the function was back the same token was 401 "Invalid or expired refresh
 /// token": an outage of the read (107 section 6 names a missing EXECUTE grant
@@ -268,19 +294,25 @@ async fn a_failed_operator_check_does_not_burn_the_refresh_token(pool: PgPool) {
     let (_agent, client_id) = agent_with_active_client(&pool, &key).await;
     let refresh = minted_refresh_token(&pool, &client_id, &key).await;
 
-    sqlx::query("ALTER FUNCTION public.epigraph_operator_actor(uuid) RENAME TO epigraph_operator_actor_gone")
-        .execute(&pool)
-        .await
-        .expect("make the actor read uncallable");
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_operator_of_author(uuid) \
+         RENAME TO epigraph_operator_of_author_gone",
+    )
+    .execute(&pool)
+    .await
+    .expect("make the link-record read uncallable");
     let (status, body) = refresh_grant(&pool, &refresh).await;
-    sqlx::query("ALTER FUNCTION public.epigraph_operator_actor_gone(uuid) RENAME TO epigraph_operator_actor")
-        .execute(&pool)
-        .await
-        .expect("restore the actor read");
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_operator_of_author_gone(uuid) \
+         RENAME TO epigraph_operator_of_author",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore the link-record read");
     assert_eq!(
         status,
         StatusCode::INTERNAL_SERVER_ERROR,
-        "PREMISE: with the actor read gone the refresh cannot be answered: {body}"
+        "PREMISE: with the link-record read gone the refresh cannot be answered: {body}"
     );
 
     let (status, body) = refresh_grant(&pool, &refresh).await;
@@ -383,6 +415,38 @@ async fn a_token_minted_before_the_link_is_refused_by_the_viewer(pool: PgPool) {
     assert!(
         body.contains("stdio-only"),
         "the refusal must say why: {body}"
+    );
+
+    // A RETIRED link is refused by the extractor too: its token was minted
+    // before the retire, and the acting read says "not acting" for it.
+    let retired_key = SigningKey::from_bytes(&[0x47; 32]);
+    let (retired, retired_client) = agent_with_active_client(&pool, &retired_key).await;
+    let (status, minted) = assertion_grant(&pool, &retired_client, &retired_key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "PREMISE: the unlinked agent mints: {minted}"
+    );
+    let retired_access = minted["access_token"]
+        .as_str()
+        .expect("access token")
+        .to_string();
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    let (status, body) = read(app.clone(), retired_access.clone()).await;
+    assert!(
+        body.contains("scoped connection"),
+        "CALIBRATION: before the retire the token reaches the handler: {status} {body}"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_retired_agent(&mut conn, retired, operator)
+        .await
+        .expect("retire the agent after its token was minted");
+    drop(conn);
+    let (status, body) = read(app, retired_access).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a retired agent's pre-retire token still resolved a viewer: {body}"
     );
 }
 
