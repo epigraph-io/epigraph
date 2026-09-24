@@ -246,7 +246,11 @@ Current reservation:
   personal membership is returned with its role kept and nothing written; only
   REVOKED rows (any epoch) RAISE SQLSTATE `RVK01`, which
   `epigraph-db/src/errors.rs` maps to `DbError::MembershipRevoked`; no row of
-  any state provisions exactly as before. 077's body ended in `ON CONFLICT …
+  any state provisions exactly as before. Before any of that, the group under
+  the canonical did_key must be the agent's own (`kind = 'personal'` and
+  `created_by_agent_id` = the agent), or it RAISEs SQLSTATE `RVK02`
+  (`DbError::PersonalGroupNotOwned`): a group another agent created under that
+  key is a squat, not a personal group. 077's body ended in `ON CONFLICT …
   DO UPDATE SET revoked_at = NULL, role = 'admin'`, so every call revived a
   revocation and promoted a demotion. Re-states 077's owner / `REVOKE … FROM
   PUBLIC` / `GRANT EXECUTE … TO epigraph_app` block (idempotent). Pinned by

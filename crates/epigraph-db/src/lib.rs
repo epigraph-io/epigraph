@@ -64,7 +64,7 @@ pub mod visibility;
 // it, and it re-exported `COARSE_EDGE_TYPES` from `repos::structural` purely to
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
-pub use errors::{DbError, PERSONAL_MEMBERSHIP_REVOKED};
+pub use errors::{DbError, PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED};
 pub use label_validation::reject_unexpanded_labels;
 pub use pool::{
     apply_statement_timeout, assert_maintenance_privilege, create_pool, create_pool_from_options,

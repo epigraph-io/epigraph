@@ -38,7 +38,9 @@ pub fn parse_uuid(s: &str) -> Result<uuid::Uuid, McpError> {
 /// which does the same for `NotFound`.
 ///
 /// `DbError::MembershipRevoked` (migration 105's refusal to restore a revoked
-/// personal-group membership) is `INVALID_REQUEST`: a denial of authority, not
+/// personal-group membership) and its sibling `DbError::PersonalGroupNotOwned`
+/// (105's refusal to join a group squatting the agent's personal did_key) are
+/// `INVALID_REQUEST`: a denial of authority, not
 /// a server fault, and not something the caller can fix by changing a
 /// parameter either — the same classification `tools::viewer::request_viewer`
 /// uses for a missing principal.
@@ -48,7 +50,8 @@ pub fn parse_uuid(s: &str) -> Result<uuid::Uuid, McpError> {
 pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
     match e {
         epigraph_db::DbError::InvalidData { reason } => invalid_params(reason),
-        epigraph_db::DbError::MembershipRevoked { message } => McpError {
+        epigraph_db::DbError::MembershipRevoked { message }
+        | epigraph_db::DbError::PersonalGroupNotOwned { message } => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(message),
             data: None,
@@ -94,5 +97,15 @@ mod tests {
             "a revoked membership is a denial, not a server fault"
         );
         assert!(revoked.message.contains("REVOKED"));
+
+        let squatted = db_caller_error(epigraph_db::DbError::PersonalGroupNotOwned {
+            message: "group g carries agent a's personal did_key but is not its personal group"
+                .to_string(),
+        });
+        assert_eq!(
+            squatted.code,
+            ErrorCode::INVALID_REQUEST,
+            "a squatted personal group is a denial, not a server fault"
+        );
     }
 }

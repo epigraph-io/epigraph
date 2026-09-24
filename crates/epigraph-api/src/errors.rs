@@ -403,6 +403,17 @@ impl From<DbError> for ApiError {
                         .to_string(),
                 }
             }
+            // Its sibling (RVK02): the group under the principal's personal
+            // did_key was created by somebody else. Same class, same reason
+            // for keeping the function's text out of the body.
+            DbError::PersonalGroupNotOwned { message } => {
+                tracing::warn!(detail = %message, "personal group is not the principal's own");
+                ApiError::Forbidden {
+                    reason: "the principal's personal group is not usable; clearing it is an \
+                             operator action"
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,

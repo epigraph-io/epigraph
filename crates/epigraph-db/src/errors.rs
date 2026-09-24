@@ -20,6 +20,12 @@ const CHECK_VIOLATION: &str = "23514";
 /// the same reason [`CHECK_VIOLATION`] is.
 pub const PERSONAL_MEMBERSHIP_REVOKED: &str = "RVK01";
 
+/// SQLSTATE `RVK02`: `epigraph_ensure_personal_group` refused because the group
+/// under the agent's canonical personal did_key is not the agent's own — not
+/// `kind = 'personal'`, or created by another agent (a squat). Migration 105.
+/// Same class as [`PERSONAL_MEMBERSHIP_REVOKED`], for the same reason.
+pub const PERSONAL_GROUP_NOT_OWNED: &str = "RVK02";
+
 /// Database operation errors
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -132,6 +138,15 @@ pub enum DbError {
     #[error("Personal-group membership revoked: {message}")]
     MembershipRevoked { message: String },
 
+    /// The group carrying the agent's canonical personal did_key is not the
+    /// agent's personal group (SQLSTATE [`PERSONAL_GROUP_NOT_OWNED`], migration
+    /// 105): somebody else created it under that name. The provisioning
+    /// function refuses to join it rather than seat the agent beside the
+    /// squatter. A DENIAL like [`Self::MembershipRevoked`], mapped the same way
+    /// (HTTP 403, MCP `INVALID_REQUEST`); clearing it is an operator action.
+    #[error("Personal group not owned by the agent: {message}")]
+    PersonalGroupNotOwned { message: String },
+
     /// Migration failed
     #[error("Migration failed: {source}")]
     MigrationFailed {
@@ -190,9 +205,32 @@ impl From<sqlx::Error> for DbError {
                     message: db_err.message().to_string(),
                 }
             }
+            // RVK02, migration 105's refusal to join a squatted personal group.
+            sqlx::Error::Database(db_err)
+                if db_err.code().as_deref() == Some(PERSONAL_GROUP_NOT_OWNED) =>
+            {
+                Self::PersonalGroupNotOwned {
+                    message: db_err.message().to_string(),
+                }
+            }
             // All other database errors become QueryFailed
             other => Self::QueryFailed { source: other },
         }
+    }
+}
+
+impl DbError {
+    /// `true` for migration 105's two refusals of a personal-group provisioning
+    /// call ([`Self::MembershipRevoked`], [`Self::PersonalGroupNotOwned`]): a
+    /// denial the caller cannot fix, never a server fault. Every surface that
+    /// maps a `DbError` to a status asks this one question, so a third refusal
+    /// added later is classified in one place.
+    #[must_use]
+    pub fn is_personal_group_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::MembershipRevoked { .. } | Self::PersonalGroupNotOwned { .. }
+        )
     }
 }
 

@@ -36,6 +36,9 @@
 --                                group (if absent) and one live epoch-0 `admin`
 --                                row.
 --
+-- and, before any of those, the group under the canonical did_key must be the
+-- agent's own (`kind = 'personal'`, created by it), or the call RAISEs 'RVK02'.
+--
 -- Signature and return shape are unchanged (`(uuid) RETURNS uuid`), so no caller
 -- has to change to keep compiling; each caller's handling of the refusal is its
 -- own decision and is made in the same commit.
@@ -57,6 +60,34 @@
 -- group has one member at one epoch in practice, but a revoked row at any epoch
 -- is the same operator decision, and an INSERT at epoch 0 beside it would be a
 -- revival spelled differently.
+--
+-- ===================================================================
+-- THE GROUP MUST BE THE AGENT'S OWN (a squatted group is refused)
+--
+-- 077 trusted ANY `groups` row carrying the canonical did_key. The key is only
+-- a naming convention, and `groups_tenancy`'s WITH CHECK asks only that
+-- `created_by_agent_id` be the stamped principal. MEASURED as `epigraph_app`,
+-- stamped as agent Z: Z inserted `groups (did_key = 'did:epigraph:personal:<V>',
+-- kind = 'personal', created_by_agent_id = Z)` and its own admin row (092's
+-- creator arm, roster empty), then this function for V returned THAT group and
+-- gave V an admin row beside Z's live admin row — Z sat inside V's personal
+-- group.
+--
+-- So both branches check, on the row they are about to use, that it IS the
+-- agent's personal group: `kind = 'personal' AND created_by_agent_id =
+-- p_agent`, the identity every legitimate creator writes (077/105 here, 071's
+-- retired shim, `tenancy_backfill`). Anything else RAISEs SQLSTATE 'RVK02',
+-- mapped to `DbError::PersonalGroupNotOwned`. The check runs AFTER the upsert
+-- too, because `ON CONFLICT (did_key) DO UPDATE` adopts a squat inserted
+-- concurrently between the read and the insert.
+--
+-- NOT checked: "no other agent holds a row". `routes/groups.rs::add_member`
+-- lets a group's admin add members with no `kind` check, so an owner may have
+-- shared its own personal group; a RAISE there would lock that owner out of
+-- its own group. The squat is stopped by the creator check alone: a squatter
+-- cannot write `created_by_agent_id = V` (WITH CHECK pins it to itself), and
+-- cannot add itself to V's real group (it is not V's admin, and the roster is
+-- not empty once this function has provisioned it).
 --
 -- ===================================================================
 -- THE LIVE PATH WRITES NOTHING
@@ -91,12 +122,26 @@ CREATE OR REPLACE FUNCTION public.epigraph_ensure_personal_group(p_agent uuid)
 RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 DECLARE
-    v_did   text := 'did:epigraph:personal:' || p_agent::text;
-    v_group uuid;
+    v_did     text := 'did:epigraph:personal:' || p_agent::text;
+    v_group   uuid;
+    v_kind    text;
+    v_creator uuid;
 BEGIN
-    SELECT g.id INTO v_group FROM public.groups g WHERE g.did_key = v_did;
+    SELECT g.id, g.kind, g.created_by_agent_id INTO v_group, v_kind, v_creator
+      FROM public.groups g WHERE g.did_key = v_did;
 
     IF v_group IS NOT NULL THEN
+        -- A squatted key: somebody else's group under this agent's name.
+        IF v_kind IS DISTINCT FROM 'personal' OR v_creator IS DISTINCT FROM p_agent THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RVK02',
+                MESSAGE = format(
+                    'group %s carries agent %s''s personal did_key but is not its personal '
+                    'group (kind %s, created by %s); epigraph_ensure_personal_group refuses '
+                    'to join it', v_group, p_agent, v_kind, v_creator),
+                HINT = 'An operator must inspect and remove the squatting group.';
+        END IF;
+
         -- A live row: keep it exactly as it is, role included. No write.
         IF EXISTS (SELECT 1 FROM public.group_memberships m
                     WHERE m.group_id = v_group
@@ -123,7 +168,17 @@ BEGIN
                                    created_by_agent_id)
         VALUES ('personal:' || p_agent::text, v_did, ''::bytea, 'personal', p_agent)
         ON CONFLICT (did_key) DO UPDATE SET updated_at = now()
-        RETURNING id INTO v_group;
+        RETURNING id, kind, created_by_agent_id INTO v_group, v_kind, v_creator;
+        -- The upsert adopts a row a concurrent squatter inserted after the read.
+        IF v_kind IS DISTINCT FROM 'personal' OR v_creator IS DISTINCT FROM p_agent THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RVK02',
+                MESSAGE = format(
+                    'group %s carries agent %s''s personal did_key but is not its personal '
+                    'group (kind %s, created by %s); epigraph_ensure_personal_group refuses '
+                    'to join it', v_group, p_agent, v_kind, v_creator),
+                HINT = 'An operator must inspect and remove the squatting group.';
+        END IF;
     END IF;
 
     -- No row of any state: first-time provisioning.

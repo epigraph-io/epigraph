@@ -206,7 +206,7 @@ pub(crate) async fn principal_agent_id(
     let agent_id = AgentRepository::ensure_for_client(&mut tx, client_row_id)
         .await
         .map_err(|e| match e {
-            epigraph_db::DbError::MembershipRevoked { .. } => ApiError::from(e),
+            e if e.is_personal_group_refusal() => ApiError::from(e),
             other => ApiError::InternalError {
                 message: format!("Failed to resolve principal agent: {other}"),
             },

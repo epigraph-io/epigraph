@@ -17,7 +17,9 @@
 //! * live row: the group, no write, role kept;
 //! * only revoked: `DbError::MembershipRevoked` (SQLSTATE `RVK01`), state
 //!   unchanged;
-//! * no row at all: first-time provisioning (group + live epoch-0 admin).
+//! * no row at all: first-time provisioning (group + live epoch-0 admin);
+//! * a group under the agent's did_key that the agent did not create:
+//!   `DbError::PersonalGroupNotOwned` (SQLSTATE `RVK02`), agent not seated.
 //!
 //! # Verified to fail
 //!
@@ -25,7 +27,9 @@
 //! databases carry 077's `ON CONFLICT … DO UPDATE SET revoked_at = NULL, role =
 //! 'admin'`), the revoked, reader, other-epoch and raw-SQL arms FAIL; the
 //! provisioning and concurrency arms pass on both, as they must. The recorded
-//! output is in the commit message.
+//! output is in the commit message. Each arm added after review (the squat,
+//! the ledger) was reverted on its own fix and failed; its commit carries that
+//! output.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -267,4 +271,91 @@ async fn the_owner_group_wrapper_refuses_a_revoked_author_on_every_role(pool: Pg
         "epigraph_app: a revoked author must be refused, got {r_app:?}"
     );
     assert_eq!(rows(&pool, revoked).await, vec![(0, "admin".into(), false)]);
+}
+
+/// A transaction on the `epigraph_app` pool stamped as `principal` with the
+/// given live group set: the three `set_config` calls `ScopedPool::begin_as`
+/// makes, transaction-scoped.
+async fn stamped<'a>(
+    app: &'a PgPool,
+    principal: Uuid,
+    groups: &[Uuid],
+) -> sqlx::Transaction<'a, sqlx::Postgres> {
+    let mut tx = app.begin().await.expect("begin as epigraph_app");
+    let set = groups
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, true), \
+                set_config('epigraph.writable_group_ids', $1, true), \
+                set_config('epigraph.principal_id', $2, true)",
+    )
+    .bind(&set)
+    .bind(principal.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("stamp");
+    tx
+}
+
+/// THE SQUAT (review finding, LOW). Agent Z, as `epigraph_app` stamped as
+/// itself, creates a group under VICTIM's canonical personal did_key and seats
+/// itself in it as admin. The policies admit both writes: `groups_tenancy`'s
+/// WITH CHECK pins only `created_by_agent_id` to the principal, and 092's
+/// creator arm admits the first roster row. Provisioning the victim must then
+/// REFUSE (RVK02) rather than seat it beside the squatter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_squatted_personal_group_is_refused(pool: PgPool) {
+    let app = app_pool(&pool).await;
+    let squatter = seed_agent(&pool).await;
+    let victim = seed_agent(&pool).await;
+
+    let mut tx = stamped(&app, squatter, &[]).await;
+    let g: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('squat', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $2) \
+         RETURNING id",
+    )
+    .bind(victim)
+    .bind(squatter)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the policies admit the squatting group row");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(g)
+    .bind(squatter)
+    .execute(&mut *tx)
+    .await
+    .expect("the creator arm admits the squatter's own admin row");
+    tx.commit().await.unwrap();
+
+    let res = ensure_as_app(&app, victim).await;
+    match res {
+        Err(DbError::PersonalGroupNotOwned { message }) => assert!(
+            message.contains(&victim.to_string()),
+            "the refusal names the agent, got: {message}"
+        ),
+        other => panic!("expected DbError::PersonalGroupNotOwned, got {other:?}"),
+    }
+    assert!(
+        rows(&pool, victim).await.is_empty(),
+        "the victim must not be seated in the squatted group"
+    );
+    let err =
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT public.epigraph_ensure_personal_group($1)")
+            .bind(victim)
+            .fetch_one(&app)
+            .await
+            .expect_err("raw SQL sees the refusal too");
+    assert_eq!(
+        err.as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))
+            .as_deref(),
+        Some(epigraph_db::PERSONAL_GROUP_NOT_OWNED)
+    );
 }
