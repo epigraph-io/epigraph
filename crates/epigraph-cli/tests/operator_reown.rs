@@ -2008,6 +2008,99 @@ async fn link_retired_dry_run_apply_and_refusal(pool: PgPool) {
     );
 }
 
+/// Run `link-retired` over `agents` for `operator`, dry run then apply, and
+/// assert both stop at the FIRST id with an operator refusal naming `code`,
+/// report every later id NOT-ATTEMPTED, exit 3, and write nothing.
+async fn assert_link_retired_stops_on_operator_refusal(
+    pool: &PgPool,
+    operator: Uuid,
+    agents: &[Uuid],
+    code: &str,
+) {
+    let dir = scratch_dir();
+    let file = dir.join("agents.txt");
+    let body: String = agents.iter().map(|a| format!("{a}\n")).collect();
+    std::fs::write(&file, body).unwrap();
+    let op = operator.to_string();
+    let before = snapshot(pool, false).await;
+    for apply in [false, true] {
+        let mut args = vec![
+            "link-retired",
+            "--agents-file",
+            file.to_str().unwrap(),
+            "--operator",
+            op.as_str(),
+        ];
+        if apply {
+            args.push("--apply");
+        }
+        let r = run_op(pool, &args).await;
+        assert_eq!(r.code, 3, "apply={apply}: {}", r.show());
+        assert!(
+            r.stdout
+                .contains(&format!("{}\tREFUSED-OPERATOR\t", agents[0])),
+            "apply={apply}: the first id must carry the OPERATOR refusal: {}",
+            r.show()
+        );
+        assert!(
+            r.stdout.contains(code),
+            "apply={apply}: the refusal must name {code}: {}",
+            r.show()
+        );
+        for later in &agents[1..] {
+            assert!(
+                r.stdout.contains(&format!("{later}\tNOT-ATTEMPTED\t")),
+                "apply={apply}: every later id must be reported NOT-ATTEMPTED: {}",
+                r.show()
+            );
+        }
+        assert_same(
+            &before,
+            &snapshot(pool, false).await,
+            &format!("link-retired refused on {code}, apply={apply}"),
+        );
+    }
+}
+
+/// `epigraph_link_retired_agent` resolves the operator's group through 105's
+/// `epigraph_ensure_personal_group`, so an operator whose OWN row in its
+/// personal group is only revoked is refused `RVK01` on every id. That is a
+/// fact about the operator, not the id: the run stops at the first id, reports
+/// the rest NOT-ATTEMPTED, and writes nothing, dry run or apply.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_stops_on_the_operators_revoked_own_membership_rvk01(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (a1, _) = fixture::seed_agent_with_group(&pool, "rvk01-retiree-1").await;
+    let (a2, _) = fixture::seed_agent_with_group(&pool, "rvk01-retiree-2").await;
+    let revoked = sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(fx.target)
+    .bind(fx.operator)
+    .execute(&pool)
+    .await
+    .expect("revoke the operator's own row in its personal group");
+    assert_eq!(revoked.rows_affected(), 1, "the operator held one live row");
+    assert_link_retired_stops_on_operator_refusal(&pool, fx.operator, &[a1, a2], "RVK01").await;
+}
+
+/// The same for `RVK02`: the group under the operator's personal did_key was
+/// created by someone else (a squat that predates 108's INSERT guard).
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_stops_on_a_squatted_operator_group_rvk02(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let (a1, _) = fixture::seed_agent_with_group(&pool, "rvk02-retiree-1").await;
+    let (a2, _) = fixture::seed_agent_with_group(&pool, "rvk02-retiree-2").await;
+    sqlx::query("UPDATE groups SET created_by_agent_id = $2 WHERE id = $1")
+        .bind(fx.target)
+        .bind(fx.stranger)
+        .execute(&pool)
+        .await
+        .expect("make the operator's group a squat (superuser: 108 admits a maintenance session)");
+    assert_link_retired_stops_on_operator_refusal(&pool, fx.operator, &[a1, a2], "RVK02").await;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Opt-in evidence hiding (Amendment 2): selectors, preview and refusals
 // ─────────────────────────────────────────────────────────────────────────────

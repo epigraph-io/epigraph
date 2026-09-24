@@ -145,7 +145,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             let results = link::run(&mut conn, &agents, op, apply).await?;
             let mut refused = 0;
             for (a, s) in &results {
-                if matches!(s, link::LinkStatus::Refused(_)) {
+                if s.is_refusal() {
                     refused += 1;
                 }
                 println!("{}", link::describe(*a, s));
