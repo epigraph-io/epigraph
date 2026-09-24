@@ -284,9 +284,13 @@ Current reservation:
   reader deleted its admin's row, an emptied group re-bootstrapped). Pinned by
   `epigraph-db/tests/community_membership_integrity.rs` as `epigraph_app`.
   **No undo runbook ships**: reversing it is two `DROP FUNCTION IF EXISTS`
-  (named in the file) plus the pre-batch-F `community.rs`; it creates no rows.
-  **No deploy precondition.** **Claimed 2026-09-24.** **Applied to a throwaway
-  database only, NOT to any deployed database.**
+  (named in the file), `GRANT DELETE ON group_memberships TO epigraph_app`
+  (which restores the hole), and the pre-batch-F `community.rs`; it creates no
+  rows. **No deploy precondition in this repository**; deploy note: a consumer
+  OUTSIDE this repository that deletes `group_memberships` rows as
+  `epigraph_app` will get 42501 after this file (none exists in-tree; not
+  verified for out-of-repo consumers). **Claimed 2026-09-24.** **Applied to a
+  throwaway database only, NOT to any deployed database.**
 - **107+**: public next
 
 Next public migration **outside both reserved tenancy ranges** must be `107` or
