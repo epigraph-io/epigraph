@@ -26,9 +26,19 @@
 //! * the operated-agent check itself FAILS (the actor read made uncallable)
 //!   -> 500, and the SAME refresh token still refreshes once the read is back:
 //!   a failure to answer never burns the token.
+//!
+//! The last two mint arms each get their own test through the same route, each
+//! calibrated by the same flow minting for an unlinked agent:
+//!
+//! * `authorization_code`: a code whose `human` client is linked to an agent
+//!   that becomes operated -> 403 naming the operator;
+//! * the external-provider grant (`providers::provision::provision_external_user`):
+//!   the first grant provisions the identity's client and agent (200); once
+//!   that agent is operated, the next grant (the warm path) -> 403.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+mod oauth_providers;
 
 use axum::{
     body::Body,
@@ -373,5 +383,225 @@ async fn a_token_minted_before_the_link_is_refused_by_the_viewer(pool: PgPool) {
     assert!(
         body.contains("stdio-only"),
         "the refusal must say why: {body}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The two remaining mint arms (stage-2 still_open): `authorization_code` and
+// the external-provider provision grant. Each goes through the real
+// `/oauth/token` route, each is calibrated by the SAME flow succeeding for an
+// unlinked agent, and each refuses only once the agent has an ACTING link.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REDIRECT_URI: &str = "https://claude.ai/api/mcp/auth_callback";
+const VERIFIER: &str = "a-fixed-pkce-code-verifier-for-the-operated-agent-token-tests-0001";
+
+/// A `human` OAuth client already linked to `agent` (the warm path of
+/// `principal_agent_id`), and one fresh authorization code for it. Returns the
+/// varchar client id and the raw code.
+async fn human_client_with_code(pool: &PgPool, agent: Uuid) -> (String, String) {
+    use epigraph_db::repos::authorization_code::AuthorizationCodeRepository;
+    use sha2::{Digest, Sha256};
+
+    let unique = Uuid::new_v4().simple().to_string();
+    let client_id = format!("operated_code_{unique}");
+    let row: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, 'operated-code-test', 'human', ARRAY['claims:read'], \
+                 ARRAY['claims:read'], 'active', $2) \
+         RETURNING id",
+    )
+    .bind(&client_id)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("human client linked to the agent");
+    let code = format!("code_{unique}");
+    let challenge = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        Sha256::digest(VERIFIER.as_bytes()),
+    );
+    AuthorizationCodeRepository::create(
+        pool,
+        blake3::hash(code.as_bytes()).as_bytes(),
+        &client_id,
+        row,
+        REDIRECT_URI,
+        &challenge,
+        &["claims:read".to_string()],
+        None,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    )
+    .await
+    .expect("authorization code");
+    (client_id, code)
+}
+
+async fn post_token(state: AppState, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = create_router(state).oneshot(req).await.expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn redeem(pool: &PgPool, client_id: &str, code: &str) -> (StatusCode, Value) {
+    post_token(
+        AppState::with_db(pool.clone(), config()),
+        json!({
+            "grant_type": "authorization_code",
+            "code": code,
+            "code_verifier": VERIFIER,
+            "redirect_uri": REDIRECT_URI,
+            "client_id": client_id,
+        }),
+    )
+    .await
+}
+
+/// The AUTHORIZATION_CODE arm refuses a code whose client's agent is operated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_cannot_redeem_an_authorization_code(pool: PgPool) {
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+
+    // CALIBRATION: the same flow for an unlinked agent mints.
+    let (unlinked, _) = fixture::seed_agent_with_group(&pool, "unlinked").await;
+    let (client_id, code) = human_client_with_code(&pool, unlinked).await;
+    let (status, body) = redeem(&pool, &client_id, &code).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: an unlinked agent's authorization code must redeem, or the refusal below \
+         proves nothing: {body}"
+    );
+    assert!(body.get("access_token").is_some(), "{body}");
+
+    // The operated agent: its client and code exist; then it is linked.
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "operated").await;
+    let (client_id, code) = human_client_with_code(&pool, agent).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link the agent after its code was issued");
+    drop(conn);
+    let (status, body) = redeem(&pool, &client_id, &code).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an operated agent redeemed an authorization code: {body}"
+    );
+    assert!(
+        body.to_string().contains("stdio-only") && body.to_string().contains(&operator.to_string()),
+        "the refusal must say why and name the operator: {body}"
+    );
+}
+
+/// The external-provider PROVISION arm (`providers::provision::provision_external_user`)
+/// refuses once the provisioned identity's agent is operated. The first grant
+/// provisions the client and its agent (the cold path; a brand-new agent is
+/// never operated) and is the calibration; the agent is then linked, and the
+/// next grant for the same identity takes the warm path and is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_cannot_mint_through_an_external_provider(pool: PgPool) {
+    use epigraph_api::oauth::providers::{
+        config::{ProviderConfig, ProviderFlow},
+        google::GoogleProvider,
+        jwks::JwksCache,
+        ExternalIdentityProvider, OidcRedirectFlow, ProviderRegistry,
+    };
+    use std::sync::Arc;
+
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let fx = oauth_providers::fixtures::ProviderFixture::new().await;
+    std::env::set_var("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_ID", "test-audience");
+    std::env::set_var("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_SECRET", "test-secret");
+    let cfg = ProviderConfig {
+        name: "google".into(),
+        flow: ProviderFlow::Redirect,
+        grant_type: "google_id_token".into(),
+        issuer: "https://accounts.google.com".into(),
+        extra_issuers: vec![],
+        jwks_url: fx.jwks_url.clone(),
+        audience: None,
+        audience_env: Some("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_ID".into()),
+        client_id_env: Some("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_ID".into()),
+        client_secret_env: Some("OPERATED_AGENT_TOKEN_GOOGLE_CLIENT_SECRET".into()),
+        auth_endpoint: Some("https://example/auth".into()),
+        token_endpoint: Some("https://example/token".into()),
+        redirect_uri: None,
+        redirect_uri_env: None,
+        auto_provision: true,
+        default_scopes: vec!["claims:read".into()],
+        allowed_emails: vec![],
+        allowed_domains: vec![],
+    };
+    let provider = Arc::new(GoogleProvider::from_config(&cfg, JwksCache::new()).expect("provider"));
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn ExternalIdentityProvider>,
+            Some(provider as Arc<dyn OidcRedirectFlow>),
+        )
+        .expect("register");
+    let registry = Arc::new(registry);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let grant = || {
+        json!({
+            "grant_type": "google_id_token",
+            "assertion": fx.sign(&json!({
+                "iss": "https://accounts.google.com",
+                "aud": "test-audience",
+                "sub": "operated-sub-1",
+                "email": "operated@example.com",
+                "email_verified": true,
+                "name": "operated",
+                "iat": now,
+                "exp": now + 600,
+            })),
+        })
+    };
+    let state = || AppState::with_db(pool.clone(), config()).with_providers(registry.clone());
+
+    // CALIBRATION: the first grant provisions and mints.
+    let (status, body) = post_token(state(), grant()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "CALIBRATION: the external grant must provision and mint, or the refusal below proves \
+         nothing: {body}"
+    );
+    let agent: Uuid = sqlx::query_scalar(
+        "SELECT agent_id FROM oauth_clients WHERE client_id = 'google:operated-sub-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("PREMISE: the grant provisioned a client linked to an agent");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link the provisioned agent");
+    drop(conn);
+    let (status, body) = post_token(state(), grant()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an operated agent minted through the external-provider arm: {body}"
+    );
+    assert!(
+        body.to_string().contains("stdio-only") && body.to_string().contains(&operator.to_string()),
+        "the refusal must say why and name the operator: {body}"
     );
 }
