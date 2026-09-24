@@ -178,6 +178,47 @@ site that hit them; they are collected here because they generalise.
    baseline with a separate `CARGO_TARGET_DIR`, and check
    `strings <binary> | grep crates/epigraph-engine` names the tree you meant.
 
+## Measured: batch H (the R3 prerequisites), base a3fbc4ce vs branch tip
+
+Every script in this directory was run on both configurations, with the base
+binary (built from `a3fbc4ce` in the same worktree) and the tip binary.
+**drive, probe-tools, probe-embed, probe-workflow (a, b, b2a) and probe-unit-e
+produced the same verdicts and row counts for both binaries.** Their only
+differences are log lines and run-to-run noise (agent counts, a similarity of
+0.99999 vs 1.0), so nothing previously working regressed. The per-tool table
+below is `probe-batch-h.sh`, whose group-private rows are what discriminate.
+"own" = the server agent's personal group, "foreign" = a team group it is not
+in. Row counts are the database's, not the response's.
+
+| tool / case | A base | A tip | B base | B tip |
+|---|---|---|---|---|
+| patch_claim own public | ERR 42501, 0 rows | OK | OK | OK |
+| patch_claim own private | ERR not found | OK | OK | OK |
+| patch_claim foreign private | ERR not found | ERR not found, 0 rows | **OK (orphan policy; caller cannot read it)** | ERR not found, 0 rows |
+| patch_claim foreign public | ERR 42501 | ERR 42501, 0 rows | OK | OK |
+| link_hierarchical own→own private | ERR not found | OK, edge owned by own group | OK | OK |
+| link_hierarchical touching foreign private | ERR not found | ERR not found, 0 edges | ERR | ERR |
+| link_alternative own↔own private | ERR not found | OK | OK | OK |
+| link_epistemic own→own private (supports) | ERR not found | OK, belief_wired, BBA 1→2, edge.added | OK | OK |
+| link_epistemic own→foreign public (contradicts) | ERR not found | OK edge, belief_wired=false, 0 target BBAs | same | same |
+| patch_edge + delete_edge, own-group edge | ERR not found | OK, patched, retracted, 2 events | OK | OK |
+| patch_edge + delete_edge, foreign-group edge | ERR not found | ERR not found, untouched | OK (orphan policy) | OK (orphan policy) |
+| resolve_backlog_item, public basis | **ERR after writing: resolution=1, item still open** | OK 1/1/1 | OK | OK |
+| resolve_backlog_item, own-private basis | ERR not visible | OK 1/1/1 | OK | OK |
+| resolve_backlog_item, justifies edge refused (injected) | **ERR, resolution=1 left behind** | ERR, 0/0/0 | **ERR, resolution=1 left behind** | ERR, 0/0/0 |
+| submit_claim / memorize fresh | OK, BBA=1 | OK, BBA=1 | OK | OK |
+| submit_claim / memorize, BBA refused (injected) | **OK over claims=1 with no BBA** | ERR, claims=0 | **OK over claims=1 with no BBA** | ERR, claims=0 |
+| recompute_beliefs / sweep_semantic_duplicates / backfill_embeddings, maintenance DSN unset or = app login | ERR (hard gate) | ERR, rows unchanged | ERR | ERR, rows unchanged |
+| the same three, maintenance DSN bypass-capable | ERR (hard gate) | OK on FOREIGN rows: cache written, cross-group dup retired, vector stored | ERR | OK, same |
+
+Bold cells are the success-over-nothing / partial-state shapes the R3 gate
+forbids. A guard-less mutation build (maintenance pool attached unconditionally,
+per-call probe skipped) turns the "unset / app login" row into **OK over zero
+rows** (claims_recomputed=0, scanned=0, embedded=0), which is the hazard the
+maintenance gate exists for. The HTTP half of batch H (supersede and
+deprecate_workflow gate reads) is pinned by
+`crates/epigraph-api/tests/write_gate_reads_are_viewer_filtered.rs`, not here.
+
 ## What this harness does not cover
 
 It exercises tools, not the repository layer, and it says nothing about the HTTP
