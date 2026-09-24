@@ -291,7 +291,21 @@
 -- (any row), an agent that already operates others, an agent already linked to
 -- a different operator, and 105's two refusals on the operator's own personal
 -- group (`RVK02`: a squatted key; `RVK01`: the operator's own row is only
--- revoked). EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
+-- revoked). And two of its own, both 55000 with a HINT, both raised before
+-- anything is written:
+--
+--   * an ACTOR (not retired) row for the same pair: a retire is not a
+--     demotion, the row is never edited, and `ON CONFLICT DO NOTHING` would
+--     have left the agent acting while reporting success (review measured
+--     `link_created=f, link_retired=f` with the actor read unchanged). The
+--     way to end an actor's authority is to revoke its membership.
+--   * a LIVE `writer`/`admin` membership for the agent in the operator's
+--     group: a row made before the retire would otherwise survive it, and
+--     review measured the retired identity writing a claim owned by the
+--     operator's group through it. The check runs under row locks on the
+--     agent's membership rows and on the group row, so no such row can be
+--     inserted or promoted between the check and the commit; migration 109's
+--     trigger refuses one being added afterwards. EXECUTE: `epigraph_maintenance` only, as for `epigraph_link_operator`. The
 -- two preludes are deliberately written out twice rather than shared through a
 -- third definer, so each function can be reviewed on its own page; both are
 -- exercised by `operator_link.rs`.
@@ -714,6 +728,21 @@ BEGIN
                         'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
+    -- A retire is not a demotion (section 7). An ACTOR row for this very pair
+    -- cannot be turned into a retired one -- `operator_links` rows are never
+    -- edited -- so `ON CONFLICT (agent_id) DO NOTHING` below would leave it
+    -- acting and report success. Refused instead, so the caller cannot
+    -- believe a key was de-authorized when it was not.
+    IF EXISTS (SELECT 1 FROM public.operator_links l
+                WHERE l.agent_id = p_agent AND l.operator_id = p_operator
+                  AND NOT l.retired) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % already has an ACTOR (not '
+                        'retired) link to operator %, and a retired link cannot replace it',
+                        p_agent, p_operator
+            USING ERRCODE = '55000',
+                  HINT = 'End its authority by revoking its membership in the operator''s '
+                         'group; the operator keeps ownership of its claims either way.';
+    END IF;
     -- A SHARED SIGNER is neither linkable nor an operator (section 9). Checked
     -- on a FIRST link only: an exact relink (a row for this very pair already
     -- exists) records nothing new, and the edges the check counts are
@@ -743,6 +772,31 @@ BEGIN
                                 WHERE g.did_key = 'did:epigraph:personal:' || p_operator::text);
     v_group := public.epigraph_ensure_personal_group(p_operator);
 
+    -- ZERO write authority is a precondition, not a hope (section 7). A live
+    -- `writer`/`admin` row for the agent in the operator's group -- the
+    -- routine "add my agents to my group", made BEFORE the retire -- would
+    -- survive it, and `Viewer::resolve` counts it: review measured a retired
+    -- identity inserting a claim owned by the operator's group through exactly
+    -- that row. Refused, not revoked here: revoking is the operator's decision
+    -- and has its own last-admin rules. Locked first, in the order every
+    -- roster writer takes them (the agent's rows in the group, then the
+    -- `groups` row, whose FOR UPDATE also blocks a concurrent membership
+    -- INSERT's foreign-key share lock), so no row can appear or be promoted
+    -- between this check and the commit.
+    PERFORM 1 FROM public.group_memberships m
+     WHERE m.group_id = v_group AND m.agent_id = p_agent
+       FOR UPDATE;
+    PERFORM 1 FROM public.groups g WHERE g.id = v_group FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM public.group_memberships m
+                WHERE m.group_id = v_group AND m.agent_id = p_agent
+                  AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')) THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % holds a live writer/admin '
+                        'membership in operator group %, and a retired identity may hold no '
+                        'write authority there', p_agent, v_group
+            USING ERRCODE = '55000',
+                  HINT = 'Revoke that membership first, then retire the agent.';
+    END IF;
+
     -- The record, retired. No membership: see section 7.
     INSERT INTO public.operator_links (agent_id, operator_id, operator_group_id, retired)
     VALUES (p_agent, p_operator, v_group, true)
@@ -758,10 +812,10 @@ BEGIN
                           AND e.relationship = 'OPERATED_BY');
     GET DIAGNOSTICS v_edge_rows = ROW_COUNT;
 
-    -- `membership_live` REPORTS a pre-existing live membership (e.g. the agent
-    -- was an actor before it was retired); it is never created or changed
-    -- here. A retired identity has zero write authority only while this is
-    -- false, so the caller must see it.
+    -- `membership_live` REPORTS a live membership of any role; it is never
+    -- created or changed here. A live writer/admin row was refused above, so
+    -- a true value here is a `reader` row (no write authority). Callers still
+    -- treat it as a refusal-worthy surprise, not a success.
     RETURN QUERY
     SELECT v_group,
            NOT v_group_existed,

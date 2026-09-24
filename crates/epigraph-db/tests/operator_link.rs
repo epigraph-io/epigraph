@@ -1818,23 +1818,108 @@ async fn link_retired_agent_refuses_and_never_touches_a_membership(pool: PgPool)
         .expect_err("an agent linked to a different operator");
     assert!(err.to_string().contains("already has a link"), "{err}");
 
-    // An ACTOR whose membership the operator revoked: the retired call leaves
-    // the actor row and the revoked membership exactly as they were.
+    // An ACTOR whose membership the operator revoked: the retire is REFUSED (a
+    // retire is not a demotion, and the row is never edited), and the actor
+    // row and the revoked membership are left exactly as they were.
     let former_actor = seed_bare_agent(&pool).await;
     link(&pool, former_actor, operator).await;
     GroupMembershipRepository::revoke_member_unless_last_admin(&pool, op_group, former_actor)
         .await
         .expect("revoke");
-    let out = link_retired(&pool, former_actor, operator).await;
-    assert!(
-        !out.link_created && !out.link_retired && !out.membership_live,
-        "{out:?}"
-    );
+    let err = AgentRepository::link_retired_agent(&mut conn, former_actor, operator)
+        .await
+        .expect_err("retiring over an actor row must be refused");
+    assert!(err.to_string().contains("ACTOR (not retired)"), "{err}");
     assert_eq!(link_row(&pool, former_actor).await, Some((operator, false)));
     assert_eq!(
         membership_rows(&pool, op_group, former_actor).await,
         vec![("writer".to_string(), true, 0)],
         "the retired link must never revive or otherwise touch an existing membership"
+    );
+}
+
+/// Retiring an agent that still holds WRITE authority in the operator's group
+/// is refused, and so is retiring an agent whose link is still ACTING.
+///
+/// Review measured both as silent successes:
+///
+/// * the operator, as `epigraph_app`, added R as a `writer` in its group (the
+///   routine "add my agents to my group"); `epigraph_link_retired_agent(R, O)`
+///   then returned `link_created=t, membership_live=t`, and R, stamped from its
+///   live set, inserted a claim owned by the operator's group. 109's trigger
+///   guards only rows written AFTER the retire.
+/// * an acting A2: the retire returned `link_created=f, link_retired=f`
+///   (`ON CONFLICT DO NOTHING`), and A2 was still an actor.
+///
+/// CALIBRATION: once the writer row is revoked the same retire succeeds with
+/// no live membership, and a `reader` row (no write authority) does not
+/// refuse, so the refusal is the write authority and not any roster row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retiring_an_agent_that_still_holds_write_authority_is_refused(pool: PgPool) {
+    assert_app_role_is_not_bypassing(&pool).await;
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let writer = seed_bare_agent(&pool).await;
+    let reader = seed_bare_agent(&pool).await;
+
+    // The operator enrols its agents, as `epigraph_app` stamped from its own
+    // viewer: the path review measured, not a harness shortcut.
+    let v = Viewer::resolve(&pool, operator).await.expect("operator viewer");
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &v).await;
+        for (agent, role) in [(writer, "writer"), (reader, "reader")] {
+            sqlx::query(
+                "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+                 VALUES ($1, $2, ''::bytea, 0, $3)",
+            )
+            .bind(op_group)
+            .bind(agent)
+            .bind(role)
+            .execute(&mut *conn)
+            .await
+            .expect("PREMISE: the operator can enrol its agent as an app session");
+        }
+        (conn, ())
+    })
+    .await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_retired_agent(&mut conn, writer, operator)
+        .await
+        .expect_err("retiring an agent with a live writer row in the operator group");
+    assert!(err.to_string().contains("live writer/admin"), "{err}");
+    assert_eq!(link_row(&pool, writer).await, None, "a refused retire wrote a link row");
+
+    // CALIBRATION: a reader row grants no write and does not refuse.
+    let out = AgentRepository::link_retired_agent(&mut conn, reader, operator)
+        .await
+        .expect("CALIBRATION: a reader row does not refuse the retire");
+    assert!(out.link_created && out.link_retired, "{out:?}");
+
+    // CALIBRATION: revoke the writer row; the retire now succeeds.
+    GroupMembershipRepository::revoke_member_unless_last_admin(&pool, op_group, writer)
+        .await
+        .expect("revoke the writer row");
+    let out = AgentRepository::link_retired_agent(&mut conn, writer, operator)
+        .await
+        .expect("CALIBRATION: the retire succeeds once the writer row is revoked");
+    assert!(
+        out.link_created && out.link_retired && !out.membership_live,
+        "{out:?}"
+    );
+
+    // An ACTING link cannot be retired either.
+    let actor = seed_bare_agent(&pool).await;
+    assert!(link(&pool, actor, operator).await.link_live);
+    let err = AgentRepository::link_retired_agent(&mut conn, actor, operator)
+        .await
+        .expect_err("retiring an acting link must be refused, not reported as done");
+    assert!(err.to_string().contains("ACTOR (not retired)"), "{err}");
+    assert!(
+        AgentRepository::operator_actor(&mut conn, actor)
+            .await
+            .expect("actor read")
+            .is_some(),
+        "the refused retire must leave the acting link exactly as it was"
     );
 }
 

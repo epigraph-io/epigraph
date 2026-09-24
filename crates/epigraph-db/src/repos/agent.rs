@@ -70,15 +70,17 @@ pub struct RetiredLinkOutcome {
     pub group_created: bool,
     /// This call inserted the `operator_links` row.
     pub link_created: bool,
-    /// The agent's link record is retired after the call. `false` means the
-    /// agent already had an ACTOR link to this operator, which the call left
-    /// exactly as it was (`ON CONFLICT DO NOTHING`).
+    /// The agent's link record is retired after the call. Always `true` on
+    /// success: an existing ACTOR link to this operator is refused, not left
+    /// in place (migration 107 section 7).
     pub link_retired: bool,
     /// This call inserted the `OPERATED_BY` edge.
     pub edge_created: bool,
-    /// The agent holds a live membership in the operator's group. Never created
-    /// or changed by this call — REPORTED, because a retired identity has zero
-    /// write authority only while this is `false`.
+    /// The agent holds a live membership (of any role) in the operator's
+    /// group. Never created or changed by this call. A live `writer`/`admin`
+    /// row is refused before the call writes anything, so `true` here means a
+    /// `reader` row; callers still surface it rather than report a clean
+    /// retire.
     pub membership_live: bool,
 }
 
@@ -1597,16 +1599,19 @@ impl AgentRepository {
     /// retired agent itself can never act for the operator.
     ///
     /// Same authorization as [`Self::link_operator`]: EXECUTE-able by
-    /// `epigraph_maintenance` (and superusers) only. Idempotent, and never
-    /// changes an existing row or membership.
+    /// `epigraph_maintenance` (and superusers) only. Idempotent on an existing
+    /// RETIRED row, and never changes an existing row or membership.
     ///
     /// # Errors
     /// [`DbError::MembershipRevoked`] (RVK01) / [`DbError::PersonalGroupNotOwned`]
     /// (RVK02) from the operator's own personal group, exactly as
     /// [`Self::link_operator`]; both write nothing. `DbError::QueryFailed` for a
     /// permission refusal, a missing agent, a self-link, an operator that is
-    /// itself operated, or an agent that already operates others or is linked
-    /// to a DIFFERENT operator; the database message names which.
+    /// itself operated, an agent that already operates others or is linked to
+    /// a DIFFERENT operator, an agent with an ACTOR (not retired) link to this
+    /// operator (a retire is not a demotion), or an agent holding a live
+    /// `writer`/`admin` membership in the operator's group (revoke it first);
+    /// the database message names which, and nothing is written.
     pub async fn link_retired_agent(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
