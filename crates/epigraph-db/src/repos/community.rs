@@ -175,6 +175,10 @@ pub enum MembershipOutcome {
     /// `remove_member` would remove the group's LAST live admin, which would
     /// leave it unmanageable. Nothing was written. Map to 409.
     LastAdmin,
+    /// `add_member` would restore a REVOKED membership (the owner left or was
+    /// evicted), and the acting agent is not a live admin. Re-admitting a
+    /// removed member is an admin decision; nothing was written. Map to 403.
+    DeniedReadmitNeedsAdmin,
 }
 
 impl MembershipOutcome {
@@ -184,6 +188,7 @@ impl MembershipOutcome {
             "not_found" => Ok(Self::NotFound),
             "denied" => Ok(Self::DeniedNotAMember),
             "last_admin" => Ok(Self::LastAdmin),
+            "denied_readmit" => Ok(Self::DeniedReadmitNeedsAdmin),
             other => Err(DbError::InvalidData {
                 reason: format!("unexpected community membership outcome {other:?}"),
             }),
@@ -384,7 +389,10 @@ impl CommunityRepository {
     /// A REVOKED projected row is restored at the requested role, `reader` — a
     /// revoked admin re-added through here never comes back as admin (batch F,
     /// F4a: this used to be `DO UPDATE SET revoked_at = NULL` with the old role
-    /// kept). A LIVE row is left exactly as it is.
+    /// kept) — and only when `acting_agent` is a LIVE admin of the community:
+    /// otherwise [`MembershipOutcome::DeniedReadmitNeedsAdmin`], nothing
+    /// written, so a live reader cannot undo an admin's eviction. A LIVE row is
+    /// left exactly as it is.
     ///
     /// # Authorization
     ///

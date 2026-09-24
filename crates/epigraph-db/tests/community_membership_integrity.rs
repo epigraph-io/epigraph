@@ -334,6 +334,66 @@ async fn community_with_reader(pool: &PgPool, name: &str) -> (Uuid, Uuid, Uuid, 
     (c, admin, admin_p, reader)
 }
 
+/// An admin's eviction lasts (review finding, MEDIUM). A live READER lists a
+/// perspective whose `owner_agent_id` is the evictee. Both perspective-create
+/// paths accept a caller-supplied owner, and `perspectives_tenancy` does not
+/// constrain it. The restore must be refused, with nothing written, because
+/// re-admitting a removed member is an admin decision.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reader_cannot_readmit_an_evicted_member(pool: PgPool) {
+    let (c, admin, _, reader) = community_with_reader(&pool, "f4-readmit").await;
+    let evictee = agent(&pool, "f4-evictee").await;
+    let evictee_p = perspective(&pool, evictee, "f4-evictee-p").await;
+    CommunityRepository::add_member(&pool, Some(admin), c, evictee_p)
+        .await
+        .expect("add the evictee");
+    let out = CommunityRepository::remove_member(
+        &as_actor(&pool, admin).await,
+        Some(admin),
+        c,
+        evictee_p,
+    )
+    .await
+    .expect("evict");
+    assert_eq!(out, MembershipOutcome::Applied);
+    assert_eq!(state(&pool, c, evictee).await, "reader(revoked)");
+
+    // The reader, as the deployed role, forges a perspective owned by the
+    // evictee (the registry policy admits it) and lists it.
+    let as_reader = as_actor(&pool, reader).await;
+    let forged: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, visibility, owner_group_id) \
+         VALUES ('f4-forged', $1, 'public', '00000000-0000-0000-0000-000000000000') \
+         RETURNING id",
+    )
+    .bind(evictee)
+    .fetch_one(&as_reader)
+    .await
+    .expect("the registry policy admits a perspective with any owner");
+    let out = CommunityRepository::add_member(&as_reader, Some(reader), c, forged)
+        .await
+        .expect("a refusal is an outcome, not an error");
+    assert_eq!(out, MembershipOutcome::DeniedReadmitNeedsAdmin);
+    assert_eq!(
+        state(&pool, c, evictee).await,
+        "reader(revoked)",
+        "the eviction must stand"
+    );
+    assert!(!listed(&pool, c, forged).await, "nothing may be written");
+
+    // An ADMIN may re-admit, at reader.
+    let out = CommunityRepository::add_member(
+        &as_actor(&pool, admin).await,
+        Some(admin),
+        c,
+        evictee_p,
+    )
+    .await
+    .expect("re-admit");
+    assert_eq!(out, MembershipOutcome::Applied);
+    assert_eq!(state(&pool, c, evictee).await, "reader(live)");
+}
+
 /// The membership ledger is not deletable by the deployed role (review
 /// finding, MEDIUM). Before migration 106 revoked DELETE from `epigraph_app`, a
 /// READER stamped with the community in its group set could delete the

@@ -268,7 +268,9 @@ Current reservation:
   statement for `CommunityRepository`. Rules: add needs a LIVE member, except a
   group that has NEVER had a membership row of any state (a group emptied by
   removals does not re-open); a revoked row is restored at the requested
-  `reader` role, never its old one. Remove needs the perspective's owner
+  `reader` role, never its old one. Only a LIVE admin may restore a revoked
+  row (`'denied_readmit'` otherwise), so a live reader cannot undo an
+  eviction. Remove needs the perspective's owner
   (leaving) or a LIVE admin (evicting), and never removes the last live admin
   (`'last_admin'`, nothing written). The actor is `epigraph_principal_id()`
   unless `epigraph_bypass()`; a mismatched `p_actor` is DENIED. The

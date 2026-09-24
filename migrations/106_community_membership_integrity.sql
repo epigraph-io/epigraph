@@ -69,7 +69,10 @@
 --           live row      -> left exactly as it is (an admin re-adding its own
 --                            perspective keeps admin);
 --           revoked row   -> restored at the REQUESTED role, `reader`, never at
---                            its old role;
+--                            its old role, and ONLY when the actor is a LIVE
+--                            admin: a removed member's return is an admin
+--                            decision, so a live reader cannot undo an
+--                            eviction ('denied_readmit', nothing written);
 --           no row        -> inserted as `reader`.
 -- remove: allowed iff the actor owns the perspective (leaving), or holds a
 --         LIVE `admin` membership (evicting). Never removes the group's LAST
@@ -77,8 +80,9 @@
 --         guard as `revoke_member_unless_last_admin`, because with no admin a
 --         group is unmanageable and there is no break-glass path.
 --
--- Return values: 'applied' | 'denied' | 'not_found' | 'last_admin'. For
--- remove, 'applied' means "authorised, and the projected membership handled";
+-- Return values: 'applied' | 'denied' | 'denied_readmit' | 'not_found' |
+-- 'last_admin'. For remove, 'applied' means "authorised, and the projected
+-- membership handled";
 -- the `community_members` row itself is deleted by the caller's statement (see
 -- the note in the function body for why the definer does not delete).
 -- ===================================================================
@@ -122,6 +126,33 @@ BEGIN
         RETURN 'denied';
     END IF;
 
+    -- RE-ADMISSION IS AN ADMIN DECISION. An owner with only REVOKED rows here
+    -- was removed: it left, or an admin evicted it. Restoring that row lets it
+    -- back in, and "any live member may add" would let any live READER undo
+    -- an admin's eviction by listing a perspective the evictee owns
+    -- (`owner_agent_id` is caller-supplied on both perspective-create paths).
+    -- MEASURED before this arm, as `epigraph_app`: admin Y evicted W ('applied',
+    -- W revoked); live reader X inserted a perspective owned by W and added it
+    -- ('applied'); W was live again. So the restore requires a LIVE admin
+    -- actor (or a maintenance session), decided here, under both locks and
+    -- before anything is written.
+    SELECT p.owner_agent_id INTO v_owner FROM public.perspectives p WHERE p.id = p_perspective;
+    IF v_group IS NOT NULL AND v_owner IS NOT NULL
+       AND NOT public.epigraph_bypass()
+       AND NOT EXISTS (SELECT 1 FROM public.group_memberships m
+                        WHERE m.group_id = v_group AND m.agent_id = v_owner
+                          AND m.revoked_at IS NULL)
+       AND EXISTS (SELECT 1 FROM public.group_memberships m
+                    WHERE m.group_id = v_group AND m.agent_id = v_owner)
+       AND NOT (v_actor IS NOT NULL AND EXISTS (
+                SELECT 1 FROM public.group_memberships m
+                 WHERE m.group_id = v_group
+                   AND m.agent_id = v_actor
+                   AND m.role = 'admin'
+                   AND m.revoked_at IS NULL)) THEN
+        RETURN 'denied_readmit';
+    END IF;
+
     INSERT INTO public.community_members (community_id, perspective_id)
     VALUES (p_community, p_perspective)
     ON CONFLICT (community_id, perspective_id) DO NOTHING;
@@ -129,7 +160,6 @@ BEGIN
     -- The projection. No group of kind 'community' with this id, or a
     -- perspective with no owner: no membership, exactly as before (068's
     -- behaviour, a silent no-op by necessity).
-    SELECT p.owner_agent_id INTO v_owner FROM public.perspectives p WHERE p.id = p_perspective;
     IF v_group IS NULL OR v_owner IS NULL THEN
         RETURN 'applied';
     END IF;
@@ -140,8 +170,9 @@ BEGIN
         RETURN 'applied';
     END IF;
 
-    -- A revoked row is restored at the REQUESTED role; the conflict arm only
-    -- ever touches a revoked row, so it can never demote a live one either.
+    -- A revoked row (reachable only by a live admin actor, above) is restored
+    -- at the REQUESTED role; the conflict arm only ever touches a revoked row,
+    -- so it can never demote a live one either.
     INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
     VALUES (v_group, v_owner, ''::bytea, 0, 'reader')
     ON CONFLICT (group_id, agent_id, epoch)

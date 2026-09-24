@@ -417,6 +417,13 @@ pub async fn add_member(
                 reason: "only a live member of this community may add members".to_string(),
             })
         }
+        epigraph_db::MembershipOutcome::DeniedReadmitNeedsAdmin => {
+            return Err(ApiError::Forbidden {
+                reason: "this perspective's owner was removed from the community; only a \
+                         live admin of the community may re-admit it"
+                    .to_string(),
+            })
+        }
         // `add_member` never removes anyone, so it cannot report this; mapped
         // rather than panicked on, because a refusal is never a 500.
         epigraph_db::MembershipOutcome::LastAdmin => {
@@ -507,7 +514,8 @@ pub async fn remove_member(
                      admin first"
                 .to_string(),
         }),
-        epigraph_db::MembershipOutcome::DeniedNotAMember => Err(ApiError::Forbidden {
+        epigraph_db::MembershipOutcome::DeniedNotAMember
+        | epigraph_db::MembershipOutcome::DeniedReadmitNeedsAdmin => Err(ApiError::Forbidden {
             reason: "only an admin of this community, or the perspective's own owner, may \
                      remove members"
                 .to_string(),
