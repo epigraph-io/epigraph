@@ -2696,9 +2696,9 @@ async fn hide_evidence_apply_hides_exactly_the_selected_rows_and_reverse_restore
 
 /// The point of the pin: a hidden row stays hidden through a later evidence
 /// INSERT for its claim (070 arm c) and a later re-own of its claim (072 arm
-/// d), where it follows the claim's new owner and stays `group`. A reverse
-/// then HOLDS that row (its state and its claim moved since the hide) and
-/// restores the other one, exit 3.
+/// d), where it keeps the operator's group as its owner and stays `group`, so
+/// the claim's new owning group cannot read it. A reverse then HOLDS that row
+/// (its claim moved since the hide) and restores the other one, exit 3.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_hidden_row_survives_later_writes_and_reverse_holds_it_once_its_claim_moved(
     pool: PgPool,
@@ -2724,8 +2724,9 @@ async fn a_hidden_row_survives_later_writes_and_reverse_holds_it_once_its_claim_
         .expect("a later re-own of the claim");
     assert_eq!(
         tenancy_of(&pool, h.ev_testimony).await,
-        (h.fx.third_group, "group".to_string()),
-        "a re-own moves the hidden row with its claim and keeps it group"
+        (h.fx.target, "group".to_string()),
+        "a re-own must leave the hidden row with the operator's group: moving its owner \
+         with the claim hands the hidden content to the claim's new owner"
     );
     assert_eq!(app_reads_evidence(&pool, h.ev_testimony).await, 0);
 
@@ -2738,7 +2739,7 @@ async fn a_hidden_row_survives_later_writes_and_reverse_holds_it_once_its_claim_
     );
     assert_eq!(
         tenancy_of(&pool, h.ev_testimony).await,
-        (h.fx.third_group, "group".to_string()),
+        (h.fx.target, "group".to_string()),
         "a held row is not touched"
     );
     assert_eq!(pins(&pool).await, vec![(h.ev_testimony, h.fx.operator)]);

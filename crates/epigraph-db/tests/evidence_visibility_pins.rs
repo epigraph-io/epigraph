@@ -14,8 +14,11 @@
 //! * arm (c), a new evidence INSERT for the same claim.
 //!
 //! FREE must equal its claim after every step (070/072's invariant, unchanged).
-//! PINNED must stay `group` at every step; its owner follows the claim, except
-//! onto world or seed, where it keeps the owner it had.
+//! PINNED must stay `('group', operator group)` at every step: never widened,
+//! and its owner never follows the claim, because a moved owner changes who can
+//! READ the row while the column still says 'group' (110 section 2). The
+//! reader arm measures that directly, as `epigraph_app` sessions stamped with
+//! the claim's new owner and with the author's personal group.
 //!
 //! `#[sqlx::test]` connects as a BYPASSRLS superuser, so the privilege arms
 //! reach `epigraph_app` and `epigraph_maintenance` through `SET SESSION
@@ -139,11 +142,10 @@ async fn assert_rows(pool: &PgPool, fx: &Fx, step: &str, pinned_owner: Uuid) {
 }
 
 /// B-H2 end to end. Revert either arm's pin clause and the row is re-published:
-/// arm (d) at the first `move_claim`, arm (c) at the evidence INSERT.
+/// arm (d) at the first `move_claim`, arm (c) at the evidence INSERT. Let the
+/// pinned owner follow the claim and it moves at the first `move_claim`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_pinned_row_is_never_widened_and_follows_its_claim_except_onto_world_or_seed(
-    pool: PgPool,
-) {
+async fn a_pinned_row_is_never_widened_and_keeps_its_own_owner(pool: PgPool) {
     let fx = seed(&pool).await;
     assert_rows(&pool, &fx, "after the hide", fx.op_group).await;
 
@@ -157,28 +159,18 @@ async fn a_pinned_row_is_never_widened_and_follows_its_claim_except_onto_world_o
     );
     assert_rows(&pool, &fx, "after an evidence INSERT (arm c)", fx.op_group).await;
 
-    // Arm (d): a re-own onto another group. The pinned row follows the owner
-    // and stays group.
-    move_claim(&pool, fx.claim, fx.other_group, "public").await;
-    assert_rows(&pool, &fx, "after a re-own (arm d)", fx.other_group).await;
-
-    // Privatization, then declassification onto the world group.
-    move_claim(&pool, fx.claim, fx.other_group, "group").await;
-    assert_rows(&pool, &fx, "after privatization (arm d)", fx.other_group).await;
-    move_claim(&pool, fx.claim, WORLD, "public").await;
-    assert_rows(
-        &pool,
-        &fx,
-        "after declassification onto world (arm d)",
-        fx.other_group,
-    )
-    .await;
-
-    // Back to a real group, then onto 074's seed group.
-    move_claim(&pool, fx.claim, fx.op_group, "public").await;
-    assert_rows(&pool, &fx, "after a re-own back (arm d)", fx.op_group).await;
-    move_claim(&pool, fx.claim, SEED, "public").await;
-    assert_rows(&pool, &fx, "after a move onto seed (arm d)", fx.op_group).await;
+    // Arm (d), through every claim transition: the pinned row stays exactly
+    // where the hide put it.
+    for (owner, vis, step) in [
+        (fx.other_group, "public", "after a re-own (arm d)"),
+        (fx.other_group, "group", "after privatization (arm d)"),
+        (WORLD, "public", "after declassification onto world (arm d)"),
+        (fx.op_group, "public", "after a re-own back (arm d)"),
+        (SEED, "public", "after a move onto seed (arm d)"),
+    ] {
+        move_claim(&pool, fx.claim, owner, vis).await;
+        assert_rows(&pool, &fx, step, fx.op_group).await;
+    }
 
     // And arm (c) once more, on the seed-owned claim.
     insert_evidence(&pool, fx.claim, "later").await;
@@ -189,6 +181,105 @@ async fn a_pinned_row_is_never_widened_and_follows_its_claim_except_onto_world_o
         fx.op_group,
     )
     .await;
+}
+
+/// How many of `ids` an `epigraph_app` session stamped with `groups` (read set)
+/// can read `raw_content` of: the measurement that decides "hidden", which the
+/// tenancy tuple alone does not.
+async fn app_reads(pool: &PgPool, groups: &[Uuid], ids: &[Uuid]) -> i64 {
+    let set = groups
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let ids = ids.to_vec();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let n: i64 = {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+            sqlx::query(
+                "SELECT set_config('epigraph.group_ids', $1, true), \
+                        set_config('epigraph.writable_group_ids', '', true), \
+                        set_config('epigraph.principal_id', '', true)",
+            )
+            .bind(&set)
+            .execute(&mut *tx)
+            .await
+            .expect("stamp");
+            let n =
+                sqlx::query_scalar("SELECT count(raw_content) FROM evidence WHERE id = ANY($1)")
+                    .bind(&ids)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .expect("app read");
+            tx.rollback().await.expect("rollback");
+            n
+        };
+        (conn, n)
+    })
+    .await
+}
+
+/// THE READERS of a pinned row do not change when its claim moves (stage-3
+/// review, HIGH). Measured before this arm: after the claim moved to
+/// `(stranger_group, public)` the operator read 0 of its hidden row and the
+/// stranger group read 1, and after the tenancy-backfill shape (world -> the
+/// author's personal group) a RETIRED author's personal group read it.
+///
+/// The claim here is authored by a separate agent (the retired identity whose
+/// group is the backfill's target) and hidden into the operator's group. It is
+/// moved to a stranger's group and then to the author's personal group; after
+/// each move an app session stamped with the NEW owner reads 0 hidden rows and
+/// one stamped with the operator's group reads 1.
+///
+/// CALIBRATION: the unpinned sibling is readable by the new owner after each
+/// move, so a 0 is the pin and not a session that can read nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pinned_rows_readers_do_not_change_when_its_claim_moves(pool: PgPool) {
+    let (operator, op_group) = fixture::seed_agent_with_group(&pool, "pin-operator").await;
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "pin-author").await;
+    let (_, stranger_group) = fixture::seed_agent_with_group(&pool, "pin-stranger").await;
+    let claim = fixture::seed_public_claim(&pool, author, "a retired author's claim").await;
+    let pinned = insert_evidence(&pool, claim, "pinned").await;
+    let free = insert_evidence(&pool, claim, "free").await;
+    hide(&pool, pinned, op_group, operator).await;
+
+    assert_eq!(app_reads(&pool, &[op_group], &[pinned]).await, 1, "PREMISE");
+    assert_eq!(
+        app_reads(&pool, &[stranger_group], &[pinned]).await,
+        0,
+        "PREMISE"
+    );
+
+    for (new_owner, vis, step) in [
+        (stranger_group, "public", "a move to a stranger's group"),
+        (
+            author_group,
+            "public",
+            "the backfill shape: the author's personal group",
+        ),
+        (
+            author_group,
+            "group",
+            "a privatization into the author's group",
+        ),
+    ] {
+        move_claim(&pool, claim, new_owner, vis).await;
+        assert_eq!(
+            app_reads(&pool, &[new_owner], &[pinned]).await,
+            0,
+            "after {step}: the claim's new owning group reads the HIDDEN row"
+        );
+        assert_eq!(
+            app_reads(&pool, &[op_group], &[pinned]).await,
+            1,
+            "after {step}: the operator lost its hidden row"
+        );
+        assert_eq!(
+            app_reads(&pool, &[new_owner], &[free]).await,
+            1,
+            "CALIBRATION after {step}: the new owner reads the unpinned sibling"
+        );
+    }
 }
 
 /// Unpinned rows keep 070/072 semantics: with NO pin anywhere, every evidence

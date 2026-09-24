@@ -65,17 +65,26 @@
 --     so an unpinned evidence row is selected and written exactly as before.
 --     The `derived text[] := ARRAY[...]` literal is byte-for-byte 072's:
 --     `epigraph_cli::operator::tables::parse_derived_array` reads it.
---   * PINNED evidence rows: a separate statement sets
---       visibility     = 'group'                            (never widened)
---       owner_group_id = COALESCE(NULLIF(NULLIF(claim_owner, world), seed),
---                                 row_owner)
---     i.e. the pinned row FOLLOWS its claim's owner, so it stays readable by
---     the claim's new owning group and is never orphaned, EXCEPT onto the world
---     group or 074's seed group: `evidence_group_needs_real_group` forbids a
---     `group` row owned by either, and a claim moving there says nothing about
---     who may read hidden content, so the row keeps its own (real) owner. It
---     keeps 070's assertion shape: the rows updated must equal the rows counted,
---     or the statement raises (an RLS-filtered definer would otherwise no-op).
+--   * PINNED evidence rows: a separate statement sets `visibility = 'group'`
+--     if anything had made it otherwise, and NEVER touches `owner_group_id`.
+--     A pinned row keeps the owner the hide gave it (the operator's personal
+--     group) whatever happens to its claim. It keeps 070's assertion shape:
+--     the rows updated must equal the rows counted, or the statement raises
+--     (an RLS-filtered definer would otherwise no-op).
+--
+--     WHY THE OWNER DOES NOT FOLLOW THE CLAIM. The first form of this file (the
+--     B-H2 design as first written) let the pinned owner follow the claim
+--     except onto world/seed, so the row "stays readable by the claim's new
+--     owning group". Review measured what that means: the `visibility` column
+--     stayed 'group' while the set of READERS changed. After a claim moved to
+--     another group the operator read 0 of its hidden rows and the new owner
+--     read 1; after `epigraph-tenancy-backfill`'s world -> author's-personal-group
+--     shape, a RETIRED author's personal group (whose key 107 treats as
+--     possibly exposed) read the hidden content, and `reown-reverse` could
+--     only HOLD. That is a widening in everything but the column name, and it
+--     contradicts "pinned rows are never widened on later claim owner or
+--     visibility changes". So the owner is fixed at the hide, and only an
+--     explicit unhide (`reown-reverse` on the hide manifest) moves it.
 --
 -- Arm (c) `epigraph_inherit_tenancy_stmt`, on a derived-row INSERT: for
 -- `evidence` the re-sync UPDATE excludes pinned rows (same extra conjunct), so
@@ -202,10 +211,10 @@ BEGIN
                             '(RLS filtered?)', t, actual, expected;
         END IF;
     END LOOP;
-    -- 110: PINNED evidence. Never widened: visibility stays 'group'. The owner
-    -- follows the claim, except onto world or 074's seed group, which
-    -- `evidence_group_needs_real_group` forbids for a 'group' row; there the
-    -- row keeps its own owner. Same count/update assertion as the loop.
+    -- 110: PINNED evidence. Never widened: visibility is forced to 'group' and
+    -- the owner is NEVER changed, so the set of readers is the one the hide
+    -- chose whatever happens to the claim (header, section 2). Same
+    -- count/update assertion as the loop.
     --
     -- The UPDATE runs only when the count finds a pinned row to change, so a
     -- claim change with nothing pinned issues exactly 072's statements: ONE
@@ -217,28 +226,14 @@ BEGIN
       FROM public.evidence d
       JOIN changed ch ON ch.id = d.claim_id
       JOIN public.evidence_visibility_pins vp ON vp.evidence_id = d.id
-     WHERE (d.owner_group_id, d.visibility)
-           IS DISTINCT FROM (COALESCE(NULLIF(NULLIF(ch.owner_group_id,
-                                 '00000000-0000-0000-0000-000000000000'::uuid),
-                                 '00000000-0000-0000-0000-00000000dead'::uuid),
-                             d.owner_group_id),
-                             'group'::character varying(16));
+     WHERE d.visibility IS DISTINCT FROM 'group'::character varying(16);
     IF expected > 0 THEN
         UPDATE public.evidence d
-           SET owner_group_id = COALESCE(NULLIF(NULLIF(ch.owner_group_id,
-                                    '00000000-0000-0000-0000-000000000000'::uuid),
-                                    '00000000-0000-0000-0000-00000000dead'::uuid),
-                                d.owner_group_id),
-               visibility = 'group'::character varying(16)
+           SET visibility = 'group'::character varying(16)
           FROM changed ch, public.evidence_visibility_pins vp
          WHERE ch.id = d.claim_id
            AND vp.evidence_id = d.id
-           AND (d.owner_group_id, d.visibility)
-               IS DISTINCT FROM (COALESCE(NULLIF(NULLIF(ch.owner_group_id,
-                                     '00000000-0000-0000-0000-000000000000'::uuid),
-                                     '00000000-0000-0000-0000-00000000dead'::uuid),
-                                 d.owner_group_id),
-                                 'group'::character varying(16));
+           AND d.visibility IS DISTINCT FROM 'group'::character varying(16);
         GET DIAGNOSTICS actual = ROW_COUNT;
         IF actual <> expected THEN
             RAISE EXCEPTION 'epigraph tenancy: propagation to pinned evidence updated % '

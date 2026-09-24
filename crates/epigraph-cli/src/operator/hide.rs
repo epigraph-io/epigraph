@@ -10,9 +10,13 @@
 //! `evidence_visibility_pins`. The pin is what keeps it hidden: without it,
 //! 070's insert arm re-publishes the row at the next evidence INSERT for its
 //! claim and 072's update arm at the next claim owner or visibility change.
-//! With it, propagation never widens the row; its owner follows the claim
-//! except onto world or seed (see 110's header). Exactly the selected rows
-//! change and no other row's visibility does.
+//! With it, propagation never widens the row and never moves its owner: a
+//! pinned row stays `('group', operator group)` whatever later happens to its
+//! claim, so the set of readers is the one the hide chose (110 section 2
+//! records why an owner that followed the claim was a widening). Exactly the
+//! selected rows change and no other row's visibility does. A later move of
+//! the claim makes `reown-reverse` HOLD the row (its claim is no longer in the
+//! state the hide recorded); the row stays hidden with the operator's group.
 //!
 //! # The guards, in the order `--apply` meets them
 //!

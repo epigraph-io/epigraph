@@ -424,10 +424,10 @@ Current reservation:
   does not subtract from. Pin-aware bodies for `epigraph_propagate_tenancy`
   (072's arm d) and `epigraph_inherit_tenancy_stmt` (070's arm c), still
   SECURITY DEFINER and owned by `epigraph_maintenance`: a pinned row is never
-  widened (it stays `group`), and on a claim owner/visibility change its owner
-  follows the claim except onto world or 074's seed group (which
-  `evidence_group_needs_real_group` forbids for a `group` row), where it keeps
-  its own. Unpinned rows get 072/070's statements exactly (one extra
+  widened (it stays `group`) and its owner never changes on a claim
+  owner/visibility change, because an owner that followed the claim changed
+  who could READ the hidden row (stage-3 review measured the claim's new
+  owner, and a retired author's personal group, reading it). Unpinned rows get 072/070's statements exactly (one extra
   `NOT EXISTS (pin)` conjunct on the `evidence` iteration only), and the
   `derived text[]` literal is byte-for-byte 072's, because
   `epigraph_cli::operator::tables::parse_derived_array` reads it. Registered
