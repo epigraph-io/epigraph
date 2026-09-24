@@ -553,7 +553,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// a future author could raise a row and its total together. These two are the
 /// ratchet proper: a shard lowering entries touches only its own rows and never
 /// these, and any net growth fails here as well.
-const HIGH_WATER: usize = 297;
+const HIGH_WATER: usize = 296;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -587,7 +587,10 @@ const HIGH_WATER: usize = 297;
 /// DS-substrate conversion in the same branch took it 27 -> 25 and `HIGH_WATER`
 /// 300 -> 298, by the same method and for the same reason: the file keeps 25
 /// sites, so no key is deleted. Unit E's authority fix took it 25 -> 24 and
-/// `HIGH_WATER` 298 -> 297, the file keeping 24 sites.
+/// `HIGH_WATER` 298 -> 297, the file keeping 24 sites. Batch F's community
+/// membership fix took `routes/community.rs` 3 -> 2 and `HIGH_WATER` 297 ->
+/// 296, the file keeping 2 sites, read off `the_scanner_is_not_vacuous`'s own
+/// failure on the converted tree.
 const HIGH_WATER_FILES: usize = 44;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
@@ -634,7 +637,12 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
     // so a `0` row could never be satisfied.
     ("routes/clusters.rs", 1),
-    ("routes/community.rs", 3),
+    // 3 before batch F. `remove_member` no longer touches `state.db_pool` at
+    // all: both membership writes run on a transaction stamped from the
+    // caller's viewer (`routes/community.rs::membership_tx`), because migration
+    // 106's definer takes the actor from the stamped principal. The two that
+    // remain are `create_community` and `add_member`'s existence checks.
+    ("routes/community.rs", 2),
     // 15 before this PR. Shard 4 converted the five sites belonging to its four
     // read-only handlers (`sheaf_consistency`, `sheaf_cohomology`,
     // `sheaf_reconcile`, `belief_at_time`). Unlike `routes/belief.rs` the sites

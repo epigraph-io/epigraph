@@ -196,11 +196,13 @@ impl GroupMembershipRepository {
     /// `groups`, then `group_key_epochs`, and the `FOR UPDATE` above does NOT
     /// change it: it is on `group_memberships`, the table this transaction
     /// already took first. That is why it was preferred to locking the
-    /// `groups` row instead — no site in this codebase takes a `groups` row
-    /// lock, and introducing one here would invert the order against
-    /// `CommunityRepository::remove_member`, which holds a `group_memberships`
-    /// row while it writes `groups` for the SAME id (the community projection
-    /// is id-preserving). `GroupKeyEpochRepository::rotate_conn` takes the same
+    /// `groups` row instead — taking one here FIRST would invert the order
+    /// against `CommunityRepository::remove_member`, which holds the
+    /// `group_memberships` roster while it writes `groups` for the SAME id (the
+    /// community projection is id-preserving). Since batch F that function's
+    /// definer (`epigraph_community_remove_member`, migration 106) and its
+    /// `add_member` twin DO take a `groups` row lock, but only AFTER the same
+    /// roster lock, so the order is unchanged. `GroupKeyEpochRepository::rotate_conn` takes the same
     /// two it needs in the same relative order — roster first, epoch row
     /// second — for exactly this reason: the reverse would let a rotation
     /// holding the epoch row wait on a removal holding the roster while the

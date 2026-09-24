@@ -399,21 +399,37 @@ pub async fn add_member(
     // This is the MEMBERSHIP half. The SCOPE half is the `RequireScopeGroupsAdmin`
     // extractor in the signature, which ran before this body was entered. Both,
     // never either: see the handler doc.
-    match epigraph_db::CommunityRepository::add_member(
-        pool,
+    //
+    // Batch F: the rule and the write are ONE statement in a SECURITY DEFINER
+    // function, on a transaction stamped from the caller's viewer, so the actor
+    // the function trusts is the stamped principal (see migration 106).
+    let mut tx = membership_tx(&state, &viewer, "community::add_member").await?;
+    let outcome = epigraph_db::CommunityRepository::add_member(
+        &mut *tx,
         viewer.principal(),
         community_id,
         request.perspective_id,
     )
-    .await?
-    {
+    .await?;
+    match outcome {
         epigraph_db::MembershipOutcome::DeniedNotAMember => {
             return Err(ApiError::Forbidden {
                 reason: "only a live member of this community may add members".to_string(),
             })
         }
+        // `add_member` never removes anyone, so it cannot report this; mapped
+        // rather than panicked on, because a refusal is never a 500.
+        epigraph_db::MembershipOutcome::LastAdmin => {
+            return Err(ApiError::Conflict {
+                reason: "the membership change would leave the community without an admin"
+                    .to_string(),
+            })
+        }
         epigraph_db::MembershipOutcome::Applied | epigraph_db::MembershipOutcome::NotFound => {}
     }
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the membership change: {e}"),
+    })?;
 
     // Materialize MEMBER_OF edge (perspective → community)
     let _ = epigraph_db::EdgeRepository::create(
@@ -442,15 +458,17 @@ pub async fn add_member(
 /// reason: the write revokes a projected `group_memberships` row, so it is
 /// group-membership management whichever route reaches it. See [`add_member`]'s
 /// doc for the scope-tier argument, the availability cost, and the rejected
-/// alternative. The repo layer keeps its own rule on top — a live member, or the
-/// perspective's own owner removing itself.
+/// alternative. The repo layer keeps its own rule on top — a live ADMIN of the
+/// community evicting, or the perspective's own owner removing itself — and
+/// never removes the community's last live admin (batch F).
 ///
 /// # Errors
 ///
 /// - 401 Unauthorized: no token, or a token naming no `agents.id`
-/// - 403 Forbidden: missing `groups:admin`, or neither a live member nor the
+/// - 403 Forbidden: missing `groups:admin`, or neither a live admin nor the
 ///   perspective's owner
 /// - 404 Not Found: no such membership
+/// - 409 Conflict: the removal would leave the community with no live admin
 #[cfg(feature = "db")]
 pub async fn remove_member(
     _scope: crate::middleware::bearer::RequireScopeGroupsAdmin,
@@ -458,8 +476,6 @@ pub async fn remove_member(
     State(state): State<AppState>,
     Path((community_id, perspective_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    let pool = &state.db_pool;
-
     // THE VIEWER IS NEW HERE. This handler previously extracted nothing at all,
     // so self-service EVICTION was as open as self-service joining: any caller
     // could revoke any member. PR-12 makes the revocation real (`revoked_at =
@@ -469,17 +485,31 @@ pub async fn remove_member(
     // `community.rs` appears in neither of its registers. The scope half, which
     // the viewer does not supply, is the `RequireScopeGroupsAdmin` extractor
     // above it.
-    match epigraph_db::CommunityRepository::remove_member(
-        pool,
+    //
+    // Batch F: decided and written in ONE statement under the roster lock, on a
+    // transaction stamped from the caller's viewer (migration 106). Only an
+    // admin evicts, a member may leave, and the last admin is never removed.
+    let mut tx = membership_tx(&state, &viewer, "community::remove_member").await?;
+    let outcome = epigraph_db::CommunityRepository::remove_member(
+        &mut *tx,
         viewer.principal(),
         community_id,
         perspective_id,
     )
-    .await?
-    {
+    .await?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the membership change: {e}"),
+    })?;
+    match outcome {
         epigraph_db::MembershipOutcome::Applied => Ok(StatusCode::NO_CONTENT),
+        epigraph_db::MembershipOutcome::LastAdmin => Err(ApiError::Conflict {
+            reason: "cannot remove the community's last admin; promote another member to \
+                     admin first"
+                .to_string(),
+        }),
         epigraph_db::MembershipOutcome::DeniedNotAMember => Err(ApiError::Forbidden {
-            reason: "only a live member of this community, or the perspective's own owner,                      may remove members"
+            reason: "only an admin of this community, or the perspective's own owner, may \
+                     remove members"
                 .to_string(),
         }),
         epigraph_db::MembershipOutcome::NotFound => Err(ApiError::NotFound {
@@ -487,6 +517,41 @@ pub async fn remove_member(
             id: format!("{community_id}/{perspective_id}"),
         }),
     }
+}
+
+/// A transaction stamped from `viewer`, for the two membership writes.
+///
+/// `epigraph_community_add_member` / `_remove_member` (migration 106) take the
+/// actor from the connection's stamped principal on a non-maintenance session,
+/// so an unstamped `state.db_pool` checkout would deny every call. Refuses
+/// rather than falling back to the pool, as `groups::rotate_key` does.
+#[cfg(feature = "db")]
+async fn membership_tx<'s>(
+    state: &'s AppState,
+    viewer: &epigraph_db::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedTx<'s>, ApiError> {
+    let scoped = state.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            handler,
+            "membership change refused: this process was not built from a ScopedPool"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })?;
+    scoped.begin_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler,
+            "could not begin a viewer-stamped transaction"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped transaction".to_string(),
+        }
+    })
 }
 
 #[cfg(feature = "db")]

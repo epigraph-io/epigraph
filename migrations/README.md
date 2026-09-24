@@ -255,8 +255,27 @@ Current reservation:
   restores the defect; it creates and changes no rows. **No deploy
   precondition.** **Claimed 2026-09-24.** **Applied to a throwaway database
   only, NOT to any deployed database.**
-- **106**: HELD for batch F's follow-on (community membership integrity, F4)
-  should it need a migration; recorded when claimed.
+- **106**: public `community_membership_integrity` (batch F follow-on; F4a
+  `afb1cfaf`, F4b `7cdea6f1`). Two `SECURITY DEFINER` functions,
+  `epigraph_community_add_member(uuid, uuid, uuid)` and
+  `epigraph_community_remove_member(uuid, uuid, uuid)`, each of which takes the
+  community group's roster lock, then its `groups` row lock (which serialises
+  first joiners over an empty roster), decides under both, and writes — one
+  statement for `CommunityRepository`. Rules: add needs a LIVE member, except a
+  group that has NEVER had a membership row of any state (a group emptied by
+  removals does not re-open); a revoked row is restored at the requested
+  `reader` role, never its old one. Remove needs the perspective's owner
+  (leaving) or a LIVE admin (evicting), and never removes the last live admin
+  (`'last_admin'`, nothing written). The actor is `epigraph_principal_id()`
+  unless `epigraph_bypass()`; a mismatched `p_actor` is DENIED. The
+  `community_members` DELETE runs in the caller's statement, because
+  `epigraph_maintenance` holds no DELETE (070). Owner `epigraph_maintenance`,
+  `REVOKE … FROM PUBLIC`, `GRANT EXECUTE … TO epigraph_app`. Pinned by
+  `epigraph-db/tests/community_membership_integrity.rs` as `epigraph_app`.
+  **No undo runbook ships**: reversing it is two `DROP FUNCTION IF EXISTS`
+  (named in the file) plus the pre-batch-F `community.rs`; it creates no rows.
+  **No deploy precondition.** **Claimed 2026-09-24.** **Applied to a throwaway
+  database only, NOT to any deployed database.**
 - **107+**: public next
 
 Next public migration **outside both reserved tenancy ranges** must be `107` or

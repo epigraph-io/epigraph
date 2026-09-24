@@ -252,22 +252,13 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 
 /// `(file under crates/, occurrences, why)` of the literal revival statement
 /// shape `revoked_at = NULL` (whitespace-normalised, comments stripped).
-const REVIVE_REGISTER: &[(&str, usize, &str)] = &[
-    (
-        "epigraph-db/src/repos/community.rs",
-        2,
-        "`CommunityRepository::create` (creator's admin row) and `::add_member` (the projected \
-         reader row) — the F4 community sites, fixed in their own follow-on series; this count \
-         must shrink with it.",
-    ),
-    (
-        "epigraph-db/src/repos/instance_admin.rs",
-        1,
-        "`InstanceAdminRepository::grant` on `instance_admins`, NOT a group membership: an \
+const REVIVE_REGISTER: &[(&str, usize, &str)] = &[(
+    "epigraph-db/src/repos/instance_admin.rs",
+    1,
+    "`InstanceAdminRepository::grant` on `instance_admins`, NOT a group membership: an \
          explicit operator re-grant on the maintenance connection (migration 083 revokes \
          INSERT/UPDATE on the table from `epigraph_app`).",
-    ),
-];
+)];
 
 fn crates_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
