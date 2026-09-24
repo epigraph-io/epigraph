@@ -23,6 +23,29 @@ The first deploy after 2026-05-05 also requires a one-shot reconcile of
 Subsequent deploys: run `cargo run -p epigraph-api --bin epigraph-migrate`
 (or let `ExecStartPre=` do it), then restart `epigraph-api.service`.
 
+On success `epigraph-migrate` prints one stdout line that still starts with
+the `migrations: ok` marker and now names both heads, e.g.
+`migrations: ok db_head=101 binary_head=101 applied=42` (issue #492). It exits
+nonzero, and never prints the marker, when:
+
+* the database is **ahead** of the binary — `_sqlx_migrations` holds a
+  successful version above the highest migration embedded in this build. The
+  binary is stale; deploy one built from the revision that applied that
+  version. Nothing is applied. For a *deliberate* rollback to an older build,
+  re-run with `--allow-db-ahead` or `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` (the
+  env var also covers `EPIGRAPH_MIGRATE_ON_BOOT=1` on the server); it then
+  applies pending migrations at or below its own head, leaves the newer ones in
+  place, prints a `WARNING`, and appends `db_ahead_of_binary=allowed` to the
+  marker line.
+* after running, any migration embedded in the binary is not recorded as
+  successfully applied.
+
+A database that stops at an older head *because the binary itself is stale*
+(built before the newer migrations existed) still reports `ok` — the binary
+cannot know migrations it was never built with — but the marker now shows its
+`binary_head`, so compare it with the newest file in `migrations/` for the
+revision you meant to deploy.
+
 ### Cross-worktree binary caching (foot-gun)
 
 `/home/jeremy/.cargo-target` is the shared cargo target across every worktree

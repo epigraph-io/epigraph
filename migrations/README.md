@@ -172,7 +172,7 @@ Current reservation:
   free number for PR-10's webhook-persistence migration and no slack at all. The
   version space is shared with `epigraph-internal` against the same
   `_sqlx_migrations` table, and `run_migrations` sets `set_ignore_missing(true)`
-  (`crates/epigraph-api/src/lib.rs:54`), so a collision is **not** caught by the
+  (`crates/epigraph-api/src/migrate.rs::embedded_migrator`), so a collision is **not** caught by the
   missing-version check — it panics the api binary on restart.
 
   **Why the +1 shift:** the plan assigns no migration to PR-02, yet PR-02's
@@ -398,11 +398,19 @@ carries a migration in this block; if a database is found that ran internal, the
 whole `092`–`099` reservation is void for that database and the rule in the
 paragraph above applies instead.
 
-Note also that `crates/epigraph-api/src/lib.rs` sets
+Note also that `crates/epigraph-api/src/migrate.rs::embedded_migrator` sets
 `migrator.set_ignore_missing(true)`, so a *gap* is tolerated but a *checksum
 mismatch* is not. Prod's missing version 35 is the benign case: there is no
 public `035_*.sql` at all, 035 belongs to internal, and prod's 036/037/038
 descriptions match the public filenames.
+
+Since issue #492 the flag no longer hides a database that is AHEAD of the
+binary: `run_migrations` refuses, before applying anything, when
+`_sqlx_migrations` holds a successful version above the binary's highest
+embedded migration, unless `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1`
+opts in to a rollback. A gap BELOW the head (the 035 case) is still tolerated.
+A database that ever ran internal's `060`–`112` above public's head therefore
+now trips that refusal — deliberately; see the paragraph above.
 
 ## Migration Order
 
