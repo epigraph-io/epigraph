@@ -1130,6 +1130,72 @@ async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPo
     assert!(retired_link.link_created, "{retired_link:?}");
 }
 
+/// An EXISTING acting link stops acting while the operator's OWN row in its
+/// group is revoked, and acts again once that row is restored.
+///
+/// Review measured the gap: with the operator's row revoked, a NEW link to it
+/// raised RVK01 ("would hand them write authority the owner no longer has"),
+/// while an agent linked before the revoke still resolved (O, OG) through the
+/// actor read, so it kept authoring into OG and acting for O in
+/// `require_owner_or_admin`.
+///
+/// CALIBRATION: the actor read answers before the revoke and after the
+/// restore, so the refusal is the operator's row and not the fixture.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_acting_link_stops_acting_while_its_operators_own_row_is_revoked(pool: PgPool) {
+    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let (actor, own_group) = fixture::seed_agent_with_group(&pool, "actor").await;
+    assert!(link(&pool, actor, operator).await.link_live);
+    let acting = |pool: PgPool| async move {
+        AgentRepository::operator_actor_pool(&pool, actor)
+            .await
+            .expect("actor read")
+            .map(|l| (l.operator_id, l.operator_group_id))
+    };
+    assert_eq!(
+        acting(pool.clone()).await,
+        Some((operator, group)),
+        "CALIBRATION: the link acts before the operator's row is revoked"
+    );
+
+    let set_revoked = |pool: PgPool, revoked: bool| async move {
+        sqlx::query(
+            "UPDATE group_memberships \
+                SET revoked_at = CASE WHEN $3 THEN now() ELSE NULL END \
+              WHERE group_id = $1 AND agent_id = $2",
+        )
+        .bind(group)
+        .bind(operator)
+        .bind(revoked)
+        .execute(&pool)
+        .await
+        .expect("maintenance: set the operator's own row");
+    };
+    set_revoked(pool.clone(), true).await;
+    assert_eq!(
+        acting(pool.clone()).await,
+        None,
+        "an actor kept acting for an operator whose own row in its group is revoked"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let decl = ClaimRepository::default_decl_for_author(&mut conn, actor)
+        .await
+        .expect("default_decl_for_author");
+    drop(conn);
+    assert_eq!(
+        owner_of(decl),
+        own_group,
+        "the actor must author into its own group while its operator's row is revoked"
+    );
+
+    set_revoked(pool.clone(), false).await;
+    assert_eq!(
+        acting(pool.clone()).await,
+        Some((operator, group)),
+        "CALIBRATION: restoring the operator's row restores the link"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constraint 4 and the authoring path.
 // ─────────────────────────────────────────────────────────────────────────────

@@ -96,7 +96,9 @@
 --     self-link. That is deliberate: only the group's admin (the operator) or
 --     maintenance can revoke that row, and linking agents into a group whose
 --     owner was revoked from it would hand them write authority the owner no
---     longer has. Restoring the row is an operator action (105's HINT).
+--     longer has. Restoring the row is an operator action (105's HINT). For
+--     the same reason an EXISTING acting link stops acting while that row is
+--     revoked (section 5's operator's-own-row conjunct).
 --   * the `operator_links` row is keyed on the agent and inserted
 --     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
 --     ever: a row naming a DIFFERENT operator is refused rather than replaced,
@@ -181,9 +183,22 @@
 --     refusal-only checks (an HTTP listener must not serve as a linked signer).
 --   * `epigraph_operator_actor(agent)` -- "may this agent act for an
 --     operator?" Requires a NOT-retired row, a live `writer`/`admin`
---     membership in the group the row names, and that group being the
---     operator's own personal group. It is used for the CALLER side of the
+--     membership in the group the row names, that group being the
+--     operator's own personal group, AND the operator's OWN row in that group
+--     being live `writer`/`admin`. It is used for the CALLER side of the
 --     ownership rule and by `ClaimRepository::default_decl_for_author`.
+--
+-- The operator's-own-row conjunct is section 3's RVK01 rationale applied to
+-- links that already exist: a new link into a group whose owner was revoked
+-- from it is refused because it "would hand them write authority the owner no
+-- longer has", and an EXISTING actor must not keep acting for that owner
+-- either (review measured an actor still resolving (O, OG) after O's own row
+-- was revoked, while a new link to O raised RVK01). What the conjunct does NOT
+-- end is the agent's own writer ROW, which `Viewer::resolve` still counts for
+-- an explicit write into OG; ending it is the ordinary revoke of that row.
+-- Every HTTP refusal (token issuance, both viewer extractors, webhook
+-- delivery) keys on the link RECORD, not on this read, so an agent this
+-- conjunct stops from acting stays stdio-only.
 --
 -- Why authoring must use the ACTOR read: a retired identity has no membership,
 -- so if it ever ran again and `default_decl_for_author` chose its OPERATOR's
@@ -403,6 +418,13 @@ SET search_path = public, pg_temp AS $$
        AND m.role IN ('writer', 'admin')
      WHERE l.agent_id = p_agent
        AND NOT l.retired
+       -- The OPERATOR's own row in its own group is live (section 5): an agent
+       -- does not act for an operator who no longer holds the group.
+       AND EXISTS (SELECT 1 FROM public.group_memberships om
+                    WHERE om.group_id = l.operator_group_id
+                      AND om.agent_id = l.operator_id
+                      AND om.revoked_at IS NULL
+                      AND om.role IN ('writer', 'admin'))
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) FROM PUBLIC;
 
