@@ -1,0 +1,1260 @@
+//! `epigraph-operator`: `link-retired`, `reown-claims` and `reown-reverse`,
+//! driven through the real binary against a `#[sqlx::test]` database migrated
+//! 001 → head.
+//!
+//! # The fixture reproduces every hazard the brief names
+//!
+//! * world-owned public claims by a RETIRED-linked author, and one by an
+//!   ACTOR-linked author;
+//! * a claim owned by its author's own personal group;
+//! * a listed claim owned by a third group (must be held);
+//! * a listed claim by an UNLINKED author (must be held);
+//! * a listed claim that does not exist (must be held);
+//! * a public claim carrying a GROUP-PRIVATE evidence row (must be held, and
+//!   nothing of it written — the operator's 2026-09-23 directive);
+//! * derived rows written by the linked author AND by a non-linked agent, in
+//!   `evidence`, `mass_functions`, `claim_versions` and `challenges`, plus
+//!   writer-less rows (`reasoning_traces`, `claim_frames` — a composite key —
+//!   `harvester_claim_provenance`), a harvester fragment shared with a held
+//!   claim, and edges (one signed by the non-linked agent, one whose prior
+//!   owner differs from both endpoints');
+//! * a derived row whose prior owner DIFFERS from its claim's, so reversal must
+//!   restore that row's own owner rather than re-propagate the claim's;
+//! * a `recall_events` row, which is principal-scoped and must stay untouched.
+//!
+//! # What a snapshot is
+//!
+//! Every row of every table the re-own could reach, plus the control tables,
+//! as `to_jsonb(row)::text`, sorted. `claims.updated_at` is removed from the
+//! claims rows ONLY in the comparisons that span an apply: the
+//! `claims_updated_at` trigger (migration 001) stamps `now()` on every claims
+//! UPDATE, which neither the re-own nor its reversal can prevent. Every other
+//! column of every row is compared byte for byte.
+
+mod viewer_fixture;
+
+use sqlx::PgPool;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::Command;
+use uuid::Uuid;
+use viewer_fixture as fixture;
+
+const BIN: &str = env!("CARGO_BIN_EXE_epigraph-operator");
+const DSN_ENV: &str = "EPIGRAPH_OPERATOR_MAINTENANCE_DSN";
+const WORLD: Uuid = Uuid::nil();
+
+struct Run {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn show(&self) -> String {
+        format!(
+            "exit={}\n--- stdout\n{}\n--- stderr\n{}",
+            self.code, self.stdout, self.stderr
+        )
+    }
+}
+
+/// Run the binary with ONLY the dedicated DSN variable pointing at `pool`'s
+/// database. `DATABASE_URL` and `MAINTENANCE_DATABASE_URL` are removed, so a
+/// run that succeeds did not reach the database through either of them.
+async fn run_op(pool: &PgPool, args: &[&str]) -> Run {
+    let url = fixture::database_url_for(pool).await;
+    run_with_env(
+        args,
+        &[(DSN_ENV, url.as_str())],
+        &["DATABASE_URL", "MAINTENANCE_DATABASE_URL"],
+    )
+}
+
+fn run_with_env(args: &[&str], set: &[(&str, &str)], remove: &[&str]) -> Run {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args).env("RUST_LOG", "warn");
+    for r in remove {
+        cmd.env_remove(r);
+    }
+    for (k, v) in set {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn epigraph-operator");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+fn scratch_dir() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("operator-reown-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&d).expect("scratch dir");
+    d
+}
+
+fn h32(seed: Uuid) -> Vec<u8> {
+    seed.as_bytes().iter().copied().cycle().take(32).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixture
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+struct Fx {
+    operator: Uuid,
+    target: Uuid,
+    retired: Uuid,
+    retired_group: Uuid,
+    actor: Uuid,
+    actor_group: Uuid,
+    stranger: Uuid,
+    stranger_group: Uuid,
+    unlinked: Uuid,
+    third_group: Uuid,
+    frame: Uuid,
+    c_world: Uuid,
+    c_personal: Uuid,
+    c_actor: Uuid,
+    c_third: Uuid,
+    c_unlinked: Uuid,
+    c_private: Uuid,
+    missing: Uuid,
+    ev_r: Uuid,
+    ev_w: Uuid,
+    ev_null: Uuid,
+    ev_personal: Uuid,
+    ev_private: Uuid,
+    trace: Uuid,
+    mf_w: Uuid,
+    mf_r: Uuid,
+    mf_w_personal: Uuid,
+    cv_w: Uuid,
+    challenge_w: Uuid,
+    frag: Uuid,
+    edge_plain: Uuid,
+    edge_w: Uuid,
+    edge_prior: Uuid,
+    recall: Uuid,
+}
+
+async fn exec(pool: &PgPool, sql: &str) {
+    sqlx::query(sql)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+async fn claim(pool: &PgPool, author: Uuid, owner: Uuid, text: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             owner_group_id, visibility) \
+         VALUES ($1, $2, $3, 0.7, $4, true, $5, 'public')",
+    )
+    .bind(id)
+    .bind(text)
+    .bind(h32(id))
+    .bind(author)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("seed claim");
+    id
+}
+
+async fn evidence(pool: &PgPool, claim: Uuid, signer: Option<Uuid>, text: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content, \
+                               signer_id, signature) \
+         VALUES ($1, $2, 'document', $3, $4, $5, CASE WHEN $5::uuid IS NULL THEN NULL \
+                 ELSE decode(repeat('ab', 64), 'hex') END)",
+    )
+    .bind(id)
+    .bind(claim)
+    .bind(h32(id))
+    .bind(text)
+    .bind(signer)
+    .execute(pool)
+    .await
+    .expect("seed evidence");
+    id
+}
+
+async fn mass_function(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses) \
+         VALUES ($1, $2, $3, '{\"a\": 1.0}') RETURNING id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("seed mass function")
+}
+
+async fn signed_edge(pool: &PgPool, source: Uuid, target: Uuid, signer: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            signer_id, signature) \
+         VALUES ($1, $2, 'claim', $3, 'claim', 'supports', $4, decode(repeat('cd', 64), 'hex'))",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(target)
+    .bind(signer)
+    .execute(pool)
+    .await
+    .expect("seed signed edge");
+    id
+}
+
+async fn seed(pool: &PgPool) -> Fx {
+    let (operator, target) = fixture::seed_agent_with_group(pool, "operator").await;
+    let (retired, retired_group) = fixture::seed_agent_with_group(pool, "retired").await;
+    let (actor, actor_group) = fixture::seed_agent_with_group(pool, "actor").await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(pool, "stranger").await;
+    let (unlinked, _) = fixture::seed_agent_with_group(pool, "unlinked").await;
+    let (_, third_group) = fixture::seed_agent_with_group(pool, "third").await;
+
+    sqlx::query("SELECT * FROM epigraph_link_retired_agent($1, $2)")
+        .bind(retired)
+        .bind(operator)
+        .execute(pool)
+        .await
+        .expect("retired link");
+    sqlx::query("SELECT * FROM epigraph_link_operator($1, $2)")
+        .bind(actor)
+        .bind(operator)
+        .execute(pool)
+        .await
+        .expect("actor link");
+
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, owner_group_id, visibility) \
+         VALUES ('reown-frame', ARRAY['a','b'], $1, 'public') RETURNING id",
+    )
+    .bind(WORLD)
+    .fetch_one(pool)
+    .await
+    .expect("seed frame");
+
+    let c_world = claim(pool, retired, WORLD, "retired author, world-owned").await;
+    let c_personal = claim(pool, retired, retired_group, "retired author, own group").await;
+    let c_actor = claim(pool, actor, actor_group, "actor author, own group").await;
+    let c_third = claim(pool, retired, third_group, "retired author, third group").await;
+    let c_unlinked = claim(pool, unlinked, WORLD, "unlinked author").await;
+    let c_private = claim(pool, retired, WORLD, "public claim, private evidence").await;
+    let missing = Uuid::new_v4();
+
+    let ev_r = evidence(
+        pool,
+        c_world,
+        Some(retired),
+        "evidence signed by the retired author",
+    )
+    .await;
+    let ev_w = evidence(
+        pool,
+        c_world,
+        Some(stranger),
+        "evidence signed by a stranger",
+    )
+    .await;
+    let ev_null = evidence(pool, c_world, None, "unsigned evidence").await;
+    let ev_personal = evidence(
+        pool,
+        c_personal,
+        Some(retired),
+        "evidence on the personal claim",
+    )
+    .await;
+    let ev_private = evidence(pool, c_private, None, "group-private evidence").await;
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(ev_private)
+        .bind(retired_group)
+        .execute(pool)
+        .await
+        .expect("make ev_private group-private");
+
+    let trace = fixture::seed_reasoning_trace(pool, c_world, "deductive").await;
+    let mf_w = mass_function(pool, c_world, frame, stranger).await;
+    let mf_r = mass_function(pool, c_personal, frame, retired).await;
+    let mf_w_personal = mass_function(pool, c_personal, frame, stranger).await;
+    let cv_w: Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_versions (claim_id, version_number, content, truth_value, created_by) \
+         VALUES ($1, 1, 'v1', 0.5, $2) RETURNING id",
+    )
+    .bind(c_world)
+    .bind(stranger)
+    .fetch_one(pool)
+    .await
+    .expect("seed claim version");
+    let challenge_w: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation) \
+         VALUES ($1, $2, 'factual', 'a stranger disputes it') RETURNING id",
+    )
+    .bind(c_world)
+    .bind(stranger)
+    .fetch_one(pool)
+    .await
+    .expect("seed challenge");
+    sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+        .bind(c_world)
+        .bind(frame)
+        .execute(pool)
+        .await
+        .expect("seed claim frame");
+
+    let source: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
+    )
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester source");
+    let frag: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
+                                          visibility) \
+         VALUES ($1, $2, 'fragment text', $3, 'public') RETURNING id",
+    )
+    .bind(source)
+    .bind(h32(Uuid::new_v4()))
+    .bind(WORLD)
+    .fetch_one(pool)
+    .await
+    .expect("seed fragment");
+    for c in [c_world, c_unlinked] {
+        sqlx::query(
+            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
+        )
+        .bind(c)
+        .bind(frag)
+        .execute(pool)
+        .await
+        .expect("seed provenance");
+    }
+
+    let edge_plain = fixture::seed_edge(pool, c_world, c_personal).await;
+    let edge_w = signed_edge(pool, c_world, c_actor, stranger).await;
+    let edge_prior =
+        fixture::seed_edge_owned_by(pool, c_world, c_third, "public", retired_group).await;
+
+    let recall: Uuid = sqlx::query_scalar(
+        "INSERT INTO recall_events (agent_id, tool, query_text, returned_claim_ids, \
+                                    owner_group_id, visibility) \
+         VALUES ($1, 'recall', 'what did I say', ARRAY[$2]::uuid[], $3, 'group') RETURNING id",
+    )
+    .bind(retired)
+    .bind(c_world)
+    .bind(retired_group)
+    .fetch_one(pool)
+    .await
+    .expect("seed recall event");
+
+    // A derived row whose prior owner differs from its claim's: reversal must
+    // give it THIS owner back, not the claim's. LAST, on purpose: migration
+    // 070's insert arm re-syncs EVERY evidence row of a claim to the claim on
+    // each new evidence insert for it, so an earlier divergence would already
+    // have been undone by the inserts above.
+    sqlx::query("UPDATE evidence SET owner_group_id = $2 WHERE id = $1")
+        .bind(ev_w)
+        .bind(stranger_group)
+        .execute(pool)
+        .await
+        .expect("diverge ev_w");
+
+    Fx {
+        operator,
+        target,
+        retired,
+        retired_group,
+        actor,
+        actor_group,
+        stranger,
+        stranger_group,
+        unlinked,
+        third_group,
+        frame,
+        c_world,
+        c_personal,
+        c_actor,
+        c_third,
+        c_unlinked,
+        c_private,
+        missing,
+        ev_r,
+        ev_w,
+        ev_null,
+        ev_personal,
+        ev_private,
+        trace,
+        mf_w,
+        mf_r,
+        mf_w_personal,
+        cv_w,
+        challenge_w,
+        frag,
+        edge_plain,
+        edge_w,
+        edge_prior,
+        recall,
+    }
+}
+
+fn claims_file(dir: &std::path::Path, fx: &Fx) -> PathBuf {
+    let p = dir.join("claims.txt");
+    let body = [
+        fx.c_world,
+        fx.c_personal,
+        fx.c_actor,
+        fx.c_third,
+        fx.c_unlinked,
+        fx.c_private,
+        fx.missing,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join("\n");
+    std::fs::write(&p, format!("# reown fixture\n{body}\n")).expect("claims file");
+    p
+}
+
+const SNAP_TABLES: &[&str] = &[
+    "claims",
+    "evidence",
+    "reasoning_traces",
+    "mass_functions",
+    "claim_versions",
+    "challenges",
+    "claim_frames",
+    "triples",
+    "entity_mentions",
+    "ds_combined_beliefs",
+    "ds_bayesian_divergence",
+    "harvester_claim_provenance",
+    "experiment_triples",
+    "experiment_entity_mentions",
+    "claim_clusters",
+    "claim_cluster_membership",
+    "claim_neighborhood_membership",
+    "claim_signature_revocations",
+    "harvester_fragments",
+    "harvester_sources",
+    "edges",
+    "factors",
+    "recall_events",
+    "groups",
+    "group_memberships",
+    "operator_links",
+    "agents",
+    "frames",
+];
+
+/// Every row of [`SNAP_TABLES`]. With `strip_updated_at`, `claims.updated_at`
+/// is removed from claims rows (see the module doc); nothing else ever is.
+async fn snapshot(pool: &PgPool, strip_updated_at: bool) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for t in SNAP_TABLES {
+        let expr = if *t == "claims" && strip_updated_at {
+            "(to_jsonb(t) - 'updated_at')::text"
+        } else {
+            "to_jsonb(t)::text"
+        };
+        let sql = format!("SELECT {expr} FROM {t} t ORDER BY 1");
+        let rows: Vec<String> = sqlx::query_scalar(&sql)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        out.insert((*t).to_string(), rows);
+    }
+    out
+}
+
+fn assert_same(a: &BTreeMap<String, Vec<String>>, b: &BTreeMap<String, Vec<String>>, what: &str) {
+    for (t, rows) in a {
+        let other = &b[t];
+        if rows != other {
+            let gone: Vec<_> = rows.iter().filter(|r| !other.contains(r)).collect();
+            let new: Vec<_> = other.iter().filter(|r| !rows.contains(r)).collect();
+            panic!("{what}: table {t} differs\n  before-only: {gone:#?}\n  after-only: {new:#?}");
+        }
+    }
+}
+
+async fn tenancy(pool: &PgPool, table: &str, id: Uuid) -> (Uuid, String) {
+    sqlx::query_as(&format!(
+        "SELECT owner_group_id, visibility::text FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{table} {id}: {e}"))
+}
+
+async fn tenancy_where(pool: &PgPool, table: &str, cond: &str, id: Uuid) -> (Uuid, String) {
+    sqlx::query_as(&format!(
+        "SELECT owner_group_id, visibility::text FROM {table} WHERE {cond}"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{table} where {cond}: {e}"))
+}
+
+fn public(g: Uuid) -> (Uuid, String) {
+    (g, "public".to_string())
+}
+
+async fn reown(
+    pool: &PgPool,
+    dir: &std::path::Path,
+    fx: &Fx,
+    derived: &str,
+    manifest: &str,
+    apply: bool,
+) -> Run {
+    let cf = claims_file(dir, fx);
+    let mf = dir.join(manifest);
+    let op = fx.operator.to_string();
+    let mut args = vec![
+        "reown-claims",
+        "--claims-file",
+        cf.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--derived",
+        derived,
+        "--manifest-out",
+        mf.to_str().unwrap(),
+        "--batch-size",
+        "2",
+    ];
+    if apply {
+        args.push("--apply");
+    }
+    run_op(pool, &args).await
+}
+
+async fn reverse(pool: &PgPool, manifest: &std::path::Path, apply: bool) -> Run {
+    let mut args = vec![
+        "reown-reverse",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--batch-size",
+        "2",
+    ];
+    if apply {
+        args.push("--apply");
+    }
+    run_op(pool, &args).await
+}
+
+/// The held claims and everything of theirs that must never be written.
+async fn assert_held_untouched(pool: &PgPool, fx: &Fx) {
+    assert_eq!(
+        tenancy(pool, "claims", fx.c_third).await,
+        public(fx.third_group)
+    );
+    assert_eq!(tenancy(pool, "claims", fx.c_unlinked).await, public(WORLD));
+    assert_eq!(tenancy(pool, "claims", fx.c_private).await, public(WORLD));
+    assert_eq!(
+        tenancy(pool, "evidence", fx.ev_private).await,
+        (fx.retired_group, "group".to_string()),
+        "the group-private evidence row must stay exactly where it was"
+    );
+    assert_eq!(
+        tenancy(pool, "recall_events", fx.recall).await,
+        (fx.retired_group, "group".to_string()),
+        "recall_events is principal-scoped and must stay untouched"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The derived-table list cannot drift
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The tables `epigraph_propagate_tenancy` cascades to, parsed from the live
+/// function body, are EXACTLY the tables `WRITER_COLUMNS` attributes. A
+/// migration that adds a table to the trigger fails here until the new table's
+/// writer rule is decided; one that removes a table fails here until the stale
+/// entry is removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_propagated_table_has_a_writer_rule(pool: PgPool) {
+    let mut conn = pool.acquire().await.unwrap();
+    let specs = epigraph_cli::operator::tables::propagated_tables(&mut conn)
+        .await
+        .expect("the live cascade is fully attributed");
+    let derived: std::collections::BTreeSet<String> = specs
+        .iter()
+        .filter(|s| s.kind == epigraph_cli::operator::tables::Kind::Derived)
+        .map(|s| s.name.clone())
+        .collect();
+    let ruled: std::collections::BTreeSet<String> = epigraph_cli::operator::tables::WRITER_COLUMNS
+        .iter()
+        .map(|(t, _)| (*t).to_string())
+        .collect();
+    assert_eq!(derived, ruled);
+    assert!(specs.iter().any(|s| s.name == "harvester_fragments"));
+    assert!(specs.iter().any(|s| s.name == "edges"));
+    let cf = specs.iter().find(|s| s.name == "claim_frames").unwrap();
+    assert_eq!(
+        cf.pk,
+        vec!["claim_id", "frame_id"],
+        "composite keys are read, not assumed"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// reown-claims
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A dry run changes nothing, not even `claims.updated_at`, and creates no
+/// manifest; it prints the plan, the held list with reasons, the spill and the
+/// per-table "rows moved, all public before and after" lines.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, false).await;
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", false).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_same(&before, &snapshot(&pool, false).await, "dry run");
+    assert!(
+        !dir.join("m.jsonl").exists(),
+        "a dry run writes no manifest"
+    );
+
+    let o = &r.stdout;
+    assert!(
+        o.contains("PLAN: 7 requested, 3 eligible, 4 held"),
+        "{}",
+        r.show()
+    );
+    assert!(
+        o.contains(&format!("HELD\t{}\tnot found", fx.missing)),
+        "{o}"
+    );
+    assert!(
+        o.contains(&format!(
+            "HELD\t{}\towned by group {}",
+            fx.c_third, fx.third_group
+        )),
+        "{o}"
+    );
+    assert!(
+        o.contains(&format!(
+            "HELD\t{}\tauthor {} has no operator link",
+            fx.c_unlinked, fx.unlinked
+        )),
+        "{o}"
+    );
+    assert!(
+        o.contains(&format!(
+            "HELD\t{}\tnon-public rows would move with it: evidence=1",
+            fx.c_private
+        )),
+        "{o}"
+    );
+    assert!(o.contains(&format!("SPILL-WRITER\t{}", fx.stranger)), "{o}");
+    assert!(o.contains("SHARED-FRAGMENTS\t1"), "{o}");
+    assert!(
+        o.contains("evidence: rows moved: 4, all public before and after"),
+        "{o}"
+    );
+    assert!(o.contains("invariants: all held in every batch"), "{o}");
+    assert!(o.contains("DRY RUN"), "{o}");
+}
+
+/// `--derived follow-claim`: every eligible claim and every row it carries
+/// lands exactly where the plan says, visibility never changes, and nothing
+/// held is touched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_follow_claim_gives_exact_owners(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let t = fx.target;
+    for c in [fx.c_world, fx.c_personal, fx.c_actor] {
+        assert_eq!(tenancy(&pool, "claims", c).await, public(t));
+    }
+    for e in [fx.ev_r, fx.ev_w, fx.ev_null, fx.ev_personal] {
+        assert_eq!(tenancy(&pool, "evidence", e).await, public(t));
+    }
+    for m in [fx.mf_w, fx.mf_r, fx.mf_w_personal] {
+        assert_eq!(tenancy(&pool, "mass_functions", m).await, public(t));
+    }
+    assert_eq!(tenancy(&pool, "claim_versions", fx.cv_w).await, public(t));
+    assert_eq!(
+        tenancy(&pool, "challenges", fx.challenge_w).await,
+        public(t)
+    );
+    assert_eq!(
+        tenancy(&pool, "reasoning_traces", fx.trace).await,
+        public(t)
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fx.frag).await,
+        public(t)
+    );
+    assert_eq!(
+        tenancy_where(&pool, "claim_frames", "claim_id = $1", fx.c_world).await,
+        public(t)
+    );
+    // The held claim's provenance row of the SHARED fragment stays its own.
+    assert_eq!(
+        tenancy_where(
+            &pool,
+            "harvester_claim_provenance",
+            "claim_id = $1",
+            fx.c_unlinked
+        )
+        .await,
+        public(WORLD)
+    );
+    // Edges take the trigger's meet: two public endpoints => world.
+    for e in [fx.edge_plain, fx.edge_w, fx.edge_prior] {
+        assert_eq!(tenancy(&pool, "edges", e).await, public(WORLD));
+    }
+    assert_held_untouched(&pool, &fx).await;
+    assert!(r.stdout.contains("claims moved: 3"), "{}", r.show());
+}
+
+/// `--derived keep-writer`: rows written by the non-linked stranger keep their
+/// prior owners (including one that differed from its claim's); rows by the
+/// linked author, and writer-less rows, follow the claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_keep_writer_keeps_non_linked_rows(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "keep-writer", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let t = fx.target;
+    assert_eq!(tenancy(&pool, "claims", fx.c_world).await, public(t));
+    // Stranger-written: kept.
+    assert_eq!(
+        tenancy(&pool, "evidence", fx.ev_w).await,
+        public(fx.stranger_group)
+    );
+    assert_eq!(
+        tenancy(&pool, "mass_functions", fx.mf_w).await,
+        public(WORLD)
+    );
+    assert_eq!(
+        tenancy(&pool, "mass_functions", fx.mf_w_personal).await,
+        public(fx.retired_group)
+    );
+    assert_eq!(
+        tenancy(&pool, "claim_versions", fx.cv_w).await,
+        public(WORLD)
+    );
+    assert_eq!(
+        tenancy(&pool, "challenges", fx.challenge_w).await,
+        public(WORLD)
+    );
+    // Linked-author and writer-less rows: follow.
+    assert_eq!(tenancy(&pool, "evidence", fx.ev_r).await, public(t));
+    assert_eq!(tenancy(&pool, "evidence", fx.ev_null).await, public(t));
+    assert_eq!(tenancy(&pool, "evidence", fx.ev_personal).await, public(t));
+    assert_eq!(tenancy(&pool, "mass_functions", fx.mf_r).await, public(t));
+    assert_eq!(
+        tenancy(&pool, "reasoning_traces", fx.trace).await,
+        public(t)
+    );
+    // The stranger-signed edge's prior owner was world, which the meet also gives.
+    assert_eq!(tenancy(&pool, "edges", fx.edge_w).await, public(WORLD));
+    assert_held_untouched(&pool, &fx).await;
+    assert!(
+        r.stdout
+            .contains("evidence: rows moved: 3, all public before and after (1 kept"),
+        "{}",
+        r.show()
+    );
+}
+
+async fn apply_then_reverse_is_byte_for_byte(pool: PgPool, derived: &str) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, true).await;
+    let r = reown(&pool, &dir, &fx, derived, "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let moved = snapshot(&pool, true).await;
+    assert_ne!(
+        moved["claims"], before["claims"],
+        "the apply must have moved something"
+    );
+
+    let rv = reverse(&pool, &dir.join("m.jsonl"), true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert!(rv.stdout.contains("claims restored: 3"), "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, true).await, "apply then reverse");
+
+    // A second reversal is a no-op: nothing changes, not even updated_at.
+    let settled = snapshot(&pool, false).await;
+    let rv2 = reverse(&pool, &dir.join("m.jsonl"), true).await;
+    assert_eq!(rv2.code, 0, "{}", rv2.show());
+    assert!(rv2.stdout.contains("claims restored: 0"), "{}", rv2.show());
+    assert_same(&settled, &snapshot(&pool, false).await, "second reverse");
+}
+
+/// `follow-claim` → reverse restores every row byte for byte, including the
+/// evidence row whose prior owner differed from its claim's and the edge whose
+/// prior owner was neither endpoint's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn follow_claim_apply_then_reverse_restores_every_row(pool: PgPool) {
+    apply_then_reverse_is_byte_for_byte(pool, "follow-claim").await;
+}
+
+/// The same for `keep-writer`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn keep_writer_apply_then_reverse_restores_every_row(pool: PgPool) {
+    apply_then_reverse_is_byte_for_byte(pool, "keep-writer").await;
+}
+
+/// A dry-run reversal changes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_reverse_writes_nothing(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let moved = snapshot(&pool, false).await;
+    let rv = reverse(&pool, &dir.join("m.jsonl"), false).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert!(rv.stdout.contains("claims restored: 3"), "{}", rv.show());
+    assert_same(&moved, &snapshot(&pool, false).await, "dry-run reverse");
+}
+
+/// A second apply moves nothing, and a manifest is never overwritten.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rerun_is_a_noop(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m1.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let first = std::fs::read_to_string(dir.join("m1.jsonl")).unwrap();
+    let settled = snapshot(&pool, false).await;
+
+    let again = reown(&pool, &dir, &fx, "follow-claim", "m1.jsonl", true).await;
+    assert_eq!(
+        again.code,
+        1,
+        "an existing manifest must be refused: {}",
+        again.show()
+    );
+    assert!(again.stderr.contains("must not exist"), "{}", again.show());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("m1.jsonl")).unwrap(),
+        first
+    );
+
+    let r2 = reown(&pool, &dir, &fx, "follow-claim", "m2.jsonl", true).await;
+    assert_eq!(r2.code, 0, "{}", r2.show());
+    assert!(r2.stdout.contains("0 eligible"), "{}", r2.show());
+    assert!(
+        r2.stdout.contains("3 already owned by the target"),
+        "{}",
+        r2.show()
+    );
+    assert!(r2.stdout.contains("claims moved: 0"), "{}", r2.show());
+    assert_same(&settled, &snapshot(&pool, false).await, "re-run");
+}
+
+/// The manifest is written before the first write and holds one record per
+/// claim and per derived row, each with ITS OWN prior tenancy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_manifest_records_each_rows_own_prior_owner(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let text = std::fs::read_to_string(dir.join("m.jsonl")).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(lines[0].get("manifest").is_some(), "header first");
+    let find = |table: &str, id: Uuid| {
+        lines
+            .iter()
+            .find(|v| v["table"] == table && v["id"] == id.to_string())
+            .unwrap_or_else(|| panic!("no record for {table} {id}"))
+            .clone()
+    };
+    assert_eq!(
+        find("claims", fx.c_world)["owner_group_id"],
+        WORLD.to_string()
+    );
+    assert_eq!(
+        find("claims", fx.c_personal)["owner_group_id"],
+        fx.retired_group.to_string()
+    );
+    assert_eq!(
+        find("evidence", fx.ev_w)["owner_group_id"],
+        fx.stranger_group.to_string()
+    );
+    let edge = find("edges", fx.edge_prior);
+    assert_eq!(edge["owner_group_id"], fx.retired_group.to_string());
+    assert!(edge["co_owner_group_id"].is_null());
+    assert!(find("evidence", fx.ev_r).get("co_owner_group_id").is_none());
+    let cf = lines
+        .iter()
+        .find(|v| v["table"] == "claim_frames")
+        .expect("composite-key record");
+    assert_eq!(cf["id"]["claim_id"], fx.c_world.to_string());
+    assert_eq!(cf["id"]["frame_id"], fx.frame.to_string());
+    for v in &lines[1..] {
+        assert_ne!(v["table"], "recall_events");
+        for held in [fx.c_third, fx.c_unlinked, fx.c_private] {
+            assert_ne!(
+                v["claim_id"],
+                held.to_string(),
+                "a held claim was recorded: {v}"
+            );
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant violations roll the batch back
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn assert_batch_rolls_back(pool: &PgPool, fx: &Fx, needle: &str) {
+    let dir = scratch_dir();
+    let before = snapshot(pool, false).await;
+    let r = reown(pool, &dir, fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 2, "{}", r.show());
+    assert!(r.stdout.contains("ROLLED BACK"), "{}", r.show());
+    assert!(r.stdout.contains(needle), "{}", r.show());
+    assert!(r.stdout.contains("STOPPED"), "{}", r.show());
+    assert_same(&before, &snapshot(pool, false).await, "rolled-back batch");
+    assert!(
+        dir.join("m.jsonl").exists(),
+        "the manifest is written before the first write"
+    );
+}
+
+/// A trigger that narrows evidence to `group` whenever its owner changes: the
+/// visibility invariant must catch it and the batch must roll back whole.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_visibility_change_rolls_back_its_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    exec(
+        &pool,
+        "CREATE FUNCTION test_narrow_evidence() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.owner_group_id IS DISTINCT FROM OLD.owner_group_id THEN \
+         NEW.visibility := 'group'; END IF; RETURN NEW; END $$",
+    )
+    .await;
+    exec(
+        &pool,
+        "CREATE TRIGGER test_narrow_evidence BEFORE UPDATE ON evidence \
+         FOR EACH ROW EXECUTE FUNCTION test_narrow_evidence()",
+    )
+    .await;
+    assert_batch_rolls_back(&pool, &fx, "visibility changed public -> group").await;
+}
+
+/// A trigger that writes a row OUTSIDE the eligible set — a principal-scoped
+/// `recall_events` row — on every claims UPDATE: the transaction's row census
+/// must catch it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_write_outside_the_set_rolls_back_its_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    exec(
+        &pool,
+        "CREATE FUNCTION test_touch_recall() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN UPDATE recall_events SET query_text = query_text || '!'; RETURN NULL; END $$",
+    )
+    .await;
+    exec(
+        &pool,
+        "CREATE TRIGGER test_touch_recall AFTER UPDATE ON claims \
+         FOR EACH STATEMENT EXECUTE FUNCTION test_touch_recall()",
+    )
+    .await;
+    assert_batch_rolls_back(&pool, &fx, "table recall_events").await;
+}
+
+/// A row can become unreadable to an unstamped application session without
+/// its visibility column changing — here a RESTRICTIVE policy that hides rows
+/// owned by the target group from `epigraph_app`. The readability census, taken
+/// under `SET LOCAL SESSION AUTHORIZATION epigraph_app`, must catch it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_readability_loss_rolls_back_its_batch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    exec(
+        &pool,
+        &format!(
+            "CREATE POLICY test_hide_target ON evidence AS RESTRICTIVE FOR SELECT \
+             TO epigraph_app USING (owner_group_id <> '{}')",
+            fx.target
+        ),
+    )
+    .await;
+    assert_batch_rolls_back(
+        &pool,
+        &fx,
+        "an unstamped epigraph_app session can read changed",
+    )
+    .await;
+}
+
+/// The operator's 2026-09-23 directive, alone: a public claim whose evidence
+/// row is GROUP-private is held, and nothing at all is written — not the
+/// claim, not the row, not a manifest record.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_private_evidence_row_holds_its_claim_and_nothing_is_written(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let cf = dir.join("one.txt");
+    std::fs::write(&cf, format!("{}\n", fx.c_private)).unwrap();
+    let mf = dir.join("m.jsonl");
+    let op = fx.operator.to_string();
+    let before = snapshot(&pool, false).await;
+    let r = run_op(
+        &pool,
+        &[
+            "reown-claims",
+            "--claims-file",
+            cf.to_str().unwrap(),
+            "--operator",
+            &op,
+            "--derived",
+            "follow-claim",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!(
+            "HELD\t{}\tnon-public rows would move with it: evidence=1",
+            fx.c_private
+        )),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("claims moved: 0"), "{}", r.show());
+    assert_same(&before, &snapshot(&pool, false).await, "held claim");
+    let recorded = std::fs::read_to_string(&mf).unwrap();
+    assert_eq!(recorded.lines().count(), 1, "header only: {recorded}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The connection
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn with_user(url: &str, user: &str, pass: &str) -> String {
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials in DATABASE_URL");
+    format!("{scheme}://{user}:{pass}@{host}")
+}
+
+/// Without the dedicated variable the tool refuses — even with `DATABASE_URL`
+/// and `MAINTENANCE_DATABASE_URL` both pointing at a maintenance-capable
+/// database — and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn it_never_falls_back_to_database_url(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let url = fixture::database_url_for(&pool).await;
+    let before = snapshot(&pool, false).await;
+    let cf = claims_file(&dir, &fx);
+    let mf = dir.join("m.jsonl");
+    let op = fx.operator.to_string();
+    let r = run_with_env(
+        &[
+            "reown-claims",
+            "--claims-file",
+            cf.to_str().unwrap(),
+            "--operator",
+            &op,
+            "--derived",
+            "follow-claim",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+        &[("DATABASE_URL", &url), ("MAINTENANCE_DATABASE_URL", &url)],
+        &[DSN_ENV],
+    );
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(
+        r.stderr
+            .contains("EPIGRAPH_OPERATOR_MAINTENANCE_DSN is not set"),
+        "{}",
+        r.show()
+    );
+    assert_same(&before, &snapshot(&pool, false).await, "refused run");
+    assert!(!mf.exists());
+}
+
+/// A LOGIN role that is not a member of `epigraph_maintenance` is refused
+/// before anything is read or written. Calibration: the SAME role, once
+/// granted membership, gets past the check (and `reown-claims` then refuses
+/// for the next reason — it cannot switch `session_user` for the readability
+/// check — also before writing anything).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_maintenance_role_is_refused(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let role = format!("reown_probe_{}", Uuid::new_v4().simple());
+    exec(
+        &pool,
+        &format!("CREATE ROLE {role} LOGIN PASSWORD 'probe-only'"),
+    )
+    .await;
+    let url = with_user(&fixture::database_url_for(&pool).await, &role, "probe-only");
+    let agents = dir.join("agents.txt");
+    std::fs::write(&agents, format!("{}\n", fx.stranger)).unwrap();
+    let op = fx.operator.to_string();
+    let link_args = [
+        "link-retired",
+        "--agents-file",
+        agents.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--apply",
+    ];
+    let before = snapshot(&pool, false).await;
+
+    let r = run_with_env(&link_args, &[(DSN_ENV, &url)], &["DATABASE_URL"]);
+    let refused = r.code == 1 && r.stderr.contains("is not a member of epigraph_maintenance");
+
+    exec(&pool, &format!("GRANT epigraph_maintenance TO {role}")).await;
+    let dry = [
+        "link-retired",
+        "--agents-file",
+        agents.to_str().unwrap(),
+        "--operator",
+        &op,
+    ];
+    let calibrated = run_with_env(&dry, &[(DSN_ENV, &url)], &["DATABASE_URL"]);
+    let cf = claims_file(&dir, &fx);
+    let mf = dir.join("m.jsonl");
+    let no_switch = run_with_env(
+        &[
+            "reown-claims",
+            "--claims-file",
+            cf.to_str().unwrap(),
+            "--operator",
+            &op,
+            "--derived",
+            "follow-claim",
+            "--manifest-out",
+            mf.to_str().unwrap(),
+            "--apply",
+        ],
+        &[(DSN_ENV, &url)],
+        &["DATABASE_URL"],
+    );
+    exec(&pool, &format!("REVOKE epigraph_maintenance FROM {role}")).await;
+    exec(&pool, &format!("DROP ROLE {role}")).await;
+
+    assert!(refused, "{}", r.show());
+    assert_eq!(calibrated.code, 0, "{}", calibrated.show());
+    assert!(
+        calibrated.stdout.contains("LINKED-RETIRED"),
+        "{}",
+        calibrated.show()
+    );
+    assert_eq!(no_switch.code, 1, "{}", no_switch.show());
+    assert!(
+        no_switch.stderr.contains("SESSION AUTHORIZATION"),
+        "{}",
+        no_switch.show()
+    );
+    assert!(!mf.exists(), "refused before the manifest");
+    assert_same(&before, &snapshot(&pool, false).await, "refused runs");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// link-retired
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dry run: the function's real outcome per id, rolled back. Apply: a retired
+/// row and no membership; a second apply is ALREADY-RETIRED; a self-link is
+/// refused with the function's own message and exit code 3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_dry_run_apply_and_refusal(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let (fresh, _) = fixture::seed_agent_with_group(&pool, "fresh-retiree").await;
+    let agents = dir.join("agents.txt");
+    std::fs::write(&agents, format!("{fresh}\n{}\n", fx.operator)).unwrap();
+    let op = fx.operator.to_string();
+    let args = |apply: bool| {
+        let mut a = vec![
+            "link-retired".to_string(),
+            "--agents-file".into(),
+            agents.to_str().unwrap().into(),
+            "--operator".into(),
+            op.clone(),
+        ];
+        if apply {
+            a.push("--apply".into());
+        }
+        a
+    };
+    let before = snapshot(&pool, false).await;
+    let dry_args = args(false);
+    let dry = run_op(
+        &pool,
+        &dry_args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    assert_eq!(dry.code, 3, "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!("{fresh}\tLINKED-RETIRED")),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("cannot be its own operator"),
+        "{}",
+        dry.show()
+    );
+    assert_same(
+        &before,
+        &snapshot(&pool, false).await,
+        "link-retired dry run",
+    );
+
+    let apply_args = args(true);
+    let apply_args: Vec<&str> = apply_args.iter().map(String::as_str).collect();
+    let r = run_op(&pool, &apply_args).await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    let row: (Uuid, bool) =
+        sqlx::query_as("SELECT operator_id, retired FROM operator_links WHERE agent_id = $1")
+            .bind(fresh)
+            .fetch_one(&pool)
+            .await
+            .expect("retired row");
+    assert_eq!(row, (fx.operator, true));
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(fx.target)
+    .bind(fresh)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(memberships, 0, "a retired link creates no membership");
+
+    let again = run_op(&pool, &apply_args).await;
+    assert!(
+        again.stdout.contains(&format!("{fresh}\tALREADY-RETIRED")),
+        "{}",
+        again.show()
+    );
+}
