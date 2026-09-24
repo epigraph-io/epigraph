@@ -16,7 +16,7 @@
 //! claim to the claim on the next evidence INSERT for it, and 072's update arm
 //! does the same on the next claim owner or visibility change, so an unpinned
 //! hidden row is re-published by ordinary application writes. The guard (a
-//! definer-only pin table plus pin-aware arms (c) and (d), as migration 104)
+//! definer-only pin table plus pin-aware arms (c) and (d), as migration 110)
 //! was not written in this branch. So `--apply` with any hide selector REFUSES
 //! on a schema without that guard, keyed on the live catalog
 //! ([`guard_status`]), and refuses again, with its own message, on a schema
@@ -363,7 +363,7 @@ pub fn refuse_apply(
              {}, update arm pinned: {}, insert arm pinned: {}). Without it the next claim \
              update, or the next evidence insert for the same claim, re-publishes every hidden \
              row (migrations 070/072), so a hide would not hold. It is the evidence pin \
-             migration (planned as 104); refusing",
+             migration (planned as 110); refusing",
             guard.pin_table,
             guard.propagate_arm_pinned,
             guard.inherit_arm_pinned

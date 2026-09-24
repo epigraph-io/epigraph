@@ -1,11 +1,11 @@
 //! `epigraph-operator`: the reviewed, in-repo tool for the one-time operator
-//! ownership backfill that migration 102 left out of scope.
+//! ownership backfill that migration 107 left out of scope.
 //!
 //! Three subcommands, each dry-run by default:
 //!
 //! * `link-retired` — call `epigraph_link_retired_agent` for a list of
 //!   historical agent identities, so the operator OWNS their claims while the
-//!   identities gain zero write authority (102 section 7).
+//!   identities gain zero write authority (107 section 7).
 //! * `reown-claims` — move an explicit list of claims (and every row the
 //!   tenancy trigger cascades from them) into the operator's personal group,
 //!   under a manifest written and fsynced BEFORE the first write.
@@ -179,7 +179,7 @@ pub fn read_ids_file(path: &Path) -> anyhow::Result<Vec<Uuid>> {
 /// operator itself created.
 ///
 /// The same test `epigraph_operator_actor` and the two link functions apply
-/// (migration 102 section 3): a group carrying the operator's `did_key` that
+/// (migration 107 section 3): a group carrying the operator's `did_key` that
 /// someone else created is a squat, not the operator's group.
 ///
 /// # Errors

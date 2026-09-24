@@ -2354,7 +2354,7 @@ async fn a_squatted_target_group_is_refused(pool: PgPool) {
         .bind(fx.stranger)
         .execute(&pool)
         .await
-        .expect("make the target a squat (superuser: 103 admits a maintenance session)");
+        .expect("make the target a squat (superuser: 108 admits a maintenance session)");
     let before = snapshot(&pool, false).await;
     let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
     assert_eq!(r.code, 1, "{}", r.show());
