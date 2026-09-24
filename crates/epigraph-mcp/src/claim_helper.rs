@@ -206,6 +206,227 @@ pub async fn begin_author_stamped_tx<'p>(
     })
 }
 
+/// Begin the ONE transaction a workflow-ingest write runs in, stamped from the
+/// **`workflow-ingest-system`** agent's viewer — *not* from `server.agent_id()`.
+///
+/// # Why this is a second entry point rather than a call to the one above
+///
+/// [`begin_author_stamped_tx`] resolves the author it is handed. The whole
+/// difficulty on this path is knowing WHICH author to hand it, and the answer is
+/// not the one every sibling tool uses. `store_workflow`, `ingest_workflow`,
+/// `improve_workflow_hierarchy`, `add_step` and `delete_step` all route through
+/// `epigraph-ingest-executor`, which authors every row as
+/// `get_or_create_system_agent` and owns it with
+/// `default_decl_for_author(system_agent)`. Migration 077's `WITH CHECK` asks
+/// about the ROW's owner group, so the caller's identity is the wrong question —
+/// MEASURED: stamping from the MCP server's own agent is refused exactly as
+/// being unstamped is. `epigraph_ingest_executor::system_agent_write_authority`
+/// carries that measurement and the bootstrap argument.
+///
+/// It returns the system agent id alongside the transaction because callers need
+/// it for the post-commit embed: `embed_claim_author_stamped` must stamp from
+/// the SAME author that owns the row, and passing `server.agent_id()` there
+/// would render a `{WRITABLE:c}` predicate no row satisfies.
+///
+///
+/// # RESIDUAL, stated so the R3 policy drop is not read as closing it
+///
+/// This stamps the transaction with the SYSTEM agent's authority, and nothing on
+/// this path asks whether the CALLER has any authority over the workflow it
+/// names. `add_step`, `delete_step`, `ingest_workflow` and
+/// `improve_workflow_hierarchy` (MCP), and `POST /api/v1/workflows/steps` and
+/// `/steps/delete` (HTTP, gated only by the `claims:write` scope) reach this on
+/// caller-supplied input (`canonical_name`, `step_lineage_id`). So any
+/// `claims:write` caller can mutate any system-owned workflow — the harness's
+/// `delete_step` arm drives a step's truth to 0.05 with no ownership relation
+/// between caller and workflow. MEASURED by review; not a regression: config B
+/// (production today) admits the same writes through the orphan `*_privacy`
+/// policies, and main behaves the same there.
+///
+/// What it means for R3: dropping the orphan policies does NOT tighten workflow
+/// mutation at all, because these writes no longer depend on them. Tightening
+/// needs a caller-side check against the TARGET workflow before the stamp, and
+/// a decision about who "owns" a workflow the system agent authored — neither
+/// of which is a mechanical conversion. Tracked as open work, not fixed here.
+///
+/// # Errors
+/// * `McpError::internal_error` if the system agent has no write authority (see
+///   `system_agent_write_authority`) — a loud refusal, nothing written.
+/// * `McpError::internal_error` if this process was not built from a
+///   [`epigraph_db::ScopedPool`], or if `BEGIN` / the GUC stamp fails. Never a
+///   fallback to the unstamped pool.
+pub async fn begin_system_ingest_stamped_tx<'p>(
+    server: &'p EpiGraphMcpFull,
+    tool_name: &'static str,
+) -> Result<(uuid::Uuid, epigraph_db::ScopedTx<'p>), McpError> {
+    let scoped = server.scoped.as_ref().ok_or_else(|| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            "write refused: this MCP process was not built from a ScopedPool, so no connection \
+             can be stamped with the ingest system agent's tenancy context. Refusing rather than \
+             walking the plan on the unstamped pool, where a cleanly-migrated schema refuses the \
+             first claim INSERT and leaves the workflows row behind."
+        );
+        internal_error(format!(
+            "{tool_name}: this MCP server was not built from a ScopedPool, so the workflow \
+             ingest path cannot stamp a connection with the ingest system agent's tenancy \
+             context. Nothing was written. Construct the server with \
+             EpiGraphMcpFull::with_scoped_pool."
+        ))
+    })?;
+
+    let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                tool = tool_name,
+                error = %e,
+                "write refused: could not establish the workflow-ingest-system agent's write \
+                 authority. Nothing was written."
+            );
+            internal_error(format!(
+                "{tool_name}: could not establish the workflow-ingest-system agent's write \
+                 authority: {e}. Nothing was written."
+            ))
+        })?;
+
+    let tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            tool = tool_name,
+            author = %authority.agent_id,
+            error = %e,
+            "could not begin a system-agent-stamped transaction"
+        );
+        internal_error(format!(
+            "{tool_name}: could not begin a system-agent-stamped transaction: {e}"
+        ))
+    })?;
+
+    Ok((authority.agent_id, tx))
+}
+
+/// Run `ds_auto::auto_wire_ds_for_claim` in its OWN transaction, stamped from
+/// the **author's** viewer. Post-commit, best-effort, and deliberately NOT
+/// inside the submission's write transaction.
+///
+/// # Why the DS wiring gets its own transaction rather than joining the write
+///
+/// For `submit_claim` and `memorize` the DS wiring is best-effort by contract —
+/// the module doc on `tools::ds_auto` states it: "`update_with_evidence`
+/// propagates errors. `submit_claim` treats DS as best-effort (claim is already
+/// persisted)." Folding it into the submission transaction would make a DS
+/// failure roll the claim back, which converts a WARN into a total
+/// `submit_claim` outage. That is the fail-closed-regression-as-data-loss shape
+/// [`emit_verb_edge_best_effort`]'s doc argues against, and it is why the embed
+/// is post-commit too.
+///
+/// What a separate transaction DOES buy is atomicity WITHIN the wiring.
+/// `auto_wire_ds_for_claim` writes `claim_frames`, `mass_functions` and then
+/// `UPDATE claims SET belief/…`; on the pool each of those was a separate
+/// checkout with its own tenancy context, so a refusal at the belief UPDATE left
+/// a BBA behind with no cached belief derived from it. Here they land together or
+/// not at all.
+///
+/// # THE `was_created` GATE IS THE CALLER'S AND MUST NOT MOVE
+///
+/// Both callers gate this on `was_created` alone, and the asymmetry with the
+/// embed gate (which was deliberately widened) is not an oversight — the two
+/// have OPPOSITE safety properties. Re-running the embed overwrites one vector
+/// with an equivalent one; re-running this COMBINES the same mass a second time
+/// and inflates the claim's belief. This helper therefore takes no view on when
+/// it should run: it is called inside the caller's `if was_created` and that is
+/// where the decision stays.
+///
+/// # Errors
+/// None returned. Every failure is warned and reported as `None`, because the
+/// claim is already committed and CLAUDE.md's write-path invariant forbids a
+/// best-effort step from unwinding it.
+/// `persist_truth_from_pignistic` folds the caller's follow-up
+/// `UPDATE claims SET truth_value` into the SAME transaction. `submit_claim`
+/// needs it and `memorize` does not, and the difference is not cosmetic: that
+/// UPDATE writes a value DERIVED from the BBA this wiring just stored, so on a
+/// separate checkout it could land while the BBA was refused, or be refused
+/// while the BBA landed — a claim whose `truth_value` and whose `mass_functions`
+/// rows disagree about what the evidence says. Inside the transaction the two are
+/// one fact.
+pub async fn wire_ds_for_new_claim_author_stamped(
+    server: &EpiGraphMcpFull,
+    author_agent_id: uuid::Uuid,
+    claim_id: uuid::Uuid,
+    viewer: &epigraph_db::visibility::Viewer,
+    input: crate::tools::ds_auto::DsAutoInput<'_>,
+    persist_truth_from_pignistic: bool,
+    tool_name: &'static str,
+) -> Option<crate::tools::ds_auto::DsAutoResult> {
+    let mut tx = match begin_author_stamped_tx(server, author_agent_id, tool_name).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "ds auto-wire skipped: {}. The claim is stored but carries no BBA and no cached \
+                 belief until a recompute reaches it",
+                e.message
+            );
+            return None;
+        }
+    };
+    let wired = crate::tools::ds_auto::auto_wire_ds_for_claim(
+        &mut tx,
+        viewer,
+        claim_id,
+        author_agent_id,
+        input,
+    )
+    .await;
+    let result = match wired {
+        Ok(r) => r,
+        Err(e) => {
+            // Dropping `tx` rolls back, so a partial wiring is never left behind.
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "ds auto-wire failed: {e}. Rolled back; the claim is stored with no BBA"
+            );
+            return None;
+        }
+    };
+
+    if persist_truth_from_pignistic {
+        let ds_truth = epigraph_core::TruthValue::clamped(result.pignistic_prob);
+        if let Err(e) = ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            epigraph_core::ClaimId::from_uuid(claim_id),
+            ds_truth,
+        )
+        .await
+        {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "failed to update truth from DS pignistic: {e}. Rolled back the whole wiring \
+                 rather than leaving truth_value and mass_functions disagreeing"
+            );
+            return None;
+        }
+    }
+
+    match tx.commit().await {
+        Ok(()) => Some(result),
+        Err(e) => {
+            tracing::warn!(
+                claim_id = %claim_id,
+                tool = tool_name,
+                "ds auto-wire computed but could not commit: {e}. Nothing was written"
+            );
+            None
+        }
+    }
+}
+
 /// Generate (or reuse) a claim's embedding vector and store it on a connection
 /// stamped from the **author's** viewer. Post-commit, best-effort, and
 /// deliberately NOT inside the submission's write transaction.

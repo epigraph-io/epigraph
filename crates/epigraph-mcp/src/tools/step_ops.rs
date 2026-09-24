@@ -15,7 +15,10 @@ pub struct AddStepParams {
     pub canonical_name: String,
     /// Step text to append/insert.
     pub step_text: String,
-    /// 0-indexed insertion slot. `None` (or out-of-range) appends.
+    /// 0-indexed insertion slot in the `step_follows` chain. `None` (or
+    /// out-of-range) appends. It does not change plan order: find_workflow,
+    /// find_workflow_hierarchical and the outcome tools list an added step after
+    /// all originally planned steps.
     #[serde(default)]
     pub position: Option<u32>,
 }
@@ -59,19 +62,47 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
     }
 }
 
+/// Append or middle-insert a step under an existing workflow.
+///
+/// # One stamped transaction, not five pool checkouts
+///
+/// The step claim is authored by `workflow-ingest-system` and owned by that
+/// agent's personal group, so on the unstamped pool its INSERT is refused on a
+/// cleanly-migrated schema. The stamp is therefore the system agent's — see
+/// [`crate::claim_helper::begin_system_ingest_stamped_tx`] — not
+/// `server.agent_id()`.
+///
+/// Holding one transaction across the whole call also makes the chain rewire
+/// atomic. `add_step` writes the claim, an `executes` edge, a `decomposes_to`
+/// edge and up to three `step_follows` rewires including a `DELETE`; on separate
+/// checkouts a refusal at the last of those left a step spliced into a broken
+/// chain, which `ordered_steps` then reports by appending the orphan in
+/// `created_at` order — a silent reordering rather than an error. Retrying is
+/// safe because the claim id is `compound_claim_id(step_hash, canonical_name)`
+/// and the INSERT carries `ON CONFLICT (id) DO NOTHING`.
 pub async fn add_step(
     server: &EpiGraphMcpFull,
     params: AddStepParams,
 ) -> Result<CallToolResult, McpError> {
+    let (_system_agent_id, mut tx) =
+        crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step").await?;
     let r = epigraph_ingest_executor::add_step(
-        &server.pool,
+        &mut tx,
         &params.canonical_name,
         &params.step_text,
         params.position,
     )
     .await
     .map_err(map_step_err)?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(format!("add_step: could not commit: {e}")))?;
 
+    // Post-commit and best-effort, deliberately outside the transaction: the
+    // embed holds a network round trip to OpenAI, and CLAUDE.md's embedding
+    // policy forbids a failed embed from unwinding a committed claim.
+    // `embed_and_store` reads the author off the row, so it stamps from the
+    // system agent without being told to.
     if let Some(ref content) = r.inserted_content {
         let _ = server
             .embedder
@@ -88,14 +119,26 @@ pub async fn add_step(
     })
 }
 
+/// Soft-delete a step lineage by setting its head claim's `truth_value` to 0.05.
+///
+/// Same stamp and same reason as [`add_step`]: the row being updated is owned by
+/// the system agent's personal group, and `claims_tenancy`'s `WITH CHECK`
+/// governs an UPDATE as well as an INSERT. On the unstamped pool this was
+/// admitted in production only by the orphan `claims_privacy` policy and refused
+/// on a clean migrate.
 pub async fn delete_step(
     server: &EpiGraphMcpFull,
     params: DeleteStepParams,
 ) -> Result<CallToolResult, McpError> {
     let lineage = parse_uuid(&params.step_lineage_id)?;
-    let r = epigraph_ingest_executor::delete_step(&server.pool, &params.canonical_name, lineage)
+    let (_system_agent_id, mut tx) =
+        crate::claim_helper::begin_system_ingest_stamped_tx(server, "delete_step").await?;
+    let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;
+    tx.commit()
+        .await
+        .map_err(|e| internal_error(format!("delete_step: could not commit: {e}")))?;
     success_json(&DeleteStepResponse {
         workflow_id: r.workflow_id,
         step_claim_id: r.step_claim_id,

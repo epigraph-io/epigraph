@@ -65,9 +65,13 @@ async fn lineage_assigned_to_level_2_and_3_only(pool: PgPool) {
     let step_id = id_at(&plan, "phases[0].steps[0]");
     let op_id = id_at(&plan, "phases[0].steps[0].operations[0]");
 
-    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("ingest plan");
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("ingest plan");
     assert!(!result.already_ingested);
     assert!(
         result.claims_ingested >= 4,
@@ -184,9 +188,13 @@ async fn caller_supplied_lineage_uuid_preserved(pool: PgPool) {
             serde_json::Value::String(preset.to_string()),
         );
 
-    let _result = epigraph_ingest_executor::execute_workflow_ingest_plan(&pool, &plan, &extraction)
-        .await
-        .expect("ingest plan");
+    let _result = epigraph_ingest_executor::execute_workflow_ingest_plan(
+        &mut pool.acquire().await.expect("acquire"),
+        &plan,
+        &extraction,
+    )
+    .await
+    .expect("ingest plan");
 
     let row: (Option<Uuid>,) = sqlx::query_as("SELECT step_lineage_id FROM claims WHERE id = $1")
         .bind(step_id)

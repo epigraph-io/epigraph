@@ -23,7 +23,7 @@ mod fixture;
 
 mod common;
 
-use common::{build_test_server, seed_claim, seed_claim_with_belief};
+use common::{build_scoped_test_server, seed_claim, seed_claim_with_belief};
 use epigraph_mcp::tools::link_epistemic::do_link_epistemic;
 use epigraph_mcp::types::LinkEpistemicParams;
 use sqlx::PgPool;
@@ -91,7 +91,10 @@ async fn edge_count(pool: &PgPool, source: Uuid, target: Uuid, relationship: &st
 #[sqlx::test(migrations = "../../migrations")]
 async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     // High-commitment source so the wire produces `Wired` (not SourceFactorless).
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     // Target starts neutral: NULL DS columns, truth_value 0.5.
@@ -206,7 +209,10 @@ async fn supports_raises_target_belief_and_is_idempotent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn contradicts_lowers_target_belief(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let target = seed_claim(&pool, "target under attack", 0.5).await;
 
@@ -260,7 +266,10 @@ async fn contradicts_lowers_target_belief(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     // `seed_claim` plants an agent_id but leaves belief/plausibility/pignistic
     // NULL → the engine finds no source interval → SourceFactorless.
     let source = seed_claim(&pool, "factorless source", 0.5).await;
@@ -345,7 +354,10 @@ async fn factorless_source_writes_durable_edge_without_wiring(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim(&pool, "will gain belief later", 0.5).await;
     let target = seed_claim(&pool, "dependent on source", 0.5).await;
 
@@ -487,7 +499,10 @@ async fn factorless_source_wakes_up_when_it_later_gains_belief(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn structural_relationship_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim(&pool, "s", 0.5).await;
     let target = seed_claim(&pool, "t", 0.5).await;
 
@@ -531,7 +546,10 @@ async fn structural_relationship_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     // Same high-commitment source as the `supports` test, so a failure to
     // no-op couldn't hide behind `SourceFactorless`.
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
@@ -604,7 +622,10 @@ async fn cites_edge_is_created_but_does_not_move_belief(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersedes_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim(&pool, "newer", 0.5).await;
     let target = seed_claim(&pool, "older", 0.5).await;
 
@@ -637,7 +658,10 @@ async fn supersedes_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn self_loop_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let claim = seed_claim(&pool, "loop", 0.5).await;
 
     let err = do_link_epistemic(
@@ -664,7 +688,10 @@ async fn self_loop_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn missing_target_claim_is_rejected(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let bogus = Uuid::new_v4();
 
@@ -718,7 +745,10 @@ async fn symmetric_edge_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &st
 #[sqlx::test(migrations = "../../migrations")]
 async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "the disputed claim", 0.5).await;
 
@@ -787,7 +817,10 @@ async fn contradicts_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim(&pool, "the corroborated claim", 0.5).await;
 
@@ -829,7 +862,10 @@ async fn corroborates_filed_in_both_orders_collapses_to_one_edge(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let a = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
     let b = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
 
@@ -881,7 +917,10 @@ async fn supports_filed_in_both_orders_stays_two_directional_edges(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn reverse_order_rehit_wires_the_stored_orientation(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    // `link_epistemic`'s belief wiring now REFUSES on a server with no
+    // `ScopedPool` rather than falling back to the unstamped pool, so
+    // `belief_wired` would be false for a reason that is not about this test.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let a = seed_claim(&pool, "stored source, factorless at first", 0.5).await;
     let b = seed_claim(&pool, "stored target", 0.5).await;
 

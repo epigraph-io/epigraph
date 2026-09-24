@@ -73,7 +73,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     let evidence_id = seed_evidence(&pool, claim_id).await;
 
     tools::ds_auto::auto_wire_ds_update(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         claim_id,
         agent_id,
@@ -152,7 +152,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     let ev_c = seed_evidence(&pool, claim_id).await;
 
     tools::ds_auto::auto_wire_ds_update(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         claim_id,
         agent_id,
@@ -166,7 +166,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     .expect("first update");
 
     tools::ds_auto::auto_wire_ds_update(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         claim_id,
         agent_id,
@@ -219,7 +219,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     // BBA and the two existing intra-tagged rows (we promote AFTER the
     // call too to make sure THIS row goes through the helper as intra).
     tools::ds_auto::auto_wire_ds_update(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         claim_id,
         agent_id,
@@ -245,9 +245,13 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     // We can use a fresh call to auto_wire_ds_update with an additional
     // ev_id, but a cleaner path is to call recompute_claim_belief_binary
     // directly on the engine API.
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(&pool, &viewer, claim_id)
-        .await
-        .expect("recompute under factor 0.9");
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim_id,
+    )
+    .await
+    .expect("recompute under factor 0.9");
 
     let betp_weak: f64 = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(claim_id)
@@ -264,9 +268,13 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
     .await
     .expect("set per-frame factor to 0.05");
 
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(&pool, &viewer, claim_id)
-        .await
-        .expect("recompute under factor 0.05");
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        claim_id,
+    )
+    .await
+    .expect("recompute under factor 0.05");
 
     let betp_strong: f64 = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
         .bind(claim_id)

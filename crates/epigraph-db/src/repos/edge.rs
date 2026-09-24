@@ -183,10 +183,26 @@ impl EdgeRepository {
     /// `ON CONFLICT`. Two round-trips are acceptable for the ingestion
     /// path; the race window is small and edges are idempotent in practice.
     ///
+    /// # Why this takes an `Acquire` rather than a `&PgPool`
+    ///
+    /// `edges` is tier-A under migration 077 and `edges_tenancy`'s `WITH CHECK`
+    /// derives the row's tenancy from its endpoints, so on an unstamped
+    /// connection this INSERT is refused on a cleanly-migrated schema (it lands
+    /// in production only because of the orphan PERMISSIVE `edges_privacy`
+    /// policy, which exists in no migration). A generic `Acquire` lets a
+    /// converted caller pass `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` while the seventeen `&pool` callers
+    /// compile and behave exactly as before — `&PgPool` implements `Acquire`
+    /// too.
+    ///
+    /// `begin()` below therefore opens a real transaction when handed a pool and
+    /// a **SAVEPOINT** when handed a connection already inside one, which is the
+    /// property that keeps the dedup probe + INSERT atomic in both shapes
+    /// without a second code path.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database operation fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, properties))]
     pub async fn create_if_not_exists(
         pool: &PgPool,
         source_id: Uuid,
@@ -198,7 +214,51 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
-        let mut tx = pool.begin().await?;
+        let mut conn = pool.acquire().await?;
+        Self::create_if_not_exists_conn(
+            &mut conn,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_if_not_exists`] on a connection the caller owns — the form
+    /// a stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one dedup probe
+    /// and one INSERT. `begin()` opens a real transaction when this connection is
+    /// not already in one and a **SAVEPOINT** when it is, which keeps the
+    /// probe+INSERT atomic in both shapes.
+    ///
+    /// A concrete `&mut PgConnection` rather than a generic `Acquire` for the
+    /// reason given on
+    /// [`crate::ClaimRepository::create_with_id_if_absent_conn`]: under
+    /// `#[tool_router]`'s boxed `dyn Future + Send` an `Acquire<'a>` bound fails
+    /// to prove `for<'x> &'x mut PgConnection: Acquire<'x>`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any database operation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_not_exists_conn(
+        conn: &mut sqlx::PgConnection,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        use sqlx::Acquire;
+        let mut tx = conn.begin().await?;
 
         let existing = sqlx::query!(
             r#"
@@ -704,13 +764,16 @@ impl EdgeRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn is_in_force(pool: &PgPool, edge_id: Uuid) -> Result<bool, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn is_in_force<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        edge_id: Uuid,
+    ) -> Result<bool, DbError> {
         let found: Option<bool> = sqlx::query_scalar(&format!(
             "SELECT true FROM edges e WHERE e.id = $1 AND {EDGE_IN_FORCE}"
         ))
         .bind(edge_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(found.unwrap_or(false))
     }

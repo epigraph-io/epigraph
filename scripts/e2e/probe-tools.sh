@@ -13,7 +13,8 @@
 # --- credentials come from the environment, never from this file -------------
 # Required:
 #   E2E_SU_DSN   superuser DSN with DDL rights on the throwaway DB (migrations,
-#                policy replay, row counts).  e.g. postgres://u:p@host:5432/epigraph_e2e_test
+#                policy replay, row counts).  e.g. postgres://u:p@127.0.0.1:5433/epigraph_e2e_test
+#                (an explicit port is required; a DSN on 5432 is refused)
 #   E2E_APP_DSN  the least-privilege application DSN the server connects as.
 #                MUST be a role with rolbypassrls=false, or every arm is vacuous.
 # Optional:
@@ -30,6 +31,10 @@
 #                   one run, and it writes to a throwaway database.
 : "${E2E_SU_DSN:?set E2E_SU_DSN (superuser DSN for the throwaway e2e database)}"
 : "${E2E_APP_DSN:?set E2E_APP_DSN (least-privilege app DSN; rolbypassrls MUST be false)}"
+# Refuse a DSN on the production port (or with no port) before anything runs;
+# sets E2E_SU_PORT, which every psql call below passes as -p.
+# shellcheck source=dsn-guard.sh
+. "$(cd "$(dirname "$0")" && pwd)/dsn-guard.sh"
 E2E_SU_PW="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://[^:]+:([^@]*)@.*#\1#')"
 E2E_SU_USER="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*://([^:]+):.*#\1#')"
 E2E_DB="$(printf '%s' "$E2E_SU_DSN" | sed -E 's#.*/([^/?]+)$#\1#')"
@@ -47,7 +52,7 @@ SOCK="$E2E/probe.sock.$LABEL"
 DSN="$E2E_APP_DSN"
 H=(-H Content-Type:application/json -H Accept:application/json,text/event-stream)
 
-q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
+q() { PGPASSWORD="$E2E_SU_PW" psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
 
 # OPENAI_API_KEY comes from the ENVIRONMENT only. An earlier revision read it out
 # of a host-specific `epiclaw.env`, which made the harness unrunnable anywhere else
@@ -58,7 +63,7 @@ echo "### binary: $BIN"
 LOCKFIFO="$E2E/.plock.$LABEL"
 rm -f "$LOCKFIFO"; mkfifo "$LOCKFIFO"
 PGPASSWORD="$E2E_SU_PW" \
-  psql -h 127.0.0.1 -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
+  psql -h 127.0.0.1 -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -qtA \
   -c "SELECT pg_advisory_lock(918273645);" -f "$LOCKFIFO" >/dev/null 2>&1 &
 LOCKPID=$!
 exec 9>"$LOCKFIFO"
@@ -98,12 +103,14 @@ echo "--- challenge_claim ---"
 call "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"challenge_claim\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"challenge_type\":\"insufficient_evidence\",\"explanation\":\"probe challenge\"}}}" | tail -c 400
 echo
 echo "--- update_with_evidence ---"
-# `labels` is passed so the arm has a DISCRIMINATING row count. The evidence
-# INSERT commits before the DS wiring on every binary, so `evidence` alone reads
-# the same whether the tool then errors or succeeds; the label merge runs only
-# AFTER the wiring, so `uwe_labelled` separates "errored after the evidence row"
-# from "completed". The snapshot is taken HERE, before submit_ds_evidence below
-# can add frames/masses of its own.
+# `labels` is passed so the arm has a DISCRIMINATING row count. On pre-D2
+# binaries the evidence INSERT committed before the DS wiring, so `evidence`
+# alone read the same whether the tool then errored or succeeded; the label
+# merge runs only AFTER the wiring, so `uwe_labelled` separates "errored after
+# the evidence row" from "completed". Since D2 (Unit E) the whole call is one
+# transaction, so a failed call leaves evidence_on_claim, mass_functions and
+# uwe_labelled all unchanged and a completed one moves all three. The snapshot is
+# taken HERE, before submit_ds_evidence below can add frames/masses of its own.
 TRUTH_PRE=$(q "SELECT truth_value FROM claims WHERE id = '$CLAIM'")
 UWE=$(call "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"update_with_evidence\",\"arguments\":{\"claim_id\":\"$CLAIM\",\"evidence_data\":\"probe corroboration\",\"evidence_type\":\"empirical\",\"strength\":0.7,\"supports\":true,\"labels\":[\"uwe-probe\"]}}}")
 echo "$UWE" | tail -c 500

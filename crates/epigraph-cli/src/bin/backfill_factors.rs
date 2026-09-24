@@ -187,8 +187,20 @@ async fn run_evidence_phase(
 
     for (evidence_id, claim_id, signer_id, evidence_type, _extr) in eligible {
         let weight = load_evidence_type_weight(&evidence_type);
+        // An operator backfill on the DSN the operator supplies — in practice a
+        // superuser, where a tenancy stamp is inert. The acquire is mechanical: it
+        // moves each row's wiring onto ONE connection instead of a checkout per
+        // statement, which is also what makes the savepoint inside the helper
+        // meaningful.
+        let mut conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  skip: could not acquire a connection: {e}");
+                continue;
+            }
+        };
         match ds_auto::auto_wire_ds_update(
-            pool,
+            &mut conn,
             viewer,
             claim_id,
             signer_id,
@@ -264,8 +276,15 @@ async fn run_edge_phase(
     }
 
     for (edge_id, signer_id, source_id, target_id, relationship) in rows {
+        let mut conn = match pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  skip: could not acquire a connection: {e}");
+                continue;
+            }
+        };
         match ds_auto::auto_wire_ds_for_edge(
-            pool,
+            &mut conn,
             viewer,
             edge_id,
             signer_id,

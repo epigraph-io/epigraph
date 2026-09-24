@@ -848,6 +848,34 @@ impl ClaimRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, claim))]
     pub async fn create(pool: &PgPool, claim: &Claim, decl: TenancyDecl) -> Result<Claim, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_conn(&mut conn, claim, decl).await
+    }
+
+    /// [`Self::create`] on a connection the caller owns — the form a
+    /// tenancy-stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so the dedup probe, the
+    /// INSERT and the event are one implementation. `ingest_document`'s atoms
+    /// (level 3, content-addressed) are written through it, and on an unstamped
+    /// checkout migration 077's `claims_tenancy` `WITH CHECK` refuses the INSERT
+    /// on a cleanly-migrated schema; handed `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` the atom rides the same transaction
+    /// as the document's other rows.
+    ///
+    /// The `claim.created` event moved to `publish_or_log_conn`: it is a
+    /// SWALLOWED failure, and inside a caller's transaction a swallowed failure is
+    /// a deferred silent ROLLBACK at COMMIT unless it is SAVEPOINT-wrapped (hard
+    /// constraint #6). On a bare pooled connection that SAVEPOINT is a real
+    /// `BEGIN`/`COMMIT` around the one INSERT, which is what the pool path did.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+    ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -867,7 +895,7 @@ impl ClaimRepository {
                FROM claims WHERE content_hash = $1 LIMIT 1"#,
             content_hash.as_slice()
         )
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         if let Some(existing_row) = existing {
@@ -903,7 +931,7 @@ impl ClaimRepository {
             decl.visibility_bind(),
             decl.owner_group_bind()
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         // Fire-and-forget claim.created event (closes #61). This is the
@@ -911,8 +939,8 @@ impl ClaimRepository {
         // (MCP ingestion paths, API conventions, paper repo, tests). The
         // dedup early-return above does NOT emit, so resubmissions of an
         // existing content_hash do not pollute the audit log.
-        let _ = crate::repos::EventRepository::publish_or_log(
-            pool,
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
             "claim.created",
             Some(row.agent_id),
             &serde_json::json!({
@@ -948,13 +976,31 @@ impl ClaimRepository {
         claim_id: ClaimId,
         properties: serde_json::Value,
     ) -> Result<(), DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::set_properties_conn(&mut conn, claim_id, properties).await
+    }
+
+    /// [`Self::set_properties`] on a connection the caller owns, so an ingest's
+    /// hierarchy metadata lands in the same stamped transaction as the claim it
+    /// describes. `rows_affected() == 0` stays an ERROR here, and that matters
+    /// more on a stamped connection than it did on the pool: an `UPDATE` that
+    /// `claims_tenancy`'s USING hides matches zero rows WITHOUT raising, so this
+    /// check is what keeps an invisible target from reading as success.
+    ///
+    /// # Errors
+    /// As [`Self::set_properties`].
+    pub async fn set_properties_conn(
+        conn: &mut sqlx::PgConnection,
+        claim_id: ClaimId,
+        properties: serde_json::Value,
+    ) -> Result<(), DbError> {
         let id: Uuid = claim_id.into();
         let result = sqlx::query!(
             "UPDATE claims SET properties = $2, updated_at = NOW() WHERE id = $1",
             id,
             properties
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -5138,6 +5184,26 @@ impl ClaimRepository {
     /// skipped via `ON CONFLICT (id) DO NOTHING`). Used by ingest paths that
     /// generate deterministic UUIDs and rely on idempotent re-runs.
     ///
+    /// # Why this takes an `Acquire` rather than a `&PgPool`
+    ///
+    /// Migration 077's `claims_tenancy` `WITH CHECK` asks
+    /// `owner_group_id = ANY(epigraph_writable_groups())`, and on an unstamped
+    /// pool checkout that set is `{}` — so on a cleanly-migrated schema this
+    /// INSERT is **refused**, which is how `store_workflow` came to be entirely
+    /// unavailable (`new row violates row-level security policy for table
+    /// "claims"`, raised from `epigraph-ingest-executor`). MEASURED as
+    /// `epigraph_app` (`rolbypassrls = false`) on a database migrated 001→head
+    /// from empty: this statement is refused unstamped, refused when stamped
+    /// from a *different* real group, and admitted when stamped from the group
+    /// the row is owned by.
+    ///
+    /// A generic `Acquire` rather than `&mut PgConnection` because every
+    /// existing caller passes `&pool` and `&PgPool` implements `Acquire`: the
+    /// twelve unconverted call sites keep their current behaviour verbatim,
+    /// while a converted caller passes `&mut *tx` from
+    /// `ScopedPool::begin_as(author_viewer)` and both statements below ride
+    /// that one stamped transaction.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` for non-conflict failures, or
     /// `DbError::InvalidData` if a label carries unexpanded shell syntax.
@@ -5148,9 +5214,46 @@ impl ClaimRepository {
     // thinking about the field — which is the shape a `Default` impl grows out
     // of, and D1 is the rule that says there must not be one.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, content, content_hash, labels))]
     pub async fn create_with_id_if_absent(
         pool: &PgPool,
+        id: Uuid,
+        content: &str,
+        content_hash: &[u8; 32],
+        agent_id: Uuid,
+        truth: TruthValue,
+        labels: &[String],
+        decl: TenancyDecl,
+    ) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_with_id_if_absent_conn(
+            &mut conn,
+            id,
+            content,
+            content_hash,
+            agent_id,
+            truth,
+            labels,
+            decl,
+        )
+        .await
+    }
+
+    /// [`Self::create_with_id_if_absent`] on a connection the caller owns — the
+    /// form a stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one statement
+    /// pair and one tenancy argument. A concrete `&mut PgConnection` rather than
+    /// a generic `Acquire`: the workflow-ingest path reaches this through
+    /// `#[tool_router]`'s boxed `dyn Future + Send`, and an `Acquire<'a>` bound
+    /// there fails to prove `for<'x> &'x mut PgConnection: Acquire<'x>`
+    /// ("implementation of `sqlx::Acquire` is not general enough"). Measured, not
+    /// anticipated.
+    ///
+    /// # Errors
+    /// As [`Self::create_with_id_if_absent`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_id_if_absent_conn(
+        conn: &mut sqlx::PgConnection,
         id: Uuid,
         content: &str,
         content_hash: &[u8; 32],
@@ -5179,7 +5282,7 @@ impl ClaimRepository {
         .bind(labels)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
         let was_inserted = row.map(|(b,)| b).unwrap_or(false);
@@ -5188,10 +5291,18 @@ impl ClaimRepository {
         // insertion. ON CONFLICT (id) DO NOTHING swallows duplicate-id paths,
         // and we rely on `was_inserted` (xmax=0 only on freshly-inserted rows)
         // to skip emission for idempotent re-runs.
+        //
+        // `publish_or_log_conn`, NOT `publish_or_log`: this is a swallowed
+        // failure, and once the caller can hand us a transaction a swallowed
+        // failure stops being fire-and-forget and becomes a DEFERRED abort —
+        // PostgreSQL answers the eventual `COMMIT` with `ROLLBACK` and no error,
+        // so the tool reports success having written nothing. The `_conn`
+        // variant wraps the INSERT in a SAVEPOINT, which keeps "the event is
+        // best-effort" true inside a transaction instead of only outside one.
         if was_inserted {
             let truth_value = truth.value();
-            let _ = crate::repos::EventRepository::publish_or_log(
-                pool,
+            let _ = crate::repos::EventRepository::publish_or_log_conn(
+                &mut *conn,
                 "claim.created",
                 Some(agent_id),
                 &serde_json::json!({
@@ -6122,6 +6233,28 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<DedupRepair, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::mark_duplicate_with_repair_conn(&mut conn, dup, canonical).await
+    }
+
+    /// [`Self::mark_duplicate_with_repair`] on a connection the caller owns.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one
+    /// implementation. `begin()` below opens a real transaction when this
+    /// connection is not already in one and a **SAVEPOINT** when it is, so the
+    /// repair stays atomic in both shapes.
+    ///
+    /// A concrete `&mut PgConnection` rather than a generic `Acquire` for the
+    /// reason recorded on [`Self::create_with_id_if_absent_conn`].
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_with_repair`].
+    pub async fn mark_duplicate_with_repair_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<DedupRepair, DbError> {
+        use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         if dup_uuid == canon_uuid {
@@ -6129,7 +6262,7 @@ impl ClaimRepository {
                 source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
             });
         }
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
         let canon_exists: bool =
             sqlx::query_scalar(
                 r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -8120,7 +8253,6 @@ impl ClaimRepository {
     /// duplicates, non-current, already-superseded) and `DbError::NotFound`
     /// when a source id does not exist.
     #[instrument(skip(pool, merged_content), fields(n_sources = source_ids.len()))]
-    #[allow(clippy::too_many_lines)]
     pub async fn consolidate(
         pool: &PgPool,
         source_ids: &[Uuid],
@@ -8130,6 +8262,52 @@ impl ClaimRepository {
         reason: &str,
         acting_agent_id: Uuid,
     ) -> Result<ConsolidateResult, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::consolidate_conn(
+            &mut conn,
+            source_ids,
+            merged_content,
+            merged_truth,
+            mode,
+            reason,
+            acting_agent_id,
+        )
+        .await
+    }
+
+    /// [`Self::consolidate`] on a connection the caller owns — the form a
+    /// tenancy-stamped transaction can reach.
+    ///
+    /// The pool-taking wrapper above delegates here, so there is one
+    /// implementation. `begin()` below issues a real `BEGIN` on a bare pooled
+    /// connection — exactly what `pool.begin()` did — and a `SAVEPOINT` inside a
+    /// caller's transaction, so the merge is one unit in both shapes.
+    ///
+    /// # Why a stamped caller needs this
+    ///
+    /// On an unstamped pool checkout, migration 077's `claims_tenancy` `WITH
+    /// CHECK` has an empty writable set, so the merged-claim INSERT is refused
+    /// for every caller on a cleanly-migrated schema — `consolidate_claims` was
+    /// unavailable there. And the all-public branch's `personal_group_of` read
+    /// is BLIND on that connection (`groups_tenancy` has no true arm), so it
+    /// took the mint path on every merge: `epigraph_ensure_personal_group`'s
+    /// reviving `ON CONFLICT` inside an unrelated write — hard constraint #3's
+    /// hazard. Stamped from the acting agent, the read sees the group and mints
+    /// nothing.
+    ///
+    /// # Errors
+    /// As [`Self::consolidate`].
+    #[allow(clippy::too_many_lines)]
+    pub async fn consolidate_conn(
+        conn: &mut sqlx::PgConnection,
+        source_ids: &[Uuid],
+        merged_content: &str,
+        merged_truth: f64,
+        mode: ConsolidateMode,
+        reason: &str,
+        acting_agent_id: Uuid,
+    ) -> Result<ConsolidateResult, DbError> {
+        use sqlx::Acquire;
         let protocol = |m: String| DbError::QueryFailed {
             source: sqlx::Error::Protocol(m),
         };
@@ -8149,7 +8327,7 @@ impl ClaimRepository {
             return Err(protocol("consolidate: merged_content is empty".into()));
         }
 
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         // Lock every source up front so a concurrent merge/supersede cannot
         // interleave between validation and retirement.

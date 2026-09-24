@@ -100,11 +100,29 @@ pub struct AgentRepository;
 impl AgentRepository {
     /// Create a new agent in the database
     ///
+    /// Takes an `Acquire` so the agent row and its `agent.registered` event ride
+    /// ONE connection — the caller's transaction when there is one. `&PgPool`
+    /// implements `Acquire`, so every existing call site is unchanged.
+    ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` if an agent with the same public key already exists.
     /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool, agent))]
     pub async fn create(pool: &PgPool, agent: &Agent) -> Result<Agent, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_conn(&mut conn, agent).await
+    }
+
+    /// [`Self::create`] on a connection the caller owns, so the `agents` row and
+    /// its `agent.registered` event ride the caller's transaction. Concrete
+    /// `&mut PgConnection` for the reason given on
+    /// [`crate::ClaimRepository::create_with_id_if_absent_conn`].
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_conn(
+        conn: &mut sqlx::PgConnection,
+        agent: &Agent,
+    ) -> Result<Agent, DbError> {
         let id: Uuid = agent.id.into();
         let public_key = &agent.public_key;
         let display_name = agent.display_name.as_deref();
@@ -124,7 +142,7 @@ impl AgentRepository {
             agent.orcid.as_deref(),
             agent.ror_id.as_deref(),
         )
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|err| {
             if let sqlx::Error::Database(ref db_err) = err {
@@ -145,12 +163,14 @@ impl AgentRepository {
                 reason: "public_key is not 32 bytes".to_string(),
             })?;
 
-        // Fire-and-forget agent.registered event (closes #61).
-        // The downstream write has already committed (we hold `row`); the
-        // event log is a separate observability surface and must not roll
-        // back the agent on failure.
-        let _ = crate::repos::EventRepository::publish_or_log(
-            pool,
+        // Fire-and-forget agent.registered event (closes #61). The event log
+        // is a separate observability surface and must not roll back the agent
+        // on failure — and once the caller can hand us a transaction, "must not
+        // roll back" needs a SAVEPOINT rather than a swallowed error, or the
+        // failure is merely DEFERRED to a COMMIT that PostgreSQL answers with
+        // `ROLLBACK` and no error at all. `publish_or_log_conn` takes it.
+        let _ = crate::repos::EventRepository::publish_or_log_conn(
+            &mut *conn,
             "agent.registered",
             Some(row.id),
             &serde_json::json!({
@@ -289,9 +309,8 @@ impl AgentRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, public_key))]
-    pub async fn get_by_public_key(
-        pool: &PgPool,
+    pub async fn get_by_public_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         public_key: &[u8; 32],
     ) -> Result<Option<Agent>, DbError> {
         let row = sqlx::query!(
@@ -302,7 +321,7 @@ impl AgentRepository {
             "#,
             public_key.as_slice()
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         match row {

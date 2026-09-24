@@ -41,6 +41,14 @@ pub struct EpiGraphMcpFull {
     /// `crate::maintenance::maintenance_tools_run_on_the_maintenance_connection`
     /// for why that gate deliberately does not key on this field.
     pub(crate) scoped: Option<epigraph_db::ScopedPool>,
+    /// `Some(reason)` when the caller DECLARED that `pool` is a privileged
+    /// (BYPASSRLS) maintenance pool — set only through
+    /// [`Self::on_a_privileged_pool`]. The operator `ingest-document` CLI runs
+    /// its whole ingest on `MaintenancePool`, where there is no tenancy context
+    /// to stamp and a plain transaction is the correct shape. Declared rather
+    /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
+    /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
+    pub(crate) privileged_pool: Option<&'static str>,
     pub(crate) signer: Arc<AgentSigner>,
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) embedder: Arc<McpEmbedder>,
@@ -536,6 +544,7 @@ impl EpiGraphMcpFull {
             tool_router: Self::tool_router(),
             pool,
             scoped: None,
+            privileged_pool: None,
             signer: Arc::new(signer),
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder: Arc::new(embedder),
@@ -571,6 +580,21 @@ impl EpiGraphMcpFull {
     #[must_use]
     pub fn with_scoped_pool(mut self, scoped: epigraph_db::ScopedPool) -> Self {
         self.scoped = Some(scoped);
+        self
+    }
+
+    /// Declare that this server's `pool` is a PRIVILEGED (BYPASSRLS)
+    /// maintenance pool, so a write path that would otherwise stamp a
+    /// connection may run a plain transaction on it instead. `reason` is
+    /// required and is logged by the paths that honour it.
+    ///
+    /// Honoured today ONLY by the document ingest walk
+    /// (`tools::ingestion::do_ingest_document` / `_spine`), which the operator
+    /// `ingest-document` CLI drives on `MaintenancePool`. Every other write path
+    /// still requires [`Self::with_scoped_pool`] and fails closed without it.
+    #[must_use]
+    pub fn on_a_privileged_pool(mut self, reason: &'static str) -> Self {
+        self.privileged_pool = Some(reason);
         self
     }
 
@@ -613,6 +637,7 @@ impl EpiGraphMcpFull {
             tool_router: Self::tool_router(),
             pool,
             scoped: None,
+            privileged_pool: None,
             signer,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder,
@@ -733,7 +758,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The evidence row is always attached on success; the belief update is BEST-EFFORT (same policy as submit_claim). belief_wired=false means the evidence was attached but the belief update did not complete: claims.truth_value and the cached belief columns were not updated (truth_after equals truth_before; belief/plausibility/pignistic_prob are omitted rather than reported stale) and ds_wire_error names the failing step. bba_stored says whether this evidence's BBA was persisted before the failure; if true, framed belief reads may already reflect it and the next successful update combines it, so do NOT submit the evidence again. Recovery if bba_stored=true: the operator binary `recompute_claim_belief` (cargo run -p epigraph-cli --bin recompute_claim_belief -- --stdin) recomputes the cached DS columns from stored mass functions but does NOT rewrite truth_value (the recompute_beliefs tool refuses by construction). If bba_stored=false (the current production case) no BBA was stored and that binary repairs nothing; no tool mints a BBA from an existing evidence row. Re-submitting identical evidence_data is refused as a duplicate, and re-worded evidence adds a second evidence row for the same assertion, so keep evidence_id to identify the BBA-less row."
+        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The call is ATOMIC: the evidence row, its BBA, the truth_value update and any label merge commit together in one transaction or not at all. On success belief_wired and bba_stored are always true (both fields are retained for client compatibility). If the belief update fails, the call returns an error naming the failing step (e.g. `assign_claim: ...`) and writes nothing, so re-submitting the identical evidence_data once the cause is fixed is safe and is the recovery."
     )]
     async fn update_with_evidence(
         &self,
@@ -885,7 +910,15 @@ impl EpiGraphMcpFull {
                        claim, its edges migrated (cross-source duplicates collapsed so \
                        Dempster-Shafer mass is not double-counted), and lineage recorded as \
                        supersedes edges plus properties.merge. The caller supplies \
-                       merged_content; the server never calls an LLM."
+                       merged_content; the server never calls an LLM. ALL-OR-NOTHING: on any \
+                       error no merged claim is written and no source is retired, so retrying \
+                       a failed call is safe. A source owned by a group this server's agent \
+                       cannot write, or sources spanning two owner groups, is refused \
+                       permanently (sometimes as INTERNAL_ERROR); do not retry it. After a \
+                       success the sources are no longer current, so repeating the call fails \
+                       with 'source ... is not current', which means the first call landed. If \
+                       this agent already holds a claim with identical merged_content, that \
+                       claim is returned with already_existed=true and nothing changes."
     )]
     async fn consolidate_claims(
         &self,
@@ -996,7 +1029,7 @@ impl EpiGraphMcpFull {
     // ── Ingestion ──
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent for re-runs at the same pipeline version."
+        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms; the path must be inside the server's working directory). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Same writer and same ASYNCHRONOUS contract as ingest_document_inline (read it): a write-authority refusal is a synchronous error with nothing written; otherwise the call returns {status: 'queued', paper_id, document_key} and the all-or-nothing walk runs in the background, where any failure (verbatim guard, malformed axis, a rejected row) reaches only the server log. Confirm it landed by query_paper(document_key)'s claim_count rising, not by the paper existing. Re-runs converge on existing nodes, so retrying is safe."
     )]
     async fn ingest_document(
         &self,
@@ -1010,7 +1043,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version}. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. Read-only."
+        description = "Check whether a paper has been ingested (has a processed_by edge). Returns {already_ingested, paper_id?, doi, pipeline_version}. Useful as a quick pre-flight read before calling ingest_document_spine. Note: with node-level dedup, already_ingested=true means the spine was previously run — it does NOT mean all atoms are present. Use ingest_document_spine to discover which paragraphs are new. The edge persists, so it cannot confirm a background ingest_document / ingest_document_inline of a document that was ingested or spine-ingested before; use query_paper's claim_count for that. Read-only."
     )]
     async fn check_already_ingested(
         &self,
@@ -1023,7 +1056,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine."
+        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: on any error (including a refusal because this server's agent cannot write its personal group) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. A node another author already wrote is reused, never rewritten; converged_claims_unlabelled counts reused nodes you could not give this document's doi: label."
     )]
     async fn ingest_document_spine(
         &self,
@@ -1034,7 +1067,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the call rather than silently falling back to binary."
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously — if this server's agent cannot write its personal group (membership revoked or read-only) it returns an error and writes nothing — then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and if its owner group is one you cannot write it does not get this document's doi: label. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest (in the background task, so only the server log shows it) rather than silently falling back to binary."
     )]
     async fn ingest_document_inline(
         &self,
@@ -1086,7 +1119,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it). On first creation, builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief, then emits an edge.added event; the response reports was_created, belief_wired, and the target's resulting {belief, plausibility, pignistic_prob}. Idempotent on (source, target, relationship): a re-hit returns the existing edge with was_created=false and belief_wired=false (no re-wire). For supersedes use supersede_claim instead."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is owned by a group this server's agent cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead."
     )]
     async fn link_epistemic(
         &self,
@@ -1193,7 +1226,7 @@ impl EpiGraphMcpFull {
     // ── Workflows (8 tools) ──
 
     #[tool(
-        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. KNOWN ISSUE (not your error): the steps are filed under a constant 'Body' phase, so once any stored workflow has that phase this call can fail with 'Duplicate entity already exists' and write nothing. Workaround: `ingest_workflow` with a phase summary unique to this workflow (and different from its thesis) and step texts no other workflow uses."
     )]
     async fn store_workflow(
         &self,
@@ -1257,7 +1290,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record what actually happened when you used a workflow. Accepts workflow_id values returned by `store_workflow` (rows in `workflows`) and delegates to the hierarchical outcome path; legacy flat workflow claim IDs are still supported for backward compatibility."
+        description = "Record what actually happened when you used a workflow. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows, no evidence, no belief change, NOT idempotent, and execution_log[].step_index mapped to the steps in original plan order. Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe), and it is refused for a workflow claim owned by a group this server's agent cannot write."
     )]
     async fn report_workflow_outcome(
         &self,
@@ -1271,7 +1304,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Deprecate a workflow (and optionally its entire lineage). Sets truth to 0.05."
+        description = "Deprecate a workflow (and optionally its variant_of / supersedes lineage), all-or-nothing. A workflow claim gets truth 0.05 and is_current=false; a hierarchical `workflows` row gets truth 0.05. WARNING: for a hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return for hierarchical workflows) only the `workflows` row changes: its thesis and step claims stay current, yet the id is still reported in deprecated_ids. The id you pass is always listed, whether or not a claim changed; cascaded ids are listed only when a claim was actually deprecated."
     )]
     async fn deprecate_workflow(
         &self,
@@ -1292,7 +1325,7 @@ impl EpiGraphMcpFull {
     // variants independently of its workflow root.
 
     #[tool(
-        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim, and resolves author identities. Idempotent: re-ingesting the same canonical_name+generation is a no-op."
+        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. KNOWN ISSUE (not your error): a thesis, phase text (summary, or title when the summary is empty) or step text that another stored workflow already uses can fail the call with 'Duplicate entity already exists', writing nothing. Keep those texts unique to this workflow, and do not reuse the thesis text as a phase summary."
     )]
     async fn ingest_workflow(
         &self,
@@ -1306,7 +1339,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation."
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation. Same all-or-nothing behaviour and duplicate-text known issue as ingest_workflow; texts unchanged from the parent are reused, not duplicated."
     )]
     async fn improve_workflow_hierarchy(
         &self,
@@ -1333,7 +1366,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution with step_claim_id resolved from the workflow's `executes` edges in plan order. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
+        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution, with step_index mapped to the workflow's steps in original PLAN order (the order find_workflow / find_workflow_hierarchical list them; steps added with add_step come after all planned steps). Writes no evidence and changes no belief. NOT idempotent: every call adds to the counters and rows, so do not retry a call that succeeded. Not all-or-nothing either: the counters are written first, a per-step row that fails is skipped (step_executions_written says how many landed), and an out-of-range step_index is stored with a null step_claim_id. There is no ownership check on the workflow. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
     )]
     async fn report_hierarchical_outcome(
         &self,
@@ -1344,7 +1377,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i. Idempotent on `(canonical_name, step_text)` via deterministic claim ID. Re-wires the `step_follows` chain."
+        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. `position` does NOT change plan order: find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome all place an added step AFTER every originally planned step (added steps in the order they were added). Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing; a step text another workflow already uses can fail with 'Duplicate entity already exists' (known issue, see ingest_workflow)."
     )]
     async fn add_step(
         &self,
@@ -1396,7 +1429,7 @@ impl EpiGraphMcpFull {
     // ── Challenges (2 tools) ──
 
     #[tool(
-        description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error."
+        description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error. Returns {challenge_id, claim_id, challenge_type, state: 'pending'}. Refused with an error, writing nothing, when the claim is owned by a group this server's agent cannot write."
     )]
     async fn challenge_claim(
         &self,
@@ -1551,7 +1584,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame. Supports all 6 combination methods (Dempster, Conjunctive, YagerOpen, YagerClosed, DuboisPrade, Inagaki) and perspective-scoped combination."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write) writes nothing. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief."
     )]
     async fn submit_ds_evidence(
         &self,

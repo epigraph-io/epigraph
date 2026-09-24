@@ -142,8 +142,15 @@ impl WorkflowRepository {
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails for reasons other
     /// than a duplicate-key conflict on the UNIQUE constraint.
-    pub async fn insert_root(
-        pool: &PgPool,
+    /// `workflows` is MEASURED `relrowsecurity = false` with no policy at
+    /// migration head 101, so this write needs no stamp to be admitted. It takes
+    /// an executor anyway so the workflow-ingest plan walk can run it on the SAME
+    /// connection as the tier-A `claims` and `edges` writes it is atomic with —
+    /// an `insert_root` on a sibling pool checkout would leave a `workflows` row
+    /// behind when the claim walk rolled back, which is the zombie-row shape the
+    /// executor's own pre-flight content guard exists to avoid.
+    pub async fn insert_root<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         canonical_name: &str,
         generation: i32,
@@ -162,14 +169,14 @@ impl WorkflowRepository {
         .bind(goal)
         .bind(parent_id)
         .bind(metadata)
-        .execute(pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
-    pub async fn find_root_by_canonical(
-        pool: &PgPool,
+    pub async fn find_root_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         canonical_name: &str,
         generation: i32,
     ) -> Result<Option<Uuid>, sqlx::Error> {
@@ -178,7 +185,7 @@ impl WorkflowRepository {
         )
         .bind(canonical_name)
         .bind(generation)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row.map(|(id,)| id))
     }
@@ -517,15 +524,26 @@ impl WorkflowRepository {
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
-        // step_lineage_id, ordered by edge created_at + claim id (matches
-        // do_report_hierarchical_outcome_via_pool).
+        // step_lineage_id, in PLAN ORDER.
+        //
+        // The order key is the `plan_index` ordinal that
+        // `epigraph_ingest_executor::execute_workflow_ingest_plan` records on the
+        // `executes` edge, NOT `e.created_at`. Those edges are now written inside
+        // ONE transaction, and `NOW()` is transaction-start time in PostgreSQL, so
+        // they all share a `created_at` and the old `created_at, c.id` key returned
+        // an arbitrary order. See that loop's comment for the measurement.
+        // `created_at` remains the fallback so edges written before the ordinal
+        // existed are ordered exactly as they were.
         let sql = viewer.splice(
             "SELECT c.id, c.step_lineage_id \
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
-             ORDER BY e.created_at ASC, c.id ASC",
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut sq = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(&sql).bind(workflow_id);
@@ -646,7 +664,13 @@ impl WorkflowRepository {
         }
 
         // ── Round-trip 1: fetch all step seeds (level=2) for all workflow IDs. ──
-        // Order matches the single-workflow function: (e.created_at ASC, c.id ASC).
+        // Order matches the single-workflow function: the `plan_index` ordinal
+        // first, `(e.created_at ASC, c.id ASC)` only as the fallback for edges
+        // that predate it. This batched twin was left on the bare `created_at`
+        // key when `resolve_steps_to_heads` was moved to `plan_index`, so once a
+        // plan's edges were written in one transaction (one shared `NOW()`), the
+        // `step_index` it assigns below followed `c.id` — a content-derived UUID
+        // — while its single-workflow sibling followed the plan.
         #[derive(sqlx::FromRow)]
         struct StepSeedRow {
             workflow_id: Uuid,
@@ -665,7 +689,11 @@ impl WorkflowRepository {
                AND e.relationship = 'executes' \
                AND (c.properties->>'level')::int = 2 \
                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
-             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+             ORDER BY e.source_id, \
+                      CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut sq = sqlx::query_as::<_, StepSeedRow>(&seed_sql).bind(workflow_ids);
@@ -684,7 +712,7 @@ impl WorkflowRepository {
         }
 
         // Build per-workflow step lists and collect the set of lineage_ids to query.
-        // Preserve ordering: seeds are already in (workflow_id, e.created_at, c.id) order.
+        // Preserve ordering: seeds are already in (workflow_id, plan order) order.
         // We need per-workflow sequential step_index, so we track a counter per workflow.
         let mut step_index_counter: HashMap<Uuid, usize> = HashMap::new();
 
@@ -1044,9 +1072,12 @@ impl WorkflowRepository {
     /// steps" received `[]`, fell back to a bare `theme_cluster` with
     /// `wipe_first=true`, and destroyed 76 themes.
     ///
-    /// Ordering is `(edge created_at ASC, claim id ASC)` — the same plan order
-    /// [`Self::resolve_steps_to_heads`] and `do_report_hierarchical_outcome`
-    /// use, so step N means the same step in all three.
+    /// Ordering is the `executes` edge's `plan_index` ordinal, falling back to
+    /// `(edge created_at ASC, claim id ASC)` for edges that predate it — the
+    /// same plan order [`Self::resolve_steps_to_heads`],
+    /// [`Self::resolve_steps_to_heads_batched`] and both
+    /// `report_hierarchical_outcome` handlers (MCP and HTTP) use, so step N
+    /// means the same step in all of them.
     ///
     /// Returns the FROZEN step claims attached to the workflow, not lineage
     /// heads. `find_workflow` advertises the workflow as stored; callers that
@@ -1079,7 +1110,11 @@ impl WorkflowRepository {
              WHERE e.source_id = ANY($1) \
                AND e.relationship = 'executes' \
                AND (c.properties->>'level')::int = 2 /* {VISIBILITY:c} */ \
-             ORDER BY e.source_id, e.created_at ASC, c.id ASC",
+             ORDER BY e.source_id, \
+                      CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
         let mut q = sqlx::query_as(&sql).bind(workflow_ids);
