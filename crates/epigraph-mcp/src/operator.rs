@@ -246,6 +246,40 @@ async fn refuse_operator_http_signer(
     }
 }
 
+/// The startup refusal text for a failed [`self_link`], naming the cause an
+/// operator can act on.
+///
+/// `epigraph_link_operator` resolves the operator's personal group through
+/// migration 105's `epigraph_ensure_personal_group` (107 section 3), so two of
+/// its refusals are that definer's: `RVK01` (the OPERATOR's own membership of
+/// its own group is only revoked) and `RVK02` (the group under the operator's
+/// personal did_key is not the operator's own). Both are deliberate refusals,
+/// not faults, and each gets its own text; everything else keeps the
+/// EXECUTE-grant hint, because on a stdio host the usual cause is an
+/// `epigraph_app` DSN (`42501`).
+pub fn link_refusal_text(agent: Uuid, operator: Uuid, e: &epigraph_db::DbError) -> String {
+    match e {
+        epigraph_db::DbError::MembershipRevoked { message } => format!(
+            "refused to record agent {agent} as operated by {operator}: the operator's OWN \
+             membership of its personal group is REVOKED (migration 105, RVK01), and agents are \
+             not linked into a group its owner was revoked from. Restoring that membership is an \
+             operator action. Database: {message}"
+        ),
+        epigraph_db::DbError::PersonalGroupNotOwned { message } => format!(
+            "refused to record agent {agent} as operated by {operator}: the group carrying the \
+             operator's personal did_key is not the operator's own (migration 105, RVK02: a \
+             squatted key). An operator must inspect and remove the squatting group. \
+             Database: {message}"
+        ),
+        other => format!(
+            "could not record agent {agent} as operated by {operator} \
+             (epigraph_link_operator is EXECUTE-able by epigraph_maintenance only; on an \
+             epigraph_app DSN the host must record the link on a maintenance connection \
+             instead): {other}"
+        ),
+    }
+}
+
 /// Record `operator` as the operator of this server's own signer agent and log
 /// the outcome. Resolves (and on first boot creates) the signer agent first.
 ///
@@ -254,8 +288,10 @@ async fn refuse_operator_http_signer(
 ///
 /// # Errors
 /// The agent could not be resolved, or `epigraph_link_operator` refused — most
-/// importantly `42501 permission denied` on an `epigraph_app` DSN. `main` exits
-/// on any error: a declared operator that cannot be recorded must be loud.
+/// importantly `42501 permission denied` on an `epigraph_app` DSN, and 105's
+/// `RVK01` / `RVK02` on the operator's own personal group
+/// ([`link_refusal_text`]). `main` exits on any error: a declared operator that
+/// cannot be recorded must be loud.
 pub async fn self_link(
     server: &EpiGraphMcpFull,
     operator: Uuid,
@@ -270,14 +306,7 @@ pub async fn self_link(
         })?;
     let outcome = AgentRepository::link_operator(&mut conn, agent, operator)
         .await
-        .map_err(|e| {
-            format!(
-                "could not record agent {agent} as operated by {operator} \
-                 (epigraph_link_operator is EXECUTE-able by epigraph_maintenance only; on an \
-                 epigraph_app DSN the host must record the link on a maintenance connection \
-                 instead): {e}"
-            )
-        })?;
+        .map_err(|e| link_refusal_text(agent, operator, &e))?;
     match LinkStatus::of(&outcome) {
         LinkStatus::Live => tracing::info!(
             agent = %agent,
@@ -414,5 +443,34 @@ mod tests {
     #[test]
     fn an_operator_on_stdio_with_a_declared_identity_is_accepted() {
         assert!(check_operator_transport(None, Some(Uuid::new_v4()), true).is_ok());
+    }
+
+    #[test]
+    fn the_personal_group_refusals_name_their_cause_not_the_grant() {
+        let (a, o) = (Uuid::new_v4(), Uuid::new_v4());
+        let revoked = super::link_refusal_text(
+            a,
+            o,
+            &epigraph_db::DbError::MembershipRevoked {
+                message: "m".into(),
+            },
+        );
+        assert!(revoked.contains("RVK01") && !revoked.contains("EXECUTE-able"), "{revoked}");
+        let squat = super::link_refusal_text(
+            a,
+            o,
+            &epigraph_db::DbError::PersonalGroupNotOwned {
+                message: "m".into(),
+            },
+        );
+        assert!(squat.contains("RVK02") && !squat.contains("EXECUTE-able"), "{squat}");
+        let other = super::link_refusal_text(
+            a,
+            o,
+            &epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::RowNotFound,
+            },
+        );
+        assert!(other.contains("EXECUTE-able"), "{other}");
     }
 }

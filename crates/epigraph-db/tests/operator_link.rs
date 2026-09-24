@@ -993,14 +993,27 @@ async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
             "linking to an operator whose did_key is squatted must be refused, not enrol the \
              agent in the squatter's group",
         );
+    // The refusal is 105's RVK02, raised by the one personal-group definer the
+    // link resolves the operator's group through (107 section 3).
     assert!(
-        err.to_string()
-            .contains("not a personal group created by that operator"),
-        "{err}"
+        matches!(err, epigraph_db::DbError::PersonalGroupNotOwned { .. }),
+        "expected RVK02 (DbError::PersonalGroupNotOwned), got {err:?}"
+    );
+    let err = AgentRepository::link_retired_agent(&mut conn, e, d)
+        .await
+        .expect_err("a retired link to a squatted operator must be refused too");
+    assert!(
+        matches!(err, epigraph_db::DbError::PersonalGroupNotOwned { .. }),
+        "expected RVK02 (DbError::PersonalGroupNotOwned), got {err:?}"
     );
     assert!(
         membership_rows(&pool, squatted, e).await.is_empty(),
         "the refused link enrolled the agent in the squatter's group"
+    );
+    assert_eq!(
+        link_row(&pool, e).await,
+        None,
+        "a refused link wrote an operator_links row"
     );
 
     // Defense in depth: a link record naming the squatted group reads as none.
@@ -1030,6 +1043,87 @@ async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
             .is_none(),
         "epigraph_operator_actor accepted a group the operator did not create"
     );
+}
+
+/// 105's RVK01, reached through the link (107 section 3). An operator whose
+/// own membership of its own personal group is only REVOKED cannot have agents
+/// linked into that group, as an actor or as a retired identity: the link
+/// function resolves the operator's group through
+/// `epigraph_ensure_personal_group`, whose only-revoked arm RAISEs, and the
+/// call is refused before anything is written — no link row, no membership, no
+/// edge. Before the delegation the link carried its own group lookup and
+/// linked the agent regardless.
+///
+/// CALIBRATION: once the operator's own row is restored (an operator action;
+/// here on the harness), the same two calls succeed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_to_an_operator_with_only_a_revoked_own_row_is_refused(pool: PgPool) {
+    let (operator, group) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let actor = seed_bare_agent(&pool).await;
+    let retired = seed_bare_agent(&pool).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(operator)
+    .execute(&pool)
+    .await
+    .expect("revoke the operator's own row");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = AgentRepository::link_operator(&mut conn, actor, operator)
+        .await
+        .expect_err("a link into a group its operator was revoked from must be refused");
+    assert!(
+        matches!(err, epigraph_db::DbError::MembershipRevoked { .. }),
+        "expected RVK01 (DbError::MembershipRevoked), got {err:?}"
+    );
+    let err = AgentRepository::link_retired_agent(&mut conn, retired, operator)
+        .await
+        .expect_err("a retired link to such an operator must be refused too");
+    assert!(
+        matches!(err, epigraph_db::DbError::MembershipRevoked { .. }),
+        "expected RVK01 (DbError::MembershipRevoked), got {err:?}"
+    );
+
+    for agent in [actor, retired] {
+        assert_eq!(link_row(&pool, agent).await, None, "a refused link wrote a link row");
+        assert!(
+            membership_rows(&pool, group, agent).await.is_empty(),
+            "a refused link wrote a membership"
+        );
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'OPERATED_BY'",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("count edges");
+        assert_eq!(edges, 0, "a refused link wrote an OPERATED_BY edge");
+    }
+    assert_eq!(
+        membership_rows(&pool, group, operator).await,
+        vec![("admin".to_string(), true, 0)],
+        "the refusal must not have revived the operator's own row either"
+    );
+
+    // CALIBRATION: restore the operator's row; the same calls now link.
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = NULL WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(operator)
+    .execute(&pool)
+    .await
+    .expect("operator action: restore the operator's own row");
+    let linked = AgentRepository::link_operator(&mut conn, actor, operator)
+        .await
+        .expect("CALIBRATION: the link succeeds once the operator's row is live");
+    assert!(linked.link_live && !linked.group_created, "{linked:?}");
+    let retired_link = AgentRepository::link_retired_agent(&mut conn, retired, operator)
+        .await
+        .expect("CALIBRATION: the retired link succeeds too");
+    assert!(retired_link.link_created, "{retired_link:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

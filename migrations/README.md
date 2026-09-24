@@ -328,8 +328,17 @@ Current reservation:
   promotes a retired row. The link is recorded once: the membership is inserted only
   by the call that recorded the `operator_links` row (plus a no-history check
   and `ON CONFLICT DO NOTHING`), so a revoked link is never revived, not even
-  after its revoked row is erased (the #493 shape
-  `epigraph_ensure_personal_group` has is deliberately not reused). Both link
+  after its revoked row is erased. The OPERATOR's personal group (and its first
+  admin row) is resolved through 105's `epigraph_ensure_personal_group`, the one
+  personal-group definer, so both link functions refuse with its `RVK01` (the
+  operator's own row is only revoked) and `RVK02` (a squatted key) and write
+  nothing; `personal_group_mint_ratchet.rs::GUARDED_DEFINERS` pins that call and
+  that neither body revives. **Deploy precondition:** because that refusal also
+  fires on every stdio self-link, the operator must hold a LIVE row in its own
+  personal group (read-only check: `SELECT count(*) FROM group_memberships m JOIN
+  groups g ON g.id = m.group_id WHERE g.did_key = 'did:epigraph:personal:' ||
+  $operator AND m.agent_id = $operator AND m.revoked_at IS NULL` must be 1, or
+  the operator must have no group yet). Both link
   functions refuse a SHARED HTTP SIGNER (an agent or operator whose outbound
   `OPERATED_BY` auth-lineage edges name more than one principal), and a third
   refusal-only read, `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`),
@@ -368,7 +377,11 @@ Current reservation:
   `kind='personal'` with `did_key = 'did:epigraph:personal:' || created_by_agent_id`:
   review showed any principal could squat a not-yet-grouped operator's personal
   did (as `personal` or, through `create_with_admin`, as `team`) and block every
-  link to that operator permanently. Behaviour in
+  link to that operator permanently. This overlaps 105's `RVK02`, and both are
+  kept: 108 refuses a NEW squat at INSERT, and 105 refuses at use a squat that
+  predates 108, which only an upgraded database can hold
+  (`personal_group_no_revival.rs::a_squatted_personal_group_is_refused` pins
+  both layers). Behaviour in
   `epigraph-db/tests/operator_link.rs::an_operated_writer_cannot_rewrite_its_operator_groups_identity`.
   Like 100, 101 and 107 it sits inside internal's `060–112`. **No undo runbook ships**:
   undo is the `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked

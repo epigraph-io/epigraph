@@ -1558,10 +1558,18 @@ impl AgentRepository {
     /// [`OperatorLinkOutcome::link_live`] report `false`). See the migration's
     /// section 3.
     ///
+    /// The OPERATOR's personal group is resolved through migration 105's
+    /// `epigraph_ensure_personal_group` (107 section 3), so its two refusals
+    /// surface here as themselves.
+    ///
     /// # Errors
-    /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
-    /// self-link, an operator that is itself operated, or an agent already
-    /// linked to a DIFFERENT live operator; the database message names which.
+    /// [`DbError::MembershipRevoked`] (RVK01) when the operator's own membership
+    /// of its personal group is only revoked; [`DbError::PersonalGroupNotOwned`]
+    /// (RVK02) when the group under the operator's personal did_key is not the
+    /// operator's own. Both write nothing. `DbError::QueryFailed` for a
+    /// permission refusal, a missing agent, a self-link, an operator that is
+    /// itself operated, or an agent already linked to a DIFFERENT live
+    /// operator; the database message names which.
     pub async fn link_operator(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
@@ -1593,10 +1601,12 @@ impl AgentRepository {
     /// changes an existing row or membership.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` for a permission refusal, a missing agent, a
-    /// self-link, an operator that is itself operated, an agent that already
-    /// operates others or is linked to a DIFFERENT operator, or an operator
-    /// group the operator did not create; the database message names which.
+    /// [`DbError::MembershipRevoked`] (RVK01) / [`DbError::PersonalGroupNotOwned`]
+    /// (RVK02) from the operator's own personal group, exactly as
+    /// [`Self::link_operator`]; both write nothing. `DbError::QueryFailed` for a
+    /// permission refusal, a missing agent, a self-link, an operator that is
+    /// itself operated, or an agent that already operates others or is linked
+    /// to a DIFFERENT operator; the database message names which.
     pub async fn link_retired_agent(
         conn: &mut sqlx::PgConnection,
         agent_id: Uuid,
