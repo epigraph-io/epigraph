@@ -23,7 +23,7 @@ async fn run_migrations_applies_all_from_empty(pool: PgPool) {
     assert!(pre.is_none(), "test fixture must start clean");
 
     // Invoke the production migration step the same way server.rs will.
-    epigraph_api::run_migrations(&pool)
+    epigraph_api::run_migrations(&pool, epigraph_api::migrate::MigrateOptions::default())
         .await
         .expect("run_migrations should succeed against empty DB");
 

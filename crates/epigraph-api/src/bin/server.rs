@@ -359,10 +359,22 @@ async fn main() {
         if epigraph_api::should_migrate_on_boot(
             std::env::var("EPIGRAPH_MIGRATE_ON_BOOT").ok().as_deref(),
         ) {
-            epigraph_api::run_migrations(&pool)
-                .await
-                .expect("Failed to apply pending migrations");
-            tracing::info!("Migrations up to date");
+            // Same schema-head checks as `epigraph-migrate` (issue #492): a
+            // database ahead of this binary is refused unless
+            // EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD opts in to the rollback case.
+            let report = epigraph_api::run_migrations(
+                &pool,
+                epigraph_api::migrate::MigrateOptions::from_env(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Failed to apply pending migrations: {e}"));
+            tracing::info!(
+                db_head = report.db_head,
+                binary_head = report.binary_head,
+                applied = report.applied_this_run,
+                db_ahead = report.db_ahead,
+                "Migrations up to date"
+            );
         } else {
             tracing::info!(
                 "EPIGRAPH_MIGRATE_ON_BOOT unset — skipping migrations; run `epigraph-migrate`"
