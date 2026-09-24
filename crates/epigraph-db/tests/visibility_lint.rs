@@ -481,6 +481,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "patch_claim_atomic_conn",
+        "WRITE. Arrived by a SIGNATURE change, not a new function: its parameter was a \
+         `sqlx::Transaction`, which this rule does not read, and it now takes the \
+         `&mut PgConnection` a stamped `ScopedTx` derefs to, so the MCP `patch_claim` tool can \
+         reach it on an author-stamped transaction. Same argument as update_labels_conn: the \
+         FOR UPDATE read is part of the mutation it guards, and claims_tenancy's WITH CHECK \
+         (keyed on epigraph_writable_groups()) authorises the row. Both callers check the \
+         caller's read authority with a viewer-filtered get before they reach it.",
+    ),
+    (
+        "claim.rs",
         "update_trace_id_conn",
         "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
          authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
@@ -1160,11 +1171,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// Eighty-one repo fns take a `PgConnection` in their parameter list: 27 take a
 /// `Viewer` and the 54 below are enumerated with reasons. Fifty-two functions
 /// have a name ending `_conn`, which is why a bare grep disagrees with the
-/// register in both directions — it catches
-/// `ClaimRepository::patch_claim_atomic_conn` (whose parameter is a
-/// `Transaction`, not a `PgConnection`, so this rule correctly skips it) and it
-/// misses all eleven of the functions the widening added. Quote the rule with
-/// the number; the two are not interchangeable.
+/// register in both directions. At the widening it caught
+/// `ClaimRepository::patch_claim_atomic_conn`, whose parameter was then a
+/// `Transaction`, not a `PgConnection`, so this rule correctly skipped it. That
+/// function now takes a `PgConnection` and is in the register. The grep also
+/// misses all eleven of the functions the widening added. Quote the rule with the
+/// number; the two are not interchangeable.
 ///
 /// # What this rule still cannot see
 ///
@@ -1173,7 +1185,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
 /// defect species this whole batch exists to remove.
 ///
 /// 1. **Spelling.** A `Transaction` parameter, as the `patch_claim_atomic_conn`
-///    case shows. The generic `E: sqlx::PgExecutor<'e>` spelling is covered
+///    case showed until it moved to a connection parameter. The generic `E: sqlx::PgExecutor<'e>` spelling is covered
 ///    separately by [`every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt`];
 ///    between the two, the remaining uncovered executor spelling is the
 ///    transaction.

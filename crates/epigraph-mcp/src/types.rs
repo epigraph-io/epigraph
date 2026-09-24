@@ -2306,7 +2306,9 @@ pub struct UpdateLabelsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchClaimParams {
-    #[schemars(description = "UUID of the claim to patch")]
+    #[schemars(
+        description = "UUID of the claim to patch. Must be a claim you can read (otherwise: not found) and one owned by a group this server's agent can write (otherwise: refused, nothing written)."
+    )]
     pub claim_id: String,
     #[schemars(description = "New trace_id (must reference an existing reasoning_traces row)")]
     pub trace_id: Option<String>,

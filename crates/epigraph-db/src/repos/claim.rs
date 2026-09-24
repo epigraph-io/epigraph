@@ -6590,14 +6590,31 @@ impl ClaimRepository {
         })
     }
 
-    /// Apply a patch atomically inside the supplied transaction. Returns a diff so
+    /// Apply a patch atomically on the supplied connection. Returns a diff so
     /// callers can build provenance or HTTP responses. No provenance writing here.
-    pub async fn patch_claim_atomic_conn<'c>(
-        tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+    ///
+    /// # Why this takes a connection, not a `Transaction`
+    ///
+    /// It used to take `&mut sqlx::Transaction`. That shape made it unreachable
+    /// from a STAMPED transaction: `ScopedPool::begin_as` yields a `ScopedTx`,
+    /// which derefs to `PgConnection` and is not a `sqlx::Transaction`. So the MCP
+    /// `patch_claim` tool could only reach it through an unstamped
+    /// `server.pool.begin()`, and on a cleanly-migrated schema `claims_tenancy`'s
+    /// `WITH CHECK` refused the UPDATE. That session's writable set is `{}`.
+    ///
+    /// The function stays atomic on its own. The body opens `conn.begin()`, which
+    /// is a real transaction on a bare connection and a SAVEPOINT inside a caller's
+    /// transaction. The FOR UPDATE read and the up-to-three UPDATEs therefore land
+    /// together in both shapes. A `&mut Transaction` caller still compiles
+    /// unchanged through deref coercion.
+    pub async fn patch_claim_atomic_conn(
+        conn: &mut sqlx::PgConnection,
         id: ClaimId,
         patch: &PatchClaimInput,
     ) -> Result<PatchClaimDiff, DbError> {
+        use sqlx::Acquire as _;
         use sqlx::Row as _;
+        let mut tx = conn.begin().await?;
         let id_uuid: Uuid = id.into();
         let row = sqlx::query(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -6605,7 +6622,7 @@ impl ClaimRepository {
                     COALESCE(properties, '{}'::jsonb) AS properties
              FROM claims WHERE id = $1 FOR UPDATE"#,
         )
-        .bind(id_uuid).fetch_optional(&mut **tx).await?
+        .bind(id_uuid).fetch_optional(&mut *tx).await?
         .ok_or(DbError::NotFound { entity: "Claim".into(), id: id_uuid })?;
         let before_labels: Vec<String> = row.get("labels");
         let before_props: serde_json::Value = row.get("properties");
@@ -6616,7 +6633,7 @@ impl ClaimRepository {
             sqlx::query("UPDATE claims SET trace_id = $1 WHERE id = $2")
                 .bind(t)
                 .bind(id_uuid)
-                .execute(&mut **tx)
+                .execute(&mut *tx)
                 .await?;
             after_trace = Some(t);
         }
@@ -6626,7 +6643,7 @@ impl ClaimRepository {
             sqlx::query(
                 "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $1 WHERE id = $2"
             )
-            .bind(p).bind(id_uuid).execute(&mut **tx).await?;
+            .bind(p).bind(id_uuid).execute(&mut *tx).await?;
             if let (Some(merged), Some(po)) = (after_props.as_object_mut(), p.as_object()) {
                 for (k, v) in po {
                     merged.insert(k.clone(), v.clone());
@@ -6637,9 +6654,11 @@ impl ClaimRepository {
         let mut after_labels = before_labels.clone();
         if !patch.add_labels.is_empty() || !patch.remove_labels.is_empty() {
             after_labels =
-                Self::update_labels_conn(tx, id_uuid, &patch.add_labels, &patch.remove_labels)
+                Self::update_labels_conn(&mut tx, id_uuid, &patch.add_labels, &patch.remove_labels)
                     .await?;
         }
+
+        tx.commit().await?;
 
         Ok(PatchClaimDiff {
             before_labels,

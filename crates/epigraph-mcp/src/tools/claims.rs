@@ -1464,6 +1464,7 @@ pub(crate) const RETIREMENT_LABEL: &str = "resolved";
 /// reachable for the fleet; issue #374 stays open for that half.
 async fn gate_retirement_label(
     server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     claim_id: Uuid,
@@ -1494,7 +1495,12 @@ async fn gate_retirement_label(
     // Viewer is supplied by the caller (acquired in server.rs). Acquiring it
     // here instead would break `tool_viewer_coverage`'s location ratchet, which
     // asserts `request_viewer(` appears under src/tools/ only in viewer.rs.
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
+    //
+    // On the caller's STAMPED connection, not the unstamped pool. An unstamped
+    // session's `claims_tenancy` USING admits only public rows, so a
+    // group-private claim read "not found" here even for its own author. The
+    // gate then refused the one population the stamp below exists to admit.
+    let claim = ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
@@ -1512,7 +1518,6 @@ pub async fn update_labels(
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
-    gate_retirement_label(server, viewer, auth, id, &params.add, &params.remove).await?;
     // `db_caller_error`, not `internal_error`: a label refused by
     // `reject_unexpanded_labels` is the caller's input, not a server fault. The
     // repo layer refuses it inside the same statement that would have written
@@ -1532,6 +1537,18 @@ pub async fn update_labels(
         server,
         server.agent_id().await?,
         "update_labels",
+    )
+    .await?;
+    // The gate reads on the SAME stamped transaction; a refusal drops `tx`, which
+    // rolls back, so nothing is written.
+    gate_retirement_label(
+        server,
+        &mut tx,
+        viewer,
+        auth,
+        id,
+        &params.add,
+        &params.remove,
     )
     .await?;
     let labels = ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
@@ -1561,11 +1578,46 @@ pub async fn patch_claim(
             "at least one of trace_id/properties/add_labels/remove_labels required",
         ));
     }
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT, and every read
+    // and write below runs on it.
+    //
+    // This was `server.pool.begin()`: atomic, but carrying no tenancy context,
+    // so on a cleanly-migrated schema `claims_tenancy`'s `WITH CHECK` refused
+    // `patch_claim_atomic_conn`'s UPDATE. That session's writable set is `{}`.
+    // It was not converted with `update_labels` because
+    // `patch_claim_atomic_conn` took a `&mut sqlx::Transaction`, which a
+    // `ScopedTx` is not. It now takes the connection a `ScopedTx` derefs to.
+    //
+    // THE STAMP IS `server.agent_id()`'s, the same as `update_labels`, and for
+    // the same reason. Every claim this MCP process writes is authored by that
+    // agent and owned by its group, so that is the population the stamp admits.
+    // A claim owned by another agent's group is refused loudly (`42501` from the
+    // UPDATE, or not-found from the row lock). Nothing is written, because the
+    // refusal aborts this transaction and it is never committed. Whether a
+    // `claims:admin` caller should carry write authority into a group this
+    // process cannot write is the cross-agent ownership question (#374), not a
+    // stamping one.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, server.agent_id().await?, "patch_claim")
+            .await?;
+
+    // The CALLER's read authority, on the same transaction. Before this,
+    // `patch_claim` checked caller visibility only on the retirement-label path
+    // below. A caller could patch the trace or properties of a claim it could not
+    // read, as long as it named the id. That is the MCP twin of the HTTP
+    // write-path gap (backlog 30c29c52). An invisible claim is reported as not
+    // found, exactly like a missing one.
+    ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(id))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+
     // Same gate as `update_labels`: `patch_claim` also accepts
     // `add_labels`/`remove_labels`, so leaving it ungated would just move the
     // bypass one tool over (issue #374).
     gate_retirement_label(
         server,
+        &mut tx,
         viewer,
         auth,
         id,
@@ -1573,25 +1625,6 @@ pub async fn patch_claim(
         &params.remove_labels,
     )
     .await?;
-    // STILL UNSTAMPED, and named here rather than left silent. This transaction
-    // is ATOMIC but carries no tenancy context, so `patch_claim_atomic_conn`'s
-    // `UPDATE claims` is refused by `claims_tenancy`'s `WITH CHECK` on a session
-    // whose writable set is `{}` — the same refusal the `update_labels` tool
-    // above was converted out of.
-    //
-    // It is not converted with it because the fix is a REPOSITORY SIGNATURE
-    // CHANGE, not a call-site one: `patch_claim_atomic_conn` takes a
-    // `&mut sqlx::Transaction`, which `ScopedTx` is not (it derefs to
-    // `PgConnection`), so the parameter has to become a connection — with an
-    // `epigraph-api` caller to move and a `visibility_lint` register entry to
-    // write, since a `&mut PgConnection` parameter is exactly what that lint's
-    // connection scanner reads.
-    //
-    // Recorded because this site escaped the residual-write inventory
-    // altogether: it takes no `&server.pool` ARGUMENT — it calls
-    // `server.pool.begin()` — so an argument-shaped scan cannot see it. Its
-    // sibling `update_labels`, two functions up, was in that inventory.
-    let mut tx = server.pool.begin().await.map_err(internal_error)?;
     let diff = ClaimRepository::patch_claim_atomic_conn(
         &mut tx,
         ClaimId::from_uuid(id),

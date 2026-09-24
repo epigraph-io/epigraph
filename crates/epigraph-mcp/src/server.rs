@@ -921,7 +921,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP)."
+        description = "Patch a claim atomically (trace_id, properties JSONB merge, label add/remove). FAST PATH — does NOT emit provenance. Use REST PATCH /api/v1/claims/:id if audit trail required. Adding or removing the 'resolved' label requires claims:admin or ownership of the claim when the caller is authenticated (HTTP). All-or-nothing: the whole patch lands or nothing does. A claim you cannot read is reported as not found. A claim owned by a group this server's agent cannot write (another agent's claim) is refused with nothing written, even with claims:admin."
     )]
     async fn patch_claim(
         &self,

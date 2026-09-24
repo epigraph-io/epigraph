@@ -114,16 +114,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          question (the basis claims are frequently another agent's).",
     ),
     (
-        "tools/claims.rs",
-        "server.pool.begin",
-        1,
-        "`patch_claim`. ATOMIC but unstamped. Invisible to an argument-shaped scan — it takes no \
-         `&server.pool` ARGUMENT — which is how it escaped the inherited inventory. Its fix is a \
-         REPOSITORY SIGNATURE change: `patch_claim_atomic_conn` takes `&mut sqlx::Transaction`, \
-         which `ScopedTx` is not, so the parameter has to become a connection and an \
-         `epigraph-api` caller moves with it.",
-    ),
-    (
         "tools/dedup_sweep.rs",
         "server.pool.acquire",
         1,
@@ -770,13 +760,19 @@ fn the_scanner_is_not_vacuous() {
          exact-equality assertion above is the ratchet.",
         measured.len()
     );
+    // The method-call arm's calibration site MOVED. It was `patch_claim`'s
+    // `server.pool.begin()` in `tools/claims.rs`, the site the argument-shaped
+    // inventory could not see. Batch H converted that one onto
+    // `begin_author_stamped_tx`, so the arm is now calibrated on the one
+    // registered method-call site left: `begin_ingest_tx`'s privileged arm.
     assert!(
         measured.contains_key(&(
-            "tools/claims.rs".to_string(),
+            "tools/ingestion.rs".to_string(),
             "server.pool.begin".to_string()
         )),
-        "the `patch_claim` site is the one the argument-shaped inventory could not see; if the \
-         scan stops finding it, the method-call arm of the matcher is broken"
+        "`begin_ingest_tx`'s privileged `server.pool.begin()` is the remaining method-call site \
+         (a method ON the pool, not a pool argument); if the scan stops finding it, the \
+         method-call arm of the matcher is broken"
     );
 }
 
