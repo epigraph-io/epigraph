@@ -1097,6 +1097,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorised by edges_tenancy's WITH CHECK.",
     ),
     (
+        "edge.rs",
+        "create_symmetric_if_absent_oriented_conn",
+        "WRITE. `create_symmetric_if_absent_oriented` on a caller's connection so `link_epistemic` \
+         writes the edge on the same author-stamped transaction as the belief wiring keyed on its \
+         id. Its dedup probe is the write-path read `create_or_get` documents (it must see an \
+         existing edge whoever asks, or the get half becomes a duplicate create); the INSERT is \
+         authorised by edges_tenancy's WITH CHECK on the stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_returning_conn",
+        "WRITE. `create_symmetric_if_absent_returning` on a caller's connection, for \
+         `link_alternative`'s author-stamped transaction. Same argument as \
+         create_symmetric_if_absent_oriented_conn: a write-path dedup probe plus an INSERT \
+         authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
         "group_membership.rs",
         "count_own_revoked_rows_conn",
         "READ of `group_memberships`, and deliberately viewer-less: it is an AUTHORITY BOOTSTRAP \
@@ -1624,6 +1641,23 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          transaction just created or fetched; the edge's authority was decided by the \
          statement that produced its id, and `edges_tenancy` on the stamped connection still \
          backstops the read.",
+    ),
+    (
+        "edge.rs",
+        "retract_by_id",
+        "WRITE. `UPDATE edges SET valid_to = now()` on one edge by primary key. Widened from \
+         `&PgPool` so the MCP `delete_edge` tool runs it on an author-stamped transaction. \
+         Authority is edges_tenancy on that connection: its USING decides whether the row is \
+         reachable at all (an unreachable edge is `false`, i.e. not found), and its WITH CHECK \
+         decides whether it may be kept. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "edge.rs",
+        "update_valid_to_and_properties",
+        "WRITE. One `UPDATE edges` by primary key. Widened from `&PgPool` for the same reason as \
+         retract_by_id, for `patch_edge`. edges_tenancy on the stamped connection authorises the \
+         row; an unreachable edge is `DbError::NotFound`. SCOPE: executor only; the SQL is \
+         unchanged.",
     ),
     (
         "frame.rs",

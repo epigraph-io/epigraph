@@ -78,12 +78,40 @@ pub async fn do_link_hierarchical(
         ));
     }
 
-    let pool = &server.pool;
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT. The two
+    // existence reads and the INSERT all run on it.
+    //
+    // The INSERT used to run on the unstamped pool. `edges_tenancy`'s WITH CHECK
+    // then admitted only what its static arm admits: an edge between two PUBLIC
+    // claims, which 070's BEFORE trigger makes world-owned. An edge touching a
+    // group-private claim is owned by that claim's group, and on a
+    // cleanly-migrated schema it was refused. Production admitted it only through
+    // the orphan `edges_privacy` policy that R3 drops.
+    //
+    // The READS move too, and they are what make the stamp able to succeed. On
+    // an unstamped session `claims_tenancy`'s USING admits only public rows, so a
+    // group-private endpoint read "not found" before the INSERT was reached.
+    // Converting only the INSERT would have been a conversion its own target
+    // population could never reach.
+    //
+    // THE STAMP IS `server.agent_id()`'s, as for every other MCP write: the edge
+    // is owned by an endpoint's group, and the population this admits is the
+    // server agent's own claims. An endpoint in another agent's private group is
+    // refused loudly by the WITH CHECK (or, for a co-owned edge, by RETURNING's
+    // intersection read) and nothing is written. Whether a caller should carry
+    // write authority into a group this process cannot write is the cross-agent
+    // ownership question (#374), not a stamping one.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "link_hierarchical",
+    )
+    .await?;
 
     // Verify both claims exist via the repo layer (per CLAUDE.md, SQL stays
     // in epigraph-db). Disambiguate which side is missing so the caller can
     // fix the right end of the link.
-    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(source_id))
+    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(source_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -92,7 +120,7 @@ pub async fn do_link_hierarchical(
             "source_claim_id {source_id} not found"
         )));
     }
-    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(target_id))
+    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(target_id))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -102,8 +130,8 @@ pub async fn do_link_hierarchical(
         )));
     }
 
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists(
-        pool,
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+        &mut tx,
         source_id,
         "claim",
         target_id,
@@ -115,6 +143,7 @@ pub async fn do_link_hierarchical(
     )
     .await
     .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkHierarchicalResponse {
         edge_id: edge_row.id.to_string(),

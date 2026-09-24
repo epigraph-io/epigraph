@@ -63,19 +63,31 @@ pub async fn do_link_alternative(
         ));
     }
 
-    let pool = &server.pool;
+    // ONE TRANSACTION, STAMPED FROM THE MCP SERVER'S OWN AGENT. Every read and
+    // the INSERT run on it. Same reasoning as `link_hierarchical`: the INSERT on
+    // the unstamped pool was admitted only for a world-owned edge (two public
+    // endpoints), and the READS on it could not see a group-private endpoint at
+    // all. So both have to move for a group-owned `alternative_of` edge to be
+    // writable. An endpoint in another agent's private group is refused loudly
+    // with nothing written (#374 owns whether it should be).
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "link_alternative",
+    )
+    .await?;
 
     // Verify both claims exist via the repo layer (SQL stays in epigraph-db per
     // CLAUDE.md). Disambiguate which side is missing so the caller can fix the
     // right end of the pair.
-    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(a))
+    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(a))
         .await
         .map_err(internal_error)?
         .is_none()
     {
         return Err(invalid_params(format!("claim_a {a} not found")));
     }
-    if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(b))
+    if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(b))
         .await
         .map_err(internal_error)?
         .is_none()
@@ -89,7 +101,7 @@ pub async fn do_link_alternative(
     let mut props = Map::new();
     if let Some(t) = &params.target_claim_id {
         let tid = parse_uuid(t)?;
-        if ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(tid))
+        if ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(tid))
             .await
             .map_err(internal_error)?
             .is_none()
@@ -105,8 +117,8 @@ pub async fn do_link_alternative(
         props.insert("rationale".to_string(), Value::String(r.clone()));
     }
 
-    let (edge_id, created) = EdgeRepository::create_symmetric_if_absent_returning(
-        pool,
+    let (edge_id, created) = EdgeRepository::create_symmetric_if_absent_returning_conn(
+        &mut tx,
         a,
         b,
         "alternative_of",
@@ -114,6 +126,7 @@ pub async fn do_link_alternative(
     )
     .await
     .map_err(internal_error)?;
+    tx.commit().await.map_err(internal_error)?;
 
     success_json(&LinkAlternativeResponse {
         edge_id: edge_id.to_string(),

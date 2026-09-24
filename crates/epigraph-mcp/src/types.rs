@@ -1801,10 +1801,13 @@ pub struct PatchEdgeResponse {
 }
 
 /// Parameters for the `delete_edge` MCP tool — mirrors
-/// `DELETE /api/v1/edges/:id`, which hard-deletes the row.
+/// `DELETE /api/v1/edges/:id`. Both RETRACT the row (`valid_to = now()` via
+/// `EdgeRepository::retract_by_id`). Neither hard-deletes it.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteEdgeParams {
-    #[schemars(description = "UUID of the edge to hard-delete")]
+    #[schemars(
+        description = "UUID of the edge to take out of force (retracted: valid_to is set, the row survives). Must be an edge this server's agent can write; otherwise it reports not found and nothing is written."
+    )]
     pub edge_id: String,
 }
 
