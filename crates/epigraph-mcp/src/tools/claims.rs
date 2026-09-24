@@ -290,14 +290,10 @@ pub async fn submit_claim(
     // Follows `epigraph-api/src/routes/groups.rs::rotate_key`'s "why the whole
     // body runs on `ScopedPool::begin_as`"; this is that pattern, not a new one.
     //
-    // WHAT IS DELIBERATELY *OUTSIDE* IT, below the commit: the DS auto-wire and
-    // the embedding. The embedding is CLAUDE.md's policy (best-effort,
-    // post-commit, warn on failure, never block the write). The DS auto-wire is
-    // a larger conversion — it writes `claim_frames` / `mass_functions` through
-    // a pool-bound helper — and it also READS the claim back, which a sibling
-    // connection cannot do before this transaction commits. It therefore stays
-    // post-commit and stays warn-only; `claim_frames` / `mass_functions` remain
-    // in the unstamped-write blast radius until that conversion lands.
+    // The DS auto-wire is INSIDE it too (see below, before COMMIT). Only the
+    // embedding is deliberately outside, below the commit: that is CLAUDE.md's
+    // policy (best-effort, post-commit, warn on failure, never block the write),
+    // and a provider round trip must not hold a transaction open.
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_claim").await?;
 
@@ -416,45 +412,47 @@ pub async fn submit_claim(
             .map_err(internal_error)?;
     }
 
-    // COMMIT. Everything below this line is post-commit and best-effort.
-    tx.commit().await.map_err(internal_error)?;
-
     // DS auto-wire: FIRST-CREATE ONLY, and that asymmetry with the embed below is
     // deliberate. Re-running it on an existing claim would combine the same mass
     // into the same frame twice, so a resubmit must not; re-embedding a claim that
     // has no vector is idempotent and is the only way a repaired orphan becomes
     // recallable again.
     //
-    // Both halves now run in ONE transaction stamped from the AUTHOR's viewer —
-    // `claim_frames`, `mass_functions`, the cached-belief `UPDATE claims`, and the
-    // `truth_value` derived from the pignistic. On the unstamped pool the first
-    // of those was refused outright on a cleanly-migrated schema (`claim_frames`
-    // carries no orphan `*_privacy` policy, which is why `mass_functions` stopped
-    // growing in production), and the `truth_value` write could land while the
-    // BBA it is derived from did not. See
-    // `claim_helper::wire_ds_for_new_claim_author_stamped`.
+    // IN THIS TRANSACTION, BEFORE COMMIT, AND A FAILURE FAILS THE SUBMISSION.
+    // `claim_frames`, `mass_functions`, the cached-belief `UPDATE claims` and the
+    // `truth_value` derived from the pignistic land with the claim or not at all.
+    // It used to run post-commit and warn-only, so a wiring failure returned
+    // success with `belief: null` over a committed claim that had no BBA: partial
+    // state behind a success response. See
+    // `claim_helper::wire_ds_for_new_claim_in_tx` for why that is now safe to make
+    // fatal, and why retrying is safe.
     let ds = if was_created {
-        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
-            server,
-            agent_id,
-            claim_uuid,
-            viewer,
-            ds_auto::DsAutoInput {
-                confidence,
-                weight,
-                supports: true,
-                evidence_type: Some(&params.evidence_type),
-            },
-            /* persist_truth_from_pignistic */ true,
-            "submit_claim",
+        Some(
+            crate::claim_helper::wire_ds_for_new_claim_in_tx(
+                &mut tx,
+                viewer,
+                agent_id,
+                claim_uuid,
+                ds_auto::DsAutoInput {
+                    confidence,
+                    weight,
+                    supports: true,
+                    evidence_type: Some(&params.evidence_type),
+                },
+                /* persist_truth_from_pignistic */ true,
+                "submit_claim",
+            )
+            .await?,
         )
-        .await
     } else {
         // Resubmit (Option B): verb-edges already emitted above, and the canonical
         // trace stays as it is unless the claim had none (the orphan-repair arm
         // above). No DS: canonical truth was set on first create.
         None
     };
+
+    // COMMIT. Everything below this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
 
     // EMBEDDING. Gated on `was_created` OR "the canonical row is missing its
     // vector", never on `was_created` alone.

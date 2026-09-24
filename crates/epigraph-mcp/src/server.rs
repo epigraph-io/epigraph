@@ -772,7 +772,7 @@ impl EpiGraphMcpFull {
     // ── Claims (11 tools) ──
 
     #[tool(
-        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
+        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its evidence, reasoning trace, verb-edges and its Dempster-Shafer belief (BBA, frame assignment, cached belief and derived truth_value) commit together; if the belief cannot be wired the call fails and nothing is written, so a retry is safe. Only the embedding is best-effort after commit (embedded=false)."
     )]
     async fn submit_claim(
         &self,
@@ -1053,7 +1053,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action. All-or-nothing: the claim, its tags, evidence, trace and Dempster-Shafer belief commit together; if the belief cannot be wired the call fails and nothing is written. Only the embedding is best-effort after commit."
     )]
     async fn memorize(
         &self,

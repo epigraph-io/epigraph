@@ -279,8 +279,13 @@ if want submit_ds; then
   # and reported success with belief=null).
   q "ALTER TABLE mass_functions ADD CONSTRAINT bh_probe_no_bba CHECK (false) NOT VALID" >/dev/null
   R=$(tool submit_claim '{"content":"Batch H DS refusal probe","methodology":"extraction","evidence_data":"probe","evidence_type":"empirical","confidence":0.8,"novelty_threshold":0.0}')
+  RM=$(tool memorize '{"content":"Batch H memorize DS refusal probe","tags":["bh-memo"]}')
   q "ALTER TABLE mass_functions DROP CONSTRAINT bh_probe_no_bba" >/dev/null
-  echo "   injected BBA refusal: $(verdict "$R") belief=$(field "$R" belief) | claims=$(q "SELECT count(*) FROM claims WHERE content='Batch H DS refusal probe'") evidence=$(q "SELECT count(*) FROM evidence e JOIN claims c ON c.id=e.claim_id WHERE c.content='Batch H DS refusal probe'")"
+  echo "   injected BBA refusal, submit_claim: $(verdict "$R") belief=$(field "$R" belief) | claims=$(q "SELECT count(*) FROM claims WHERE content='Batch H DS refusal probe'") evidence=$(q "SELECT count(*) FROM evidence e JOIN claims c ON c.id=e.claim_id WHERE c.content='Batch H DS refusal probe'")"
+  echo "   injected BBA refusal, memorize:     $(verdict "$RM") belief=$(field "$RM" belief) | claims=$(q "SELECT count(*) FROM claims WHERE content='Batch H memorize DS refusal probe'") evidence=$(q "SELECT count(*) FROM evidence e JOIN claims c ON c.id=e.claim_id WHERE c.content='Batch H memorize DS refusal probe'")"
+  R=$(tool memorize '{"content":"Batch H memorize DS wiring probe","tags":["bh-memo"]}')
+  C=$(field "$R" claim_id)
+  echo "   memorize fresh: $(verdict "$R") belief=$(field "$R" belief) | claims=$(q "SELECT count(*) FROM claims WHERE content='Batch H memorize DS wiring probe'") bbas=$(q "SELECT count(*) FROM mass_functions WHERE claim_id='${C:-00000000-0000-0000-0000-000000000000}'")"
 fi
 
 # ── maintenance tools ──────────────────────────────────────────────────────

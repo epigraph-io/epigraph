@@ -2,7 +2,11 @@
 //!
 //! Every claim-creating or claim-updating tool calls into this module after
 //! persisting the claim. DS is the primary belief authority — `update_with_evidence`
-//! propagates errors. `submit_claim` treats DS as best-effort (claim is already persisted).
+//! propagates errors, and so do `submit_claim` and `memorize`: their new-claim
+//! wiring runs inside the submission's own author-stamped transaction, before
+//! COMMIT, and a wiring failure rolls the whole submission back
+//! (`claim_helper::wire_ds_for_new_claim_in_tx`). It used to be best-effort and
+//! post-commit, which reported success over a committed claim with no BBA.
 //!
 //! Each BBA is Shafer-discounted by its `source_strength` before combination to
 //! prevent runaway confirmation (C2) and dilution attacks (C3).
