@@ -1017,11 +1017,16 @@ pub async fn report_workflow_outcome(
     //
     // So the stamp buys nothing on either configuration and, on the one this
     // programme exists to make reachable, trades a clean refusal for a committed
-    // orphan. `Evidence::new` mints a fresh `EvidenceId` per call and
-    // `EvidenceRepository::create` has no `ON CONFLICT`, so each retry of a call
-    // that is CERTAIN to fail appends another row: a retry amplifier, not just a
-    // one-off orphan. Re-adding the stamp belongs in D2, which has to put
-    // evidence → BBA → truth_value into one unit anyway.
+    // orphan. (An earlier form of this note also called it a retry amplifier,
+    // on the premise that a fresh `EvidenceId` plus no `ON CONFLICT` appends a
+    // row per retry. That is wrong for an IDENTICAL retry: `content_hash` is
+    // `blake3(evidence_text)`, a deterministic serialization of the call's
+    // arguments, and migration 001's `evidence_content_hash_claim_unique UNIQUE
+    // (content_hash, claim_id)` refuses it. Only a retry with different
+    // arguments adds a row. See `tools::claims::update_with_evidence`, where the
+    // same correction is measured.) Re-adding the stamp belongs in D2, which has
+    // to put evidence → BBA → truth_value into one unit anyway.
+    //
     // ── D2 lands here too: evidence -> BBA -> truth_value, ONE STAMPED UNIT ──
     //
     // "the DS wiring that follows is itself unconverted" and "a SIBLING pool
@@ -1030,10 +1035,10 @@ pub async fn report_workflow_outcome(
     // THIS transaction, and migration 046's FK from `mass_functions.evidence_id`
     // is checked against this transaction's own snapshot — an uncommitted evidence
     // row in the same transaction satisfies it. The stamped INSERT is therefore no
-    // longer forced to commit alone, which removes both objections at once: the
-    // committed orphan (nothing commits unless everything does) and the retry
-    // amplifier (a rolled-back `Evidence::new` id leaves no row to accumulate
-    // against).
+    // longer forced to commit alone, which removes the objection: nothing commits
+    // unless everything does, so a failed call leaves no BBA-less evidence row
+    // behind to make `evidence_content_hash_claim_unique` refuse the identical
+    // retry that would land it.
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, agent_id, "report_workflow_outcome")
             .await?;

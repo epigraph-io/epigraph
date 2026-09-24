@@ -1272,6 +1272,44 @@ pub struct UpdateResponse {
     pub truth_before: f64,
     pub truth_after: f64,
     pub evidence_id: String,
+    /// Whether the Dempster-Shafer wiring for this submission landed. Always
+    /// `true` in a response.
+    ///
+    /// Introduced by #497, when the DS wiring ran on a sibling pool connection
+    /// after the evidence row had already self-committed, so a wire failure was
+    /// reported as a SUCCESS with `belief_wired: false` rather than as an error
+    /// for work the database had kept. D2 (Unit E) put evidence -> BBA ->
+    /// `truth_value` -> labels in ONE author-stamped transaction, so a wire
+    /// failure now rolls every one of those writes back and the tool returns an
+    /// ERROR naming the failing step (`assign_claim: …`, `store BBA: …`,
+    /// `update_claim_belief: …`). There is no longer a partially-successful
+    /// outcome for this flag to disclose, and nothing is left behind: an
+    /// identical re-submit of the same `evidence_data` is admitted once the
+    /// cause is fixed (pinned in
+    /// `tests/update_with_evidence_ds_wiring_failure_is_atomic.rs`).
+    ///
+    /// The field is RETAINED, constant `true`, because clients of #497 may
+    /// already read it; `true` means what it always meant — a fresh BBA was
+    /// materialized and `truth_after` / `belief` / `plausibility` /
+    /// `pignistic_prob` describe the new epistemic state. Compare
+    /// [`LinkEpistemicResponse::belief_wired`], which is still a live
+    /// best-effort disclosure.
+    pub belief_wired: bool,
+    /// Whether THIS submission's BBA is persisted in `mass_functions`. Always
+    /// `true` in a response.
+    ///
+    /// #497 defined it as always `true` when `belief_wired` is `true`, and used
+    /// `false` to separate a first-step from a late-step wire drop on the old
+    /// best-effort path. Under D2 both drops are a rolled-back ERROR — a BBA
+    /// written before a late-step failure is rolled back with everything else —
+    /// so no response can carry `false`. Retained for client compatibility.
+    pub bba_stored: bool,
+    /// Always absent from a response since D2. #497 reported the DS wiring's
+    /// step-prefixed error here on its best-effort path; that text is now the
+    /// tool's -32603 error MESSAGE instead, because the failure rolls the whole
+    /// submission back. Kept (skipped when `None`) for client compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ds_wire_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub belief: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

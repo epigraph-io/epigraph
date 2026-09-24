@@ -862,22 +862,31 @@ pub async fn update_with_evidence(
     // would have had to self-commit (migration 046's
     // `mass_functions.evidence_id -> evidence(id)` FK, with the DS wiring on a
     // sibling connection), and the still-unconverted DS wiring then failed at
-    // `claim_frames` — a committed orphan that grew by one fresh-UUID row per
-    // retry (`EvidenceRepository::create` has no `ON CONFLICT`). MEASURED on
-    // the pre-branch binary, CONFIG B: `update_with_evidence` -> "assign_claim:
-    // ... policy for table \"claim_frames\"" with the evidence row committed.
+    // `claim_frames` — a committed evidence row whose BBA never landed. MEASURED
+    // on the pre-branch binary, CONFIG B: `update_with_evidence` ->
+    // "assign_claim: ... policy for table \"claim_frames\"" with the evidence
+    // row committed.
+    //
+    // (An earlier form of this note also called that orphan a RETRY AMPLIFIER —
+    // "`Evidence::new` mints a fresh v4 UUID and `EvidenceRepository::create`
+    // has no `ON CONFLICT`, so each retry appends another row". #497 measured
+    // that premise wrong for an IDENTICAL retry: `content_hash` is
+    // `blake3(evidence_data)` and migration 001's
+    // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+    // refuses it as "Duplicate entity already exists". Only a RE-WORDED retry
+    // adds a row. That makes a committed BBA-less row WORSE, not better: it
+    // blocks the identical re-submission that would land the contribution.)
     //
     // ── D2: evidence -> BBA -> truth_value -> labels, ONE STAMPED UNIT ──
     //
     // THE OBJECTION ABOVE IS ANSWERED BY THE TRANSACTION, NOT WAIVED. It said
     // stamping this INSERT alone "converts a clean refusal into a committed
-    // orphan", unbounded because `Evidence::new` mints a fresh v4 UUID and
-    // `EvidenceRepository::create` has no `ON CONFLICT`, so each retry of a call
-    // certain to fail appends another row. That is true of a SELF-COMMITTING
-    // stamped INSERT. Here the INSERT joins the transaction that also carries the
-    // DS wiring, the truth write and the label merge: if any of them fails,
-    // nothing is committed, so there is no orphan for a retry to accumulate
-    // against.
+    // orphan". That is true of a SELF-COMMITTING stamped INSERT. Here the INSERT
+    // joins the transaction that also carries the DS wiring, the truth write and
+    // the label merge: if any of them fails, nothing is committed, so there is
+    // no BBA-less row left behind to refuse the identical re-submission — the
+    // caller's retry of the same `evidence_data` is the recovery, and it is
+    // pinned in `tests/update_with_evidence_ds_wiring_failure_is_atomic.rs`.
     //
     // AND THE FK ORDERING THAT FORCED THE SPLIT DISSOLVES. Migration 046 gives
     // `mass_functions.evidence_id` a foreign key to `evidence(id)`, which is why
@@ -916,7 +925,34 @@ pub async fn update_with_evidence(
     // I-3: use helper that checks CALIBRATION_PATH env var before relative path
     let weight = load_evidence_type_weight(&params.evidence_type);
 
-    // CDST update (primary — errors propagated, not swallowed)
+    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
+    //
+    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
+    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
+    // the evidence INSERT had already self-committed on the unstamped pool, the
+    // wiring ran on a sibling pool connection and was refused in production
+    // (`new row violates row-level security policy for table "claim_frames"`),
+    // so a fatal error reported total failure for a call whose evidence row the
+    // database had kept.
+    //
+    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
+    // so the production refusal it was working around is the thing D2 removes,
+    // and the evidence row is uncommitted until everything below succeeds. A
+    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
+    // truth write, no labels — and an error is now the complete and truthful
+    // answer. Swallowing it instead would commit exactly the BBA-less evidence
+    // row the note above explains is worse than nothing (it blocks the identical
+    // re-submit via `evidence_content_hash_claim_unique`). The error text keeps
+    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
+    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
+    // which is the part of #497's disclosure that still has a referent.
+    //
+    // `submit_claim` still treats its own DS wiring as best-effort, and that is
+    // not a discrepancy: there the CLAIM is the primary write and it has already
+    // committed in its own transaction before the wire runs, so the claim
+    // exists either way. Here the evidence row IS the submission, and it is in
+    // the same unit as its BBA.
+    //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
     let ds = ds_auto::auto_wire_ds_update(
         &mut tx,
@@ -995,11 +1031,21 @@ pub async fn update_with_evidence(
             .to_string()
     });
 
+    // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
+    // kept because clients may already read them. Under D2 a success response is
+    // only reachable when the whole unit committed, so they are constant here:
+    // the wire landed (`true`), this submission's BBA is persisted (`true`, which
+    // #497 defines as always true when `belief_wired` is), and there is no wire
+    // error to report. A failed wire never reaches this line — it is the `?`
+    // above, with everything rolled back.
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
         truth_after: after_truth.value(),
         evidence_id: evidence.id.as_uuid().to_string(),
+        belief_wired: true,
+        bba_stored: true,
+        ds_wire_error: None,
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),

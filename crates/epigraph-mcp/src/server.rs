@@ -758,7 +758,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Add new evidence to an existing claim and run a Bayesian belief update. Returns the before/after truth values."
+        description = "Add new evidence to an existing claim and run a Dempster-Shafer belief update. Returns the before/after truth values plus belief_wired. The call is ATOMIC: the evidence row, its BBA, the truth_value update and any label merge commit together in one transaction or not at all. On success belief_wired and bba_stored are always true (both fields are retained for client compatibility). If the belief update fails, the call returns an error naming the failing step (e.g. `assign_claim: ...`) and writes nothing, so re-submitting the identical evidence_data once the cause is fixed is safe and is the recovery."
     )]
     async fn update_with_evidence(
         &self,
