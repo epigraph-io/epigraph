@@ -1288,6 +1288,31 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "INSERT INTO `edges`. Same write-side argument as the two above. It moved because a          verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted ABOUT a row the same          submission just wrote: once that row's INSERT lives in a transaction, an edge emitted          on a different connection points at a row no other session can see yet. NOTE FOR A          CALLER PASSING A TRANSACTION, which the function's own doc also carries: a failed          statement aborts the whole PostgreSQL transaction, so `let _ = create(...)` does NOT          preserve best-effort semantics there -- it defers the failure to COMMIT as          `current transaction is aborted` with the cause gone.          `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort` wraps it in a SAVEPOINT          for exactly that reason. SCOPE: executor only; the SQL is unchanged.",
     ),
     (
+        "community.rs",
+        "add_member",
+        "ONE statement, `SELECT public.epigraph_community_add_member($1, $2, $3)` (migration \
+         106, batch F). A WRITE, and its authorization is neither an in-query viewer predicate \
+         nor the caller's `WITH CHECK`: the SECURITY DEFINER function takes the actor from the \
+         CONNECTION's stamped `epigraph_principal_id()` (a differing `acting_agent` is DENIED \
+         unless the session is `epigraph_bypass()`), locks the group's roster and `groups` row, \
+         and decides under the lock. A `&Viewer` here would be spent on nothing -- there is no \
+         FROM to splice -- and the executor is generic precisely so the API route can pass the \
+         transaction `ScopedPool::begin_as` stamped from its viewer, which is what the function \
+         reads the actor from. Pinned as `epigraph_app` by \
+         `community_membership_integrity.rs`.",
+    ),
+    (
+        "community.rs",
+        "remove_member",
+        "ONE statement: `epigraph_community_remove_member` (migration 106) in a CTE, plus the \
+         `community_members` DELETE, run as the CALLER only when the function answered \
+         'applied' (the definer's owner holds no DELETE, per 070). Same argument as `add_member` \
+         above: the actor comes from the connection's stamped principal, the rule (owner leaves, \
+         live admin evicts, never the last admin) runs under the roster lock inside the definer, \
+         and `community_members` carries no RLS and no tenancy columns to filter. Pinned as \
+         `epigraph_app` by `community_membership_integrity.rs`.",
+    ),
+    (
         "method.rs",
         "get",
         "Reads `methods` by primary key, and the statement's FROM is `methods` alone -- it joins \
