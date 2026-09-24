@@ -59,11 +59,15 @@ CONCURRENTLY` migration; that predates #492 (raw `sqlx::migrate!` does the
 same), the losing run exits nonzero without the marker, and re-running it is
 safe.
 
-A database that stops at an older head *because the binary itself is stale*
-(built before the newer migrations existed) still reports `ok` — the binary
-cannot know migrations it was never built with — but the marker now shows its
-`binary_head`, so compare it with the newest file in `migrations/` for the
-revision you meant to deploy.
+**What this cannot catch.** A database that stops at an older head *because
+the binary itself is stale* (built before the newer migrations existed) still
+reports `ok` — the binary cannot know migrations it was never built with, so
+nothing inside it can tell "at my head" from "at the head the deployed code
+requires". #492's own measurement (a head-59 build on an empty database)
+still exits 0. The marker shows `binary_head`, so compare it with the newest
+file in `migrations/` for the revision you meant to deploy; making that
+comparison automatic needs the expected head supplied from outside the
+binary.
 
 ### Cross-worktree binary caching (foot-gun)
 

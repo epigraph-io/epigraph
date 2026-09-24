@@ -28,6 +28,13 @@
 //! advisory lock, so no other lock-respecting migrator can change
 //! `_sqlx_migrations` between the checks and the run.
 //!
+//! **What this cannot catch.** A binary knows only the migrations it was built
+//! with. A stale binary run against a database at or below its own head —
+//! #492's headline measurement, a head-59 build on an empty database — reaches
+//! ITS head and succeeds; the only signal is `binary_head=59` in the marker
+//! line. Detecting that needs an expected head supplied from outside the
+//! binary (the deploy's target revision), which this module does not take.
+//!
 //! The comparison itself is the pure [`compare_schema_heads`] plus the pure
 //! gates [`check_before_run`] / [`check_after_run`], so every branch —
 //! including the post-run floor, which a successful `Migrator::run` can never
