@@ -607,9 +607,9 @@ impl IngestTx<'_> {
         else {
             return Err(refuse(format!(
                 "the ingesting agent ({agent_id}) holds no LIVE membership of its personal group, \
-                 which owns every row this ingest would write. Refusing rather than provisioning \
-                 it: the provisioning call revives a revoked membership as admin, and reversing \
-                 a revocation is an operator decision. Nothing was written"
+                 which owns every row this ingest would write. Refusing: if the membership was \
+                 revoked, restoring it is an operator decision, and nothing on this path will \
+                 restore it. Nothing was written"
             )));
         };
         let writable =

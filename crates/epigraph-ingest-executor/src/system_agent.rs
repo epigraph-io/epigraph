@@ -158,8 +158,10 @@ pub struct SystemAgentAuthority {
 /// that did the discriminating reads, so the decision and the write see one
 /// snapshot.
 ///
-/// A live `reader` membership of the personal group is refused too: the same
-/// `DO UPDATE` would silently promote it to `admin`.
+/// A live `reader` membership of the personal group is refused too: every row
+/// the executor writes is owned by that group, and a reader cannot write it.
+/// (077's `DO UPDATE` would also have silently promoted it to `admin`;
+/// migration 105's function leaves a live row's role alone.)
 ///
 /// # Errors
 /// [`IngestExecutorError::AgentCreation`] if the agent or its viewer cannot be
@@ -215,8 +217,8 @@ pub async fn system_agent_write_authority(
         return Err(refuse(format!(
             "the workflow-ingest-system agent ({agent_id}) holds a LIVE but read-only membership \
              of its personal group ({group}). Every row the ingest executor writes is owned by \
-             that group, so nothing can be written. Refusing rather than provisioning: the \
-             provisioning call would silently promote the membership to admin"
+             that group, so nothing can be written. Refusing: promoting the membership is an \
+             operator decision"
         )));
     }
 
