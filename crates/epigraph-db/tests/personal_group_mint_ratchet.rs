@@ -152,16 +152,18 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-db/src/repos/claim.rs",
         "personal_group_of",
-        3,
-        "`default_decl_for_author`, `personal_group_of_pool` and `consolidate`'s all-public \
-         branch. All resolve through the definer.",
+        2,
+        "`default_decl_for_author` (reached only when the author has no ACTING operator link, \
+         migration 107) and `personal_group_of_pool`. Both resolve through the definer.",
     ),
     (
         "epigraph-db/src/repos/claim.rs",
         "default_decl_for_author",
-        1,
-        "`default_decl_for_author_pool`'s body: acquire a pool connection, then the same \
-         definer answer as every other caller.",
+        2,
+        "`default_decl_for_author_pool`'s body (acquire a pool connection, then the same \
+         definer answer as every other caller) and `consolidate`'s all-public branch, which \
+         since migration 107 asks the ACTOR read first so an operated agent's merge lands in \
+         its operator's group; otherwise the same definer answer.",
     ),
     (
         "epigraph-ingest-executor/src/system_agent.rs",
