@@ -604,6 +604,16 @@ async fn handle_client_credentials(
     ))
 }
 
+/// Revoke a refresh token (rotation, or a deliberate burn on a denied refresh).
+#[cfg(feature = "db")]
+async fn burn_refresh_token(state: &AppState, id: uuid::Uuid) -> Result<(), ApiError> {
+    epigraph_db::repos::refresh_token::RefreshTokenRepository::revoke(&state.db_pool, id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: e.to_string(),
+        })
+}
+
 #[cfg(feature = "db")]
 async fn handle_refresh_token(
     state: &AppState,
@@ -630,13 +640,17 @@ async fn handle_refresh_token(
             reason: "Invalid or expired refresh token".to_string(),
         })?;
 
-    // Revoke old token (rotation)
-    RefreshTokenRepository::revoke(&state.db_pool, stored.id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
-
+    // WHEN THE OLD TOKEN IS BURNED (rotation). A DENIAL burns it on purpose --
+    // a suspended client, an identity no longer allowlisted, an operated agent
+    // keeps no reusable token -- but a FAILURE to answer must not: before
+    // migration 102 nothing between the revoke and the mint could fail on a
+    // warm client, and `principal_agent_id` now reads the operator link on
+    // every refresh. An `InternalError` there (e.g. a missing EXECUTE grant on
+    // `epigraph_operator_actor`, which 102 section 6 names an outage) used to
+    // outlive the outage: the token was already revoked, so every refreshing
+    // client lost its chain. So the client is loaded and every check runs
+    // FIRST, and the token is revoked only once the refresh is either denied or
+    // about to mint.
     let client = OAuthClientRepository::get_by_id(&state.db_pool, stored.client_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -647,6 +661,7 @@ async fn handle_refresh_token(
         })?;
 
     if client.status != "active" {
+        burn_refresh_token(state, stored.id).await?;
         return Err(ApiError::Forbidden {
             reason: "Client has been suspended or revoked".to_string(),
         });
@@ -656,10 +671,9 @@ async fn handle_refresh_token(
     // clients BEFORE minting. The provision gate only fires on a full ID-token /
     // authorization grant; refresh rotation re-issues a fresh 30d refresh on every
     // call, so without this an identity removed from the allowlist keeps renewing
-    // access indefinitely. The old token was already revoked above (rotation), so a
-    // denied refresh correctly burns it — a deauthorized identity keeps no reusable
-    // token. SKIP (issue normally) for non-external clients and unconfigured
-    // allowlists; see [`refresh_allowed`].
+    // access indefinitely. A denied refresh burns the old token here, so a
+    // deauthorized identity keeps no reusable token. SKIP (issue normally) for
+    // non-external clients and unconfigured allowlists; see [`refresh_allowed`].
     if !refresh_allowed(
         &state.providers,
         &client.client_id,
@@ -680,6 +694,7 @@ async fn handle_refresh_token(
                 "reason": "email_not_in_allowlist",
             }),
         );
+        burn_refresh_token(state, stored.id).await?;
         return Err(ApiError::Forbidden {
             reason: "email no longer authorized for this provider".into(),
         });
@@ -698,7 +713,21 @@ async fn handle_refresh_token(
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
     // their next token, and so all four mint sites share one code path.
-    let agent_id = principal_agent_id(state, client.id, client.agent_id).await?;
+    //
+    // A `Forbidden` (an operated agent) is a DENIAL and burns the token; any
+    // other error is a failure to answer and leaves it intact (see above).
+    let agent_id = match principal_agent_id(state, client.id, client.agent_id).await {
+        Ok(agent_id) => agent_id,
+        Err(denied @ ApiError::Forbidden { .. }) => {
+            burn_refresh_token(state, stored.id).await?;
+            return Err(denied);
+        }
+        Err(unanswered) => return Err(unanswered),
+    };
+
+    // Rotation: the refresh is going ahead, so the old token is spent.
+    burn_refresh_token(state, stored.id).await?;
+
     let (access_token, _jti) = state
         .jwt_config
         .issue_access_token(

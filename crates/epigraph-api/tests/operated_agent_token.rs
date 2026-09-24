@@ -17,6 +17,15 @@
 //!   the refusal is the link and not the fixture;
 //! * retired link -> 200: a retired agent holds no membership, so its token
 //!   carries no operator authority (documented behaviour, not a gap).
+//!
+//! The REFRESH grant is covered on its own, because it is the arm where the
+//! check's ORDER matters: the old refresh token is burned by rotation, so a
+//! check that fails AFTER the burn cost the client its refresh chain.
+//!
+//! * an agent that is linked AFTER it minted -> its refresh is 403;
+//! * the operated-agent check itself FAILS (the actor read made uncallable)
+//!   -> 500, and the SAME refresh token still refreshes once the read is back:
+//!   a failure to answer never burns the token.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -168,4 +177,108 @@ async fn an_operated_agent_cannot_mint_a_token_by_assertion(pool: PgPool) {
         StatusCode::OK,
         "a retired agent holds no membership, so its token carries no operator authority: {body}"
     );
+}
+
+async fn refresh_grant(pool: &PgPool, refresh_token: &str) -> (StatusCode, Value) {
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    let body = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    });
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = app.oneshot(req).await.expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Mint by assertion and return the refresh token.
+async fn minted_refresh_token(pool: &PgPool, client_id: &str, key: &SigningKey) -> String {
+    let (status, body) = assertion_grant(pool, client_id, key).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "PREMISE: the assertion grant mints: {body}"
+    );
+    body.get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("PREMISE: the assertion grant issues a refresh token: {body}"))
+        .to_string()
+}
+
+/// The REFRESH arm refuses an agent linked after it minted (A3 in every grant
+/// arm that yields an agent token, not only the assertion).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_linked_after_minting_cannot_refresh(pool: PgPool) {
+    let (operator, _) = fixture::seed_agent_with_group(&pool, "operator").await;
+    let key = SigningKey::from_bytes(&[0x44; 32]);
+    let (agent, client_id) = agent_with_active_client(&pool, &key).await;
+    let refresh = minted_refresh_token(&pool, &client_id, &key).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, operator)
+        .await
+        .expect("link the agent after it minted");
+    drop(conn);
+
+    let (status, body) = refresh_grant(&pool, &refresh).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an operated agent refreshed a token: its writer membership in the operator's group \
+         would reach the HTTP surface: {body}"
+    );
+    assert!(
+        body.to_string().contains("stdio-only"),
+        "the refusal must say why: {body}"
+    );
+}
+
+/// A FAILURE of the operated-agent check (not a refusal) leaves the refresh
+/// token intact.
+///
+/// Review's measurement: with `epigraph_operator_actor` renamed away, the
+/// refresh returned 500 AFTER rotation had already revoked the token, and once
+/// the function was back the same token was 401 "Invalid or expired refresh
+/// token": an outage of the read (102 section 6 names a missing EXECUTE grant
+/// one) cost every refreshing client its chain, and the loss outlived the
+/// outage. The token must be burned only once the refresh is denied or about
+/// to mint.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_operator_check_does_not_burn_the_refresh_token(pool: PgPool) {
+    let key = SigningKey::from_bytes(&[0x45; 32]);
+    let (_agent, client_id) = agent_with_active_client(&pool, &key).await;
+    let refresh = minted_refresh_token(&pool, &client_id, &key).await;
+
+    sqlx::query("ALTER FUNCTION public.epigraph_operator_actor(uuid) RENAME TO epigraph_operator_actor_gone")
+        .execute(&pool)
+        .await
+        .expect("make the actor read uncallable");
+    let (status, body) = refresh_grant(&pool, &refresh).await;
+    sqlx::query("ALTER FUNCTION public.epigraph_operator_actor_gone(uuid) RENAME TO epigraph_operator_actor")
+        .execute(&pool)
+        .await
+        .expect("restore the actor read");
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "PREMISE: with the actor read gone the refresh cannot be answered: {body}"
+    );
+
+    let (status, body) = refresh_grant(&pool, &refresh).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refresh token was BURNED by a refresh that failed to answer: the client lost its \
+         refresh chain to an outage of the operator read: {body}"
+    );
+    assert!(body.get("access_token").is_some(), "{body}");
 }
