@@ -2643,6 +2643,116 @@ async fn a_hidden_row_survives_later_writes_and_reverse_holds_it_once_its_claim_
     );
 }
 
+/// The claim-state half of the reversal's compare-and-swap. A re-own of the
+/// claim onto WORLD leaves its pinned row exactly in the hide's post state (a
+/// pinned row keeps its own owner rather than move onto world), so only the
+/// recorded claim state tells reversal that unhiding now would leave the row
+/// out of step with its claim. That row is HELD, exit 3; the other row, whose
+/// claim did not move, is restored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_holds_a_hidden_row_whose_claim_moved_even_when_the_row_did_not(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    let mf = h.dir.join("hide.jsonl");
+    let r = hide_apply(&pool, &h, &mf).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(h.fx.c_personal)
+        .bind(WORLD)
+        .execute(&pool)
+        .await
+        .expect("move the claim onto world (public -> public)");
+    assert_eq!(
+        tenancy_of(&pool, h.ev_labelled).await,
+        (h.fx.target, "group".to_string()),
+        "a pinned row does not follow its claim onto world: still the hide's post state"
+    );
+
+    let rv = reverse(&pool, &mf, true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(
+        rv.stdout.contains(&format!(
+            "HELD\t{}\tits claim {}",
+            h.ev_labelled, h.fx.c_personal
+        )),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(
+        tenancy_of(&pool, h.ev_labelled).await,
+        (h.fx.target, "group".to_string()),
+        "the held row is untouched"
+    );
+    assert_eq!(pins(&pool).await, vec![(h.ev_labelled, h.fx.operator)]);
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await.1,
+        "public",
+        "the row whose claim did not move is restored"
+    );
+}
+
+/// The documented order end to end: `reown-claims --apply` (M1), then
+/// `hide-evidence --apply` over the moved claims (H2), then ONE
+/// `reown-reverse` given both manifests in the WRONG order. It orders them
+/// newest-first by `created_at` across the two kinds, unhides H2's rows and
+/// then reverses M1, and the snapshot taken before M1 comes back row for row
+/// with no pin left.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reown_then_hide_then_one_reverse_of_both_restores_everything(pool: PgPool) {
+    let h = hide_fixture(&pool).await;
+    let before = snapshot(&pool, true).await;
+    let m1 = reown(&pool, &h.dir, &h.fx, "follow-claim", "m1.jsonl", true).await;
+    assert_eq!(m1.code, 0, "{}", m1.show());
+    assert!(m1.stdout.contains("claims moved: 3"), "{}", m1.show());
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await,
+        (h.fx.target, "public".to_string()),
+        "the re-own moved the row, public"
+    );
+
+    let h2 = h.dir.join("h2.jsonl");
+    let r = hide_apply(&pool, &h, &h2).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        tenancy_of(&pool, h.ev_testimony).await,
+        (h.fx.target, "group".to_string())
+    );
+
+    let m1p = h.dir.join("m1.jsonl");
+    let rv = run_op(
+        &pool,
+        &[
+            "reown-reverse",
+            "--manifest",
+            m1p.to_str().unwrap(),
+            "--manifest",
+            h2.to_str().unwrap(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    let order_hide = rv
+        .stdout
+        .find("HIDE-MANIFEST")
+        .expect("hide manifest reversed");
+    let order_reown = rv
+        .stdout
+        .find("\nMANIFEST\t")
+        .expect("re-own manifest reversed");
+    assert!(
+        order_hide < order_reown,
+        "the NEWER hide manifest must be reversed first: {}",
+        rv.show()
+    );
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "re-own + hide, reversed together",
+    );
+    assert!(pins(&pool).await.is_empty(), "no pin is left");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // reown-reverse checks itself too, and the target group must be the operator's
 // ─────────────────────────────────────────────────────────────────────────────
