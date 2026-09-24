@@ -50,7 +50,9 @@
 //!
 //! A row the manifest does not name (a derived row written after the re-own)
 //! is left where the trigger puts it, which is where it would have been had
-//! the claim never moved. Its visibility is still checked.
+//! the claim never moved — when it is public. A NON-public one, or an edge
+//! with a non-public endpoint, would change visibility under the cascade, so
+//! its claim is HELD in step 2 rather than failing the whole batch.
 //!
 //! # Idempotent
 //!
@@ -330,6 +332,36 @@ pub async fn run_batch(
                         drift.entry(*cl).or_insert_with(|| why.clone());
                     }
                 }
+            }
+        }
+    }
+    // ---- rows the cascade would widen: hold, don't fail the batch ----
+    // Restoring a claim makes `epigraph_propagate_tenancy` copy the claim's
+    // (owner, visibility) onto EVERY derived row, recorded or not, and
+    // recompute every touching edge's meet. A row written AFTER the re-own
+    // that is not public, or an edge with a non-public endpoint, would change
+    // visibility; the batch's invariant would then roll the WHOLE batch back
+    // and stop the run (review finding), so every other claim in the manifest
+    // would stay moved. Holding the one claim is the per-claim answer.
+    for (k, a) in &attached {
+        let why = if !res.rows.contains_key(k) && a.tenancy.visibility != "public" {
+            Some(format!(
+                "{} {} is {} and was written after the re-own; restoring the claim would copy \
+                 the claim's public visibility onto it, so not reversing",
+                k.0, k.1, a.tenancy.visibility
+            ))
+        } else if a.endpoints_public == Some(false) {
+            Some(format!(
+                "edge {} has a non-public endpoint now, so the trigger's meet would change its \
+                 visibility; not reversing",
+                k.1
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            for cl in a.claims.intersection(&cand_ids) {
+                drift.entry(*cl).or_insert_with(|| why.clone());
             }
         }
     }

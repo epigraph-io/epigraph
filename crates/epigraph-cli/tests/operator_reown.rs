@@ -1618,6 +1618,107 @@ async fn a_stopped_run_and_its_resume_reverse_safely(pool: PgPool) {
     );
 }
 
+/// One claim that changed after the re-own is HELD, and the rest of the
+/// manifest still reverses (review probe P4: a recorded evidence row made
+/// group-private after the re-own, plus a new evidence row, stopped the whole
+/// reverse at batch 1 with "ROLLED BACK ... STOPPED", restoring nothing).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_drifted_claim_is_held_and_the_rest_of_the_manifest_still_reverses(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    exec(
+        &pool,
+        &format!(
+            "UPDATE evidence SET visibility = 'group' WHERE id = '{}'",
+            fx.ev_r
+        ),
+    )
+    .await;
+    let later = evidence(&pool, fx.c_personal, None, "written after the re-own").await;
+
+    let rv = reverse(&pool, &dir.join("m.jsonl"), true).await;
+    assert_eq!(
+        rv.code,
+        3,
+        "a drifted claim must be HELD (exit 3), not roll back the batch and stop the run: {}",
+        rv.show()
+    );
+    assert!(!rv.stdout.contains("ROLLED BACK"), "{}", rv.show());
+    assert!(
+        rv.stdout
+            .contains(&format!("HELD\t{}\tevidence {}", fx.c_world, fx.ev_r)),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(
+        tenancy(&pool, "evidence", fx.ev_r).await,
+        (fx.target, "group".to_string()),
+        "the held claim's private row is untouched"
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_world).await,
+        public(fx.target)
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_personal).await,
+        public(fx.retired_group),
+        "a later claim of the same batch still reverses"
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_actor).await,
+        public(fx.actor_group),
+        "a later batch still runs"
+    );
+    assert_eq!(
+        tenancy(&pool, "evidence", later).await,
+        public(fx.retired_group),
+        "an unrecorded PUBLIC row moves with its claim"
+    );
+}
+
+/// A NON-public row written after the re-own holds its claim in
+/// pre-classification. Without that, restoring the claim makes the cascade
+/// copy the claim's public visibility onto it; the batch invariant then rolls
+/// the WHOLE batch back and stops the run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_row_written_after_the_reown_holds_its_claim(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let r = reown(&pool, &dir, &fx, "follow-claim", "m.jsonl", true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let private = evidence(&pool, fx.c_personal, None, "private, written later").await;
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(private)
+        .bind(fx.target)
+        .execute(&pool)
+        .await
+        .expect("make the later row group-private");
+
+    let rv = reverse(&pool, &dir.join("m.jsonl"), true).await;
+    assert_eq!(rv.code, 3, "{}", rv.show());
+    assert!(!rv.stdout.contains("ROLLED BACK"), "{}", rv.show());
+    assert!(
+        rv.stdout.contains(&format!(
+            "HELD\t{}\tevidence {} is group and was written after the re-own",
+            fx.c_personal, private
+        )),
+        "{}",
+        rv.show()
+    );
+    assert_eq!(
+        tenancy(&pool, "evidence", private).await,
+        (fx.target, "group".to_string()),
+        "the private row was neither widened nor moved"
+    );
+    assert_eq!(tenancy(&pool, "claims", fx.c_world).await, public(WORLD));
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_actor).await,
+        public(fx.actor_group)
+    );
+}
+
 /// A row can become unreadable to an unstamped application session without
 /// its visibility column changing — here a RESTRICTIVE policy that hides rows
 /// owned by the target group from `epigraph_app`. The readability census, taken
