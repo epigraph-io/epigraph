@@ -312,7 +312,10 @@ async fn a_hard_deleted_revocation_is_not_revived_by_a_relink(pool: PgPool) {
         .await
         .expect("erase the revoked history row")
         .rows_affected();
-    assert_eq!(erased, 1, "PREMISE: the revoked row existed and is now gone");
+    assert_eq!(
+        erased, 1,
+        "PREMISE: the revoked row existed and is now gone"
+    );
 
     let relinked = link(&pool, x, operator).await;
     assert!(
@@ -387,9 +390,16 @@ async fn an_app_session_cannot_hard_delete_a_membership(pool: PgPool) {
         (conn, (visible, r))
     })
     .await;
-    assert_eq!(visible, 1, "PREMISE: X's session can see its own revoked row");
+    assert_eq!(
+        visible, 1,
+        "PREMISE: X's session can see its own revoked row"
+    );
     let err = deleted.expect_err("ARM X: a revoked agent erased its own revocation history");
-    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
     assert_eq!(
         membership_rows(&pool, group, x).await,
         vec![("writer".to_string(), true, 0)],
@@ -416,9 +426,16 @@ async fn an_app_session_cannot_hard_delete_a_membership(pool: PgPool) {
         (conn, (visible, r))
     })
     .await;
-    assert_eq!(visible, 1, "PREMISE: Y's session can see the operator's admin row");
+    assert_eq!(
+        visible, 1,
+        "PREMISE: Y's session can see the operator's admin row"
+    );
     let err = deleted.expect_err("ARM Y: an operated writer deleted its operator's admin row");
-    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
     assert_eq!(
         membership_rows(&pool, group, operator).await,
         vec![("admin".to_string(), false, 0)],
@@ -442,7 +459,116 @@ async fn an_app_session_cannot_hard_delete_a_membership(pool: PgPool) {
     .await
     .expect("the operator's soft revoke must still work")
     .rows_affected();
-    assert_eq!(revoked, 1, "CALIBRATION: the operator revokes Y with an UPDATE");
+    assert_eq!(
+        revoked, 1,
+        "CALIBRATION: the operator revokes Y with an UPDATE"
+    );
+}
+
+/// `record_auth_lineage`'s shape: `signer --OPERATED_BY--> principal`.
+async fn lineage_edge(pool: &PgPool, signer: Uuid, principal: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+    )
+    .bind(signer)
+    .bind(principal)
+    .execute(pool)
+    .await
+    .expect("auth-lineage edge");
+}
+
+/// A SHARED HTTP SIGNER is neither linkable nor an operator (102 section 9).
+///
+/// Review's scope note: a mistaken entry for the shared signer in a
+/// link-retired agents file would make the operator the owner of every HTTP
+/// caller's claims, and a signer that is an operator would, unauthenticated,
+/// make every anonymous caller that operator. The signer's fingerprint is its
+/// auth-lineage edges to MORE THAN ONE principal. Both link functions refuse
+/// it as the AGENT and as the OPERATOR, and write nothing.
+///
+/// CALIBRATION: an agent with exactly ONE lineage edge (not a shared-signer
+/// fingerprint) still links, as the agent and as an operator.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_signer_is_refused_as_agent_and_as_operator(pool: PgPool) {
+    let operator = seed_bare_agent(&pool).await;
+    let (p1, p2) = (seed_bare_agent(&pool).await, seed_bare_agent(&pool).await);
+    // One fresh shared signer per arm, so each arm stands on its own: a link
+    // that landed in one arm cannot make a later arm fail for another reason.
+    let mut signers = Vec::new();
+    for _ in 0..4 {
+        let signer = seed_bare_agent(&pool).await;
+        lineage_edge(&pool, signer, p1).await;
+        lineage_edge(&pool, signer, p2).await;
+        signers.push(signer);
+    }
+    let mut conn = pool.acquire().await.expect("acquire");
+    let refused = |r: Result<(), epigraph_db::DbError>| match r {
+        Ok(()) => false,
+        Err(e) => {
+            assert!(e.to_string().contains("more than one principal"), "{e}");
+            true
+        }
+    };
+
+    let mut landed = Vec::new();
+    let r = AgentRepository::link_operator(&mut conn, signers[0], operator).await;
+    if !refused(r.map(|_| ())) {
+        landed.push("link_operator(signer as agent)");
+    }
+    let r = AgentRepository::link_retired_agent(&mut conn, signers[1], operator).await;
+    if !refused(r.map(|_| ())) {
+        landed.push("link_retired_agent(signer as agent)");
+    }
+    let a = seed_bare_agent(&pool).await;
+    let r = AgentRepository::link_operator(&mut conn, a, signers[2]).await;
+    if !refused(r.map(|_| ())) {
+        landed.push("link_operator(signer as operator)");
+    }
+    let b = seed_bare_agent(&pool).await;
+    let r = AgentRepository::link_retired_agent(&mut conn, b, signers[3]).await;
+    if !refused(r.map(|_| ())) {
+        landed.push("link_retired_agent(signer as operator)");
+    }
+    assert!(
+        landed.is_empty(),
+        "a shared HTTP signer was linked: {landed:?}. Its operator would own every HTTP \
+         caller's claims, or every anonymous caller would be an operator"
+    );
+    let links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operator_links \
+          WHERE agent_id = ANY($1) OR operator_id = ANY($1)",
+    )
+    .bind(&signers)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(links, 0, "a refused link must write no record");
+
+    // CALIBRATION: one lineage edge is not the fingerprint.
+    let single = seed_bare_agent(&pool).await;
+    lineage_edge(&pool, single, p1).await;
+    let ok = AgentRepository::link_operator(&mut conn, single, operator)
+        .await
+        .expect("CALIBRATION: an agent with ONE lineage edge still links");
+    assert!(ok.link_live, "{ok:?}");
+    let op_single = seed_bare_agent(&pool).await;
+    lineage_edge(&pool, op_single, p2).await;
+    AgentRepository::link_retired_agent(&mut conn, seed_bare_agent(&pool).await, op_single)
+        .await
+        .expect("CALIBRATION: an operator with ONE lineage edge is still accepted");
+    assert!(
+        AgentRepository::operates_agents(&mut conn, op_single)
+            .await
+            .expect("operator-side read"),
+        "the operator-side read reports the link it just recorded"
+    );
+    assert!(
+        !AgentRepository::operates_agents(&mut conn, signers[2])
+            .await
+            .expect("operator-side read"),
+        "the refused signer operates nobody"
+    );
 }
 
 /// `link_live` reports what the authoring and ownership paths will actually
@@ -1330,10 +1456,18 @@ async fn an_operator_cannot_enrol_a_retired_identity_as_a_writer(pool: PgPool) {
         "INSERT arm: the operator enrolled a RETIRED identity as a writer in its group; a \
          retired key may be public",
     );
-    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
     as_reader.expect("a reader row grants no write and stays allowed");
     let err = promoted.expect_err("UPDATE arm: a retired identity's reader row was promoted");
-    assert_eq!(sqlstate(&err).as_deref(), Some(INSUFFICIENT_PRIVILEGE), "{err}");
+    assert_eq!(
+        sqlstate(&err).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{err}"
+    );
 
     assert_eq!(
         membership_rows(&pool, op_group, retired).await,

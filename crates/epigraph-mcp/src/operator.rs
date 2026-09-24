@@ -32,6 +32,11 @@
 //! call, so a link recorded after the listener started takes effect as a
 //! refusal at once rather than at the next restart.
 //!
+//! Both HTTP checks also refuse a signer that is anyone's OPERATOR
+//! (`AgentRepository::operates_agents`, migration 102 section 9): on
+//! `--allow-unauthenticated-http` every caller IS the signer, and would satisfy
+//! "caller is the operator of the claim's author" for every linked agent.
+//!
 //! Both HTTP checks read the AUTHOR record (`AgentRepository::operator_of_author`,
 //! retired links included), not the actor read. That is a REFUSAL-only use of
 //! "whose are this agent's claims?": an HTTP signer with any link record would
@@ -90,7 +95,8 @@ pub fn check_operator_transport(
 
 /// Refuse to serve HTTP when this process's signer agent already has an
 /// operator link of either kind (see the module doc for why the author record,
-/// retired links included, is the predicate).
+/// retired links included, is the predicate), or is itself some agent's
+/// OPERATOR (migration 102 section 9).
 ///
 /// Read-only: the signer is looked up by public key and NOT created, so a
 /// listener whose signer has never been registered passes without writing.
@@ -126,10 +132,21 @@ pub async fn refuse_operated_http_signer(
                  link (is migration 102 applied?): {e}"
             )
         })?;
-    match link {
-        None => Ok(()),
-        Some(link) => Err(linked_http_signer_reason(agent_id, &link)),
+    if let Some(link) = link {
+        return Err(linked_http_signer_reason(agent_id, &link));
     }
+    let operates = AgentRepository::operates_agents(&mut conn, agent_id)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not check whether this listener's signer agent {agent_id} is an operator \
+                 (is migration 102 applied?): {e}"
+            )
+        })?;
+    if operates {
+        return Err(operator_http_signer_reason(agent_id));
+    }
+    Ok(())
 }
 
 /// The refusal text shared by the startup gate and the per-call guard.
@@ -145,6 +162,16 @@ fn linked_http_signer_reason(agent_id: Uuid, link: &AuthorOperator) -> String {
          write with the operator's ownership. Run the listener under a different --agent-key; \
          the link record is permanent.",
         link.operator_id
+    )
+}
+
+/// The refusal text for a signer that is some agent's OPERATOR (102 section 9).
+fn operator_http_signer_reason(agent_id: Uuid) -> String {
+    format!(
+        "this HTTP listener's signer agent {agent_id} is the operator of linked agents. On an \
+         unauthenticated HTTP transport every caller IS the signer, and would own every claim \
+         those agents authored. Run the listener under a different --agent-key; the link \
+         records are permanent."
     )
 }
 
@@ -167,7 +194,7 @@ fn linked_http_signer_reason(agent_id: Uuid, link: &AuthorOperator) -> String {
 pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), McpError> {
     let agent_id = server.agent_id().await?;
     match AgentRepository::operator_of_author_pool(&server.pool, agent_id).await {
-        Ok(None) => Ok(()),
+        Ok(None) => refuse_operator_http_signer(server, agent_id).await,
         Ok(Some(link)) => {
             let reason = linked_http_signer_reason(agent_id, &link);
             tracing::error!(
@@ -187,6 +214,33 @@ pub async fn refuse_linked_http_signer(server: &EpiGraphMcpFull) -> Result<(), M
             Err(internal_error(format!(
                 "refused: could not verify that this HTTP listener's signer agent {agent_id} \
                  has no operator link: {e}"
+            )))
+        }
+    }
+}
+
+/// The operator half of [`refuse_linked_http_signer`]: refuse while this
+/// server's signer is anyone's OPERATOR (102 section 9). Fails closed.
+async fn refuse_operator_http_signer(
+    server: &EpiGraphMcpFull,
+    agent_id: Uuid,
+) -> Result<(), McpError> {
+    match AgentRepository::operates_agents_pool(&server.pool, agent_id).await {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            let reason = operator_http_signer_reason(agent_id);
+            tracing::error!(agent = %agent_id, "refusing an HTTP tool call: {reason}");
+            Err(internal_error(format!("refused: {reason}")))
+        }
+        Err(e) => {
+            tracing::error!(
+                agent = %agent_id,
+                error = %e,
+                "refusing an HTTP tool call: could not check whether the signer is an operator"
+            );
+            Err(internal_error(format!(
+                "refused: could not verify that this HTTP listener's signer agent {agent_id} \
+                 is no agent's operator: {e}"
             )))
         }
     }

@@ -1478,6 +1478,38 @@ impl AgentRepository {
         Self::operator_of_author(&mut conn, agent_id).await
     }
 
+    /// "Does any agent name `agent_id` as its operator?", through migration
+    /// 102's `epigraph_operates_agents` (retired links included).
+    ///
+    /// REFUSAL-ONLY (102 section 9): an HTTP listener must not serve as a
+    /// signer that is anyone's operator, because on an unauthenticated HTTP
+    /// transport every anonymous caller IS the signer, and would then satisfy
+    /// "caller is the operator of the claim's author". Never use it to GRANT.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails (e.g. a database without 102).
+    pub async fn operates_agents(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_operates_agents($1)")
+                .bind(agent_id)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// [`Self::operates_agents`] for a caller holding a pool.
+    ///
+    /// # Errors
+    /// As [`Self::operates_agents`], plus `DbError::ConnectionFailed` if no
+    /// connection can be acquired.
+    pub async fn operates_agents_pool(pool: &PgPool, agent_id: Uuid) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::operates_agents(&mut conn, agent_id).await
+    }
+
     /// Record that `agent_id` is operated by `operator_id`, through migration
     /// 102's `epigraph_link_operator`.
     ///

@@ -37,6 +37,7 @@ const SECRET: &[u8] = b"runtime-guard-test-secret-at-least-32-bytes!!";
 const ACCEPT: &str = "application/json, text/event-stream";
 const SESSION_HEADER: &str = "Mcp-Session-Id";
 const REFUSAL: &str = "has an operator link to";
+const OPERATOR_REFUSAL: &str = "is the operator of linked agents";
 
 fn token() -> String {
     let (token, _) = JwtConfig::from_secret(SECRET)
@@ -183,6 +184,8 @@ async fn call(client: &reqwest::Client, url: &str, token: &str, session: &str, i
 enum LinkKind {
     Acting,
     Retired,
+    /// The signer becomes some OTHER agent's operator (102 section 9).
+    Operator,
 }
 
 async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind: LinkKind) {
@@ -190,6 +193,7 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
     let seed = match kind {
         LinkKind::Acting => 0x71,
         LinkKind::Retired => 0x72,
+        LinkKind::Operator => 0x73,
     };
     let signer = AgentSigner::from_bytes(&[seed; 32]).expect("signer");
     let public_key = signer.public_key();
@@ -226,16 +230,47 @@ async fn a_link_recorded_after_startup_refuses_the_next_call(pool: PgPool, kind:
                 .await
                 .expect("retired link");
         }
+        LinkKind::Operator => {
+            let operated: Uuid = sqlx::query_scalar(
+                "INSERT INTO agents (id, public_key, agent_type) \
+                 VALUES (gen_random_uuid(), $1, 'system') RETURNING id",
+            )
+            .bind(vec![0x74u8; 32])
+            .fetch_one(&pool)
+            .await
+            .expect("an agent for the signer to operate");
+            epigraph_db::AgentRepository::link_retired_agent(&mut conn, operated, signer_agent)
+                .await
+                .expect("link an agent with the SIGNER as its operator");
+        }
     }
     drop(conn);
 
-    // 3. The next call on the same session is refused, naming the operator.
+    // 3. The next call on the same session is refused, naming why.
     let after = call(&client, &url, &token, &session, 3).await;
+    let refused = match kind {
+        LinkKind::Acting | LinkKind::Retired => {
+            after.contains(REFUSAL) && after.contains(&operator.to_string())
+        }
+        LinkKind::Operator => {
+            after.contains(OPERATOR_REFUSAL) && after.contains(&signer_agent.to_string())
+        }
+    };
     assert!(
-        after.contains(REFUSAL) && after.contains(&operator.to_string()),
-        "an HTTP listener kept serving after its signer was linked: every caller's claims \
-         would be authored into, or owned by, the operator's group until a restart:\n{after}"
+        refused,
+        "an HTTP listener kept serving after its signer was linked, or became an operator: \
+         every caller's claims would be authored into, or owned by, the operator's group (or, \
+         unauthenticated, every caller would own the linked agents' claims) until a \
+         restart:\n{after}"
     );
+}
+
+/// The signer becomes some other agent's OPERATOR after startup (102 section
+/// 9): on an unauthenticated transport every caller IS the signer, so the
+/// listener must refuse rather than hand every caller the operator arm.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_signer_that_becomes_an_operator_after_startup_refuses_the_next_http_call(pool: PgPool) {
+    a_link_recorded_after_startup_refuses_the_next_call(pool, LinkKind::Operator).await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]

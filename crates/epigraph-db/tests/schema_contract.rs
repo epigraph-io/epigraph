@@ -1194,6 +1194,12 @@ async fn migration_102_operator_definers_are_owned_and_granted(pool: PgPool) {
             true,
         ),
         (
+            "epigraph_operates_agents",
+            "public.epigraph_operates_agents(uuid)",
+            "s",
+            true,
+        ),
+        (
             "epigraph_link_operator",
             "public.epigraph_link_operator(uuid, uuid)",
             "v",

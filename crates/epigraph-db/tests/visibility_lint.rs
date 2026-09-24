@@ -955,6 +955,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "operates_agents",
+        "READ through migration 102's `epigraph_operates_agents` SECURITY DEFINER function; \
+         same reason as `operator_actor`. It returns one boolean for the NAMED agent (does any \
+         link name it as operator), used only to REFUSE an HTTP listener's signer.",
+    ),
+    (
+        "agent.rs",
         "link_operator",
         "WRITE through migration 102's `epigraph_link_operator` SECURITY DEFINER function, which \
          is EXECUTE-able by epigraph_maintenance only; the CONNECTION's privilege is the \

@@ -3,8 +3,8 @@
 -- human operator writes into that operator's personal group, and the operator
 -- (and the operator's other agents) own what it writes.
 --
--- One definer-only table (`operator_links`), four SECURITY DEFINER
--- functions (two writes, two reads), no change to any existing policy, and no
+-- One definer-only table (`operator_links`), five SECURITY DEFINER
+-- functions (two writes, three reads), no change to any existing policy, and no
 -- rows written by the migration itself.
 --
 -- ===================================================================
@@ -281,7 +281,8 @@
 -- HTTP signer already carries lineage edges, so that form needed a pre-deploy
 -- measurement of production signers. The record-based form does not.)
 --
--- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`,
+-- UNDO: `DROP FUNCTION IF EXISTS public.epigraph_operates_agents(uuid)`,
+-- `DROP FUNCTION IF EXISTS public.epigraph_link_operator(uuid, uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_link_retired_agent(uuid, uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_operator_actor(uuid)`,
 -- `DROP FUNCTION IF EXISTS public.epigraph_operator_of_author(uuid)` and
@@ -292,6 +293,25 @@
 -- (`UPDATE group_memberships SET revoked_at = now() ...`) ends one link
 -- without any DDL. **Applied to a throwaway database only, NOT to any deployed
 -- database.**
+--
+-- ===================================================================
+-- 9. A SHARED HTTP SIGNER IS NEVER LINKED AND NEVER AN OPERATOR
+--
+-- `record_auth_lineage` writes `signer --OPERATED_BY--> P` for every OAuth
+-- caller P of an HTTP listener, so the shared signer is the one agent that
+-- carries auth-lineage edges to MANY principals. Linking it (by operator error,
+-- e.g. its id in a link-retired agents file) would make the operator the owner
+-- of every HTTP caller's claims; making it an OPERATOR would, on
+-- `--allow-unauthenticated-http` (where every anonymous caller IS the signer),
+-- make every anonymous caller the operator of the linked agents' claims. Both
+-- link functions therefore refuse an agent, and an operator, whose outbound
+-- `OPERATED_BY` edges name MORE THAN ONE distinct principal. The threshold is
+-- deliberately not "any other principal": a false refusal in
+-- `epigraph_link_operator` is fatal at every stdio startup, and one lineage
+-- edge is not a shared-signer fingerprint. The HTTP guards in
+-- `epigraph_mcp::operator` additionally refuse to serve as a signer that is
+-- anyone's operator, through the refusal-only read
+-- `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`).
 -- ===================================================================
 
 -- The link record. See section 4.
@@ -357,6 +377,17 @@ SET search_path = public, pg_temp AS $$
        AND NOT l.retired
 $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) FROM PUBLIC;
+
+-- The OPERATOR-side read: "does any agent name this one as its operator?"
+-- Refusal-only (section 9): an HTTP listener must not serve as a signer that
+-- is someone's operator. Retired links included.
+CREATE OR REPLACE FUNCTION public.epigraph_operates_agents(p_agent uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT EXISTS (SELECT 1 FROM public.operator_links l WHERE l.operator_id = p_agent)
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operates_agents(uuid) FROM PUBLIC;
 
 -- The write. See sections 2 and 3. Returns one row describing what it did, so
 -- the caller can log the outcome rather than infer it.
@@ -424,6 +455,21 @@ BEGIN
         RAISE EXCEPTION 'epigraph_link_operator: agent % already has a link to operator %; '
                         'an agent is linked to one operator, and re-pointing it is an '
                         'out-of-band act', p_agent, v_other
+            USING ERRCODE = '55000';
+    END IF;
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9).
+    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+        RAISE EXCEPTION 'epigraph_link_operator: agent % carries OPERATED_BY auth-lineage edges to more '
+                        'than one principal, the fingerprint of a shared HTTP signer; '
+                        'refusing to link it', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+        RAISE EXCEPTION 'epigraph_link_operator: operator % carries OPERATED_BY auth-lineage edges to more '
+                        'than one principal, the fingerprint of a shared HTTP signer; '
+                        'refusing it as an operator', p_operator
             USING ERRCODE = '55000';
     END IF;
 
@@ -576,6 +622,21 @@ BEGIN
                         'out-of-band act', p_agent, v_other
             USING ERRCODE = '55000';
     END IF;
+    -- A SHARED SIGNER is neither linkable nor an operator (section 9).
+    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+         WHERE e.source_id = p_agent AND e.relationship = 'OPERATED_BY') > 1 THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: agent % carries OPERATED_BY auth-lineage edges to more '
+                        'than one principal, the fingerprint of a shared HTTP signer; '
+                        'refusing to link it', p_agent
+            USING ERRCODE = '55000';
+    END IF;
+    IF (SELECT count(DISTINCT e.target_id) FROM public.edges e
+         WHERE e.source_id = p_operator AND e.relationship = 'OPERATED_BY') > 1 THEN
+        RAISE EXCEPTION 'epigraph_link_retired_agent: operator % carries OPERATED_BY auth-lineage edges to more '
+                        'than one principal, the fingerprint of a shared HTTP signer; '
+                        'refusing it as an operator', p_operator
+            USING ERRCODE = '55000';
+    END IF;
 
     INSERT INTO public.groups (display_name, did_key, public_key, kind,
                                created_by_agent_id)
@@ -646,6 +707,8 @@ DO $$ BEGIN
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_operator_of_author(uuid) '
                 'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_operates_agents(uuid) '
+                'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_link_operator(uuid, uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_link_retired_agent(uuid, uuid) '
@@ -658,6 +721,8 @@ DO $$ BEGIN
                 'TO epigraph_maintenance';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) '
                 'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operates_agents(uuid) '
+                'TO epigraph_maintenance';
         EXECUTE 'GRANT SELECT, INSERT ON public.operator_links TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
@@ -668,6 +733,8 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_actor(uuid) '
                 'TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_of_author(uuid) '
+                'TO epigraph_app';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operates_agents(uuid) '
                 'TO epigraph_app';
         EXECUTE 'REVOKE ALL ON public.operator_links FROM epigraph_app';
         EXECUTE 'GRANT SELECT ON public.operator_links TO epigraph_app';

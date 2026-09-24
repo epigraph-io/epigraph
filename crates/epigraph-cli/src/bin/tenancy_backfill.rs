@@ -1015,6 +1015,7 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // is exactly what a green pre-flight must not hide.
     ("epigraph_operator_actor", 102),
     ("epigraph_operator_of_author", 102),
+    ("epigraph_operates_agents", 102),
     ("epigraph_link_operator", 102),
     ("epigraph_link_retired_agent", 102),
 ];
@@ -1202,7 +1203,10 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
 ///   quietly off — it is `42501` on every app-DSN claim write, an outage. 102
 ///   grants it inside `IF EXISTS (… 'epigraph_app')`, so a cluster where the app
 ///   role is provisioned AFTER 102 ran carries no grant, and the ownership check
-///   still passes green (review finding F8).
+///   still passes green (review finding F8). The third read,
+///   `epigraph_operates_agents`, is refusal-only, and the HTTP listener's guard
+///   calls it on every tool call and fails CLOSED, so a missing grant there
+///   refuses every HTTP call: the same class of outage.
 /// * the two LINK functions (`epigraph_link_operator`,
 ///   `epigraph_link_retired_agent`) must NOT be. A grant there lets the request
 ///   DSN record operator links, which is the whole of 102's trust basis.
@@ -1221,6 +1225,11 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_operator_of_author",
             "public.epigraph_operator_of_author(uuid)",
+            true,
+        ),
+        (
+            "epigraph_operates_agents",
+            "public.epigraph_operates_agents(uuid)",
             true,
         ),
         (

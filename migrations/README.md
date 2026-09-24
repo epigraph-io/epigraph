@@ -256,9 +256,15 @@ Current reservation:
   membership, so a retired identity whose key may be exposed gains zero write
   authority while the operator owns its claims; `epigraph_link_operator` never
   promotes a retired row. The link is recorded once: the membership is inserted only
-  when the roster holds no row of any state for the pair, with `ON CONFLICT DO
-  NOTHING`, so a revoked link is never revived (the #493 shape
-  `epigraph_ensure_personal_group` has is deliberately not reused). The table
+  by the call that recorded the `operator_links` row (plus a no-history check
+  and `ON CONFLICT DO NOTHING`), so a revoked link is never revived, not even
+  after its revoked row is erased (the #493 shape
+  `epigraph_ensure_personal_group` has is deliberately not reused). Both link
+  functions refuse a SHARED HTTP SIGNER (an agent or operator whose outbound
+  `OPERATED_BY` auth-lineage edges name more than one principal), and a third
+  refusal-only read, `epigraph_operates_agents(agent)` (EXECUTE: `epigraph_app`),
+  lets the HTTP listeners refuse to serve as a signer that is anyone's
+  operator (102 section 9). The table
   is registered with the FORCE ratchets (`FORCE_PROTECTED_SET`,
   `rls_enforcement.rs::PROTECTED`, `locked_decisions.rs::OPERATOR_TABLES`,
   `docs/runbooks/079-undo.sql`). Pinned by

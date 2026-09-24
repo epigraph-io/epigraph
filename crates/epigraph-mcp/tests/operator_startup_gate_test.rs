@@ -277,6 +277,35 @@ async fn an_http_listener_refuses_a_signer_that_already_has_an_operator_link(poo
              own every caller's claims.\n{stderr}"
         ),
     }
+
+    // A signer that is some agent's OPERATOR refuses too (102 section 9): on an
+    // unauthenticated transport every caller IS the signer, and would own every
+    // claim the linked agent authored.
+    let (operator_signer, operator_key) = register_signer(&pool, 0x66).await;
+    let (operated, _) = register_signer(&pool, 0x67).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_retired_agent(&mut conn, operated, operator_signer)
+        .await
+        .expect("record a link naming the signer as operator");
+    drop(conn);
+    let url = db_url.clone();
+    match tokio::task::spawn_blocking(move || spawn_listener(&url, &operator_key))
+        .await
+        .expect("join")
+    {
+        Outcome::Exited { code, stderr } => {
+            assert_ne!(code, Some(0), "the refusal must be a failing exit");
+            assert!(
+                stderr.contains("is the operator of linked agents")
+                    && stderr.contains(&operator_signer.to_string()),
+                "stderr must say the signer is an operator; got:\n{stderr}"
+            );
+        }
+        Outcome::Serving { stderr } => panic!(
+            "an HTTP listener whose signer is an OPERATOR started serving: an unauthenticated \
+             caller would own the linked agents' claims.\n{stderr}"
+        ),
+    }
 }
 
 /// Spawn a STDIO process with a derived identity and `--operator-id`, and wait
