@@ -361,20 +361,36 @@ async fn preflight(pool: &PgPool) -> anyhow::Result<()> {
 /// operation over ~1,198 rows. The `did_key` shape
 /// (`did:epigraph:personal:<agent uuid>`) is the contract between the two, and
 /// it is what migration 071's shim looks the group up by — so a drift here is a
-/// drift there. Both statements are the same `ON CONFLICT` targets the repo
-/// function uses, and for the same reasons: `groups_did_key_key` for the group,
-/// and the composite `(group_id, agent_id, epoch)` for the membership, which
-/// REVIVES a revoked row rather than silently no-opping.
+/// drift there. The membership half follows the function's contract since
+/// migration 105: a membership is inserted only for an author with NO row of
+/// any state in its personal group, and a REVOKED row is left revoked and
+/// counted, never revived — see the note on the membership statement.
 async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Result<()> {
     // The early-return gate covers BOTH statements below, so it must measure
-    // both: an author with no personal group AND an author whose membership in
-    // its own personal group is missing or revoked. Keying it on the group
-    // alone made the membership repair conditional on unrelated state.
+    // both: an author with no personal group AND an author with no membership
+    // row of ANY state in it. Keying it on the group alone made the membership
+    // repair conditional on unrelated state. An author whose rows are all
+    // REVOKED is not "needing repair": that is an operator's decision, counted
+    // and reported below, and this binary does not reverse it.
     let needing_repair: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM (
             SELECT DISTINCT c.agent_id FROM claims c
              WHERE {pg} IS NULL
                 OR NOT EXISTS (SELECT 1 FROM group_memberships m
+                                WHERE m.group_id = {pg}
+                                  AND m.agent_id = c.agent_id)
+         ) q",
+        pg = personal_group_sql("c.agent_id")
+    ))
+    .fetch_one(pool)
+    .await?;
+    let left_revoked: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM (
+            SELECT DISTINCT c.agent_id FROM claims c
+             WHERE {pg} IS NOT NULL
+               AND EXISTS (SELECT 1 FROM group_memberships m
+                            WHERE m.group_id = {pg} AND m.agent_id = c.agent_id)
+               AND NOT EXISTS (SELECT 1 FROM group_memberships m
                                 WHERE m.group_id = {pg}
                                   AND m.agent_id = c.agent_id
                                   AND m.revoked_at IS NULL)
@@ -383,6 +399,13 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     ))
     .fetch_one(pool)
     .await?;
+    if left_revoked > 0 {
+        tracing::warn!(
+            authors = left_revoked,
+            "claim author(s) hold only REVOKED membership(s) of their personal group; left \
+             revoked (reversing a revocation is an operator action, not a backfill side effect)"
+        );
+    }
 
     if needing_repair == 0 {
         tracing::info!(
@@ -419,23 +442,23 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
     .await?;
 
     // ==================================================================
-    // SCOPED TO AGENTS WITH NO LIVE MEMBERSHIP — NOT TO EVERY CLAIM AUTHOR.
+    // SCOPED TO AGENTS WITH NO MEMBERSHIP ROW OF ANY STATE.
     //
     // An earlier revision selected every agent that has ever authored a claim
-    // and `DO UPDATE SET revoked_at = NULL, role = 'admin'`. That is a
-    // privilege-RESTORING side effect over the whole agent population: a
-    // deliberately revoked or deliberately demoted personal-group membership
-    // was silently returned to live admin by a run of the backfill, and whether
-    // it happened at all depended on the `missing == 0` early return above —
-    // i.e. on whether some entirely unrelated agent lacked a group.
+    // and `DO UPDATE SET revoked_at = NULL, role = 'admin'`, a
+    // privilege-RESTORING side effect over the whole agent population. A later
+    // one narrowed it to agents with no LIVE membership and dropped the `role`
+    // write, so a demotion survived — but it still ended in `DO UPDATE SET
+    // revoked_at = NULL`, so a deliberately REVOKED membership was revived by a
+    // run of the backfill.
     //
-    // The `NOT EXISTS` below narrows it to the set this phase is actually for:
-    // an agent with NO live membership in its own personal group. Reviving THAT
-    // is `ensure_personal_group`'s documented semantics and the reason its own
-    // ON CONFLICT targets the composite — an untargeted DO NOTHING no-ops
-    // against a revoked row and leaves the agent locked out of its own group
-    // permanently. `role` is no longer written on conflict, so an existing
-    // deliberate demotion survives.
+    // Batch F aligns this copy with migration 105's contract for
+    // `epigraph_ensure_personal_group`: insert only where the agent holds NO
+    // row of any state in its personal group, and `DO NOTHING` on conflict. A
+    // revoked-only author is left revoked and counted in the WARN above; its
+    // claims are still stamped to the group (the group row exists), which is
+    // who owns them — only the author's own membership stays as the operator
+    // left it.
     // ==================================================================
     sqlx::query(&format!(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
@@ -445,10 +468,8 @@ async fn materialize_personal_groups(pool: &PgPool, dry_run: bool) -> anyhow::Re
             AND {pg} IS NOT NULL
             AND NOT EXISTS (SELECT 1 FROM group_memberships m
                              WHERE m.group_id = {pg}
-                               AND m.agent_id = a.id
-                               AND m.revoked_at IS NULL)
-         ON CONFLICT (group_id, agent_id, epoch)
-         DO UPDATE SET revoked_at = NULL",
+                               AND m.agent_id = a.id)
+         ON CONFLICT DO NOTHING",
         pg = personal_group_sql("a.id")
     ))
     .execute(&mut *tx)

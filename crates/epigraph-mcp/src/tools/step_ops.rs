@@ -58,7 +58,11 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
     match e {
         E::Invalid(msg) | E::WorkflowNotFound(msg) => invalid_params(msg),
         E::StepNotFound { .. } | E::PhaseMissing => invalid_params(e.to_string()),
-        E::Db(_) | E::Repo(_) | E::Executor(_) => internal_error(e.to_string()),
+        // Migration 105's personal-group refusal (the step claim's owner
+        // declaration): a denial, as on every other write tool.
+        E::Repo(db) if db.is_personal_group_refusal() => crate::errors::db_caller_error(db),
+        E::Executor(x) => crate::errors::executor_caller_error("executor error", x),
+        E::Db(_) | E::Repo(_) => internal_error(e.to_string()),
     }
 }
 

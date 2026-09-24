@@ -547,12 +547,14 @@ impl IngestTx<'_> {
     ///
     /// # Why not `ClaimRepository::default_decl_for_author`
     ///
-    /// That helper is read-first-then-MINT: when the personal group is not
-    /// visible it calls `ensure_personal_group`, whose `ON CONFLICT … DO UPDATE
-    /// SET revoked_at = NULL, role = 'admin'` revives a revoked admin
-    /// membership (hard constraint #3). On a transaction stamped from the
-    /// author, "not visible" means exactly "no LIVE membership of it" — the
-    /// case where minting is a privilege change, not provisioning.
+    /// That helper resolves through `ensure_personal_group`, which on migration
+    /// 077's body revived a revoked admin membership (`ON CONFLICT … DO UPDATE
+    /// SET revoked_at = NULL, role = 'admin'`, hard constraint #3). Migration
+    /// 105 makes it refuse instead, but this arm stays a PURE READ: on a
+    /// transaction stamped from the author, "not visible" already means "no
+    /// LIVE membership", and a read-only check can refuse with the
+    /// operator-facing reason without spending the function's RAISE on an
+    /// ingest transaction.
     ///
     /// `begin_author_stamped_tx` only proves the author has SOME writable
     /// group, and "some writable group is not the same question"
@@ -570,9 +572,12 @@ impl IngestTx<'_> {
     ///   the exact question migration 077's `WITH CHECK` will ask of every row;
     ///   a live `reader` membership fails it; refuse.
     ///
-    /// The Privileged arm (the operator CLI on `MaintenancePool`, BYPASSRLS) is
-    /// unchanged: there is no stamp to reason about, its reads are not blind,
-    /// and it is an operator acting on purpose.
+    /// The Privileged arm (the operator CLI on `MaintenancePool`, BYPASSRLS)
+    /// calls `default_decl_for_author`: there is no stamp to reason about. Since
+    /// batch F that helper no longer reads the group on the caller's connection
+    /// first, so an operator ingest authored by an agent whose personal
+    /// membership is REVOKED is refused (`DbError::MembershipRevoked`) instead
+    /// of being owned by the group the agent was revoked from.
     async fn owner_decl(
         &mut self,
         agent_id: Uuid,
@@ -582,7 +587,7 @@ impl IngestTx<'_> {
             Self::Privileged(tx) => {
                 return ClaimRepository::default_decl_for_author(tx, agent_id)
                     .await
-                    .map_err(internal_error);
+                    .map_err(crate::errors::db_caller_error);
             }
             Self::Stamped(tx) => tx,
         };
@@ -602,9 +607,9 @@ impl IngestTx<'_> {
         else {
             return Err(refuse(format!(
                 "the ingesting agent ({agent_id}) holds no LIVE membership of its personal group, \
-                 which owns every row this ingest would write. Refusing rather than provisioning \
-                 it: the provisioning call revives a revoked membership as admin, and reversing \
-                 a revocation is an operator decision. Nothing was written"
+                 which owns every row this ingest would write. Refusing: if the membership was \
+                 revoked, restoring it is an operator decision, and nothing on this path will \
+                 restore it. Nothing was written"
             )));
         };
         let writable =

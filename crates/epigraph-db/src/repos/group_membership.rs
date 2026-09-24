@@ -196,11 +196,13 @@ impl GroupMembershipRepository {
     /// `groups`, then `group_key_epochs`, and the `FOR UPDATE` above does NOT
     /// change it: it is on `group_memberships`, the table this transaction
     /// already took first. That is why it was preferred to locking the
-    /// `groups` row instead — no site in this codebase takes a `groups` row
-    /// lock, and introducing one here would invert the order against
-    /// `CommunityRepository::remove_member`, which holds a `group_memberships`
-    /// row while it writes `groups` for the SAME id (the community projection
-    /// is id-preserving). `GroupKeyEpochRepository::rotate_conn` takes the same
+    /// `groups` row instead — taking one here FIRST would invert the order
+    /// against `CommunityRepository::remove_member`, which holds the
+    /// `group_memberships` roster while it writes `groups` for the SAME id (the
+    /// community projection is id-preserving). Since batch F that function's
+    /// definer (`epigraph_community_remove_member`, migration 106) and its
+    /// `add_member` twin DO take a `groups` row lock, but only AFTER the same
+    /// roster lock, so the order is unchanged. `GroupKeyEpochRepository::rotate_conn` takes the same
     /// two it needs in the same relative order — roster first, epoch row
     /// second — for exactly this reason: the reverse would let a rotation
     /// holding the epoch row wait on a removal holding the roster while the
@@ -574,14 +576,15 @@ impl GroupMembershipRepository {
     ///
     /// # The discriminator a provisioning mint must consult first
     ///
-    /// `epigraph_ensure_personal_group`'s membership statement is `ON CONFLICT
+    /// Migration 077's `epigraph_ensure_personal_group` ended in `ON CONFLICT
     /// (group_id, agent_id, epoch) DO UPDATE SET revoked_at = NULL, role =
-    /// 'admin'`: called for an agent that already holds a revoked row in its
-    /// personal group, it REVIVES that admin membership. So "this agent cannot
-    /// see its personal group" does not on its own license a mint — "never
+    /// 'admin'`: called for an agent that already held a revoked row in its
+    /// personal group, it REVIVED that admin membership. So "this agent cannot
+    /// see its personal group" did not on its own license a mint — "never
     /// provisioned" and "deliberately revoked" both look like that — and this
-    /// count is what tells them apart: `0` means there is no revoked row a mint
-    /// could revive. (A live `reader` row is the other thing the same
+    /// count is what tells them apart: `0` means there is no revoked row. Since
+    /// migration 105 the function refuses a revoked row itself; this read is
+    /// how a caller learns WHY before it asks. (A live `reader` row is the other thing the same
     /// `DO UPDATE` would silently change; it is live, so the personal group is
     /// visible to a stamped caller and never reaches the mint branch at all.)
     ///

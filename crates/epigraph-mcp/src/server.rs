@@ -123,6 +123,78 @@ impl EpiGraphMcpFull {
     }
 }
 
+/// Builds the per-session servers of ONE HTTP listener, all sharing ONE
+/// resolution of the server's own `agents.id`.
+///
+/// # Why this exists (backlog F1, `da432f25`)
+///
+/// rmcp's streamable-HTTP transport calls its factory closure once per SESSION,
+/// and `main` used to build each session's server with
+/// [`EpiGraphMcpFull::new_shared_with_federation`], which gives every server a
+/// fresh, EMPTY `agent_db_id` cell. So [`EpiGraphMcpFull::agent_id`]'s
+/// resolution — which ends in PR-09's `ensure_personal_group` call on the
+/// UNSTAMPED pool — ran once per session, not once per process. On the old
+/// migration-077 function that call is `ON CONFLICT … DO UPDATE SET revoked_at
+/// = NULL, role = 'admin'`, so every new HTTP session re-opened any revocation
+/// an operator had made of the server agent's personal membership. MEASURED on
+/// the real binary as `epigraph_app` (`scripts/e2e/probe-unit-e.sh`,
+/// PERSONAL-REVOKED fresh-session arm): `personal:admin(revoked)` came back
+/// `(live)` and the first `ingest_document_inline` of the new session committed
+/// +4 claims under it.
+///
+/// # The choice: resolve once per process, rather than discriminate per session
+///
+/// The alternative the backlog names is to apply the
+/// `system_agent_write_authority` discriminator (a stamped read of the agent's
+/// own rows) inside `agent_id()` on every session. That keeps one provisioning
+/// attempt per session and makes each one safe. Sharing the cell removes the
+/// attempts instead: the per-session servers are clones of one template, and
+/// `EpiGraphMcpFull` is `Clone` over `Arc`s, so the clone SHARES `agent_db_id`.
+/// MEASURED (`pg_stat_user_functions.calls` for `epigraph_ensure_personal_group`,
+/// real binary as `epigraph_app`, `--allow-unauthenticated-http`, boot plus three
+/// sequential sessions each calling one tool): 4 calls with a fresh cell per
+/// session (the boot probe plus one per session), 1 call with the shared cell. A per-session write on what is, for every tool, a read
+/// path is the thing removed. The one remaining per-process call cannot revive
+/// a revocation made before the process started either: since migration 105
+/// the provisioning function refuses a revoked row instead of restoring it.
+///
+/// # What is per-session, and stays so
+///
+/// Only `seen_auth_lineage`, the `OPERATED_BY` memo, whose doc makes it
+/// per-session; [`Self::session`] resets it. Everything else a session server
+/// holds is either immutable configuration or an `Arc` the old constructor
+/// already shared (`signer`, `embedder`, `federation`, the `ScopedPool`).
+///
+/// # A cost, stated
+///
+/// `agent_id()` holds the cell's mutex across its database awaits. Sharing the
+/// cell means that, until the FIRST resolution succeeds, concurrent sessions
+/// queue on one mutex rather than each resolving on its own. After it succeeds
+/// the lock is a cache read. `auth::UnauthenticatedPrincipal`'s cooldown already
+/// bounds the unauthenticated listener's retry rate during an outage.
+#[derive(Clone)]
+pub struct SessionFactory {
+    template: EpiGraphMcpFull,
+}
+
+impl SessionFactory {
+    /// Wrap a fully configured server (scoped pool, signer-identity flag and
+    /// policy gate already applied) as the template every session clones.
+    #[must_use]
+    pub fn new(template: EpiGraphMcpFull) -> Self {
+        Self { template }
+    }
+
+    /// A server for one new session: a clone of the template that SHARES its
+    /// `agent_db_id` cell and starts with an empty `OPERATED_BY` memo.
+    #[must_use]
+    pub fn session(&self) -> EpiGraphMcpFull {
+        let mut srv = self.template.clone();
+        srv.seen_auth_lineage = Arc::new(Mutex::new(HashSet::new()));
+        srv
+    }
+}
+
 /// Lets `auth::UnauthenticatedPrincipal` re-attempt the resolution on a later
 /// request instead of treating a boot-time failure as final.
 ///
@@ -167,19 +239,21 @@ impl EpiGraphMcpFull {
     ///    `--read-only` server performs these writes on its first tool call.
     ///    That is pre-existing in kind (the `agents` insert) and widened in
     ///    degree here.
-    /// 2. **It is an authority restoration, not just provisioning.**
-    ///    `ensure_personal_group`'s membership insert is
-    ///    `ON CONFLICT (group_id, agent_id, epoch) DO UPDATE SET revoked_at =
-    ///    NULL, role = 'admin'`, so an operator who revoked this membership sees
-    ///    it revived, at admin role, on the next process boot. The reviving form
-    ///    is used rather than a second `DO NOTHING` variant because `repos/agent.rs`
-    ///    documents at length why `DO NOTHING` was wrong (a pre-existing revoked
-    ///    epoch-0 row makes the insert a permanent silent no-op, leaving the
-    ///    agent with no live membership forever), and because this is exactly
-    ///    what every API principal already gets on every `oauth/token.rs` mint.
-    ///    One provisioning path, one behaviour.
-    /// 3. **It fails closed.** A failure warns and leaves the agent with an
-    ///    empty group set, i.e. a viewer that reads public rows only.
+    /// 2. **It provisions; it does not restore.** It used to be an authority
+    ///    restoration: migration 077's `epigraph_ensure_personal_group` ended in
+    ///    `ON CONFLICT … DO UPDATE SET revoked_at = NULL, role = 'admin'`, so an
+    ///    operator who revoked this membership saw it revived, at admin, on the
+    ///    next process boot — and, before `SessionFactory`, on every new HTTP
+    ///    session. Since migration 105 a revoked membership makes the call
+    ///    REFUSE (`DbError::MembershipRevoked`), a live one is returned with its
+    ///    role untouched, and only an agent with no row at all is provisioned.
+    ///    The refusal takes arm 3 below: the id still resolves (it is the
+    ///    process's identity, not an authority grant), and the revocation
+    ///    stands.
+    /// 3. **It fails closed.** A failure — the refusal included — warns and
+    ///    leaves the agent with whatever live groups it has, which for a revoked
+    ///    personal membership means no personal group: its writes are refused
+    ///    by the ingest preflight and the author-stamped transaction.
     pub(crate) async fn agent_id(&self) -> Result<uuid::Uuid, McpError> {
         let mut cached = self.agent_db_id.lock().await;
         if let Some(id) = *cached {
@@ -227,9 +301,14 @@ impl EpiGraphMcpFull {
 
         // PR-09: the server agent needs a personal group, or the viewer it
         // resolves to has an empty group set and reads public rows only. See
-        // the doc comment above. Idempotent (`ON CONFLICT (did_key)`), so the
-        // found branch pays one cheap upsert per process, not per call — this
-        // runs once and is then served from `cached`.
+        // the doc comment above. Migration 105's contract: a LIVE membership
+        // reads and writes nothing (role kept); a REVOKED one is refused with
+        // `DbError::MembershipRevoked` (RVK01) and a group squatting the
+        // agent's did_key with `PersonalGroupNotOwned` (RVK02), each logged
+        // below as a warning, never restored; only an agent with no row of
+        // any state is provisioned. It runs once per PROCESS: every session
+        // shares this cell (`SessionFactory`), and later calls are served
+        // from `cached`.
         match self.pool.acquire().await {
             Ok(mut conn) => {
                 if let Err(e) =
@@ -237,9 +316,10 @@ impl EpiGraphMcpFull {
                 {
                     tracing::warn!(
                         agent_id = %id,
-                        error = ?e,
-                        "failed to ensure the server agent's personal group; its viewer will \
-                         resolve to an empty group set and read public rows only"
+                        error = %e,
+                        "did not provision the server agent's personal group (a revoked \
+                         membership is refused, never restored); its viewer resolves to its \
+                         remaining live groups only"
                     );
                 }
             }
@@ -692,7 +772,7 @@ impl EpiGraphMcpFull {
     // ── Claims (11 tools) ──
 
     #[tool(
-        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite."
+        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
     )]
     async fn submit_claim(
         &self,
@@ -973,7 +1053,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
     )]
     async fn memorize(
         &self,
@@ -1479,7 +1559,7 @@ impl EpiGraphMcpFull {
     // ── Batch / Staging / Stats (3 tools) ──
 
     #[tool(
-        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence."
+        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence. Entries are submitted one at a time, exactly as submit_claim, and reported individually (submitted, errors, error_details); a refused entry writes nothing. If an operator has revoked this server's agent's personal-group membership, every entry is refused that way. The membership is never restored; restoring it is an operator action."
     )]
     async fn batch_submit_claims(
         &self,
@@ -1584,7 +1664,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write) writes nothing. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is owned by a group this server's agent cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief."
     )]
     async fn submit_ds_evidence(
         &self,
@@ -2303,5 +2383,74 @@ mod policy_gate_wiring_tests {
              AppState::with_policy_gate; removing it would make the gate \
              unswappable"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_factory_tests {
+    //! F1 (`da432f25`): every HTTP session of one listener shares ONE
+    //! resolution of the server agent, so `agent_id()`'s provisioning call runs
+    //! once per process, not once per session.
+    //!
+    //! `epigraph-mcp/tests/per_session_agent_resolution.rs` cannot pin this
+    //! any more. Since migration 105 the provisioning function refuses a
+    //! revoked row by itself, so that file's revoked-server arm also passes
+    //! with a fresh cell per session. The batch F review measured this: 3
+    //! passed with `SessionFactory::session` giving each session a new cell.
+    //! What the shared cell still buys is the removal of the per-session
+    //! write, and only this pin can see that.
+    //!
+    //! No database: the pool is lazy and points at a port nothing listens on,
+    //! so any session that tried to resolve through the database would ERROR
+    //! instead of answering.
+    use super::*;
+
+    fn unreachable_template() -> EpiGraphMcpFull {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+            .expect("a lazy pool never connects at construction");
+        let signer = Arc::new(AgentSigner::from_bytes(&[0x5Eu8; 32]).expect("signer"));
+        let embedder = Arc::new(McpEmbedder::new(pool.clone(), None));
+        EpiGraphMcpFull::new_shared_with_federation(
+            pool,
+            signer,
+            embedder,
+            false,
+            crate::federation::SharedFederation::empty(),
+            None,
+        )
+    }
+
+    /// Structural: two sessions of one factory hold the SAME cell.
+    #[tokio::test]
+    async fn sessions_of_one_factory_share_the_agent_cell() {
+        let sessions = SessionFactory::new(unreachable_template());
+        let (a, b) = (sessions.session(), sessions.session());
+        assert!(
+            Arc::ptr_eq(&a.agent_db_id, &b.agent_db_id),
+            "every session must share the template's agent_db_id cell"
+        );
+        assert!(
+            !Arc::ptr_eq(&a.seen_auth_lineage, &b.seen_auth_lineage),
+            "the OPERATED_BY memo is per-session by contract"
+        );
+    }
+
+    /// Behavioural: once one session has resolved the agent, a NEW session
+    /// answers `agent_id()` from the shared cell without touching the
+    /// database. A fresh cell would try the unreachable pool and error.
+    #[tokio::test]
+    async fn a_new_session_answers_from_the_resolved_cell_without_the_database() {
+        let sessions = SessionFactory::new(unreachable_template());
+        let resolved = uuid::Uuid::new_v4();
+        *sessions.session().agent_db_id.lock().await = Some(resolved);
+
+        let fresh = sessions.session();
+        let got = fresh
+            .agent_id()
+            .await
+            .expect("a new session must not re-resolve through the database");
+        assert_eq!(got, resolved);
     }
 }

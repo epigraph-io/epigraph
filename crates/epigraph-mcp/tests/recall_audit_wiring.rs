@@ -16,13 +16,20 @@ use epigraph_mcp::types::RecallParams;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
+/// A server WITH a `ScopedPool`, the shape `main` builds on both transports.
+///
+/// Required, not incidental: the audit owner is now read on a transaction
+/// stamped from the request principal's own viewer, never minted on the
+/// unstamped pool (#493, `tools/recall.rs::recall_audit_owner_group`). A server
+/// with no `ScopedPool` has no such transaction and DROPS the audit row.
+async fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_crypto::AgentSigner;
     use epigraph_mcp::embed::McpEmbedder;
     use epigraph_mcp::EpiGraphMcpFull;
+    let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false)
+    EpiGraphMcpFull::new(pool, signer, embedder, /*read_only=*/ false).with_scoped_pool(scoped)
 }
 
 /// A viewer for a REAL principal — an agent row with a personal group.
@@ -94,7 +101,7 @@ async fn recall_logs_the_claim_ids_it_returned(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let hit = seed_claim(&pool, agent, "wextonium audit fixture").await;
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall(&server, &viewer, params("wextonium"))
         .await
         .expect("recall ok");
@@ -153,7 +160,7 @@ async fn recall_survives_a_failing_audit_write(pool: PgPool) {
         .await
         .expect("drop");
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall(&server, &viewer, params("brentalix"))
         .await
         .expect("recall must succeed even when the audit log is unwritable");
@@ -198,7 +205,7 @@ async fn since_is_recorded_in_recall_audit_params(pool: PgPool) {
         .unwrap()
         .to_rfc3339();
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let mut p = params("quorbiline");
     p.since = Some(since.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
     recall(&server, &viewer, p).await.expect("recall ok");
@@ -331,7 +338,7 @@ async fn since_is_recorded_in_recall_with_context_audit_params(pool: PgPool) {
     // call takes the PAGE path rather than the empty early return.
     seed_paragraph(&pool, agent, "quorbiline context window fixture", &pgvec).await;
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall_with_context_with_pgvec(
         &server,
         &viewer,
@@ -385,7 +392,7 @@ async fn since_is_recorded_on_the_empty_recall_with_context_audit_row(pool: PgPo
         .await
         .expect("backdate");
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let out = recall_with_context_with_pgvec(
         &server,
         &viewer,
@@ -456,7 +463,7 @@ async fn recall_audit_row_is_owned_by_the_request_principal_not_the_process(pool
         .expect("resolve the request principal");
     let hit = seed_claim(&pool, principal, "zelmaraq principal fixture").await;
 
-    let server = build_test_server(pool.clone());
+    let server = build_test_server(pool.clone()).await;
     let process_agent = server
         .server_agent_id()
         .await
@@ -517,4 +524,55 @@ async fn recall_audit_row_is_owned_by_the_request_principal_not_the_process(pool
         "over-suppression is silent and permanent: the author must still read its own row"
     );
     let _ = hit;
+}
+
+/// The audit row is written on the principal-stamped transaction, NOT on the
+/// server's unstamped pool (batch F review, #493-adjacent).
+///
+/// `recall_events_tenancy`'s WITH CHECK admits an `epigraph_app` insert only
+/// when `agent_id = epigraph_principal_id()`, so on the unstamped pool every
+/// audit row was refused. The e2e harness measured zero rows on both configs.
+/// This server's `pool` is `SET SESSION AUTHORIZATION epigraph_app` and
+/// UNSTAMPED, the production shape of that pool. Its `ScopedPool` cannot be
+/// downgraded in-process (`viewer_fixture::downgraded_pool`'s header says why),
+/// so the arm pins WHICH connection writes the row: on the unstamped app pool
+/// the insert is refused and no row appears.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_audit_row_is_not_written_on_the_unstamped_pool(pool: PgPool) {
+    use epigraph_crypto::AgentSigner;
+    use epigraph_mcp::embed::McpEmbedder;
+    use epigraph_mcp::EpiGraphMcpFull;
+    let viewer = principal_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    seed_claim(&pool, agent, "quorvantine audit fixture").await;
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let scoped = fixture::scoped_pool(&pool).await;
+    let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(app.clone(), None);
+    let server = EpiGraphMcpFull::new(app, signer, embedder, false).with_scoped_pool(scoped);
+
+    recall(&server, &viewer, params("quorvantine"))
+        .await
+        .expect("recall ok");
+
+    let mut logged = 0i64;
+    for _ in 0..100 {
+        logged = sqlx::query_scalar(
+            "SELECT count(*) FROM recall_events WHERE query_text = 'quorvantine' AND agent_id = $1",
+        )
+        .bind(viewer.principal())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if logged > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    assert_eq!(
+        logged, 1,
+        "the audit row must be written on the principal-stamped transaction; on the unstamped \
+         epigraph_app pool recall_events_tenancy refuses it"
+    );
 }

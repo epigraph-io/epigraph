@@ -333,9 +333,7 @@ pub async fn store_workflow(
     let result =
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("workflow ingest: {e}"),
-            })?;
+            .map_err(workflow_ingest_error)?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -1570,9 +1568,7 @@ pub async fn ingest_workflow(
     let result =
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("workflow ingest: {e}"),
-            })?;
+            .map_err(workflow_ingest_error)?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -1861,8 +1857,31 @@ pub struct DeleteStepRequest {
     pub step_lineage_id: Uuid,
 }
 
+/// Map a workflow-ingest executor error. Migration 105's personal-group
+/// refusals (`DbError::is_personal_group_refusal`), carried as
+/// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
+/// detail logged and kept out of the body. Everything else stays a 500.
+///
+/// On these routes `system_agent_write_authority` refuses a revoked system
+/// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
+/// this arm is what a revocation racing that preflight would surface.
+#[cfg(feature = "db")]
+fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> ApiError {
+    match e {
+        epigraph_ingest_executor::IngestExecutorError::Repository(db)
+            if db.is_personal_group_refusal() =>
+        {
+            ApiError::from(db)
+        }
+        other => ApiError::InternalError {
+            message: format!("workflow ingest: {other}"),
+        },
+    }
+}
+
 /// Map executor's StepOpError to ApiError. WorkflowNotFound + StepNotFound
-/// are 404; Invalid is 400; Db/Executor are 500.
+/// are 404; Invalid is 400; migration 105's personal-group refusal is 403;
+/// Db/Executor are otherwise 500.
 #[cfg(feature = "db")]
 fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
     use epigraph_ingest_executor::StepOpError as E;
@@ -1879,6 +1898,12 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
             message: "workflow has no level-1 phase claim".into(),
         },
         E::Invalid(msg) => ApiError::BadRequest { message: msg },
+        E::Repo(db) if db.is_personal_group_refusal() => ApiError::from(db),
+        E::Executor(epigraph_ingest_executor::IngestExecutorError::Repository(db))
+            if db.is_personal_group_refusal() =>
+        {
+            ApiError::from(db)
+        }
         E::Db(e) => ApiError::InternalError {
             message: format!("db: {e}"),
         },
@@ -2460,5 +2485,36 @@ mod tests {
             found,
             "expected to find the seeded canonical_name in results"
         );
+    }
+
+    /// Migration 105's personal-group refusal, wrapped by the executor, is a
+    /// 403 on the workflow-ingest and step routes; every other executor failure
+    /// stays a 500 (batch F review).
+    #[test]
+    fn a_personal_group_refusal_from_the_executor_is_a_403() {
+        use epigraph_ingest_executor::{IngestExecutorError as X, StepOpError as S};
+        let revoked = || epigraph_db::DbError::MembershipRevoked {
+            message: "agent a holds only REVOKED membership(s) of its personal group g".into(),
+        };
+        assert!(matches!(
+            workflow_ingest_error(X::Repository(revoked())),
+            ApiError::Forbidden { .. }
+        ));
+        assert!(matches!(
+            workflow_ingest_error(X::AgentCreation("preflight".into())),
+            ApiError::InternalError { .. }
+        ));
+        assert!(matches!(
+            map_step_err(S::Repo(revoked())),
+            ApiError::Forbidden { .. }
+        ));
+        assert!(matches!(
+            map_step_err(S::Executor(X::Repository(revoked()))),
+            ApiError::Forbidden { .. }
+        ));
+        assert!(matches!(
+            map_step_err(S::Executor(X::AgentCreation("preflight".into()))),
+            ApiError::InternalError { .. }
+        ));
     }
 }

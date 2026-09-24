@@ -80,7 +80,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         crate::claim_helper::begin_system_ingest_stamped_tx(server, "workflow_ingest").await?;
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, extraction)
         .await
-        .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
+        .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
     tx.commit()
         .await
         .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
@@ -256,7 +256,7 @@ pub async fn do_ingest_workflow_via_pool(
             extraction,
         )
         .await
-        .map_err(|e| internal_error(format!("workflow ingest: {e}")))?;
+        .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
         unstamped_tx
             .commit()
             .await
