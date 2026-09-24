@@ -9,13 +9,14 @@
 //!
 //! Exit codes: 0 success; 1 refused or failed before writing; 2 a batch
 //! violated an invariant and was rolled back (under `--apply` the run stops
-//! there); 3 `link-retired` refused at least one id.
+//! there); 3 `link-retired` refused at least one id, or `reown-reverse` HELD at
+//! least one claim (it is not fully restored).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> [--apply]
 //!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
-//!     epigraph-operator reown-reverse --manifest reown-1.jsonl [--apply]
+//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
 //!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f]
 
@@ -95,10 +96,12 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Restore every row a manifest names to the owner it recorded.
+    /// Restore every row a manifest's run moved to the owner it recorded.
     ReownReverse {
-        #[arg(long)]
-        manifest: PathBuf,
+        /// A manifest to reverse. Repeatable: several are applied newest-first
+        /// by their header `created_at`, whatever order they are given in.
+        #[arg(long, required = true)]
+        manifest: Vec<PathBuf>,
         #[arg(long)]
         apply: bool,
         #[arg(long, default_value_t = 200)]
@@ -203,16 +206,18 @@ async fn main_inner() -> anyhow::Result<i32> {
             lock_timeout,
         } => {
             let opts = reverse::Options {
-                manifest,
+                manifests: manifest,
                 apply,
                 batch_size,
                 lock_timeout,
             };
             let report = reverse::run(&mut conn, &opts, &mut stdout).await?;
-            Ok(if report.batch_failures.is_empty() {
-                0
-            } else {
+            Ok(if !report.batch_failures.is_empty() {
                 2
+            } else if !report.held.is_empty() {
+                3
+            } else {
+                0
             })
         }
     }

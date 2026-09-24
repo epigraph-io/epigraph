@@ -471,6 +471,8 @@ pub fn records_for(claims: &[ClaimRow], attached: &Snapshot, specs: &[TableSpec]
             co_owner_group_id: None,
             claim_id: c.id,
             hidden: false,
+            after: false,
+            neighbour: false,
         });
     }
     for a in attached.values() {
@@ -483,6 +485,77 @@ pub fn records_for(claims: &[ClaimRow], attached: &Snapshot, specs: &[TableSpec]
             co_owner_group_id: (spec.kind == Kind::Edges).then_some(a.tenancy.co_owner),
             claim_id: a.claim,
             hidden: false,
+            after: false,
+            neighbour: false,
+        });
+    }
+    out
+}
+
+/// Every claim a checked row hangs off that this batch did NOT move: the
+/// fragment's other provenance claims, the edge's other claim endpoint, and a
+/// claim of the batch itself that was held.
+fn neighbours_of(s0: &Snapshot, moved: &BTreeSet<Uuid>) -> Vec<Uuid> {
+    let mut out = BTreeSet::new();
+    for a in s0.values() {
+        for c in a.claims.iter().chain(a.neighbours.iter()) {
+            if !moved.contains(c) {
+                out.insert(*c);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// POST-state records for a batch that is about to commit: every moved claim,
+/// every row the batch checked (in the state the batch left it in), and every
+/// NEIGHBOUR claim's current state (see `manifest`'s module doc).
+fn post_records_for(
+    claims: &[ClaimRow],
+    s0: &Snapshot,
+    s2: &BTreeMap<RowKey, Tenancy>,
+    neighbours: &[ClaimRow],
+    specs: &[TableSpec],
+) -> Vec<Record> {
+    let mut out = Vec::with_capacity(claims.len() + s2.len() + neighbours.len());
+    for n in neighbours {
+        out.push(Record {
+            table: "claims".into(),
+            id: json!(n.id.to_string()),
+            owner_group_id: n.owner,
+            visibility: n.visibility.clone(),
+            co_owner_group_id: None,
+            claim_id: n.id,
+            hidden: false,
+            after: true,
+            neighbour: true,
+        });
+    }
+    for c in claims {
+        out.push(Record {
+            table: "claims".into(),
+            id: json!(c.id.to_string()),
+            owner_group_id: c.owner,
+            visibility: c.visibility.clone(),
+            co_owner_group_id: None,
+            claim_id: c.id,
+            hidden: false,
+            after: true,
+            neighbour: false,
+        });
+    }
+    for (k, t) in s2 {
+        let spec = spec_of(specs, &k.0);
+        out.push(Record {
+            table: k.0.clone(),
+            id: spec.id_json(&k.1),
+            owner_group_id: t.owner,
+            visibility: t.visibility.clone(),
+            co_owner_group_id: (spec.kind == Kind::Edges).then_some(t.co_owner),
+            claim_id: s0.get(k).map_or(Uuid::nil(), |a| a.claim),
+            hidden: false,
+            after: true,
+            neighbour: false,
         });
     }
     out
@@ -805,6 +878,17 @@ pub async fn run_batch(
     if !v.is_empty() {
         return Err(BatchError::Invariant(v));
     }
+    // The post-state, fsynced under the batch's locks BEFORE the caller
+    // commits: what reversal compares against (see `manifest`).
+    let moved_ids: BTreeSet<Uuid> = claim_ids.iter().copied().collect();
+    let neighbour_rows = fetch_claims(conn, &neighbours_of(&s0, &moved_ids), false).await?;
+    sink.record_post(&post_records_for(
+        &after_claims,
+        &s0,
+        &s2,
+        &neighbour_rows,
+        ctx.specs,
+    ))?;
     out.claims_moved = claim_ids.len();
     out.moved_by_table = actual;
     out.post_claims = after_claims
@@ -1030,7 +1114,7 @@ pub async fn run(
     let mut sink = if opts.apply {
         let header = json!({
             "manifest": "epigraph-operator reown-claims",
-            "version": 1,
+            "version": super::manifest::VERSION,
             "operator": opts.operator,
             "target_group_id": target,
             "derived": opts.mode.as_str(),
@@ -1135,7 +1219,9 @@ pub async fn run(
     if report.batch_failures.is_empty() && opts.apply && report.claims_moved < plan.eligible.len() {
         writeln!(
             out,
-            "NOTE: {} planned claim(s) were held under the lock; re-run to retry them",
+            "NOTE: {} planned claim(s) were held under the lock. To retry them, re-run with a \
+             NEW --manifest-out. To undo, pass EVERY manifest to one reown-reverse (it applies \
+             them newest first); a manifest reversed on its own HOLDS any row a newer run moved",
             plan.eligible.len() - report.claims_moved
         )?;
     }

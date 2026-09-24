@@ -912,6 +912,12 @@ async fn the_manifest_records_each_rows_own_prior_owner(pool: PgPool) {
     assert_eq!(cf["id"]["frame_id"], fx.frame.to_string());
     for v in &lines[1..] {
         assert_ne!(v["table"], "recall_events");
+        if v["neighbour"] == true {
+            // A NEIGHBOUR record observes the state of a claim that shares a
+            // row with a moved one; it moves nothing and restores nothing.
+            assert_eq!(v["after"], true, "{v}");
+            continue;
+        }
         for held in [fx.c_third, fx.c_unlinked, fx.c_private] {
             assert_ne!(
                 v["claim_id"],
@@ -1411,6 +1417,204 @@ async fn a_row_this_run_moved_in_an_earlier_batch_is_not_a_false_hold(pool: PgPo
         &before,
         &snapshot(&pool, true).await,
         "reverse after two batches",
+    );
+}
+
+async fn reverse_many(pool: &PgPool, manifests: &[&std::path::Path], apply: bool) -> Run {
+    let mut args = vec!["reown-reverse", "--batch-size", "2"];
+    for m in manifests {
+        args.push("--manifest");
+        args.push(m.to_str().unwrap());
+    }
+    if apply {
+        args.push("--apply");
+    }
+    run_op(pool, &args).await
+}
+
+async fn manifests_in_one_reverse_restore_byte_for_byte(pool: PgPool, oldest_first_argv: bool) {
+    let dir = scratch_dir();
+    let (fx, _e) = shared_rows_fixture(&pool).await;
+    let before = snapshot(&pool, true).await;
+    let m1 = dir.join("m1.jsonl");
+    let m2 = dir.join("m2.jsonl");
+    let r = reown_ids(
+        &pool,
+        &fx,
+        &ids_file(&dir, "a.txt", &[fx.c_world]),
+        &m1,
+        &[],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let r = reown_ids(
+        &pool,
+        &fx,
+        &ids_file(&dir, "b.txt", &[fx.c_personal]),
+        &m2,
+        &[],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let argv: [&std::path::Path; 2] = if oldest_first_argv {
+        [&m1, &m2]
+    } else {
+        [&m2, &m1]
+    };
+    let r = reverse_many(&pool, &argv, true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(!r.stdout.contains("HELD\t"), "{}", r.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "two manifests reversed in one invocation",
+    );
+}
+
+/// Both manifests in ONE `reown-reverse`, given OLDEST first on the command
+/// line: the tool orders them newest-first by header `created_at`, so the
+/// shared rows come back byte-for-byte (review finding: in that order, as two
+/// invocations, the fragment ended on the target and the edge on world, where
+/// both had been on the retired author's group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_manifests_in_one_reverse_restore_when_given_oldest_first(pool: PgPool) {
+    manifests_in_one_reverse_restore_byte_for_byte(pool, true).await;
+}
+
+/// The same, given newest first.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_manifests_in_one_reverse_restore_when_given_newest_first(pool: PgPool) {
+    manifests_in_one_reverse_restore_byte_for_byte(pool, false).await;
+}
+
+/// Reversing the OLDER manifest on its own, while a newer run's changes to
+/// shared rows stand, HOLDS instead of restoring stale state: exit 3, the hold
+/// names the cause, and nothing at all is written. Then the right order (M2,
+/// then M1, as two invocations) restores everything byte-for-byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reversing_an_older_manifest_alone_holds_and_writes_nothing(pool: PgPool) {
+    let dir = scratch_dir();
+    let (fx, _e) = shared_rows_fixture(&pool).await;
+    let before = snapshot(&pool, true).await;
+    let m1 = dir.join("m1.jsonl");
+    let m2 = dir.join("m2.jsonl");
+    assert_eq!(
+        reown_ids(
+            &pool,
+            &fx,
+            &ids_file(&dir, "a.txt", &[fx.c_world]),
+            &m1,
+            &[]
+        )
+        .await
+        .code,
+        0
+    );
+    assert_eq!(
+        reown_ids(
+            &pool,
+            &fx,
+            &ids_file(&dir, "b.txt", &[fx.c_personal]),
+            &m2,
+            &[]
+        )
+        .await
+        .code,
+        0
+    );
+    let moved = snapshot(&pool, false).await;
+
+    let r = reverse(&pool, &m1, true).await;
+    assert_eq!(
+        r.code,
+        3,
+        "reversing M1 alone must HOLD, not restore rows a newer run moved: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains(&format!("HELD\t{}\t", fx.c_world))
+            && r.stdout.contains("reverse that manifest first"),
+        "{}",
+        r.show()
+    );
+    assert_same(
+        &moved,
+        &snapshot(&pool, false).await,
+        "a held reversal writes nothing, not even updated_at",
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_world).await,
+        public(fx.target)
+    );
+
+    for m in [&m2, &m1] {
+        let r = reverse(&pool, m, true).await;
+        assert_eq!(r.code, 0, "{}", r.show());
+    }
+    assert_same(&before, &snapshot(&pool, true).await, "M2 then M1");
+}
+
+/// A STOPPED run and its resume (review probe P6). Batch 2 of run 1 times out on
+/// a held `FOR KEY SHARE`, so M1's plan records BOTH claims while only
+/// `c_world` moved; the resume moves `c_personal` into M2. M1 reversed alone
+/// must neither touch `c_personal` (M1 never moved it) nor restore `c_world`
+/// over the resumed run's shared rows; both manifests in one invocation, in
+/// either argv order, restore byte-for-byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stopped_run_and_its_resume_reverse_safely(pool: PgPool) {
+    let (fx, _e) = shared_rows_fixture(&pool).await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, true).await;
+    let cf = ids_file(&dir, "ab.txt", &[fx.c_world, fx.c_personal]);
+    let m1 = dir.join("m1.jsonl");
+    let m2 = dir.join("m2.jsonl");
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR KEY SHARE")
+        .bind(fx.c_personal)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let r = reown_ids(&pool, &fx, &cf, &m1, &["--lock-timeout", "500ms"]).await;
+    holder.rollback().await.unwrap();
+    assert_eq!(r.code, 2, "PREMISE: run 1 stops at batch 2: {}", r.show());
+    let text = std::fs::read_to_string(&m1).unwrap();
+    let priors = text
+        .lines()
+        .filter(|l| l.contains("\"table\":\"claims\"") && !l.contains("\"after\""))
+        .count();
+    let posts = text
+        .lines()
+        .filter(|l| {
+            l.contains("\"table\":\"claims\"")
+                && l.contains("\"after\"")
+                && !l.contains("\"neighbour\"")
+        })
+        .count();
+    assert_eq!(
+        (priors, posts),
+        (2, 1),
+        "PREMISE: M1's plan records both claims, and its post records only the one it moved"
+    );
+    let r = reown_ids(&pool, &fx, &cf, &m2, &[]).await;
+    assert_eq!(r.code, 0, "the resume: {}", r.show());
+    let moved = snapshot(&pool, false).await;
+
+    let r = reverse(&pool, &m1, true).await;
+    assert_eq!(r.code, 3, "{}", r.show());
+    assert!(
+        r.stdout
+            .contains("claims planned but never moved by their run (untouched): 1"),
+        "{}",
+        r.show()
+    );
+    assert_same(&moved, &snapshot(&pool, false).await, "M1 alone");
+
+    let r = reverse_many(&pool, &[&m1, &m2], true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "M1 + M2 in one reverse",
     );
 }
 

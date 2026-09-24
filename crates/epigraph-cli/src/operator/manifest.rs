@@ -16,17 +16,49 @@
 //! through. `co_owner_group_id` is present on `edges` records only, the one
 //! table that carries it.
 //!
-//! Each record holds THAT ROW's own prior tenancy. Reversal restores every row
-//! to its own record, never by re-propagating its claim's prior owner: a
-//! derived row whose owner differed from its claim's before the re-own gets its
-//! own owner back.
+//! Each PRIOR record holds THAT ROW's own tenancy before the re-own. Reversal
+//! restores every row to its own record, never by re-propagating its claim's
+//! prior owner: a derived row whose owner differed from its claim's before the
+//! re-own gets its own owner back.
+//!
+//! # Post-state records (version 2)
+//!
+//! A record carrying `"after": true` is the state a COMMITTED batch left that
+//! row (or claim) in. Each batch appends one for every claim it moved and
+//! every row it checked, under its locks and `fsync`ed BEFORE its commit. A
+//! row shared by several batches gets one per batch; the LAST one is the state
+//! this run left it in. If the commit then fails, the post records describe a
+//! state that never happened, and the rows are still at their prior records,
+//! which reversal treats as "nothing to undo".
+//!
+//! A post record carrying `"neighbour": true` is the `(owner, visibility)` of a
+//! NEIGHBOUR claim at that batch: a claim the batch did NOT move that shares a
+//! checked row (a fragment's other provenance claim, an edge's other claim
+//! endpoint, or a claim of the batch that was held) with one it did.
+//!
+//! Reversal uses them as a COMPARE-AND-SWAP (`reverse.rs`). A claim is reversed
+//! only if it HAS a post record (so a claim the plan recorded but no batch
+//! moved is never touched), only while it is still in that post state, only
+//! while each recorded row is in its post or prior state, and only while every
+//! recorded NEIGHBOUR of its rows is still in the state recorded here. The
+//! neighbour test is the one that makes reversal order-safe. Review measured
+//! two manifests M1, M2 whose runs shared rows, reversed oldest-first,
+//! silently leaving those rows on neither their original owner nor anything
+//! the operator chose; the rows' own post states could not tell the two runs
+//! apart (a public–public edge is `(world, public)` after either, and the
+//! shared fragment was already on the target before M2 ran). What does tell
+//! them apart is that M2 moved a claim M1 recorded as a neighbour. So M1
+//! reversed on its own HOLDS, and `reown-reverse` applies several manifests
+//! newest-first by header `created_at`.
 //!
 //! # Durability
 //!
 //! The file is opened `create_new`, so a re-run can never truncate the record
-//! of a run that already wrote (a resumed run takes a new path; the claims the
-//! first run moved are skipped, so each manifest records only what its own run
-//! moved). Every append is flushed and `fsync`ed, and the directory is
+//! of a run that already wrote: a resumed or repeated run takes a NEW path.
+//! The plan's prior records are written before the first batch and cover every
+//! PLANNED claim, including claims a batch then held or never reached, so a
+//! manifest's prior records are NOT a list of what its run moved; its post
+//! records are. Every append is flushed and `fsync`ed, and the directory is
 //! `fsync`ed after creation, BEFORE the write the records describe.
 
 use anyhow::{anyhow, bail, Context};
@@ -37,7 +69,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// One row's prior tenancy.
+/// The manifest format version this build writes and reads.
+pub const VERSION: i64 = 2;
+
+/// One row's prior tenancy, or (with `after`) its post-batch tenancy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub table: String,
@@ -50,6 +85,11 @@ pub struct Record {
     /// The row was HIDDEN by this run (evidence only): reversal restores its
     /// visibility too, and removes its pin.
     pub hidden: bool,
+    /// A POST-state record (see the module doc), not a prior one.
+    pub after: bool,
+    /// With `after`: a NEIGHBOUR claim's state — a claim this batch did not
+    /// move that shares a row with one it did (see the module doc).
+    pub neighbour: bool,
 }
 
 impl Record {
@@ -67,6 +107,12 @@ impl Record {
         }
         if self.hidden {
             v["hidden"] = json!(true);
+        }
+        if self.after {
+            v["after"] = json!(true);
+        }
+        if self.neighbour {
+            v["neighbour"] = json!(true);
         }
         v
     }
@@ -99,6 +145,8 @@ impl Record {
             co_owner_group_id,
             claim_id: u("claim_id")?,
             hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false),
+            after: v.get("after").and_then(Value::as_bool).unwrap_or(false),
+            neighbour: v.get("neighbour").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -136,7 +184,19 @@ impl Sink {
         }
     }
 
-    /// Total rows recorded.
+    /// Record POST-state records, every one: never de-duplicated, because a
+    /// row a later batch changes again needs its later state too.
+    ///
+    /// # Errors
+    /// A write or `fsync` fails.
+    pub fn record_post(&mut self, recs: &[Record]) -> anyhow::Result<usize> {
+        match self {
+            Sink::File(w) => w.append_post(recs),
+            Sink::Memory(..) => Ok(recs.len()),
+        }
+    }
+
+    /// Total prior rows recorded.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -228,6 +288,23 @@ impl Writer {
     }
 }
 
+impl Writer {
+    /// Append POST-state records unconditionally, then flush and `fsync`.
+    ///
+    /// # Errors
+    /// A write or `fsync` fails.
+    pub fn append_post(&mut self, recs: &[Record]) -> anyhow::Result<usize> {
+        for r in recs {
+            debug_assert!(r.after);
+            self.write_line(&r.to_json())?;
+        }
+        if !recs.is_empty() {
+            self.sync()?;
+        }
+        Ok(recs.len())
+    }
+}
+
 /// A manifest read back: its header and its row records, in file order.
 pub struct Manifest {
     pub header: Value,
@@ -276,6 +353,8 @@ mod tests {
             co_owner_group_id: Some(None),
             claim_id: Uuid::nil(),
             hidden: false,
+            after: false,
+            neighbour: false,
         };
         let j = edge.to_json();
         assert!(j.get("co_owner_group_id").is_some_and(Value::is_null));
@@ -305,6 +384,8 @@ mod tests {
             co_owner_group_id: None,
             claim_id: Uuid::nil(),
             hidden: false,
+            after: false,
+            neighbour: false,
         };
         assert_eq!(w.append(&[r.clone(), r.clone()]).unwrap(), 1);
         assert_eq!(w.append(&[r]).unwrap(), 0);

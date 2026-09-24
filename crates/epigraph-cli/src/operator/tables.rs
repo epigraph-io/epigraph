@@ -362,6 +362,10 @@ pub struct Attached {
     /// Fragments only: the fragment is also the provenance of a claim outside
     /// the set being moved.
     pub shared_outside: bool,
+    /// Fragments and edges: the OTHER claims (outside the queried set) the row
+    /// also hangs off — the fragment's other provenance claims, the edge's
+    /// other claim endpoint.
+    pub neighbours: BTreeSet<Uuid>,
     /// Evidence only: `evidence_type`, `labels` and the first 80 characters of
     /// `raw_content`, for the hide selectors and their preview.
     pub evidence_type: Option<String>,
@@ -414,6 +418,7 @@ fn insert_min(out: &mut Snapshot, mut row: Attached) {
     match out.get_mut(&key) {
         Some(existing) => {
             existing.claims.insert(row.claim);
+            existing.neighbours.extend(row.neighbours);
             if row.claim < existing.claim {
                 existing.claim = row.claim;
             }
@@ -471,6 +476,7 @@ pub async fn fetch_attached(
                             writer: r.get(4),
                             endpoints_public: None,
                             shared_outside: false,
+                            neighbours: BTreeSet::new(),
                             evidence_type: r.get(5),
                             labels: r.get(6),
                             preview: r.get(7),
@@ -481,14 +487,15 @@ pub async fn fetch_attached(
             Kind::Fragments => {
                 let sql = format!(
                     "SELECT {pk}, p.claim_id, f.owner_group_id, f.visibility::text, \
-                            EXISTS (SELECT 1 FROM harvester_claim_provenance p2 \
-                                     WHERE p2.fragment_id = f.id AND p2.claim_id <> ALL($1)) \
+                            ARRAY(SELECT p2.claim_id FROM harvester_claim_provenance p2 \
+                                   WHERE p2.fragment_id = f.id AND p2.claim_id <> ALL($1)) \
                        FROM harvester_fragments f \
                        JOIN harvester_claim_provenance p ON p.fragment_id = f.id \
                       WHERE p.claim_id = ANY($1)",
                     pk = s.pk_expr("f")
                 );
                 for r in sqlx::query(&sql).bind(claims).fetch_all(&mut *conn).await? {
+                    let others: Vec<Uuid> = r.get(4);
                     insert_min(
                         &mut out,
                         Attached {
@@ -503,7 +510,8 @@ pub async fn fetch_attached(
                             },
                             writer: None,
                             endpoints_public: None,
-                            shared_outside: r.get(4),
+                            shared_outside: !others.is_empty(),
+                            neighbours: others.into_iter().collect(),
                             evidence_type: None,
                             labels: Vec::new(),
                             preview: None,
@@ -515,7 +523,12 @@ pub async fn fetch_attached(
                 let sql = format!(
                     "SELECT {pk}, c.cid, \
                             e.owner_group_id, e.visibility::text, e.co_owner_group_id, \
-                            e.\"{EDGE_WRITER}\", (s.v = 'public' AND tt.v = 'public') \
+                            e.\"{EDGE_WRITER}\", (s.v = 'public' AND tt.v = 'public'), \
+                            array_remove(ARRAY[ \
+                              CASE WHEN e.source_type = 'claim' AND e.source_id <> ALL($1) \
+                                   THEN e.source_id END, \
+                              CASE WHEN e.target_type = 'claim' AND e.target_id <> ALL($1) \
+                                   THEN e.target_id END], NULL) \
                        FROM edges e \
                        CROSS JOIN LATERAL (VALUES \
                             (CASE WHEN e.source_type = 'claim' THEN e.source_id END), \
@@ -528,6 +541,7 @@ pub async fn fetch_attached(
                     pk = s.pk_expr("e")
                 );
                 for r in sqlx::query(&sql).bind(claims).fetch_all(&mut *conn).await? {
+                    let others: Vec<Uuid> = r.get(7);
                     insert_min(
                         &mut out,
                         Attached {
@@ -543,6 +557,7 @@ pub async fn fetch_attached(
                             writer: r.get(5),
                             endpoints_public: Some(r.get(6)),
                             shared_outside: false,
+                            neighbours: others.into_iter().collect(),
                             evidence_type: None,
                             labels: Vec::new(),
                             preview: None,

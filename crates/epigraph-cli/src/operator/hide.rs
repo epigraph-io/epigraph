@@ -477,6 +477,7 @@ mod tests {
             writer: None,
             endpoints_public: None,
             shared_outside: false,
+            neighbours: BTreeSet::new(),
             evidence_type: Some(t.into()),
             labels: labels.iter().map(|s| (*s).to_string()).collect(),
             preview: Some("line one\nline two".into()),
