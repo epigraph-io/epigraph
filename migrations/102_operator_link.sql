@@ -80,7 +80,9 @@
 --     group yet), and the link would then have enrolled the agent as a writer
 --     in Z's group. Every in-tree personal-group writer (077's
 --     `epigraph_ensure_personal_group`, 071's shim, `tenancy_backfill`) stamps
---     the agent itself as creator, so this refuses nothing legitimate.
+--     the agent itself as creator, so this refuses nothing legitimate. Since
+--     migration 103 section 3 the squat itself is refused at INSERT; this
+--     check remains for a squat that predates it.
 --   * the `operator_links` row is keyed on the agent and inserted
 --     `ON CONFLICT (agent_id) DO NOTHING`. An agent has at most one operator,
 --     ever: a row naming a DIFFERENT operator is refused rather than replaced,

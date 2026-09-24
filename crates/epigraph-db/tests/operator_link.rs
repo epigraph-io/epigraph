@@ -749,43 +749,112 @@ async fn operator_links_refuses_an_app_insert_by_policy_and_by_grant(pool: PgPoo
     assert_eq!(rows, 0);
 }
 
-/// Personal-group squatting (review attack 2f): a group that merely CARRIES an
-/// operator's `did:epigraph:personal:<operator>` key, created by someone else,
-/// is not the operator's group.
+/// Personal-group squatting (review attack 2f, and stage-2 atk2): a group that
+/// merely CARRIES an operator's `did:epigraph:personal:<operator>` key, created
+/// by someone else, is not the operator's group.
 ///
-/// Principal `Z`, on `epigraph_app` stamped as itself, pre-creates
-/// `did:epigraph:personal:D` for an operator `D` that has no personal group yet
-/// (`groups_tenancy`'s creator WITH CHECK admits it — asserted as the premise).
-/// Linking an agent to `D` must then REFUSE, rather than enrol the agent as a
-/// writer in `Z`'s group. The second arm is defense in depth for the read: a
-/// link record pointing at a squatted group (written here on the superuser
-/// harness, since no in-tree path can) still reads as no link.
+/// * ARM A (migration 103 section 3) — principal `Z`, on `epigraph_app`
+///   stamped as itself, can no longer pre-create `did:epigraph:personal:D` for
+///   an operator `D` that has no personal group yet, as `kind='personal'` OR as
+///   `kind='team'` (`GroupRepository::create_with_admin` takes a caller-supplied
+///   did_key). Before 103's insert guard the personal arm returned `INSERT 0 1`
+///   and the squat blocked `D` permanently (`groups_block_delete`, section 2's
+///   immutability). CALIBRATION in the same shape: `Z` creates a `team` group
+///   with a non-personal key, and a fresh `W` creates its OWN canonical
+///   personal group — both accepted.
+/// * ARM B — defense in depth for a squat that exists anyway (written here on
+///   the superuser harness, e.g. from before 103): linking an agent to `D` must
+///   REFUSE rather than enrol it as a writer in `Z`'s group, and a link record
+///   pointing at the squatted group still reads as no link.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_squatted_personal_group_is_not_the_operators(pool: PgPool) {
     assert_app_role_is_not_bypassing(&pool).await;
     let (z, _) = fixture::seed_agent_with_group(&pool, "squatter").await;
     let d = seed_bare_agent(&pool).await;
     let e = seed_bare_agent(&pool).await;
+    // A second not-yet-grouped operator for the team-kind arm, so the two arms
+    // cannot collide on `groups_did_key_key` and each stands on its own.
+    let d_team = seed_bare_agent(&pool).await;
+    let w = seed_bare_agent(&pool).await;
     let z_viewer = Viewer::resolve(&pool, z).await.expect("resolve Z");
+    let w_viewer = Viewer::resolve(&pool, w).await.expect("resolve W");
 
-    let squat = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        set_gucs_from(&mut conn, &z_viewer).await;
-        let r = sqlx::query_scalar::<_, Uuid>(
+    // ARM A.
+    let (as_personal, as_team, calibration_team) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            set_gucs_from(&mut conn, &z_viewer).await;
+            let insert = "INSERT INTO groups \
+                            (display_name, did_key, public_key, kind, created_by_agent_id) \
+                          VALUES ('squat', $1, $2, $3, $4)";
+            let as_personal = sqlx::query(insert)
+                .bind(format!("did:epigraph:personal:{d}"))
+                .bind(Vec::<u8>::new())
+                .bind("personal")
+                .bind(z)
+                .execute(&mut *conn)
+                .await;
+            let as_team = sqlx::query(insert)
+                .bind(format!("did:epigraph:personal:{d_team}"))
+                .bind(vec![7u8; 32])
+                .bind("team")
+                .bind(z)
+                .execute(&mut *conn)
+                .await;
+            let calibration_team = sqlx::query(insert)
+                .bind(format!("did:epigraph:test:team:{z}"))
+                .bind(vec![7u8; 32])
+                .bind("team")
+                .bind(z)
+                .execute(&mut *conn)
+                .await;
+            (conn, (as_personal, as_team, calibration_team))
+        })
+        .await;
+    calibration_team.expect("CALIBRATION: Z can still create an ordinary team group");
+    let squats: Vec<(&str, Result<_, sqlx::Error>)> =
+        vec![("kind=personal", as_personal), ("kind=team", as_team)];
+    let landed: Vec<&str> = squats
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(arm, _)| *arm)
+        .collect();
+    assert!(
+        landed.is_empty(),
+        "ARM A: an app session squatted another agent's personal did_key as {landed:?}"
+    );
+    for (arm, r) in squats {
+        let err = r.expect_err("checked above");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "{arm}: {err}"
+        );
+    }
+    let own = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        set_gucs_from(&mut conn, &w_viewer).await;
+        let r = sqlx::query(
             "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
-             VALUES ('squat', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $2) \
-             RETURNING id",
+             VALUES ('own', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $1)",
         )
-        .bind(d)
-        .bind(z)
-        .fetch_one(&mut *conn)
+        .bind(w)
+        .execute(&mut *conn)
         .await;
         (conn, r)
     })
     .await;
-    let squatted = squat.expect(
-        "PREMISE: an app session can pre-create a group carrying another agent's personal \
-         did_key; if it cannot, this test no longer replays the attack",
-    );
+    own.expect("CALIBRATION: an agent can create its OWN canonical personal group");
+
+    // ARM B: a squat that exists anyway, on the superuser harness.
+    let squatted: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('squat', 'did:epigraph:personal:' || $1::text, ''::bytea, 'personal', $2) \
+         RETURNING id",
+    )
+    .bind(d)
+    .bind(z)
+    .fetch_one(&pool)
+    .await
+    .expect("a pre-existing squat, written on the superuser harness");
 
     let mut conn = pool.acquire().await.expect("acquire");
     let err = AgentRepository::link_operator(&mut conn, e, d)

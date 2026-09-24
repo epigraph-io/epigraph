@@ -281,7 +281,13 @@ Current reservation:
   pre-existing 077 hole that 102 made reachable: `groups_tenancy`'s WITH CHECK
   let any member rewrite a group's creator to itself, and 092's creator arm
   then made an operated `writer` admin-equivalent in its operator's group.
-  Behaviour in
+  A second invoker trigger, `groups_personal_identity_names_creator`
+  (`BEFORE INSERT`), raises `42501` outside the same bypasses for any row in the
+  personal did namespace or of `kind='personal'` unless it is
+  `kind='personal'` with `did_key = 'did:epigraph:personal:' || created_by_agent_id`:
+  review showed any principal could squat a not-yet-grouped operator's personal
+  did (as `personal` or, through `create_with_admin`, as `team`) and block every
+  link to that operator permanently. Behaviour in
   `epigraph-db/tests/operator_link.rs::an_operated_writer_cannot_rewrite_its_operator_groups_identity`.
   Like 100–102 it sits inside internal's `060–112`. **No undo runbook ships**:
   undo is the `DROP TRIGGER` / `DROP FUNCTION` pair named in the file. Checked

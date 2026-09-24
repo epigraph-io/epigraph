@@ -2,8 +2,8 @@
 -- A group's IDENTITY columns -- `created_by_agent_id`, `did_key`, `kind` --
 -- cannot be changed by an application session.
 --
--- One invoker trigger function and one BEFORE UPDATE trigger on `groups`. No
--- table, no policy change, no rows written.
+-- Two invoker trigger functions, a BEFORE UPDATE and a BEFORE INSERT trigger
+-- on `groups`. No table, no policy change, no rows written.
 --
 -- ===================================================================
 -- 1. THE HOLE (pre-existing since 077; 102 is the first path that exposes it)
@@ -62,11 +62,39 @@
 -- caller sees a permission failure, not a generic check violation.
 --
 -- ===================================================================
--- 3. UNDO
+-- 3. A PERSONAL IDENTITY NAMES ITS CREATOR FROM THE FIRST INSERT
+--
+-- Immutability after insert is only half of it. `groups_tenancy`'s WITH CHECK
+-- only asks that the NEW row name the session principal as creator, so ANY
+-- principal Z could INSERT a group carrying `did:epigraph:personal:<N>` for an
+-- operator N that has no personal group yet (MEASURED by review, attack 2: as
+-- `epigraph_app` stamped as Z, `INSERT 0 1`). 102's link functions then refuse
+-- N as an operator ("is not a personal group created by that operator"), which
+-- is correct, but the squat row can never be removed by the app
+-- (`groups_block_delete`) or re-keyed (section 2), so the squatter blocks N's
+-- personal group -- and every operator link to N -- permanently, until
+-- maintenance repairs it. `GroupRepository::create_with_admin` also takes a
+-- caller-supplied did_key for a `kind='team'` group, so the squat is not
+-- limited to `kind='personal'`.
+--
+-- So a BEFORE INSERT row trigger refuses, outside the same two escape
+-- hatches, any row whose did_key is in the personal namespace OR whose kind is
+-- `personal` unless BOTH hold: `kind = 'personal'` and
+-- `did_key = 'did:epigraph:personal:' || created_by_agent_id`. Every in-tree
+-- personal-group writer already produces exactly that row (077's
+-- `epigraph_ensure_personal_group`, 102's link functions and 071's shim run as
+-- definers; `tenancy_backfill` runs on a maintenance DSN), so this refuses
+-- nothing legitimate. Squatting becomes impossible rather than merely refused
+-- at link time.
+--
+-- ===================================================================
+-- 4. UNDO
 --
 -- `DROP TRIGGER IF EXISTS groups_identity_immutable ON public.groups;` then
--- `DROP FUNCTION IF EXISTS public.epigraph_groups_identity_immutable();`. No
--- rows to un-write. **Applied to a throwaway database only, NOT to any
+-- `DROP FUNCTION IF EXISTS public.epigraph_groups_identity_immutable();`, and
+-- `DROP TRIGGER IF EXISTS groups_personal_identity_names_creator ON public.groups;`
+-- then `DROP FUNCTION IF EXISTS public.epigraph_groups_personal_identity_names_creator();`.
+-- No rows to un-write. **Applied to a throwaway database only, NOT to any
 -- deployed database.**
 -- ===================================================================
 
@@ -93,3 +121,29 @@ CREATE TRIGGER groups_identity_immutable
        OR OLD.did_key IS DISTINCT FROM NEW.did_key
        OR OLD.kind IS DISTINCT FROM NEW.kind)
     EXECUTE FUNCTION public.epigraph_groups_identity_immutable();
+
+CREATE OR REPLACE FUNCTION public.epigraph_groups_personal_identity_names_creator()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_bypass() OR public.epigraph_definer_bypass() THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.kind IS DISTINCT FROM 'personal'
+       OR NEW.did_key IS DISTINCT FROM
+          'did:epigraph:personal:' || NEW.created_by_agent_id::text THEN
+        RAISE EXCEPTION 'groups: a personal group must be kind personal and carry '
+                        'did:epigraph:personal:<its creator> (did_key %, kind %, creator %)',
+                        NEW.did_key, NEW.kind, NEW.created_by_agent_id
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS groups_personal_identity_names_creator ON public.groups;
+CREATE TRIGGER groups_personal_identity_names_creator
+    BEFORE INSERT ON public.groups
+    FOR EACH ROW
+    WHEN (NEW.kind = 'personal' OR NEW.did_key LIKE 'did:epigraph:personal:%')
+    EXECUTE FUNCTION public.epigraph_groups_personal_identity_names_creator();
