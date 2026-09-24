@@ -654,4 +654,37 @@ impl GroupMembershipRepository {
         .await?;
         Ok(id)
     }
+
+    /// Whether THIS connection's stamp may write rows owned by `group_id`:
+    /// `group_id = ANY(epigraph_writable_groups())`, evaluated on the caller's
+    /// own connection — a pure read that never mints.
+    ///
+    /// It is the exact question migration 077's `WITH CHECK (owner_group_id =
+    /// ANY(epigraph_writable_groups()))` will ask of every row the caller then
+    /// writes on the same connection, asked BEFORE the first write so a refusal
+    /// can be reported with nothing written. It reads no table: the answer comes
+    /// from the `epigraph.writable_group_ids` GUC the stamp set (migration 067),
+    /// so a live `reader` membership answers `false`, and an UNSTAMPED
+    /// connection answers `false` for every group (the function is `{}` without
+    /// the GUC) — it fails closed.
+    ///
+    /// It deliberately takes a connection and not a `Viewer`: a `Viewer`'s
+    /// `writable_groups()` is the set a stamp was COMPUTED from, while this asks
+    /// the set the connection actually CARRIES, which is what the `WITH CHECK`
+    /// evaluates.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(conn))]
+    pub async fn session_can_write_group_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let writable: bool =
+            sqlx::query_scalar("SELECT $1 = ANY(public.epigraph_writable_groups()::uuid[])")
+                .bind(group_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        Ok(writable)
+    }
 }

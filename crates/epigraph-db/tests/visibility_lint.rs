@@ -1023,7 +1023,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     // transaction. Each is the pool-taking original's body, moved; the pool form
     // now delegates. Every one is a WRITE whose control is the connection's
     // stamped GUCs evaluated by the table's `WITH CHECK`, the argument
-    // `update_labels_conn` states — except the two group_membership.rs READS
+    // `update_labels_conn` states — except the three group_membership.rs READS
     // at the end, which state their own.
     (
         "agent.rs",
@@ -1104,6 +1104,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          reason as `count_own_revoked_rows_conn`: groups_tenancy on the caller's stamped \
          connection is the filter, and 'invisible here' is exactly the answer the caller needs \
          (no LIVE membership). Returns one id or None.",
+    ),
+    (
+        "group_membership.rs",
+        "session_can_write_group_conn",
+        "READ of NO table: it evaluates `$1 = ANY(epigraph_writable_groups())` over the \
+         caller's stamped connection, i.e. the `epigraph.writable_group_ids` GUC (migration 067), \
+         which is the exact predicate migration 077's `WITH CHECK (owner_group_id = \
+         ANY(epigraph_writable_groups()))` applies to every write on that connection. There is \
+         no FROM for a viewer marker to splice into, and a `&Viewer` would be the set a stamp \
+         was COMPUTED from, not the set the connection CARRIES — the question is the latter. \
+         Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
+         `IngestTx::owner_decl`, which refuses the ingest when it is false.",
     ),
 ];
 

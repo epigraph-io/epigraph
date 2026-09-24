@@ -565,7 +565,8 @@ impl IngestTx<'_> {
     /// So on the Stamped arm this is a pure read plus a refusal:
     /// * [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
     ///   — `None` means no live membership; refuse.
-    /// * `group = ANY(epigraph_writable_groups())` on the same transaction —
+    /// * [`epigraph_db::GroupMembershipRepository::session_can_write_group_conn`]
+    ///   — `group = ANY(epigraph_writable_groups())` on the same transaction,
     ///   the exact question migration 077's `WITH CHECK` will ask of every row;
     ///   a live `reader` membership fails it; refuse.
     ///
@@ -606,10 +607,8 @@ impl IngestTx<'_> {
                  a revocation is an operator decision. Nothing was written"
             )));
         };
-        let writable: bool =
-            sqlx::query_scalar("SELECT $1 = ANY(public.epigraph_writable_groups()::uuid[])")
-                .bind(group)
-                .fetch_one(&mut **tx)
+        let writable =
+            epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, group)
                 .await
                 .map_err(|e| internal_error(format!("{tool_name}: writable-group check: {e}")))?;
         if !writable {
