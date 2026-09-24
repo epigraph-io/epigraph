@@ -14,10 +14,10 @@
 //!
 //! # The contract under test (for the personal group, across every epoch)
 //!
-//! * live row        -> the group, no write, role kept;
-//! * only revoked    -> `DbError::MembershipRevoked` (SQLSTATE `RVK01`), state
-//!                      unchanged;
-//! * no row at all   -> first-time provisioning (group + live epoch-0 admin).
+//! * live row: the group, no write, role kept;
+//! * only revoked: `DbError::MembershipRevoked` (SQLSTATE `RVK01`), state
+//!   unchanged;
+//! * no row at all: first-time provisioning (group + live epoch-0 admin).
 //!
 //! # Verified to fail
 //!

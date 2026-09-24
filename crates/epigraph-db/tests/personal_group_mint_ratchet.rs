@@ -45,9 +45,10 @@
 //!   - `system_agent_write_authority`'s mint runs only after a stamped read
 //!     proved the agent has no row at all; pinned by
 //!     `scripts/e2e/probe-unit-e.sh`'s REVOKED/READER arms.
-//!   A NEW wrapper — a function that calls one of these and is then called from
-//!   elsewhere — is caught once (its own call to the watched helper) and then
-//!   not followed. Adding it to [`WATCHED`] is the reviewer's job.
+//!
+//!   A NEW wrapper — a function that calls one of these and is then called
+//!   from elsewhere — is caught once (its own call to the watched helper) and
+//!   then not followed. Adding it to [`WATCHED`] is the reviewer's job.
 //! * **SQL built at runtime.** A statement assembled with `format!` whose
 //!   function name is split across literals, or read from a file, is invisible.
 //!   So is a revival spelled other than `revoked_at = NULL` (e.g. `revoked_at =
@@ -532,11 +533,10 @@ fn the_live_function_body_does_not_revive() {
     files.sort();
     let definer = files
         .iter()
-        .filter(|p| {
+        .rfind(|p| {
             strip_sql_comments(&std::fs::read_to_string(p).unwrap())
                 .contains("FUNCTION public.epigraph_ensure_personal_group(p_agent uuid)")
         })
-        .next_back()
         .expect("some migration defines epigraph_ensure_personal_group");
     let body = collapse_ws(&strip_sql_comments(
         &std::fs::read_to_string(definer).unwrap(),
