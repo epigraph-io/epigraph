@@ -56,6 +56,12 @@
 //! * **Test files.** `crates/*/tests/` is NOT scanned: fixtures there provision
 //!   and revoke memberships on purpose. `#[cfg(test)]` modules inside `src/`
 //!   ARE scanned and registered.
+//! * **Outside `crates/*/src`.** The workspace member `tests/engine-integration`
+//!   (no watched call at the time of writing) and the e2e shell scripts are not
+//!   scanned. `scripts/e2e/probe-workflow.sh` calls
+//!   `epigraph_ensure_personal_group` in raw SQL, for freshly created fixture
+//!   agents only, on a throwaway database; after migration 105 a revoked row
+//!   there would RAISE `RVK01` and abort the probe rather than revive.
 //! * **It is syntactic.** It says which sites can reach the mint, never whether
 //!   the connection they run on is stamped. That axis is the arms that call the
 //!   function as `epigraph_app`
