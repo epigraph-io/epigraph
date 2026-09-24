@@ -359,3 +359,50 @@ async fn a_squatted_personal_group_is_refused(pool: PgPool) {
         Some(epigraph_db::PERSONAL_GROUP_NOT_OWNED)
     );
 }
+
+/// THE LEDGER (review finding, MEDIUM). `group_memberships` is
+/// append-and-revoke. Every contract 105 and 106 state ("only revoked rows ->
+/// refuse", "a group that has ever had a member does not re-open") rests on
+/// rows never disappearing. `epigraph_app` held DELETE on the table, and the
+/// FOR ALL policy's `agent_id = epigraph_principal_id()` arm let a revoked
+/// agent delete its OWN revoked row; provisioning then saw "no row of any
+/// state" and handed it a fresh live admin row. Migration 106 revokes DELETE
+/// from `epigraph_app`, so the attempt must fail with 42501 and the revocation
+/// must stand.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_agent_cannot_delete_its_row_and_reprovision(pool: PgPool) {
+    let app = app_pool(&pool).await;
+    let agent = seed_agent(&pool).await;
+    ensure_as_app(&app, agent).await.expect("provision");
+    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut tx = stamped(&app, agent, &[]).await;
+    let del = sqlx::query("DELETE FROM group_memberships WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&mut *tx)
+        .await;
+    let code = del
+        .as_ref()
+        .err()
+        .and_then(|e| e.as_database_error())
+        .and_then(|d| d.code().map(|c| c.to_string()));
+    assert_eq!(
+        code.as_deref(),
+        Some("42501"),
+        "epigraph_app must hold no DELETE on group_memberships, got {del:?}"
+    );
+    // Commit whatever the DELETE did (an aborted transaction commits as a
+    // rollback), so the next call sees its effect if it had one.
+    let _ = tx.commit().await;
+
+    let res = ensure_as_app(&app, agent).await;
+    assert!(
+        matches!(res, Err(DbError::MembershipRevoked { .. })),
+        "still refused, got {res:?}"
+    );
+    assert_eq!(rows(&pool, agent).await, vec![(0, "admin".into(), false)]);
+}

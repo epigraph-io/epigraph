@@ -250,6 +250,43 @@ BEGIN
     RETURN 'applied';
 END $$;
 
+-- ===================================================================
+-- THE LEDGER: `epigraph_app` may not DELETE a membership row.
+--
+-- Both files' contracts rest on membership rows never disappearing: 105's
+-- "only revoked rows -> refuse", and this file's "a group that has EVER had a
+-- membership row does not re-open" and last-admin guard. `epigraph_app` held
+-- DELETE on `group_memberships` (077's `GRANT … ON ALL TABLES`), and the FOR
+-- ALL `group_memberships_tenancy` USING admits a stamped agent's own rows
+-- (`agent_id = epigraph_principal_id()`) and every row of its session groups.
+-- MEASURED by the batch F review as `epigraph_app` on a database migrated
+-- 001→106 before this statement, each with a transaction-scoped stamp (the
+-- first two re-measured by this file's two DELETE arms with it removed):
+--   * a REVOKED agent deleted its own revoked row; `epigraph_ensure_personal_group`
+--     then provisioned it a fresh LIVE admin row (105 bypassed);
+--   * a READER of a community deleted its ADMIN's row (106's "reader cannot
+--     evict" and last-admin guard bypassed);
+--   * the sole member deleted every row of its community; a stranger's
+--     `epigraph_community_add_member` then answered 'applied' (the "never
+--     re-opens" rule bypassed; so is 092's roster-bounded creator arm, whose
+--     own header names an emptied roster as its residual).
+-- No production statement deletes from this table (removal is `revoked_at =
+-- now()` everywhere; 092 measured it, and batch F re-checked it by grep), so
+-- the privilege is revoked outright rather than narrowed by a policy.
+--
+-- REVOKE rather than a BEFORE DELETE trigger: referential actions run as the
+-- table owner, so a forced `DELETE FROM groups` (060's
+-- `epigraph.allow_group_delete`) or an agent deletion still cascades, where a
+-- row trigger would fire on the cascade and block it. A later migration that
+-- re-issues `GRANT … ON ALL TABLES … TO epigraph_app` would restore it;
+-- `personal_group_no_revival.rs` and `community_membership_integrity.rs` each
+-- carry an `epigraph_app` DELETE arm that fails if it comes back.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE DELETE ON public.group_memberships FROM epigraph_app';
+    END IF;
+END $$;
+
 REVOKE EXECUTE ON FUNCTION public.epigraph_community_add_member(uuid, uuid, uuid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.epigraph_community_remove_member(uuid, uuid, uuid) FROM PUBLIC;
 DO $$ BEGIN
@@ -275,5 +312,6 @@ END $$;
 
 -- UNDO: DROP FUNCTION IF EXISTS public.epigraph_community_add_member(uuid, uuid, uuid);
 --       DROP FUNCTION IF EXISTS public.epigraph_community_remove_member(uuid, uuid, uuid);
+--       GRANT DELETE ON public.group_memberships TO epigraph_app;  (restores the hole)
 -- and restore `community.rs`'s pre-batch-F statements. No rows are created or
 -- changed by this file.

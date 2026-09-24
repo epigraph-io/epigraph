@@ -274,7 +274,12 @@ Current reservation:
   unless `epigraph_bypass()`; a mismatched `p_actor` is DENIED. The
   `community_members` DELETE runs in the caller's statement, because
   `epigraph_maintenance` holds no DELETE (070). Owner `epigraph_maintenance`,
-  `REVOKE … FROM PUBLIC`, `GRANT EXECUTE … TO epigraph_app`. Pinned by
+  `REVOKE … FROM PUBLIC`, `GRANT EXECUTE … TO epigraph_app`. Also `REVOKE
+  DELETE ON group_memberships FROM epigraph_app`: the membership table is an
+  append-and-revoke ledger, 105's and 106's rules both rest on rows never
+  disappearing, and the FOR ALL policy let a stamped agent delete its own and
+  its groups' rows (measured: a revoked agent re-provisioned as live admin, a
+  reader deleted its admin's row, an emptied group re-bootstrapped). Pinned by
   `epigraph-db/tests/community_membership_integrity.rs` as `epigraph_app`.
   **No undo runbook ships**: reversing it is two `DROP FUNCTION IF EXISTS`
   (named in the file) plus the pre-batch-F `community.rs`; it creates no rows.

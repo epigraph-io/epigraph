@@ -319,3 +319,67 @@ async fn an_app_session_cannot_name_another_actor(pool: PgPool) {
     assert_eq!(out, MembershipOutcome::DeniedNotAMember);
     assert_eq!(state(&pool, c, admin).await, "admin(live)");
 }
+
+/// A community with a live admin and a live reader. Returns
+/// `(community, admin, admin_perspective, reader)`.
+async fn community_with_reader(pool: &PgPool, name: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+    let admin = agent(pool, &format!("{name}-admin")).await;
+    let reader = agent(pool, &format!("{name}-reader")).await;
+    let (c, admin_p) = community_with_admin(pool, admin, name).await;
+    let reader_p = perspective(pool, reader, &format!("{name}-reader-p")).await;
+    CommunityRepository::add_member(pool, Some(admin), c, reader_p)
+        .await
+        .expect("admin adds the reader");
+    assert_eq!(state(pool, c, reader).await, "reader(live)");
+    (c, admin, admin_p, reader)
+}
+
+/// The membership ledger is not deletable by the deployed role (review
+/// finding, MEDIUM). Before migration 106 revoked DELETE from `epigraph_app`, a
+/// READER stamped with the community in its group set could delete the
+/// ADMIN's row, which bypassed "a reader cannot evict" and the last-admin
+/// guard. The sole member could also delete every row, after which a stranger
+/// bootstrapped the "emptied" group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_deployed_role_cannot_delete_membership_rows(pool: PgPool) {
+    let (c, admin, _, reader) = community_with_reader(&pool, "f4-ledger").await;
+
+    let code = |r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        r.err()
+            .and_then(|e| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string())))
+    };
+
+    // A reader deleting the admin's row.
+    let del = sqlx::query("DELETE FROM group_memberships WHERE group_id = $1 AND role = 'admin'")
+        .bind(c)
+        .execute(&as_actor(&pool, reader).await)
+        .await;
+    assert_eq!(code(del).as_deref(), Some("42501"), "reader delete");
+    assert_eq!(state(&pool, c, admin).await, "admin(live)");
+
+    // The admin deleting every row of its own community (so a stranger could
+    // then bootstrap it).
+    let del = sqlx::query("DELETE FROM group_memberships WHERE group_id = $1")
+        .bind(c)
+        .execute(&as_actor(&pool, admin).await)
+        .await;
+    assert_eq!(code(del).as_deref(), Some("42501"), "admin delete");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
+        .bind(c)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2, "the roster must be intact");
+
+    let stranger = agent(&pool, "f4-ledger-stranger").await;
+    let stranger_p = perspective(&pool, stranger, "f4-ledger-stranger-p").await;
+    let out = CommunityRepository::add_member(
+        &as_actor(&pool, stranger).await,
+        Some(stranger),
+        c,
+        stranger_p,
+    )
+    .await
+    .expect("a refusal is an outcome, not an error");
+    assert_eq!(out, MembershipOutcome::DeniedNotAMember);
+}
