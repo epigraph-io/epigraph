@@ -477,7 +477,12 @@ pub struct Standalone {
 }
 
 /// Which listed claims are the operator's: owned by its personal group, or
-/// authored by the operator or by an agent linked to it (retired or actor).
+/// authored by the operator or by an agent linked to it (retired or actor) AND
+/// owned by the world group or that author's own personal group
+/// ([`super::owner_is_takeable`], the rule `reown::classify` applies). A claim
+/// a THIRD group owns is HELD even when a linked agent wrote it: hiding moves
+/// its evidence into the operator's group, and the owning group would lose
+/// read and write access to evidence on its own claim.
 async fn scope(
     conn: &mut PgConnection,
     operator: Uuid,
@@ -493,16 +498,33 @@ async fn scope(
             held.push((*id, "not found".to_string()));
             continue;
         };
+        if c.owner == target {
+            in_scope.push(c.id);
+            continue;
+        }
         let linked = c.author == operator
             || super::operator_of_author(conn, c.author).await? == Some(operator);
-        if c.owner == target || linked {
-            in_scope.push(c.id);
-        } else {
+        if !linked {
             held.push((
                 *id,
                 "neither owned by the operator's group nor authored by the operator or an agent \
                  linked to it"
                     .to_string(),
+            ));
+            continue;
+        }
+        let personal = super::authors_personal_group(conn, c.author).await?;
+        if super::owner_is_takeable(c.owner, personal) {
+            in_scope.push(c.id);
+        } else {
+            held.push((
+                *id,
+                format!(
+                    "owned by group {}, which is neither the operator's group, the world group \
+                     nor its author's personal group: hiding would take evidence on that group's \
+                     own claim away from it",
+                    c.owner
+                ),
             ));
         }
     }
@@ -564,9 +586,12 @@ async fn print_surfaces(
 ///
 /// A listed claim is in scope only if it is already the operator's: owned by
 /// the operator's personal group, or authored by the operator or by an agent
-/// linked to it (retired or actor). Any other listed claim is HELD — hiding
-/// moves a row into the operator's group, and taking a row away from a group
-/// the operator has no claim on is not this tool's call.
+/// linked to it (retired or actor) and owned by the world group or that
+/// author's own personal group (the owner rule `reown-claims` applies). Any
+/// other listed claim is HELD — hiding moves a row into the operator's group,
+/// and taking a row away from a group the operator has no claim on is not this
+/// tool's call. A claim a third group owns is held even when a linked agent
+/// authored it.
 ///
 /// # Errors
 /// A refusal (see the module doc) or a database error. On any error after the

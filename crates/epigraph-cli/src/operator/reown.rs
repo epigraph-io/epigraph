@@ -95,7 +95,7 @@ use super::tables::{
     writer_is_linked, xact_counters, Attached, ClaimRow, Kind, RowKey, Snapshot, TableSpec,
     Tenancy,
 };
-use super::{authors_personal_group, operator_group, operator_of_author, WORLD};
+use super::{authors_personal_group, operator_group, operator_of_author, owner_is_takeable, WORLD};
 use anyhow::{bail, Context};
 use serde_json::json;
 use sqlx::PgConnection;
@@ -318,7 +318,7 @@ pub async fn classify(
                 v
             }
         };
-        if c.owner != WORLD && Some(c.owner) != personal {
+        if !owner_is_takeable(c.owner, personal) {
             out.held
                 .push((c.id, Hold::OwnerNotEligible { owner: c.owner }));
             continue;

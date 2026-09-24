@@ -68,6 +68,19 @@ pub const DSN_ENV: &str = "EPIGRAPH_OPERATOR_MAINTENANCE_DSN";
 /// The world group: public, owned by no one.
 pub const WORLD: Uuid = Uuid::nil();
 
+/// THE OWNER RULE `reown-claims` and `hide-evidence` share: a claim a linked
+/// author wrote is the operator's to take (re-own, or hide evidence of) only
+/// while it is owned by the world group or by that author's OWN personal group.
+/// A claim some THIRD group owns is that group's, and taking its rows away is
+/// not an operator tool's call (`reown::classify` holds it as
+/// `OwnerNotEligible`, `hide::scope` as HELD). One function so the two tools
+/// cannot drift apart again (stage-3 review found `hide-evidence` admitting a
+/// third-group claim that `reown-claims` held).
+#[must_use]
+pub fn owner_is_takeable(owner: Uuid, author_personal_group: Option<Uuid>) -> bool {
+    owner == WORLD || Some(owner) == author_personal_group
+}
+
 /// Migration 074's seed group (`00000000-0000-0000-0000-00000000dead`).
 pub const SEED: Uuid = Uuid::from_u128(0xdead);
 

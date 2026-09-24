@@ -2350,6 +2350,85 @@ async fn hide_evidence_dry_run_previews_and_writes_nothing(pool: PgPool) {
     assert_same(&before, &snapshot(&pool, false).await, "hide dry run");
 }
 
+/// `hide-evidence` HOLDS a claim a THIRD group owns even when a linked agent
+/// authored it, as `reown-claims` does (stage-3 review, MEDIUM: authorship
+/// alone admitted `c_third`, and `--apply` moved that group's public evidence
+/// into the operator's group, where the owning group read 0 of it).
+///
+/// CALIBRATION: in the same run a world-owned claim by the same linked author
+/// is in scope and its row is hidden, so the hold is the owner rule and not a
+/// run that hides nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn hide_evidence_holds_a_claim_a_third_group_owns(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let ev_third = evidence_typed(&pool, fx.c_third, "testimony", &[], "third group's row").await;
+    let ev_world = evidence_typed(&pool, fx.c_world, "testimony", &[], "world claim's row").await;
+    let dir = scratch_dir();
+    let claims = dir.join("claims.txt");
+    std::fs::write(&claims, format!("{}\n{}\n", fx.c_third, fx.c_world)).unwrap();
+    let op = fx.operator.to_string();
+    let base = [
+        "hide-evidence",
+        "--claims-file",
+        claims.to_str().unwrap(),
+        "--operator",
+        op.as_str(),
+        "--hide-evidence-type",
+        "testimony",
+    ];
+    let dry = run_op(&pool, &base).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!(
+            "HELD\t{}\towned by group {}",
+            fx.c_third, fx.third_group
+        )),
+        "a third-group claim must be HELD by the owner rule: {}",
+        dry.show()
+    );
+    assert!(
+        !dry.stdout.contains(&format!("HIDE\t{ev_third}\t")),
+        "the third group's row must not be planned: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains(&format!("HIDE\t{ev_world}\t")),
+        "CALIBRATION: the world-owned claim's row is planned: {}",
+        dry.show()
+    );
+    let planned: String = dry
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("HIDE-PLAN: "))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("HIDE-PLAN line")
+        .to_string();
+
+    let mf = dir.join("hide.jsonl");
+    let mut apply = base.to_vec();
+    apply.extend_from_slice(&[
+        "--apply",
+        "--confirm-hide",
+        planned.as_str(),
+        "--manifest-out",
+        mf.to_str().unwrap(),
+        "--reason",
+        "test",
+    ]);
+    let r = run_op(&pool, &apply).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        tenancy_of(&pool, ev_third).await,
+        (fx.third_group, "public".to_string()),
+        "the third group's evidence on its own claim was taken into the operator's group"
+    );
+    assert_eq!(
+        tenancy_of(&pool, ev_world).await,
+        (fx.target, "group".to_string()),
+        "CALIBRATION: the in-scope row was hidden"
+    );
+}
+
 /// `--apply` needs `--confirm-hide <N>` equal to the planned count, then
 /// `--manifest-out`, and it refuses on a schema without the kernel guard
 /// (migration 110's pin table), before the manifest. Nothing is written on any
