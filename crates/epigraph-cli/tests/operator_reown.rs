@@ -1221,6 +1221,199 @@ async fn a_dry_run_holds_no_lock_past_its_batch(pool: PgPool) {
     assert!(!mf.exists(), "a dry run writes no manifest");
 }
 
+/// Two claims in two batches that SHARE rows: a fragment (provenance of both)
+/// and an edge between them, whose tenancy batch 1 changes. The shared rows
+/// are the review's P1 shape.
+async fn shared_rows_fixture(pool: &PgPool) -> (Fx, Uuid) {
+    let fx = seed(pool).await;
+    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
+        .bind(fx.c_personal)
+        .bind(fx.frag)
+        .execute(pool)
+        .await
+        .expect("share the fragment with c_personal");
+    let e =
+        fixture::seed_edge_owned_by(pool, fx.c_world, fx.c_personal, "public", fx.retired_group)
+            .await;
+    (fx, e)
+}
+
+fn ids_file(dir: &std::path::Path, name: &str, ids: &[Uuid]) -> PathBuf {
+    let p = dir.join(name);
+    let body: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    std::fs::write(&p, body.join("\n") + "\n").expect("ids file");
+    p
+}
+
+async fn reown_ids(
+    pool: &PgPool,
+    fx: &Fx,
+    claims: &std::path::Path,
+    manifest: &std::path::Path,
+    extra: &[&str],
+) -> Run {
+    let op = fx.operator.to_string();
+    let mut args = vec![
+        "reown-claims",
+        "--claims-file",
+        claims.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--derived",
+        "follow-claim",
+        "--manifest-out",
+        manifest.to_str().unwrap(),
+        "--batch-size",
+        "1",
+        "--apply",
+    ];
+    args.extend_from_slice(extra);
+    run_op(pool, &args).await
+}
+
+/// A row ANOTHER writer changes between the plan and its batch holds the claim
+/// (review finding: the manifest de-duplicates by key, so the row kept its
+/// stale plan-time record, and a reversal would have restored the stale owner).
+///
+/// The run is made to wait in batch 2 on a `FOR KEY SHARE` held by a second
+/// transaction, which meanwhile re-owns `ev_personal` (a row of batch 2's
+/// claim) and commits. Batch 2 must then HOLD `c_personal` with "changed since
+/// the plan", and leave the row where the other writer put it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_changed_by_another_writer_since_the_plan_holds_its_claim(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let cf = ids_file(&dir, "two.txt", &[fx.c_world, fx.c_personal]);
+    let mf = dir.join("m.jsonl");
+    let url = fixture::database_url_for(&pool).await;
+    let op = fx.operator.to_string();
+
+    let mut holder = pool.begin().await.expect("holder tx");
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR KEY SHARE")
+        .bind(fx.c_personal)
+        .execute(&mut *holder)
+        .await
+        .expect("hold batch 2's claim");
+    let args: Vec<String> = [
+        "reown-claims",
+        "--claims-file",
+        cf.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--derived",
+        "follow-claim",
+        "--manifest-out",
+        mf.to_str().unwrap(),
+        "--batch-size",
+        "1",
+        "--lock-timeout",
+        "8s",
+        "--apply",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let run = tokio::task::spawn_blocking(move || {
+        let a: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_with_env(
+            &a,
+            &[(DSN_ENV, url.as_str())],
+            &["DATABASE_URL", "MAINTENANCE_DATABASE_URL"],
+        )
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                AND query ILIKE '%FOR UPDATE%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            waiting = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(waiting, "PREMISE: the run waits in batch 2, after the plan");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2 WHERE id = $1")
+        .bind(fx.ev_personal)
+        .bind(fx.stranger_group)
+        .execute(&mut *holder)
+        .await
+        .expect("another writer re-owns a row of batch 2's claim");
+    holder.commit().await.expect("the other writer commits");
+    let r = run.await.expect("join");
+
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains(&format!(
+            "HELD-UNDER-LOCK\t{}\tevidence {} changed since the plan",
+            fx.c_personal, fx.ev_personal
+        )),
+        "a claim whose row changed since the plan must be held, not moved with a stale record: \
+         {}",
+        r.show()
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_personal).await,
+        public(fx.retired_group),
+        "the held claim did not move"
+    );
+    assert_eq!(
+        tenancy(&pool, "evidence", fx.ev_personal).await,
+        public(fx.stranger_group),
+        "the other writer's change stands"
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.c_world).await,
+        public(fx.target),
+        "batch 1 was unaffected"
+    );
+}
+
+/// The other direction: a shared row THIS run changed in an earlier batch is
+/// expected, not "changed since the plan". Batch 1 (`c_world`) moves the shared
+/// fragment and recomputes the shared edge's meet; batch 2 (`c_personal`) must
+/// still move, and a reversal must restore every row byte-for-byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_row_this_run_moved_in_an_earlier_batch_is_not_a_false_hold(pool: PgPool) {
+    let (fx, e) = shared_rows_fixture(&pool).await;
+    let dir = scratch_dir();
+    let before = snapshot(&pool, true).await;
+    let prior_edge = tenancy(&pool, "edges", e).await;
+    let mf = dir.join("m.jsonl");
+    let r = reown_ids(
+        &pool,
+        &fx,
+        &ids_file(&dir, "two.txt", &[fx.c_world, fx.c_personal]),
+        &mf,
+        &[],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        !r.stdout.contains("HELD-UNDER-LOCK"),
+        "a row this run moved in batch 1 was mistaken for another writer's change: {}",
+        r.show()
+    );
+    assert!(r.stdout.contains("claims moved: 2"), "{}", r.show());
+    assert_ne!(
+        tenancy(&pool, "edges", e).await,
+        prior_edge,
+        "PREMISE: the shared edge's tenancy changed during the run"
+    );
+    let r = reverse(&pool, &mf, true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "reverse after two batches",
+    );
+}
+
 /// A row can become unreadable to an unstamped application session without
 /// its visibility column changing — here a RESTRICTIVE policy that hides rows
 /// owned by the target group from `epigraph_app`. The readability census, taken

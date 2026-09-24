@@ -158,6 +158,13 @@ pub enum Hold {
     EdgeEndpointNotPublic {
         edges: usize,
     },
+    /// A row (or the claim) is not in the state this run last knew it in —
+    /// the plan's reading, or an earlier batch's result — so another writer
+    /// changed it after the plan recorded its prior state.
+    ChangedSincePlan {
+        table: String,
+        id: String,
+    },
 }
 
 impl fmt::Display for Hold {
@@ -187,6 +194,11 @@ impl fmt::Display for Hold {
                 "{edges} edge(s) touching it have a non-public endpoint, so the trigger's meet \
                  would change their visibility"
             ),
+            Self::ChangedSincePlan { table, id } => write!(
+                f,
+                "{table} {id} changed since the plan recorded it (another writer); its recorded \
+                 prior state would be stale, so the claim is not moved in this run"
+            ),
         }
     }
 }
@@ -207,6 +219,52 @@ pub struct Caches {
     pub operator_of: BTreeMap<Uuid, Option<Uuid>>,
     pub personal: BTreeMap<Uuid, Option<Uuid>>,
     pub linked_writer: BTreeMap<Uuid, bool>,
+}
+
+/// The state this run last knew each row and claim to be in: the plan's
+/// reading, then each COMMITTED batch's post-state.
+///
+/// The manifest records a row's prior state once, at the plan (records are
+/// de-duplicated by key). A row another writer changes between the plan and
+/// its batch would therefore keep a STALE prior record, and a reversal would
+/// restore the stale owner (review finding). So each batch compares what it
+/// finds under the lock with this map and HOLDS every claim a changed row
+/// hangs off. A change made by THIS run's earlier batch (a shared edge or
+/// fragment) is expected, not a change: committed batches write their
+/// post-state here. A dry run never does, because it rolls every batch back.
+#[derive(Default, Debug)]
+pub struct Known {
+    pub claims: BTreeMap<Uuid, (Uuid, String)>,
+    pub rows: BTreeMap<RowKey, Tenancy>,
+}
+
+impl Known {
+    /// Seed from the plan.
+    #[must_use]
+    pub fn from_plan(plan: &Classified) -> Self {
+        Self {
+            claims: plan
+                .eligible
+                .iter()
+                .map(|c| (c.id, (c.owner, c.visibility.clone())))
+                .collect(),
+            rows: plan
+                .attached
+                .iter()
+                .map(|(k, a)| (k.clone(), a.tenancy.clone()))
+                .collect(),
+        }
+    }
+
+    /// Record a committed batch's result.
+    pub fn commit(&mut self, b: &BatchOutcome) {
+        for (id, st) in &b.post_claims {
+            self.claims.insert(*id, st.clone());
+        }
+        for (k, t) in &b.post_rows {
+            self.rows.insert(k.clone(), t.clone());
+        }
+    }
 }
 
 /// Classify the claims named by `requested`, whose current rows are `rows`.
@@ -439,6 +497,10 @@ pub struct BatchOutcome {
     pub held: Vec<(Uuid, Hold)>,
     pub already: Vec<Uuid>,
     pub newly_recorded: usize,
+    /// The moved claims' `(owner, visibility)` after the batch.
+    pub post_claims: Vec<(Uuid, (Uuid, String))>,
+    /// Every row the batch checked, in its state after the batch.
+    pub post_rows: BTreeMap<RowKey, Tenancy>,
 }
 
 /// A batch that must not commit.
@@ -539,6 +601,7 @@ pub async fn run_batch(
     batch: &[Uuid],
     sink: &mut Sink,
     caches: &mut Caches,
+    known: &Known,
 ) -> Result<BatchOutcome, BatchError> {
     let mut out = BatchOutcome::default();
     sqlx::query("SELECT set_config('lock_timeout', $1, true)")
@@ -559,15 +622,54 @@ pub async fn run_batch(
     .await?;
     out.held = c.held;
     out.already = c.already;
-    if c.eligible.is_empty() {
+
+    // Changed since the plan (see [`Known`]): hold every claim a changed row
+    // hangs off, and drop the rows only those claims carried.
+    let eligible_ids: BTreeSet<Uuid> = c.eligible.iter().map(|r| r.id).collect();
+    let mut changed: BTreeMap<Uuid, (String, String)> = BTreeMap::new();
+    for row in &c.eligible {
+        if let Some(st) = known.claims.get(&row.id) {
+            if (row.owner, row.visibility.clone()) != *st {
+                changed
+                    .entry(row.id)
+                    .or_insert_with(|| ("claims".into(), row.id.to_string()));
+            }
+        }
+    }
+    for (k, a) in &c.attached {
+        if let Some(t) = known.rows.get(k) {
+            if *t != a.tenancy {
+                for cl in a.claims.intersection(&eligible_ids) {
+                    changed
+                        .entry(*cl)
+                        .or_insert_with(|| (k.0.clone(), k.1.clone()));
+                }
+            }
+        }
+    }
+    let eligible: Vec<ClaimRow> = c
+        .eligible
+        .into_iter()
+        .filter(|r| !changed.contains_key(&r.id))
+        .collect();
+    for (id, (table, row)) in changed {
+        out.held
+            .push((id, Hold::ChangedSincePlan { table, id: row }));
+    }
+    if eligible.is_empty() {
         return Ok(out);
     }
-    let claim_ids: Vec<Uuid> = c.eligible.iter().map(|r| r.id).collect();
-    let s0 = c.attached;
+    let claim_ids: Vec<Uuid> = eligible.iter().map(|r| r.id).collect();
+    let keep_ids: BTreeSet<Uuid> = claim_ids.iter().copied().collect();
+    let s0: Snapshot = c
+        .attached
+        .into_iter()
+        .filter(|(_, a)| a.claims.iter().any(|cl| keep_ids.contains(cl)))
+        .collect();
 
     // Manifest first: any row the plan did not see is recorded, and fsynced,
     // before the write that moves it.
-    out.newly_recorded = sink.record(&records_for(&c.eligible, &s0, ctx.specs))?;
+    out.newly_recorded = sink.record(&records_for(&eligible, &s0, ctx.specs))?;
 
     let keep = kept_rows(conn, &s0, ctx.mode, ctx.operator, caches).await?;
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
@@ -623,7 +725,7 @@ pub async fn run_batch(
             claim_ids.len()
         ));
     }
-    let before_claims: BTreeMap<Uuid, &ClaimRow> = c.eligible.iter().map(|r| (r.id, r)).collect();
+    let before_claims: BTreeMap<Uuid, &ClaimRow> = eligible.iter().map(|r| (r.id, r)).collect();
     for a in &after_claims {
         let b = before_claims[&a.id];
         if a.owner != ctx.target {
@@ -705,6 +807,11 @@ pub async fn run_batch(
     }
     out.claims_moved = claim_ids.len();
     out.moved_by_table = actual;
+    out.post_claims = after_claims
+        .iter()
+        .map(|c| (c.id, (c.owner, c.visibility.clone())))
+        .collect();
+    out.post_rows = s2;
     for k in &keep {
         *out.kept_by_table.entry(k.0.clone()).or_default() += 1;
     }
@@ -958,15 +1065,17 @@ pub async fn run(
         mode: opts.mode,
         lock_timeout: &opts.lock_timeout,
     };
+    let mut known = Known::from_plan(&plan);
     let eligible: Vec<Uuid> = plan.eligible.iter().map(|c| c.id).collect();
     let batches: Vec<&[Uuid]> = eligible.chunks(opts.batch_size.max(1)).collect();
     let total = batches.len();
     if opts.apply {
         for (i, batch) in batches.iter().enumerate() {
             let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-            let r = run_batch(&mut tx, &ctx, batch, &mut sink, &mut caches).await;
-            if r.is_ok() {
+            let r = run_batch(&mut tx, &ctx, batch, &mut sink, &mut caches, &known).await;
+            if let Ok(b) = &r {
                 tx.commit().await?;
+                known.commit(b);
             } else {
                 tx.rollback().await?;
             }
@@ -977,7 +1086,7 @@ pub async fn run(
     } else {
         for (i, batch) in batches.iter().enumerate() {
             let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-            let r = run_batch(&mut tx, &ctx, batch, &mut sink, &mut caches).await;
+            let r = run_batch(&mut tx, &ctx, batch, &mut sink, &mut caches, &known).await;
             tx.rollback().await?;
             tally(&mut report, out, i + 1, total, r, false)?;
         }
