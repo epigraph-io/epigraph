@@ -2008,6 +2008,112 @@ async fn link_retired_dry_run_apply_and_refusal(pool: PgPool) {
     );
 }
 
+/// A retire that would not de-authorize the key is a REFUSAL with a non-zero
+/// exit, never a success (stage-3 review: both cases used to print a linked
+/// status and exit 0).
+///
+/// * an id holding a live `writer` row in the operator's group: the function
+///   refuses it, and the line carries the HINT (revoke first);
+/// * an id whose link to this operator is an ACTOR link: refused (a retire is
+///   not a demotion), the actor row untouched;
+/// * an id holding only a `reader` row: retired, but the live membership is
+///   printed NOT-DEAUTHORIZED and counted as a refusal.
+///
+/// CALIBRATION: a clean id in the same file is LINKED-RETIRED, so one id's
+/// refusal does not stop the others and the exit code is the refusals'.
+#[sqlx::test(migrations = "../../migrations")]
+async fn link_retired_refuses_an_id_it_would_not_deauthorize(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let (writer, _) = fixture::seed_agent_with_group(&pool, "writer-retiree").await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "reader-retiree").await;
+    let (clean, _) = fixture::seed_agent_with_group(&pool, "clean-retiree").await;
+    for (agent, role) in [(writer, "writer"), (reader, "reader")] {
+        sqlx::query(
+            "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+             VALUES ($1, $2, ''::bytea, 0, $3)",
+        )
+        .bind(fx.target)
+        .bind(agent)
+        .bind(role)
+        .execute(&pool)
+        .await
+        .expect("enrol before the retire");
+    }
+    let agents = dir.join("agents.txt");
+    std::fs::write(
+        &agents,
+        format!("{writer}\n{}\n{reader}\n{clean}\n", fx.actor),
+    )
+    .unwrap();
+    let op = fx.operator.to_string();
+    let r = run_op(
+        &pool,
+        &[
+            "link-retired",
+            "--agents-file",
+            agents.to_str().unwrap(),
+            "--operator",
+            op.as_str(),
+            "--apply",
+        ],
+    )
+    .await;
+    assert_eq!(
+        r.code,
+        3,
+        "a retire that did not de-authorize exited 0: {}",
+        r.show()
+    );
+    for (needle, why) in [
+        (
+            format!("{writer}\tREFUSED\t"),
+            "the live writer row must refuse the retire",
+        ),
+        (
+            format!("{}\tREFUSED\t", fx.actor),
+            "the actor link must refuse the retire",
+        ),
+        (
+            format!("{reader}\tLINKED-RETIRED"),
+            "a reader row does not refuse",
+        ),
+        (
+            format!("{clean}\tLINKED-RETIRED"),
+            "CALIBRATION: a clean id retires",
+        ),
+    ] {
+        assert!(r.stdout.contains(&needle), "{why}: {}", r.show());
+    }
+    assert!(
+        r.stdout.contains("live writer/admin") && r.stdout.contains("HINT: Revoke"),
+        "the writer refusal must say why and print the remedy: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("ACTOR (not retired)"),
+        "the actor refusal must say why: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("NOT-DEAUTHORIZED"),
+        "a retired id with a live membership must be flagged: {}",
+        r.show()
+    );
+    let rows: Vec<(Uuid, bool)> = sqlx::query_as(
+        "SELECT agent_id, retired FROM operator_links WHERE agent_id = ANY($1) ORDER BY 1",
+    )
+    .bind(vec![writer, fx.actor])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(fx.actor, false)],
+        "the refused writer got no row, and the actor row is untouched"
+    );
+}
+
 /// Run `link-retired` over `agents` for `operator`, dry run then apply, and
 /// assert both stop at the FIRST id with an operator refusal naming `code`,
 /// report every later id NOT-ATTEMPTED, exit 3, and write nothing.

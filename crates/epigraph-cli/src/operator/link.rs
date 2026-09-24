@@ -19,6 +19,17 @@
 //! [`LinkStatus::NotAttempted`], and nothing is written for any of them (the
 //! function refuses before its first INSERT). Clearing either is an operator
 //! action this tool does not take.
+//!
+//! # A retire that did not de-authorize is a refusal, never a success
+//!
+//! The point of a retired link is that a possibly-exposed key ends with ZERO
+//! write authority. The function refuses (55000, with a HINT this module
+//! prints) an id that still holds a live `writer`/`admin` row in the operator's
+//! group, and an id whose link to this operator is an ACTOR link (a retire is
+//! not a demotion). A [`LinkStatus::Linked`] outcome that is not retired, or
+//! that still reports a live membership, is counted as a refusal too
+//! ([`LinkStatus::is_refusal`]), so the binary exits non-zero and an operator
+//! cannot read a clean run as "these keys are de-authorized" when one is not.
 
 use epigraph_db::{AgentRepository, DbError, RetiredLinkOutcome};
 use sqlx::PgConnection;
@@ -40,10 +51,16 @@ pub enum LinkStatus {
 }
 
 impl LinkStatus {
-    /// Every status that is not a link: the binary exits 3 on any.
+    /// Every status that is not a clean retire: the binary exits 3 on any. A
+    /// [`LinkStatus::Linked`] outcome counts as a refusal when the row is NOT
+    /// retired (an actor row the call left in place) or a live membership
+    /// remains: in both the id was not de-authorized (see the module doc).
     #[must_use]
     pub const fn is_refusal(&self) -> bool {
-        !matches!(self, Self::Linked(_))
+        match self {
+            Self::Linked(o) => !o.link_retired || o.membership_live,
+            _ => true,
+        }
     }
 }
 
@@ -64,7 +81,21 @@ pub fn refusal_text(operator: Uuid, e: &DbError) -> String {
              (migration 105, RVK02: a squatted key). An operator must inspect and remove the \
              squatting group. Database: {message}"
         ),
-        other => other.to_string(),
+        other => {
+            let mut text = other.to_string();
+            // The two retire-specific refusals (107 section 7) carry their
+            // remedy in the HINT, which `Display` drops.
+            if let DbError::QueryFailed { source } = other {
+                if let Some(hint) = source
+                    .as_database_error()
+                    .and_then(|d| d.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+                    .and_then(sqlx::postgres::PgDatabaseError::hint)
+                {
+                    let _ = write!(text, " HINT: {hint}");
+                }
+            }
+            text
+        }
     }
 }
 
@@ -87,9 +118,10 @@ pub fn describe(agent: Uuid, status: &LinkStatus) -> String {
             } else if o.link_retired {
                 s.push_str("ALREADY-RETIRED");
             } else {
-                // `ON CONFLICT DO NOTHING` kept an existing ACTOR row for the
-                // same operator exactly as it was.
-                s.push_str("ALREADY-ACTOR-NOT-RETIRED");
+                // Unreachable against 107 (the function refuses an actor row),
+                // kept so an older schema cannot print a success: counted as a
+                // refusal by `is_refusal`.
+                s.push_str("REFUSED-ALREADY-ACTOR-NOT-RETIRED");
             }
             let _ = write!(
                 s,
@@ -98,8 +130,8 @@ pub fn describe(agent: Uuid, status: &LinkStatus) -> String {
             );
             if o.membership_live {
                 s.push_str(
-                    "\tWARNING: holds a LIVE membership in the operator group; a retired \
-                     identity has zero write authority only once that membership is revoked",
+                    "\tNOT-DEAUTHORIZED: holds a LIVE membership in the operator group; revoke \
+                     it (counted as a refusal: the run exits non-zero)",
                 );
             }
             s
@@ -184,4 +216,31 @@ pub async fn run(
     }
     tx.rollback().await?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outcome(link_retired: bool, membership_live: bool) -> RetiredLinkOutcome {
+        RetiredLinkOutcome {
+            operator_group_id: Uuid::nil(),
+            group_created: false,
+            link_created: link_retired,
+            link_retired,
+            edge_created: false,
+            membership_live,
+        }
+    }
+
+    /// A linked outcome that did not de-authorize the key is a refusal: the
+    /// binary's exit code is computed from this, and a clean exit on either
+    /// case would read as "these keys are de-authorized".
+    #[test]
+    fn only_a_clean_retire_is_not_a_refusal() {
+        assert!(!LinkStatus::Linked(outcome(true, false)).is_refusal());
+        assert!(LinkStatus::Linked(outcome(true, true)).is_refusal());
+        assert!(LinkStatus::Linked(outcome(false, false)).is_refusal());
+        assert!(LinkStatus::NotAttempted.is_refusal());
+    }
 }
