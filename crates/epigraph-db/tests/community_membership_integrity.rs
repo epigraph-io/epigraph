@@ -382,14 +382,10 @@ async fn a_reader_cannot_readmit_an_evicted_member(pool: PgPool) {
     assert!(!listed(&pool, c, forged).await, "nothing may be written");
 
     // An ADMIN may re-admit, at reader.
-    let out = CommunityRepository::add_member(
-        &as_actor(&pool, admin).await,
-        Some(admin),
-        c,
-        evictee_p,
-    )
-    .await
-    .expect("re-admit");
+    let out =
+        CommunityRepository::add_member(&as_actor(&pool, admin).await, Some(admin), c, evictee_p)
+            .await
+            .expect("re-admit");
     assert_eq!(out, MembershipOutcome::Applied);
     assert_eq!(state(&pool, c, evictee).await, "reader(live)");
 }
@@ -405,8 +401,10 @@ async fn the_deployed_role_cannot_delete_membership_rows(pool: PgPool) {
     let (c, admin, _, reader) = community_with_reader(&pool, "f4-ledger").await;
 
     let code = |r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
-        r.err()
-            .and_then(|e| e.as_database_error().and_then(|d| d.code().map(|c| c.to_string())))
+        r.err().and_then(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+        })
     };
 
     // A reader deleting the admin's row.
@@ -424,11 +422,12 @@ async fn the_deployed_role_cannot_delete_membership_rows(pool: PgPool) {
         .execute(&as_actor(&pool, admin).await)
         .await;
     assert_eq!(code(del).as_deref(), Some("42501"), "admin delete");
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
-        .bind(c)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
+            .bind(c)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(rows, 2, "the roster must be intact");
 
     let stranger = agent(&pool, "f4-ledger-stranger").await;

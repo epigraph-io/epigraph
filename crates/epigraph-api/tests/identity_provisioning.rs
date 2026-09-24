@@ -895,9 +895,10 @@ async fn a_revoked_author_packet_is_a_403_that_leaks_no_ids(pool: PgPool) {
     .await
     .expect("seed ed25519 agent");
     let mut conn = pool.acquire().await.unwrap();
-    let group = epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, author)
-        .await
-        .expect("provision");
+    let group =
+        epigraph_db::repos::agent::AgentRepository::ensure_personal_group(&mut conn, author)
+            .await
+            .expect("provision");
     drop(conn);
     sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE agent_id = $1")
         .bind(author)

@@ -907,21 +907,20 @@ async fn recall_post_embed(
             // Unresolvable ⇒ DROP, never widen, and never mint (#493). The row
             // is written on the principal-stamped transaction that resolved its
             // owner; see `recall::write_recall_audit`.
-            let written = super::recall::write_recall_audit(
-                scoped.as_ref(),
-                principal,
-                |owner_group_id| epigraph_db::NewRecallEvent {
-                    id: event_id,
-                    agent_id: principal,
-                    tool: "recall".to_string(),
-                    query_text,
-                    query_pgvector,
-                    params: params_json,
-                    returned_claim_ids,
-                    owner_group_id: Some(owner_group_id),
-                },
-            )
-            .await;
+            let written =
+                super::recall::write_recall_audit(scoped.as_ref(), principal, |owner_group_id| {
+                    epigraph_db::NewRecallEvent {
+                        id: event_id,
+                        agent_id: principal,
+                        tool: "recall".to_string(),
+                        query_text,
+                        query_pgvector,
+                        params: params_json,
+                        returned_claim_ids,
+                        owner_group_id: Some(owner_group_id),
+                    }
+                })
+                .await;
             match written {
                 Ok(_) => {}
                 Err(super::recall::RecallAuditNotWritten::Unresolved(e)) => {

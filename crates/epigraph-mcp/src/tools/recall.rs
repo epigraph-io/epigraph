@@ -442,9 +442,7 @@ pub(crate) async fn write_recall_audit(
     let id = epigraph_db::RecallEventRepository::log(&mut *tx, build(group))
         .await
         .map_err(RecallAuditNotWritten::Write)?;
-    tx.commit()
-        .await
-        .map_err(RecallAuditNotWritten::Write)?;
+    tx.commit().await.map_err(RecallAuditNotWritten::Write)?;
     Ok(id)
 }
 
