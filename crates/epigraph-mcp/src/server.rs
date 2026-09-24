@@ -772,7 +772,7 @@ impl EpiGraphMcpFull {
     // ── Claims (11 tools) ──
 
     #[tool(
-        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite."
+        description = "Submit an epistemic claim with evidence. The full evidence text is preserved for human audit. Supports all evidence types (empirical 1.0x, statistical 0.9x, logical 0.85x, testimonial 0.6x). Prefer this over memorize when you have a source or data to cite. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
     )]
     async fn submit_claim(
         &self,
@@ -1053,7 +1053,7 @@ impl EpiGraphMcpFull {
     // ── Memory (2 tools) ──
 
     #[tool(
-        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`."
+        description = "Quick-store a memory as a testimonial claim (0.6x evidence weight). For facts you want to recall later. Tags are persisted as claim labels — queryable via `query_claims_by_label`. The claim is authored by this server's agent and owned by that agent's personal group: if an operator has revoked the agent's personal-group membership, the call is refused and writes nothing. It never restores the membership; restoring it is an operator action."
     )]
     async fn memorize(
         &self,
@@ -1559,7 +1559,7 @@ impl EpiGraphMcpFull {
     // ── Batch / Staging / Stats (3 tools) ──
 
     #[tool(
-        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence."
+        description = "Submit multiple claims in a single batch (max 100). Each entry needs content, evidence_data, evidence_type, and optional confidence. Entries are submitted one at a time, exactly as submit_claim, and reported individually (submitted, errors, error_details); a refused entry writes nothing. If an operator has revoked this server's agent's personal-group membership, every entry is refused that way. The membership is never restored; restoring it is an operator action."
     )]
     async fn batch_submit_claims(
         &self,
