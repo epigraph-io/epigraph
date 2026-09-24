@@ -21,3 +21,5 @@ dh.*
 dsn
 .uelock.*
 ueh.*
+.oplock.*
+op.*.err
