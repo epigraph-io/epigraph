@@ -460,12 +460,16 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "middleware/bearer.rs",
-        1,
-        "STRUCTURALLY non-exemptable, not merely unconverted. The single site is Viewer::resolve, \
+        2,
+        "STRUCTURALLY non-exemptable, not merely unconverted. The first site is Viewer::resolve, \
          which BUILDS the viewer every scoped acquire needs; ScopedPool::acquire_as takes the very \
          Viewer this call constructs, so stamping the connection first is circular. Recorded as \
          D-PR17-live-memberships-is-parameterised-not-principal-bound. A shard that 'converts' \
-         this deadlocks the bootstrap rather than fixing a leak.",
+         this deadlocks the bootstrap rather than fixing a leak. The second, beside it and run \
+         concurrently with it, is AgentRepository::operator_actor_pool: migration 102's \
+         `epigraph_operator_actor` SECURITY DEFINER read, which must answer BEFORE there is a \
+         viewer (it decides whether the principal gets one: an operated agent is stdio-only), \
+         reads no tenancy-partitioned row, and returns only the named principal's own link.",
     ),
     (
         "middleware/rate_limit.rs",
