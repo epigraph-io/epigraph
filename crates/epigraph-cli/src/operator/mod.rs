@@ -29,11 +29,16 @@
 //! # Why the pool is built by `ScopedPool::connect_with_options`
 //!
 //! `crates/epigraph-db/tests/no_unmaintained_dsn.rs` keys on pool construction
-//! spellings. This module builds through a spelling that lint recognises as a
-//! maintenance constructor rather than a bare `PgPool`, so the ratchet keeps
-//! seeing it. The privilege check here is stricter than
-//! `epigraph_db::assert_maintenance_privilege` (which is conditioned on row
-//! security being active): it is unconditional.
+//! spellings, and this module uses one it classifies as a maintenance
+//! constructor rather than a bare `PgPool`. THAT LINT DOES NOT SCAN THIS FILE:
+//! its `RUST_ROOTS` are `epigraph-cli/src/bin`, `epigraph-jobs/src`,
+//! `epigraph-api/src/bin` and `epigraph-mcp/src/main.rs`, and library modules
+//! of `epigraph-cli` are outside all four. What keeps this construction honest
+//! is the privilege check below plus `tests/operator_reown.rs`'s DSN tests
+//! (`it_never_falls_back_to_database_url`,
+//! `a_non_maintenance_role_is_refused`), not the lint. The privilege check here
+//! is stricter than `epigraph_db::assert_maintenance_privilege` (which is
+//! conditioned on row security being active): it is unconditional.
 
 pub mod hide;
 pub mod link;
