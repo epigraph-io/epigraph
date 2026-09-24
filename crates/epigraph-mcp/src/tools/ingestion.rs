@@ -338,9 +338,10 @@ async fn ensure_paper_node(
 /// Shared response body for the two queued ingest entry points.
 fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value {
     let mut note = String::from(
-        "DB writes are running as a detached background task. Call check_already_ingested \
-         (or query_paper) with the returned `document_key` to confirm completion before \
-         assuming the write landed.",
+        "DB writes are running as a detached background task; confirm they landed by \
+         query_paper(`document_key`)'s claim_count rising, not with check_already_ingested, \
+         which is already true after ingest_document_spine or any earlier ingest of this \
+         document.",
     );
     if is_synthetic_key(doi) {
         note.push_str(

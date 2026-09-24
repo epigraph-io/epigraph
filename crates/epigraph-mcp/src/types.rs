@@ -772,7 +772,9 @@ pub struct EvaluateWorkflowPromotionParams {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
-    #[schemars(description = "Zero-based index of the step in the workflow")]
+    #[schemars(
+        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+    )]
     pub step_index: usize,
 
     #[schemars(description = "What the workflow plan said to do for this step")]
@@ -790,7 +792,9 @@ pub struct StepExecution {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReportWorkflowOutcomeParams {
-    #[schemars(description = "UUID of the workflow claim to report on")]
+    #[schemars(
+        description = "UUID of the workflow: a workflows-table id (from store_workflow / ingest_workflow / find_workflow), or a legacy flat workflow claim id."
+    )]
     pub workflow_id: String,
 
     #[schemars(description = "true if the workflow succeeded, false if it failed")]
@@ -800,7 +804,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub execution_log: Vec<StepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')"
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Recorded in the evidence row for a legacy flat workflow claim; not stored for a workflows-table id."
     )]
     pub outcome_details: String,
 
@@ -810,14 +814,16 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. Falls back to the workflow's goal if omitted. More specific goal text improves future affinity matching."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
     )]
     pub goal_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeprecateWorkflowParams {
-    #[schemars(description = "UUID of the workflow to deprecate")]
+    #[schemars(
+        description = "UUID of the workflow to deprecate. A hierarchical workflows-table id deprecates only that workflows row, not its thesis or step claims (see the tool description)."
+    )]
     pub workflow_id: String,
 
     #[schemars(
@@ -885,7 +891,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2)."
+        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -913,12 +919,12 @@ pub struct ReportHierarchicalOutcomeParams {
     pub success: bool,
 
     #[schemars(
-        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges so per-step evidence accrues."
+        description = "Per-step execution log. Each step_index is resolved to the step's claim node via `executes` edges and recorded as one behavioral_executions row (no evidence row, no belief change)."
     )]
     pub step_executions: Vec<HierarchicalStepExecution>,
 
     #[schemars(
-        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed')."
+        description = "Summary of what happened (e.g. 'Completed in 45s, all checks passed'). Currently accepted but not stored."
     )]
     pub outcome_details: String,
 
@@ -934,7 +940,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run. More specific goal text improves future affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
     )]
     pub goal_text: Option<String>,
 }
@@ -1040,16 +1046,26 @@ pub struct SubmitDsEvidenceParams {
     pub reliability: Option<f64>,
 
     #[schemars(
-        description = "Combination method: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, Inagaki"
+        description = "Combination method label: Dempster (default), Conjunctive, YagerOpen, \
+                       YagerClosed, DuboisPrade, Inagaki. Validated, stored on the BBA and echoed \
+                       as method_used, but it does NOT change the returned belief: the claim's \
+                       belief is always recomputed by the shared adaptive combine."
     )]
     pub combination_method: Option<String>,
 
     #[schemars(
-        description = "Inagaki gamma parameter (only used with Inagaki method, default 0.5)"
+        description = "Inagaki gamma parameter. Currently has no effect: it is neither stored nor \
+                       used by the belief recompute."
     )]
     pub gamma: Option<f64>,
 
-    #[schemars(description = "Perspective UUID for scoped combination (optional)")]
+    #[schemars(
+        description = "Optional perspective UUID stored on the BBA. It is part of the BBA's \
+                       replacement key: a resubmission by this agent for the same claim, frame and \
+                       perspective_id replaces the earlier BBA, while a different perspective_id adds \
+                       a separate one. It does not scope the combination: the returned belief \
+                       combines every BBA on the claim and frame regardless of perspective."
+    )]
     pub perspective_id: Option<String>,
 
     #[schemars(
@@ -1864,7 +1880,7 @@ pub struct LinkEpistemicParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or cites, a structural edge that moves no belief. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 
@@ -1887,13 +1903,17 @@ pub struct LinkEpistemicBelief {
 
 /// Response for the `link_epistemic` MCP tool.
 ///
-/// `was_created=true` means a new edge row was inserted and belief wiring was
-/// attempted; `false` means an edge with the same `(source, target,
-/// relationship)` already existed (idempotent re-hit — no re-wire). `belief_wired`
-/// is `true` only when the engine actually materialized a BBA and recomputed
-/// the target (engine outcome `Wired`); it is `false` for idempotent re-hits and
-/// for the no-op wiring outcomes (source has no belief interval, vacuous
-/// transfer, or a recompute error). `target_belief` is a best-effort read of the
+/// `was_created=true` means a new edge row was inserted; `false` means an edge
+/// with the same `(source, target, relationship)` — or, for a symmetric
+/// relationship, the same unordered pair — already existed (idempotent re-hit).
+/// Belief wiring is attempted on EVERY call, re-hits included. `belief_wired` is
+/// `true` only when THIS call materialized the edge's BBA and recomputed the
+/// target (engine outcome `Wired`), which a re-hit can do when the edge had no
+/// BBA yet and its source has since gained belief. It is `false` when no belief
+/// moved: the edge was already wired, the source has no belief interval, the
+/// transfer was vacuous, the relationship is structural, or the wire was
+/// refused or failed (e.g. a target owned by a group this server's agent cannot
+/// write) — the edge row stays either way. `target_belief` is a best-effort read of the
 /// target's cached DS columns after the recompute (`None` if the target carries
 /// no belief yet or the read failed).
 #[derive(Debug, Serialize)]

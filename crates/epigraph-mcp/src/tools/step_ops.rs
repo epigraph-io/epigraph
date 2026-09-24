@@ -15,7 +15,10 @@ pub struct AddStepParams {
     pub canonical_name: String,
     /// Step text to append/insert.
     pub step_text: String,
-    /// 0-indexed insertion slot. `None` (or out-of-range) appends.
+    /// 0-indexed insertion slot in the `step_follows` chain. `None` (or
+    /// out-of-range) appends. It does not change plan order: find_workflow,
+    /// find_workflow_hierarchical and the outcome tools list an added step after
+    /// all originally planned steps.
     #[serde(default)]
     pub position: Option<u32>,
 }
