@@ -20,7 +20,8 @@
 #           store_workflow on a non-empty database, transactional event
 #           timestamps, a hidden axis frame inside the DS transaction, and a
 #           server agent revoked in its PERSONAL group but live in a team group
-#           (warm session, and a fresh MCP session)
+#           (warm session, a fresh MCP session, and a restarted process)
+#   BATCH F RECALL (#493): recall by a revoked principal does not revive it
 #
 # add_step and store_workflow are probe-embed.sh's; update_with_evidence and
 # submit_ds_evidence are probe-tools.sh's; report_workflow_outcome and
@@ -73,14 +74,21 @@ echo "### $(q "SELECT 'config: ' || CASE WHEN EXISTS(SELECT 1 FROM pg_policy WHE
 q "TRUNCATE claims, evidence, edges, reasoning_traces, mass_functions, claim_frames,
            recall_events, challenges, events, workflows, papers CASCADE;" >/dev/null 2>&1
 
-rm -f "$SOCK"
-DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
-  --agent-key "$E2E_AGENT_KEY" \
-  --listen "unix:$SOCK" --allow-unauthenticated-http > "$E2E/ue.$LABEL.log" 2>&1 &
-PID=$!
+# Started by a function so the FRESH-PROCESS arm below can restart the server:
+# a restart is the only thing that empties the process-wide agent-id cell
+# (`SessionFactory`), so it is the only way to reach the provisioning call again.
+start_server() {
+  rm -f "$SOCK"
+  DATABASE_URL="$E2E_APP_DSN" RUST_LOG=warn "$BIN" \
+    --agent-key "$E2E_AGENT_KEY" \
+    --listen "unix:$SOCK" --allow-unauthenticated-http >> "$E2E/ue.$LABEL.log" 2>&1 &
+  PID=$!
+  for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 1; done
+  [ -S "$SOCK" ] || { echo "FAIL: socket never appeared"; tail -20 "$E2E/ue.$LABEL.log"; exit 1; }
+}
+: > "$E2E/ue.$LABEL.log"
+start_server
 trap 'kill $PID 2>/dev/null; release_lock' EXIT
-for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 1; done
-[ -S "$SOCK" ] || { echo "FAIL: socket never appeared"; tail -20 "$E2E/ue.$LABEL.log"; exit 1; }
 
 call() { curl -s --unix-socket "$SOCK" "${H[@]}" -H "mcp-session-id: $SID" \
            -X POST http://localhost/mcp -d "$1" | grep '^data: {' | tail -1; }
@@ -384,11 +392,21 @@ ax_doc trg "ue_axis_hidden_$LABEL"
 echo
 echo "=== PERSONAL-REVOKED: server agent revoked in its PERSONAL group, live writer in a TEAM group ==="
 # Hard constraint #3. Review measured personal:admin(revoked) -> (live) and +3/+4
-# claims committed by ingest_document_inline. PASS (warm session) = refused
-# synchronously, stays revoked, +0 claims. The FRESH-session arm measures the
-# per-session PR-09 provisioning in server.rs::agent_id — pre-existing main
-# behaviour, NOT in this unit's scope; it is recorded, not asserted.
+# claims committed by ingest_document_inline. Three arms, each ASSERTED:
+#   warm    the session that already resolved the agent;
+#   fresh   a NEW MCP session of the same process. Batch F F1: the HTTP
+#           transport builds a server per session, and before `SessionFactory`
+#           each one re-ran `ensure_personal_group` (the reviving 077 body);
+#   restart a NEW PROCESS, whose empty agent-id cell reaches the provisioning
+#           call again. Only migration 105 (refuse, never revive) covers it.
+# PASS for each = refused, personal still admin(revoked), +0 claims.
 MA=$(q "SELECT agent_id FROM claims WHERE content='Unit E register probe parent' LIMIT 1")
+new_session() {
+  curl -s --unix-socket "$SOCK" "${H[@]}" -X POST http://localhost/mcp -D "$E2E/ueh.$LABEL.s2" -o /dev/null \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"unit-e-probe-2","version":"1"}}}'
+  SID=$(grep -i '^mcp-session-id:' "$E2E/ueh.$LABEL.s2" | tr -d '\r' | cut -d' ' -f2)
+  call '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+}
 if [ -n "$MA" ]; then
   PG=$(q "SELECT id FROM groups WHERE did_key='did:epigraph:personal:$MA'")
   TG=$(q "INSERT INTO groups (display_name, did_key, public_key, kind) VALUES ('ue team $LABEL', 'did:ue:team:$LABEL:'||gen_random_uuid(), decode(repeat('ab',32),'hex'), 'team') RETURNING id" | head -1)
@@ -397,27 +415,58 @@ if [ -n "$MA" ]; then
   pr_doc() {  # $1 tag
     echo '{"source":{"title":"Unit E personal '"$1"'","doi":"10.9999/unit-e-personal-'"$LABEL-$1"'","source_type":"Paper","authors":[]},"thesis":"Unit E personal thesis '"$1"'","thesis_derivation":"TopDown","sections":[{"title":"S","paragraphs":[{"text":"Unit E personal paragraph '"$1"'","atoms":["Unit E personal atom '"$1"'"],"generality":[3],"confidence":0.8}]}],"relationships":[]}'
   }
-  for arm in warm fresh; do
+  for arm in warm fresh restart; do
     q "UPDATE group_memberships SET revoked_at = now() WHERE agent_id='$MA' AND group_id='$PG' AND revoked_at IS NULL" >/dev/null
     if [ "$arm" = fresh ]; then
-      # A NEW MCP session: the HTTP transport builds a fresh server per session,
-      # so its agent-id cache is empty.
-      curl -s --unix-socket "$SOCK" "${H[@]}" -X POST http://localhost/mcp -D "$E2E/ueh.$LABEL.s2" -o /dev/null \
-        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"unit-e-probe-2","version":"1"}}}'
-      SID=$(grep -i '^mcp-session-id:' "$E2E/ueh.$LABEL.s2" | tr -d '\r' | cut -d' ' -f2)
-      call '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+      new_session
+    elif [ "$arm" = restart ]; then
+      kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
+      start_server
+      new_session
     fi
     CB=$(q "SELECT count(*) FROM claims WHERE agent_id='$MA'")
     echo "   [$arm] before: $(pstate)"
     R=$(tool ingest_document_inline "{\"extraction\":$(pr_doc "$arm")}")
+    ERR=$(echo "$R" | grep -oE '"isError":(true|false)|"code":-?[0-9]+' | head -1)
     echo "   [$arm] $(echo "$R" | grep -oE '"isError":(true|false)|"message":"[^"]{0,140}' | head -2 | tr '\n' ' ')"
     sleep 4
-    echo "   [$arm] after:  $(pstate)   claims by agent +$(( $(q "SELECT count(*) FROM claims WHERE agent_id='$MA'") - CB ))"
+    AFTER=$(pstate); DC=$(( $(q "SELECT count(*) FROM claims WHERE agent_id='$MA'") - CB ))
+    echo "   [$arm] after:  $AFTER   claims by agent +$DC"
+    case "$AFTER" in
+      *"personal:admin(revoked)"*) if [ "$DC" = 0 ] && [ -n "$ERR" ] && [ "$ERR" != '"isError":false' ]; then
+                                     echo "   [$arm] PASS: refused, still revoked, +0"
+                                   else echo "   [$arm] FAIL: not refused or rows written ($ERR, +$DC)"; fi ;;
+      *) echo "   [$arm] FAIL: the personal membership was REVIVED" ;;
+    esac
   done
   q "UPDATE group_memberships SET revoked_at = NULL WHERE agent_id='$MA' AND group_id='$PG'" >/dev/null
   q "DELETE FROM group_memberships WHERE agent_id='$MA' AND group_id='$TG'" >/dev/null
 else
   echo "   SKIP: could not identify the server's own agent"
+fi
+
+echo
+echo "=== RECALL (#493): recall must not revive a revoked principal's personal membership ==="
+# The recall audit resolved its owner group by a blind read on the unstamped
+# pool and then MINTED — the reviving 077 body — on every recall. PASS = the
+# revoked membership is still revoked after a recall, and a recall by a LIVE
+# member still answers.
+if [ -n "$MA" ] && [ -n "$OPENAI_API_KEY" ]; then
+  rstate() { q "SELECT 'live='||count(*) FILTER (WHERE revoked_at IS NULL)||' revoked='||count(*) FILTER (WHERE revoked_at IS NOT NULL) FROM group_memberships WHERE agent_id='$MA' AND group_id='$PG'"; }
+  q "UPDATE group_memberships SET revoked_at = now() WHERE agent_id='$MA' AND group_id='$PG' AND revoked_at IS NULL" >/dev/null
+  echo "   [revoked] before: $(rstate)"
+  R=$(tool recall '{"query":"Unit E register probe parent","limit":3}')
+  echo "   [revoked] recall $(echo "$R" | grep -oE '"isError":(true|false)' | head -1)"
+  sleep 3
+  AFTER=$(rstate); echo "   [revoked] after:  $AFTER"
+  [ "$AFTER" = "live=0 revoked=1" ] && echo "   [revoked] PASS: still revoked" || echo "   [revoked] FAIL: revived by recall"
+  q "UPDATE group_memberships SET revoked_at = NULL WHERE agent_id='$MA' AND group_id='$PG'" >/dev/null
+  R=$(tool recall '{"query":"Unit E register probe parent","limit":3}')
+  OK=$(echo "$R" | grep -oE '"isError":(true|false)' | head -1)
+  echo "   [live] recall $OK hits=$(echo "$R" | grep -o 'claim_id' | wc -l) membership $(rstate)"
+  [ "$OK" = '"isError":false' ] && echo "   [live] PASS: recall still answers for a live member" || echo "   [live] FAIL"
+else
+  echo "   SKIP: needs the server's own agent and OPENAI_API_KEY (recall embeds its query)"
 fi
 
 echo
