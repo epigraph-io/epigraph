@@ -205,3 +205,56 @@ fn request_viewers_stdio_arm_is_documented_as_relying_on_that_gate() {
          arm plan §4.12 specifies."
     );
 }
+
+/// The unknown-tool early return (backlog ee50d10d) must never answer ahead of
+/// the auth gate this file exists to protect.
+///
+/// `call_tool` now returns `unknown_tool_error` for a name that neither the
+/// kernel router nor a federation route owns, instead of letting it fall into
+/// `enforce_tool_scope`'s authz-shaped "no scope mapping". That return sits
+/// ABOVE the `if is_http_call { enforce_tool_scope(..) }` block — it has to,
+/// because the federation branch it lives in has to intercept before the static
+/// gate. Ungated, it would answer an UNAUTHENTICATED HTTP call (reachable:
+/// `main.rs` nests `/mcp` bare when given neither `--jwt-secret` nor
+/// `--allow-unauthenticated-http`, which is the whole premise of this file) and
+/// become a pre-auth tool-name oracle.
+///
+/// The gate `!is_http_call || auth_owned.is_some()` is what stops that:
+/// unauthenticated HTTP falls through to `enforce_tool_scope`'s no-auth branch
+/// exactly as before. Source-lock rather than behavioural for the same reason
+/// as every other test here — no test in this crate synthesizes an
+/// `rmcp::service::RequestContext`.
+#[test]
+fn the_unknown_tool_early_return_is_gated_behind_the_auth_discriminator() {
+    let src = server_rs();
+    let body = call_tool_body(&src);
+
+    let ret = body
+        .find("Self::unknown_tool_error(")
+        .expect("`call_tool` must still report an unroutable name as a ROUTING failure");
+    let gate = body
+        .find("if !is_http_call || auth_owned.is_some() {")
+        .expect(
+            "the unknown-tool early return lost its gate. Ungated it answers \
+             BEFORE `enforce_tool_scope`'s no-auth branch, turning an \
+             unauthenticated HTTP call into a tool-name oracle on the bare \
+             router arm.",
+        );
+
+    assert!(
+        gate < ret,
+        "the gate must PRECEDE the unknown-tool return. Gate is at byte {gate} \
+         and the return is at {ret}."
+    );
+
+    let enforce = body
+        .find("Self::enforce_tool_scope(")
+        .expect("`call_tool` must still call `enforce_tool_scope`");
+    assert!(
+        ret < enforce,
+        "the unknown-tool return is expected ABOVE the static scope gate (it \
+         lives in the federation-interception block). If it moved below, \
+         re-derive whether the gate above is still the control that keeps an \
+         unauthenticated caller out. Return at {ret}, enforce at {enforce}."
+    );
+}

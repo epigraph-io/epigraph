@@ -97,8 +97,18 @@ impl RecallEventRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the insert fails. Callers are
     /// expected to warn and continue rather than propagate.
-    #[instrument(skip(pool, event), fields(tool = %event.tool))]
-    pub async fn log(pool: &PgPool, event: NewRecallEvent) -> Result<Uuid, DbError> {
+    ///
+    /// Generic over the executor so the MCP surfaces can write on the SAME
+    /// transaction, stamped from the querying principal, that resolved the
+    /// owner group: `recall_events_tenancy`'s WITH CHECK requires
+    /// `agent_id = epigraph_principal_id()` for `epigraph_app`, so on an
+    /// unstamped pool connection this insert is refused (batch F review,
+    /// measured on the e2e harness: zero rows written).
+    #[instrument(skip(executor, event), fields(tool = %event.tool))]
+    pub async fn log<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        event: NewRecallEvent,
+    ) -> Result<Uuid, DbError> {
         let hash = event
             .query_pgvector
             .as_ref()
@@ -161,7 +171,7 @@ impl RecallEventRepository {
             decl.visibility_bind(),
             decl.owner_group_bind(),
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.id)

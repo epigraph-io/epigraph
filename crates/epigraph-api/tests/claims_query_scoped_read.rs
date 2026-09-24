@@ -1,6 +1,6 @@
 //! `routes/claims_query.rs::list_claims_query` serves every statement of
-//! `GET /api/v1/claims` on ONE viewer-stamped connection, and both of its paths
-//! suppress on the viewer.
+//! `GET /api/v1/claims` on ONE viewer-stamped connection, and every one of them
+//! suppresses on the viewer.
 //!
 //! # What this file is, in the series
 //!
@@ -26,33 +26,37 @@
 //! scoped.inner()`, the raw arm is FILTERED and unstamped, and reverting any of
 //! the five converted sites is observable.
 //!
-//! # The five sites, and which arm below drives each
+//! # THE FAST/SLOW SPLIT IS GONE. The arm names below outlived it.
 //!
-//! `needs_in_memory_filters` decides the path, and it includes
-//! `methodology.is_some() || evidence_type.is_some()` — so a fired prefetch
-//! FORCES the slow path and `count` can never run alongside a prefetch. The
-//! sites therefore partition:
+//! PR-28 wrote this file against a handler with two paths: a `count` + `list`
+//! fast path, and a slow path that read the 10,000 most-recent rows and filtered
+//! them in Rust. Backlog `2265a67b` deleted the split — every predicate now runs
+//! in SQL through `ClaimRepository::{count_filtered, list_filtered}`, because the
+//! slow path's `total` was the length of a filtered slice of a capped window and
+//! returned an empty set, indistinguishable from a true zero, for any filter
+//! matching only older claims.
 //!
-//! | site | driven by |
+//! **Every arm below still drives the handler and still asserts what it says it
+//! asserts** — these are HTTP-level tests of `list_claims_query`, so they
+//! followed the handler through the change. What the names no longer describe is
+//! WHICH internal path they take: there is one. They are kept, rather than
+//! renamed, because each still selects a distinct PARAMETER SHAPE, and the shape
+//! is what the file is really covering:
+//!
+//! | parameter shape | driven by |
 //! |---|---|
-//! | `count` (no-search shape) | [`the_fast_path_serves_the_viewers_own_group_private_claim`] |
-//! | `list` (no-search shape) | the same |
-//! | `count` + `list` (ILIKE shapes) | [`the_fast_paths_search_shape_still_suppresses`] |
-//! | `list` (slow path) | [`the_slow_path_serves_the_viewers_own_group_private_claim`] |
+//! | no filters (the `FILTER_WHERE` all-`NULL` shape) | [`the_fast_path_serves_the_viewers_own_group_private_claim`] |
+//! | `content_contains` (the `ILIKE` predicate) | [`the_fast_paths_search_shape_still_suppresses`] |
+//! | `truth_min` (a bound predicate) | [`the_slow_path_serves_the_viewers_own_group_private_claim`] |
 //! | `claim_ids_by_methodology` | [`the_methodology_prefetch_narrows_without_dropping_the_viewers_own_claim`] |
 //! | `claim_ids_by_evidence_type` | [`the_evidence_type_prefetch_narrows_without_dropping_the_viewers_own_claim`] |
 //!
-//! Both `list` and `count` carry TWO SQL texts with their own marker, selected
-//! by `content_contains`, and `visibility_lint.rs` checks a marker's SPELLING
-//! rather than its presence per shape. Driving only one shape would leave the
-//! other unpinned, which is why the search arm exists.
-//!
-//! `total == claims.len()` is asserted on the FAST arms only. There it
-//! separates the two sites independently: reverting only `count` gives
-//! `total < len`, reverting only `list` gives `total > len`. On the slow path the
-//! same equality is a tautology — `total` is assigned `claims.len()` after
-//! filtering and before pagination — so asserting it there would look like
-//! evidence and be none.
+//! `total == claims.len()` separates `count_filtered` from `list_filtered`
+//! independently: reverting only the count gives `total != len` in one direction,
+//! reverting only the list in the other. It is no longer a tautology on ANY arm —
+//! under the old slow path `total` was assigned `claims.len()` after filtering,
+//! so the equality there was evidence of nothing. It is now two SQL statements
+//! agreeing, which is the property `2265a67b` is about.
 //!
 //! # What is still NOT proven here
 //!
@@ -186,8 +190,14 @@ async fn the_fast_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
     let (agent, group) = seed_agent_with_group(&pool, "cq-fast-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-fast-theirs").await;
 
-    let mine = seed_group_claim(&pool, agent, group, "fast path: my claim").await;
-    let theirs = seed_group_claim(&pool, stranger, stranger_group, "fast path: their claim").await;
+    let mine = seed_group_claim(&pool, agent, group, "no-filter shape: my claim").await;
+    let theirs = seed_group_claim(
+        &pool,
+        stranger,
+        stranger_group,
+        "no-filter shape: their claim",
+    )
+    .await;
 
     let state = split_state(&pool).await;
     let out = list(&pool, state, agent, base_params()).await;
@@ -208,15 +218,16 @@ async fn the_fast_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
          not present with its content blanked; got {got:?}"
     );
 
-    // `count` and `list` are SEPARATE statements. This equality is what
-    // distinguishes them: reverting only `count` gives total < len, reverting
-    // only `list` gives total > len. Both are seeded well under the default
-    // limit of 20, so pagination cannot explain a difference.
+    // `count_filtered` and `list_filtered` are SEPARATE statements. This
+    // equality is what distinguishes them: reverting only the count gives
+    // total != len in one direction, reverting only the list in the other. Both
+    // are seeded well under the default limit of 20, so pagination cannot
+    // explain a difference.
     assert_eq!(
         out.total,
         out.claims.len(),
-        "the fast path reports `total` from ClaimRepository::count and the rows from \
-         ClaimRepository::list. Two statements that disagree about one viewer's corpus \
+        "`total` comes from ClaimRepository::count_filtered and the rows from \
+         ClaimRepository::list_filtered. Two statements that disagree about one viewer's corpus \
          mean one of them ran on a connection the other did not; got total={} len={}",
         out.total,
         out.claims.len()
@@ -227,9 +238,9 @@ async fn the_fast_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
 /// own marker, selected by `content_contains`; the arm above drives only the
 /// no-search pair.
 ///
-/// `content_contains` does NOT select the path — it is absent from
-/// `needs_in_memory_filters` — so this stays on the fast path and the
-/// `total == len` discrimination still applies.
+/// `content_contains` is `$1` of `FILTER_WHERE`, ANDed with the viewer
+/// predicate in the same clause both statements share, so the `total == len`
+/// discrimination applies here exactly as it does above.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_fast_paths_search_shape_still_suppresses(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-ilike-mine").await;
@@ -282,18 +293,21 @@ async fn the_fast_paths_search_shape_still_suppresses(pool: PgPool) {
     );
 }
 
-/// THE SLOW PATH, which is a different call site of `ClaimRepository::list`
-/// (10_000 / 0, then filtered in memory) and never calls `count` at all.
+/// A BOUND PREDICATE (`truth_min`) alongside the viewer's.
 ///
-/// `truth_min` is the selector: it is a term of `needs_in_memory_filters` and
-/// nothing else about it touches tenancy.
+/// `truth_min` used to be the selector for the in-memory slow path; since
+/// `2265a67b` it is `$2` of `FILTER_WHERE` and runs in SQL beside the viewer
+/// predicate. The arm is kept because that is a different statement shape from
+/// the all-`NULL` one above, and nothing else about `truth_min` touches
+/// tenancy — so a row missing here is the viewer, not the bound.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_slow_path_serves_the_viewers_own_group_private_claim(pool: PgPool) {
     let (agent, group) = seed_agent_with_group(&pool, "cq-slow-mine").await;
     let (stranger, stranger_group) = seed_agent_with_group(&pool, "cq-slow-theirs").await;
 
-    let mine = seed_group_claim(&pool, agent, group, "slow path: my claim").await;
-    let theirs = seed_group_claim(&pool, stranger, stranger_group, "slow path: their claim").await;
+    let mine = seed_group_claim(&pool, agent, group, "bound shape: my claim").await;
+    let theirs =
+        seed_group_claim(&pool, stranger, stranger_group, "bound shape: their claim").await;
 
     let state = split_state(&pool).await;
     let out = list(
@@ -313,15 +327,15 @@ async fn the_slow_path_serves_the_viewers_own_group_private_claim(pool: PgPool) 
     let got = ids(&out);
     assert!(
         got.contains(&mine),
-        "CALIBRATION: the slow path's working-set read is a SECOND call site of \
-         ClaimRepository::list and must serve the viewer's own group-private claim; \
+        "CALIBRATION: a bound predicate must not cost the viewer their own \
+         group-private claim — the bound admits it and the viewer owns it; \
          got {got:?}"
     );
     assert!(
         !got.contains(&theirs),
-        "a stranger's group-private claim must be absent from the slow path's working \
-         set too — the in-memory filters below it only ever NARROW, so anything the \
-         read admits is served; got {got:?}"
+        "a stranger's group-private claim must be absent under this shape too — \
+         `FILTER_WHERE` ANDs the bound with the viewer predicate, so neither can \
+         excuse the other; got {got:?}"
     );
 }
 
@@ -530,7 +544,8 @@ async fn a_failed_statement_answers_with_an_opaque_body_not_the_driver_error(poo
 }
 
 /// `methodology = "deductive"` and nothing else — the shape that fires the
-/// prefetch and therefore forces the slow path.
+/// prefetch, whose resolved id set becomes the `ids` field of
+/// `ClaimListFilter` (`$9`, `id = ANY(...)`) rather than an in-memory `retain`.
 fn methodology_params() -> ClaimQueryParams {
     ClaimQueryParams {
         methodology: Some("deductive".to_string()),

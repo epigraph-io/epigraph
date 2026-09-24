@@ -552,9 +552,27 @@ async fn tenancy_tier_has_no_default(pool: PgPool) {
     assert_eq!(default, None, "tenancy_tier must have no column_default");
 }
 
-/// Every seeded type is classified, and the split is the measured 6/1/16.
+/// Every seeded type is classified, and the split is the measured 6/1/17.
+///
+/// # 16 -> 17 derived, and it is a claim about migration 101, not a slackening
+///
+/// The register was written over the 23 types migration 054 seeded. Migration
+/// `101_seed_method_entity_type.sql` adds a 24th CORE type, `method`, so it
+/// enters this histogram — which is the ratchet working exactly as its own
+/// failure message instructs ("A new core type added by a later migration must
+/// classify itself and bump this"). It classified itself `'derived'`:
+/// `public.methods` is absent from migration 062's `tier_a` array, so it has
+/// neither `owner_group_id` nor `visibility` and `'columns'` would be a false
+/// claim — `routes/admin.rs`'s registration handler refuses that tier for a
+/// table lacking them, and `'derived'` is the bucket 069 swept every other
+/// non-tier-A kernel type into.
+///
+/// **`columns` and `identity` are UNCHANGED, and that is the load-bearing half
+/// of this edit.** Those are the two tiers that assert a table carries tenancy
+/// of its own; a bump there would be a new root, not a new leaf. Only the
+/// `derived` count moved.
 #[sqlx::test(migrations = "../../migrations")]
-async fn all_23_core_types_are_classified(pool: PgPool) {
+async fn all_24_core_types_are_classified(pool: PgPool) {
     let unclassified: i64 = sqlx::query_scalar(
         "SELECT count(*)::bigint FROM entity_types WHERE tenancy_tier = 'unclassified'",
     )
@@ -592,12 +610,13 @@ async fn all_23_core_types_are_classified(pool: PgPool) {
         histogram,
         vec![
             ("columns".to_string(), 6),
-            ("derived".to_string(), 16),
+            ("derived".to_string(), 17),
             ("identity".to_string(), 1),
         ],
-        "the 23 types seeded by migration 054 must split 6 columns / 16 derived / \
-         1 identity. A new core type added by a later migration must classify itself \
-         and bump this."
+        "the 23 types seeded by migration 054, plus `method` from migration 101, must \
+         split 6 columns / 17 derived / 1 identity. A new core type added by a later \
+         migration must classify itself and bump this — and a bump in `columns` or \
+         `identity` is a new tenancy ROOT and needs review, not a number change."
     );
 
     // The six `columns` types are named, not merely counted: a migration that

@@ -105,12 +105,30 @@ impl MassFunctionRepository {
     ///
     /// Uses ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id) to update.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `mass_functions` is tier-A with 077's strict
+    /// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` and no
+    /// orphan `*_privacy` policy to fall back on, so on an unstamped application
+    /// session this INSERT is refused with `42501`. That is why
+    /// `mass_functions`' last successful production write was 2026-09-22 and why
+    /// it stayed **0** through every e2e run. A stamped connection is a
+    /// transaction (`ScopedPool::begin_as`), which a `&PgPool` parameter cannot
+    /// accept; `&PgPool` and `&mut PgConnection` both satisfy
+    /// [`sqlx::PgExecutor`], so [`Self::store`] and the CLI callers compile
+    /// unchanged.
+    ///
+    /// The ON CONFLICT is what makes a stamped caller's RETRY safe after a
+    /// failure further down its own pipeline: the row is keyed on
+    /// `(claim_id, frame_id, source_agent_id, perspective_id)` and re-storing the
+    /// same BBA updates it rather than combining mass twice.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, masses_json))]
-    pub async fn store_with_perspective(
-        pool: &PgPool,
+    #[instrument(skip(executor, masses_json))]
+    pub async fn store_with_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         source_agent_id: Option<Uuid>,
@@ -151,7 +169,7 @@ impl MassFunctionRepository {
         .bind(evidence_type)
         .bind(locality_tag)
         .bind(evidence_id)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row.0)
@@ -431,9 +449,9 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn delete_for_perspective(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn delete_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         perspective_id: Uuid,
     ) -> Result<u64, DbError> {
         let result = sqlx::query(
@@ -443,7 +461,7 @@ impl MassFunctionRepository {
             "#,
         )
         .bind(perspective_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected())
@@ -483,8 +501,11 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn clear_claim_belief(pool: &PgPool, claim_id: Uuid) -> Result<u64, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn clear_claim_belief<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        claim_id: Uuid,
+    ) -> Result<u64, DbError> {
         let result = sqlx::query(
             r#"
             UPDATE claims
@@ -497,7 +518,7 @@ impl MassFunctionRepository {
             "#,
         )
         .bind(claim_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(result.rows_affected())
@@ -514,9 +535,9 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn update_claim_belief(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn update_claim_belief<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         cached: CachedBelief,
     ) -> Result<(), DbError> {
@@ -549,7 +570,7 @@ impl MassFunctionRepository {
         .bind(mass_on_missing)
         .bind(claim_id)
         .bind(cached.belief_frame_id)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())
@@ -569,16 +590,16 @@ impl MassFunctionRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn update_claim_classification(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn update_claim_classification<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         classification: &str,
     ) -> Result<(), DbError> {
         sqlx::query("UPDATE claims SET classification = $1, updated_at = NOW() WHERE id = $2")
             .bind(classification)
             .bind(claim_id)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(())
     }

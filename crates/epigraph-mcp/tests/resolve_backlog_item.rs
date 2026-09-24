@@ -24,12 +24,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 mod common;
-use common::build_test_server;
+use common::build_scoped_test_server;
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let server = build_test_server(pool.clone());
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Author the backlog claim through the MCP server's own signer so the
     // owner-or-admin check inside resolve_backlog_item succeeds. (The
@@ -45,6 +45,7 @@ async fn resolve_backlog_item_creates_resolution_and_patches_original(pool: PgPo
             original_id: original.as_uuid().to_string(),
             resolution_content: "Fixed by replacing the index with a GIN BTREE.".to_string(),
             methodology: None,
+            basis_claim_ids: Vec::new(),
         },
         None,
     )

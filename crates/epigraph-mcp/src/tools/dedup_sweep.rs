@@ -226,11 +226,20 @@ pub async fn sweep_semantic_duplicates(
                 // errors land in `failures` alongside the mark failures; they
                 // do not undo an already-committed collapse, so `pairs_marked`
                 // still counts the pair.
+                // UNSTAMPED, for the same PR-17 reason recorded in
+                // `cdst_maintenance.rs`: `sweep_semantic_duplicates` is a
+                // MAINTENANCE tool, hard-gated off before the pool is consulted,
+                // and its target is the maintenance connection. The acquire below
+                // is a mechanical consequence of the engine signature change.
+                let mut conn = match server.pool.acquire().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("dedup sweep: could not acquire: {e}");
+                        continue;
+                    }
+                };
                 match epigraph_engine::retraction_cascade::mark_duplicate_with_cascade(
-                    &server.pool,
-                    viewer,
-                    *dup,
-                    *survivor,
+                    &mut conn, viewer, *dup, *survivor,
                 )
                 .await
                 {

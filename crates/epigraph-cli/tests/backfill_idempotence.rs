@@ -546,6 +546,70 @@ async fn an_author_with_no_personal_group_is_given_one(pool: PgPool) {
     );
 }
 
+/// A claim author whose personal membership is REVOKED is NOT revived by a run
+/// of the backfill (batch F).
+///
+/// The previous copy of the membership statement was narrowed to "no LIVE
+/// membership" and ended in `DO UPDATE SET revoked_at = NULL`, so exactly this
+/// author — revoked, no live row — was the one it revived. It now inserts only
+/// where the author has no row of any state, the contract migration 105 gives
+/// `epigraph_ensure_personal_group`. The claim is still stamped: the group row
+/// exists and owns it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_author_is_not_revived_by_the_backfill(pool: PgPool) {
+    let agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(vec![12u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ('personal:' || $1::text, 'did:epigraph:personal:' || $1::text, ''::bytea, \
+                 'personal', $1) RETURNING id",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed personal group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role, \
+                                        revoked_at) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin', now())",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("seed revoked membership");
+    let claim = seed_undeclared_claim(&pool, agent, "a revoked author's claim").await;
+
+    let (code, stderr) = run_backfill(&pool, &["run"]).await;
+    assert_eq!(code, 0, "run: {stderr}");
+
+    let (live, revoked): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE revoked_at IS NULL), \
+                count(*) FILTER (WHERE revoked_at IS NOT NULL) \
+           FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("membership state");
+    assert_eq!(
+        (live, revoked),
+        (0, 1),
+        "the backfill must leave a revoked membership revoked"
+    );
+    let (owner, _vis) = tenancy_of(&pool, claim).await;
+    assert_eq!(
+        owner, group,
+        "the claim is still owned by the author's personal group"
+    );
+}
+
 /// The backfill REFUSES to run if migration 070 is not armed.
 ///
 /// The backfill relies on arm (d) to reach the 17 claim-derived tables. Without

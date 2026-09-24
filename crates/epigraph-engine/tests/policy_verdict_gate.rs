@@ -17,7 +17,7 @@ use epigraph_db::repos::match_candidate::MatchCandidateRepo;
 mod fixture;
 use epigraph_engine::matching::policy::{Policy, PolicyAction};
 use epigraph_engine::matching::scorer::MatchFeatures;
-use epigraph_engine::matching::verifier::Verdict;
+use epigraph_engine::matching::verifier::{Verdict, REJECTED_RELATIONSHIP};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -86,7 +86,7 @@ fn verdict(a: Uuid, b: Uuid, relationship: &str, rationale: &str) -> Verdict {
 /// Night 2: the nightly `--dry-run` sweep re-touches the same pair (it reaches
 /// `Policy::act` on every run; `--dry-run` only clears `auto_promote`, which
 /// gates the *edge* write, not the row write) and the verifier now answers
-/// `derives_from` → `MatchVerdict::Distinct`. Before the fix, `patch_verdict`
+/// an explicit rejection → `MatchVerdict::Distinct`. Before the fix, `patch_verdict`
 /// rewrote the decided row's verdict to `distinct`, destroying the record of
 /// what the human actually approved — and, on prod, leaving 6 `CORROBORATES`
 /// edges whose candidate row no longer says `contradicts` so the polarity
@@ -135,7 +135,11 @@ async fn act_does_not_rewrite_the_verdict_of_a_decided_candidate(pool: PgPool) {
         .await
         .expect("set_status");
 
-    // Night 2 — the verifier now answers `derives_from` (→ Distinct → Reject).
+    // Night 2 — the verifier now explicitly REJECTS the pair (→ Distinct →
+    // Reject). Named via `REJECTED_RELATIONSHIP`: this used to be spelled
+    // `"derives_from"`, which reached `Distinct` only because that vocabulary
+    // string had no arm (issue #388). It now maps to `Overlapping`, so the
+    // literal would no longer express "the verifier said no".
     let policy2 = Policy::new(pool.clone(), repo.clone(), Uuid::new_v4(), false);
     policy2
         .act(
@@ -146,7 +150,7 @@ async fn act_does_not_rewrite_the_verdict_of_a_decided_candidate(pool: PgPool) {
             Some(verdict(
                 a,
                 b,
-                "derives_from",
+                REJECTED_RELATIONSHIP,
                 "verifier returned no verdict for this pair",
             )),
         )
@@ -213,7 +217,7 @@ async fn act_still_updates_the_verdict_of_an_undecided_candidate(pool: PgPool) {
             a,
             b,
             &features(0.30),
-            Some(verdict(a, b, "derives_from", "unrelated")),
+            Some(verdict(a, b, REJECTED_RELATIONSHIP, "unrelated")),
         )
         .await
         .expect("first act");

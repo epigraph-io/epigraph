@@ -1018,6 +1018,105 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          report success. Nothing crosses to the caller — the return value is the row COUNT, and \
          ids and content are re-filtered under the actor's own viewer by `visible_previews`.",
     ),
+    // ── Unit E (R3 release gate). The `_conn` siblings the ingest executor and
+    // the DS/consolidate conversions needed so their writes can ride ONE stamped
+    // transaction. Each is the pool-taking original's body, moved; the pool form
+    // now delegates. Every one is a WRITE whose control is the connection's
+    // stamped GUCs evaluated by the table's `WITH CHECK`, the argument
+    // `update_labels_conn` states — except the three group_membership.rs READS
+    // at the end, which state their own.
+    (
+        "agent.rs",
+        "create_conn",
+        "WRITE. INSERT INTO `agents` plus its best-effort `agent.registered` event. `agents` is \
+         not tenant-partitioned (authorship must render on a public claim; migration 077's policy \
+         on it admits the provisioning INSERT), so there is no read predicate to splice. The \
+         event emit rides `publish_or_log_conn`'s SAVEPOINT, because a swallowed failure inside \
+         a caller's transaction would otherwise surface as a silent ROLLBACK at COMMIT.",
+    ),
+    (
+        "claim.rs",
+        "consolidate_conn",
+        "WRITE. `ClaimRepository::consolidate`'s body, moved so `consolidate_claims` can run it \
+         inside a transaction stamped from the acting agent. Its reads (`FOR UPDATE` lock of the \
+         sources, the edge-migration candidate scan, the idempotency probe) are VISIBILITY-EXEMPT \
+         write-path reads of rows it is about to mutate; `claims_tenancy`'s USING and WITH CHECK \
+         on the stamped connection are what authorise them (a private foreign source is \
+         invisible to the lock and refuses with NotFound; a public foreign one fails WITH CHECK).",
+    ),
+    (
+        "claim.rs",
+        "create_conn",
+        "WRITE. `ClaimRepository::create`'s body on a caller's connection, so `ingest_document`'s \
+         content-addressed atoms ride the document walk's stamped transaction. Its \
+         `content_hash` dedup probe is the existing VISIBILITY-EXEMPT write-path read; the \
+         INSERT is authorised by claims_tenancy's WITH CHECK, and the `claim.created` event rides \
+         `publish_or_log_conn`'s SAVEPOINT.",
+    ),
+    (
+        "claim.rs",
+        "set_properties_conn",
+        "WRITE. `UPDATE claims SET properties` by primary key on a claim the same transaction \
+         just created — the ingest walk's hierarchy metadata. Authorised by claims_tenancy's \
+         WITH CHECK; `rows_affected() == 0` stays an error, which on a stamped connection is \
+         what keeps a USING-hidden target from reading as success.",
+    ),
+    (
+        "claim.rs",
+        "create_with_id_if_absent_conn",
+        "WRITE. `INSERT INTO claims ... ON CONFLICT (id) DO NOTHING` for the ingest paths' \
+         deterministic ids, plus the SAVEPOINT-wrapped `claim.created` event. Same argument as \
+         `update_labels_conn`: authorised by claims_tenancy's WITH CHECK on the stamped \
+         connection, not by a read predicate.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_with_repair_conn",
+        "WRITE. `mark_duplicate_with_repair`'s body on a caller's connection; `begin()` inside it \
+         is a SAVEPOINT there. Its reads are the existence/lock probes of the two claims it is \
+         about to mutate, authorised by claims_tenancy on the caller's stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_not_exists_conn",
+        "WRITE. `create_if_not_exists` on a caller's connection so an ingest's edges ride the \
+         same transaction as the claims they join. Its dedup probe is the VISIBILITY-EXEMPT \
+         write-path read `create_or_get` already documents (it must see an existing edge \
+         regardless of who asks, or the get half becomes a duplicate create); the INSERT is \
+         authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "group_membership.rs",
+        "count_own_revoked_rows_conn",
+        "READ of `group_memberships`, and deliberately viewer-less: it is an AUTHORITY BOOTSTRAP \
+         read, run before any viewer with write authority exists, on a connection stamped with \
+         the agent as PRINCIPAL. The filter is migration 077's own-row arm (`agent_id = \
+         epigraph_principal_id()`), which admits only that agent's rows — a spliced viewer \
+         predicate could only narrow it to the same set. It returns a COUNT, never rows, and \
+         its one caller is `system_agent_write_authority`, which refuses to provision when it is \
+         non-zero.",
+    ),
+    (
+        "group_membership.rs",
+        "visible_personal_group_conn",
+        "READ of `groups` by `did_key`, the pure-read half of `personal_group_of` (which mints on \
+         a miss and is registered above for that reason). Viewer-less for the same bootstrap \
+         reason as `count_own_revoked_rows_conn`: groups_tenancy on the caller's stamped \
+         connection is the filter, and 'invisible here' is exactly the answer the caller needs \
+         (no LIVE membership). Returns one id or None.",
+    ),
+    (
+        "group_membership.rs",
+        "session_can_write_group_conn",
+        "READ of NO table: it evaluates `$1 = ANY(epigraph_writable_groups())` over the \
+         caller's stamped connection, i.e. the `epigraph.writable_group_ids` GUC (migration 067), \
+         which is the exact predicate migration 077's `WITH CHECK (owner_group_id = \
+         ANY(epigraph_writable_groups()))` applies to every write on that connection. There is \
+         no FROM for a viewer marker to splice into, and a `&Viewer` would be the set a stamp \
+         was COMPUTED from, not the set the connection CARRIES — the question is the latter. \
+         Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
+         `IngestTx::owner_decl`, which refuses the ingest when it is false.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
@@ -1170,6 +1269,61 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── THE THREE WRITES. Every other entry in this register is a READ with
+    // nothing to filter; these are the first writes, and the argument is a
+    // different one, so it is stated in full rather than borrowed.
+    (
+        "trace.rs",
+        "create",
+        "INSERT INTO `reasoning_traces`. A WRITE, which is what makes this entry different in          kind from every read above: the control on a write is not an in-query viewer predicate          but migration 077's `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,          evaluated by PostgreSQL against the CONNECTION's session GUCs. A `&Viewer` parameter          here would be spent on nothing -- `Viewer::splice` has no marker to fill on an INSERT          with no FROM -- while `Viewer::splice_write` is PR-16's, not this change's. WHY THE          EXECUTOR MOVED: the only connection that can satisfy that `WITH CHECK` is one stamped          by `ScopedPool::begin_as`, which hands back a transaction; a `&PgPool` parameter made          this function unreachable from the one connection shape that works, which is why every          MCP `reasoning_traces` INSERT failed with `42501` once the deployed DSN moved to          `epigraph_app`. `rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`          is the pin on both halves (arm 1 refuses unstamped, arm 3 admits author-stamped).          SCOPE: the executor widened, the SQL is byte-identical and was not re-derived.",
+    ),
+    (
+        "evidence.rs",
+        "create",
+        "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "edge.rs",
+        "create",
+        "INSERT INTO `edges`. Same write-side argument as the two above. It moved because a          verb-edge (`AUTHORED`, `DERIVED_FROM`, `HAS_TRACE`) is emitted ABOUT a row the same          submission just wrote: once that row's INSERT lives in a transaction, an edge emitted          on a different connection points at a row no other session can see yet. NOTE FOR A          CALLER PASSING A TRANSACTION, which the function's own doc also carries: a failed          statement aborts the whole PostgreSQL transaction, so `let _ = create(...)` does NOT          preserve best-effort semantics there -- it defers the failure to COMMIT as          `current transaction is aborted` with the cause gone.          `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort` wraps it in a SAVEPOINT          for exactly that reason. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "community.rs",
+        "add_member",
+        "ONE statement, `SELECT public.epigraph_community_add_member($1, $2, $3)` (migration \
+         106, batch F). A WRITE, and its authorization is neither an in-query viewer predicate \
+         nor the caller's `WITH CHECK`: the SECURITY DEFINER function takes the actor from the \
+         CONNECTION's stamped `epigraph_principal_id()` (a differing `acting_agent` is DENIED \
+         unless the session is `epigraph_bypass()`), locks the group's roster and `groups` row, \
+         and decides under the lock. A `&Viewer` here would be spent on nothing -- there is no \
+         FROM to splice -- and the executor is generic precisely so the API route can pass the \
+         transaction `ScopedPool::begin_as` stamped from its viewer, which is what the function \
+         reads the actor from. Pinned as `epigraph_app` by \
+         `community_membership_integrity.rs`.",
+    ),
+    (
+        "community.rs",
+        "remove_member",
+        "ONE statement: `epigraph_community_remove_member` (migration 106) in a CTE, plus the \
+         `community_members` DELETE, run as the CALLER only when the function answered \
+         'applied' (the definer's owner holds no DELETE, per 070). Same argument as `add_member` \
+         above: the actor comes from the connection's stamped principal, the rule (owner leaves, \
+         live admin evicts, never the last admin) runs under the roster lock inside the definer, \
+         and `community_members` carries no RLS and no tenancy columns to filter. Pinned as \
+         `epigraph_app` by `community_membership_integrity.rs`.",
+    ),
+    (
+        "recall_event.rs",
+        "log",
+        "ONE INSERT INTO `recall_events` with an explicit `(visibility, owner_group_id)` \
+         declaration; a WRITE with no FROM for a viewer splice. Generic since batch F so the MCP \
+         recall surfaces can write it on the transaction `ScopedPool::begin_as` stamped from the \
+         request principal (`tools/recall.rs::write_recall_audit`): `recall_events_tenancy`'s \
+         WITH CHECK admits an `epigraph_app` insert only when `agent_id = \
+         epigraph_principal_id()`, so on the unstamped pool every audit row was refused. The \
+         engine's agent-less library path still passes its pool. Pinned by \
+         `epigraph-mcp/tests/recall_audit_wiring.rs::the_audit_row_is_not_written_on_the_unstamped_pool`.",
+    ),
     (
         "cluster_run.rs",
         "latest",
@@ -1373,6 +1527,190 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          shard 7 widened the executor only. The SQL, its two binds and the projected row shape \
          are unchanged. REACH IS WIDER THAN MOTIVATION: three other production call sites, all \
          in `epigraph-mcp/src/tools/rdf.rs`, still pass `&PgPool` and were not edited.",
+    ),
+    // ── FIVE MORE WRITES, from the conversion of the MCP tools PR #494 left
+    // unconverted. Same argument as the three writes at the top of this
+    // register — the control on a write is migration 077's `WITH CHECK`
+    // evaluated against the CONNECTION's session GUCs, not an in-query viewer
+    // predicate — so each entry below states only what is specific to it.
+    (
+        "challenge.rs",
+        "create",
+        "INSERT INTO `challenges`. A WRITE, so its control is migration 077's \
+         `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))` evaluated against the \
+         connection's session GUCs, and a `&Viewer` here would be spent on nothing: the \
+         statement is an INSERT with no FROM, so `Viewer::splice` has no marker to fill. WHY THE \
+         EXECUTOR MOVED: `challenges` carries NO orphan `*_privacy` policy, so unlike `claims` / \
+         `evidence` / `edges` it is refused with `42501` on an unstamped session in PRODUCTION as \
+         well as on a clean migrate — MEASURED with the real binary as `epigraph_app` on both \
+         schema configurations, `challenge_claim` returning `new row violates row-level security \
+         policy for table \"challenges\"` and writing nothing. The only connection that can \
+         satisfy that check comes from `ScopedPool::begin_as`, which hands back a transaction. \
+         WHOSE group: the row is claim-derived, so 074's `epigraph_derived_require_tenancy` fills \
+         its tenancy from the CHALLENGED CLAIM and 070 arm (c) re-stamps it unconditionally — the \
+         check is about the claim's owning group, not the challenger's, and \
+         `tool_write_tables_require_a_stamp.rs` pins all three directions of that. SCOPE: the \
+         executor widened, the SQL is byte-identical and was not re-derived.",
+    ),
+    (
+        "frame.rs",
+        "assign_claim",
+        "INSERT INTO `claim_frames` (ON CONFLICT DO UPDATE). A write with the same control as the \
+         entries above, and the same absence of an orphan `*_privacy` policy to fall back on: \
+         `submit_ds_evidence` was MEASURED returning `new row violates row-level security policy \
+         for table \"claim_frames\"` on BOTH schema configurations, which is why `claim_frames` \
+         stayed empty in production. The executor moved so this assignment and the BBA that gives \
+         it meaning can share ONE stamped transaction — a frame membership with no mass function \
+         moves no belief, and a BBA whose claim is not assigned to the frame is unreachable from \
+         `recompute_claim_belief_on_frame`'s enumeration. Tenancy is inherited from the parent \
+         claim by 074/070, exactly as for `challenge.rs::create`. SCOPE: executor only; the SQL \
+         is unchanged.",
+    ),
+    (
+        "mass_function.rs",
+        "store_with_perspective",
+        "INSERT INTO `mass_functions` (ON CONFLICT on `(claim_id, frame_id, source_agent_id, \
+         perspective_id)` DO UPDATE). Same write-side control as the entries above. This is the \
+         table whose EMPTINESS was the original symptom: its last successful production write was \
+         2026-09-22 and it stayed 0 through every e2e run, so every `supports` / `refutes` edge \
+         created since the deployed DSN moved to `epigraph_app` moved NO belief mass. The \
+         executor moved so it can join `frame.rs::assign_claim` in one author-stamped \
+         transaction. The ON CONFLICT is also what makes a caller's RETRY safe after a failure \
+         further down its own pipeline — the same BBA is re-stored rather than combined twice — \
+         which is why this half was convertible ahead of the pool-bound DS recompute it feeds. \
+         SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "claim.rs",
+        "deprecate_claim",
+        "UPDATE `claims` SET `is_current = false`, `truth_value = 0.05`, `embedding = NULL`. A \
+         write, so the control is `claims_tenancy`'s `WITH CHECK` against the connection's GUCs; \
+         a `&Viewer` would be spendable only through `splice_write`, which is PR-16's marker and \
+         not this change's, and the UPDATE is by primary key. WHY THE EXECUTOR MOVED: \
+         `deprecate_workflow` calls this once per node while CASCADING over a variant tree, so a \
+         refusal partway through left a HALF-DEPRECATED hierarchy — some variants flipped, some \
+         still current, and `find_workflow_hierarchical` returning the ones that were missed. One \
+         transaction for the whole cascade is what removes that state, and a `&PgPool` parameter \
+         cannot express it. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "workflow.rs",
+        "set_truth_value",
+        "UPDATE `workflows` SET `truth_value`. THE ONE ENTRY HERE THAT IS NOT ABOUT A REFUSAL, \
+         and the distinction is measured rather than assumed: at migration head 101 `workflows` \
+         has `relrowsecurity` and `relforcerowsecurity` both FALSE, no policy, and no entry in \
+         migration 062's `tier_a` array — so unlike the `claims` UPDATE it cascades from, this \
+         statement is NOT refused on an unstamped session and a `&Viewer` would have nothing to \
+         filter on either. The executor moved for COHESION: `deprecate_workflow` flips the flat \
+         claim and this hierarchical row as two halves of ONE deprecation, and a `claims` row \
+         marked `is_current = false` whose `workflows` row keeps its truth value is exactly the \
+         split the cascade exists to prevent — `find_workflow_hierarchical` reads the half that \
+         was missed. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    // ── Unit E (R3 release gate). Every entry below was a viewer-less `&PgPool`
+    // function before this branch; ONLY its executor widened, so the ingest
+    // executor's plan walk and the DS belief chain can run on ONE stamped
+    // transaction. The SQL of each is unchanged. Writes rest on the
+    // `trace.rs::create` argument above (the control is the stamped
+    // connection's `WITH CHECK`); reads say what they read.
+    (
+        "agent.rs",
+        "get_by_public_key",
+        "READ of `agents` by public key. `agents` is not tenant-partitioned — authorship must \
+         render on a public claim, so its read policy admits every row — and the lookup is the \
+         get half of an ingest's get-or-create, which must find the row whoever asks. Widened \
+         so the lookup rides the same transaction as the create it guards.",
+    ),
+    (
+        "edge.rs",
+        "is_in_force",
+        "READ of one `edges` row by primary key, returning only whether it is in force. Its \
+         callers are the DS edge-factor wiring deciding whether to fire on an edge the SAME \
+         transaction just created or fetched; the edge's authority was decided by the \
+         statement that produced its id, and `edges_tenancy` on the stamped connection still \
+         backstops the read.",
+    ),
+    (
+        "frame.rs",
+        "create",
+        "WRITE into `frames`, one of migration 077 section 2b's instance-wide REGISTRIES whose \
+         WITH CHECK carries the static `TenancyDecl::instance_wide()` arm. Widened so \
+         `ensure_binary_frame` can run inside the DS wiring's stamped transaction.",
+    ),
+    (
+        "frame.rs",
+        "create_refinement",
+        "WRITE into `frames` (a refinement row); same instance-wide REGISTRY argument as \
+         `frame.rs::create` — the static WITH CHECK arm admits it, and there is no tenant \
+         content to filter.",
+    ),
+    (
+        "frame.rs",
+        "get_intra_evidence_locality_factor",
+        "READ of one `frames` row's property by primary key — registry configuration consumed \
+         by the combination arithmetic, not tenant content. Widened to ride the DS wiring's \
+         transaction.",
+    ),
+    (
+        "frame.rs",
+        "get_per_frame_evidence_type_weights",
+        "READ of one `frames` row's property by primary key; same argument as \
+         `get_intra_evidence_locality_factor`.",
+    ),
+    (
+        "mass_function.rs",
+        "clear_claim_belief",
+        "WRITE: `UPDATE claims` clearing the cached belief columns. Authorised by claims_tenancy's \
+         WITH CHECK on the caller's stamped connection, like `update_claim_belief`.",
+    ),
+    (
+        "mass_function.rs",
+        "delete_for_perspective",
+        "WRITE: DELETE from `mass_functions` for one perspective, the retraction half of a \
+         re-combination. Authorised by the table's policy on the caller's stamped connection.",
+    ),
+    (
+        "mass_function.rs",
+        "update_claim_belief",
+        "WRITE: `UPDATE claims SET belief/plausibility/...`, the statement \
+         `submit_ds_evidence` was refused at on a clean schema. MEASURED as `epigraph_app`: \
+         unstamped -> row-level security refusal; stamped from the claim's owner -> UPDATE 1. \
+         Widened so the BBA and the belief it implies commit as one unit.",
+    ),
+    (
+        "mass_function.rs",
+        "update_claim_classification",
+        "WRITE: `UPDATE claims SET classification`, followed by a mass_functions COUNT that \
+         already carries the `{VISIBILITY:mass_functions}` marker. Same WITH CHECK argument as \
+         `update_claim_belief`.",
+    ),
+    (
+        "perspective.rs",
+        "ensure_edge_perspective",
+        "WRITE: idempotent INSERT INTO `perspectives` for an edge-factor BBA's perspective. \
+         Authorised by the table's WITH CHECK on the caller's stamped connection; widened so it \
+         rides the DS wiring's transaction.",
+    ),
+    (
+        "perspective.rs",
+        "ensure_evidence_perspective",
+        "WRITE: idempotent INSERT INTO `perspectives` for an evidence BBA's perspective; same \
+         argument as `ensure_edge_perspective`.",
+    ),
+    (
+        "workflow.rs",
+        "find_root_by_canonical",
+        "READ of `workflows` by `(canonical_name, generation)`. `workflows` has \
+         `relrowsecurity` and `relforcerowsecurity` both FALSE and no policy (measured at head \
+         101), so there is nothing for a viewer to filter; it is the ingest executor's \
+         idempotency gate and must see every row. Widened to ride the plan walk's transaction.",
+    ),
+    (
+        "workflow.rs",
+        "insert_root",
+        "WRITE: `INSERT INTO workflows ... ON CONFLICT (canonical_name, generation) DO NOTHING`. \
+         `workflows` has no RLS (see `find_root_by_canonical`); widened for COHESION, so a \
+         workflow row cannot survive the rollback of the plan walk that wrote it.",
     ),
 ];
 

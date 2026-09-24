@@ -37,7 +37,13 @@ async fn wire_supports(pool: &sqlx::PgPool, agent: Uuid, source: Uuid, target: U
     .await
     .expect("create edge");
     let outcome = epigraph_engine::edge_factor::auto_wire_ds_for_edge(
-        pool, &viewer, edge_id, agent, source, target, "supports",
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        edge_id,
+        agent,
+        source,
+        target,
+        "supports",
     )
     .await
     .expect("auto-wire edge factor");
@@ -220,11 +226,17 @@ async fn dedup_route_reports_and_applies_the_belief_cascade() {
     // The inherited supporter is visible in the survivor's cache, and the
     // retired duplicate no longer claims a belief it lost the evidence for.
     let viewer = fixture::public_viewer(&pool).await;
-    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(&pool, &viewer)
-        .await
-        .expect("binary frame");
+    let frame_id = epigraph_engine::edge_factor::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("binary frame");
     let coherent = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
-        &pool, &viewer, canonical, frame_id,
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+        canonical,
+        frame_id,
     )
     .await
     .expect("preview")

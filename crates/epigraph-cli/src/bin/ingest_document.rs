@@ -85,8 +85,26 @@ async fn run(
         serde_json::from_str(&data).context("invalid DocumentExtraction JSON")?;
 
     let signer = signer_from_cli(cli.agent_key.as_deref())?;
-    let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key);
-    let server = EpiGraphMcpFull::new(pool, signer, embedder, false);
+    // `on_a_privileged_pool`, not `with_scoped_pool`: `pool` here is
+    // `MaintenancePool::pool()` — see the comment in `main` above, which records
+    // that this bin's whole ingest deliberately runs on the maintenance pool
+    // because under FORCE it is the pool that filters, not the viewer. That role
+    // holds BYPASSRLS, so `epigraph_bypass()` is true, the tier-A `WITH CHECK`
+    // admits the embedding UPDATE, and there is no tenancy context to stamp. The
+    // declaration is required rather than defaulted so that a future bin built on
+    // an ORDINARY pool cannot acquire an unstamped embedding writer by omission —
+    // it would get `StorePath::Undeclared` and a loud refusal instead.
+    let embedder = McpEmbedder::new(pool.clone(), cli.openai_api_key).on_a_privileged_pool(
+        "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
+    );
+    // Declared on the SERVER too, for the same reason: `do_ingest_document` now
+    // runs its walk in one transaction stamped from the ingesting agent, and a
+    // server with neither a `ScopedPool` nor this declaration refuses rather
+    // than write on an unstamped connection. On `MaintenancePool` there is
+    // nothing to stamp, and the declaration selects a plain transaction.
+    let server = EpiGraphMcpFull::new(pool, signer, embedder, false).on_a_privileged_pool(
+        "epigraph-cli ingest_document runs entirely on MaintenancePool, whose role bypasses RLS",
+    );
 
     let result = do_ingest_document(&server, viewer, &extraction)
         .await

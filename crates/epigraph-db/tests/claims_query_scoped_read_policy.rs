@@ -37,12 +37,29 @@
 //!
 //! # All FOUR reads, and both `SessionGucMode` arms
 //!
-//! Factored over [`Read`] as well as the mode. `count` and `list` are the fast
-//! path; `list` is also the slow path's working-set read;
-//! `claim_ids_by_methodology` and `claim_ids_by_evidence_type` are the two
-//! prefetches. All four are RLS-relevant — `claims`, `reasoning_traces` and
-//! `evidence` are all in 077's owned set and FORCEd by 079 — and the register's
-//! rule is that one function being correct does not cover its siblings.
+//! Factored over [`Read`] as well as the mode. `count_filtered` and
+//! `list_filtered` are the handler's page; `claim_ids_by_methodology` and
+//! `claim_ids_by_evidence_type` are the two prefetches. All four are
+//! RLS-relevant — `claims`, `reasoning_traces` and `evidence` are all in 077's
+//! owned set and FORCEd by 079 — and the register's rule is that one function
+//! being correct does not cover its siblings.
+//!
+//! # These are `count_filtered` / `list_filtered`, and they used to be `count` /
+//! `list`
+//!
+//! PR-28 wrote this file against the fast/slow split `list_claims_query` had at
+//! the time. Backlog `2265a67b` deleted that split: the handler now runs
+//! `ClaimRepository::{count_filtered, list_filtered}` on ONE path and never
+//! calls `count` or `list` at all. Leaving the arms pointed at the old pair
+//! would have kept this file green while it measured two functions no request
+//! reaches — a test that still passes and no longer covers its subject, which
+//! is the precise shape of the citation-without-measurement failure this file's
+//! `visibility_lint` sibling was written to end.
+//!
+//! `count` and `list` are not thereby unowned: they keep their own callers
+//! elsewhere and their own marker, and `visibility_lint` still requires both to
+//! spend a viewer. What moved is only which pair THIS file — the one whose
+//! subject is `GET /api/v1/claims` — drives.
 //!
 //! `Session` alone would prove the half that already worked: in `Session` mode a
 //! `ScopedRead` is a bare connection, so "these statements run in one
@@ -61,7 +78,7 @@
 mod viewer_fixture;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ClaimRepository, SessionGucMode};
+use epigraph_db::{ClaimListFilter, ClaimRepository, SessionGucMode};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 use viewer_fixture::{
@@ -85,12 +102,12 @@ struct Observation {
 /// Fut` cannot thread without an HRTB fight, and the four differ in arity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Read {
-    /// The fast path's `COUNT(*)`, whose differential is NUMERIC — `1` against
+    /// The handler's `COUNT(*)`, whose differential is NUMERIC — `1` against
     /// `0` — rather than an empty vec. That is the sharpest available form of
     /// "rows vanish from their own owner with a 200".
-    Count,
-    /// The fast path's page read, and the slow path's 10_000-row working set.
-    List,
+    CountFiltered,
+    /// The handler's page read.
+    ListFiltered,
     /// The methodology prefetch.
     Methodology,
     /// The evidence-type prefetch.
@@ -109,10 +126,23 @@ impl Read {
         viewer: &Viewer,
     ) -> Result<usize, epigraph_db::DbError> {
         Ok(match self {
-            Read::Count => ClaimRepository::count(&mut *conn, viewer, None).await? as usize,
-            Read::List => ClaimRepository::list(&mut *conn, viewer, 100, 0, None)
-                .await?
-                .len(),
+            // `ClaimListFilter::default()` constrains nothing, so the ONLY
+            // predicate either statement carries is the viewer's. That is what
+            // makes the 1-vs-0 differential below attributable to the stamp
+            // rather than to some other clause.
+            Read::CountFiltered => {
+                ClaimRepository::count_filtered(&mut *conn, viewer, &ClaimListFilter::default())
+                    .await? as usize
+            }
+            Read::ListFiltered => ClaimRepository::list_filtered(
+                &mut *conn,
+                viewer,
+                &ClaimListFilter::default(),
+                100,
+                0,
+            )
+            .await?
+            .len(),
             Read::Methodology => {
                 ClaimRepository::claim_ids_by_methodology(&mut *conn, viewer, "deductive")
                     .await?
@@ -256,31 +286,31 @@ async fn coherence_case_for(pool: PgPool, mode: SessionGucMode, read: Read) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_stamped_count_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+async fn the_stamped_count_filtered_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
     pool: PgPool,
 ) {
-    coherence_case_for(pool, SessionGucMode::Session, Read::Count).await;
+    coherence_case_for(pool, SessionGucMode::Session, Read::CountFiltered).await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_stamped_count_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+async fn the_stamped_count_filtered_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
     pool: PgPool,
 ) {
-    coherence_case_for(pool, SessionGucMode::Transaction, Read::Count).await;
+    coherence_case_for(pool, SessionGucMode::Transaction, Read::CountFiltered).await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_stamped_list_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+async fn the_stamped_list_filtered_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
     pool: PgPool,
 ) {
-    coherence_case_for(pool, SessionGucMode::Session, Read::List).await;
+    coherence_case_for(pool, SessionGucMode::Session, Read::ListFiltered).await;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_stamped_list_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+async fn the_stamped_list_filtered_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
     pool: PgPool,
 ) {
-    coherence_case_for(pool, SessionGucMode::Transaction, Read::List).await;
+    coherence_case_for(pool, SessionGucMode::Transaction, Read::ListFiltered).await;
 }
 
 /// The methodology prefetch's own differential.

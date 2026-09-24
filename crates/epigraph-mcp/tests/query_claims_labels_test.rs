@@ -4,13 +4,16 @@
 //! correctly via `ClaimRepository::get_labels`.
 //!
 //! Seeds TWO labelled claims — one current, one superseded — because the fix's
-//! batch label fetch must NOT filter on `is_current` (`query_claims` /
-//! `list_by_truth_range` return superseded claims, and `get_claim`'s label
+//! batch label fetch must NOT filter on `is_current` (`get_claim`'s label
 //! source has no `is_current` clause). A naive helper that copies the
 //! `COALESCE(is_current, true)` filter from `contents_by_ids` would silently
-//! re-drop labels for the superseded claim — the same bug class, narrowed. This
-//! test locks in the no-filter decision by asserting BOTH claims surface their
-//! labels through the `query_claims` tool entry point.
+//! re-drop labels for the superseded claim — the same bug class, narrowed.
+//!
+//! Since backlog `a85ee585` the two rows are no longer reachable in one call:
+//! `query_claims` defaults to current-only and `is_current=false` selects the
+//! superseded row. Both selections are therefore exercised separately, which
+//! keeps the babd5904 coverage intact — the label fetch must stay
+//! `is_current`-blind for whichever rows the caller asked for.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -38,6 +41,7 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
 
     let server = build_test_server(pool.clone());
 
+    // ---- Current selection (the default) ----
     let result = query_claims(
         &server,
         &viewer,
@@ -45,6 +49,7 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
             min_truth: Some(0.0),
             max_truth: Some(1.0),
             limit: Some(50),
+            is_current: None,
         },
     )
     .await
@@ -58,6 +63,21 @@ async fn query_claims_populates_labels_for_current_and_superseded(pool: PgPool) 
             && current_labels.contains(&"task-3-1".to_string()),
         "current claim must surface its labels through query_claims, got {current_labels:?}"
     );
+
+    // ---- Superseded selection ----
+    let result = query_claims(
+        &server,
+        &viewer,
+        QueryClaimsParams {
+            min_truth: Some(0.0),
+            max_truth: Some(1.0),
+            limit: Some(50),
+            is_current: Some(false),
+        },
+    )
+    .await
+    .expect("query_claims(is_current = false)");
+    let claims = parse_claims(&result);
 
     let superseded_claim = find_claim(&claims, superseded);
     let superseded_labels = labels_of(superseded_claim);

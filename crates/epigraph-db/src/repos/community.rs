@@ -83,17 +83,34 @@
 //! authorization therefore sits on the whole operation, in the repo layer where
 //! both writers reach it:
 //!
-//! * if the community's projected group has **any** live membership, the acting
-//!   agent must itself be a live member of it;
-//! * if it has none, the operation is allowed — that is the bootstrap case, and
-//!   refusing it would make every 068-projected group (which 068 left with
-//!   *zero administrators* by design) permanently unmanageable;
-//! * `remove_member` additionally always permits an agent to remove **its own**
-//!   perspective.
+//! * **adding** requires the acting agent to hold a LIVE membership of the
+//!   community's projected group — unless that group has NEVER had a membership
+//!   row of any state (the bootstrap case: 068 left projected groups
+//!   memberless, and refusing would freeze them). A group whose members were all
+//!   removed has had rows, so it does NOT re-open (batch F, F4b);
+//! * **removing** requires the acting agent to own the perspective (leaving) or
+//!   to hold a LIVE `admin` membership (evicting), and never removes the group's
+//!   LAST live admin (batch F, F4a) — the guard
+//!   `GroupMembershipRepository::revoke_member_unless_last_admin` has.
 //!
-//! This is deliberately weaker than "only an admin may add members": community
-//! groups have no admins to require. It is strictly stronger than nothing, and it
-//! is fail-closed in the direction that matters (a stranger cannot let itself in).
+//! Adding is deliberately weaker than "only an admin may add members": most
+//! community groups have no admins (068), and the admin backfill for them is an
+//! operator task (PR-18). It is fail-closed in the direction that matters (a
+//! stranger cannot let itself in).
+//!
+//! ## Where the rule runs (batch F)
+//!
+//! In two `SECURITY DEFINER` functions, `epigraph_community_add_member` and
+//! `epigraph_community_remove_member` (migration 106), each of which takes the
+//! roster lock, decides under it and writes, as ONE statement. It used to be a
+//! pool read (`may_manage_membership`) followed by a separate write
+//! transaction — a TOCTOU window between two first joiners — and under the
+//! deployed role the rule could not even be expressed in the caller's own
+//! statements: `group_memberships_tenancy`'s WITH CHECK admits only an admin, so
+//! a member could not remove itself, and a non-member cannot see the revoked
+//! rows "has this group ever had a member?" must count. The actor is the
+//! connection's stamped principal; see the migration for when `acting_agent`
+//! is honoured instead.
 //!
 //! ## The route-level half is now in place too
 //!
@@ -152,48 +169,35 @@ pub enum MembershipOutcome {
     Applied,
     /// The row was not present (`remove_member` only).
     NotFound,
-    /// The acting agent is not a live member of the community's projected
-    /// group, and that group has live members — so this is not the bootstrap
-    /// case. Map to 403.
+    /// The acting agent may not make this change (see the module docs for the
+    /// rule). Map to 403.
     DeniedNotAMember,
+    /// `remove_member` would remove the group's LAST live admin, which would
+    /// leave it unmanageable. Nothing was written. Map to 409.
+    LastAdmin,
+    /// `add_member` would restore a REVOKED membership (the owner left or was
+    /// evicted), and the acting agent is not a live admin. Re-admitting a
+    /// removed member is an admin decision; nothing was written. Map to 403.
+    DeniedReadmitNeedsAdmin,
+}
+
+impl MembershipOutcome {
+    fn from_sql(outcome: &str) -> Result<Self, DbError> {
+        match outcome {
+            "applied" => Ok(Self::Applied),
+            "not_found" => Ok(Self::NotFound),
+            "denied" => Ok(Self::DeniedNotAMember),
+            "last_admin" => Ok(Self::LastAdmin),
+            "denied_readmit" => Ok(Self::DeniedReadmitNeedsAdmin),
+            other => Err(DbError::InvalidData {
+                reason: format!("unexpected community membership outcome {other:?}"),
+            }),
+        }
+    }
 }
 
 /// Repository for Community operations
 pub struct CommunityRepository;
-
-/// Is `acting_agent` allowed to change this community's membership?
-///
-/// See the module docs for the rule and why it is this rule. Returns `true`
-/// when the projected group has no live members at all (bootstrap), otherwise
-/// requires the acting agent to hold a live membership in it.
-async fn may_manage_membership(
-    pool: &PgPool,
-    acting_agent: Option<Uuid>,
-    community_id: Uuid,
-) -> Result<bool, DbError> {
-    let has_members: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM group_memberships m
-                         WHERE m.group_id = $1 AND m.revoked_at IS NULL)",
-    )
-    .bind(community_id)
-    .fetch_one(pool)
-    .await?;
-    if !has_members {
-        return Ok(true);
-    }
-    let Some(agent) = acting_agent else {
-        return Ok(false);
-    };
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM group_memberships m
-                         WHERE m.group_id = $1 AND m.agent_id = $2
-                           AND m.revoked_at IS NULL)",
-    )
-    .bind(community_id)
-    .bind(agent)
-    .fetch_one(pool)
-    .await?)
-}
 
 impl CommunityRepository {
     /// Create a new community **and its projected group**, atomically.
@@ -294,8 +298,7 @@ impl CommunityRepository {
                 r#"
                 INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
                 VALUES ($1, $2, ''::bytea, 0, 'admin')
-                ON CONFLICT (group_id, agent_id, epoch)
-                DO UPDATE SET revoked_at = NULL, role = 'admin'
+                ON CONFLICT DO NOTHING
                 "#,
             )
             .bind(row.id)
@@ -383,60 +386,40 @@ impl CommunityRepository {
     /// there is no agent to grant it to. That is 068's behaviour too, and it is
     /// a silent no-op by necessity, not by choice.
     ///
+    /// A REVOKED projected row is restored at the requested role, `reader` — a
+    /// revoked admin re-added through here never comes back as admin (batch F,
+    /// F4a: this used to be `DO UPDATE SET revoked_at = NULL` with the old role
+    /// kept) — and only when `acting_agent` is a LIVE admin of the community:
+    /// otherwise [`MembershipOutcome::DeniedReadmitNeedsAdmin`], nothing
+    /// written, so a live reader cannot undo an admin's eviction. A LIVE row is
+    /// left exactly as it is.
+    ///
     /// # Authorization
     ///
-    /// Closed membership — see the module docs. `acting_agent` is the
-    /// authenticated principal (`Viewer::principal()`); `None` is a caller with
-    /// no principal and is refused unless the community's group is empty.
+    /// Closed membership — see the module docs. The decision and the write are
+    /// ONE statement, `epigraph_community_add_member` (migration 106), under
+    /// the roster lock. `acting_agent` is the authenticated principal
+    /// (`Viewer::principal()`); on a non-maintenance connection it must equal the
+    /// principal the connection was stamped with, or the call is denied, so
+    /// pass a transaction from `ScopedPool::begin_as` for that viewer.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any statement fails.
-    #[instrument(skip(pool))]
-    pub async fn add_member(
-        pool: &PgPool,
+    /// Returns `DbError::QueryFailed` if the statement fails.
+    #[instrument(skip(executor))]
+    pub async fn add_member<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         acting_agent: Option<Uuid>,
         community_id: Uuid,
         perspective_id: Uuid,
     ) -> Result<MembershipOutcome, DbError> {
-        if !may_manage_membership(pool, acting_agent, community_id).await? {
-            return Ok(MembershipOutcome::DeniedNotAMember);
-        }
-
-        let mut tx = pool.begin().await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO community_members (community_id, perspective_id)
-            VALUES ($1, $2)
-            ON CONFLICT (community_id, perspective_id) DO NOTHING
-            "#,
-        )
-        .bind(community_id)
-        .bind(perspective_id)
-        .execute(&mut *tx)
-        .await?;
-
-        // The join to `groups` guarantees `group_memberships_group_id_fkey`
-        // holds and that a same-id group of another KIND can never be targeted
-        // — 068 makes the same point about the same join.
-        sqlx::query(
-            r#"
-            INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
-            SELECT g.id, p.owner_agent_id, ''::bytea, 0, 'reader'
-              FROM perspectives p
-              JOIN groups g ON g.id = $1 AND g.kind = 'community'
-             WHERE p.id = $2 AND p.owner_agent_id IS NOT NULL
-            ON CONFLICT (group_id, agent_id, epoch)
-            DO UPDATE SET revoked_at = NULL
-            "#,
-        )
-        .bind(community_id)
-        .bind(perspective_id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(MembershipOutcome::Applied)
+        let outcome: String =
+            sqlx::query_scalar("SELECT public.epigraph_community_add_member($1, $2, $3)")
+                .bind(community_id)
+                .bind(perspective_id)
+                .bind(acting_agent)
+                .fetch_one(executor)
+                .await?;
+        MembershipOutcome::from_sql(&outcome)
     }
 
     /// Remove a perspective from a community **and revoke the projected
@@ -458,122 +441,53 @@ impl CommunityRepository {
     ///
     /// # Authorization
     ///
-    /// Closed membership (module docs), with one addition: an agent may always
-    /// remove **its own** perspective. Without that carve-out an agent whose
-    /// only membership is the one being removed could still be evicted by a
-    /// peer but could not leave voluntarily, which is the wrong asymmetry.
+    /// Leaving (the actor owns the perspective) or evicting (the actor holds a
+    /// LIVE `admin` membership) — nothing else; a live `reader` can no longer
+    /// evict (batch F, F4a). The group's LAST live admin is never removed:
+    /// [`MembershipOutcome::LastAdmin`], nothing written. Decision and write are
+    /// ONE statement, `epigraph_community_remove_member` (migration 106), under
+    /// the roster lock; the `groups.reseal_required_at` and `group_key_epochs`
+    /// marks (PR-20) are made in it when, and only when, a revoke happened, in
+    /// the lock order `revoke_member_unless_last_admin` uses. See
+    /// [`Self::add_member`] for how `acting_agent` is checked.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any statement fails.
-    #[instrument(skip(pool))]
-    pub async fn remove_member(
-        pool: &PgPool,
+    /// Returns `DbError::QueryFailed` if the statement fails.
+    #[instrument(skip(executor))]
+    pub async fn remove_member<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         acting_agent: Option<Uuid>,
         community_id: Uuid,
         perspective_id: Uuid,
     ) -> Result<MembershipOutcome, DbError> {
-        let owns_the_perspective = match acting_agent {
-            Some(agent) => {
-                sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS (SELECT 1 FROM perspectives p
-                                 WHERE p.id = $1 AND p.owner_agent_id = $2)",
-                )
-                .bind(perspective_id)
-                .bind(agent)
-                .fetch_one(pool)
-                .await?
-            }
-            None => false,
-        };
-        if !owns_the_perspective && !may_manage_membership(pool, acting_agent, community_id).await?
-        {
-            return Ok(MembershipOutcome::DeniedNotAMember);
-        }
-
-        let mut tx = pool.begin().await?;
-
-        let result = sqlx::query(
+        // ONE statement: the definer decides and revokes, and — only when it
+        // answered 'applied' — this statement deletes the `community_members`
+        // row as the CALLER's role. The definer's owner holds no DELETE (070:
+        // the maintenance role never destroys). The initplan over `o` runs the
+        // function before the DELETE's scan.
+        let outcome: String = sqlx::query_scalar(
             r#"
-            DELETE FROM community_members
-            WHERE community_id = $1 AND perspective_id = $2
+            WITH o AS (
+                SELECT public.epigraph_community_remove_member($1, $2, $3) AS outcome
+            ),
+            d AS (
+                DELETE FROM community_members
+                 WHERE community_id = $1 AND perspective_id = $2
+                   AND (SELECT outcome FROM o) = 'applied'
+                RETURNING 1
+            )
+            SELECT o.outcome || CASE WHEN o.outcome = 'applied'
+                                          AND NOT EXISTS (SELECT 1 FROM d)
+                                     THEN '_undeleted' ELSE '' END
+              FROM o
             "#,
         )
         .bind(community_id)
         .bind(perspective_id)
-        .execute(&mut *tx)
+        .bind(acting_agent)
+        .fetch_one(executor)
         .await?;
-
-        let revoked = sqlx::query(
-            r#"
-            UPDATE group_memberships gm
-               SET revoked_at = now()
-              FROM perspectives p
-             WHERE p.id = $2
-               AND p.owner_agent_id IS NOT NULL
-               AND gm.group_id = $1
-               AND gm.agent_id = p.owner_agent_id
-               AND gm.revoked_at IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM community_members cm
-                     JOIN perspectives p2 ON p2.id = cm.perspective_id
-                    WHERE cm.community_id = $1
-                      AND p2.owner_agent_id = p.owner_agent_id)
-            "#,
-        )
-        .bind(community_id)
-        .bind(perspective_id)
-        .execute(&mut *tx)
-        .await?;
-
-        // PR-20 / FINAL-PLAN §6.7 point 2. This is a SECOND live removal path:
-        // `create` above projects the community onto a real tenancy group with
-        // its own `group_key_epochs` row, so a member revoked here keeps a
-        // `wrapped_key_share` that still opens everything sealed before the
-        // rotation, exactly as one revoked through
-        // `GroupMembershipRepository::revoke_member_unless_last_admin` does.
-        // Marking in only one of the two places would make
-        // `epigraph_groups_reseal_required` report the healthy value for a
-        // group that owes a re-key, and a metric that is silent on a real
-        // obligation is worse than no metric.
-        //
-        // Guarded on `rows_affected() > 0`, so the over-revocation case the
-        // `NOT EXISTS` above prevents — an agent whose OTHER perspective still
-        // holds the membership — marks nothing, because nothing was revoked.
-        //
-        // Table order is `group_memberships`, then `groups`, then
-        // `group_key_epochs`, matching `revoke_member_unless_last_admin` and
-        // `GroupKeyEpochRepository::rotate_conn`; those two doc comments explain
-        // why taking them in a different order here would be a deadlock.
-        if revoked.rows_affected() > 0 {
-            sqlx::query(
-                r#"
-                UPDATE groups
-                SET reseal_required_at = COALESCE(reseal_required_at, now())
-                WHERE id = $1
-                "#,
-            )
-            .bind(community_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                r#"
-                UPDATE group_key_epochs
-                SET status = 'rotating'
-                WHERE group_id = $1 AND status = 'active'
-                "#,
-            )
-            .bind(community_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        if result.rows_affected() > 0 {
-            Ok(MembershipOutcome::Applied)
-        } else {
-            Ok(MembershipOutcome::NotFound)
-        }
+        MembershipOutcome::from_sql(&outcome)
     }
 
     /// Get all member perspectives for a community

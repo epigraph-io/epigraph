@@ -53,9 +53,9 @@ impl FrameRepository {
     /// # Errors
     /// Returns `DbError::DuplicateKey` if a frame with the same name exists.
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, hypotheses))]
-    pub async fn create(
-        pool: &PgPool,
+    #[instrument(skip(executor, hypotheses))]
+    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         name: &str,
         description: Option<&str>,
         hypotheses: &[String],
@@ -76,7 +76,7 @@ impl FrameRepository {
         // unreadable for no gain. See `TenancyDecl::instance_wide`.
         .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
         .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row)
@@ -202,11 +202,30 @@ impl FrameRepository {
     ///
     /// Uses ON CONFLICT to update the hypothesis_index if the assignment exists.
     ///
+    /// # The executor is generic, and that is what makes this table writable
+    ///
+    /// `claim_frames` is in migration 062's tier-A array and carries 077's strict
+    /// `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`, with no
+    /// orphan `*_privacy` policy anywhere to fall back on — so this INSERT is
+    /// refused with `42501` on an unstamped application session, in production as
+    /// well as on a clean migrate. MEASURED: `submit_ds_evidence` returned
+    /// `new row violates row-level security policy for table "claim_frames"` on
+    /// both schema configurations. Only a connection stamped by
+    /// `ScopedPool::begin_as` can satisfy that check, and it hands back a
+    /// transaction rather than a pool. `&PgPool` and `&mut PgConnection` both
+    /// satisfy [`sqlx::PgExecutor`], so every existing pool-taking caller compiles
+    /// unchanged. Same change and same reasoning as
+    /// [`crate::repos::ReasoningTraceRepository::create`].
+    ///
+    /// The row's `(visibility, owner_group_id)` is inherited from the CLAIM by
+    /// migration 074's BEFORE-row trigger and re-stamped by 070 arm (c), so the
+    /// group the session must be able to write is the claim's, not the caller's.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn assign_claim(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn assign_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         claim_id: Uuid,
         frame_id: Uuid,
         hypothesis_index: Option<i32>,
@@ -222,7 +241,7 @@ impl FrameRepository {
         .bind(claim_id)
         .bind(frame_id)
         .bind(hypothesis_index)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())
@@ -235,9 +254,9 @@ impl FrameRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, hypotheses))]
-    pub async fn create_refinement(
-        pool: &PgPool,
+    #[instrument(skip(executor, hypotheses))]
+    pub async fn create_refinement<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         parent_frame_id: Uuid,
         name: &str,
         description: Option<&str>,
@@ -262,7 +281,7 @@ impl FrameRepository {
         // So this declares, exactly as `create` above does.
         .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
         .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         Ok(row)
@@ -411,10 +430,10 @@ impl FrameRepository {
     /// Returns `DbError::QueryFailed` only on actual DB failure. Missing
     /// rows / missing keys return `Ok(None)`, not an error — the consumer
     /// is expected to use a calibration default in that case.
-    #[instrument(skip(pool))]
+    #[instrument(skip(executor))]
     #[allow(clippy::doc_markdown)]
-    pub async fn get_intra_evidence_locality_factor(
-        pool: &PgPool,
+    pub async fn get_intra_evidence_locality_factor<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         frame_id: Uuid,
     ) -> Result<Option<f64>, DbError> {
         // `properties->>'intra_evidence_locality_factor'` returns TEXT.
@@ -431,7 +450,7 @@ impl FrameRepository {
             "#,
         )
         .bind(frame_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         let Some((Some(raw),)) = row else {
             return Ok(None);
@@ -503,9 +522,9 @@ impl FrameRepository {
     /// rows / missing keys / malformed JSON return `Ok(None)`, not an
     /// error — the consumer is expected to fall back to the global
     /// calibration in that case.
-    #[instrument(skip(pool))]
-    pub async fn get_per_frame_evidence_type_weights(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_per_frame_evidence_type_weights<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         frame_id: Uuid,
     ) -> Result<Option<HashMap<String, f64>>, DbError> {
         let row: Option<(Option<serde_json::Value>,)> = sqlx::query_as(
@@ -517,7 +536,7 @@ impl FrameRepository {
                 "#,
         )
         .bind(frame_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         let Some((Some(value),)) = row else {
             return Ok(None);

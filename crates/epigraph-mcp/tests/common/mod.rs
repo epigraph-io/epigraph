@@ -198,6 +198,70 @@ pub fn build_test_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
 }
 
+/// [`build_test_server`] plus the [`epigraph_db::ScopedPool`] that the canonical
+/// write path now REQUIRES.
+///
+/// # Why a second constructor rather than changing the first
+///
+/// `submit_claim`, `memorize`, `batch_submit_claims` and `resolve_backlog_item`
+/// run their claim + trace + evidence + `update_trace_id` in ONE transaction
+/// stamped from the author's viewer, and `ScopedPool::begin_as` is the only thing
+/// that can open one. A server with no `ScopedPool` REFUSES those tools outright,
+/// deliberately — falling back to the unstamped pool is how a `42501` on
+/// `reasoning_traces` becomes a committed claim with no provenance. So a write
+/// test needs this; a read test does not, and making the ~230 `build_test_server`
+/// call sites async to give every one of them a pool they will not use would be
+/// churn with a running cost (each `ScopedPool::connect` opens its own
+/// connections).
+///
+/// # Why `scoped` is a PARAMETER and not built in here
+///
+/// The pool has to come from `fixture::scoped_pool`, and this module cannot reach
+/// it. Two routes were tried and both are worse:
+///
+/// * `#[path]`-including the canonical fixture here as well — MEASURED to fail
+///   `clippy::duplicate_mod` under `-D warnings`, because every test binary that
+///   uses this helper also declares its own `mod fixture;` over the same file
+///   ("file is loaded as a module multiple times").
+/// * `crate::fixture::scoped_pool` — `mod fixture;` is declared per test BINARY,
+///   so this would compile in some binaries and not others, and the error would
+///   surface in THIS file rather than in the test that forgot the declaration.
+///
+/// Passing it in keeps the derivation single-sourced in the canonical fixture and
+/// makes each call site say where its pool came from:
+///
+/// ```ignore
+/// let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+/// ```
+/// # The pool is attached TWICE, and both are load-bearing
+///
+/// `EpiGraphMcpFull::with_scoped_pool` is what lets the claim write stamp a
+/// transaction; `McpEmbedder::with_scoped_pool` is what lets the post-commit
+/// embed stamp a connection. A server with the first and not the second writes
+/// claims correctly and embeds NONE of them, silently, because the embed is
+/// best-effort — which is the release gate this branch exists to close. Both are
+/// given the same pool here (`ScopedPool` is `Clone`, and the clone shares the
+/// underlying `PgPool`, so this opens no extra connections).
+pub fn build_scoped_test_server(pool: PgPool, scoped: epigraph_db::ScopedPool) -> EpiGraphMcpFull {
+    let signer = AgentSigner::from_bytes(&[0xA7u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false).with_scoped_pool(scoped)
+}
+
+/// [`build_test_server_generated_signer`] plus a `ScopedPool`. See
+/// [`build_scoped_test_server`] for why the scoped variant exists and why the
+/// pool is a parameter.
+pub fn build_scoped_test_server_generated_signer(
+    pool: PgPool,
+    scoped: epigraph_db::ScopedPool,
+) -> EpiGraphMcpFull {
+    let signer = AgentSigner::generate();
+    let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(pool, signer, embedder, /* read_only */ false)
+        .with_generated_signer_identity()
+        .with_scoped_pool(scoped)
+}
+
 /// A server in `main::select_signer`'s rung-4 configuration: neither
 /// `--agent-key` nor `--agent-model` was supplied, so the signer is a fresh
 /// random keypair belonging to this process alone. Both halves matter — the

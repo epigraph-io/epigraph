@@ -243,12 +243,24 @@ impl PaperRepository {
         Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
     }
 
-    /// List claim summaries asserted by this paper, up to `limit` rows,
-    /// reached via `paper -asserts-> claim` edges. Ordered by claim
-    /// `created_at` ascending (ingest order) for stable pagination.
+    /// List claim summaries asserted by this paper — one page of `limit` rows
+    /// starting at `offset` — reached via `paper -asserts-> claim` edges.
+    /// Ordered by claim `created_at` ascending (ingest order), with an `id`
+    /// tiebreaker so `LIMIT`/`OFFSET` paging is stable across the many claims
+    /// a single ingestion writes with an identical timestamp.
     ///
     /// Returns `(id, content, truth_value, agent_id, content_hash, created_at)`
     /// per claim — the shape `query_paper` needs for `ClaimResponse`.
+    ///
+    /// `offset` exists because `query_paper` previously hardcoded
+    /// `limit = 100` with no way to reach claim 101, and the resulting
+    /// single-shot response exceeded the MCP tool output token limit on dense
+    /// paper subgraphs (backlog `0e6ec456`). Pair it with
+    /// [`Self::count_asserted_claims`] so a caller can tell a full page from
+    /// the end of the set.
+    ///
+    /// Uses the runtime `query_as` form (no compile-time `.sqlx` cache entry),
+    /// so adding `OFFSET` needs no `cargo sqlx prepare`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -258,35 +270,53 @@ impl PaperRepository {
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<AssertedClaimRow>, DbError> {
-        let rows = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: Uuid,
+            content: String,
+            truth_value: f64,
+            agent_id: Uuid,
+            content_hash: Vec<u8>,
+            created_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let rows: Vec<Row> = sqlx::query_as(
             r#"
             SELECT
-                c.id          AS "id!",
-                c.content     AS "content!",
-                c.truth_value AS "truth_value!",
-                c.agent_id    AS "agent_id!",
-                c.content_hash AS "content_hash!",
-                c.created_at  AS "created_at!"
+                c.id,
+                c.content,
+                c.truth_value,
+                c.agent_id,
+                c.content_hash,
+                c.created_at
             FROM edges e
             JOIN claims c ON c.id = e.target_id
             WHERE e.source_id = $1
               AND e.source_type = 'paper'
               AND e.target_type = 'claim'
               AND e.relationship = 'asserts'
-              AND ($3::bool OR e.visibility = 'public'
-                   OR (e.owner_group_id = ANY($4::uuid[])
+              AND ($4::bool OR e.visibility = 'public'
+                   OR (e.owner_group_id = ANY($5::uuid[])
                        AND (e.co_owner_group_id IS NULL
-                            OR e.co_owner_group_id = ANY($4::uuid[]))))
-              AND ($3::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($4::uuid[]))
+                            OR e.co_owner_group_id = ANY($5::uuid[]))))
+              AND ($4::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($5::uuid[]))
             ORDER BY c.created_at ASC, c.id
-            LIMIT $2
+            LIMIT $2 OFFSET $3
             "#,
-            paper_id,
-            limit,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
         )
+        .bind(paper_id) // $1
+        .bind(limit) // $2
+        .bind(offset) // $3
+        // The STATIC three-bind visibility form, not `splice`: both binds are
+        // unconditional, so `OFFSET $3` can sit ahead of them without the
+        // arity of this statement depending on the viewer's shape. Renumbered
+        // from HEAD's $3/$4 because the branch's new `offset` took $3 — left
+        // as-is the bypass flag and the page offset would have shared a
+        // placeholder, which typechecks and silently pages by a boolean.
+        .bind(viewer.bypass_bind()) // $4
+        .bind(viewer.group_bind().unwrap_or(&[])) // $5
         .fetch_all(executor)
         .await?;
         rows.into_iter()

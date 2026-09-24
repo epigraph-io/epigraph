@@ -2,7 +2,7 @@
 
 use rmcp::model::*;
 
-use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
+use crate::errors::{db_caller_error, internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::tools::ds_auto;
 use crate::types::*;
@@ -13,7 +13,7 @@ use epigraph_core::{
 };
 use epigraph_crypto::ContentHasher;
 use epigraph_db::PatchClaimInput;
-use epigraph_db::{ClaimRepository, EdgeRepository, EvidenceRepository, ReasoningTraceRepository};
+use epigraph_db::{ClaimRepository, EvidenceRepository, ReasoningTraceRepository};
 use uuid::Uuid;
 
 /// Resolve an agent-supplied methodology string to a [`Methodology`].
@@ -145,6 +145,21 @@ pub async fn submit_claim(
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
 
+    // Label validation runs HERE — before any write — not at the
+    // `ClaimRepository::update_labels` call further down. The repo layer
+    // refuses unexpanded shell syntax either way (backlog f6310444), but that
+    // call happens AFTER `create_claim_idempotent` has already persisted the
+    // claim, so a guard there returns an error while leaving an ORPHAN claim
+    // behind: a row with none of the labels the caller asked for, and nothing
+    // marking it as the residue of a failed submission. That is the same
+    // "guard after the write" shape this branch's own HTTP tests assert must
+    // not happen (they check the 400 AND `COUNT(*) = 0`).
+    //
+    // `batch_submit_claims` delegates here per entry, so this also bounds a
+    // bad label's blast radius to its own index instead of leaving one orphan
+    // per rejected row.
+    epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
+
     let agent_id = server.agent_id().await?;
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let pub_key = server.signer.public_key();
@@ -257,16 +272,50 @@ pub async fn submit_claim(
         // feature existed — insert, then embed best-effort post-insert.
     }
 
+    // ── THE ONE TRANSACTION THIS SUBMISSION RUNS IN ─────────────────────
+    //
+    // Claim + labels + Trace + Evidence + the two verb-edges + `update_trace_id`
+    // all run on ONE connection stamped from the AUTHOR's viewer. Two defects
+    // are closed by the same construction, which is why it is one change:
+    //
+    // 1. **42501.** Nothing on the MCP path stamped the session GUCs migration
+    //    077's policies read, so `epigraph_writable_groups` was `{}` and the
+    //    `reasoning_traces` INSERT was refused — on a connection where the claim
+    //    INSERT had already been admitted by an orphan `claims_privacy` policy.
+    // 2. **Non-atomic writes.** Every step used to take its own pool checkout,
+    //    so a refused trace left a COMMITTED claim with no trace, no evidence
+    //    and no AUTHORED edge, and returned an error carrying no claim id — the
+    //    caller could not even find what it had created.
+    //
+    // Follows `epigraph-api/src/routes/groups.rs::rotate_key`'s "why the whole
+    // body runs on `ScopedPool::begin_as`"; this is that pattern, not a new one.
+    //
+    // WHAT IS DELIBERATELY *OUTSIDE* IT, below the commit: the DS auto-wire and
+    // the embedding. The embedding is CLAUDE.md's policy (best-effort,
+    // post-commit, warn on failure, never block the write). The DS auto-wire is
+    // a larger conversion — it writes `claim_frames` / `mass_functions` through
+    // a pool-bound helper — and it also READS the claim back, which a sibling
+    // connection cannot do before this transaction commits. It therefore stays
+    // post-commit and stays warn-only; `claim_frames` / `mass_functions` remain
+    // in the unstamped-write blast radius until that conversion lands.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "submit_claim").await?;
+
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) =
-        crate::claim_helper::create_claim_idempotent(&server.pool, viewer, &claim, "submit_claim")
+        crate::claim_helper::create_claim_idempotent(&mut tx, viewer, &claim, "submit_claim")
             .await?;
     let claim_uuid = claim.id.as_uuid();
 
+    // Already validated above, before the claim write. This call can now only
+    // fail for server-side reasons; `db_caller_error` keeps those
+    // INTERNAL_ERROR while still reporting a caller-caused `InvalidData`
+    // correctly if a future label rule is added to the repo layer. Inside the
+    // transaction, so a rejected label no longer leaves a labelled-nothing claim.
     if !params.labels.is_empty() {
-        ClaimRepository::update_labels(&server.pool, claim_uuid, &params.labels, &[])
+        ClaimRepository::update_labels_conn(&mut tx, claim_uuid, &params.labels, &[])
             .await
-            .map_err(internal_error)?;
+            .map_err(db_caller_error)?;
     }
 
     // Build Evidence + Trace from this submission. Both are noun-claims with
@@ -303,11 +352,13 @@ pub async fn submit_claim(
         explanation,
     );
 
-    // Persist Trace + Evidence on every submission.
-    ReasoningTraceRepository::create(&server.pool, &trace, claim.id)
+    // Persist Trace + Evidence on every submission. In the transaction: a
+    // refusal here now rolls the claim back instead of committing it as an
+    // orphan.
+    ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
         .await
         .map_err(internal_error)?;
-    EvidenceRepository::create(&server.pool, &evidence_with_sig)
+    EvidenceRepository::create(&mut *tx, &evidence_with_sig)
         .await
         .map_err(internal_error)?;
 
@@ -317,104 +368,164 @@ pub async fn submit_claim(
     // The was_created marker on properties lets queries distinguish
     // first-create from resubmit edges.
     //
-    // Note: the API handler at routes/claims.rs:585-614 still follows the
-    // pre-S3a skip-on-resubmit rule. Aligning the API to MCP's accumulating
-    // semantics is spec backlog item #10.
-    let _ = EdgeRepository::create(
-        &server.pool,
+    // SAVEPOINT-wrapped rather than `let _ =`: inside a transaction a failed
+    // INSERT aborts everything that follows, so a swallowed edge error would
+    // surface at COMMIT as `current transaction is aborted` with the real cause
+    // lost. `emit_verb_edge_best_effort` keeps the architecture doc's
+    // best-effort policy without that trade.
+    //
+    // Note: the API handler at routes/claims.rs still follows the pre-S3a
+    // skip-on-resubmit rule. Aligning the API to MCP's accumulating semantics is
+    // spec backlog item #10.
+    crate::claim_helper::emit_verb_edge_best_effort(
+        &mut tx,
         claim_uuid,
         "claim",
         evidence_with_sig.id.as_uuid(),
         "evidence",
         "DERIVED_FROM",
         Some(serde_json::json!({"was_created": was_created})),
-        None,
-        None,
+        "submit_claim",
     )
-    .await;
-    let _ = EdgeRepository::create(
-        &server.pool,
+    .await?;
+    crate::claim_helper::emit_verb_edge_best_effort(
+        &mut tx,
         claim_uuid,
         "claim",
         trace.id.as_uuid(),
         "trace",
         "HAS_TRACE",
         Some(serde_json::json!({"was_created": was_created})),
-        None,
-        None,
+        "submit_claim",
     )
-    .await;
+    .await?;
 
-    let (final_truth, ds, embedded) = if was_created {
-        // First-create: full lineage. update_trace_id, DS auto-wire, embed.
-        ClaimRepository::update_trace_id(&server.pool, claim.id, trace.id)
+    // A resubmit whose canonical claim has NO `trace_id` is a PRE-EXISTING
+    // ORPHAN — the residue of a submission that committed the claim and then
+    // lost its trace to the 42501. `was_created` is false for it, so the old
+    // code skipped `update_trace_id` and returned bare HTTP success forever: the
+    // retry a caller performs precisely to repair the row could not repair it.
+    // This submission already wrote a fresh Trace and Evidence above, so linking
+    // them is the repair. Gated on `trace_id.is_none()` alone, never widened to
+    // every resubmit: relinking a claim that already has a canonical trace would
+    // rewrite settled provenance.
+    let needs_trace_link = was_created || claim.trace_id.is_none();
+    if needs_trace_link {
+        ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
+    }
 
-        let ds_result = ds_auto::auto_wire_ds_for_claim(
-            &server.pool,
-            viewer,
-            claim_uuid,
+    // COMMIT. Everything below this line is post-commit and best-effort.
+    tx.commit().await.map_err(internal_error)?;
+
+    // DS auto-wire: FIRST-CREATE ONLY, and that asymmetry with the embed below is
+    // deliberate. Re-running it on an existing claim would combine the same mass
+    // into the same frame twice, so a resubmit must not; re-embedding a claim that
+    // has no vector is idempotent and is the only way a repaired orphan becomes
+    // recallable again.
+    //
+    // Both halves now run in ONE transaction stamped from the AUTHOR's viewer —
+    // `claim_frames`, `mass_functions`, the cached-belief `UPDATE claims`, and the
+    // `truth_value` derived from the pignistic. On the unstamped pool the first
+    // of those was refused outright on a cleanly-migrated schema (`claim_frames`
+    // carries no orphan `*_privacy` policy, which is why `mass_functions` stopped
+    // growing in production), and the `truth_value` write could land while the
+    // BBA it is derived from did not. See
+    // `claim_helper::wire_ds_for_new_claim_author_stamped`.
+    let ds = if was_created {
+        crate::claim_helper::wire_ds_for_new_claim_author_stamped(
+            server,
             agent_id,
+            claim_uuid,
+            viewer,
             ds_auto::DsAutoInput {
                 confidence,
                 weight,
                 supports: true,
                 evidence_type: Some(&params.evidence_type),
             },
+            /* persist_truth_from_pignistic */ true,
+            "submit_claim",
         )
-        .await;
-        if let Err(ref e) = ds_result {
-            tracing::warn!(claim_id = %claim_uuid, "ds auto-wire failed: {e}");
-        }
-        if let Ok(ref ds) = ds_result {
-            let ds_truth = TruthValue::clamped(ds.pignistic_prob);
-            if let Err(e) = ClaimRepository::update_truth_value(
-                &server.pool,
-                ClaimId::from_uuid(claim_uuid),
-                ds_truth,
-            )
+        .await
+    } else {
+        // Resubmit (Option B): verb-edges already emitted above, and the canonical
+        // trace stays as it is unless the claim had none (the orphan-repair arm
+        // above). No DS: canonical truth was set on first create.
+        None
+    };
+
+    // EMBEDDING. Gated on `was_created` OR "the canonical row is missing its
+    // vector", never on `was_created` alone.
+    //
+    // `was_created` alone is what made the orphan repair half a repair. A
+    // production orphan committed its claim and lost its trace to the 42501
+    // BEFORE this post-commit embed ran, so it carries `is_current = true` AND
+    // `embedding IS NULL` — CLAUDE.md's `live_missing` violation. The retry that
+    // repairs its provenance took the `was_created == false` branch, which
+    // returned `{"embedded": false}` with HTTP success and a comment asserting
+    // "canonical embedding already exists". For that row the comment was false
+    // and the claim stayed invisible to `recall()` forever.
+    //
+    // `claim_text_if_embedding_missing` is the gate rather than a bare
+    // `embedding IS NULL` read because the embedded population excludes
+    // telemetry and sealed rows — see `EMBEDDABLE_POPULATION` in
+    // `epigraph-db/src/repos/claim.rs`. A read failure means we cannot tell, and
+    // the conservative answer is not to embed (the maintenance backfill
+    // enumerates the same population and will pick it up).
+    let embed_text: Option<String> = if was_created {
+        Some(params.content.clone())
+    } else {
+        match ClaimRepository::claim_text_if_embedding_missing(&server.pool, viewer, claim_uuid)
             .await
-            {
+        {
+            Ok(text) => text,
+            Err(e) => {
                 tracing::warn!(
                     claim_id = %claim_uuid,
-                    "failed to update truth from DS pignistic: {e}"
+                    "could not read whether the canonical claim still needs an embedding; \
+                     skipping the repair embed: {e}"
                 );
+                None
             }
         }
-        let ds = ds_result.ok();
+    };
 
-        // Reuse the novelty gate's already-generated vector when we have
-        // one (avoids a second OpenAI call for the same content). Only the
-        // gate's own embedder-failure path (`pending_embedding = None`)
-        // falls back to `embed_and_store`'s independent generate-and-store.
-        let embedded = if let Some(pgvec) = pending_embedding.take() {
-            match ClaimRepository::store_embedding(&server.pool, claim_uuid, &pgvec).await {
-                Ok(stored) => stored,
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_uuid, "novelty-gate embedding store failed: {e}");
-                    false
-                }
-            }
-        } else {
-            server
-                .embedder
-                .embed_and_store(claim_uuid, &params.content)
-                .await
-        };
+    // The store runs on an AUTHOR-STAMPED connection, not on `server.pool`: the
+    // `UPDATE claims SET embedding` is governed by `claims_tenancy`'s WITH CHECK
+    // and is refused on an unstamped session, silently, because the embed is
+    // best-effort. See `claim_helper::embed_claim_author_stamped` for the
+    // measurement and for why the provider call stays outside the transaction.
+    //
+    // Both arms go through it: the novelty gate's already-generated vector when
+    // there is one (no second OpenAI call), and a fresh `generate` otherwise —
+    // the gate's own embedder-failure path and the repair arm, where the
+    // exact-resubmit shortcut means the gate never ran. The previous fallback,
+    // `McpEmbedder::embed_and_store`, stores through the embedder's OWN
+    // unstamped pool and is therefore refused in exactly the same way.
+    let embedded = match embed_text {
+        None => false,
+        Some(text) => {
+            crate::claim_helper::embed_claim_author_stamped(
+                server,
+                agent_id,
+                claim_uuid,
+                &text,
+                pending_embedding.take(),
+                "submit_claim",
+            )
+            .await
+        }
+    };
 
-        let final_truth = ds
-            .as_ref()
+    // A resubmit reports the CANONICAL truth, not this submission's raw value.
+    let final_truth = if was_created {
+        ds.as_ref()
             .map(|d| d.pignistic_prob.clamp(0.01, 0.99))
-            .unwrap_or(raw_truth);
-
-        (final_truth, ds, embedded)
+            .unwrap_or(raw_truth)
     } else {
-        // Resubmit (Option B): verb-edges already emitted above. Skip
-        // update_trace_id (canonical trace immutable), skip DS auto-wire
-        // (canonical truth set on first create), skip embed (canonical
-        // embedding already exists). Report canonical truth, not raw.
-        (claim.truth_value.value(), None, false)
+        claim.truth_value.value()
     };
 
     success_json(&SubmitClaimResponse {
@@ -438,11 +549,21 @@ pub async fn query_claims(
     let min = params.min_truth.unwrap_or(0.0);
     let max = params.max_truth.unwrap_or(1.0);
 
-    // Filter by truth range in SQL (before LIMIT) so matching claims outside
-    // the most-recent `limit` rows are still reachable (bug 5a55a48e).
-    let claims = ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, limit, 0)
-        .await
-        .map_err(internal_error)?;
+    // Retirement state defaults to current-only. This tool is used as an
+    // assessment-queue proxy (`query_claims(max_truth=0.4)`), and returning
+    // superseded/refuted claims made already-resolved work resurface every
+    // cycle (backlog a85ee585). `Some(false)` still yields superseded rows for
+    // callers that want them; the schema documents that omission means
+    // current-only.
+    let is_current = params.is_current.or(Some(true));
+
+    // Filter by truth range AND retirement state in SQL (before LIMIT) so
+    // matching claims outside the most-recent `limit` rows are still reachable
+    // (bug 5a55a48e) and excluded rows don't consume the limit budget.
+    let claims =
+        ClaimRepository::list_by_truth_range(&server.pool, viewer, min, max, is_current, limit, 0)
+            .await
+            .map_err(internal_error)?;
 
     // No per-id access map. `list_by_truth_range` is spliced with `viewer`, so
     // a claim this caller may not read is not in `claims`. The map existed to
@@ -454,8 +575,8 @@ pub async fn query_claims(
     // (backlog babd5904: this handler previously hardcoded `labels: Vec::new()`
     // while get_claim on the same id returned them). Batch fetch avoids the
     // N+1 fan-out of per-claim get_labels calls; the helper does NOT filter on
-    // is_current so superseded rows (which list_by_truth_range returns) keep
-    // their labels, matching get_labels' label source. A missing id → no labels.
+    // is_current, so an explicit `is_current=false` request keeps its labels,
+    // matching get_labels' label source. A missing id → no labels.
     let labels_map = ClaimRepository::labels_by_ids(&server.pool, viewer, &ids)
         .await
         .map_err(internal_error)?;
@@ -472,8 +593,11 @@ pub async fn query_claims(
                 content_hash: ContentHasher::to_hex(&c.content_hash),
                 created_at: c.created_at.to_rfc3339(),
                 labels: labels_map.get(&id).cloned().unwrap_or_default(),
-                is_current: true,
-                supersedes: None,
+                // The row's real retirement state, not a hardcoded `true` /
+                // `None` (backlog a85ee585) — `list_by_truth_range` now
+                // projects both columns.
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
             }
         })
         .collect();
@@ -581,22 +705,75 @@ pub async fn get_claim(
     })
 }
 
+/// Report the crypto state of a claim: does the body still match its stored
+/// digest, and did a known key sign that digest.
+///
+/// # The integrity answer is three-valued, deliberately
+///
+/// `claims.content_hash` is not `blake3(content)` on every row. The canonical
+/// Tier-1 document pipeline binds
+/// `compound_content_hash(blake3(text), artifact_seed)` on every thesis,
+/// section and paragraph node so that migration 013's
+/// `UNIQUE (content_hash, agent_id)` cannot collapse two papers' "Introduction"
+/// rows (`epigraph_ingest::common::plan::PlannedClaim::content_hash` is the
+/// contract; `epigraph_mcp::tools::ingestion` binds it verbatim). For that class
+/// `blake3(content) != stored` holds on *untampered* rows, and the seed is not
+/// carried on the claim, so the comparison decides nothing — reported as
+/// [`HashCheck::NotApplicable`] rather than as a mismatch.
+///
+/// The seed is deliberately NOT guessed back. `verify_claim` was filed as
+/// theatre (backlog `49c17386`) for asserting certainty it did not have;
+/// recomputing a compound digest from an inferred seed would reintroduce
+/// exactly that, one level deeper.
 pub async fn verify_claim(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(id))
+    let claim_id = ClaimId::from_uuid(id);
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, claim_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
 
-    // Verify content hash
+    // Integrity: BLAKE3 over the body vs. the digest STORED on the row.
+    //
+    // `ClaimRepository::get_by_id` projects `claims.content_hash` (backlog
+    // `49c17386`). It used to inherit `claim_from_row`'s placeholder, which was
+    // itself `ContentHasher::hash(content)` — so this comparison ran a value
+    // against itself, the answer was unconditionally "matches", and a claim
+    // whose body had been mutated without rewriting its digest verified clean.
     let computed_hash = ContentHasher::hash(claim.content.as_bytes());
-    let hash_matches = computed_hash == claim.content_hash;
+    let hash_check = if computed_hash == claim.content_hash {
+        HashCheck::Match
+    } else {
+        // The digest is not blake3(body). Two very different causes, and only
+        // one of them is tampering. Classify by how the row was WRITTEN — the
+        // predicate lives next to the writer that creates the class.
+        //
+        // Second query, on this branch only: the matching case needs no
+        // `properties` read at all, so the common path is unchanged.
+        let properties = ClaimRepository::get_properties(&server.pool, viewer, claim_id)
+            .await
+            .map_err(internal_error)?
+            .unwrap_or(serde_json::Value::Null);
+        if epigraph_ingest::document::stored_content_hash_is_seed_scoped(&properties) {
+            HashCheck::NotApplicable
+        } else {
+            HashCheck::Mismatch
+        }
+    };
 
-    // Verify signature
+    // Authenticity: the stored Ed25519 signature over the stored digest,
+    // checked against the SIGNER's public key (resolved by `get_by_id` through
+    // `claims.signer_id -> agents.public_key`). Previously `public_key` was
+    // hardcoded `[0u8; 32]` and `signature` hardcoded `None`, so this check
+    // could never pass for any claim.
+    //
+    // `signed` keeps "no signature to check" distinguishable from "signature
+    // present and rejected" — both of which report `signature_valid = false`.
+    let signed = claim.signature.is_some();
     let signature_valid = match claim.signature {
         Some(sig) => {
             epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
@@ -608,7 +785,14 @@ pub async fn verify_claim(
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
-        hash_matches,
+        signed,
+        hash_check,
+        hash_matches: match hash_check {
+            HashCheck::Match => Some(true),
+            HashCheck::Mismatch => Some(false),
+            // `null`, never `false`: see `VerifyResponse::hash_matches`.
+            HashCheck::NotApplicable => None,
+        },
         truth_value: claim.truth_value.value(),
     })
 }
@@ -645,6 +829,13 @@ pub async fn update_with_evidence(
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
 
+    // Same placement rule as `submit_claim`: validate the caller's labels
+    // before anything is written. The additive label merge at the bottom of
+    // this function runs AFTER the Evidence insert, the DS/BBA wiring and the
+    // truth_value update, so a rejection there would move the claim's belief
+    // on the strength of a submission the caller was told had failed.
+    epigraph_db::reject_unexpanded_labels(&params.labels).map_err(db_caller_error)?;
+
     let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
         .await
         .map_err(internal_error)?
@@ -666,7 +857,49 @@ pub async fn update_with_evidence(
     );
     evidence.signature = Some(server.signer.sign(&evidence_hash));
 
-    EvidenceRepository::create(&server.pool, &evidence)
+    // HISTORY, kept short because the next block supersedes it: before D2 this
+    // evidence INSERT was deliberately left UNSTAMPED. Stamped on its own it
+    // would have had to self-commit (migration 046's
+    // `mass_functions.evidence_id -> evidence(id)` FK, with the DS wiring on a
+    // sibling connection), and the still-unconverted DS wiring then failed at
+    // `claim_frames` — a committed evidence row whose BBA never landed. MEASURED
+    // on the pre-branch binary, CONFIG B: `update_with_evidence` ->
+    // "assign_claim: ... policy for table \"claim_frames\"" with the evidence
+    // row committed.
+    //
+    // (An earlier form of this note also called that orphan a RETRY AMPLIFIER —
+    // "`Evidence::new` mints a fresh v4 UUID and `EvidenceRepository::create`
+    // has no `ON CONFLICT`, so each retry appends another row". #497 measured
+    // that premise wrong for an IDENTICAL retry: `content_hash` is
+    // `blake3(evidence_data)` and migration 001's
+    // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+    // refuses it as "Duplicate entity already exists". Only a RE-WORDED retry
+    // adds a row. That makes a committed BBA-less row WORSE, not better: it
+    // blocks the identical re-submission that would land the contribution.)
+    //
+    // ── D2: evidence -> BBA -> truth_value -> labels, ONE STAMPED UNIT ──
+    //
+    // THE OBJECTION ABOVE IS ANSWERED BY THE TRANSACTION, NOT WAIVED. It said
+    // stamping this INSERT alone "converts a clean refusal into a committed
+    // orphan". That is true of a SELF-COMMITTING stamped INSERT. Here the INSERT
+    // joins the transaction that also carries the DS wiring, the truth write and
+    // the label merge: if any of them fails, nothing is committed, so there is
+    // no BBA-less row left behind to refuse the identical re-submission — the
+    // caller's retry of the same `evidence_data` is the recovery, and it is
+    // pinned in `tests/update_with_evidence_ds_wiring_failure_is_atomic.rs`.
+    //
+    // AND THE FK ORDERING THAT FORCED THE SPLIT DISSOLVES. Migration 046 gives
+    // `mass_functions.evidence_id` a foreign key to `evidence(id)`, which is why
+    // the evidence row had to exist before `auto_wire_ds_update` could reference
+    // it. A foreign key is checked at statement time against the CURRENT
+    // transaction's snapshot, not at commit, so an uncommitted evidence row in
+    // this same transaction satisfies it. The two writes no longer need separate
+    // commits to be orderable.
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, agent_id, "update_with_evidence")
+            .await?;
+
+    EvidenceRepository::create(&mut *tx, &evidence)
         .await
         .map_err(internal_error)?;
 
@@ -683,7 +916,7 @@ pub async fn update_with_evidence(
     // by the prior column value for supports=true, so the warning is only ever
     // reachable on the NULL-column (no-prior-DS-state) path.
     let pre_pignistic =
-        ClaimRepository::get_belief_columns(&server.pool, viewer, ClaimId::from_uuid(claim_id))
+        ClaimRepository::get_belief_columns(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
             .await
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
@@ -692,10 +925,37 @@ pub async fn update_with_evidence(
     // I-3: use helper that checks CALIBRATION_PATH env var before relative path
     let weight = load_evidence_type_weight(&params.evidence_type);
 
-    // CDST update (primary — errors propagated, not swallowed)
+    // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
+    //
+    // #497 ("update_with_evidence best-effort") made this failure non-fatal and
+    // disclosed it as `belief_wired: false`. That was right FOR ITS TREE: there
+    // the evidence INSERT had already self-committed on the unstamped pool, the
+    // wiring ran on a sibling pool connection and was refused in production
+    // (`new row violates row-level security policy for table "claim_frames"`),
+    // so a fatal error reported total failure for a call whose evidence row the
+    // database had kept.
+    //
+    // Neither premise survives D2. The wiring runs on THIS stamped transaction,
+    // so the production refusal it was working around is the thing D2 removes,
+    // and the evidence row is uncommitted until everything below succeeds. A
+    // failure here therefore leaves NOTHING behind — no evidence, no BBA, no
+    // truth write, no labels — and an error is now the complete and truthful
+    // answer. Swallowing it instead would commit exactly the BBA-less evidence
+    // row the note above explains is worse than nothing (it blocks the identical
+    // re-submit via `evidence_content_hash_claim_unique`). The error text keeps
+    // the failing step as its prefix (`assign_claim:`, `store BBA:`,
+    // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
+    // which is the part of #497's disclosure that still has a referent.
+    //
+    // `submit_claim` still treats its own DS wiring as best-effort, and that is
+    // not a discrepancy: there the CLAIM is the primary write and it has already
+    // committed in its own transaction before the wire runs, so the claim
+    // exists either way. Here the evidence row IS the submission, and it is in
+    // the same unit as its BBA.
+    //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
     let ds = ds_auto::auto_wire_ds_update(
-        &server.pool,
+        &mut tx,
         viewer,
         claim_id,
         agent_id,
@@ -706,25 +966,72 @@ pub async fn update_with_evidence(
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(|e| {
+        // Logged as well as returned. `internal_error` only builds the
+        // `McpError`, so without this a dropped wire here would never reach
+        // the server log. #497 added this warn so that one log query
+        // ("ds auto-wire failed") finds every dropped wire, whichever tool
+        // dropped it; `submit_claim`'s path emits the same prefix with the same
+        // `claim_id`/`tool` fields. The wording differs because the outcome
+        // does: here the whole submission is rolled back.
+        tracing::warn!(
+            claim_id = %claim_id,
+            tool = "update_with_evidence",
+            "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
+        );
+        internal_error(e)
+    })?;
 
-    // Derive truth_value from CDST pignistic probability
+    // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
+    //
+    // Both are `UPDATE claims`, so both are governed by `claims_tenancy`'s
+    // `WITH CHECK` and both were refused on the unstamped pool. They share a
+    // transaction because they are one decision about one row: the belief this
+    // submission produced, and the labels it was submitted under. Splitting them
+    // is how a successful truth update with dropped labels happens — the shape
+    // backlog f14592cb reported for the labels themselves.
+    //
+    // AFTER the DS wiring, necessarily: `after_truth` is derived from
+    // `ds.pignistic_prob`, so there is nothing to write until the recompute has
+    // run. The label merge stays in the same unit rather than moving earlier,
+    // because a label rejection must not leave the claim's belief moved on the
+    // strength of a submission the caller was told had failed — the placement rule
+    // the caller-label validation at the top of this function already follows.
+    //
+    // IT SERVES ONLY CLAIMS THIS SERVER'S
+    // GROUP OWNS. The stamp carries `server.agent_id()`'s writable set, and
+    // `claims_tenancy`'s `WITH CHECK` asks about the ROW's `owner_group_id` — the
+    // TARGET claim's group, not the evidence author's. So `update_with_evidence`
+    // against another agent's claim stays refused on a cleanly-migrated schema,
+    // exactly as `update_labels` does. That residual is pinned on the non-bypassing
+    // role by `epigraph-db/tests/tool_write_tables_require_a_stamp.rs::
+    // relabelling_a_foreign_groups_claim_is_refused_on_a_stamped_app_session` and
+    // its `…_lands_when_the_session_carries_the_claims_own_group` pair; the same
+    // statement holds for `challenge_claim` and `submit_ds_evidence`, and each
+    // states it at its own site. It is a tenancy-model decision, not a defect here.
     let after_truth = TruthValue::clamped(ds.pignistic_prob);
-    ClaimRepository::update_truth_value(&server.pool, ClaimId::from_uuid(claim_id), after_truth)
+    {
+        ClaimRepository::update_truth_value_conn(
+            &mut tx,
+            ClaimId::from_uuid(claim_id),
+            after_truth,
+        )
         .await
         .map_err(internal_error)?;
 
-    // Additive label merge on the dedup-match write, mirroring submit_claim's
-    // and memorize's dedup-hit behavior: labels union into the claim's
-    // existing array (ClaimRepository::update_labels dedupes via
-    // array_agg(DISTINCT ...)), never overwriting labels from the claim's
-    // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
-    // norcal-rfp-2026-07-05) were previously dropped on every call because
-    // UpdateWithEvidenceParams had no labels field at all.
-    if !params.labels.is_empty() {
-        ClaimRepository::update_labels(&server.pool, claim_id, &params.labels, &[])
-            .await
-            .map_err(internal_error)?;
+        // Additive label merge on the dedup-match write, mirroring submit_claim's
+        // and memorize's dedup-hit behavior: labels union into the claim's
+        // existing array (ClaimRepository::update_labels dedupes via
+        // array_agg(DISTINCT ...)), never overwriting labels from the claim's
+        // original creation cycle. Fixes backlog f14592cb: run-tag labels (e.g.
+        // norcal-rfp-2026-07-05) were previously dropped on every call because
+        // UpdateWithEvidenceParams had no labels field at all.
+        if !params.labels.is_empty() {
+            ClaimRepository::update_labels_conn(&mut tx, claim_id, &params.labels, &[])
+                .await
+                .map_err(db_caller_error)?;
+        }
+        tx.commit().await.map_err(internal_error)?;
     }
 
     // Warn when SUPPORTING evidence lowered the pignistic probability. Compare
@@ -738,11 +1045,21 @@ pub async fn update_with_evidence(
             .to_string()
     });
 
+    // `belief_wired` / `bba_stored` / `ds_wire_error` are #497's response fields,
+    // kept because clients may already read them. Under D2 a success response is
+    // only reachable when the whole unit committed, so they are constant here:
+    // the wire landed (`true`), this submission's BBA is persisted (`true`, which
+    // #497 defines as always true when `belief_wired` is), and there is no wire
+    // error to report. A failed wire never reaches this line — it is the `?`
+    // above, with everything rolled back.
     success_json(&UpdateResponse {
         claim_id: claim_id.to_string(),
         truth_before: before,
         truth_after: after_truth.value(),
         evidence_id: evidence.id.as_uuid().to_string(),
+        belief_wired: true,
+        bba_stored: true,
+        ds_wire_error: None,
         belief: Some(ds.belief),
         plausibility: Some(ds.plausibility),
         pignistic_prob: Some(ds.pignistic_prob),
@@ -905,6 +1222,41 @@ pub async fn resolve_backlog_item(
     let target_agent = original.agent_id.as_uuid();
     require_owner_or_admin(server, auth, target_agent).await?;
 
+    // Resolve the closure basis BEFORE anything is created.
+    //
+    // Ordering is the load-bearing decision here: a bad or unreadable basis id
+    // discovered AFTER `submit_claim` would leave an orphan resolution claim
+    // with no edges — and, once the label patch ran, an item that looks closed
+    // with no recorded basis at all, which is the exact failure this parameter
+    // exists to prevent.
+    //
+    // The existence check goes through the caller's `viewer`, the same read
+    // `original` above uses. That is deliberate and is the tenancy property of
+    // this feature: a caller cannot point a `justifies` edge at a claim they
+    // cannot see, and an invisible basis is REFUSED rather than silently
+    // dropped. Silently dropping would be worse than either alternative — it
+    // would record a closure whose basis set is quietly smaller than the one
+    // the caller asked for.
+    let mut basis_ids: Vec<uuid::Uuid> = Vec::with_capacity(params.basis_claim_ids.len());
+    for raw in &params.basis_claim_ids {
+        let basis_uuid = parse_uuid(raw)?;
+        if basis_uuid == original_id {
+            return Err(invalid_params(format!(
+                "basis claim {basis_uuid} is the backlog item being resolved; a closure \
+                 cannot be its own justification"
+            )));
+        }
+        ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(basis_uuid))
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                invalid_params(format!("basis claim {basis_uuid} not found or not visible"))
+            })?;
+        if !basis_ids.contains(&basis_uuid) {
+            basis_ids.push(basis_uuid);
+        }
+    }
+
     // 1. Submit the resolution claim via the canonical pipeline.
     let methodology = params
         .methodology
@@ -932,7 +1284,64 @@ pub async fn resolve_backlog_item(
     let submit_result = submit_claim(server, viewer, submit_params).await?;
     let resolution_id = extract_submit_claim_id(&submit_result)?;
 
-    // 2. PATCH the original's labels: add "resolved", keep "backlog".
+    // 2. Record the closure basis as `resolution -justifies-> basis` edges,
+    //    BEFORE the label patch. Ordering again: the item must not read as
+    //    closed until its basis is on the graph, because a closure with a
+    //    `resolved` label and no basis is precisely the un-reopenable state
+    //    this records against.
+    //
+    //    `create_if_not_exists` keys on (source, target, relationship), so a
+    //    retried call re-asserts rather than duplicating.
+    let resolution_uuid = parse_uuid(&resolution_id)?;
+    let mut basis_edge_ids: Vec<String> = Vec::with_capacity(basis_ids.len());
+    for basis_uuid in &basis_ids {
+        // Direction is `basis -justifies-> resolution`, NOT the reverse. Two
+        // reasons, and the second is the load-bearing one:
+        //   1. It is the correct English reading — the basis justifies the
+        //      resolution, not the other way round.
+        //   2. `EdgeRepository::list_current_claim_targets`, which
+        //      `retraction_cascade` uses to enumerate downstream work, takes a
+        //      `source_id` and walks `WHERE e.source_id = $1`. With the basis on
+        //      the TARGET side, retracting a basis could never reach the
+        //      resolution that rested on it.
+        // NOTE this alone does NOT make the closure defeasible — see the
+        // `basis_claim_ids` doc in types.rs. `sheaf::restriction_kind_with_profile`
+        // does not name "justifies", so it takes the `_ => Neutral` arm, and
+        // `auto_wire_edge_if_epistemic` short-circuits on Neutral, so the edge
+        // carries no BBA and the cascade's BBA filter skips it regardless of
+        // direction. This direction is a precondition for a future fix, not the
+        // fix itself.
+        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists(
+            &server.pool,
+            *basis_uuid,
+            "claim",
+            resolution_uuid,
+            "claim",
+            JUSTIFIES_RELATIONSHIP,
+            Some(serde_json::json!({
+                "via": "resolve_backlog_item",
+                "closure_of": original_id.to_string(),
+            })),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| McpError {
+            code: rmcp::model::ErrorCode::INTERNAL_ERROR,
+            message: format!(
+                "resolution claim {resolution_id} created but failed to record basis \
+                 {basis_uuid}: {e}"
+            )
+            .into(),
+            data: Some(serde_json::json!({
+                "resolution_claim_id": resolution_id,
+                "original_id": original_id.to_string(),
+            })),
+        })?;
+        basis_edge_ids.push(row.id.to_string());
+    }
+
+    // 3. PATCH the original's labels: add "resolved", keep "backlog".
     //    Best-effort: if this fails the resolution claim already exists,
     //    return a partial-success error so the reconciler can back-fill.
     let after_labels = match ClaimRepository::update_labels(
@@ -963,8 +1372,20 @@ pub async fn resolve_backlog_item(
         "resolution_claim_id": resolution_id,
         "original_id": original_id.to_string(),
         "original_labels": after_labels,
+        "basis_claim_ids": basis_ids.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
+        "basis_edge_ids": basis_edge_ids,
     }))
 }
+
+/// Relationship byte string for a closure-basis edge: resolution → basis.
+///
+/// LOWERCASE, and the same literal on both surfaces. `epigraph-api`'s
+/// `is_valid_relationship` matches `VALID_RELATIONSHIPS` case-sensitively and
+/// carries both spellings of several names (`DERIVED_FROM` and `derived_from`),
+/// so a mismatch here would make an edge this tool writes unreachable through
+/// `POST /api/v1/edges`. Lowercase matches the claim→claim cluster it belongs
+/// with: `alternative_of`, `asserts`, `decomposes_to`.
+pub const JUSTIFIES_RELATIONSHIP: &str = "justifies";
 
 /// Pull `claim_id` out of a `submit_claim` response. Mirrors the
 /// `first_text` helper in `tests/common/mod.rs` (the proven shape for
@@ -984,23 +1405,147 @@ fn extract_submit_claim_id(result: &CallToolResult) -> Result<String, McpError> 
         .ok_or_else(|| internal_error("submit_claim response missing claim_id"))
 }
 
+/// The one label that carries RETIREMENT semantics.
+///
+/// Exact byte string on purpose: it must be the same literal the canonical
+/// open-backlog query filters on
+/// (`query_claims_by_label(labels=["backlog"], exclude_labels=["resolved"])`,
+/// `CLAUDE.md`). A case variant such as `Resolved` is deliberately NOT gated,
+/// because it does not retire anything either — `exclude_labels` would not
+/// match it, so the claim stays visible in every backlog query.
+pub(crate) const RETIREMENT_LABEL: &str = "resolved";
+
+/// Apply `resolve_backlog_item`'s ownership gate to a free-form label mutation,
+/// but ONLY when it touches [`RETIREMENT_LABEL`] and ONLY on a transport that
+/// carries an `AuthContext` (issue #374).
+///
+/// ## The asymmetry this closes
+///
+/// `resolve_backlog_item`, `supersede_claim` and `mark_duplicate` all call
+/// [`require_owner_or_admin`]; `update_labels` and `patch_claim` called nothing,
+/// while being able to achieve the same *observable* effect — adding `resolved`
+/// to a claim removes it from every open-backlog query, without the resolution
+/// claim or the `Resolves <id>: ` trail the gated verb exists to create. A
+/// caller refused by the gated path was nudged toward the unaudited one. The
+/// reporter's own session relabelled 161 claims it did not own over the same
+/// token that `resolve_backlog_item` then refused.
+///
+/// ## Why only the `resolved` label
+///
+/// A blanket `require_owner_or_admin` on these two tools would gate cross-agent
+/// taxonomy maintenance, which is legitimate and high-volume. `resolved` is the
+/// one label with retirement semantics; the rest are free-form vocabulary.
+/// Both directions are gated: *removing* `resolved` un-retires a claim, which is
+/// the same authority as retiring it.
+///
+/// ## Why only the authenticated transport — and what stays open
+///
+/// `auth = None` means stdio, and stdio is NOT a trust boundary here: the
+/// process that spawned the server handed it `--database-url`, so it already
+/// holds unmediated write access to every row this gate protects (the same
+/// argument [`require_owner_or_admin`]'s doc comment makes for its own stdio
+/// arm). Gating it would also break a live, documented workflow rather than an
+/// abuse: `epiclaw-host`'s baked `release/epiclaw/CLAUDE.md` instructs every
+/// scheduled agent to retire cross-agent backlog items with exactly
+/// `update_labels(original_id, add=["resolved"])`, because `resolve_backlog_item`
+/// refuses them.
+///
+/// That refusal is real and was **re-measured, not assumed**: the epiclaw
+/// agent-runner exports `EPIGRAPH_AGENT_MODEL` /
+/// `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` (`agent-runner/src/index.ts`,
+/// `agentIdentityEnv`), so `main::select_signer` takes rung 1 and
+/// `signer_identity_declared` is **true** for the fleet — the
+/// warn-and-allow `!signer_identity_declared` arm does not cover them. Gating
+/// stdio here would therefore leave those agents with no way to retire a
+/// backlog item at all.
+///
+/// So this closes the remotely-reachable half and leaves the local half as it
+/// was. The stdio bypass remains open by design until the sanctioned path is
+/// reachable for the fleet; issue #374 stays open for that half.
+async fn gate_retirement_label(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    claim_id: Uuid,
+    add: &[String],
+    remove: &[String],
+) -> Result<(), McpError> {
+    let touches_retirement = add
+        .iter()
+        .chain(remove.iter())
+        .any(|l| l == RETIREMENT_LABEL);
+    if !touches_retirement {
+        return Ok(());
+    }
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+
+    // Only fetched on the gated path, so the common label mutation keeps its
+    // single round-trip. This also means a `resolved` mutation now reports
+    // "claim not found" for a missing id where it previously fell through to a
+    // repo-layer no-op — deliberate: the gate cannot decide ownership of a row
+    // it cannot read.
+    //
+    // Read with the CALLER's own authority, not a maintenance viewer: this is
+    // an ownership gate, and a principal who cannot see the row cannot own it.
+    // A viewer-invisible claim therefore takes the same "not found" branch as a
+    // nonexistent one, which is the behaviour the paragraph above describes.
+    // Viewer is supplied by the caller (acquired in server.rs). Acquiring it
+    // here instead would break `tool_viewer_coverage`'s location ratchet, which
+    // asserts `request_viewer(` appears under src/tools/ only in viewer.rs.
+    let claim = ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(claim_id))
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
+
+    require_owner_or_admin(server, Some(auth), claim.agent_id.as_uuid()).await
+}
+
 pub async fn update_labels(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::UpdateLabelsParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     if params.add.is_empty() && params.remove.is_empty() {
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
-    let labels = ClaimRepository::update_labels(&server.pool, id, &params.add, &params.remove)
+    gate_retirement_label(server, viewer, auth, id, &params.add, &params.remove).await?;
+    // `db_caller_error`, not `internal_error`: a label refused by
+    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
+    // repo layer refuses it inside the same statement that would have written
+    // it, so nothing is persisted — only the reported code was wrong here.
+    //
+    // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
+    // WITH CHECK refuses it on an unstamped session. The stamp is the MCP
+    // server's own agent, which is what makes the SANCTIONED case work: the
+    // stdio ownership gate above degrades to "the claim's author is this server's
+    // agent", so the row is owned by the group this session can write. A
+    // `claims:admin` HTTP caller relabelling ANOTHER agent's claim is still
+    // refused on a cleanly-migrated schema, because the row is owned by that
+    // agent's group and no viewer this process can resolve carries write
+    // authority there — the same residual `challenge_claim` carries, and a
+    // tenancy-model question rather than a stamping one.
+    let mut tx = crate::claim_helper::begin_author_stamped_tx(
+        server,
+        server.agent_id().await?,
+        "update_labels",
+    )
+    .await?;
+    let labels = ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
         .await
-        .map_err(internal_error)?;
+        .map_err(db_caller_error)?;
+    tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({ "claim_id": id, "labels": labels }))
 }
 
 pub async fn patch_claim(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::PatchClaimParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
     let trace = match &params.trace_id {
@@ -1016,6 +1561,36 @@ pub async fn patch_claim(
             "at least one of trace_id/properties/add_labels/remove_labels required",
         ));
     }
+    // Same gate as `update_labels`: `patch_claim` also accepts
+    // `add_labels`/`remove_labels`, so leaving it ungated would just move the
+    // bypass one tool over (issue #374).
+    gate_retirement_label(
+        server,
+        viewer,
+        auth,
+        id,
+        &params.add_labels,
+        &params.remove_labels,
+    )
+    .await?;
+    // STILL UNSTAMPED, and named here rather than left silent. This transaction
+    // is ATOMIC but carries no tenancy context, so `patch_claim_atomic_conn`'s
+    // `UPDATE claims` is refused by `claims_tenancy`'s `WITH CHECK` on a session
+    // whose writable set is `{}` — the same refusal the `update_labels` tool
+    // above was converted out of.
+    //
+    // It is not converted with it because the fix is a REPOSITORY SIGNATURE
+    // CHANGE, not a call-site one: `patch_claim_atomic_conn` takes a
+    // `&mut sqlx::Transaction`, which `ScopedTx` is not (it derefs to
+    // `PgConnection`), so the parameter has to become a connection — with an
+    // `epigraph-api` caller to move and a `visibility_lint` register entry to
+    // write, since a `&mut PgConnection` parameter is exactly what that lint's
+    // connection scanner reads.
+    //
+    // Recorded because this site escaped the residual-write inventory
+    // altogether: it takes no `&server.pool` ARGUMENT — it calls
+    // `server.pool.begin()` — so an argument-shaped scan cannot see it. Its
+    // sibling `update_labels`, two functions up, was in that inventory.
     let mut tx = server.pool.begin().await.map_err(internal_error)?;
     let diff = ClaimRepository::patch_claim_atomic_conn(
         &mut tx,
@@ -1028,7 +1603,7 @@ pub async fn patch_claim(
         },
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(db_caller_error)?;
     tx.commit().await.map_err(internal_error)?;
     success_json(&serde_json::json!({
         "claim_id": id,

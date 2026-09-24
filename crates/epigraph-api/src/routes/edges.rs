@@ -118,27 +118,33 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "OPERATED_BY",     // software_agent/instrument → person (prov:actedOnBehalfOf)
     "MANUFACTURED_BY", // instrument → organization
     // Ingestion and cross-source edge types (used by Python migration scripts)
-    "alternative_of",     // claim → claim (alternative formulation; spec 2026-05-27)
-    "asserts",            // paper → claim (paper asserts a claim)
-    "same_source",        // claim → claim (same source document)
-    "decomposes_to",      // claim → claim (atomic decomposition)
-    "section_follows",    // claim → claim (sibling section ordering within a document)
-    "continues_argument", // claim → claim (sibling paragraph ordering within a section)
-    "same_as",            // claim → claim (deduplication identity)
-    "CORROBORATES",       // claim → claim (cross-source corroboration)
-    "AUTHORED",           // agent → claim (materialized authorship)
-    "ATTRIBUTED_TO",      // claim → agent (prov:wasAttributedTo)
-    "refines",            // claim → claim (refinement)
-    "cites",              // claim → claim (citation link)
-    "EQUIVALENT_TO",      // claim → claim (semantic equivalence)
-    "CONTRADICTS",        // claim → claim (contradiction)
-    "supersedes",         // claim → claim (version chain)
-    "revises",            // claim → claim (concurrent branch from common ancestor)
-    "enables",            // claim → claim (enablement)
+    "alternative_of", // claim → claim (alternative formulation; spec 2026-05-27)
+    "asserts",        // paper → claim (paper asserts a claim)
+    "same_source",    // claim → claim (same source document)
+    "decomposes_to",  // claim → claim (atomic decomposition)
+    // Closure basis: resolution claim → the claims that justified closing a
+    // backlog item. Written by MCP `resolve_backlog_item`; registered here so
+    // the same edge can be asserted and inspected over HTTP. The byte string
+    // must stay identical to `epigraph_mcp::tools::claims::JUSTIFIES_RELATIONSHIP`
+    // — this list is matched case-sensitively.
+    "justifies",             // claim → claim (closure basis; reopenable via supersede)
+    "section_follows",       // claim → claim (sibling section ordering within a document)
+    "continues_argument",    // claim → claim (sibling paragraph ordering within a section)
+    "same_as",               // claim → claim (deduplication identity)
+    "CORROBORATES",          // claim → claim (cross-source corroboration)
+    "AUTHORED",              // agent → claim (materialized authorship)
+    "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
+    "refines",               // claim → claim (refinement)
+    "cites",                 // claim → claim (citation link)
+    "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
+    "CONTRADICTS",           // claim → claim (contradiction)
+    "supersedes",            // claim → claim (version chain)
+    "revises",               // claim → claim (concurrent branch from common ancestor)
+    "enables",               // claim → claim (enablement)
     "has_method_capability", // method → capability (method graph)
-    "interpreted_by",     // claim → agent (interpretation provenance)
-    "concludes",          // trace → claim (reasoning conclusion)
-    "HAS_TRACE",          // claim → trace (reasoning trace link)
+    "interpreted_by",        // claim → agent (interpretation provenance)
+    "concludes",             // trace → claim (reasoning conclusion)
+    "HAS_TRACE",             // claim → trace (reasoning trace link)
     // AI development patterns — context persistence, issue generation, observability
     "OBSERVED_DURING", // claim → claim (design decision observed during feature work)
     "INFORMS",         // claim → claim (decision informs future work)
@@ -323,8 +329,21 @@ async fn trigger_edge_ds_recomputation(
         return Ok(()); // source claim doesn't exist — skip silently
     };
 
+    // STILL UNSTAMPED. This is the HTTP twin of MCP `link_epistemic`, which WAS
+    // stamped in this change, and the asymmetry is deliberate rather than an
+    // omission: `epigraph-api`'s request path is converted shard by shard under
+    // `epigraph-db/tests/no_unscoped_pool.rs`, which counts `routes/edges.rs` at 7
+    // unconverted sites and requires a shard to lower its own row. Converting one
+    // site here out of band would lower that row for a handler whose other six
+    // sites still reach the raw pool, which is the "looks converted" shape this
+    // programme has already paid for. The acquire below is mechanical: it moves N
+    // pool checkouts onto ONE connection, which is what makes the per-edge
+    // savepoint inside the helper meaningful, and carries no tenancy context.
+    let mut wire_conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: format!("edge auto-wire: could not acquire: {e}"),
+    })?;
     let outcome = auto_wire_edge_if_epistemic(
-        pool,
+        &mut wire_conn,
         viewer,
         was_created,
         edge_id,
@@ -457,19 +476,27 @@ async fn recompute_claim_belief(
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
 ) -> Result<(), crate::errors::ApiError> {
-    epigraph_engine::edge_factor::recompute_claim_belief_binary(pool, viewer, claim_id)
-        .await
-        .map(|recomputed| {
-            if recomputed {
-                tracing::info!(
-                    claim = %claim_id,
-                    "Dependent claim recomputed via 1-hop propagation"
-                );
-            }
-        })
-        .map_err(|e| crate::errors::ApiError::DatabaseError {
-            message: format!("Failed to recompute dependent claim belief: {e}"),
-        })
+    // Unstamped for the reason recorded above on `auto_wire_edge_if_epistemic`.
+    let mut recompute_conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+        message: format!("belief recompute: could not acquire: {e}"),
+    })?;
+    epigraph_engine::edge_factor::recompute_claim_belief_binary(
+        &mut recompute_conn,
+        viewer,
+        claim_id,
+    )
+    .await
+    .map(|recomputed| {
+        if recomputed {
+            tracing::info!(
+                claim = %claim_id,
+                "Dependent claim recomputed via 1-hop propagation"
+            );
+        }
+    })
+    .map_err(|e| crate::errors::ApiError::DatabaseError {
+        message: format!("Failed to recompute dependent claim belief: {e}"),
+    })
 }
 
 // =============================================================================
@@ -3847,7 +3874,7 @@ mod db_tests {
     // entity_types registry (Phase 1 + Phase 2)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// All 23 seeded types are valid; the 6 DB-only ones the old Rust list
+    /// All 24 seeded types are valid; the 6 DB-only ones the old Rust list
     /// omitted are present; case-variants and junk are rejected. This absorbs
     /// the ex-`edges_validation.rs::synthesis_entity_type_is_valid` coverage.
     #[sqlx::test(migrations = "../../migrations")]
@@ -3867,11 +3894,16 @@ mod db_tests {
             "claim",
             "node",
             "frame",
+            // Seeded by migration 094 (backlog 895a74e5): `public.methods` has
+            // existed since 001 but migration 054 omitted its registry row, so
+            // after 055 swapped the static CHECK for an FK every method edge
+            // was refused.
+            "method",
         ] {
             assert!(is_valid_entity_type(&state, t).await, "{t} should be valid");
         }
-        // Exactly the 23 seeded rows.
-        assert_eq!(valid_entity_type_names(&state).len(), 23);
+        // Exactly the 24 seeded rows (23 from migration 054 + `method` from 094).
+        assert_eq!(valid_entity_type_names(&state).len(), 24);
         // Rejections.
         for bad in ["invalid", "", "CLAIM", "public.claims"] {
             assert!(

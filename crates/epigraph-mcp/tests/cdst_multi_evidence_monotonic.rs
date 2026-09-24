@@ -70,9 +70,12 @@ async fn add_evidence(
 /// Seed the binary frame and return its id (creates it if absent).
 async fn get_or_create_binary_frame(pool: &PgPool) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
-    epigraph_mcp::tools::ds_auto::ensure_binary_frame(pool, &viewer)
-        .await
-        .expect("ensure_binary_frame")
+    epigraph_mcp::tools::ds_auto::ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &viewer,
+    )
+    .await
+    .expect("ensure_binary_frame")
 }
 
 /// Insert a legacy mixed-format BBA directly into mass_functions.
@@ -147,7 +150,11 @@ async fn supporting_evidence_never_lowers_betp_with_legacy_mixed_bbas(pool: PgPo
         insert_legacy_mixed_bba(&pool, claim_id, frame_id).await;
     }
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Set an initial pignistic_prob to simulate the pre-bug state (~0.88).
     // auto_wire_ds_update will read this before combining and clamp against it.
@@ -195,7 +202,7 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .await;
 
     let (_frame_id, wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         &[
             BatchDsEntry {
@@ -226,7 +233,11 @@ async fn supporting_evidence_never_lowers_betp_with_opposing_bbas(pool: PgPool) 
     .expect("auto_wire_ds_batch");
     assert_eq!(wired, 3);
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Add opposing evidence to create conflict.
     add_evidence(
@@ -268,7 +279,7 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
     let claim_id = seed_claim(&pool, "1c1360bb variant-2opp regression claim", 0.5).await;
 
     let (_frame_id, _wired) = auto_wire_ds_batch(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &viewer,
         &[
             BatchDsEntry {
@@ -291,7 +302,11 @@ async fn supporting_evidence_never_lowers_betp_two_opposing(pool: PgPool) {
     .await
     .expect("batch 2 supports");
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     add_evidence(
         &server,
@@ -401,7 +416,11 @@ async fn monotonicity_clamp_never_exceeds_plausibility(pool: PgPool) {
         .await
         .expect("seed inflated prior");
 
-    let server = build_test_server(pool.clone());
+    // Scoped: `update_with_evidence` now writes its evidence row and its
+    // truth_value update on author-stamped transactions, and a server with no
+    // `ScopedPool` refuses the tool by name rather than writing on the unstamped
+    // pool, where `evidence` and `claims` both refuse it with 42501.
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
 
     // Weak supporting evidence: `supports=true` arms the clamp, and the legacy
     // mixed BBAs' opposing + complement mass keeps the combined plausibility

@@ -417,6 +417,36 @@ async fn validate_packet(
         ));
     }
 
+    // 1b-ii. Reject labels carrying an unexpanded shell variable.
+    // `packet.claim.labels` is caller-supplied and is written by a raw
+    // `UPDATE claims SET labels` in `submit_packet`, NOT through
+    // `ClaimRepository`, so it does not inherit the repo-layer guard.
+    //
+    // Gated on `db` because `epigraph-db` is an optional dependency
+    // (`db = ["dep:epigraph-db", ...]`) while `validate_packet` itself is not
+    // feature-gated, so an unconditional reference here breaks the
+    // `--no-default-features` variant that CI checks. Gating loses nothing: the
+    // write this guard protects — `submit_packet`'s raw `UPDATE claims SET
+    // labels` — is itself `#[cfg(feature = "db")]`, so without `db` there is no
+    // persistence path for an unexpanded label to reach.
+    #[cfg(feature = "db")]
+    {
+        if let Err(e) = epigraph_db::reject_unexpanded_labels(&packet.claim.labels) {
+            let reason = match e {
+                epigraph_db::DbError::InvalidData { reason } => reason,
+                other => other.to_string(),
+            };
+            return Err((
+                StatusCode::BAD_REQUEST,
+                ErrorResponse::with_details(
+                    "ValidationError",
+                    reason,
+                    serde_json::json!({ "field": "claim.labels" }),
+                ),
+            ));
+        }
+    }
+
     // 1c. Validate idempotency key length (DoS prevention)
     if let Some(ref key) = packet.claim.idempotency_key {
         if key.len() > MAX_IDEMPOTENCY_KEY_LENGTH {
@@ -1035,6 +1065,41 @@ struct PersistOutcome {
     evidence_ids: Vec<EvidenceId>,
 }
 
+/// Map a failure to resolve the packet author's owner group.
+///
+/// Migration 105's two refusals (`DbError::is_personal_group_refusal`: the
+/// author's personal membership is REVOKED, or its did_key is squatted) are a
+/// DENIAL, not a server fault: 403, as on every other surface that reaches the
+/// definer (`errors.rs`'s `From<DbError>`). The function's text names the agent
+/// and the group, so it is LOGGED and kept out of the body, as the
+/// `From<DbError>` arm does too. This route builds its own `(StatusCode,
+/// ErrorResponse)` pairs, so it needs its own arm; before it, a revoked author
+/// got a 500 whose body carried both ids.
+#[cfg(feature = "db")]
+fn author_tenancy_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+    if e.is_personal_group_refusal() {
+        tracing::warn!(
+            detail = %e,
+            "submit_packet refused: the author's personal group cannot own the claim"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            ErrorResponse::new(
+                "Forbidden",
+                "the author's personal-group membership is revoked, or its personal group is not \
+                 usable; restoring it is an operator action. Nothing was written.",
+            ),
+        );
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorResponse::new(
+            "DatabaseError",
+            format!("Failed to resolve the author's tenancy: {e}"),
+        ),
+    )
+}
+
 #[cfg(feature = "db")]
 async fn persist_packet(
     pool: &epigraph_db::PgPool,
@@ -1116,15 +1181,7 @@ async fn persist_packet(
     // group is the only owner this surface can name without inventing one.
     let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, agent_id.into())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new(
-                    "DatabaseError",
-                    format!("Failed to resolve the author's tenancy: {e}"),
-                ),
-            )
-        })?;
+        .map_err(author_tenancy_error)?;
 
     let (persisted, was_created) =
         epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)
@@ -2482,6 +2539,54 @@ mod signature_verification_tests {
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Submission for an unregistered agent must be rejected"
+        );
+    }
+
+    /// `packet.claim.labels` is caller-supplied and is applied by a raw
+    /// `UPDATE claims SET labels` in `submit_packet`, bypassing the
+    /// `ClaimRepository` chokepoint — so this path needs (and now has) its own
+    /// unexpanded-shell-variable rejection. Backlog f6310444.
+    ///
+    /// The packet is otherwise fully valid and correctly signed, so a 400 here
+    /// can only come from the label check; and the claim must not be written.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn submit_packet_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool) {
+        let signer = epigraph_crypto::AgentSigner::generate();
+        let agent_id = seed_agent_with_pubkey(&pool, signer.public_key()).await;
+        let state = test_state_with_required_signatures(pool.clone());
+
+        let content = "Packet whose label array was never interpolated.";
+        let mut claim = build_test_claim_submission(agent_id, content);
+        claim.labels = vec![
+            "fine-label".to_string(),
+            "group:$EPICLAW_GROUP_ID".to_string(),
+        ];
+
+        let mut packet = EpistemicPacket {
+            claim,
+            evidence: vec![],
+            reasoning_trace: build_test_trace(),
+            signature: String::new(),
+        };
+        let canonical = packet.signable_bytes().unwrap();
+        packet.signature = hex::encode(signer.sign(&canonical));
+
+        let response = submit_packet_endpoint(state, packet).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an unexpanded shell variable in packet.claim.labels must be a 400"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "the packet was persisted despite the 400 — validate_packet runs before \
+             the write, so a non-zero count means the check is in the wrong place"
         );
     }
 }

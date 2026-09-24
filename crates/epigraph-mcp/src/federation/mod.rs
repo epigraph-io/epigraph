@@ -435,6 +435,29 @@ impl SharedFederation {
         self.read().route(effective_name).cloned()
     }
 
+    /// Names of configured extensions that are mounted **unhealthy** and could
+    /// plausibly own `tool_name`.
+    ///
+    /// An unhealthy extension has no tool list (that is what unhealthy means),
+    /// so the gateway cannot know whether it owns a given name. The configured
+    /// `prefix=` is the one piece of evidence that survives the outage: if any
+    /// unhealthy extension's prefix matches, those are the only candidates
+    /// worth naming. See [`narrow_unhealthy_candidates`] for the rule.
+    ///
+    /// Exists for `server.rs`'s unknown-tool error, which reports a routing
+    /// failure and wants to say *why* a name might be missing. Only names are
+    /// returned — never `addr`, which is deployment topology.
+    #[must_use]
+    pub fn unhealthy_extension_candidates(&self, tool_name: &str) -> Vec<String> {
+        let pairs: Vec<(String, Option<String>)> = self
+            .read()
+            .unhealthy_targets()
+            .into_iter()
+            .map(|(_, cfg)| (cfg.name, cfg.prefix))
+            .collect();
+        narrow_unhealthy_candidates(&pairs, tool_name)
+    }
+
     /// Proxy a federated `tools/call` to the owning extension. See
     /// [`FederationRegistry::invoke`].
     ///
@@ -503,5 +526,94 @@ impl SharedFederation {
                 this.reconnect_tick().await;
             }
         })
+    }
+}
+
+/// Which unhealthy extensions are worth naming in an unknown-tool error.
+///
+/// `unhealthy` is `(name, configured prefix)` for every extension mounted
+/// unhealthy. The rule:
+///
+/// - If any unhealthy extension carries a `prefix=` that `tool_name` starts
+///   with, return **only** those. A prefix match is real evidence of ownership
+///   and the unqualified list would bury it.
+/// - Otherwise return every unhealthy extension's name: without a prefix the
+///   gateway genuinely cannot tell which one (if any) owns the name, and
+///   guessing would be worse than listing.
+///
+/// Pure and separate from [`SharedFederation`] so the rule is testable without
+/// standing up a registry, a lock, or a downstream server.
+#[must_use]
+pub fn narrow_unhealthy_candidates(
+    unhealthy: &[(String, Option<String>)],
+    tool_name: &str,
+) -> Vec<String> {
+    let prefix_owners: Vec<String> = unhealthy
+        .iter()
+        .filter(|(_, prefix)| {
+            prefix
+                .as_deref()
+                .is_some_and(|p| !p.is_empty() && tool_name.starts_with(p))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    if prefix_owners.is_empty() {
+        unhealthy.iter().map(|(name, _)| name.clone()).collect()
+    } else {
+        prefix_owners
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::narrow_unhealthy_candidates;
+
+    fn ext(name: &str, prefix: Option<&str>) -> (String, Option<String>) {
+        (name.to_string(), prefix.map(str::to_string))
+    }
+
+    #[test]
+    fn a_prefix_match_wins_over_the_unqualified_list() {
+        let unhealthy = vec![
+            ext("episcience", Some("es_")),
+            ext("otherext", Some("ox_")),
+            ext("noprefix", None),
+        ];
+        assert_eq!(
+            narrow_unhealthy_candidates(&unhealthy, "es_attach_blob"),
+            vec!["episcience".to_string()],
+            "a configured prefix is real ownership evidence and must not be \
+             buried under every other down extension"
+        );
+    }
+
+    #[test]
+    fn with_no_prefix_match_every_unhealthy_extension_is_named() {
+        let unhealthy = vec![ext("episcience", Some("es_")), ext("noprefix", None)];
+        assert_eq!(
+            narrow_unhealthy_candidates(&unhealthy, "attach_blob"),
+            vec!["episcience".to_string(), "noprefix".to_string()],
+            "an unprefixed extension may own any name, so guessing is worse \
+             than listing"
+        );
+    }
+
+    #[test]
+    fn nothing_unhealthy_names_nothing() {
+        assert!(narrow_unhealthy_candidates(&[], "attach_blob").is_empty());
+    }
+
+    /// An empty `prefix=` must not match every tool name. `starts_with("")` is
+    /// true for every string, so without the `!p.is_empty()` guard one
+    /// misconfigured entry would be reported as the owner of every unknown
+    /// tool and suppress every other candidate.
+    #[test]
+    fn an_empty_prefix_is_not_a_match() {
+        let unhealthy = vec![ext("empty", Some("")), ext("other", None)];
+        assert_eq!(
+            narrow_unhealthy_candidates(&unhealthy, "attach_blob"),
+            vec!["empty".to_string(), "other".to_string()],
+            "an empty prefix is not evidence of ownership"
+        );
     }
 }

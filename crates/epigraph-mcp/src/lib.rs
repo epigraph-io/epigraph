@@ -12,7 +12,7 @@ pub mod server;
 pub mod tools;
 pub mod types;
 
-pub use server::EpiGraphMcpFull;
+pub use server::{EpiGraphMcpFull, SessionFactory};
 
 /// Return all registered MCP tools as a JSON value.
 ///

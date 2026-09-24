@@ -86,11 +86,39 @@
 //! cannot find them, so registering them would put them in the `fixed` set and
 //! fail the second assertion of
 //! `no_function_mints_a_bypass_and_names_a_foreign_pool` — a register can only
-//! hold rows this scanner can confirm. The class IS recorded elsewhere:
-//! `no_unmaintained_dsn.rs`'s register carries `epigraph-mcp/src/main.rs` with
-//! the reasoning, `main.rs` documents it, and `EpiGraphMcpFull::with_scoped_pool`
-//! has no production caller, so `maintenance_viewer` fails CLOSED there today.
-//! Owner for closing the gap: `D-PR17-hybrid-shape-lint`.
+//! hold rows this scanner can confirm. Owner for closing the gap:
+//! `D-PR17-hybrid-shape-lint`.
+//!
+//! **WHAT KEEPS THOSE THREE SITES FAIL-CLOSED CHANGED, AND THIS PARAGRAPH IS THE
+//! REASON A READER WOULD OTHERWISE BELIEVE A FALSE PREMISE.** It used to be an
+//! accident: `EpiGraphMcpFull::with_scoped_pool` had no production caller, so
+//! `maintenance_viewer` could not mint a lease at all, and
+//! `no_unmaintained_dsn.rs` carried `epigraph-mcp/src/main.rs` in its EXEMPT
+//! register on exactly that reasoning. Both of those facts are now gone:
+//! `main.rs` builds a `ScopedPool` and attaches it on every transport, because
+//! the MCP WRITE path cannot stamp a connection otherwise, and that register
+//! entry has been removed. The control is now explicit and local —
+//! `epigraph-mcp/src/maintenance.rs::maintenance_tools_run_on_the_maintenance_connection`
+//! returns `false` and `maintenance_viewer` checks it BEFORE it looks at the
+//! pool, so attaching a `ScopedPool` cannot un-gate the three tools as a side
+//! effect. `maintenance.rs`'s own test module pins that, which is the control
+//! this scanner cannot supply.
+//!
+//! **(b2) A STRING LITERAL naming a foreign pool is indistinguishable from a
+//! use, and the stripper cannot help.** Comments are stripped; string literals
+//! deliberately are not, because [`strip_comments`]-style handling has to track
+//! them in order NOT to mistake a `"postgres://…"` DSN for a line comment (see
+//! `the_stripper_does_not_eat_code`). MEASURED, on this batch:
+//! `epigraph-mcp/src/maintenance.rs::maintenance_viewer` became this lint's only
+//! reported offender because its REFUSAL MESSAGE spelled the field access while
+//! explaining why the refusal exists — a function whose entire purpose is to make
+//! the hybrid unreachable, flagged for describing it. Same class as the
+//! comment-stripping decision above ("a lint that punishes a call site for
+//! documenting its own hazard is worse than no lint"), one layer down. It was
+//! resolved by rewording the message rather than by registering a non-hybrid in
+//! [`EXPECTED_HYBRIDS`] or by teaching the stripper to eat literals, and the site
+//! carries a comment saying so. A future message that names a pool field will
+//! reproduce it; reword, do not register.
 //!
 //! **(c) Passing a `MaintenanceSession` into a callee has the same shape as
 //! (b).** A helper taking `&mut MaintenanceSession`

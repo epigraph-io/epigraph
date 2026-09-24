@@ -8,10 +8,24 @@
 //! These are called from both the HTTP route (`epigraph-api`) and the MCP
 //! tool (`epigraph-mcp`); they live here so neither has to depend on the
 //! other.
+//!
+//! # Every entry point takes a CONNECTION the caller has stamped
+//!
+//! The step claim [`add_step`] inserts is owned by the `workflow-ingest-system`
+//! agent's personal group — not by whoever called the tool — so on the unstamped
+//! pool migration 077's `claims_tenancy` `WITH CHECK` refuses it on a cleanly
+//! migrated schema. See
+//! [`crate::system_agent::system_agent_write_authority`] for the measurement of
+//! which identity the stamp must be, and why the answer is not the caller's.
+//!
+//! Taking a connection is also what makes these operations ATOMIC. `add_step`
+//! writes a claim, two `executes`/`decomposes_to` edges and up to three
+//! `step_follows` rewires; on a pool each of those was a separate checkout, so a
+//! refusal at the rewire left a step claim linked into a broken chain. Handed
+//! `&mut *tx` the whole rewire is one unit.
 
 use std::collections::HashSet;
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use epigraph_ingest::common::ids::{compound_claim_id, content_hash};
@@ -68,7 +82,7 @@ pub enum StepOpError {
 
 /// Find the latest-generation workflow row for a `canonical_name`.
 pub async fn find_workflow_head(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     canonical_name: &str,
 ) -> Result<(Uuid, i32), StepOpError> {
     let row: Option<(Uuid, i32)> = sqlx::query_as(
@@ -76,46 +90,78 @@ pub async fn find_workflow_head(
          ORDER BY generation DESC LIMIT 1",
     )
     .bind(canonical_name)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     row.ok_or_else(|| StepOpError::WorkflowNotFound(canonical_name.to_string()))
 }
 
-/// First level-1 phase claim under a workflow (migrate convention: one phase).
-pub async fn find_phase(pool: &PgPool, workflow_id: Uuid) -> Result<Uuid, StepOpError> {
-    let row: Option<Uuid> = sqlx::query_scalar(
+/// SQL `ORDER BY` key for a workflow's `executes` edges in PLAN order.
+///
+/// The `plan_index` ordinal `execute_workflow_ingest_plan` records on each edge,
+/// then `(c.created_at, c.id)` for edges that carry none (written before the
+/// ordinal existed, or by [`add_step`]). `c.created_at` cannot lead: the
+/// executor writes a whole plan in ONE transaction, so every claim and every
+/// edge of it shares one `NOW()`, and the order would fall through to `c.id` — a
+/// content-derived UUID. See the comment on the `executes` loop in
+/// `workflow.rs`.
+const PLAN_ORDER: &str = "CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                               THEN (e.properties->>'plan_index')::int \
+                               ELSE 2147483647 END, \
+                          c.created_at ASC, c.id ASC";
+
+/// First level-1 phase claim under a workflow, in PLAN order (migrate
+/// convention: one phase; for a multi-phase workflow, the plan's first).
+///
+/// Ordered by [`PLAN_ORDER`], not `c.created_at` alone. A multi-phase
+/// workflow's phases are written in one transaction and tie on `created_at`, so
+/// `ORDER BY c.created_at LIMIT 1` picked whichever phase had the smaller UUID
+/// and `add_step` attached the new step under it.
+pub async fn find_phase(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+) -> Result<Uuid, StepOpError> {
+    let sql = format!(
         "SELECT c.id FROM claims c \
          JOIN edges e ON e.target_id = c.id AND e.source_type = 'workflow' \
                       AND e.relationship = 'executes' \
          WHERE e.source_id = $1 \
            AND (c.properties->>'level')::int = 1 \
-         ORDER BY c.created_at ASC LIMIT 1",
-    )
-    .bind(workflow_id)
-    .fetch_optional(pool)
-    .await?;
+         ORDER BY {PLAN_ORDER} LIMIT 1"
+    );
+    let row: Option<Uuid> = sqlx::query_scalar(&sql)
+        .bind(workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
     row.ok_or(StepOpError::PhaseMissing)
 }
 
 /// Level-2 step claims under a workflow, ordered by walking `step_follows`
 /// from the head. Unreachable orphans (broken chain or no edges) are
-/// appended in `created_at` order.
-pub async fn ordered_steps(pool: &PgPool, workflow_id: Uuid) -> Result<Vec<Uuid>, StepOpError> {
-    let all: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-        "SELECT c.id, c.created_at FROM claims c \
+/// appended in plan order ([`PLAN_ORDER`]), and when several steps could be
+/// the head the earliest in plan order wins.
+///
+/// Both of those used to be `c.created_at`, which ties for every step of a plan
+/// written in one transaction.
+pub async fn ordered_steps(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+) -> Result<Vec<Uuid>, StepOpError> {
+    let sql = format!(
+        "SELECT c.id FROM claims c \
          JOIN edges e ON e.target_id = c.id AND e.source_type = 'workflow' \
                       AND e.relationship = 'executes' \
          WHERE e.source_id = $1 \
            AND (c.properties->>'level')::int = 2 \
-         ORDER BY c.created_at ASC",
-    )
-    .bind(workflow_id)
-    .fetch_all(pool)
-    .await?;
+         ORDER BY {PLAN_ORDER}"
+    );
+    let all: Vec<Uuid> = sqlx::query_scalar(&sql)
+        .bind(workflow_id)
+        .fetch_all(&mut *conn)
+        .await?;
     if all.is_empty() {
         return Ok(vec![]);
     }
-    let id_set: Vec<Uuid> = all.iter().map(|(id, _)| *id).collect();
+    let id_set: Vec<Uuid> = all.clone();
 
     let head_candidates: Vec<Uuid> = sqlx::query_scalar(
         "SELECT ws.id FROM unnest($1::uuid[]) AS ws(id) \
@@ -126,13 +172,11 @@ pub async fn ordered_steps(pool: &PgPool, workflow_id: Uuid) -> Result<Vec<Uuid>
          )",
     )
     .bind(&id_set)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
-    // Pick the head with the earliest created_at among candidates.
-    let head = head_candidates
-        .into_iter()
-        .min_by_key(|id| all.iter().find(|(i, _)| i == id).map(|(_, t)| *t));
+    // Pick the head that comes earliest in plan order among the candidates.
+    let head = all.iter().copied().find(|id| head_candidates.contains(id));
 
     let mut chain: Vec<Uuid> = Vec::with_capacity(all.len());
     let mut visited: HashSet<Uuid> = HashSet::new();
@@ -149,7 +193,7 @@ pub async fn ordered_steps(pool: &PgPool, workflow_id: Uuid) -> Result<Vec<Uuid>
             )
             .bind(cur)
             .bind(&id_set)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
             match next {
                 Some(n) if !visited.contains(&n) => cur = n,
@@ -157,7 +201,7 @@ pub async fn ordered_steps(pool: &PgPool, workflow_id: Uuid) -> Result<Vec<Uuid>
             }
         }
     }
-    for (id, _) in &all {
+    for id in &all {
         if !visited.contains(id) {
             chain.push(*id);
         }
@@ -168,7 +212,7 @@ pub async fn ordered_steps(pool: &PgPool, workflow_id: Uuid) -> Result<Vec<Uuid>
 // ── add_step ────────────────────────────────────────────────────────────────
 
 pub async fn add_step(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     canonical_name: &str,
     step_text: &str,
     position: Option<u32>,
@@ -176,9 +220,9 @@ pub async fn add_step(
     if step_text.trim().is_empty() {
         return Err(StepOpError::Invalid("step_text must not be empty".into()));
     }
-    let (workflow_id, _generation) = find_workflow_head(pool, canonical_name).await?;
-    let phase_id = find_phase(pool, workflow_id).await?;
-    let chain = ordered_steps(pool, workflow_id).await?;
+    let (workflow_id, _generation) = find_workflow_head(&mut *conn, canonical_name).await?;
+    let phase_id = find_phase(&mut *conn, workflow_id).await?;
+    let chain = ordered_steps(&mut *conn, workflow_id).await?;
 
     let step_hash = content_hash(step_text);
     let step_claim_id = compound_claim_id(&step_hash, canonical_name);
@@ -187,7 +231,7 @@ pub async fn add_step(
         let existing_lineage: Option<Uuid> =
             sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
                 .bind(step_claim_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await?
                 .flatten();
         return Ok(AddStepResult {
@@ -205,7 +249,7 @@ pub async fn add_step(
         _ => chain.len(),
     };
 
-    let agent_id = get_or_create_system_agent(pool).await?;
+    let agent_id = get_or_create_system_agent(&mut *conn).await?;
     let step_lineage = Uuid::new_v4();
 
     // ── Tenancy declaration (PR-16) ──
@@ -224,7 +268,7 @@ pub async fn add_step(
     // every workflow private to whoever last edited it. A parameter here would
     // therefore only widen the ways to get it wrong, so the declaration is
     // derived from the author the row already names.
-    let decl = epigraph_db::ClaimRepository::default_decl_for_author_pool(pool, agent_id).await?;
+    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?;
 
     sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id, \
@@ -245,11 +289,11 @@ pub async fn add_step(
     .bind(step_lineage)
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
-    epigraph_db::EdgeRepository::create_if_not_exists(
-        pool,
+    epigraph_db::EdgeRepository::create_if_not_exists_conn(
+        &mut *conn,
         workflow_id,
         "workflow",
         step_claim_id,
@@ -260,8 +304,8 @@ pub async fn add_step(
         None,
     )
     .await?;
-    epigraph_db::EdgeRepository::create_if_not_exists(
-        pool,
+    epigraph_db::EdgeRepository::create_if_not_exists_conn(
+        &mut *conn,
         phase_id,
         "claim",
         step_claim_id,
@@ -275,8 +319,8 @@ pub async fn add_step(
 
     if !chain.is_empty() {
         if position == 0 {
-            epigraph_db::EdgeRepository::create_if_not_exists(
-                pool,
+            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+                &mut *conn,
                 step_claim_id,
                 "claim",
                 chain[0],
@@ -288,8 +332,8 @@ pub async fn add_step(
             )
             .await?;
         } else if position == chain.len() {
-            epigraph_db::EdgeRepository::create_if_not_exists(
-                pool,
+            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+                &mut *conn,
                 chain[chain.len() - 1],
                 "claim",
                 step_claim_id,
@@ -310,10 +354,10 @@ pub async fn add_step(
             )
             .bind(prev)
             .bind(next)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
-            epigraph_db::EdgeRepository::create_if_not_exists(
-                pool,
+            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+                &mut *conn,
                 prev,
                 "claim",
                 step_claim_id,
@@ -324,8 +368,8 @@ pub async fn add_step(
                 None,
             )
             .await?;
-            epigraph_db::EdgeRepository::create_if_not_exists(
-                pool,
+            epigraph_db::EdgeRepository::create_if_not_exists_conn(
+                &mut *conn,
                 step_claim_id,
                 "claim",
                 next,
@@ -352,11 +396,11 @@ pub async fn add_step(
 // ── delete_step ─────────────────────────────────────────────────────────────
 
 pub async fn delete_step(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     canonical_name: &str,
     step_lineage_id: Uuid,
 ) -> Result<DeleteStepResult, StepOpError> {
-    let (workflow_id, _generation) = find_workflow_head(pool, canonical_name).await?;
+    let (workflow_id, _generation) = find_workflow_head(&mut *conn, canonical_name).await?;
 
     let claim_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT c.id FROM claims c \
@@ -367,7 +411,7 @@ pub async fn delete_step(
     )
     .bind(workflow_id)
     .bind(step_lineage_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let claim_id = claim_id.ok_or_else(|| StepOpError::StepNotFound {
@@ -379,7 +423,7 @@ pub async fn delete_step(
     sqlx::query("UPDATE claims SET truth_value = $1 WHERE id = $2")
         .bind(new_truth)
         .bind(claim_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
     Ok(DeleteStepResult {

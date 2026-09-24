@@ -5,8 +5,19 @@ Consumes a precomputed semantic-dedup.json snapshot (cosine ≥ threshold over
 claim embeddings) produced by the GUI's offline analysis. For each group, picks
 a canonical claim, redirects its high-signal references (mass_functions, edges,
 evidence, reasoning_traces), preserves AUTHORED-edge provenance from each
-duplicate's agent, and soft-marks the duplicates so the GUI's collapse
-behaviour and any downstream label-aware reader stay coherent.
+duplicate's agent, and RETRACTS the duplicates — `supersedes = canonical`,
+`is_current = false`, `embedding = NULL` — while also labelling them `deduped`
+with a `deduped_into` pointer, so the GUI's collapse behaviour and any
+downstream label-aware reader stay coherent.
+
+The retraction is load-bearing, not decoration. Until 2026-09 this script only
+appended the label and the properties, leaving every duplicate `is_current =
+true` with its embedding intact. `recall()` filters `WHERE c.embedding IS NOT
+NULL AND c.is_current` on both its dense and lexical legs, so soft-marked
+duplicates kept coming back as independent rows and a single-origin figure read
+as mutual corroboration across two to four nodes. The retraction columns written
+here are exactly those of the canonical Rust path,
+`ClaimRepository::mark_duplicate_with_repair`.
 
 This is the *S3 fuzzy* layer (cross-agent semantic equivalence). The S2
 content-hash-keyed dedup that gates migration 107 is a separate tool.
@@ -26,8 +37,17 @@ Limitations (scope-deferred — see docs/architecture/noun-claims-and-verb-edges
   claim_signature_revocations, counterfactual_scenarios, countersignatures,
   ds_bayesian_divergence, entity_mentions, evidence_diversity,
   experiments.hypothesis_id, learning_events, praxis_access_log.justification_claim_id,
-  praxis_claims, praxis_compliance_requirements, sample_claims, triples,
-  claims.supersedes. Soft-mark + label-aware reads cover these for now.
+  praxis_claims, praxis_compliance_requirements, sample_claims, triples.
+  Retraction + label-aware reads cover these for now: the row survives, so
+  every un-redirected FK stays valid, but it no longer answers recall.
+- A duplicate that is ALREADY superseded is skipped, not re-pointed, and
+  counted as `duplicates_skipped_already_superseded`. Overwriting an existing
+  `supersedes` would destroy lineage; `mark_duplicate_with_repair` refuses the
+  same case.
+- `embedding_3072` is deliberately NOT nulled, because
+  `mark_duplicate_with_repair` does not null it either. If that column should
+  be cleared on retraction it is one fix in the repo layer, not two divergent
+  half-fixes in two languages.
 - Mass-function merge is lossy. Pre-2026-04-08 BBAs all carry
   perspective_id=NULL, so any same-agent BBA on the duplicate collides
   with the canonical's BBA on the unique
@@ -61,6 +81,8 @@ DEFAULT_INPUT_PATH = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 class ClusterStats:
     canonical_id: str
     duplicate_count: int = 0
+    duplicates_retracted: int = 0
+    duplicates_skipped_already_superseded: int = 0
     mfs_moved: int = 0
     mfs_skipped_collision: int = 0
     edges_redirected: int = 0
@@ -76,6 +98,8 @@ class TotalStats:
     clusters_skipped_already_deduped: int = 0
     clusters_failed: int = 0
     duplicates: int = 0
+    duplicates_retracted: int = 0
+    duplicates_skipped_already_superseded: int = 0
     mfs_moved: int = 0
     mfs_skipped_collision: int = 0
     edges_redirected: int = 0
@@ -143,9 +167,11 @@ def merge_cluster(
     duplicates = [m for m in member_ids if m != canonical_id]
 
     for dup_id in duplicates:
-        # Skip if already soft-deduped — keeps the script idempotent.
+        # Skip if already soft-deduped — keeps the script idempotent. Also read
+        # `supersedes`: a dup that already points somewhere has a lineage we
+        # must not clobber (see step 7).
         cur.execute(
-            "SELECT 'deduped' = ANY(labels) FROM claims WHERE id = %s::uuid",
+            "SELECT 'deduped' = ANY(labels), supersedes FROM claims WHERE id = %s::uuid",
             (dup_id,),
         )
         row = cur.fetchone()
@@ -153,6 +179,14 @@ def merge_cluster(
             continue  # claim was hard-deleted between the snapshot and now
         if row[0]:
             continue  # already deduped
+        if row[1] is not None:
+            # Already superseded by some other claim. Retracting it INTO this
+            # canonical would overwrite that pointer, so refuse — the same
+            # decision ClaimRepository::mark_duplicate_with_repair makes
+            # ("Claim {id} already superseded; refusing to overwrite"). Left
+            # untouched and reported rather than silently half-merged.
+            stats.duplicates_skipped_already_superseded += 1
+            continue
         stats.duplicate_count += 1
 
         # 1. Mass functions — UNIQUE (claim, frame, agent, perspective). Migrate
@@ -238,7 +272,17 @@ def merge_cluster(
         stats.traces_redirected += cur.rowcount
 
         # 6. Preserve cross-agent provenance: each dup's authoring agent gets
-        #    an AUTHORED edge to the canonical (idempotent on the triple-UNIQUE).
+        #    an AUTHORED edge to the canonical, idempotently.
+        #
+        #    Idempotence is enforced by NOT EXISTS, not by ON CONFLICT. There is
+        #    no `UNIQUE (source_id, target_id, relationship)` on `edges` to
+        #    conflict against: migration 017 deliberately made AUTHORED edges
+        #    multi-valued, 018 dropped the triple-unique constraint, and 053
+        #    dropped the drifted unique index that had survived it. An
+        #    `ON CONFLICT` naming those columns therefore raises "there is no
+        #    unique or exclusion constraint matching the ON CONFLICT
+        #    specification", which aborts the cluster transaction — every
+        #    cluster, every run.
         cur.execute(
             """
             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -246,19 +290,54 @@ def merge_cluster(
                    jsonb_build_object('via', 'fuzzy_dedup_claims', 'merged_from', c.id::text)
               FROM claims c
              WHERE c.id = %s::uuid
-            ON CONFLICT (source_id, target_id, relationship) DO NOTHING
+               AND NOT EXISTS (
+                   SELECT 1 FROM edges e
+                    WHERE e.source_id = c.agent_id
+                      AND e.target_id = %s::uuid
+                      AND e.relationship = 'AUTHORED'
+               )
             """,
-            (canonical_id, dup_id),
+            (canonical_id, dup_id, canonical_id),
         )
         stats.authored_edges_added += cur.rowcount
 
-        # 7. Soft-mark the dup. Keeping the row preserves any FK reference
-        #    we did not redirect; the label + deduped_into pointer lets readers
-        #    follow to the canonical.
+        # 7. RETRACT the dup, then mark it. Keeping the ROW preserves any FK
+        #    reference we did not redirect (see the Limitations block above);
+        #    keeping it CURRENT does not, and that was the defect: a label-only
+        #    soft-mark left the duplicate with is_current = true and its
+        #    embedding intact, so `recall()` — whose dense and lexical legs both
+        #    filter `WHERE c.embedding IS NOT NULL AND c.is_current`
+        #    (ClaimRepository::search_hybrid_scoped_since) — kept returning it
+        #    alongside its canonical partner. A single-origin figure then reads
+        #    as two to four independently corroborating nodes.
+        #
+        #    The four columns below are exactly what the canonical Rust path
+        #    ClaimRepository::mark_duplicate_with_repair writes, deliberately
+        #    matched so the two implementations cannot diverge. In particular
+        #    `embedding_3072` is NOT nulled here because that path does not null
+        #    it either; if it should be, that is one fix in the repo layer, not
+        #    two half-fixes in two languages.
+        #
+        #    ONE STATEMENT, NOT TWO. Migration 052 adds
+        #    `chk_deprecated_no_embedding CHECK (is_current OR embedding IS NULL)`,
+        #    which is evaluated per row per statement: splitting `is_current =
+        #    false` from `embedding = NULL` violates it in between and aborts
+        #    the cluster transaction.
+        #
+        #    Flipping is_current also fires the `claims_deactivate_factors`
+        #    AFTER UPDATE trigger, which runs `DELETE FROM factors WHERE
+        #    NEW.id = ANY(variable_ids)`. That drops factor rows naming the
+        #    DUPLICATE, which is the intent — a retracted claim should leave
+        #    the factor graph. The canonical's own factors reference the
+        #    canonical's id and are untouched.
         cur.execute(
             """
             UPDATE claims
-               SET labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'),
+               SET supersedes = %s::uuid,
+                   is_current = false,
+                   embedding = NULL,
+                   updated_at = NOW(),
+                   labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'),
                    properties = COALESCE(properties, '{}'::jsonb)
                               || jsonb_build_object(
                                   'deduped_into', %s,
@@ -267,8 +346,9 @@ def merge_cluster(
                               )
              WHERE id = %s::uuid
             """,
-            (canonical_id, dup_id),
+            (canonical_id, canonical_id, dup_id),
         )
+        stats.duplicates_retracted += cur.rowcount
 
     # 8. Sweep self-edges that may have arrived during redirect.
     cur.execute(
@@ -347,6 +427,15 @@ def main() -> int:
                 conn.rollback()
                 continue
             stats = merge_cluster(cur, canonical, members)
+            # Accumulate the refusal counter BEFORE the early-continue below.
+            # A cluster whose only duplicate was refused for having a prior
+            # `supersedes` has duplicate_count == 0, and reporting it purely
+            # as "already deduped" would hide the refusal — the one outcome an
+            # operator needs to see, because it means a real semantic duplicate
+            # was deliberately left current.
+            totals.duplicates_skipped_already_superseded += (
+                stats.duplicates_skipped_already_superseded
+            )
             if stats.duplicate_count == 0:
                 totals.clusters_skipped_already_deduped += 1
                 conn.rollback()
@@ -357,6 +446,7 @@ def main() -> int:
                 conn.rollback()
             totals.clusters_processed += 1
             totals.duplicates += stats.duplicate_count
+            totals.duplicates_retracted += stats.duplicates_retracted
             totals.mfs_moved += stats.mfs_moved
             totals.mfs_skipped_collision += stats.mfs_skipped_collision
             totals.edges_redirected += stats.edges_redirected
@@ -392,6 +482,11 @@ def main() -> int:
     print(f"clusters_skipped_already_deduped: {totals.clusters_skipped_already_deduped}")
     print(f"clusters_failed:                 {totals.clusters_failed}")
     print(f"duplicates_merged:               {totals.duplicates}")
+    print(f"duplicates_retracted:            {totals.duplicates_retracted}")
+    print(
+        "duplicates_skipped_already_superseded: "
+        f"{totals.duplicates_skipped_already_superseded}"
+    )
     print(f"mass_functions_moved:            {totals.mfs_moved}")
     print(f"mass_functions_dropped_collision: {totals.mfs_skipped_collision}")
     print(f"edges_redirected:                {totals.edges_redirected}")

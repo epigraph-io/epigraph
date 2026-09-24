@@ -226,8 +226,13 @@ async fn recompute_one_claim_cached_belief(
     // win — reliably clobbering the edge-derived `binary_truth` belief, since
     // `binary_truth` sorts first. `recompute_claim_cached_belief` picks the single
     // owning frame instead.
+    // An operator one-shot on the DSN the operator supplies — in practice a
+    // superuser, where a tenancy stamp is inert. The acquire is mechanical: the
+    // recompute rides ONE connection instead of a checkout per statement.
+    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
     Ok(usize::from(
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(pool, viewer, claim_id).await?,
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, viewer, claim_id)
+            .await?,
     ))
 }
 

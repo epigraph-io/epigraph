@@ -14,9 +14,12 @@
 //! API base: EPIGRAPH_API (primary) or EPIGRAPH_API_URL (container fallback),
 //! default http://127.0.0.1:8080. Auth token: EPIGRAPH_TOKEN if set, otherwise
 //! minted via client_credentials from EPIGRAPH_SERVICE_CLIENT_ID +
-//! EPIGRAPH_SERVICE_SECRET.
+//! EPIGRAPH_SERVICE_SECRET against EPIGRAPH_OAUTH_TOKEN_URL (default
+//! `{api_base}/oauth/token`). If NEITHER is available the run aborts before
+//! the first write — it does NOT proceed with an empty bearer token.
 //! Use `--provider mock` for a dry compile/smoke without credentials (it
-//! returns an empty batch, so nothing is written). Use `--provider fixture`
+//! returns an empty batch, so nothing is written, and auth is therefore not
+//! resolved at all). Use `--provider fixture`
 //! plus `DECOMPOSE_FIXTURE_PATH=<file.json>` to exercise the atom/edge WRITE
 //! path deterministically without an LLM call — see [`FixtureLlmClient`] for
 //! the file format.
@@ -49,16 +52,39 @@ struct Cli {
     dry_run: bool,
 }
 
+/// Treat a set-but-empty env var as absent.
+///
+/// Shell templating can export an env var with an unresolved-to-empty value
+/// (`EPIGRAPH_API=""`) rather than leaving it unset; `Option::or` alone does
+/// NOT catch that case since `Some("")` is not `None`. An empty `api_base`
+/// turns `format!("{api_base}/api/v1/claims")` into the relative path
+/// "/api/v1/claims", which `reqwest` rejects with `RelativeUrlWithoutBase` —
+/// the hardening for that hypothesis in backlog a422da87.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|s| !s.is_empty())
+}
+
 /// API base precedence: `EPIGRAPH_API` (explicit override) first,
 /// `EPIGRAPH_API_URL` (the container-standard name epiclaw-host exposes)
 /// second, `http://127.0.0.1:8080` otherwise. Takes already-read env values
 /// (rather than reading `std::env::var` itself) so it's a pure function —
 /// testable without mutating global process env, which races under
-/// parallel test execution.
+/// parallel test execution. Set-but-empty values are treated as absent
+/// (see [`non_empty`]).
 fn resolve_api_base(epigraph_api: Option<String>, epigraph_api_url: Option<String>) -> String {
-    epigraph_api
-        .or(epigraph_api_url)
+    non_empty(epigraph_api)
+        .or_else(|| non_empty(epigraph_api_url))
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
+}
+
+/// OAuth token endpoint precedence: explicit `EPIGRAPH_OAUTH_TOKEN_URL`
+/// first (matches the epiclaw-host `container.rs` convention of constructing
+/// it as `{api_url}/oauth/token` and exporting it directly), falling back to
+/// `{api_base}/oauth/token` when that specific env var isn't set. Set-but-
+/// empty is treated as absent, same as [`resolve_api_base`].
+fn resolve_token_url(oauth_token_url: Option<String>, api_base: &str) -> String {
+    non_empty(oauth_token_url)
+        .unwrap_or_else(|| format!("{}/oauth/token", api_base.trim_end_matches('/')))
 }
 
 /// Env var naming the JSON fixture file consumed by `--provider fixture`.
@@ -96,43 +122,139 @@ fn resolve_llm_client(
     )?)
 }
 
-/// `None` unless both service-client credential env values are present.
-/// Split out from `mint_service_token` as a pure guard so the "don't even
-/// attempt a mint without both creds" behavior is unit-testable without an
-/// HTTP mock.
+/// `None` unless both service-client credential env values are present AND
+/// non-empty. Split out from `mint_service_token` as a pure guard so the
+/// "don't even attempt a mint without both creds" behavior is unit-testable
+/// without an HTTP mock. Set-but-empty is treated as absent (see
+/// [`non_empty`]) so `EPIGRAPH_SERVICE_CLIENT_ID=""` fails fast via
+/// [`AuthError::NoCredentials`] instead of attempting (and failing) a mint
+/// with an empty client_id.
 fn resolve_service_credentials(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Option<(String, String)> {
-    Some((client_id?, client_secret?))
+    Some((non_empty(client_id)?, non_empty(client_secret)?))
+}
+
+/// The decided authentication strategy for the claims-POST calls: either
+/// reuse a caller-supplied token verbatim, or mint a fresh one from
+/// service-client credentials. Never a bare empty string —
+/// [`resolve_auth_plan`] only returns this once at least one usable auth
+/// path exists.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthPlan {
+    UseToken(String),
+    Mint {
+        client_id: String,
+        client_secret: String,
+    },
+}
+
+/// Fail-fast reason: neither an explicit token nor a client-credentials pair
+/// was available.
+///
+/// This binary previously chose the opposite: it logged "proceeding with an
+/// EMPTY bearer token, every API write below will 401" and ran anyway. That
+/// fail-open is what gh-375 tracks — the LLM calls (which cost money and
+/// time) all completed and only then did every write 401, so a whole
+/// scheduled run was burned to produce nothing.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum AuthError {
+    #[error(
+        "no auth material available: EPIGRAPH_TOKEN is unset/empty and \
+         EPIGRAPH_SERVICE_CLIENT_ID/EPIGRAPH_SERVICE_SECRET are not both set; \
+         cannot authenticate claims-POST calls"
+    )]
+    NoCredentials,
+}
+
+/// Decide how to authenticate: reuse an already-set non-empty token (never
+/// force a mint over a caller-supplied token), otherwise plan a mint from
+/// service-client credentials, otherwise fail fast rather than proceeding
+/// with an empty bearer token.
+fn resolve_auth_plan(
+    env_token: Option<String>,
+    credentials: Option<(String, String)>,
+) -> Result<AuthPlan, AuthError> {
+    if let Some(token) = non_empty(env_token) {
+        return Ok(AuthPlan::UseToken(token));
+    }
+    match credentials {
+        Some((client_id, client_secret)) => Ok(AuthPlan::Mint {
+            client_id,
+            client_secret,
+        }),
+        None => Err(AuthError::NoCredentials),
+    }
+}
+
+/// Why a mint attempt failed. Distinguishes "server reachable but rejected
+/// us" from "response body wasn't a usable token" so callers (and tests) get
+/// a clear signal instead of a silently-empty string.
+#[derive(Debug, thiserror::Error)]
+enum MintError {
+    #[error("token endpoint request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("token endpoint returned HTTP {0}")]
+    HttpStatus(reqwest::StatusCode),
+    #[error("token endpoint response was not a usable token: {0}")]
+    MalformedResponse(String),
 }
 
 /// Mint a bearer token from service-client credentials via the OAuth
-/// client_credentials flow. Returns `None` if either credential env var is
-/// absent or the request fails — callers fall back to an empty token (which
-/// will produce a 401 on the first API call, surfacing the problem clearly).
-async fn mint_service_token(api_base: &str) -> Option<String> {
-    let (client_id, client_secret) = resolve_service_credentials(
-        std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok(),
-        std::env::var("EPIGRAPH_SERVICE_SECRET").ok(),
-    )?;
-    let url = format!("{}/oauth/token", api_base.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .post(&url)
+/// client_credentials flow. Pure aside from the network call: takes the
+/// already-resolved endpoint/credentials/client rather than reading env or
+/// constructing its own `reqwest::Client`, so it's unit-testable against a
+/// mock HTTP server (wiremock) without touching process env.
+async fn mint_service_token(
+    client_id: &str,
+    client_secret: &str,
+    token_url: &str,
+    http: &reqwest::Client,
+) -> Result<String, MintError> {
+    let resp = http
+        .post(token_url)
         .form(&[
             ("grant_type", "client_credentials"),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
             ("scope", "claims:write"),
         ])
         .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(MintError::HttpStatus(status));
     }
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json["access_token"].as_str().map(str::to_owned)
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| MintError::MalformedResponse(e.to_string()))?;
+    json.get("access_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            MintError::MalformedResponse(format!(
+                "no string 'access_token' field in response body: {json}"
+            ))
+        })
+}
+
+/// Whether a run under `provider` can reach the claims-POST path at all.
+///
+/// `mock` resolves to [`epigraph_cli::enrichment::llm_client::MockLlmClient`]
+/// built with NO pre-configured responses, which returns an empty JSON array
+/// for every `complete_json` call; `parse_batch_response` then yields zero
+/// decompositions and the submit closure is never invoked. So a `--provider
+/// mock` run provably performs no authenticated request, and the module doc
+/// promises exactly that ("a dry compile/smoke without credentials").
+/// Requiring auth for it would break that documented smoke path.
+///
+/// `fixture` is deliberately NOT exempt: its whole purpose is to exercise
+/// the atom/edge WRITE path deterministically, so it does POST and does need
+/// a token.
+fn provider_writes_to_api(provider: &str) -> bool {
+    provider != "mock"
 }
 
 #[tokio::main]
@@ -179,39 +301,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("api_base={api_base}");
 
-    // EPIGRAPH_TOKEN if present; otherwise attempt client_credentials mint so
-    // container deployments work without a token-mint preamble in the schedule.
-    // Diagnostic-only: never log the token value itself, only its provenance
-    // and length (distinguishes "empty" from "present but wrong" without
-    // leaking the credential — backlog a422da87's reported non-determinism
-    // needs exactly this to disambiguate an auth failure from a URL-builder
-    // failure across repeated scheduled runs).
-    let token = {
-        let t = std::env::var("EPIGRAPH_TOKEN").unwrap_or_default();
-        if t.is_empty() {
-            match mint_service_token(&api_base).await {
-                Some(minted) => {
-                    eprintln!(
-                        "token: minted via client_credentials (len={})",
-                        minted.len()
-                    );
-                    minted
-                }
-                None => {
-                    eprintln!(
-                        "token: EPIGRAPH_TOKEN unset AND client_credentials mint failed \
-                         (missing creds or mint request error) — proceeding with an EMPTY \
-                         bearer token, every API write below will 401"
-                    );
-                    String::new()
-                }
-            }
-        } else {
-            eprintln!("token: using EPIGRAPH_TOKEN from env (len={})", t.len());
-            t
-        }
-    };
     let http = reqwest::Client::new();
+
+    // EPIGRAPH_TOKEN if present (non-empty) and used as-is; otherwise mint a
+    // fresh bearer token from service-client credentials via
+    // client_credentials, so container deployments work without a token-mint
+    // preamble in the schedule. If NEITHER is available, fail fast HERE —
+    // before the LLM batches run — rather than proceeding with an empty
+    // bearer token that only surfaces as a 401 after every batch has already
+    // been paid for (gh-375).
+    //
+    // Skipped entirely for a provider that cannot reach the write path; see
+    // `provider_writes_to_api`.
+    //
+    // Diagnostic-only logging: never the token value itself, only its
+    // provenance and length (distinguishes "empty" from "present but wrong"
+    // without leaking the credential — backlog a422da87's reported
+    // non-determinism needs exactly this to disambiguate an auth failure from
+    // a URL-builder failure across repeated scheduled runs).
+    let token = if provider_writes_to_api(&cli.provider) {
+        let plan = resolve_auth_plan(
+            std::env::var("EPIGRAPH_TOKEN").ok(),
+            resolve_service_credentials(
+                std::env::var("EPIGRAPH_SERVICE_CLIENT_ID").ok(),
+                std::env::var("EPIGRAPH_SERVICE_SECRET").ok(),
+            ),
+        )?;
+        match plan {
+            AuthPlan::UseToken(t) => {
+                eprintln!("token: using EPIGRAPH_TOKEN from env (len={})", t.len());
+                t
+            }
+            AuthPlan::Mint {
+                client_id,
+                client_secret,
+            } => {
+                let token_url =
+                    resolve_token_url(std::env::var("EPIGRAPH_OAUTH_TOKEN_URL").ok(), &api_base);
+                eprintln!("token: minting via client_credentials at {token_url}");
+                let minted =
+                    mint_service_token(&client_id, &client_secret, &token_url, &http).await?;
+                eprintln!(
+                    "token: minted via client_credentials (len={})",
+                    minted.len()
+                );
+                minted
+            }
+        }
+    } else {
+        eprintln!(
+            "token: not resolved — --provider {} performs no API write",
+            cli.provider
+        );
+        String::new()
+    };
 
     // The parent claims the runner iterates. `agent_id` rides along because
     // atoms inherit their parent compound claim's author, and the parent
@@ -307,7 +450,229 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_api_base, resolve_llm_client, resolve_service_credentials};
+    use super::{
+        mint_service_token, provider_writes_to_api, resolve_api_base, resolve_auth_plan,
+        resolve_llm_client, resolve_service_credentials, resolve_token_url, AuthError, AuthPlan,
+        MintError,
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- fail-fast auth resolution (gh-375) ---
+    //
+    // Re-landed from PR #337, which was merged and reverted 12 minutes later
+    // by PR #341 with a body of exactly "Reverts epigraph-io/epigraph#337"
+    // and no comments. The revert was a process correction, not a functional
+    // one: CI was green on the merge commit 284a20f9 ("test success",
+    // "Security audit (advisory) success"), no commit landed between the
+    // merge and the revert, the same account merged and reverted, and #337's
+    // own body ends "DO NOT MERGE — flagging for manual review".
+
+    /// A caller-supplied `EPIGRAPH_TOKEN` is used verbatim and is never
+    /// overridden by a mint, even when service-client credentials are also
+    /// present. An operator who exports a specific token means that token.
+    #[test]
+    fn resolve_auth_plan_prefers_an_explicit_token_over_available_credentials() {
+        let plan = resolve_auth_plan(
+            Some("caller-supplied-token".to_string()),
+            Some(("id".to_string(), "secret".to_string())),
+        )
+        .expect("an explicit token is sufficient auth material");
+        assert_eq!(
+            plan,
+            AuthPlan::UseToken("caller-supplied-token".to_string())
+        );
+    }
+
+    /// No token but a complete credential pair ⇒ plan a mint.
+    #[test]
+    fn resolve_auth_plan_mints_when_no_token_but_credentials_present() {
+        let plan = resolve_auth_plan(None, Some(("id".to_string(), "secret".to_string())))
+            .expect("credentials alone are sufficient auth material");
+        assert_eq!(
+            plan,
+            AuthPlan::Mint {
+                client_id: "id".to_string(),
+                client_secret: "secret".to_string(),
+            }
+        );
+    }
+
+    /// `EPIGRAPH_TOKEN=""` (shell templating that resolved to empty rather
+    /// than leaving the var unset) must be treated as absent, not as a
+    /// zero-length bearer token.
+    #[test]
+    fn resolve_auth_plan_treats_a_set_but_empty_token_as_absent() {
+        let plan = resolve_auth_plan(
+            Some(String::new()),
+            Some(("id".to_string(), "secret".to_string())),
+        )
+        .expect("an empty token must fall through to the credential path");
+        assert_eq!(
+            plan,
+            AuthPlan::Mint {
+                client_id: "id".to_string(),
+                client_secret: "secret".to_string(),
+            }
+        );
+    }
+
+    /// THE gh-375 REGRESSION GUARD. With neither a token nor credentials the
+    /// binary must refuse to start. The reverted behaviour was to log
+    /// "proceeding with an EMPTY bearer token, every API write below will
+    /// 401" and continue — burning a full LLM batch run before failing.
+    #[test]
+    fn resolve_auth_plan_fails_fast_when_no_auth_material_is_available() {
+        let err = resolve_auth_plan(None, None)
+            .expect_err("no auth material at all must fail fast, not yield an empty token");
+        assert_eq!(err, AuthError::NoCredentials);
+    }
+
+    /// A set-but-empty credential must not trigger a doomed mint attempt;
+    /// it fails fast the same way a missing one does.
+    #[test]
+    fn resolve_service_credentials_treats_set_but_empty_as_absent() {
+        assert_eq!(
+            resolve_service_credentials(Some(String::new()), Some("secret".to_string())),
+            None
+        );
+        assert_eq!(
+            resolve_service_credentials(Some("id".to_string()), Some(String::new())),
+            None
+        );
+    }
+
+    /// `EPIGRAPH_API=""` must not win over a usable `EPIGRAPH_API_URL`:
+    /// an empty base makes `format!("{api_base}/api/v1/claims")` a relative
+    /// path, which reqwest rejects with `RelativeUrlWithoutBase`.
+    #[test]
+    fn resolve_api_base_skips_a_set_but_empty_override() {
+        assert_eq!(
+            resolve_api_base(Some(String::new()), Some("https://api.example".to_string())),
+            "https://api.example"
+        );
+        assert_eq!(
+            resolve_api_base(Some(String::new()), Some(String::new())),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    // --- resolve_token_url: EPIGRAPH_OAUTH_TOKEN_URL precedence ---
+
+    /// epiclaw-host's `container.rs` documents `EPIGRAPH_OAUTH_TOKEN_URL` as
+    /// the manual-flow env var; the shipped mint never read it and always
+    /// hardcoded `{api_base}/oauth/token`.
+    #[test]
+    fn resolve_token_url_prefers_an_explicit_oauth_token_url() {
+        assert_eq!(
+            resolve_token_url(
+                Some("https://auth.example/token".to_string()),
+                "https://api.example"
+            ),
+            "https://auth.example/token"
+        );
+    }
+
+    #[test]
+    fn resolve_token_url_falls_back_to_api_base_and_strips_a_trailing_slash() {
+        assert_eq!(
+            resolve_token_url(None, "https://api.example/"),
+            "https://api.example/oauth/token"
+        );
+        assert_eq!(
+            resolve_token_url(Some(String::new()), "https://api.example"),
+            "https://api.example/oauth/token"
+        );
+    }
+
+    /// `--provider mock` must stay usable with zero credentials: the module
+    /// doc promises "a dry compile/smoke without credentials", and a mock
+    /// run provably issues no authenticated request. `fixture` DOES write,
+    /// so it is not exempt.
+    #[test]
+    fn only_the_mock_provider_is_exempt_from_auth_resolution() {
+        assert!(!provider_writes_to_api("mock"));
+        assert!(provider_writes_to_api("epigraph"));
+        assert!(provider_writes_to_api("fixture"));
+    }
+
+    // --- mint_service_token: HTTP mock coverage ---
+
+    #[tokio::test]
+    async fn mint_service_token_returns_parsed_token_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"access_token": "minted-jwt-value"})),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token_url = format!("{}/oauth/token", server.uri());
+        let token = mint_service_token("client-id", "client-secret", &token_url, &http)
+            .await
+            .expect("mock server returns a valid token");
+        assert_eq!(token, "minted-jwt-value");
+    }
+
+    #[tokio::test]
+    async fn mint_service_token_errors_clearly_on_non_200_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid_client"
+            })))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token_url = format!("{}/oauth/token", server.uri());
+        let err = mint_service_token("client-id", "wrong-secret", &token_url, &http)
+            .await
+            .expect_err("401 must surface as an Err, not a silently empty string");
+        assert!(matches!(err, MintError::HttpStatus(status) if status == 401));
+    }
+
+    #[tokio::test]
+    async fn mint_service_token_errors_clearly_on_malformed_json_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token_url = format!("{}/oauth/token", server.uri());
+        let err = mint_service_token("client-id", "client-secret", &token_url, &http)
+            .await
+            .expect_err("a malformed JSON body must surface as an Err");
+        assert!(matches!(err, MintError::MalformedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn mint_service_token_errors_clearly_when_access_token_field_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token_type": "bearer"})),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let token_url = format!("{}/oauth/token", server.uri());
+        let err = mint_service_token("client-id", "client-secret", &token_url, &http)
+            .await
+            .expect_err("a response with no access_token field must be a clear error");
+        assert!(matches!(err, MintError::MalformedResponse(_)));
+    }
 
     /// `--provider fixture` without `DECOMPOSE_FIXTURE_PATH` must fail, not
     /// fall back to some default fixture: selecting the canned-response
